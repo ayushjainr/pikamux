@@ -139,10 +139,14 @@ class TmuxIntegrationTests(unittest.TestCase):
             if "TERM=" in output:
                 break
             time.sleep(0.05)
-        self.assertIn("TERM=tmux-256color", output)
+        self.assertIn("TERM=tmux-direct", output)
         self.assertIn("NO_COLOR=unset", output)
         self.assertIn(f"PATH={os.environ['PATH']}", output)
         self.assertNotIn("/stale/tmux/path", output)
+        features = self.tmux.run(
+            "show-options", "-s", "-v", "terminal-features"
+        ).stdout
+        self.assertIn("xterm*:RGB", features)
 
     def test_exact_pane_target_selects_its_window_in_multi_window_home(self) -> None:
         exact = self.tmux.create_agent_session(

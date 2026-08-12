@@ -177,6 +177,27 @@ class Tmux:
             # theme and explicitly adopted tmux sessions remain untouched.
             self.run("set-option", "-t", session_name, "status", "off")
 
+    def ensure_pika_rgb(self) -> None:
+        """Teach the shared tmux server that xterm clients accept 24-bit colour."""
+        current = self.run(
+            "show-options",
+            "-s",
+            "-v",
+            "terminal-features",
+            check=False,
+        )
+        if current.returncode == 0 and any(
+            feature.startswith("xterm*") and "RGB" in feature.split(":")[1:]
+            for feature in current.stdout.splitlines()
+        ):
+            return
+        self.run(
+            "set-option",
+            "-as",
+            "terminal-features",
+            "xterm*:RGB",
+        )
+
     def create_agent_session(
         self,
         *,
@@ -193,6 +214,7 @@ class Tmux:
             provider, agent_argv, environment, session_id, launch_token
         )
         self.run("new-session", "-d", "-s", tmux_name, "-c", cwd, wrapper)
+        self.ensure_pika_rgb()
         self.hide_pika_status(tmux_name)
         pane = self.get_pane(tmux_name)
         if pane is None:
@@ -247,7 +269,10 @@ class Tmux:
         # contract, rather than the server's historical automation environment.
         launch_environment = dict(environment)
         launch_environment["PATH"] = os.environ.get("PATH") or os.defpath
-        launch_environment["TERM"] = "tmux-256color"
+        # `tmux-direct` advertises 24-bit RGB to Codex/Claude. This preserves
+        # subtle message-background distinctions that collapse under the
+        # 256-colour `tmux-256color` entry.
+        launch_environment["TERM"] = "tmux-direct"
         if os.environ.get("COLORTERM"):
             launch_environment["COLORTERM"] = os.environ["COLORTERM"]
         caller_no_color = os.environ.get("NO_COLOR")
@@ -294,6 +319,8 @@ class Tmux:
     ) -> int:
         # Also repairs Pika sessions created by older releases whose inherited
         # global status bar exposed Pika's internal UUID-derived tmux name.
+        if self.is_pika_session(target_session):
+            self.ensure_pika_rgb()
         self.hide_pika_status(target_session)
         if os.environ.get("TMUX"):
             client_name: str | None = None

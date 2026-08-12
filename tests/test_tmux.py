@@ -24,8 +24,40 @@ class TmuxTests(unittest.TestCase):
             )
         self.assertIn("env -u NO_COLOR", wrapper)
         self.assertIn("PATH=/caller/bin", wrapper)
-        self.assertIn("TERM=tmux-256color", wrapper)
+        self.assertIn("TERM=tmux-direct", wrapper)
         self.assertIn("codex resume uuid", wrapper)
+
+    def test_rgb_capability_is_added_once(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def run(_self, *args, **_kwargs):
+            calls.append(args)
+            existing = args[:4] == (
+                "show-options",
+                "-s",
+                "-v",
+                "terminal-features",
+            )
+            stdout = "xterm*:focus:title\n" if existing else ""
+            return subprocess.CompletedProcess(["tmux"], 0, stdout, "")
+
+        with patch.object(Tmux, "run", new=run):
+            Tmux("test").ensure_pika_rgb()
+        self.assertIn(
+            ("set-option", "-as", "terminal-features", "xterm*:RGB"), calls
+        )
+
+        calls.clear()
+
+        def already_rgb(_self, *args, **_kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(
+                ["tmux"], 0, "xterm*:focus:title\nxterm*:RGB\n", ""
+            )
+
+        with patch.object(Tmux, "run", new=already_rgb):
+            Tmux("test").ensure_pika_rgb()
+        self.assertFalse(any(call and call[0] == "set-option" for call in calls))
 
     def test_agent_wrapper_preserves_explicit_interactive_no_color(self) -> None:
         with patch.dict(
