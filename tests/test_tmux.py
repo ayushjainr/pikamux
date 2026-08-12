@@ -160,6 +160,20 @@ class TmuxTests(unittest.TestCase):
         self.assertIn(
             ("set-option", "-t", "pika-c-home", "status", "off"), calls
         )
+        self.assertIn(
+            ("set-option", "-t", "pika-c-home", "mouse", "on"), calls
+        )
+        self.assertIn(
+            (
+                "set-option",
+                "-w",
+                "-t",
+                "%7",
+                "history-limit",
+                "100000",
+            ),
+            calls,
+        )
         self.assertIn(("select-window", "-t", "%7"), calls)
         self.assertIn(("select-pane", "-t", "%7"), calls)
         self.assertIn(

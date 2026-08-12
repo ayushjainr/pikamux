@@ -100,6 +100,15 @@ scripted output preserves unread state unless `--ack` is explicit. In scripts,
 `pika wait NAME --for needs-you --timeout 600 --json` provides a daemon-free
 synchronization primitive.
 
+Pika-created homes enable tmux mouse handling only for that session, so a wheel
+or trackpad scroll enters pane history without a prefix key. Scroll back down to
+the bottom or press `q` to return to the live agent; hold Shift while dragging
+when the outer terminal should select text itself. Newly created and exact-
+respawned Pika panes retain up to 100,000 lines. A live pane created by an older
+Pika release gains wheel scrolling immediately and the deeper allocation on its
+next exact respawn. Global tmux options and adopted user-owned sessions are not
+changed.
+
 ## Data and recovery
 
 Pika stores configuration in `~/.config/pika/config.json` and owner-only state

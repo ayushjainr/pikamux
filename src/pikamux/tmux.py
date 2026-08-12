@@ -18,6 +18,9 @@ class TmuxError(RuntimeError):
     pass
 
 
+PIKA_HISTORY_LIMIT = 100_000
+
+
 @dataclass(slots=True)
 class Tmux:
     socket_name: str | None = None
@@ -181,6 +184,34 @@ class Tmux:
             # theme and explicitly adopted tmux sessions remain untouched.
             self.run("set-option", "-t", session_name, "status", "off")
 
+    def configure_pika_scrollback(
+        self, session_name: str, *, target: str | None = None
+    ) -> None:
+        """Give Pika-owned homes wheel scrolling and deep pane-local history."""
+        if not self.is_pika_session(session_name):
+            return
+        # `mouse` is a session option. With Codex not requesting application
+        # mouse events, tmux's default WheelUpPane binding enters copy mode and
+        # makes the wheel/trackpad operate on the truthful pane history.
+        self.run("set-option", "-t", session_name, "mouse", "on")
+        # tmux allocates a pane's history limit when the pane screen is created.
+        # Callers configure the window before create/respawn and pass the exact
+        # pane when repairing an existing Pika home.
+        self.run(
+            "set-option",
+            "-w",
+            "-t",
+            target or session_name,
+            "history-limit",
+            str(PIKA_HISTORY_LIMIT),
+        )
+
+    def configure_pika_session(
+        self, session_name: str, *, target: str | None = None
+    ) -> None:
+        self.hide_pika_status(session_name)
+        self.configure_pika_scrollback(session_name, target=target)
+
     def ensure_pika_rgb(self) -> None:
         """Teach the shared tmux server that xterm clients accept 24-bit colour."""
         current = self.run(
@@ -217,9 +248,16 @@ class Tmux:
         wrapper = self._agent_wrapper(
             provider, agent_argv, environment, session_id, launch_token
         )
-        self.run("new-session", "-d", "-s", tmux_name, "-c", cwd, wrapper)
+        # Create a short-lived holding pane first. tmux fixes the history buffer
+        # limit when a pane screen is created, so applying the Pika window option
+        # before respawn is what gives the real agent pane its deeper history.
+        self.run("new-session", "-d", "-s", tmux_name, "-c", cwd, "sleep 30")
+        self.configure_pika_session(tmux_name)
+        holding = self.get_pane(tmux_name)
+        if holding is None:
+            raise TmuxError(f"tmux created {tmux_name!r} but its pane was not found")
+        self.run("respawn-pane", "-k", "-t", holding.pane_id, "-c", cwd, wrapper)
         self.ensure_pika_rgb()
-        self.hide_pika_status(tmux_name)
         pane = self.get_pane(tmux_name)
         if pane is None:
             raise TmuxError(f"tmux created {tmux_name!r} but its pane was not found")
@@ -246,6 +284,10 @@ class Tmux:
         wrapper = self._agent_wrapper(
             provider, agent_argv, environment, session_id, None
         )
+        pane = self.get_pane(pane_id)
+        if pane is None:
+            raise TmuxError("pane disappeared before it could be respawned")
+        self.configure_pika_session(pane.session_name, target=pane_id)
         self.run("respawn-pane", "-k", "-t", pane_id, "-c", cwd, wrapper)
         self.tag_pane(
             pane_id,
@@ -356,10 +398,12 @@ class Tmux:
         receipt: str | None = None,
     ) -> int:
         # Also repairs Pika sessions created by older releases whose inherited
-        # global status bar exposed Pika's internal UUID-derived tmux name.
+        # global status/mouse options exposed transport details or blocked
+        # wheel scrolling. A live pane keeps its original history allocation;
+        # the deeper limit takes effect on its next exact respawn.
         if self.is_pika_session(target_session):
             self.ensure_pika_rgb()
-        self.hide_pika_status(target_session)
+        self.configure_pika_session(target_session, target=target_pane)
         if os.environ.get("TMUX"):
             client_name: str | None = None
             if receipt:

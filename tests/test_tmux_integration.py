@@ -107,10 +107,42 @@ class TmuxIntegrationTests(unittest.TestCase):
             "show-options", "-v", "-t", pane.session_name, "status"
         )
         self.assertEqual(status.stdout.strip(), "off")
+        mouse = self.tmux.run(
+            "show-options", "-v", "-t", pane.session_name, "mouse"
+        )
+        self.assertEqual(mouse.stdout.strip(), "on")
+        history_limit = self.tmux.run(
+            "show-options", "-w", "-v", "-t", pane.pane_id, "history-limit"
+        )
+        self.assertEqual(history_limit.stdout.strip(), "100000")
         self.assertEqual(panes[0].pika_session_id, "uuid-test")
         self.assertEqual(panes[0].pika_name, "integration")
         self.assertIsNotNone(provider_process(panes[0].pane_pid, "codex"))
         self.assertIn("pika-ready", self.tmux.capture(panes[0].pane_id, 20))
+
+    def test_agent_pane_gets_deep_history_not_the_server_default(self) -> None:
+        self.tmux.run("new-session", "-d", "-s", "seed", "sleep", "30")
+        self.tmux.run("set-option", "-g", "history-limit", "5")
+        command = "for i in {1..30}; do echo retained-$i; done; sleep 30"
+        pane = self.tmux.create_agent_session(
+            tmux_name="pika-c-deep-history",
+            cwd="/tmp",
+            provider="codex",
+            agent_argv=["bash", "-lc", command],
+            environment={},
+            session_id="uuid-history",
+            display_name="deep-history",
+            launch_token=None,
+        )
+        deadline = time.time() + 3
+        output = ""
+        while time.time() < deadline:
+            output = self.tmux.capture(pane.pane_id, 100)
+            if "retained-30" in output:
+                break
+            time.sleep(0.05)
+        self.assertIn("retained-1", output)
+        self.assertIn("retained-30", output)
 
     def test_agent_gets_rich_tui_environment_not_stale_server_values(self) -> None:
         self.tmux.run("new-session", "-d", "-s", "seed", "sleep", "30")
