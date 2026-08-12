@@ -1,0 +1,378 @@
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from typing import ClassVar
+from unittest.mock import patch
+
+from pikamux.hooks import handle_hook, handle_process_exit, hook_stdout
+from pikamux.models import Pane, Session, Status
+from pikamux.store import Store
+
+
+class FakeTmux:
+    tags: ClassVar[list] = []
+    alerts: ClassVar[list] = []
+    attached: ClassVar[bool] = False
+
+    def get_pane(self, target):
+        if not target:
+            return None
+        return Pane(
+            session_name="pika-c-token",
+            pane_id=target,
+            pane_pid=os.getpid(),
+            cwd="/tmp",
+            current_command="codex",
+            attached=self.attached,
+            dead=False,
+            dead_status=None,
+            activity=1,
+            created=1,
+        )
+
+    def tag_pane(self, target, **values):
+        self.tags.append((target, values))
+
+    def display_alert(self, message):
+        self.alerts.append(message)
+
+
+class HookTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.temp.name) / "pika.db")
+        self.store.add_pending(
+            "launch", "codex", "thread-name", "/tmp", "pika-c-token", "%9"
+        )
+        self.env = patch.dict(
+            os.environ,
+            {
+                "PIKA_LAUNCH_TOKEN": "launch",
+                "TMUX_PANE": "%9",
+                "PIKA_CONFIG_HOME": self.temp.name,
+            },
+            clear=False,
+        )
+        self.env.start()
+        FakeTmux.tags = []
+        FakeTmux.alerts = []
+        FakeTmux.attached = False
+
+    def tearDown(self) -> None:
+        self.env.stop()
+        self.temp.cleanup()
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_session_start_binds_pending_name_to_exact_uuid(self) -> None:
+        result = handle_hook(
+            "codex",
+            {
+                "session_id": "uuid-1",
+                "cwd": "/tmp",
+                "hook_event_name": "SessionStart",
+                "transcript_path": "/tmp/rollout.jsonl",
+                "model": "gpt-5.4",
+            },
+            self.store,
+        )
+        self.assertIsNone(result)
+        session = self.store.get_session("codex", "uuid-1")
+        self.assertEqual(session.name if session else None, "thread-name")
+        self.assertIsNone(self.store.get_pending("launch"))
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_state_transitions(self) -> None:
+        base = {"session_id": "uuid-1", "cwd": "/tmp", "transcript_path": "/tmp/x"}
+        handle_hook("codex", {**base, "hook_event_name": "SessionStart"}, self.store)
+        handle_hook(
+            "codex", {**base, "hook_event_name": "UserPromptSubmit"}, self.store
+        )
+        self.assertEqual(
+            self.store.get_session("codex", "uuid-1").status, Status.WORKING.value
+        )
+        handle_hook(
+            "codex", {**base, "hook_event_name": "PermissionRequest"}, self.store
+        )
+        self.assertEqual(
+            self.store.get_session("codex", "uuid-1").status, Status.NEEDS_YOU.value
+        )
+        self.assertEqual(
+            self.store.get_session("codex", "uuid-1").attention_reason,
+            "permission",
+        )
+        handle_hook("codex", {**base, "hook_event_name": "PostToolUse"}, self.store)
+        self.assertEqual(
+            self.store.get_session("codex", "uuid-1").status, Status.WORKING.value
+        )
+        handle_hook("codex", {**base, "hook_event_name": "Stop"}, self.store)
+        session = self.store.get_session("codex", "uuid-1")
+        self.assertEqual(session.status, Status.READY.value)
+        self.assertTrue(session.unread)
+        self.assertEqual(session.attention_reason, "completed")
+        self.assertIn("thread-name (Codex) — completed", FakeTmux.alerts[-1])
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_claude_question_reason_is_structured_without_transcript_text(self) -> None:
+        handle_hook(
+            "claude",
+            {
+                "session_id": "uuid-question",
+                "cwd": "/tmp",
+                "hook_event_name": "Notification",
+                "notification_type": "agent_needs_input",
+            },
+            self.store,
+        )
+        session = self.store.get_session("claude", "uuid-question")
+        self.assertEqual(session.attention_reason if session else None, "question")
+        self.assertIn("(Claude) — question waiting", FakeTmux.alerts[-1])
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_duplicate_actionable_event_does_not_ring_twice(self) -> None:
+        event = {
+            "session_id": "uuid-deduped",
+            "cwd": "/tmp",
+            "hook_event_name": "Stop",
+        }
+        handle_hook("codex", event, self.store)
+        handle_hook("codex", event, self.store)
+        self.assertEqual(len(FakeTmux.alerts), 1)
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_distinct_actionable_transition_still_alerts(self) -> None:
+        base = {"session_id": "uuid-transition", "cwd": "/tmp"}
+        handle_hook(
+            "codex", {**base, "hook_event_name": "PermissionRequest"}, self.store
+        )
+        handle_hook("codex", {**base, "hook_event_name": "Stop"}, self.store)
+        self.assertEqual(len(FakeTmux.alerts), 2)
+        self.assertIn("permission requested", FakeTmux.alerts[0])
+        self.assertIn("completed", FakeTmux.alerts[1])
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_claude_session_start_sets_native_title(self) -> None:
+        with patch.dict(os.environ, {"PIKA_NAME": "native-title"}, clear=False):
+            result = handle_hook(
+                "claude",
+                {
+                    "session_id": "uuid-c",
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionStart",
+                },
+                self.store,
+            )
+        self.assertEqual(result["hookSpecificOutput"]["sessionTitle"], "native-title")
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_hook_replaces_unbound_adoption_without_losing_name(self) -> None:
+        self.store.delete_pending("launch")
+        self.store.upsert_session(
+            Session(
+                provider="codex",
+                session_id="unbound:%9",
+                name="adopted-name",
+                cwd="/tmp",
+                tmux_pane="%9",
+                status=Status.UNBOUND.value,
+            )
+        )
+        with patch.dict(os.environ, {"PIKA_LAUNCH_TOKEN": ""}, clear=False):
+            handle_hook(
+                "codex",
+                {
+                    "session_id": "real-uuid",
+                    "cwd": "/tmp",
+                    "hook_event_name": "PostToolUse",
+                },
+                self.store,
+            )
+        bound = self.store.get_session("codex", "real-uuid")
+        self.assertEqual(bound.name if bound else None, "adopted-name")
+        self.assertIsNone(self.store.get_session("codex", "unbound:%9"))
+
+    def test_codex_noop_output_is_valid_json(self) -> None:
+        self.assertEqual(hook_stdout("codex", None), "{}")
+
+    @patch("pikamux.hooks.CodexProvider")
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_codex_session_start_sets_native_name(self, provider_class) -> None:
+        with patch.dict(os.environ, {"PIKA_NAME": "native-title"}, clear=False):
+            handle_hook(
+                "codex",
+                {
+                    "session_id": "uuid-native",
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionStart",
+                },
+                self.store,
+            )
+        provider_class.return_value.set_native_name.assert_called_once_with(
+            "uuid-native", "native-title"
+        )
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_ready_while_attached_is_not_unread_or_alerted(self) -> None:
+        FakeTmux.attached = True
+        handle_hook(
+            "codex",
+            {
+                "session_id": "uuid-attached",
+                "cwd": "/tmp",
+                "hook_event_name": "Stop",
+            },
+            self.store,
+        )
+        session = self.store.get_session("codex", "uuid-attached")
+        self.assertEqual(session.status if session else None, Status.READY.value)
+        self.assertFalse(session.unread if session else True)
+        self.assertEqual(FakeTmux.alerts, [])
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_visible_permission_stays_unread_but_does_not_ring(self) -> None:
+        FakeTmux.attached = True
+        handle_hook(
+            "codex",
+            {
+                "session_id": "uuid-visible-permission",
+                "cwd": "/tmp",
+                "hook_event_name": "PermissionRequest",
+            },
+            self.store,
+        )
+        session = self.store.get_session("codex", "uuid-visible-permission")
+        self.assertTrue(session.unread if session else False)
+        self.assertEqual(FakeTmux.alerts, [])
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_first_attach_token_is_replaced_by_exact_identity(self) -> None:
+        self.store.set_meta("attached_launch:launch", "1")
+        handle_hook(
+            "codex",
+            {
+                "session_id": "uuid-bound",
+                "cwd": "/tmp",
+                "hook_event_name": "SessionStart",
+            },
+            self.store,
+        )
+        self.assertEqual(
+            self.store.get_meta("last_attached"), '["codex", "uuid-bound"]'
+        )
+        self.assertIsNone(self.store.get_meta("attached_launch:launch"))
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_process_exit_uses_launch_binding_after_pending_is_deleted(self) -> None:
+        handle_hook(
+            "codex",
+            {
+                "session_id": "uuid-exit",
+                "cwd": "/tmp",
+                "hook_event_name": "SessionStart",
+            },
+            self.store,
+        )
+        self.assertIsNone(self.store.get_pending("launch"))
+        handle_process_exit("codex", 7, launch_token="launch", store=self.store)
+        session = self.store.get_session("codex", "uuid-exit")
+        self.assertEqual(session.status if session else None, Status.ERROR.value)
+        self.assertIn("status 7", session.error if session else "")
+        self.assertEqual(session.attention_reason if session else None, "exited")
+
+    def test_nonzero_exit_overrides_stale_unread_ready_state(self) -> None:
+        self.store.upsert_session(
+            Session(
+                "codex",
+                "uuid-crash",
+                name="crash",
+                status=Status.READY.value,
+                unread=True,
+            )
+        )
+        handle_process_exit("codex", 9, session_id="uuid-crash", store=self.store)
+        session = self.store.get_session("codex", "uuid-crash")
+        self.assertEqual(session.status if session else None, Status.ERROR.value)
+        self.assertIn("status 9", session.error if session else "")
+
+    @patch("pikamux.hooks.CodexProvider")
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_failed_codex_native_name_is_visible_and_retried(
+        self, provider_class
+    ) -> None:
+        provider_class.return_value.set_native_name.side_effect = [False, True]
+        with patch.dict(os.environ, {"PIKA_NAME": "retry-title"}, clear=False):
+            handle_hook(
+                "codex",
+                {
+                    "session_id": "uuid-retry",
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionStart",
+                },
+                self.store,
+            )
+            key = "native_name_error:codex:uuid-retry"
+            self.assertEqual(self.store.get_meta(key), "retry-title")
+            handle_hook(
+                "codex",
+                {
+                    "session_id": "uuid-retry",
+                    "cwd": "/tmp",
+                    "hook_event_name": "PostToolUse",
+                },
+                self.store,
+            )
+        self.assertIsNone(self.store.get_meta(key))
+        self.assertEqual(provider_class.return_value.set_native_name.call_count, 2)
+
+    @patch("pikamux.hooks.provider_ancestor", return_value=4321)
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_unnamed_external_hook_still_records_exact_live_owner(self, _owner) -> None:
+        self.store.delete_pending("launch")
+        with (
+            patch.dict(
+                os.environ, {"PIKA_LAUNCH_TOKEN": "", "TMUX_PANE": ""}, clear=False
+            ),
+            patch("pikamux.store.process_start_time", return_value=12345),
+        ):
+            result = handle_hook(
+                "codex",
+                {
+                    "session_id": "uuid-hidden",
+                    "cwd": "/tmp",
+                    "hook_event_name": "PostToolUse",
+                },
+                self.store,
+            )
+        self.assertIsNone(result)
+        self.assertIsNone(self.store.get_session("codex", "uuid-hidden"))
+        self.assertEqual(
+            self.store.get_live_owners("codex", "uuid-hidden"), [(4321, 12345)]
+        )
+
+    @patch("pikamux.hooks.provider_ancestor", return_value=4321)
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_session_end_expires_external_live_owner(self, _owner) -> None:
+        with patch("pikamux.store.process_start_time", return_value=12345):
+            self.store.set_live_owner("codex", "uuid-ended", 4321)
+            self.store.set_live_owner("codex", "uuid-ended", 9876)
+        with patch.dict(
+            os.environ, {"PIKA_LAUNCH_TOKEN": "", "TMUX_PANE": ""}, clear=False
+        ):
+            handle_hook(
+                "codex",
+                {
+                    "session_id": "uuid-ended",
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionEnd",
+                },
+                self.store,
+            )
+        self.assertEqual(
+            self.store.get_live_owners("codex", "uuid-ended"), [(9876, 12345)]
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

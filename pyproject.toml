@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.27,<1.28"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pikamux"
+version = "0.1.0"
+description = "Persistent Identity Keeper for Codex and Claude sessions in tmux"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Pikamux contributors" }]
+keywords = ["tmux", "codex", "claude", "cli"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+]
+dependencies = []
+
+[project.scripts]
+pika = "pikamux.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pikamux"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

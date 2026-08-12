@@ -1,0 +1,298 @@
+from __future__ import annotations
+
+import argparse
+import io
+import unittest
+from contextlib import redirect_stdout
+from unittest.mock import Mock, patch
+
+from pikamux.cli import _bare, _normalize_argv, _peek, _peek_popup, _setup, _wait
+from pikamux.models import Pane, Session, Status
+from pikamux.setup_hooks import hook_spec_fingerprint
+from pikamux.tmux import TmuxError
+
+
+class WaitStore:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get_session(self, *_key: str) -> Session:
+        return self.session
+
+
+class WaitPika:
+    def __init__(self) -> None:
+        self.working = Session(
+            "codex",
+            "11111111-1111-4111-8111-111111111111",
+            name="waited",
+            status=Status.WORKING.value,
+        )
+        self.ready = Session(
+            "codex",
+            self.working.session_id,
+            name="waited",
+            status=Status.READY.value,
+            unread=True,
+        )
+        self.store = WaitStore(self.working)
+        self.refresh_calls = 0
+
+    def resolve(self, _name: str, _sessions=None) -> Session:
+        return self.working
+
+    def refresh(self, *, usage: bool = False) -> list[Session]:
+        self.refresh_calls += 1
+        return [self.ready]
+
+
+class PeekTmux:
+    def __init__(self, *, fail: bool):
+        self.fail = fail
+
+    def get_pane(self, _target: str) -> Pane:
+        return Pane("home", "%1", 1, "/tmp", "codex", False, False, None, 1, 1)
+
+    def capture(self, _target: str, _lines: int) -> str:
+        if self.fail:
+            raise TmuxError("capture failed")
+        return "pane output"
+
+
+class PeekPika:
+    def __init__(self, *, fail: bool):
+        self.session = Session(
+            "codex",
+            "11111111-1111-4111-8111-111111111111",
+            name="peeked",
+            tmux_pane="%1",
+            status=Status.READY.value,
+            unread=True,
+        )
+        self.tmux = PeekTmux(fail=fail)
+        self.acknowledged = False
+
+    def resolve(self, _name: str, _sessions=None) -> Session:
+        return self.session
+
+    def acknowledge(self, _session: Session) -> None:
+        self.acknowledged = True
+
+
+class CliTests(unittest.TestCase):
+    def test_bare_name_normalizes_to_open_without_shadowing_commands(self) -> None:
+        self.assertEqual(_normalize_argv(["research"]), ["open", "research"])
+        self.assertEqual(_normalize_argv(["list"]), ["list"])
+        self.assertEqual(_normalize_argv(["open", "list"]), ["open", "list"])
+
+    def test_bare_choice_one_matches_oldest_first_next_order(self) -> None:
+        class BarePika:
+            def __init__(self):
+                self.opened = None
+                self.sessions = [
+                    Session(
+                        "codex",
+                        "newer",
+                        name="newer",
+                        status=Status.NEEDS_YOU.value,
+                        unread=True,
+                        last_activity_at=20,
+                    ),
+                    Session(
+                        "claude",
+                        "older",
+                        name="older",
+                        status=Status.NEEDS_YOU.value,
+                        unread=True,
+                        last_activity_at=10,
+                    ),
+                ]
+
+            def refresh(self, *, usage=False):
+                return self.sessions
+
+            def open(self, session):
+                self.opened = session
+                return 0
+
+        pika = BarePika()
+        fake_stdin = Mock()
+        fake_stdin.isatty.return_value = True
+        with (
+            patch("pikamux.ui.sys.stdin", fake_stdin),
+            patch("builtins.input", return_value="1"),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(_bare(pika), 0)
+        self.assertEqual(pika.opened.name, "older")
+
+    def test_wait_reconciles_provider_state_periodically(self) -> None:
+        pika = WaitPika()
+        args = argparse.Namespace(name="waited", wait_for="any", timeout=10, json=False)
+        with (
+            patch("pikamux.cli.time.monotonic", side_effect=[0.0, 5.0]),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(_wait(pika, args), 0)
+        self.assertEqual(pika.refresh_calls, 1)
+        self.assertIn("waited: READY", output.getvalue())
+
+    def test_wait_sanitizes_name_and_reason_for_terminal_output(self) -> None:
+        pika = WaitPika()
+        pika.ready.name = "waited\x1b[2J\nrenamed"
+        pika.ready.attention_reason = "done\rrewritten"
+        args = argparse.Namespace(name="waited", wait_for="any", timeout=10, json=False)
+        with (
+            patch("pikamux.cli.time.monotonic", side_effect=[0.0, 5.0]),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(_wait(pika, args), 0)
+        rendered = output.getvalue()
+        self.assertNotIn("\x1b", rendered)
+        self.assertNotIn("\r", rendered)
+        self.assertIn("waited�[2J�renamed", rendered)
+        self.assertIn("done�rewritten", rendered)
+
+    def test_peek_popup_sanitizes_name(self) -> None:
+        pika = Mock()
+        pika.tmux.capture.return_value = "pane output"
+        args = argparse.Namespace(
+            target="%1",
+            lines=20,
+            name="peek\x1b[2J\nrenamed",
+            provider="codex",
+            session_id="uuid",
+        )
+        with (
+            patch("pikamux.cli.Pika", return_value=pika),
+            patch("pikamux.cli.sys.stdin", io.StringIO("q")),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(_peek_popup(args), 0)
+        rendered = output.getvalue()
+        self.assertNotIn("\x1b", rendered)
+        self.assertIn("peek�[2J�renamed", rendered)
+
+    def test_failed_peek_does_not_acknowledge_unread_ready(self) -> None:
+        pika = PeekPika(fail=True)
+        with (
+            patch("pikamux.cli.load_config", return_value={"peek_lines": 20}),
+            self.assertRaisesRegex(TmuxError, "capture failed"),
+        ):
+            _peek(pika, "peeked", None)
+        self.assertFalse(pika.acknowledged)
+
+    def test_successful_peek_acknowledges_unread_ready(self) -> None:
+        pika = PeekPika(fail=False)
+        with (
+            patch("pikamux.cli.load_config", return_value={"peek_lines": 20}),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(_peek(pika, "peeked", None, ack=True), 0)
+        self.assertTrue(pika.acknowledged)
+
+    def test_redirected_peek_preserves_unread_without_explicit_ack(self) -> None:
+        pika = PeekPika(fail=False)
+        with (
+            patch("pikamux.cli.load_config", return_value={"peek_lines": 20}),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(_peek(pika, "peeked", None), 0)
+        self.assertFalse(pika.acknowledged)
+
+    def test_setup_frames_configuration_as_a_commissioning_contract(self) -> None:
+        class MetaStore:
+            @staticmethod
+            def get_meta(_key):
+                return None
+
+        pika = Mock(store=MetaStore())
+        args = argparse.Namespace(
+            no_import=True,
+            dry_run=False,
+            import_all=False,
+            yes=True,
+            default_provider="codex",
+        )
+        output = io.StringIO()
+        with (
+            patch("pikamux.cli.proposed_changes", return_value=[]),
+            patch("pikamux.cli.hooks_installed", return_value=True),
+            patch("pikamux.cli.load_config", return_value={}),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_setup(pika, args), 0)
+        rendered = output.getvalue()
+        self.assertIn("Pika commissioning", rendered)
+        self.assertIn("existing settings retained", rendered)
+        self.assertIn("Default for new conversations: Codex", rendered)
+        self.assertIn("Commissioning status", rendered)
+        self.assertIn("Pika not yet commissioned", rendered)
+        self.assertIn("Codex observation", rendered)
+        self.assertIn("Claude observation", rendered)
+
+    def test_setup_never_claims_commissioned_from_stale_observation(self) -> None:
+        class MetaStore:
+            @staticmethod
+            def get_meta(key):
+                provider = key.rsplit(":", 1)[-1]
+                return hook_spec_fingerprint(provider)
+
+        pika = Mock(store=MetaStore())
+        args = argparse.Namespace(
+            no_import=True,
+            dry_run=False,
+            import_all=False,
+            yes=True,
+            default_provider="codex",
+        )
+        output = io.StringIO()
+        with (
+            patch("pikamux.cli.proposed_changes", return_value=[]),
+            patch(
+                "pikamux.cli.hooks_installed",
+                side_effect=lambda provider: provider == "codex",
+            ),
+            patch("pikamux.cli.load_config", return_value={}),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_setup(pika, args), 0)
+        rendered = output.getvalue()
+        self.assertIn("Pika not yet commissioned", rendered)
+        self.assertIn("Claude activation", rendered)
+        self.assertNotIn("Pika commissioned ·", rendered)
+
+    def test_setup_one_proof_copy_requires_claude_fully_commissioned(self) -> None:
+        class MetaStore:
+            @staticmethod
+            def get_meta(_key):
+                return None
+
+        pika = Mock(store=MetaStore())
+        args = argparse.Namespace(
+            no_import=True,
+            dry_run=False,
+            import_all=False,
+            yes=True,
+            default_provider="codex",
+        )
+        output = io.StringIO()
+        with (
+            patch("pikamux.cli.proposed_changes", return_value=[]),
+            patch(
+                "pikamux.cli.hooks_installed",
+                side_effect=lambda provider: provider == "codex",
+            ),
+            patch("pikamux.cli.load_config", return_value={}),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_setup(pika, args), 0)
+        rendered = output.getvalue()
+        self.assertNotIn("One required proof remains", rendered)
+        self.assertIn("Codex observation", rendered)
+        self.assertIn("Claude activation", rendered)
+        self.assertIn("Claude observation", rendered)
+
+
+if __name__ == "__main__":
+    unittest.main()
