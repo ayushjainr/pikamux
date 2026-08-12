@@ -54,6 +54,9 @@ class TmuxTests(unittest.TestCase):
             )
         self.assertEqual(result, 0)
         self.assertEqual(attached, [True])
+        self.assertIn(
+            ("set-option", "-t", "pika-c-home", "status", "off"), calls
+        )
         self.assertIn(("select-window", "-t", "%7"), calls)
         self.assertIn(("select-pane", "-t", "%7"), calls)
         self.assertIn(
@@ -68,6 +71,20 @@ class TmuxTests(unittest.TestCase):
             ),
             calls,
         )
+
+    def test_adopted_user_session_keeps_its_status_configuration(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def run(_self, *args, **_kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+        with (
+            patch.object(Tmux, "run", new=run),
+            patch.dict(os.environ, {"TMUX": "socket,1,0"}, clear=False),
+        ):
+            self.assertEqual(Tmux("test").attach("my-existing-session"), 0)
+        self.assertFalse(any(call and call[0] == "set-option" for call in calls))
 
 
 if __name__ == "__main__":

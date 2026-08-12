@@ -115,6 +115,9 @@ that evidence remain fail-closed.
 Each Pika-managed conversation gets one UUID-derived tmux session. A new Claude
 conversation is named natively with `--name`; a new Codex conversation is named
 through Codex's local app-server thread API after SessionStart reveals its UUID.
+Pika disables the tmux status bar only for sessions it creates, keeping the
+Codex or Claude interface visually unchanged while leaving global tmux settings
+and explicitly adopted sessions untouched.
 The provider process may exit while the tmux session remains as an idle shell.
 Opening that conversation later respawns the exact UUID in the same pane. If
 that pane contains any foreground or background work, Pika preserves it, clears

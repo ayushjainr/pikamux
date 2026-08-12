@@ -102,6 +102,10 @@ class TmuxIntegrationTests(unittest.TestCase):
             time.sleep(0.05)
         panes = self.tmux.list_panes()
         self.assertEqual(len(panes), 1)
+        status = self.tmux.run(
+            "show-options", "-v", "-t", pane.session_name, "status"
+        )
+        self.assertEqual(status.stdout.strip(), "off")
         self.assertEqual(panes[0].pika_session_id, "uuid-test")
         self.assertEqual(panes[0].pika_name, "integration")
         self.assertIsNotNone(provider_process(panes[0].pane_pid, "codex"))

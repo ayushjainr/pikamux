@@ -165,6 +165,18 @@ class Tmux:
         ):
             self.run("set-option", "-p", "-u", "-t", target, option, check=False)
 
+    @staticmethod
+    def is_pika_session(name: str) -> bool:
+        """Identify tmux homes created by Pika, not user-owned adopted sessions."""
+        return name.startswith(("pika-c-", "pika-a-"))
+
+    def hide_pika_status(self, session_name: str) -> None:
+        """Keep Pika's tmux transport visually transparent to the agent UI."""
+        if self.is_pika_session(session_name):
+            # `status` is a per-session option here; the user's global tmux
+            # theme and explicitly adopted tmux sessions remain untouched.
+            self.run("set-option", "-t", session_name, "status", "off")
+
     def create_agent_session(
         self,
         *,
@@ -181,6 +193,7 @@ class Tmux:
             provider, agent_argv, environment, session_id, launch_token
         )
         self.run("new-session", "-d", "-s", tmux_name, "-c", cwd, wrapper)
+        self.hide_pika_status(tmux_name)
         pane = self.get_pane(tmux_name)
         if pane is None:
             raise TmuxError(f"tmux created {tmux_name!r} but its pane was not found")
@@ -260,6 +273,9 @@ class Tmux:
         on_attached: Callable[[], None] | None = None,
         receipt: str | None = None,
     ) -> int:
+        # Also repairs Pika sessions created by older releases whose inherited
+        # global status bar exposed Pika's internal UUID-derived tmux name.
+        self.hide_pika_status(target_session)
         if os.environ.get("TMUX"):
             client_name: str | None = None
             if receipt:
