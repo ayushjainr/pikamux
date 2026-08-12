@@ -266,12 +266,17 @@ def choose_session(
 def choose_candidates(candidates: list[Candidate]) -> list[Candidate]:
     if not candidates:
         return []
-    print("\nPika found these named or live conversations:")
+    print("\nPika found conversations worth adopting:")
     for index, item in enumerate(candidates, 1):
         live = " live" if item.live else ""
+        label = (
+            item.name
+            if item.name
+            else f"<unnamed live · {item.session_id[:8]}>"
+        )
         print(
             f"  {index:>2}. {item.provider:<6} "
-            f"{terminal_text(item.display_name):<28} "
+            f"{terminal_text(label):<28} "
             f"{short_path(item.cwd, 34)}{live}"
         )
     if not sys.stdin.isatty():

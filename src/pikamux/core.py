@@ -101,7 +101,9 @@ class Pika:
         result: list[Candidate] = []
         for provider in self.providers.values():
             try:
-                result.extend(provider.import_candidates())
+                for item in provider.import_candidates():
+                    if item.live or provider.is_resumable(item.session_id):
+                        result.append(item)
             except Exception as exc:  # noqa: BLE001 - imports are best-effort
                 self.discovery_errors.append(f"{provider.name}: {exc}")
         by_key = {(item.provider, item.session_id): item for item in result}

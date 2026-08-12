@@ -34,15 +34,18 @@ pika setup
 `pika setup` is presented as a commissioning flow, not a blind installer. It
 states the integration contract, shows a diff before changing anything, backs up
 existing files, preserves existing JSON key order, and merges lifecycle hooks
-into Codex and Claude user settings. It offers to adopt existing named or live
-conversations before asking for a default provider. Nothing is imported
-silently: derived Claude titles are presented as selectable hints. The final
+into Codex and Claude user settings. It offers to adopt existing resumable
+conversations with explicit names plus any conversation that is currently live
+before asking for a default provider. Archived sessions, missing histories, and
+AI-generated Claude summaries stay out of this commissioning choice. Ambiguous
+Codex labels from the legacy append-only name index also stay out; setup trusts
+only current native Codex names. Nothing is imported silently. The final
 commissioning ledger distinguishes active hook definitions from observed live
-events. Codex requires one extra trust step: open `/hooks`, approve the Pika
-definitions, and use Codex once so `pika doctor` can observe a real lifecycle
-event. Pika uses “commissioned” only when both integrations are currently active
-and have delivered the current hook definition; otherwise it names every
-remaining activation or observation proof.
+events. Codex requires one extra trust step: open
+`/hooks`, approve the Pika definitions, and use Codex once so `pika doctor` can
+observe a real lifecycle event. Pika uses “commissioned” only when both
+integrations are currently active and have delivered the current hook
+definition; otherwise it names every remaining activation or observation proof.
 
 For automation, review a dry run and then apply it explicitly:
 

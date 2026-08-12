@@ -141,6 +141,20 @@ class CodexProvider(Provider):
         )
         return self.enrich(named)
 
+    def import_candidates(self) -> list[Candidate]:
+        """Offer only current authoritative names during commissioning.
+
+        The legacy append-only index does not say whether a title was generated
+        or explicitly chosen, so it is useful for reconciling already-known
+        identities but too ambiguous for a one-time adoption prompt.
+        """
+        archived_ids = self.hidden_session_ids()
+        return [
+            item
+            for item in self._database_records()
+            if item.session_id not in archived_ids
+        ]
+
     def _database_records(self) -> list[Candidate]:
         return self._query_current_database(named_only=True)
 
@@ -482,12 +496,12 @@ class ClaudeProvider(Provider):
 
     def import_candidates(self) -> list[Candidate]:
         records = {item.session_id: item for item in self.discover()}
-        for item in self._historical_titles():
+        for item in self._historical_titles(explicit_only=True):
             existing = records.get(item.session_id)
             if existing:
                 if not existing.name:
                     existing.name = item.name
-                    existing.source = "claude-live+history"
+                    existing.source = "claude-live+explicit-history"
                 existing.transcript_path = (
                     existing.transcript_path or item.transcript_path
                 )
@@ -551,7 +565,9 @@ class ClaudeProvider(Provider):
             item.session_id == session_id for item in self.discover()
         )
 
-    def _historical_titles(self, limit: int = 1000) -> list[Candidate]:
+    def _historical_titles(
+        self, limit: int = 1000, *, explicit_only: bool = False
+    ) -> list[Candidate]:
         projects = self.home / "projects"
         if not projects.exists():
             return []
@@ -561,7 +577,7 @@ class ClaudeProvider(Provider):
         result: list[Candidate] = []
         for path in paths:
             session_id = path.stem
-            title = self._title_from_transcript(path)
+            title = self._title_from_transcript(path, explicit_only=explicit_only)
             if title:
                 result.append(
                     Candidate(
@@ -576,7 +592,9 @@ class ClaudeProvider(Provider):
         return result
 
     @staticmethod
-    def _title_from_transcript(path: Path) -> str | None:
+    def _title_from_transcript(
+        path: Path, *, explicit_only: bool = False
+    ) -> str | None:
         title: str | None = None
         try:
             with path.open(errors="replace") as stream:
@@ -605,7 +623,11 @@ class ClaudeProvider(Provider):
                         )
                     elif data.get("sessionTitle"):
                         title = data["sessionTitle"]
-                    elif record_type == "ai-title" and data.get("aiTitle"):
+                    elif (
+                        not explicit_only
+                        and record_type == "ai-title"
+                        and data.get("aiTitle")
+                    ):
                         title = data["aiTitle"]
         except OSError:
             return None

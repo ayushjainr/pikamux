@@ -8,9 +8,10 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 
-from pikamux.models import Session, Status
+from pikamux.models import Candidate, Session, Status
 from pikamux.ui import (
     SelectionCancelled,
+    choose_candidates,
     choose_session,
     format_tokens,
     print_sessions,
@@ -62,6 +63,21 @@ class UiTests(unittest.TestCase):
         self.assertIn("permission", rendered)
         self.assertIn("Exceptions:", rendered)
         self.assertIn("claude exited with status 7", rendered)
+
+    def test_setup_labels_unnamed_live_work_without_generated_title(self) -> None:
+        output = io.StringIO()
+        candidate = Candidate(
+            "claude",
+            "22222222-2222-4222-8222-222222222222",
+            name=None,
+            cwd="/tmp/project",
+            live=True,
+        )
+        with patch("sys.stdin", io.StringIO()), redirect_stdout(output):
+            self.assertEqual(choose_candidates([candidate]), [])
+        rendered = output.getvalue()
+        self.assertIn("<unnamed live · 22222222>", rendered)
+        self.assertIn("conversations worth adopting", rendered)
 
     def test_large_token_counts_use_a_legible_billions_unit(self) -> None:
         self.assertEqual(format_tokens(9_417_690_000), "9.42b")

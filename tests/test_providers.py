@@ -47,16 +47,28 @@ class ProviderTests(unittest.TestCase):
             1786530600.0,
         )
 
-    def test_claude_import_includes_selectable_ai_title(self) -> None:
+    def test_claude_import_excludes_ai_generated_title(self) -> None:
         project = self.root / "projects" / "repo"
         project.mkdir(parents=True)
         session_id = "11111111-1111-4111-8111-111111111111"
         (project / f"{session_id}.jsonl").write_text(
             json.dumps({"type": "ai-title", "aiTitle": "derived hint"}) + "\n"
         )
+        self.assertEqual(ClaudeProvider(self.root).import_candidates(), [])
+
+    def test_claude_import_includes_explicit_historical_title(self) -> None:
+        project = self.root / "projects" / "repo"
+        project.mkdir(parents=True)
+        session_id = "11111111-1111-4111-8111-111111111111"
+        (project / f"{session_id}.jsonl").write_text(
+            json.dumps({"type": "ai-title", "aiTitle": "derived hint"})
+            + "\n"
+            + json.dumps({"type": "custom-title", "title": "chosen name"})
+            + "\n"
+        )
         candidates = ClaudeProvider(self.root).import_candidates()
         self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0].name, "derived hint")
+        self.assertEqual(candidates[0].name, "chosen name")
         self.assertEqual(candidates[0].source, "claude-history")
 
     def test_claude_tracked_parked_rename_refreshes_from_transcript(self) -> None:
@@ -152,6 +164,45 @@ class ProviderTests(unittest.TestCase):
         )
         self.assertTrue(provider.is_resumable(active_id))
         self.assertFalse(provider.is_resumable(archived_id))
+
+    def test_codex_setup_excludes_ambiguous_legacy_name(self) -> None:
+        session_id = "11111111-1111-4111-8111-111111111111"
+        rollout = self.root / "rollout.jsonl"
+        rollout.write_text("{}\n")
+        with sqlite3.connect(self.root / "state_current.sqlite") as db:
+            db.execute(
+                "CREATE TABLE threads "
+                "(id TEXT PRIMARY KEY, name TEXT, rollout_path TEXT, archived INTEGER)"
+            )
+            db.execute(
+                "INSERT INTO threads(id,name,rollout_path,archived) VALUES (?,?,?,?)",
+                (session_id, None, str(rollout), 0),
+            )
+        (self.root / "session_index.jsonl").write_text(
+            json.dumps({"id": session_id, "thread_name": "generated-looking title"})
+            + "\n"
+        )
+
+        provider = CodexProvider(self.root)
+        self.assertEqual(provider.discover()[0].name, "generated-looking title")
+        self.assertEqual(provider.import_candidates(), [])
+
+    def test_codex_setup_includes_current_native_name(self) -> None:
+        session_id = "11111111-1111-4111-8111-111111111111"
+        rollout = self.root / "rollout.jsonl"
+        rollout.write_text("{}\n")
+        with sqlite3.connect(self.root / "state_current.sqlite") as db:
+            db.execute(
+                "CREATE TABLE threads "
+                "(id TEXT PRIMARY KEY, name TEXT, rollout_path TEXT, archived INTEGER)"
+            )
+            db.execute(
+                "INSERT INTO threads(id,name,rollout_path,archived) VALUES (?,?,?,?)",
+                (session_id, "chosen name", str(rollout), 0),
+            )
+
+        candidates = CodexProvider(self.root).import_candidates()
+        self.assertEqual([item.name for item in candidates], ["chosen name"])
 
     def test_codex_native_name_uses_official_thread_rpc(self) -> None:
         process = FakeAppServer()

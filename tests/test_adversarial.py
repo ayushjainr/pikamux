@@ -199,6 +199,29 @@ class AdversarialTests(unittest.TestCase):
         self.assertEqual(pika.refresh(), [])
         self.assertIsNotNone(self.store.get_session("codex", archived_id))
 
+    def test_setup_import_excludes_unresumable_history_but_keeps_live_work(self) -> None:
+        stale = Candidate(
+            "codex",
+            "11111111-1111-4111-8111-111111111111",
+            name="stale",
+        )
+        live = Candidate(
+            "claude",
+            "22222222-2222-4222-8222-222222222222",
+            name=None,
+            live=True,
+        )
+        pika = Pika(
+            self.store,
+            StaticTmux(),
+            {
+                "codex": FakeProvider("codex", [stale], resumable=False),
+                "claude": FakeProvider("claude", [live], resumable=False),
+            },
+        )
+
+        self.assertEqual(pika.discover_import_candidates(), [live])
+
     def test_cross_provider_native_collision_uses_chooser(self) -> None:
         candidates = [
             Candidate(
