@@ -329,10 +329,22 @@ class Tmux:
         if launch_token:
             exit_argv.extend(["--launch-token", launch_token])
         shell = os.environ.get("SHELL") or "/bin/bash"
+        shell_argv = [shell, "-l"]
+        if palette is not None:
+            # Keep the outer palette available in the protected fallback shell.
+            # A later `pika NAME` can then switch or respawn from inside tmux
+            # without attempting another OSC query through the multiplexer.
+            shell_argv = [
+                "env",
+                f"{FOREGROUND_ENV}={launch_environment[FOREGROUND_ENV]}",
+                f"{BACKGROUND_ENV}={launch_environment[BACKGROUND_ENV]}",
+                shell,
+                "-l",
+            ]
         return (
             f"{shlex.join(env_argv)}; pika_rc=$?; "
             f'{shlex.join(exit_argv)} --code "$pika_rc"; '
-            f"exec {shlex.quote(shell)} -l"
+            f"exec {shlex.join(shell_argv)}"
         )
 
     def attach(

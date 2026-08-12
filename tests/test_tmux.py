@@ -89,6 +89,11 @@ class TmuxTests(unittest.TestCase):
         self.assertIn("--foreground 221,204,187", wrapper)
         self.assertIn("--background 34,33,51", wrapper)
         self.assertIn("-- codex resume uuid", wrapper)
+        self.assertIn(
+            "exec env PIKA_TERMINAL_FOREGROUND=221,204,187 "
+            "PIKA_TERMINAL_BACKGROUND=34,33,51",
+            wrapper,
+        )
 
     def test_claude_does_not_need_the_codex_palette_bridge(self) -> None:
         with patch.dict(
