@@ -111,6 +111,39 @@ class TmuxIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(provider_process(panes[0].pane_pid, "codex"))
         self.assertIn("pika-ready", self.tmux.capture(panes[0].pane_id, 20))
 
+    def test_agent_gets_rich_tui_environment_not_stale_server_values(self) -> None:
+        self.tmux.run("new-session", "-d", "-s", "seed", "sleep", "30")
+        self.tmux.run("set-environment", "-g", "NO_COLOR", "1")
+        self.tmux.run("set-environment", "-g", "PATH", "/stale/tmux/path")
+        pane = self.tmux.create_agent_session(
+            tmux_name="pika-c-tui-environment",
+            cwd="/tmp",
+            provider="codex",
+            agent_argv=[
+                "bash",
+                "-c",
+                (
+                    "printf 'TERM=%s NO_COLOR=%s PATH=%s\\n' "
+                    '"$TERM" "${NO_COLOR-unset}" "$PATH"; sleep 30'
+                ),
+            ],
+            environment={},
+            session_id="uuid-tui",
+            display_name="tui-environment",
+            launch_token=None,
+        )
+        deadline = time.time() + 3
+        output = ""
+        while time.time() < deadline:
+            output = self.tmux.capture(pane.pane_id, 20)
+            if "TERM=" in output:
+                break
+            time.sleep(0.05)
+        self.assertIn("TERM=tmux-256color", output)
+        self.assertIn("NO_COLOR=unset", output)
+        self.assertIn(f"PATH={os.environ['PATH']}", output)
+        self.assertNotIn("/stale/tmux/path", output)
+
     def test_exact_pane_target_selects_its_window_in_multi_window_home(self) -> None:
         exact = self.tmux.create_agent_session(
             tmux_name="pika-c-multi-window",

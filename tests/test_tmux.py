@@ -9,6 +9,36 @@ from pikamux.tmux import Tmux
 
 
 class TmuxTests(unittest.TestCase):
+    def test_agent_wrapper_restores_interactive_tui_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"PATH": "/caller/bin", "TERM": "dumb", "NO_COLOR": "1"},
+            clear=True,
+        ):
+            wrapper = Tmux("test")._agent_wrapper(
+                "codex",
+                ["codex", "resume", "uuid"],
+                {"PIKA_SESSION_ID": "uuid"},
+                "uuid",
+                None,
+            )
+        self.assertIn("env -u NO_COLOR", wrapper)
+        self.assertIn("PATH=/caller/bin", wrapper)
+        self.assertIn("TERM=tmux-256color", wrapper)
+        self.assertIn("codex resume uuid", wrapper)
+
+    def test_agent_wrapper_preserves_explicit_interactive_no_color(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"PATH": "/caller/bin", "TERM": "xterm-256color", "NO_COLOR": "1"},
+            clear=True,
+        ):
+            wrapper = Tmux("test")._agent_wrapper(
+                "claude", ["claude"], {}, None, "token"
+            )
+        self.assertNotIn("-u NO_COLOR", wrapper)
+        self.assertIn("NO_COLOR=1", wrapper)
+
     def test_attached_means_the_exact_pika_pane_is_visible(self) -> None:
         separator = "\x1f"
         common = [

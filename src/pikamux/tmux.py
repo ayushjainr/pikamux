@@ -241,11 +241,30 @@ class Tmux:
         session_id: str | None,
         launch_token: str | None,
     ) -> str:
-        env_argv = (
-            ["env"]
-            + [f"{key}={value}" for key, value in environment.items()]
-            + agent_argv
+        # A long-lived tmux server can carry stale PATH/NO_COLOR values from
+        # whichever process originally started it. Launch the interactive TUI
+        # with the caller's executable path and a real 256-colour tmux terminal
+        # contract, rather than the server's historical automation environment.
+        launch_environment = dict(environment)
+        launch_environment["PATH"] = os.environ.get("PATH") or os.defpath
+        launch_environment["TERM"] = "tmux-256color"
+        if os.environ.get("COLORTERM"):
+            launch_environment["COLORTERM"] = os.environ["COLORTERM"]
+        caller_no_color = os.environ.get("NO_COLOR")
+        preserve_no_color = caller_no_color is not None and os.environ.get(
+            "TERM"
+        ) not in {None, "", "dumb"}
+        env_argv = ["env"]
+        if preserve_no_color:
+            launch_environment["NO_COLOR"] = caller_no_color
+        else:
+            # Explicitly remove a stale tmux-server value. Omitting the key is
+            # insufficient because `env` otherwise inherits the server state.
+            env_argv.extend(["-u", "NO_COLOR"])
+        env_argv.extend(
+            f"{key}={value}" for key, value in launch_environment.items()
         )
+        env_argv.extend(agent_argv)
         exit_argv = [
             sys.executable,
             "-m",
