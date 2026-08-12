@@ -5,10 +5,27 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from pikamux.tmux import Tmux
+from pikamux.tmux import Tmux, TmuxError
 
 
 class TmuxTests(unittest.TestCase):
+    def test_pane_inventory_distinguishes_no_server_from_query_failure(self) -> None:
+        tmux = Tmux("test")
+        no_server = subprocess.CompletedProcess(
+            ["tmux"], 1, "", "no server running on /tmp/tmux-test"
+        )
+        with patch.object(Tmux, "run", return_value=no_server):
+            self.assertEqual(tmux.list_panes(), [])
+
+        failed = subprocess.CompletedProcess(
+            ["tmux"], 1, "", "permission denied"
+        )
+        with (
+            patch.object(Tmux, "run", return_value=failed),
+            self.assertRaisesRegex(TmuxError, "permission denied"),
+        ):
+            tmux.list_panes()
+
     def test_agent_wrapper_restores_interactive_tui_environment(self) -> None:
         with patch.dict(
             os.environ,
@@ -187,6 +204,30 @@ class TmuxTests(unittest.TestCase):
                 "Pika → exact #thread · ATTACHED LIVE",
             ),
             calls,
+        )
+
+    def test_attach_evaluates_receipt_after_successful_attached_callback(self) -> None:
+        calls: list[tuple[str, ...]] = []
+        receipt = ["before"]
+
+        def run(_self, *args, **_kwargs):
+            calls.append(args)
+            stdout = "client-1\n" if args[:2] == ("display-message", "-p") else ""
+            return subprocess.CompletedProcess(["tmux"], 0, stdout, "")
+
+        with (
+            patch.object(Tmux, "run", new=run),
+            patch.dict(os.environ, {"TMUX": "socket,1,0"}, clear=False),
+        ):
+            result = Tmux("test").attach(
+                "pika-c-home",
+                target_pane="%7",
+                on_attached=lambda: receipt.__setitem__(0, "after"),
+                receipt=lambda: receipt[0],
+            )
+        self.assertEqual(result, 0)
+        self.assertTrue(
+            any(call[-2:] == ("-l", "after") for call in calls)
         )
 
     def test_adopted_user_session_keeps_its_status_configuration(self) -> None:

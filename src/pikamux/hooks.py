@@ -137,7 +137,13 @@ def handle_hook(
         attention_reason=attention_reason,
         created_at=existing.created_at if existing else now,
         updated_at=now,
-        last_event_at=now,
+        last_event_at=(
+            existing.last_event_at
+            if data.get("hook_event_name") == "SessionEnd"
+            and existing
+            and existing.unread
+            else now
+        ),
         last_activity_at=now,
     )
     store.upsert_session(session)

@@ -204,7 +204,7 @@ def print_sessions(sessions: list[Session], *, as_json: bool = False) -> None:
                 f"  {terminal_text(item.display_name)} ({item.provider.title()}): "
                 f"{terminal_text(detail)}"
             )
-    legend = "C=Codex  A=Claude  NEW=unread  VIEW=exact pane visible"
+    legend = "C=Codex  A=Claude  NEW=unread  VIEW=tracked pane visible"
     if any(label == "~API$" for label, _size in columns):
         legend += f"  ~API$=API-equivalent estimate ({PRICING_AS_OF})"
     print(f"\n{legend}")

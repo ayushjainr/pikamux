@@ -94,12 +94,20 @@ class Tmux:
                 "#{@pika_launch_token}",
             ]
         )
-        try:
-            proc = self.run("list-panes", "-a", "-F", fmt, check=False)
-        except TmuxError:
-            return []
+        proc = self.run("list-panes", "-a", "-F", fmt, check=False)
         if proc.returncode:
-            return []
+            message = proc.stderr.strip() or proc.stdout.strip()
+            no_server = (
+                "no server running" in message
+                or "failed to connect to server" in message
+                or (
+                    "error connecting to " in message
+                    and "No such file or directory" in message
+                )
+            )
+            if no_server:
+                return []
+            raise TmuxError(message or "tmux pane inventory failed")
         panes: list[Pane] = []
         for line in proc.stdout.splitlines():
             parts = line.split(separator)
@@ -395,7 +403,7 @@ class Tmux:
         *,
         target_pane: str | None = None,
         on_attached: Callable[[], None] | None = None,
-        receipt: str | None = None,
+        receipt: str | Callable[[], str] | None = None,
     ) -> int:
         # Also repairs Pika sessions created by older releases whose inherited
         # global status/mouse options exposed transport details or blocked
@@ -425,10 +433,11 @@ class Tmux:
             if result == 0 and on_attached:
                 on_attached()
             if result == 0 and receipt:
+                message = receipt() if callable(receipt) else receipt
                 args = ["display-message"]
                 if client_name:
                     args.extend(["-c", client_name])
-                args.extend(["-d", "3000", "-l", receipt])
+                args.extend(["-d", "3000", "-l", message])
                 self.run(*args, check=False)
             return result
         try:
@@ -443,7 +452,8 @@ class Tmux:
                 if on_attached:
                     on_attached()
                 if receipt:
-                    self._display_to_client(process.pid, receipt)
+                    message = receipt() if callable(receipt) else receipt
+                    self._display_to_client(process.pid, message)
                 return process.wait()
             if result == 0 and on_attached:
                 on_attached()

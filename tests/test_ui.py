@@ -72,6 +72,7 @@ class UiTests(unittest.TestCase):
             print_sessions(self.sessions, as_json=True)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload[0]["attention_reason"], "permission")
+        self.assertNotIn("home_state", payload[0])
         self.assertNotIn("Pika briefing", output.getvalue())
 
     def test_human_surfaces_neutralize_provider_control_characters(self) -> None:

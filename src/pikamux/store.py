@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sqlite3
@@ -9,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .models import Session, Usage
+from .models import Session, Status, Usage
 from .paths import config_path, database_path
 from .processes import process_start_time
 
@@ -30,6 +31,19 @@ class Store:
         if self._initialized and self.path.exists():
             return
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path = self.path.with_name(f".{self.path.name}.initialize.lock")
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if self._initialized and self.path.exists():
+                return
+            self._initialize_schema()
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+    def _initialize_schema(self) -> None:
         try:
             os.chmod(self.path.parent, 0o700)
         except OSError:
@@ -114,6 +128,28 @@ class Store:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS session_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    event_at REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    attention_reason TEXT,
+                    error TEXT,
+                    UNIQUE (provider, session_id, event_at, status)
+                );
+                CREATE INDEX IF NOT EXISTS session_events_time_idx
+                ON session_events(event_at);
+                CREATE TABLE IF NOT EXISTS identity_interruptions (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    unread INTEGER NOT NULL,
+                    attention_reason TEXT,
+                    error TEXT,
+                    last_event_at REAL NOT NULL,
+                    PRIMARY KEY (provider, session_id)
+                );
                 """
             )
             owner_columns = db.execute("PRAGMA table_info(live_owners)").fetchall()
@@ -168,6 +204,37 @@ class Store:
             }
             if "attention_reason" not in session_columns:
                 db.execute("ALTER TABLE sessions ADD COLUMN attention_reason TEXT")
+            event_columns = {
+                str(row["name"])
+                for row in db.execute(
+                    "PRAGMA table_info(session_events)"
+                ).fetchall()
+            }
+            if "event_id" not in event_columns:
+                db.executescript(
+                    """
+                    ALTER TABLE session_events RENAME TO session_events_legacy;
+                    CREATE TABLE session_events (
+                        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        provider TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        event_at REAL NOT NULL,
+                        status TEXT NOT NULL,
+                        attention_reason TEXT,
+                        error TEXT,
+                        UNIQUE (provider, session_id, event_at, status)
+                    );
+                    INSERT OR IGNORE INTO session_events(
+                        provider,session_id,event_at,status,attention_reason,error
+                    )
+                    SELECT provider,session_id,event_at,status,attention_reason,error
+                    FROM session_events_legacy ORDER BY event_at;
+                    DROP TABLE session_events_legacy;
+                    DROP INDEX IF EXISTS session_events_time_idx;
+                    CREATE INDEX session_events_time_idx
+                    ON session_events(event_at);
+                    """
+                )
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -179,7 +246,10 @@ class Store:
         db = sqlite3.connect(self.path, timeout=5)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA busy_timeout=5000")
-        db.execute("PRAGMA journal_mode=WAL")
+        if not self._initialized:
+            # WAL selection is persistent and initialization is file-locked.
+            # Re-negotiating it on every hook connection creates a lock race.
+            db.execute("PRAGMA journal_mode=WAL")
         try:
             yield db
             db.commit()
@@ -194,7 +264,8 @@ class Store:
         event_at = session.last_event_at or now
         with self.connect() as db:
             existing = db.execute(
-                "SELECT name FROM sessions WHERE provider=? AND session_id=?",
+                "SELECT name,status,unread,attention_reason,error "
+                "FROM sessions WHERE provider=? AND session_id=?",
                 session.key,
             ).fetchone()
             name = (
@@ -202,6 +273,28 @@ class Store:
                 if preserve_name and existing and existing["name"]
                 else session.name
             )
+            if not (
+                session.status == Status.ERROR.value
+                and session.attention_reason == "identity"
+            ):
+                # A real provider lifecycle event may arrive while identity is
+                # ambiguous. Preserve the newest lifecycle behind that fault.
+                db.execute(
+                    """
+                    UPDATE identity_interruptions
+                    SET status=?,unread=?,attention_reason=?,error=?,last_event_at=?
+                    WHERE provider=? AND session_id=?
+                    """,
+                    (
+                        session.status,
+                        int(session.unread),
+                        session.attention_reason,
+                        session.error,
+                        event_at,
+                        session.provider,
+                        session.session_id,
+                    ),
+                )
             db.execute(
                 """
                 INSERT INTO sessions (
@@ -252,6 +345,14 @@ class Store:
                     activity,
                 ),
             )
+            if self._became_actionable(
+                existing,
+                status=session.status,
+                unread=session.unread,
+                attention_reason=session.attention_reason,
+                error=session.error,
+            ):
+                self._insert_session_event(db, session, event_at)
 
     def get_session(self, provider: str, session_id: str) -> Session | None:
         self.initialize()
@@ -295,7 +396,8 @@ class Store:
             raise ValueError(
                 f"Unsupported session fields: {', '.join(sorted(unknown))}"
             )
-        fields.setdefault("updated_at", time.time())
+        now = time.time()
+        fields.setdefault("updated_at", now)
         if "unread" in fields:
             fields["unread"] = int(bool(fields["unread"]))
         if "managed" in fields:
@@ -304,10 +406,50 @@ class Store:
         values = list(fields.values()) + [provider, session_id]
         self.initialize()
         with self.connect() as db:
+            existing = db.execute(
+                "SELECT status,unread,attention_reason,error,last_event_at "
+                "FROM sessions WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            ).fetchone()
+            status = str(fields.get("status", existing["status"] if existing else ""))
+            unread = bool(fields.get("unread", existing["unread"] if existing else 0))
+            attention_reason = fields.get(
+                "attention_reason",
+                existing["attention_reason"] if existing else None,
+            )
+            error = fields.get("error", existing["error"] if existing else None)
+            became_actionable = self._became_actionable(
+                existing,
+                status=status,
+                unread=unread,
+                attention_reason=attention_reason,
+                error=error,
+            )
+            if became_actionable and "last_event_at" not in fields:
+                fields["last_event_at"] = now
+                assignments = ", ".join(f"{key}=?" for key in fields)
+                values = list(fields.values()) + [provider, session_id]
             db.execute(
                 f"UPDATE sessions SET {assignments} WHERE provider=? AND session_id=?",
                 values,
             )
+            if became_actionable:
+                self._insert_session_event(
+                    db,
+                    Session(
+                        provider,
+                        session_id,
+                        status=status,
+                        unread=unread,
+                        attention_reason=(
+                            str(attention_reason)
+                            if attention_reason is not None
+                            else None
+                        ),
+                        error=str(error) if error is not None else None,
+                    ),
+                    float(fields.get("last_event_at", now)),
+                )
 
     def delete_session(self, provider: str, session_id: str) -> None:
         self.initialize()
@@ -317,8 +459,238 @@ class Store:
                 (provider, session_id),
             )
             db.execute(
+                "DELETE FROM session_events WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            )
+            db.execute(
+                "DELETE FROM identity_interruptions "
+                "WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            )
+            db.execute(
                 "DELETE FROM sessions WHERE provider=? AND session_id=?",
                 (provider, session_id),
+            )
+
+    @staticmethod
+    def _became_actionable(
+        existing: sqlite3.Row | None,
+        *,
+        status: str,
+        unread: bool,
+        attention_reason: object,
+        error: object,
+    ) -> bool:
+        if not unread or status not in {
+            Status.NEEDS_YOU.value,
+            Status.READY.value,
+            Status.ERROR.value,
+        }:
+            return False
+        if existing is None:
+            return True
+        return not (
+            bool(existing["unread"])
+            and str(existing["status"]) == status
+            and existing["attention_reason"] == attention_reason
+            and existing["error"] == error
+        )
+
+    @staticmethod
+    def _insert_session_event(
+        db: sqlite3.Connection, session: Session, event_at: float
+    ) -> None:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO session_events(
+                provider,session_id,event_at,status,attention_reason,error
+            ) VALUES (?,?,?,?,?,?)
+            """,
+            (
+                session.provider,
+                session.session_id,
+                event_at,
+                session.status,
+                session.attention_reason,
+                session.error,
+            ),
+        )
+
+    def attention_event_counts(
+        self, *, since: float, until: float | None = None
+    ) -> dict[str, int]:
+        self.initialize()
+        end = time.time() if until is None else until
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT status,COUNT(*) AS count
+                FROM session_events
+                WHERE event_at>? AND event_at<=?
+                GROUP BY status
+                """,
+                (since, end),
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def capture_identity_interruption(
+        self, provider: str, session_id: str
+    ) -> None:
+        """Remember the lifecycle state hidden by a temporary identity fault."""
+        self.initialize()
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO identity_interruptions(
+                    provider,session_id,status,unread,attention_reason,error,
+                    last_event_at
+                )
+                SELECT provider,session_id,status,unread,attention_reason,error,
+                       last_event_at
+                FROM sessions
+                WHERE provider=? AND session_id=?
+                """,
+                (provider, session_id),
+            )
+
+    def get_identity_interruption(
+        self, provider: str, session_id: str
+    ) -> dict[str, object] | None:
+        self.initialize()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM identity_interruptions "
+                "WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "status": str(row["status"]),
+            "unread": bool(row["unread"]),
+            "attention_reason": row["attention_reason"],
+            "error": row["error"],
+            "last_event_at": float(row["last_event_at"]),
+        }
+
+    def clear_identity_interruption(
+        self, provider: str, session_id: str
+    ) -> None:
+        self.initialize()
+        with self.connect() as db:
+            db.execute(
+                "DELETE FROM identity_interruptions "
+                "WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            )
+
+    def restore_identity_interruption(
+        self, provider: str, session_id: str, *, live: bool
+    ) -> bool:
+        """Atomically restore the lifecycle hidden by the same identity fault."""
+        self.initialize()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                "SELECT status,attention_reason FROM sessions "
+                "WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            ).fetchone()
+            if not current:
+                return False
+            if not (
+                str(current["status"]) == Status.ERROR.value
+                and current["attention_reason"] == "identity"
+            ):
+                # A provider lifecycle event already replaced the fault. It is
+                # newer truth, so discard the now-redundant saved lifecycle.
+                db.execute(
+                    "DELETE FROM identity_interruptions "
+                    "WHERE provider=? AND session_id=?",
+                    (provider, session_id),
+                )
+                return False
+            interrupted = db.execute(
+                "SELECT * FROM identity_interruptions "
+                "WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            ).fetchone()
+            if interrupted:
+                interrupted_status = str(interrupted["status"])
+                if not live and interrupted_status in {
+                    Status.WORKING.value,
+                    Status.UNBOUND.value,
+                }:
+                    values = (
+                        Status.PARKED.value,
+                        0,
+                        None,
+                        None,
+                        float(interrupted["last_event_at"]),
+                    )
+                else:
+                    values = (
+                        interrupted_status,
+                        int(interrupted["unread"]),
+                        interrupted["attention_reason"],
+                        interrupted["error"],
+                        float(interrupted["last_event_at"]),
+                    )
+            else:
+                values = (
+                    Status.WORKING.value if live else Status.PARKED.value,
+                    0,
+                    None,
+                    None,
+                    time.time(),
+                )
+            db.execute(
+                """
+                UPDATE sessions
+                SET status=?,unread=?,attention_reason=?,error=?,last_event_at=?,
+                    updated_at=?
+                WHERE provider=? AND session_id=?
+                  AND status=? AND attention_reason='identity'
+                """,
+                (
+                    *values,
+                    time.time(),
+                    provider,
+                    session_id,
+                    Status.ERROR.value,
+                ),
+            )
+            db.execute(
+                "DELETE FROM identity_interruptions "
+                "WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            )
+            return True
+
+    def discard_healthy_identity_interruption(
+        self, provider: str, session_id: str
+    ) -> None:
+        """Drop stale saved state only while the current lifecycle is healthy."""
+        self.initialize()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """
+                DELETE FROM identity_interruptions
+                WHERE provider=? AND session_id=?
+                  AND EXISTS (
+                    SELECT 1 FROM sessions
+                    WHERE provider=? AND session_id=?
+                      AND NOT (status=? AND attention_reason='identity')
+                  )
+                """,
+                (
+                    provider,
+                    session_id,
+                    provider,
+                    session_id,
+                    Status.ERROR.value,
+                ),
             )
 
     def add_pending(
@@ -606,6 +978,99 @@ class Store:
         with self.connect() as db:
             row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
+
+    def claim_monitor_visit(self, timestamp: float) -> float | None:
+        """Atomically claim a successful monitor visit and return its predecessor."""
+        previous, _counts = self.claim_monitor_handoff(timestamp)
+        return previous
+
+    def claim_monitor_handoff(
+        self, timestamp: float
+    ) -> tuple[float | None, dict[str, int]]:
+        """Claim one committed ledger watermark and summarize its predecessor."""
+        self.initialize()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            seen_row = db.execute(
+                "SELECT value FROM meta WHERE key=?", ("monitor:last_seen_at",)
+            ).fetchone()
+            cursor_row = db.execute(
+                "SELECT value FROM meta WHERE key=?",
+                ("monitor:last_event_id",),
+            ).fetchone()
+            try:
+                previous_cursor = int(cursor_row["value"]) if cursor_row else 0
+            except (TypeError, ValueError):
+                previous_cursor = 0
+            current_row = db.execute(
+                "SELECT COALESCE(MAX(event_id),0) AS event_id FROM session_events"
+            ).fetchone()
+            current_cursor = int(current_row["event_id"])
+            rows = db.execute(
+                """
+                SELECT status,COUNT(*) AS count
+                FROM session_events
+                WHERE event_id>? AND event_id<=?
+                GROUP BY status
+                """,
+                (previous_cursor, current_cursor),
+            ).fetchall()
+            db.execute(
+                """
+                INSERT INTO meta(key,value) VALUES (?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                ("monitor:last_seen_at", str(timestamp)),
+            )
+            db.execute(
+                """
+                INSERT INTO meta(key,value) VALUES (?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                ("monitor:last_event_id", str(current_cursor)),
+            )
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        if not seen_row:
+            return None, counts
+        try:
+            return float(seen_row["value"]), counts
+        except (TypeError, ValueError):
+            return None, counts
+
+    def collect_result(
+        self,
+        provider: str,
+        session_id: str,
+        *,
+        expected_event_at: float,
+    ) -> int | None:
+        """Collect one exact READY event and count remaining results atomically."""
+        self.initialize()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """
+                UPDATE sessions
+                SET unread=0, updated_at=?
+                WHERE provider=? AND session_id=?
+                  AND status=? AND unread=1 AND last_event_at=?
+                """,
+                (
+                    time.time(),
+                    provider,
+                    session_id,
+                    Status.READY.value,
+                    expected_event_at,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = db.execute(
+                "SELECT COUNT(*) AS count FROM sessions "
+                "WHERE status=? AND unread=1",
+                (Status.READY.value,),
+            ).fetchone()
+            return int(row["count"])
 
     def delete_meta(self, key: str) -> None:
         self.initialize()

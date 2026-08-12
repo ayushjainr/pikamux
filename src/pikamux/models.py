@@ -48,6 +48,7 @@ class Session:
     last_activity_at: float = 0.0
     live: bool = False
     attached: bool = False
+    home_state: str = "unknown"
     cpu_percent: float | None = None
     rss_kb: int | None = None
     input_tokens: int | None = None
@@ -71,8 +72,16 @@ class Session:
             self.unread and self.status in {Status.READY.value, Status.ERROR.value}
         )
 
+    @property
+    def exact_home(self) -> bool:
+        return self.home_state == "exact-live"
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        # Reconciliation-only proof expires as soon as the process topology
+        # changes; keep it out of the stable inventory JSON contract.
+        values.pop("home_state", None)
+        return values
 
 
 @dataclass(slots=True)

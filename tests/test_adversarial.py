@@ -73,7 +73,7 @@ class StaticTmux:
         if self.attach_result == 0 and on_attached:
             on_attached()
         if self.attach_result == 0 and receipt:
-            self.receipts.append(receipt)
+            self.receipts.append(receipt() if callable(receipt) else receipt)
         return self.attach_result
 
     def tag_pane(self, target: str, **values) -> None:
@@ -316,6 +316,149 @@ class AdversarialTests(unittest.TestCase):
         refreshed = self.store.get_session("codex", session_id)
         self.assertEqual(refreshed.status if refreshed else None, Status.ERROR.value)
         self.assertEqual(refreshed.attention_reason if refreshed else None, "identity")
+
+    def test_refresh_exposes_exact_home_only_with_independent_uuid_proof(self) -> None:
+        session_id = "abababab-abab-4bab-8bab-abababababab"
+        tracked = Session(
+            "codex",
+            session_id,
+            cwd="/tmp",
+            tmux_session="manual",
+            tmux_pane="%1",
+        )
+        self.store.upsert_session(tracked)
+        tmux = StaticTmux([pane(provider="codex", session_id=session_id)])
+        pika = Pika(self.store, tmux, {"codex": FakeProvider(active=[999])})
+        with (
+            patch("pikamux.core.provider_process", return_value=999),
+            patch("pikamux.core.process_tree", return_value=[123, 999]),
+        ):
+            exact = pika.refresh()[0]
+        self.assertTrue(exact.exact_home)
+
+        pika.providers["codex"].active = []
+        with (
+            patch("pikamux.core.provider_process", return_value=999),
+            patch("pikamux.core.process_tree", return_value=[123, 999]),
+        ):
+            unverified = pika.refresh()[0]
+        self.assertFalse(unverified.exact_home)
+        self.assertEqual(unverified.status, Status.ERROR.value)
+
+    def test_exact_home_fails_closed_for_uuid_process_outside_pane(self) -> None:
+        session_id = "66666666-6666-4666-8666-666666666666"
+        session = Session(
+            "codex",
+            session_id,
+            name="one-home",
+            cwd="/tmp",
+            unread=True,
+            status=Status.READY.value,
+            last_event_at=10.0,
+        )
+        self.store.upsert_session(session)
+        tmux = StaticTmux([pane(provider="codex", session_id=session_id)])
+        pika = Pika(
+            self.store,
+            tmux,
+            {"codex": FakeProvider(active=[999, 888])},
+        )
+
+        with (
+            patch("pikamux.core.provider_process", return_value=999),
+            patch("pikamux.core.process_tree", return_value=[123, 999]),
+        ):
+            refreshed = pika.refresh()[0]
+            self.assertFalse(refreshed.exact_home)
+            self.assertEqual(refreshed.status, Status.ERROR.value)
+            with self.assertRaisesRegex(PikaError, "cannot be tied to exact UUID"):
+                pika.open(session)
+        self.assertTrue(self.store.get_session("codex", session_id).unread)
+
+        pika.providers["codex"].active = [999]
+        with (
+            patch("pikamux.core.provider_process", return_value=999),
+            patch("pikamux.core.process_tree", return_value=[123, 999]),
+        ):
+            healed = pika.refresh()[0]
+        self.assertTrue(healed.exact_home)
+        self.assertEqual(healed.status, Status.READY.value)
+        self.assertTrue(healed.unread)
+        self.assertIsNone(healed.error)
+
+    def test_duplicate_home_repair_cannot_manufacture_a_result(self) -> None:
+        session_id = "77777777-7777-4777-8777-777777777777"
+        self.store.upsert_session(
+            Session(
+                "codex",
+                session_id,
+                name="duplicate",
+                cwd="/tmp",
+                status=Status.WORKING.value,
+            )
+        )
+        first = pane(pane_id="%1", provider="codex", session_id=session_id)
+        second = pane(pane_id="%2", provider="codex", session_id=session_id)
+        tmux = StaticTmux([first, second])
+        pika = Pika(self.store, tmux, {"codex": FakeProvider(active=[999])})
+        with (
+            patch("pikamux.core.provider_process", return_value=999),
+            patch("pikamux.core.process_tree", return_value=[123, 999]),
+        ):
+            broken = pika.refresh()[0]
+            self.assertEqual(broken.status, Status.ERROR.value)
+            tmux.panes = [first]
+            healed = pika.refresh()[0]
+        self.assertEqual(healed.status, Status.WORKING.value)
+        self.assertFalse(healed.unread)
+        counts = self.store.attention_event_counts(since=0.0)
+        self.assertEqual(counts.get(Status.ERROR.value), 1)
+        self.assertNotIn(Status.READY.value, counts)
+
+    def test_provider_error_does_not_erase_exact_home_proof(self) -> None:
+        session_id = "12121212-1212-4212-8212-121212121212"
+        self.store.upsert_session(
+            Session(
+                "codex",
+                session_id,
+                status=Status.ERROR.value,
+                unread=True,
+                error="provider failed",
+                attention_reason="failed",
+            )
+        )
+        pika = Pika(
+            self.store,
+            StaticTmux([pane(provider="codex", session_id=session_id)]),
+            {"codex": FakeProvider(active=[999])},
+        )
+        with (
+            patch("pikamux.core.provider_process", return_value=999),
+            patch("pikamux.core.process_tree", return_value=[123, 999]),
+        ):
+            failed = pika.refresh()[0]
+        self.assertEqual(failed.status, Status.ERROR.value)
+        self.assertTrue(failed.exact_home)
+
+    def test_dead_unbound_placeholder_no_longer_demands_adoption(self) -> None:
+        placeholder = Session(
+            "codex",
+            "unbound:%1",
+            name="orphan-shell",
+            cwd="/tmp",
+            tmux_session="manual",
+            tmux_pane="%1",
+            status=Status.UNBOUND.value,
+            unread=True,
+            attention_reason="adopt",
+        )
+        self.store.upsert_session(placeholder)
+        pika = Pika(self.store, StaticTmux([pane()]), {"codex": FakeProvider()})
+        with patch("pikamux.core.provider_process", return_value=None):
+            healed = pika.refresh()[0]
+        self.assertEqual(healed.status, Status.PARKED.value)
+        self.assertFalse(healed.unread)
+        self.assertFalse(healed.live)
 
     def test_busy_pane_receipt_makes_preserved_work_and_new_home_visible(self) -> None:
         session_id = "55555555-5555-4555-8555-555555555555"
@@ -680,8 +823,140 @@ class AdversarialTests(unittest.TestCase):
             '["codex", "11111111-1111-4111-8111-111111111111"]',
         )
         self.assertEqual(len(tmux.receipts), 1)
-        self.assertIn("ATTACHED LIVE", tmux.receipts[0])
-        self.assertIn("id 11111111", tmux.receipts[0])
+        self.assertIn("RESULT COLLECTED", tmux.receipts[0])
+        self.assertIn("EXACT 11111111", tmux.receipts[0])
+        self.assertIn("INBOX CLEAR", tmux.receipts[0])
+        receipt_core = tmux.receipts[0].rsplit(" · ready", 1)[0]
+        self.assertLessEqual(len(receipt_core), 58)
+        tmux.receipts.clear()
+        with patch("pikamux.core.provider_process", return_value=999):
+            self.assertEqual(pika.open(self.store.get_session(*session.key)), 0)
+        self.assertNotIn("RESULT COLLECTED", tmux.receipts[0])
+        self.assertIn("ATTACHED EXACT", tmux.receipts[0])
+
+    def test_result_receipt_counts_remaining_unread_results(self) -> None:
+        session_id = "11111111-1111-4111-8111-111111111111"
+        session = Session(
+            "codex",
+            session_id,
+            name="first-result",
+            cwd="/tmp",
+            status=Status.READY.value,
+            unread=True,
+            last_event_at=100.0,
+        )
+        self.store.upsert_session(session)
+        self.store.upsert_session(
+            Session(
+                "claude",
+                "22222222-2222-4222-8222-222222222222",
+                name="second-result",
+                cwd="/tmp",
+                status=Status.READY.value,
+                unread=True,
+                last_event_at=101.0,
+            )
+        )
+        current = self.store.get_session(*session.key)
+        assert current is not None
+        tmux = StaticTmux([pane(provider="codex", session_id=session_id)])
+        pika = Pika(self.store, tmux, {"codex": FakeProvider(active=[999])})
+        with patch("pikamux.core.provider_process", return_value=999):
+            self.assertEqual(pika.open(current), 0)
+        self.assertIn("1 unread remains", tmux.receipts[0])
+
+    def test_result_receipt_fails_closed_when_a_new_event_wins_the_race(self) -> None:
+        session_id = "77777777-7777-4777-8777-777777777777"
+        session = Session(
+            "codex",
+            session_id,
+            name="racing-result",
+            cwd="/tmp",
+            status=Status.READY.value,
+            unread=True,
+            last_event_at=100.0,
+        )
+        self.store.upsert_session(session)
+        current = self.store.get_session(*session.key)
+        assert current is not None
+
+        class RacingTmux(StaticTmux):
+            def attach(inner_self, *args, on_attached=None, receipt=None, **kwargs):
+                self.store.update_session(
+                    *session.key,
+                    status=Status.NEEDS_YOU.value,
+                    unread=True,
+                    attention_reason="question",
+                    last_event_at=current.last_event_at + 1,
+                )
+                return super().attach(
+                    *args, on_attached=on_attached, receipt=receipt, **kwargs
+                )
+
+        tmux = RacingTmux([pane(provider="codex", session_id=session_id)])
+        pika = Pika(self.store, tmux, {"codex": FakeProvider(active=[999])})
+        with patch("pikamux.core.provider_process", return_value=999):
+            self.assertEqual(pika.open(current), 0)
+        self.assertNotIn("RESULT COLLECTED", tmux.receipts[0])
+        self.assertTrue(self.store.get_session(*session.key).unread)
+
+    def test_result_stays_unread_while_resumed_identity_is_pending(self) -> None:
+        session_id = "88888888-8888-4888-8888-888888888888"
+        session = Session(
+            "codex",
+            session_id,
+            name="pending-proof",
+            cwd="/tmp",
+            status=Status.READY.value,
+            unread=True,
+            last_event_at=100.0,
+        )
+        self.store.upsert_session(session)
+        current = self.store.get_session(*session.key)
+        assert current is not None
+        tmux = StaticTmux()
+        pika = Pika(self.store, tmux, {"codex": FakeProvider(active=[])})
+
+        def provider_in_new_home(pid, provider=None):
+            return 888 if pid == 456 and provider == "codex" else None
+
+        with patch(
+            "pikamux.core.provider_process", side_effect=provider_in_new_home
+        ):
+            self.assertEqual(pika.open(current), 0)
+        self.assertIn("IDENTITY PENDING", tmux.receipts[0])
+        self.assertNotIn("RESULT COLLECTED", tmux.receipts[0])
+        self.assertTrue(self.store.get_session(*session.key).unread)
+
+    def test_resume_does_not_manufacture_a_ready_result(self) -> None:
+        session_id = "99999999-9999-4999-8999-999999999999"
+        session = Session(
+            "codex",
+            session_id,
+            name="failed-before-resume",
+            cwd="/tmp",
+            status=Status.ERROR.value,
+            unread=True,
+            error="boom",
+            attention_reason="failed",
+            last_event_at=100.0,
+        )
+        self.store.upsert_session(session)
+        pika = Pika(self.store, StaticTmux(), {"codex": FakeProvider()})
+
+        def provider_in_new_home(pid, provider=None):
+            return 888 if pid == 456 and provider == "codex" else None
+
+        with patch(
+            "pikamux.core.provider_process", side_effect=provider_in_new_home
+        ):
+            self.assertEqual(pika.open(session, attach=False), 0)
+        current = self.store.get_session(*session.key)
+        self.assertEqual(current.status if current else None, Status.WORKING.value)
+        self.assertFalse(current.unread if current else True)
+        counts = self.store.attention_event_counts(since=0.0, until=time.time())
+        self.assertEqual(counts.get(Status.ERROR.value), 1)
+        self.assertNotIn(Status.READY.value, counts)
 
     def test_stale_ready_ack_cannot_hide_new_permission(self) -> None:
         session_id = "66666666-6666-4666-8666-666666666666"

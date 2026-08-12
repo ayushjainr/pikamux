@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -43,6 +45,71 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.db_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.db_path.parent.stat().st_mode & 0o777, 0o700)
 
+    def test_concurrent_fresh_store_initialization_is_serialized(self) -> None:
+        barrier = threading.Barrier(8)
+        errors: list[BaseException] = []
+
+        def initialize() -> None:
+            try:
+                barrier.wait()
+                Store(self.db_path).initialize()
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=initialize) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            Store(self.db_path).claim_monitor_handoff(100.0),
+            (None, {}),
+        )
+
+    def test_concurrent_legacy_schema_migration_is_serialized(self) -> None:
+        self.db_path.parent.mkdir(parents=True)
+        with sqlite3.connect(self.db_path) as db:
+            db.executescript(
+                """
+                CREATE TABLE session_events (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    event_at REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    attention_reason TEXT,
+                    error TEXT,
+                    PRIMARY KEY (provider, session_id, event_at, status)
+                );
+                INSERT INTO session_events VALUES (
+                    'codex','legacy',10.0,'READY','completed',NULL
+                );
+                """
+            )
+        barrier = threading.Barrier(8)
+        errors: list[BaseException] = []
+
+        def initialize() -> None:
+            try:
+                barrier.wait()
+                Store(self.db_path).initialize()
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=initialize) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        with Store(self.db_path).connect() as db:
+            row = db.execute(
+                "SELECT event_id,status FROM session_events"
+            ).fetchone()
+        self.assertEqual((row["event_id"], row["status"]), (1, "READY"))
+
     def test_attach_history_and_pending_launches(self) -> None:
         self.store.initialize()
         self.store.record_attach("codex", "one")
@@ -52,6 +119,188 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.find_pending_for_pane("%1")["name"], "named")
         self.store.delete_pending("token")
         self.assertIsNone(self.store.get_pending("token"))
+
+    def test_monitor_visit_claim_is_atomic_and_returns_previous_success(self) -> None:
+        self.assertIsNone(self.store.claim_monitor_visit(100.0))
+        self.assertEqual(self.store.claim_monitor_visit(200.0), 100.0)
+        self.assertEqual(self.store.get_meta("monitor:last_seen_at"), "200.0")
+
+    def test_monitor_handoff_uses_committed_event_watermarks(self) -> None:
+        previous, counts = self.store.claim_monitor_handoff(100.0)
+        self.assertIsNone(previous)
+        self.assertEqual(counts, {})
+
+        # An event whose timestamp predates the visit but commits afterward is
+        # still after the claimed database watermark and cannot fall through.
+        self.store.upsert_session(
+            Session(
+                "codex",
+                "late-commit",
+                status=Status.READY.value,
+                unread=True,
+                last_event_at=50.0,
+            )
+        )
+        previous, counts = self.store.claim_monitor_handoff(200.0)
+        self.assertEqual(previous, 100.0)
+        self.assertEqual(counts, {Status.READY.value: 1})
+
+        previous, counts = self.store.claim_monitor_handoff(300.0)
+        self.assertEqual(previous, 200.0)
+        self.assertEqual(counts, {})
+
+    def test_action_event_ledger_survives_later_status_changes(self) -> None:
+        self.store.upsert_session(
+            Session(
+                "codex",
+                "ledger",
+                status=Status.READY.value,
+                unread=True,
+                attention_reason="completed",
+                last_event_at=100.0,
+            )
+        )
+        self.store.update_session(
+            "codex", "ledger", status=Status.WORKING.value, unread=False
+        )
+        self.store.update_session(
+            "codex",
+            "ledger",
+            status=Status.READY.value,
+            unread=True,
+            attention_reason="completed",
+            last_event_at=200.0,
+        )
+        counts = self.store.attention_event_counts(since=50.0, until=250.0)
+        self.assertEqual(counts[Status.READY.value], 2)
+
+    def test_identity_interruption_tracks_new_provider_lifecycle(self) -> None:
+        self.store.upsert_session(
+            Session("codex", "interrupted", status=Status.WORKING.value)
+        )
+        self.store.capture_identity_interruption("codex", "interrupted")
+        self.store.update_session(
+            "codex",
+            "interrupted",
+            status=Status.ERROR.value,
+            unread=True,
+            attention_reason="identity",
+            error="duplicate Pika tmux homes",
+        )
+        self.store.upsert_session(
+            Session(
+                "codex",
+                "interrupted",
+                status=Status.READY.value,
+                unread=True,
+                attention_reason="completed",
+                last_event_at=200.0,
+            )
+        )
+        interrupted = self.store.get_identity_interruption(
+            "codex", "interrupted"
+        )
+        self.assertEqual(interrupted["status"], Status.READY.value)
+        self.assertTrue(interrupted["unread"])
+        self.assertEqual(interrupted["last_event_at"], 200.0)
+
+        # Reassert the identity fault, then repair from the latest saved state.
+        self.store.update_session(
+            "codex",
+            "interrupted",
+            status=Status.ERROR.value,
+            unread=True,
+            attention_reason="identity",
+            error="duplicate Pika tmux homes",
+        )
+        self.assertTrue(
+            self.store.restore_identity_interruption(
+                "codex", "interrupted", live=True
+            )
+        )
+        restored = self.store.get_session("codex", "interrupted")
+        self.assertEqual(restored.status if restored else None, Status.READY.value)
+        self.assertTrue(restored.unread if restored else False)
+        self.assertIsNone(
+            self.store.get_identity_interruption("codex", "interrupted")
+        )
+
+    def test_identity_restore_cannot_overwrite_a_concurrent_lifecycle_winner(
+        self,
+    ) -> None:
+        self.store.upsert_session(
+            Session("codex", "winner", status=Status.WORKING.value)
+        )
+        self.store.capture_identity_interruption("codex", "winner")
+        self.store.update_session(
+            "codex",
+            "winner",
+            status=Status.READY.value,
+            unread=True,
+            attention_reason="completed",
+            last_event_at=300.0,
+        )
+        self.assertFalse(
+            self.store.restore_identity_interruption(
+                "codex", "winner", live=True
+            )
+        )
+        winner = self.store.get_session("codex", "winner")
+        self.assertEqual(winner.status if winner else None, Status.READY.value)
+        self.assertTrue(winner.unread if winner else False)
+
+    def test_identity_restore_downgrades_dead_work_to_parked(self) -> None:
+        self.store.upsert_session(
+            Session("codex", "dead-work", status=Status.WORKING.value)
+        )
+        self.store.capture_identity_interruption("codex", "dead-work")
+        self.store.update_session(
+            "codex",
+            "dead-work",
+            status=Status.ERROR.value,
+            unread=True,
+            attention_reason="identity",
+            error="identity fault",
+        )
+        self.assertTrue(
+            self.store.restore_identity_interruption(
+                "codex", "dead-work", live=False
+            )
+        )
+        restored = self.store.get_session("codex", "dead-work")
+        self.assertEqual(restored.status if restored else None, Status.PARKED.value)
+        self.assertFalse(restored.unread if restored else True)
+
+    def test_result_collection_is_one_shot_and_counts_remaining_atomically(
+        self,
+    ) -> None:
+        for index in range(2):
+            self.store.upsert_session(
+                Session(
+                    "codex",
+                    f"result-{index}",
+                    status=Status.READY.value,
+                    unread=True,
+                    last_event_at=100.0 + index,
+                )
+            )
+        self.assertEqual(
+            self.store.collect_result(
+                "codex", "result-0", expected_event_at=100.0
+            ),
+            1,
+        )
+        self.assertIsNone(
+            self.store.collect_result(
+                "codex", "result-0", expected_event_at=100.0
+            )
+        )
+        self.assertIsNone(
+            self.store.collect_result(
+                "codex", "result-1", expected_event_at=999.0
+            )
+        )
+        self.assertTrue(self.store.get_session("codex", "result-1").unread)
 
     def test_usage_cache_is_invalidated_by_source_change(self) -> None:
         source = Path(self.temp.name) / "rollout.jsonl"

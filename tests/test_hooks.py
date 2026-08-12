@@ -153,6 +153,26 @@ class HookTests(unittest.TestCase):
         self.assertIn("completed", FakeTmux.alerts[1])
 
     @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_session_end_preserves_unread_result_event_time(self) -> None:
+        base = {"session_id": "uuid-result-age", "cwd": "/tmp"}
+        handle_hook("codex", {**base, "hook_event_name": "Stop"}, self.store)
+        before = self.store.get_session("codex", "uuid-result-age")
+        assert before is not None
+        handle_hook(
+            "codex", {**base, "hook_event_name": "SessionEnd"}, self.store
+        )
+        after = self.store.get_session("codex", "uuid-result-age")
+        assert after is not None
+        self.assertEqual(after.status, Status.READY.value)
+        self.assertTrue(after.unread)
+        self.assertEqual(after.last_event_at, before.last_event_at)
+        counts = self.store.attention_event_counts(
+            since=before.last_event_at - 1,
+            until=after.updated_at + 1,
+        )
+        self.assertEqual(counts[Status.READY.value], 1)
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_claude_session_start_sets_native_title(self) -> None:
         with patch.dict(os.environ, {"PIKA_NAME": "native-title"}, clear=False):
             result = handle_hook(

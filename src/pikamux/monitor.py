@@ -7,19 +7,20 @@ import re
 import select
 import sys
 import termios
+import threading
 import time
 import tty
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Protocol
 
 from .models import Session, Status
+from .pricing import PRICING_AS_OF
 from .ui import (
     PROVIDER_MARK,
     format_bytes,
     format_cost,
     format_tokens,
-    human_age,
     short_path,
     sorted_attention_sessions,
     sorted_sessions,
@@ -30,18 +31,75 @@ from .ui import (
 REFRESH_SECONDS = 2.0
 USAGE_REFRESH_SECONDS = 30.0
 PLAYBOOK_ROTATION_SECONDS = 300
+MORNING_GAP_SECONDS = 6 * 60 * 60
+HANDOFF_DISPLAY_SECONDS = 15.0
+SLOW_REFRESH_SECONDS = 1.0
 MIN_WIDTH = 58
 MIN_HEIGHT = 15
 SPINNER = ("◐", "◓", "◑", "◒")
 PLAYBOOK_TIPS = (
-    "Delegate, then Ctrl-b d. The agent keeps working; /exit stops it.",
-    "pika . opens this repository's conversation; pika - returns to the previous one.",
-    "pika next opens the oldest workstream needing you — no inventory triage required.",
-    "pika peek NAME inspects without switching; redirected peeks keep unread state.",
-    "pika wait NAME --for ready --timeout 600 turns delegation into a shell primitive.",
-    "Use task-specific names: the briefing should read like a delegation ledger.",
-    "Codex and Claude may share a name; Pika asks for provider + UUID.",
-    "Run pika doctor before relying on disconnects; safe means every check passed.",
+    (
+        "detach",
+        "Delegate, then Ctrl-b d. The agent keeps working; /exit stops it.",
+        "Ctrl-b d keeps work alive; /exit stops it.",
+    ),
+    (
+        "switch",
+        "pika . opens this repository's conversation; "
+        "pika - returns to the previous one.",
+        "pika . opens here; pika - goes back.",
+    ),
+    (
+        "next",
+        "pika next opens the oldest workstream needing you — "
+        "no inventory triage required.",
+        "pika next opens the oldest needed work.",
+    ),
+    (
+        "peek",
+        "pika peek NAME inspects without switching; "
+        "redirected peeks keep unread state.",
+        "pika peek NAME inspects without switching.",
+    ),
+    (
+        "wait",
+        "pika wait NAME --for ready --timeout 600 turns delegation "
+        "into a shell primitive.",
+        "pika wait NAME --for ready is scriptable.",
+    ),
+    (
+        "name",
+        "Use task-specific names: the briefing should read like a delegation ledger.",
+        "Use task names; make Pika read as a ledger.",
+    ),
+    (
+        "collision",
+        "Codex and Claude may share a name; Pika asks for provider + UUID.",
+        "Same name? Pika asks provider + UUID.",
+    ),
+    (
+        "doctor",
+        "Run pika doctor before relying on disconnects; safe means every check passed.",
+        "Run pika doctor before disconnecting.",
+    ),
+    (
+        "refresh",
+        "Press r to run a deliberate reconciliation; "
+        "stale state remains visibly marked.",
+        "Press r to reconcile stale state now.",
+    ),
+    (
+        "adopt",
+        "A live process outside an exact home stays unbound; "
+        "use pika adopt to protect it.",
+        "UNBOUND? Run pika adopt for an exact home.",
+    ),
+    (
+        "resume",
+        "For a parked workstream, pika NAME checks its saved history "
+        "and resumes only if exact.",
+        "PARKED? pika NAME checks its recovery path.",
+    ),
 )
 
 RESET = "\x1b[0m"
@@ -68,9 +126,11 @@ _MOUSE = re.compile(rb"^\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 class MonitorPika(Protocol):
     def refresh(self, *, usage: bool = False) -> list[Session]: ...
 
+    def hydrate_usage(self, sessions: list[Session]) -> list[Session]: ...
+
     def open(self, session: Session, *, attach: bool = True) -> int: ...
 
-    def acknowledge(self, session: Session, *, attaching: bool = False) -> None: ...
+    def acknowledge(self, session: Session, *, attaching: bool = False) -> bool: ...
 
     def next_attention(
         self, sessions: list[Session] | None = None
@@ -78,6 +138,9 @@ class MonitorPika(Protocol):
 
     @property
     def tmux(self): ...
+
+    @property
+    def store(self): ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,17 +150,37 @@ class MonitorFrame:
     selected_key: tuple[str, str] | None
 
 
+@dataclass(frozen=True, slots=True)
+class HandoffSummary:
+    since: float
+    finished: int
+    decisions: int
+    errors: int
+    first: bool = False
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.finished or self.decisions or self.errors)
+
+
 @dataclass(slots=True)
 class MonitorState:
     sessions: list[Session] = field(default_factory=list)
     selected_key: tuple[str, str] | None = None
     last_update: float = 0.0
     refresh_error: str | None = None
+    refresh_warning: str | None = None
+    usage_warning: str | None = None
     toast: str | None = None
     toast_until: float = 0.0
     mode: str = "sessions"
     peek_lines: list[str] = field(default_factory=list)
     peek_offset: int = 0
+    show_usage: bool = False
+    refresh_started_at: float = 0.0
+    emphasize_refresh: bool = False
+    handoff: HandoffSummary | None = None
+    handoff_until: float = 0.0
 
     def ordered(self) -> list[Session]:
         return sorted_sessions(self.sessions)
@@ -171,52 +254,132 @@ def _line(left: str, right: str, width: int) -> str:
     return _fit(left, room) + "  " + right
 
 
-def _counts(sessions: list[Session]) -> list[tuple[str, int, str]]:
-    return [
-        (
-            "NEEDS YOU",
-            sum(item.status == Status.NEEDS_YOU.value for item in sessions),
-            FG_YELLOW,
+def _session_counts(sessions: list[Session]) -> dict[str, int]:
+    return {
+        "decisions": sum(
+            item.status == Status.NEEDS_YOU.value for item in sessions
         ),
-        (
-            "UNREAD",
-            sum(item.needs_attention and item.unread for item in sessions),
-            FG_GREEN,
+        "results": sum(
+            item.status == Status.READY.value and item.unread for item in sessions
         ),
-        (
-            "WORKING",
-            sum(item.status == Status.WORKING.value for item in sessions),
-            FG_CYAN,
+        "working": sum(item.status == Status.WORKING.value for item in sessions),
+        "parked": sum(item.status == Status.PARKED.value for item in sessions),
+        "errors": sum(
+            item.status == Status.ERROR.value and item.unread for item in sessions
         ),
-        (
-            "PARKED",
-            sum(item.status == Status.PARKED.value for item in sessions),
-            FG_BRIGHT_BLACK,
-        ),
-        (
-            "ERROR",
-            sum(item.status == Status.ERROR.value for item in sessions),
-            FG_RED,
-        ),
-        (
-            "UNBOUND",
-            sum(item.status == Status.UNBOUND.value for item in sessions),
-            FG_MAGENTA,
-        ),
-    ]
+        "unbound": sum(item.status == Status.UNBOUND.value for item in sessions),
+        "protected": sum(item.exact_home for item in sessions),
+    }
 
 
-def _metric_labels(width: int) -> list[tuple[str, str]]:
-    if width < 80:
-        return [
-            ("NEEDS YOU", "NEED"),
-            ("UNREAD", "NEW"),
-            ("WORKING", "RUN"),
-            ("PARKED", "PARK"),
-            ("ERROR", "ERR"),
-            ("UNBOUND", "UNBOUND"),
-        ]
-    return [(label, label) for label, _value, _code in _counts([])]
+def _noun(value: int, singular: str, plural: str | None = None) -> str:
+    return singular if value == 1 else (plural or singular + "s")
+
+
+def build_handoff(
+    sessions: list[Session], *, since: float, now: float
+) -> HandoffSummary | None:
+    if not since or now - since < MORNING_GAP_SECONDS:
+        return None
+    recent = [item for item in sessions if item.last_event_at > since]
+    return HandoffSummary(
+        since=since,
+        finished=sum(
+            item.status == Status.READY.value and item.unread for item in recent
+        ),
+        decisions=sum(
+            item.status == Status.NEEDS_YOU.value for item in recent
+        ),
+        errors=sum(item.status == Status.ERROR.value for item in recent),
+    )
+
+
+def _handoff_text(handoff: HandoffSummary) -> str:
+    if handoff.first:
+        return (
+            f"FIRST HANDOFF // CURRENT STATE · {handoff.finished} results · "
+            f"{handoff.decisions} decisions · {handoff.errors} errors"
+        )
+    if not handoff.changed:
+        return "SINCE YOUR LAST VISIT · no new handoffs"
+    return (
+        f"SINCE YOUR LAST VISIT · {handoff.finished} finished · "
+        f"{handoff.decisions} {_noun(handoff.decisions, 'decision')} · "
+        f"{handoff.errors} {_noun(handoff.errors, 'error')}"
+    )
+
+
+def _briefing_lines(
+    sessions: list[Session],
+    *,
+    width: int,
+    handoff: HandoffSummary | None,
+    initialized: bool,
+    refresh_error: str | None,
+) -> tuple[str, str]:
+    if not initialized:
+        return (
+            _fit("INITIAL HANDOFF · scanning current workstreams", width),
+            _fit("No state is shown until the first reconciliation completes", width),
+        )
+    counts = _session_counts(sessions)
+    interventions = counts["decisions"] + counts["errors"] + counts["unbound"]
+    if not interventions and not counts["results"]:
+        prefix = "LAST KNOWN" if refresh_error else "NO ATTENTION PENDING"
+        headline = (
+            f"{prefix} · {counts['working']} working · "
+            f"{counts['parked']} parked · {counts['protected']} exact live"
+        )
+    elif not interventions:
+        headline = (
+            f"{counts['results']} {_noun(counts['results'], 'RESULT')} "
+            "READY TO COLLECT · "
+            f"{counts['working']} STILL WORKING"
+        )
+    elif width < 80:
+        headline = (
+            f"NEED {counts['decisions']} · RESULTS {counts['results']} · "
+            f"FAILED {counts['errors']} · UNBOUND {counts['unbound']}"
+        )
+    else:
+        headline = (
+            f"YOU'RE NEEDED IN {interventions} "
+            f"{_noun(interventions, 'PLACE')} · "
+            f"{counts['results']} "
+            f"{_noun(counts['results'], 'RESULT', 'RESULTS')} WAITING · "
+            f"{counts['working']} STILL WORKING"
+        )
+        if counts["errors"]:
+            headline += f" · {counts['errors']} FAILED"
+        if counts["unbound"]:
+            headline += f" · {counts['unbound']} UNBOUND"
+
+    if handoff is not None:
+        context = _handoff_text(handoff)
+    else:
+        attention = sorted_attention_sessions(
+            item for item in sessions if item.needs_attention
+        )
+        if attention:
+            next_item = attention[0]
+            reason = next_item.error or next_item.attention_reason or next_item.status
+            context = (
+                f"NEXT → {next_item.display_name} · {reason} · n to open"
+            )
+        else:
+            unbound = next(
+                (item for item in sessions if item.status == Status.UNBOUND.value),
+                None,
+            )
+            context = (
+                f"NEXT → {unbound.display_name} · run pika adopt"
+                if unbound
+                else (
+                    f"WORKING {counts['working']} · PARKED {counts['parked']} · "
+                    f"UNBOUND {counts['unbound']}"
+                )
+            )
+    return _fit(headline, width), _fit(context, width)
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,25 +389,33 @@ class _Column:
     field: str
 
 
-def _columns(width: int) -> list[_Column]:
+def _columns(width: int, *, show_usage: bool) -> list[_Column]:
     columns = [
         _Column("AG", 2, "provider"),
         _Column("NAME", 20, "name"),
         _Column("STATE", 10, "status"),
-        _Column("AGE", 6, "age"),
+        _Column("SINCE", 9, "age"),
     ]
-    if width >= 74:
-        columns.insert(3, _Column("WHY", 10, "why"))
-        columns.insert(4, _Column("VIEW", 4, "view"))
-    if width >= 104:
-        columns.insert(-1, _Column("REPO", 22, "repo"))
-        columns.extend([_Column("CPU", 6, "cpu"), _Column("RAM", 6, "ram")])
-    if width >= 132:
-        repo_index = next(i for i, item in enumerate(columns) if item.field == "repo")
-        columns.insert(repo_index + 1, _Column("BRANCH", 12, "branch"))
-        columns.extend(
-            [_Column("TOKENS", 8, "tokens"), _Column("~API$", 8, "cost")]
-        )
+    if show_usage:
+        if width >= 74:
+            columns.extend([_Column("CPU", 6, "cpu"), _Column("RAM", 6, "ram")])
+        if width >= 94:
+            columns.append(_Column("TOKENS", 8, "tokens"))
+        if width >= 112:
+            columns.append(_Column("MODEL", 14, "model"))
+        if width >= 128:
+            columns.append(_Column("API-EQUIV", 10, "cost"))
+    else:
+        if width >= 74:
+            columns.insert(3, _Column("WHY", 10, "why"))
+            columns.insert(4, _Column("VIEW", 4, "view"))
+        if width >= 104:
+            columns.insert(-1, _Column("REPO", 18, "repo"))
+        if width >= 122:
+            repo_index = next(
+                i for i, item in enumerate(columns) if item.field == "repo"
+            )
+            columns.insert(repo_index + 1, _Column("BRANCH", 12, "branch"))
     used = 3 + sum(item.width for item in columns) + 2 * (len(columns) - 1)
     extra = max(0, width - used)
     mutable = list(columns)
@@ -253,16 +424,53 @@ def _columns(width: int) -> list[_Column]:
     item = mutable[name_index]
     mutable[name_index] = _Column(item.label, item.width + name_extra, item.field)
     extra -= name_extra
-    repo_index = next(
-        (i for i, item in enumerate(mutable) if item.field == "repo"), None
+    flexible_index = next(
+        (i for i, item in enumerate(mutable) if item.field == "repo"),
+        name_index,
     )
-    if repo_index is not None and extra:
-        item = mutable[repo_index]
-        mutable[repo_index] = _Column(item.label, item.width + extra, item.field)
+    if extra:
+        item = mutable[flexible_index]
+        mutable[flexible_index] = _Column(
+            item.label, item.width + extra, item.field
+        )
     return mutable
 
 
-def _field(session: Session, field: str, width: int) -> str:
+def _human_age_at(timestamp: float, now: float) -> str:
+    if not timestamp:
+        return "—"
+    seconds = max(0, int(now - timestamp))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h"
+    days = hours // 24
+    return f"{days}d" if days < 60 else f"{days // 30}mo"
+
+
+def semantic_age(session: Session, now: float) -> str:
+    prefix = {
+        Status.NEEDS_YOU.value: "WAIT",
+        Status.READY.value: "RESULT",
+        Status.WORKING.value: "ACTIVE",
+        Status.PARKED.value: "IDLE",
+        Status.ERROR.value: "FAILED",
+        Status.UNBOUND.value: "UNBOUND",
+    }.get(session.status, "AGE")
+    timestamp = (
+        session.last_event_at
+        if session.status
+        in {Status.NEEDS_YOU.value, Status.READY.value, Status.ERROR.value}
+        else session.last_activity_at
+    )
+    return f"{prefix} {_human_age_at(timestamp, now)}"
+
+
+def _field(session: Session, field: str, width: int, now: float) -> str:
     values = {
         "provider": PROVIDER_MARK.get(session.provider, "?"),
         "name": session.display_name,
@@ -271,7 +479,7 @@ def _field(session: Session, field: str, width: int) -> str:
         "view": "yes" if session.attached else ("no" if session.tmux_session else "—"),
         "repo": short_path(session.cwd, width),
         "branch": session.branch or "—",
-        "age": human_age(session.last_activity_at),
+        "age": semantic_age(session, now),
         "cpu": (
             f"{session.cpu_percent:.1f}%"
             if session.cpu_percent is not None
@@ -280,6 +488,7 @@ def _field(session: Session, field: str, width: int) -> str:
         "ram": format_bytes(session.rss_kb),
         "tokens": format_tokens(session.total_tokens),
         "cost": format_cost(session.estimated_cost_usd),
+        "model": session.model or "—",
     }
     return values[field]
 
@@ -290,10 +499,11 @@ def _table_row(
     *,
     selected: bool,
     color: bool,
+    now: float,
 ) -> tuple[str, str]:
     marker = ("›" if selected else " ") + ("◆" if session.unread else " ")
     plain_cells = [
-        _fit(_field(session, item.field, item.width), item.width)
+        _fit(_field(session, item.field, item.width, now), item.width)
         for item in columns
     ]
     row_width = (
@@ -326,23 +536,91 @@ def _visible_rows(
     return ordered[start : start + slots], start
 
 
-def _help_lines(width: int, slots: int) -> list[str]:
-    items = [
-        "↑/k  previous workstream        ↓/j  next workstream",
-        "Enter open or exact-resume      n    open oldest attention",
-        "p     peek recent pane output   r    reconcile now",
-        "g/G   first / last              ?    close this help",
-        "q/Esc close overlay or quit",
-        "",
-        "Pika never guesses identity. Enter acts on the selected provider + UUID.",
-        "The monitor refreshes operational state every 2s and usage every 30s.",
-    ]
+def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
+    counts = _session_counts(state.sessions)
+    if width < 80:
+        items = [
+            "↑↓/jk move · Enter open · n next",
+            "p peek · u usage · r refresh",
+            "g/G ends · ? close · q/Esc close",
+            (
+                f"Need {counts['decisions']} · results {counts['results']} · "
+                f"failed {counts['errors']} · unbound {counts['unbound']}"
+            ),
+        ]
+    else:
+        items = [
+            "↑/k  previous workstream        ↓/j  next workstream",
+            "Enter open selected             n    open oldest attention",
+            "p     peek recent pane output   u    operations / usage view",
+            "r     reconcile now             g/G  first / last",
+            "?     close this help           q/Esc close this help",
+            "",
+            (
+                f"Inventory: {counts['decisions']} decisions · "
+                f"{counts['results']} results · "
+                f"{counts['working']} working · {counts['parked']} parked · "
+                f"{counts['errors']} errors · {counts['unbound']} unbound"
+            ),
+            "Pika never guesses identity. Enter acts on the selected provider + UUID.",
+            "Operations update every 2s; visible usage updates every 30s.",
+        ]
     return [_fit(value, width) for value in items[:slots]]
 
 
-def playbook_tip(now: float) -> tuple[int, str]:
-    index = int(now // PLAYBOOK_ROTATION_SECONDS) % len(PLAYBOOK_TIPS)
-    return index, PLAYBOOK_TIPS[index]
+def _playbook_options(
+    sessions: list[Session],
+    *,
+    selected: Session | None,
+    refresh_error: str | None,
+) -> list[tuple[str, str, str]]:
+    if refresh_error:
+        categories = ["refresh", "doctor"]
+    elif selected and selected.status == Status.ERROR.value:
+        categories = ["doctor", "peek"]
+    elif selected and selected.status == Status.UNBOUND.value:
+        categories = ["adopt", "doctor"]
+    elif any(item.status == Status.ERROR.value for item in sessions):
+        categories = ["doctor", "next"]
+    elif any(item.status == Status.UNBOUND.value for item in sessions):
+        categories = ["adopt", "doctor"]
+    elif any(item.status == Status.NEEDS_YOU.value for item in sessions):
+        categories = ["next", "peek"]
+    elif any(
+        item.status == Status.READY.value and item.unread for item in sessions
+    ):
+        categories = ["peek", "next"]
+    elif any(item.status == Status.WORKING.value for item in sessions):
+        categories = ["detach", "wait"]
+    elif any(item.status == Status.PARKED.value for item in sessions):
+        categories = ["resume", "switch"]
+    else:
+        categories = ["name", "switch", "doctor"]
+    names: dict[str, set[str]] = {}
+    for item in sessions:
+        names.setdefault(item.display_name.casefold(), set()).add(item.provider)
+    if any(providers == {"codex", "claude"} for providers in names.values()):
+        categories.insert(0, "collision")
+    ordered: list[tuple[str, str, str]] = []
+    for category in dict.fromkeys(categories):
+        ordered.extend(item for item in PLAYBOOK_TIPS if item[0] == category)
+    return ordered or list(PLAYBOOK_TIPS)
+
+
+def playbook_tip(
+    now: float,
+    sessions: list[Session] | None = None,
+    *,
+    selected: Session | None = None,
+    refresh_error: str | None = None,
+    compact: bool = False,
+) -> tuple[int, int, str]:
+    options = _playbook_options(
+        sessions or [], selected=selected, refresh_error=refresh_error
+    )
+    index = int(now // PLAYBOOK_ROTATION_SECONDS) % len(options)
+    _category, wide, narrow = options[index]
+    return index, len(options), narrow if compact else wide
 
 
 def _peek_view(state: MonitorState, width: int, slots: int) -> list[str]:
@@ -355,6 +633,37 @@ def _peek_view(state: MonitorState, width: int, slots: int) -> list[str]:
     return [_fit(line, width) for line in visible]
 
 
+def _identity_text(session: Session) -> str:
+    provider = session.provider.title()
+    fingerprint = session.session_id[:8]
+    if session.home_state == "exact-live":
+        return f"EXACT HOME · {provider} · id {fingerprint} · PROTECTED LIVE"
+    if session.home_state == "identity-error":
+        return f"IDENTITY UNVERIFIED · {provider} · id {fingerprint} · OPEN BLOCKED"
+    if session.home_state == "unbound":
+        return f"UNBOUND PROCESS · {provider} · id {fingerprint} · ADOPT REQUIRED"
+    if session.home_state == "outside-live":
+        return f"LIVE OUTSIDE PIKA · {provider} · id {fingerprint} · NOT PROTECTED"
+    if session.home_state == "saved-idle":
+        return f"SAVED HOME · {provider} · id {fingerprint} · NOT LIVE"
+    if session.home_state == "no-live-home":
+        return f"TRACKED WORKSTREAM · {provider} · id {fingerprint} · NO LIVE HOME"
+    return f"HOME STATE UNKNOWN · {provider} · id {fingerprint}"
+
+
+def _age_phrase(session: Session, now: float) -> str:
+    event_age = _human_age_at(session.last_event_at, now)
+    activity_age = _human_age_at(session.last_activity_at, now)
+    return {
+        Status.NEEDS_YOU.value: f"waiting on you for {event_age}",
+        Status.READY.value: f"result ready for {event_age}",
+        Status.WORKING.value: f"last active {activity_age} ago",
+        Status.PARKED.value: f"last active {activity_age} ago",
+        Status.ERROR.value: f"failed {event_age} ago",
+        Status.UNBOUND.value: f"last active {activity_age} ago",
+    }.get(session.status, f"last active {activity_age} ago")
+
+
 def render_monitor(
     state: MonitorState,
     *,
@@ -364,9 +673,9 @@ def render_monitor(
     refreshing: bool = False,
     color: bool = True,
 ) -> MonitorFrame:
-    now = now or time.time()
-    width = max(20, width)
-    height = max(6, height)
+    now = time.time() if now is None else now
+    width = max(1, width)
+    height = max(1, height)
     selected = state.selected()
 
     if width < MIN_WIDTH or height < MIN_HEIGHT:
@@ -386,46 +695,81 @@ def render_monitor(
         plain = "\n".join(_fit(line, width) for line in minimum)
         return MonitorFrame(plain, plain, state.selected_key)
 
-    spinner = SPINNER[int(now * 4) % len(SPINNER)] if refreshing else "●"
-    freshness = (
-        "waiting for first scan"
-        if not state.last_update
-        else f"updated {max(0, int(time.time() - state.last_update))}s ago"
+    refresh_age = max(0.0, now - state.refresh_started_at)
+    show_refresh = refreshing and (
+        not state.last_update
+        or state.emphasize_refresh
+        or refresh_age >= SLOW_REFRESH_SECONDS
     )
+    if state.refresh_error:
+        freshness = (
+            f"! STALE · last update {max(0, int(now - state.last_update))}s ago"
+            if state.last_update
+            else "! INITIAL SCAN FAILED"
+        )
+    elif state.refresh_warning:
+        freshness = f"! PARTIAL · UPDATED {max(0, int(now - state.last_update))}s AGO"
+    elif show_refresh:
+        spinner = SPINNER[int(now * 4) % len(SPINNER)]
+        freshness = f"{spinner} {'SCANNING' if not state.last_update else 'SYNCING'}"
+    elif state.last_update:
+        freshness = f"● UPDATED {max(0, int(now - state.last_update))}s AGO"
+    else:
+        freshness = "○ WAITING FOR FIRST SCAN"
     clock = datetime.fromtimestamp(now).strftime("%H:%M:%S")
+    view_label = " · USAGE VIEW" if state.show_usage else ""
+    if state.show_usage and width >= 112:
+        view_label += f" · PROVIDER COUNTERS · API-EQUIV EST {PRICING_AS_OF}"
+    if state.show_usage and state.usage_warning:
+        view_label += " · USAGE PARTIAL"
     header_plain = _line(
-        f"PIKA // LIVE OPERATIONS  {len(state.sessions)} HOMES",
-        f"{spinner} {freshness}  {clock}",
+        f"PIKA // LIVE OPERATIONS{view_label}  {len(state.sessions)} WORKSTREAMS",
+        f"{freshness}  {clock}",
         width,
     )
     header_ansi = _paint(header_plain, BOLD + FG_CYAN, color)
 
-    labels = dict(_metric_labels(width))
-    metric_plain_parts = [
-        f"{labels[label]} {value}"
-        for label, value, _code in _counts(state.sessions)
-    ]
-    metric_ansi_parts = [
-        _paint(f"{labels[label]} {value}", code, color)
-        for label, value, code in _counts(state.sessions)
-    ]
-    metric_text = "  ".join(metric_plain_parts)
-    metrics_plain = _fit(metric_text, width)
-    metrics_ansi = "  ".join(metric_ansi_parts) + " " * max(
-        0, width - len(metric_text)
+    active_handoff = (
+        state.handoff
+        if state.handoff and time.monotonic() < state.handoff_until
+        else None
     )
-    if not color or len(metric_text) > width:
-        metrics_ansi = metrics_plain
+    briefing_plain = _briefing_lines(
+        state.sessions,
+        width=width,
+        handoff=active_handoff,
+        initialized=bool(state.last_update),
+        refresh_error=state.refresh_error,
+    )
+    counts = _session_counts(state.sessions)
+    has_attention = bool(
+        counts["decisions"]
+        or counts["results"]
+        or counts["errors"]
+        or counts["unbound"]
+    )
+    briefing_ansi = (
+        _paint(
+            briefing_plain[0],
+            BOLD + (FG_YELLOW if has_attention else FG_GREEN),
+            color,
+        ),
+        _paint(
+            briefing_plain[1],
+            FG_MAGENTA if active_handoff else FG_BLUE,
+            color,
+        ),
+    )
 
     rule = "─" * width
-    columns = _columns(width)
+    columns = _columns(width, show_usage=state.show_usage)
     table_width = 3 + sum(item.width for item in columns) + 2 * (len(columns) - 1)
     table_header = _fit(
         "   " + "  ".join(_fit(item.label, item.width) for item in columns),
         width,
     )
 
-    row_slots = max(1, height - 10)
+    row_slots = max(1, height - 11)
     ordered = state.ordered()
     rows, start = _visible_rows(ordered, selected, row_slots)
     table_plain: list[str] = []
@@ -433,7 +777,7 @@ def render_monitor(
 
     if state.mode == "help":
         title = _fit("HELP // KEYS", width)
-        table_plain = [title, *_help_lines(width, row_slots - 1)]
+        table_plain = [title, *_help_lines(state, width, row_slots - 1)]
         table_ansi = [_paint(title, BOLD + FG_BLUE, color), *table_plain[1:]]
     elif state.mode == "peek":
         name = selected.display_name if selected else "—"
@@ -463,6 +807,7 @@ def render_monitor(
                 columns,
                 selected=bool(selected and item.key == selected.key),
                 color=color,
+                now=now,
             )
             table_plain.append(_fit(plain_row, width))
             table_ansi.append(ansi_row + " " * max(0, width - table_width))
@@ -488,29 +833,31 @@ def render_monitor(
                 f"SELECTED // {selected.display_name}  "
                 f"{selected.provider.title()} · {selected.status}"
             ),
-            f"{index + 1}/{len(ordered)}  id {selected.session_id[:8]}",
+            (
+                f"{index + 1}/{len(ordered)}  "
+                f"{short_path(selected.cwd, max(8, width // 4))}"
+                f"{' · ' + selected.branch if selected.branch else ''}"
+            ),
             width,
         )
-        location = short_path(selected.cwd, max(12, width // 2))
-        branch = f" · {selected.branch}" if selected.branch else ""
-        identity = (
-            f"{location}{branch}  ·  "
-            f"pane {selected.tmux_pane or '—'}  ·  "
-            f"{'LIVE' if selected.live else 'PARKED'}"
-        )
+        identity = _identity_text(selected)
         signal = (
             selected.error
             or selected.attention_reason
             or "No exception reported"
         )
-        resources = (
-            f"CPU {selected.cpu_percent:.1f}%"
-            if selected.cpu_percent is not None
-            else "CPU —"
-        ) + (
-            f"  RAM {format_bytes(selected.rss_kb)}  "
-            f"TOKENS {format_tokens(selected.total_tokens)}"
-        )
+        if state.show_usage:
+            resources = (
+                f"CPU {selected.cpu_percent:.1f}%"
+                if selected.cpu_percent is not None
+                else "CPU —"
+            ) + (
+                f" · RAM {format_bytes(selected.rss_kb)} · "
+                f"TOKENS {format_tokens(selected.total_tokens)} · "
+                f"API-EQUIV {format_cost(selected.estimated_cost_usd)}"
+            )
+        else:
+            resources = _age_phrase(selected, now)
         detail_plain = [
             _fit(selection, width),
             _fit(identity, width),
@@ -535,22 +882,32 @@ def render_monitor(
         detail_plain[2] = _fit(f"NOTICE // {state.toast}", width)
         detail_ansi[2] = _paint(detail_plain[2], FG_YELLOW, color)
 
+    exit_copy = "q close" if state.mode in {"help", "peek"} else "q quit"
     footer_text = (
-        "↑↓ move  Enter open  n next  p peek  ? help  q quit"
+        f"↑↓ move  ↵ open  n next  p peek  u usage  ? keys  {exit_copy}"
         if width < 80
-        else "↑↓/jk move  Enter open  n next  p peek  r refresh  ? help  q quit"
+        else (
+            "↑↓/jk move  Enter open  n next  p peek  "
+            f"u {'operations' if state.show_usage else 'usage'}  "
+            f"r refresh  ? keys  {exit_copy}"
+        )
     )
     footer_plain = _fit(footer_text, width)
     footer_ansi = _paint(footer_plain, REVERSE, color)
-    tip_index, tip = playbook_tip(now)
-    playbook_plain = _fit(
-        f"PIKA PLAYBOOK {tip_index + 1}/{len(PLAYBOOK_TIPS)} // {tip}", width
+    tip_index, tip_total, tip = playbook_tip(
+        now,
+        state.sessions,
+        selected=selected,
+        refresh_error=state.refresh_error,
+        compact=width < 90,
     )
+    tip_label = "PIKA TIP" if width < 90 else "PIKA PLAYBOOK"
+    playbook_plain = _fit(f"{tip_label} {tip_index + 1}/{tip_total} // {tip}", width)
     playbook_ansi = _paint(playbook_plain, FG_BLUE, color)
 
     plain_lines = [
         header_plain,
-        metrics_plain,
+        *briefing_plain,
         rule,
         *table_plain,
         rule,
@@ -560,7 +917,7 @@ def render_monitor(
     ]
     ansi_lines = [
         header_ansi,
-        metrics_ansi,
+        *briefing_ansi,
         rule,
         *table_ansi,
         rule,
@@ -631,6 +988,7 @@ def decode_keys(buffer: bytearray) -> list[str]:
                 "?": "help",
                 "p": "peek",
                 "n": "next",
+                "u": "usage",
                 "r": "refresh",
                 "\x0c": "refresh",
             }.get(value, value)
@@ -709,7 +1067,9 @@ def _open_peek(pika: MonitorPika, state: MonitorState) -> None:
     state.peek_offset = 0
     state.mode = "peek"
     if session.status == Status.READY.value and session.unread:
-        pika.acknowledge(session)
+        if pika.acknowledge(session):
+            session.unread = False
+            state.notify("RESULT SEEN · unread state cleared")
 
 
 def _handle_key(
@@ -762,6 +1122,9 @@ def _handle_key(
         state.mode = "help"
     elif key == "peek":
         _open_peek(pika, state)
+    elif key == "usage":
+        state.show_usage = not state.show_usage
+        return "usage", None
     elif key == "enter":
         session = state.selected()
         if session and session.status == Status.UNBOUND.value and session.live:
@@ -776,7 +1139,77 @@ def _handle_key(
             return "open", session
     elif key == "refresh":
         return "refresh", None
+    elif key != "mouse":
+        state.notify("Unknown key · press ? for controls")
     return "continue", None
+
+
+def _morning_handoff(
+    pika: MonitorPika,
+    sessions: list[Session],
+    *,
+    now: float,
+) -> HandoffSummary | None:
+    try:
+        previous, counts = pika.store.claim_monitor_handoff(now)
+    except (AttributeError, OSError):
+        try:
+            previous = pika.store.claim_monitor_visit(now)
+        except (AttributeError, OSError):
+            previous = None
+        counts = {}
+    if previous is None:
+        counts = _session_counts(sessions)
+        return HandoffSummary(
+            since=now,
+            finished=counts["results"],
+            decisions=counts["decisions"],
+            errors=counts["errors"],
+            first=True,
+        )
+    snapshot = build_handoff(sessions, since=previous, now=now)
+    if snapshot is None:
+        return None
+    if not counts:
+        return snapshot
+    journal = HandoffSummary(
+        since=previous,
+        finished=int(counts.get(Status.READY.value, 0)),
+        decisions=int(counts.get(Status.NEEDS_YOU.value, 0)),
+        errors=int(counts.get(Status.ERROR.value, 0)),
+    )
+    return journal if journal.changed or not snapshot.changed else snapshot
+
+
+class _DaemonExecutor:
+    """Tiny executor whose in-flight optional work cannot hold the TUI open."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    @staticmethod
+    def submit(callable_, *args, **kwargs):
+        future = concurrent.futures.Future()
+
+        def run() -> None:
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                result = callable_(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+        threading.Thread(
+            target=run,
+            name="pika-monitor-worker",
+            daemon=True,
+        ).start()
+        return future
 
 
 def run_monitor(
@@ -792,74 +1225,137 @@ def run_monitor(
     usage_cache: dict[tuple[str, str], dict[str, object]] = {}
     input_buffer = bytearray()
     future: concurrent.futures.Future[list[Session]] | None = None
-    future_includes_usage = False
+    usage_future: concurrent.futures.Future[list[Session]] | None = None
     next_refresh = 0.0
     next_usage = 0.0
+    manual_refresh_pending = False
     selected_to_open: Session | None = None
     last_frame: str | None = None
     color = "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+    first_scan = True
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        with _Terminal(input_fd, output_fd) as terminal:
-            while True:
-                monotonic = time.monotonic()
-                if future is not None and future.done():
-                    try:
-                        sessions = future.result()
-                    except Exception as exc:  # noqa: BLE001 - retain last good screen
-                        state.refresh_error = terminal_text(exc)
-                    else:
-                        _carry_usage(sessions, usage_cache)
-                        state.sessions = sessions
-                        state.selected()
-                        state.last_update = time.time()
-                        state.refresh_error = None
-                    if future_includes_usage:
+    try:
+        with _DaemonExecutor() as executor:
+            with _Terminal(input_fd, output_fd) as terminal:
+                while True:
+                    monotonic = time.monotonic()
+                    if future is not None and future.done():
+                        try:
+                            sessions = future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            state.refresh_error = terminal_text(exc)
+                        else:
+                            _carry_usage(sessions, usage_cache)
+                            state.sessions = sessions
+                            state.selected()
+                            state.last_update = time.time()
+                            state.refresh_error = None
+                            discovery_errors = getattr(
+                                pika, "discovery_errors", []
+                            )
+                            state.refresh_warning = (
+                                "; ".join(map(terminal_text, discovery_errors))
+                                if discovery_errors
+                                else None
+                            )
+                            if first_scan:
+                                state.handoff = _morning_handoff(
+                                    pika,
+                                    sessions,
+                                    now=state.last_update,
+                                )
+                                if state.handoff is not None:
+                                    state.handoff_until = (
+                                        monotonic + HANDOFF_DISPLAY_SECONDS
+                                    )
+                                first_scan = False
+                        future = None
+                        state.emphasize_refresh = False
+                        next_refresh = (
+                            0.0
+                            if manual_refresh_pending
+                            else monotonic + refresh_seconds
+                        )
+
+                    if usage_future is not None and usage_future.done():
+                        try:
+                            usage_sessions = usage_future.result()
+                        except Exception as exc:  # noqa: BLE001 - usage is optional
+                            state.usage_warning = terminal_text(exc)
+                        else:
+                            _carry_usage(usage_sessions, usage_cache)
+                            _carry_usage(state.sessions, usage_cache)
+                            usage_errors = getattr(pika, "usage_errors", [])
+                            state.usage_warning = (
+                                "; ".join(map(terminal_text, usage_errors))
+                                if usage_errors
+                                else None
+                            )
+                        usage_future = None
                         next_usage = monotonic + USAGE_REFRESH_SECONDS
-                    future = None
-                    next_refresh = monotonic + refresh_seconds
 
-                if future is None and monotonic >= next_refresh:
-                    future_includes_usage = monotonic >= next_usage
-                    future = executor.submit(
-                        pika.refresh, usage=future_includes_usage
+                    if future is None and monotonic >= next_refresh:
+                        state.refresh_started_at = time.time()
+                        state.emphasize_refresh = manual_refresh_pending or not bool(
+                            state.last_update
+                        )
+                        manual_refresh_pending = False
+                        future = executor.submit(pika.refresh, usage=False)
+
+                    if (
+                        state.show_usage
+                        and usage_future is None
+                        and state.sessions
+                        and monotonic >= next_usage
+                    ):
+                        usage_future = executor.submit(
+                            pika.hydrate_usage,
+                            [replace(item) for item in state.sessions],
+                        )
+
+                    size = os.get_terminal_size(output_fd)
+                    frame = render_monitor(
+                        state,
+                        width=size.columns,
+                        height=size.lines,
+                        refreshing=future is not None,
+                        color=color,
                     )
+                    if frame.ansi != last_frame:
+                        terminal.draw(frame.ansi)
+                        last_frame = frame.ansi
 
-                size = os.get_terminal_size(output_fd)
-                frame = render_monitor(
-                    state,
-                    width=size.columns,
-                    height=size.lines,
-                    refreshing=future is not None,
-                    color=color,
-                )
-                if frame.ansi != last_frame:
-                    terminal.draw(frame.ansi)
-                    last_frame = frame.ansi
-
-                readable, _, _ = select.select([input_fd], [], [], 0.12)
-                if not readable:
-                    continue
-                data = os.read(input_fd, 256)
-                if not data:
+                    poll_seconds = min(0.12, max(0.01, refresh_seconds / 2))
+                    readable, _, _ = select.select(
+                        [input_fd], [], [], poll_seconds
+                    )
+                    if not readable:
+                        continue
+                    data = os.read(input_fd, 256)
+                    if not data:
+                        break
+                    input_buffer.extend(data)
+                    for key in decode_keys(input_buffer):
+                        action, session = _handle_key(key, pika, state)
+                        if action == "quit":
+                            future = None
+                            selected_to_open = None
+                            break
+                        if action == "open":
+                            selected_to_open = session
+                            future = None
+                            break
+                        if action == "refresh":
+                            manual_refresh_pending = True
+                            state.emphasize_refresh = True
+                            next_refresh = 0.0
+                        if action == "usage" and state.show_usage:
+                            next_usage = 0.0
+                    else:
+                        continue
                     break
-                input_buffer.extend(data)
-                for key in decode_keys(input_buffer):
-                    action, session = _handle_key(key, pika, state)
-                    if action == "quit":
-                        future = None
-                        selected_to_open = None
-                        break
-                    if action == "open":
-                        selected_to_open = session
-                        future = None
-                        break
-                    if action == "refresh":
-                        next_refresh = 0.0
-                else:
-                    continue
-                break
-
+    finally:
+        pass
     if selected_to_open is None:
         return 0
     return pika.open(selected_to_open)
@@ -877,8 +1373,10 @@ def _demo_sessions(now: float) -> list[Session]:
             status=Status.NEEDS_YOU.value,
             unread=True,
             attention_reason="permission",
+            last_event_at=now - 42,
             last_activity_at=now - 42,
             live=True,
+            home_state="exact-live",
             cpu_percent=3.2,
             rss_kb=241_000,
             total_tokens=184_220,
@@ -890,8 +1388,10 @@ def _demo_sessions(now: float) -> list[Session]:
             name="plugin-cleanup-with-a-deliberately-long-name",
             cwd="/work/qes/plugin",
             status=Status.WORKING.value,
+            last_event_at=now - 8,
             last_activity_at=now - 8,
             live=True,
+            home_state="exact-live",
             cpu_percent=8.8,
             rss_kb=532_000,
         ),
@@ -903,6 +1403,7 @@ def _demo_sessions(now: float) -> list[Session]:
             status=Status.READY.value,
             unread=True,
             attention_reason="completed",
+            last_event_at=now - 3600,
             last_activity_at=now - 3600,
         ),
         Session(
@@ -911,6 +1412,7 @@ def _demo_sessions(now: float) -> list[Session]:
             name="older-parked",
             cwd="/work/archive",
             status=Status.PARKED.value,
+            last_event_at=now - 172_800,
             last_activity_at=now - 172_800,
         ),
     ]

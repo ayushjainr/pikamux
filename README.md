@@ -78,13 +78,29 @@ pika doctor --verbose      show every receipt check
 pika doctor --repair-stale remove confirmed stale launch locks (5m+)
 ```
 
-The interactive `pika` monitor refreshes operational state every two seconds
-and provider usage every thirty seconds. Use arrows or j/k to select, Enter to
-open the exact identity, `n` for the oldest attention item, `p` for a sanitized
-pane peek, `r` to reconcile immediately, `?` for help, and `q` to leave. Its
-selection is stable by provider UUID even when a status change reorders rows.
-The `PIKA PLAYBOOK` strip rotates every five minutes through practical ways to
-delegate, switch, inspect, automate waits, name workstreams, and verify recovery.
+The interactive `pika` monitor refreshes operational state every two seconds.
+Use arrows or j/k to select, Enter to open the selected identity, `n` for the
+oldest attention item, `p` for a sanitized pane peek, `u` to reveal or hide
+provider usage, `r` to reconcile immediately, `?` for keys, and `q` to leave.
+Usage collection starts separately every thirty seconds only while its view is
+visible, so it cannot delay operational updates, opening a workstream, or leaving
+the monitor. Selection is stable by provider UUID even when a status change
+reorders rows.
+
+The monitor opens with a decision briefing rather than raw process totals. A
+first handoff describes current state; after six hours away, a temporary
+`SINCE YOUR LAST VISIT` strip counts actionable lifecycle events from Pika's
+local transcript-free event ledger using an atomic committed-event watermark.
+Quiet screens say `NO ATTENTION PENDING`;
+partial or failed reconciliation says `PARTIAL` or `STALE` rather than claiming
+complete synchronization. State time is semantic: waiting/results/failures use
+their lifecycle event, while working and parked rows report last activity.
+
+The `PIKA PLAYBOOK` strip rotates every five minutes through actions relevant to
+the current screen. Exact/protected language appears only when Pika has current
+provider UUID-to-PID evidence for that tmux pane. Opening an exact unread result
+atomically clears that event and emits a one-shot `RESULT COLLECTED` receipt with
+the remaining result count; losing a race to a newer event leaves it unread.
 When stdout is redirected, bare `pika` falls back to the finite static briefing;
 `pika list --json` remains the preferred automation contract.
 
@@ -155,9 +171,10 @@ that pane contains any foreground or background work, Pika preserves it, clears
 its Pika ownership tags, and creates a fresh UUID-derived home instead. If the
 tmux session itself disappeared, Pika creates another and resumes the UUID there.
 Every successful attach displays a short threshold receipt in tmux: provider,
-name, UUID fingerprint, and the truthful outcome (`ATTACHED LIVE`, `RESUMED
-EXACT`, or `NEW HOME`). When work was preserved, the receipt identifies the old
-pane and command rather than hiding the safety decision.
+name, UUID fingerprint, and a proof-scoped outcome such as `ATTACHED EXACT`,
+`RESUMED EXACT`, `NEW HOME · EXACT`, or `IDENTITY PENDING`. When work was
+preserved, the receipt identifies the old pane and command rather than hiding
+the safety decision.
 
 `pika doctor` is deliberately strict. “Safe to close this terminal” requires
 valid provider UUIDs, durable provider history (or an exact live tagged pane),

@@ -169,7 +169,6 @@ class Pika:
         return session
 
     def refresh(self, *, usage: bool = False) -> list[Session]:
-        self.usage_errors = []
         tracked_sessions = self.store.list_sessions()
         candidates = self.discover_candidates(tracked_sessions)
         candidate_map = {(item.provider, item.session_id): item for item in candidates}
@@ -240,6 +239,11 @@ class Pika:
                 fields.update(tmux_session=None, tmux_pane=None, root_pid=None)
             duplicate_panes = panes_by_key.get(session.key, [])
             if len(duplicate_panes) > 1:
+                if not (
+                    session.status == Status.ERROR.value
+                    and session.attention_reason == "identity"
+                ):
+                    self.store.capture_identity_interruption(*session.key)
                 homes = ", ".join(
                     f"{item.session_name}:{item.pane_id}" for item in duplicate_panes
                 )
@@ -279,6 +283,11 @@ class Pika:
                     last_activity_at=max(session.last_activity_at, pane.activity),
                 )
                 if raw_pid and not live_pid:
+                    if not (
+                        session.status == Status.ERROR.value
+                        and session.attention_reason == "identity"
+                    ):
+                        self.store.capture_identity_interruption(*session.key)
                     fields.update(
                         status=Status.ERROR.value,
                         unread=True,
@@ -312,24 +321,40 @@ class Pika:
                 not live_pid
                 and not (raw_pid and not live_pid)
                 and session.status == Status.UNBOUND.value
-                and not session.session_id.startswith("unbound:")
             ):
-                fields.update(status=Status.PARKED.value, attention_reason=None)
+                fields.update(
+                    status=Status.PARKED.value,
+                    unread=False,
+                    attention_reason=None,
+                )
+            identity_repaired = False
             if (
                 len(duplicate_panes) <= 1
                 and session.error
-                and session.error.startswith(DUPLICATE_TMUX_ERROR)
+                and (
+                    session.error.startswith(DUPLICATE_TMUX_ERROR)
+                    or session.error.startswith(UNVERIFIED_PANE_ERROR)
+                )
                 and not (raw_pid and not live_pid)
             ):
-                fields.update(
-                    status=Status.READY.value if live_pid else Status.PARKED.value,
-                    error=None,
-                    attention_reason=None,
-                )
+                identity_repaired = True
             if fields:
                 self.store.update_session(
                     session.provider, session.session_id, **fields
                 )
+            if identity_repaired:
+                self.store.restore_identity_interruption(
+                    *session.key, live=bool(live_pid)
+                )
+            if (
+                live_pid
+                and len(duplicate_panes) <= 1
+                and not (
+                    session.status == Status.ERROR.value
+                    and session.attention_reason == "identity"
+                )
+            ):
+                self.store.discard_healthy_identity_interruption(*session.key)
         # Drop placeholder UNBOUND rows once the same pane is bound exactly.
         bound_panes = {
             p.pane_id
@@ -362,28 +387,54 @@ class Pika:
                 live_pid = provider_process(session.root_pid, session.provider)
             session.live = bool(live_pid)
             session.attached = bool(pane and pane.attached)
+            exact_home = bool(
+                pane
+                and live_pid
+                and len(panes_by_key.get(session.key, [])) == 1
+            )
+            if exact_home:
+                session.home_state = "exact-live"
+            elif (
+                session.status == Status.ERROR.value
+                and session.attention_reason == "identity"
+            ):
+                session.home_state = "identity-error"
+            elif session.status == Status.UNBOUND.value:
+                session.home_state = "unbound"
+            elif session.live:
+                session.home_state = "outside-live"
+            elif session.tmux_pane:
+                session.home_state = "saved-idle"
+            else:
+                session.home_state = "no-live-home"
             if live_pid:
                 session.cpu_percent, session.rss_kb = process_stats(
                     pane.pane_pid if pane else live_pid
                 )
-            if usage:
-                provider = self.providers.get(session.provider)
-                if provider:
-                    try:
-                        values = provider.usage(session, self.store)
-                    except Exception as exc:  # noqa: BLE001 - stats are best-effort
-                        self.usage_errors.append(
-                            f"{provider.name}:{session.session_id}: {exc}"
-                        )
-                        values = None
-                    if values:
-                        session.input_tokens = values.input_tokens
-                        session.output_tokens = values.output_tokens
-                        session.cached_input_tokens = values.cached_input_tokens
-                        session.cache_write_tokens = values.cache_write_tokens
-                        session.total_tokens = values.total_tokens
-                        session.estimated_cost_usd = values.estimated_cost_usd
-                        session.model = values.model or session.model
+        return self.hydrate_usage(sessions) if usage else sessions
+
+    def hydrate_usage(self, sessions: list[Session]) -> list[Session]:
+        """Add provider usage without delaying operational reconciliation."""
+        self.usage_errors = []
+        for session in sessions:
+            provider = self.providers.get(session.provider)
+            if not provider:
+                continue
+            try:
+                values = provider.usage(session, self.store)
+            except Exception as exc:  # noqa: BLE001 - stats are best-effort
+                self.usage_errors.append(
+                    f"{provider.name}:{session.session_id}: {exc}"
+                )
+                continue
+            if values:
+                session.input_tokens = values.input_tokens
+                session.output_tokens = values.output_tokens
+                session.cached_input_tokens = values.cached_input_tokens
+                session.cache_write_tokens = values.cache_write_tokens
+                session.total_tokens = values.total_tokens
+                session.estimated_cost_usd = values.estimated_cost_usd
+                session.model = values.model or session.model
         return sessions
 
     def resolve(self, query: str, sessions: list[Session] | None = None) -> Session:
@@ -489,13 +540,26 @@ class Pika:
         return exact
 
     def exact_pane_pid(self, session: Session, pane: Pane) -> int | None:
-        """Accept a tagged provider process only with independent UUID evidence."""
+        """Accept one pane only when it contains all live UUID-owned processes."""
         pid = provider_process(pane.pane_pid, session.provider)
-        return pid if pid and pid in self.identity_pids(session) else None
+        if not pid:
+            return None
+        identities = self.identity_pids(session)
+        if pid not in identities:
+            return None
+        other_identities = identities - {pid}
+        if other_identities and not other_identities.issubset(
+            process_tree(pane.pane_pid)
+        ):
+            return None
+        return pid
 
     def open(self, session: Session, *, attach: bool = True) -> int:
         sessions = self.refresh()
         current = next((item for item in sessions if item.key == session.key), session)
+        collecting_result = (
+            current.status == Status.READY.value and current.unread
+        )
         panes = self.tmux.list_panes()
         matching_panes = [
             item
@@ -636,7 +700,10 @@ class Pika:
                     if fresh_pid:
                         pane = fresh_pane
                         outcome = "ATTACHED LIVE"
-                    elif fresh_pane and self._pane_is_idle(fresh_pane):
+                    elif fresh_pane and (
+                        idle_pane := self._settle_idle_pane(fresh_pane)
+                    ):
+                        fresh_pane = idle_pane
                         pane = self.tmux.respawn_agent(
                             fresh_pane.pane_id,
                             cwd=cwd,
@@ -673,14 +740,29 @@ class Pika:
                         outcome = "NEW HOME"
                 except TmuxError as exc:
                     raise PikaError(str(exc)) from exc
+                resumed_fields: dict[str, object] = {
+                    "tmux_session": pane.session_name,
+                    "tmux_pane": pane.pane_id,
+                    "root_pid": provider_process(
+                        pane.pane_pid, current.provider
+                    ),
+                }
+                # A real unread result remains collectible after resuming its
+                # exact conversation. Every other old state becomes WORKING;
+                # launching a process must never manufacture a READY event.
+                if not (
+                    current.status == Status.READY.value and current.unread
+                ):
+                    resumed_fields.update(
+                        status=Status.WORKING.value,
+                        unread=False,
+                        error=None,
+                        attention_reason=None,
+                    )
                 self.store.update_session(
                     current.provider,
                     current.session_id,
-                    tmux_session=pane.session_name,
-                    tmux_pane=pane.pane_id,
-                    root_pid=provider_process(pane.pane_pid, current.provider),
-                    status=Status.READY.value,
-                    error=None,
+                    **resumed_fields,
                 )
             finally:
                 self.store.release_resume(
@@ -690,32 +772,82 @@ class Pika:
             return 0
         assert pane is not None
 
+        def open_outcome(exact: bool) -> str:
+            if outcome == "ATTACHED LIVE":
+                return "ATTACHED EXACT" if exact else "ATTACHED · IDENTITY UNVERIFIED"
+            if outcome == "RESUMED EXACT":
+                return "RESUMED EXACT" if exact else "RESUME STARTED · IDENTITY PENDING"
+            if outcome == "NEW HOME":
+                return "NEW HOME · EXACT" if exact else "NEW HOME · IDENTITY PENDING"
+            return outcome
+
+        receipt_box = [""]
+
+        def ordinary_receipt(exact: bool) -> str:
+            parts = [
+                f"Pika → {terminal_text(current.display_name)}",
+                current.provider.title(),
+                open_outcome(exact),
+                f"{'exact id' if exact else 'id'} {current.session_id[:8]}",
+            ]
+            if preserved:
+                parts.append(terminal_text(preserved))
+            elif current.attention_reason:
+                parts.append(terminal_text(current.attention_reason))
+            return " · ".join(parts)
+
+        receipt_box[0] = ordinary_receipt(bool(self.exact_pane_pid(current, pane)))
+
         def attached() -> None:
-            self.acknowledge(current, attaching=True)
+            exact = bool(self.exact_pane_pid(current, pane))
+            remaining: int | None = None
+            if collecting_result and exact:
+                remaining = self.store.collect_result(
+                    *current.key,
+                    expected_event_at=current.last_event_at,
+                )
+            elif not collecting_result:
+                self.acknowledge(current, attaching=True)
+            if remaining is not None:
+                remainder = (
+                    "INBOX CLEAR"
+                    if remaining == 0
+                    else (
+                        "1 unread remains"
+                        if remaining == 1
+                        else f"{remaining} unread remain"
+                    )
+                )
+                receipt_box[0] = " · ".join(
+                    [
+                        "RESULT COLLECTED",
+                        remainder,
+                        {"codex": "C", "claude": "A"}.get(
+                            current.provider, current.provider[:1].upper()
+                        ),
+                        f"EXACT {current.session_id[:8]}",
+                        terminal_text(current.display_name),
+                    ]
+                )
+            else:
+                receipt_box[0] = ordinary_receipt(exact)
             self.store.record_attach(*current.key)
 
-        receipt = (
-            f"Pika → {terminal_text(current.display_name)} · "
-            f"{current.provider.title()} · "
-            f"{outcome} · id {current.session_id[:8]}"
-        )
-        if preserved:
-            receipt += f" · {terminal_text(preserved)}"
-        elif current.attention_reason:
-            receipt += f" · {terminal_text(current.attention_reason)}"
+        def attach_receipt() -> str:
+            return receipt_box[0]
 
         try:
             result = self.tmux.attach(
                 pane.session_name,
                 target_pane=pane.pane_id,
                 on_attached=attached,
-                receipt=receipt,
+                receipt=attach_receipt,
             )
         except TmuxError as exc:
             raise PikaError(str(exc)) from exc
         if result == 0 and not os.environ.get("TMUX"):
             print(
-                f"Left {terminal_text(current.display_name)} protected in tmux · "
+                f"Left {terminal_text(current.display_name)} running in Pika tmux · "
                 "return with: "
                 f"{shlex.join(['pika', 'open', current.session_id])}"
             )
@@ -812,12 +944,12 @@ class Pika:
         if reserved_id:
             receipt = (
                 f"Pika → {terminal_text(name)} · {provider_name.title()} · STARTED · "
-                f"id {reserved_id[:8]}"
+                f"IDENTITY PENDING · id {reserved_id[:8]}"
             )
         else:
             receipt = (
                 f"Pika → {terminal_text(name)} · Codex · STARTED · "
-                "exact identity binding"
+                "IDENTITY PENDING"
             )
 
         try:
@@ -851,8 +983,30 @@ class Pika:
         # command, build, server, editor, or background job. Preserve it.
         return process_tree(pane.pane_pid) == [pane.pane_pid]
 
-    def acknowledge(self, session: Session, *, attaching: bool = False) -> None:
-        self.store.acknowledge_attention(
+    def _settle_idle_pane(self, pane: Pane, *, timeout: float = 0.5) -> Pane | None:
+        """Absorb short shell-exit races without overwriting durable pane work."""
+        if self._pane_is_idle(pane):
+            return pane
+        shells = {"bash", "dash", "fish", "ksh", "sh", "tcsh", "zsh"}
+        if Path(pane.current_command).name not in shells:
+            return None
+        get_pane = getattr(self.tmux, "get_pane", None)
+        if not get_pane:
+            return None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            current = get_pane(pane.pane_id)
+            if current is None:
+                return None
+            if self._pane_is_idle(current):
+                return current
+            if Path(current.current_command).name not in shells:
+                return None
+        return None
+
+    def acknowledge(self, session: Session, *, attaching: bool = False) -> bool:
+        return self.store.acknowledge_attention(
             session.provider,
             session.session_id,
             expected_event_at=session.last_event_at,
