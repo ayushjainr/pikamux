@@ -119,6 +119,40 @@ class ProviderTests(unittest.TestCase):
             )
         )
 
+    def test_codex_archived_row_is_hidden_even_with_legacy_name(self) -> None:
+        active_id = "11111111-1111-4111-8111-111111111111"
+        archived_id = "22222222-2222-4222-8222-222222222222"
+        active_rollout = self.root / "active.jsonl"
+        archived_rollout = self.root / "archived.jsonl"
+        active_rollout.write_text("{}\n")
+        archived_rollout.write_text("{}\n")
+        with sqlite3.connect(self.root / "state_current.sqlite") as db:
+            db.execute(
+                "CREATE TABLE threads "
+                "(id TEXT PRIMARY KEY, name TEXT, rollout_path TEXT, archived INTEGER)"
+            )
+            db.executemany(
+                "INSERT INTO threads(id,name,rollout_path,archived) VALUES (?,?,?,?)",
+                (
+                    (active_id, None, str(active_rollout), 0),
+                    (archived_id, None, str(archived_rollout), 1),
+                ),
+            )
+        (self.root / "session_index.jsonl").write_text(
+            json.dumps({"id": active_id, "thread_name": "master_quant"})
+            + "\n"
+            + json.dumps({"id": archived_id, "thread_name": "master_quant"})
+            + "\n"
+        )
+
+        provider = CodexProvider(self.root)
+        self.assertEqual(provider.hidden_session_ids(), {archived_id})
+        self.assertEqual(
+            [candidate.session_id for candidate in provider.discover()], [active_id]
+        )
+        self.assertTrue(provider.is_resumable(active_id))
+        self.assertFalse(provider.is_resumable(archived_id))
+
     def test_codex_native_name_uses_official_thread_rpc(self) -> None:
         process = FakeAppServer()
         with (

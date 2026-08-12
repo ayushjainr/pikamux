@@ -123,17 +123,22 @@ class FakeProvider:
         candidates: list[Candidate] | None = None,
         active: list[int] | None = None,
         resumable: bool = True,
+        hidden: set[str] | None = None,
     ):
         self.name = name
         self.candidates = candidates or []
         self.active = active or []
         self.resumable = resumable
+        self.hidden = hidden or set()
 
     def discover(self) -> list[Candidate]:
         return self.candidates
 
     def import_candidates(self) -> list[Candidate]:
         return self.candidates
+
+    def hidden_session_ids(self) -> set[str]:
+        return self.hidden
 
     def active_pids(self, _session_id: str) -> list[int]:
         return self.active
@@ -178,6 +183,21 @@ class AdversarialTests(unittest.TestCase):
         resolved = pika.resolve("native-name")
         self.assertEqual(resolved.session_id, candidate.session_id)
         self.assertIsNotNone(self.store.get_session("codex", candidate.session_id))
+
+    def test_provider_hidden_session_stays_out_of_refresh_and_pane_recovery(self) -> None:
+        archived_id = "22222222-2222-4222-8222-222222222222"
+        self.store.upsert_session(
+            Session("codex", archived_id, name="master_quant", cwd="/tmp")
+        )
+        tmux = StaticTmux([pane(provider="codex", session_id=archived_id)])
+        pika = Pika(
+            self.store,
+            tmux,
+            {"codex": FakeProvider(hidden={archived_id})},
+        )
+
+        self.assertEqual(pika.refresh(), [])
+        self.assertIsNotNone(self.store.get_session("codex", archived_id))
 
     def test_cross_provider_native_collision_uses_chooser(self) -> None:
         candidates = [

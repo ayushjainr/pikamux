@@ -87,6 +87,10 @@ class Provider(ABC):
     def tracked_candidates(self, sessions: Iterable[Session]) -> list[Candidate]:
         return []
 
+    def hidden_session_ids(self) -> set[str]:
+        """Return provider-owned conversations that must stay out of Pika."""
+        return set()
+
 
 class CodexProvider(Provider):
     name = "codex"
@@ -95,8 +99,11 @@ class CodexProvider(Provider):
         self.home = home or codex_home()
 
     def discover(self) -> list[Candidate]:
+        archived_ids = self.hidden_session_ids()
         records: dict[str, Candidate] = {}
         for item in self._database_records():
+            if item.session_id in archived_ids:
+                continue
             records[item.session_id] = item
         index = self.home / "session_index.jsonl"
         try:
@@ -111,7 +118,7 @@ class CodexProvider(Provider):
                     continue
                 session_id = str(data.get("id") or "")
                 name = data.get("thread_name")
-                if not session_id or not name:
+                if not session_id or not name or session_id in archived_ids:
                     continue
                 existing = records.get(session_id)
                 if existing:
@@ -157,7 +164,48 @@ class CodexProvider(Provider):
         return result
 
     def _all_database_records(self) -> list[Candidate]:
-        return self._query_current_database()
+        archived_ids = self.hidden_session_ids()
+        return [
+            item
+            for item in self._query_current_database()
+            if item.session_id not in archived_ids
+        ]
+
+    def hidden_session_ids(self) -> set[str]:
+        databases = sorted(
+            self.home.glob("state_*.sqlite"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for path in databases:
+            result = self._query_archived_ids(path)
+            if result is not None:
+                return result
+        return set()
+
+    @staticmethod
+    def _query_archived_ids(path: Path) -> set[str] | None:
+        db: sqlite3.Connection | None = None
+        try:
+            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+            db.row_factory = sqlite3.Row
+            columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(threads)").fetchall()
+            }
+            if "id" not in columns:
+                return None
+            if "archived" not in columns:
+                return set()
+            rows = db.execute(
+                "SELECT id FROM threads WHERE COALESCE(archived, 0) != 0"
+            ).fetchall()
+            return {str(row["id"]) for row in rows}
+        except (sqlite3.Error, OSError):
+            return None
+        finally:
+            if db is not None:
+                db.close()
 
     def _query_current_database(
         self,
@@ -319,6 +367,8 @@ class CodexProvider(Provider):
         return False
 
     def is_resumable(self, session_id: str) -> bool:
+        if session_id in self.hidden_session_ids():
+            return False
         records = self._query_current_database(session_ids=[session_id])
         return any(
             item.transcript_path and Path(item.transcript_path).is_file()

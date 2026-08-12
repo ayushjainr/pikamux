@@ -107,6 +107,19 @@ class Pika:
         by_key = {(item.provider, item.session_id): item for item in result}
         return sorted(by_key.values(), key=lambda item: item.updated_at, reverse=True)
 
+    def hidden_session_keys(self) -> set[tuple[str, str]]:
+        """Return provider-owned records that should not enter the daily surface."""
+        result: set[tuple[str, str]] = set()
+        for provider in self.providers.values():
+            hidden = getattr(provider, "hidden_session_ids", None)
+            if hidden is None:
+                continue
+            try:
+                result.update((provider.name, session_id) for session_id in hidden())
+            except Exception as exc:  # noqa: BLE001 - discovery remains best-effort
+                self.discovery_errors.append(f"{provider.name} hidden sessions: {exc}")
+        return result
+
     def import_candidate(
         self, candidate: Candidate, *, managed: bool = False
     ) -> Session:
@@ -171,6 +184,12 @@ class Pika:
     def refresh(self, *, usage: bool = False) -> list[Session]:
         tracked_sessions = self.store.list_sessions()
         candidates = self.discover_candidates(tracked_sessions)
+        hidden_keys = self.hidden_session_keys()
+        candidates = [
+            item
+            for item in candidates
+            if (item.provider, item.session_id) not in hidden_keys
+        ]
         candidate_map = {(item.provider, item.session_id): item for item in candidates}
         panes = self.tmux.list_panes()
         pane_by_id = {pane.pane_id: pane for pane in panes}
@@ -186,10 +205,14 @@ class Pika:
                     (pane.pika_provider, pane.pika_session_id), []
                 ).append(pane)
         # Recover tagged panes even if the ledger was lost.
-        known_keys = {session.key for session in self.store.list_sessions()}
+        known_keys = {
+            session.key
+            for session in self.store.list_sessions()
+            if session.key not in hidden_keys
+        }
         for key, pane in pane_by_key.items():
             assert key[0] is not None and key[1] is not None
-            if key in known_keys:
+            if key in known_keys or key in hidden_keys:
                 continue
             candidate = candidate_map.get((key[0], key[1]))
             now = time.time()
@@ -215,7 +238,11 @@ class Pika:
                     last_activity_at=pane.activity,
                 )
             )
-        sessions = self.store.list_sessions()
+        sessions = [
+            session
+            for session in self.store.list_sessions()
+            if session.key not in hidden_keys
+        ]
         exact_panes = {(p.pika_provider, p.pika_session_id): p for p in panes}
         for session in sessions:
             candidate = candidate_map.get(session.key)
@@ -367,7 +394,11 @@ class Pika:
                 and session.tmux_pane in bound_panes
             ):
                 self.store.delete_session(session.provider, session.session_id)
-        sessions = self.store.list_sessions()
+        sessions = [
+            session
+            for session in self.store.list_sessions()
+            if session.key not in hidden_keys
+        ]
         for session in sessions:
             pane = pane_by_id.get(session.tmux_pane or "")
             if (
