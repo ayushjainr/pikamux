@@ -121,8 +121,15 @@ and explicitly adopted sessions untouched. It also launches the agent with the
 caller's `PATH`, a 24-bit RGB tmux terminal contract, and without stale
 automation-only `NO_COLOR` state inherited from an older tmux server. Explicit
 interactive `NO_COLOR` preferences remain respected. Pika declares RGB support
-to tmux and uses the `tmux-direct` terminfo contract so Codex and Claude retain
-their subtle 24-bit user/assistant message-background differences.
+to tmux and uses the `tmux-direct` terminfo contract so both agents retain their
+24-bit color palettes. Codex additionally derives its adaptive user-message and
+composer fills from OSC 10/11 terminal queries, which tmux consumes without
+answering. Before starting Codex, Pika queries the directly attached terminal
+once and passes the result to a transparent private-PTY bridge. The bridge
+answers only those two Codex probes and forwards every other terminal byte; it
+does not hard-code a theme or alter Claude's launch path. If the outer terminal
+does not report a palette, Pika leaves Codex's conservative fallback unchanged.
+
 The provider process may exit while the tmux session remains as an idle shell.
 Opening that conversation later respawns the exact UUID in the same pane. If
 that pane contains any foreground or background work, Pika preserves it, clears

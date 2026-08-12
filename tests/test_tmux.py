@@ -71,6 +71,42 @@ class TmuxTests(unittest.TestCase):
         self.assertNotIn("-u NO_COLOR", wrapper)
         self.assertIn("NO_COLOR=1", wrapper)
 
+    def test_codex_uses_palette_bridge_when_outer_colors_are_known(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/caller/bin",
+                "TERM": "xterm-256color",
+                "PIKA_TERMINAL_FOREGROUND": "221,204,187",
+                "PIKA_TERMINAL_BACKGROUND": "34,33,51",
+            },
+            clear=True,
+        ):
+            wrapper = Tmux("test")._agent_wrapper(
+                "codex", ["codex", "resume", "uuid"], {}, "uuid", None
+            )
+        self.assertIn("pikamux.terminal_bridge", wrapper)
+        self.assertIn("--foreground 221,204,187", wrapper)
+        self.assertIn("--background 34,33,51", wrapper)
+        self.assertIn("-- codex resume uuid", wrapper)
+
+    def test_claude_does_not_need_the_codex_palette_bridge(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/caller/bin",
+                "TERM": "xterm-256color",
+                "PIKA_TERMINAL_FOREGROUND": "221,204,187",
+                "PIKA_TERMINAL_BACKGROUND": "34,33,51",
+            },
+            clear=True,
+        ):
+            wrapper = Tmux("test")._agent_wrapper(
+                "claude", ["claude"], {}, None, "token"
+            )
+        self.assertNotIn("pikamux.terminal_bridge", wrapper)
+        self.assertIn(" claude; pika_rc=$?", wrapper)
+
     def test_attached_means_the_exact_pika_pane_is_visible(self) -> None:
         separator = "\x1f"
         common = [

@@ -8,6 +8,10 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from .models import Pane
+from .terminal_palette import BACKGROUND_ENV
+from .terminal_palette import FOREGROUND_ENV
+from .terminal_palette import palette_from_environment
+from .terminal_palette import terminal_palette_environment
 
 
 class TmuxError(RuntimeError):
@@ -275,6 +279,12 @@ class Tmux:
         launch_environment["TERM"] = "tmux-direct"
         if os.environ.get("COLORTERM"):
             launch_environment["COLORTERM"] = os.environ["COLORTERM"]
+        # Codex derives its user-message and composer backgrounds from OSC 10/11
+        # replies. tmux consumes those plain queries without answering them, so
+        # capture the real outer palette before tmux starts and let Pika's
+        # private PTY bridge answer only those two probes. Inherited values make
+        # switching between Pika homes work without probing through tmux again.
+        launch_environment.update(terminal_palette_environment())
         caller_no_color = os.environ.get("NO_COLOR")
         preserve_no_color = caller_no_color is not None and os.environ.get(
             "TERM"
@@ -289,7 +299,23 @@ class Tmux:
         env_argv.extend(
             f"{key}={value}" for key, value in launch_environment.items()
         )
-        env_argv.extend(agent_argv)
+        palette = palette_from_environment(launch_environment)
+        if provider == "codex" and palette is not None:
+            env_argv.extend(
+                [
+                    sys.executable,
+                    "-m",
+                    "pikamux.terminal_bridge",
+                    "--foreground",
+                    launch_environment[FOREGROUND_ENV],
+                    "--background",
+                    launch_environment[BACKGROUND_ENV],
+                    "--",
+                    *agent_argv,
+                ]
+            )
+        else:
+            env_argv.extend(agent_argv)
         exit_argv = [
             sys.executable,
             "-m",

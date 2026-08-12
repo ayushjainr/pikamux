@@ -4,6 +4,7 @@ import os
 import shlex
 import shutil
 import signal
+import sys
 import tempfile
 import time
 import unittest
@@ -147,6 +148,58 @@ class TmuxIntegrationTests(unittest.TestCase):
             "show-options", "-s", "-v", "terminal-features"
         ).stdout
         self.assertIn("xterm*:RGB", features)
+
+    def test_codex_palette_probe_is_answered_inside_isolated_tmux(self) -> None:
+        child = """
+import os
+import select
+import time
+import tty
+
+tty.setraw(0)
+os.write(1, b"\\x1b]10;?\\x1b\\\\\\x1b]11;?\\x1b\\\\")
+deadline = time.monotonic() + 1
+data = b""
+while time.monotonic() < deadline and b"\\x1b]11;" not in data:
+    readable, _, _ = select.select([0], [], [], deadline - time.monotonic())
+    if not readable:
+        break
+    data += os.read(0, 512)
+os.write(1, b"PALETTE_REPLIES=" + data.hex().encode() + b"\\n")
+"""
+        with patch.dict(
+            os.environ,
+            {
+                "PIKA_TERMINAL_FOREGROUND": "221,204,187",
+                "PIKA_TERMINAL_BACKGROUND": "34,33,51",
+            },
+            clear=False,
+        ):
+            pane = self.tmux.create_agent_session(
+                tmux_name="pika-c-palette-probe",
+                cwd="/tmp",
+                provider="codex",
+                agent_argv=[sys.executable, "-c", child],
+                environment={
+                    "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")
+                },
+                session_id="uuid-palette",
+                display_name="palette-probe",
+                launch_token=None,
+            )
+
+        expected = (
+            b"\x1b]10;rgb:dddd/cccc/bbbb\x1b\\"
+            b"\x1b]11;rgb:2222/2121/3333\x1b\\"
+        ).hex()
+        deadline = time.time() + 3
+        output = ""
+        while time.time() < deadline:
+            output = self.tmux.capture(pane.pane_id, 20)
+            if "PALETTE_REPLIES=" in output:
+                break
+            time.sleep(0.05)
+        self.assertIn(f"PALETTE_REPLIES={expected}", output)
 
     def test_exact_pane_target_selects_its_window_in_multi_window_home(self) -> None:
         exact = self.tmux.create_agent_session(
