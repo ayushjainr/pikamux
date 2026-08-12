@@ -9,7 +9,12 @@ from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 
 from pikamux.models import Session, Status
-from pikamux.ui import SelectionCancelled, choose_session, print_sessions
+from pikamux.ui import (
+    SelectionCancelled,
+    choose_session,
+    format_tokens,
+    print_sessions,
+)
 
 
 class UiTests(unittest.TestCase):
@@ -42,7 +47,10 @@ class UiTests(unittest.TestCase):
     def test_human_list_is_a_briefing_with_reasons_and_exceptions(self) -> None:
         output = io.StringIO()
         with (
-            patch("pikamux.ui.shutil.get_terminal_size", return_value=os.terminal_size((160, 24))),
+            patch(
+                "pikamux.ui.shutil.get_terminal_size",
+                return_value=os.terminal_size((160, 24)),
+            ),
             redirect_stdout(output),
         ):
             print_sessions(self.sessions)
@@ -54,6 +62,9 @@ class UiTests(unittest.TestCase):
         self.assertIn("permission", rendered)
         self.assertIn("Exceptions:", rendered)
         self.assertIn("claude exited with status 7", rendered)
+
+    def test_large_token_counts_use_a_legible_billions_unit(self) -> None:
+        self.assertEqual(format_tokens(9_417_690_000), "9.42b")
 
     def test_json_list_stays_pure_machine_output(self) -> None:
         output = io.StringIO()

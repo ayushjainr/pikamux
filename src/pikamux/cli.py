@@ -16,6 +16,7 @@ from .core import Pika, PikaError
 from .doctor import repair_stale_state, run_doctor
 from .hooks import handle_hook, handle_process_exit, hook_stdout
 from .models import Session, Status
+from .monitor import run_monitor
 from .paths import config_path, database_path
 from .setup_hooks import (
     apply_changes,
@@ -165,17 +166,10 @@ def _select_named(
 
 
 def _bare(pika: Pika) -> int:
-    sessions = pika.refresh(usage=False)
-    attention = [item for item in sessions if item.needs_attention]
-    if len(attention) == 1:
-        return pika.open(attention[0])
-    if len(attention) > 1:
-        selected = choose_session(
-            attention,
-            "Several continuations need you",
-            attention_order=True,
-        )
-        return pika.open(selected)
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return run_monitor(pika)
+    # Preserve a useful, finite representation when bare `pika` is redirected.
+    # Stable automation should continue to prefer `pika list --json`.
     sessions = pika.refresh(usage=True)
     print_sessions(sessions)
     _print_actions(pika, sessions)

@@ -59,9 +59,9 @@ original file; Pika never deletes backups.
 ## Daily commands
 
 ```text
+pika                       open the live operations monitor
 pika NAME                  open or resurrect an exact conversation
 pika open NAME             unambiguous form, including `pika open list`
-pika                       route attention or show the compact list
 pika .                     open the relevant conversation for this repository
 pika -                     return to the previously attached Pika conversation
 pika list                  show all tracked live and parked conversations
@@ -77,6 +77,16 @@ pika doctor                print a recoverability receipt
 pika doctor --verbose      show every receipt check
 pika doctor --repair-stale remove confirmed stale launch locks (5m+)
 ```
+
+The interactive `pika` monitor refreshes operational state every two seconds
+and provider usage every thirty seconds. Use arrows or j/k to select, Enter to
+open the exact identity, `n` for the oldest attention item, `p` for a sanitized
+pane peek, `r` to reconcile immediately, `?` for help, and `q` to leave. Its
+selection is stable by provider UUID even when a status change reorders rows.
+The `PIKA PLAYBOOK` strip rotates every five minutes through practical ways to
+delegate, switch, inspect, automate waits, name workstreams, and verify recovery.
+When stdout is redirected, bare `pika` falls back to the finite static briefing;
+`pika list --json` remains the preferred automation contract.
 
 When multiple conversations share a name, Pika displays a numbered chooser with
 provider, short immutable UUID fingerprint, repository, branch, recency, and

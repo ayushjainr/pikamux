@@ -85,46 +85,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(_normalize_argv(["list"]), ["list"])
         self.assertEqual(_normalize_argv(["open", "list"]), ["open", "list"])
 
-    def test_bare_choice_one_matches_oldest_first_next_order(self) -> None:
+    def test_bare_interactive_terminal_opens_live_monitor(self) -> None:
         class BarePika:
-            def __init__(self):
-                self.opened = None
-                self.sessions = [
-                    Session(
-                        "codex",
-                        "newer",
-                        name="newer",
-                        status=Status.NEEDS_YOU.value,
-                        unread=True,
-                        last_activity_at=20,
-                    ),
-                    Session(
-                        "claude",
-                        "older",
-                        name="older",
-                        status=Status.NEEDS_YOU.value,
-                        unread=True,
-                        last_activity_at=10,
-                    ),
-                ]
-
-            def refresh(self, *, usage=False):
-                return self.sessions
-
-            def open(self, session):
-                self.opened = session
-                return 0
+            pass
 
         pika = BarePika()
         fake_stdin = Mock()
         fake_stdin.isatty.return_value = True
+        fake_stdout = Mock()
+        fake_stdout.isatty.return_value = True
         with (
-            patch("pikamux.ui.sys.stdin", fake_stdin),
-            patch("builtins.input", return_value="1"),
-            redirect_stdout(io.StringIO()),
+            patch("pikamux.cli.sys.stdin", fake_stdin),
+            patch("pikamux.cli.sys.stdout", fake_stdout),
+            patch("pikamux.cli.run_monitor", return_value=7) as monitor,
         ):
+            self.assertEqual(_bare(pika), 7)
+        monitor.assert_called_once_with(pika)
+
+    def test_bare_redirected_output_remains_static(self) -> None:
+        pika = Mock()
+        pika.refresh.return_value = []
+        with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(_bare(pika), 0)
-        self.assertEqual(pika.opened.name, "older")
+        pika.refresh.assert_called_once_with(usage=True)
+        self.assertIn("No Pika sessions yet", output.getvalue())
 
     def test_wait_reconciles_provider_state_periodically(self) -> None:
         pika = WaitPika()

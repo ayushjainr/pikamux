@@ -77,7 +77,9 @@ def format_tokens(value: int | None) -> str:
         return str(value)
     if value < 1_000_000:
         return f"{value / 1000:.1f}k"
-    return f"{value / 1_000_000:.2f}m"
+    if value < 1_000_000_000:
+        return f"{value / 1_000_000:.2f}m"
+    return f"{value / 1_000_000_000:.2f}b"
 
 
 def format_cost(value: float | None) -> str:
@@ -219,7 +221,8 @@ def choose_session(
     if not sys.stdin.isatty():
         names = ", ".join(f"{item.provider}:{item.session_id[:8]}" for item in sessions)
         raise ValueError(
-            f"Multiple continuations match; run interactively or use a session UUID: {names}"
+            "Multiple continuations match; run interactively or use a "
+            f"session UUID: {names}"
         )
     providers = {item.provider for item in sessions}
     names = {item.display_name.casefold() for item in sessions}
