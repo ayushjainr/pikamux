@@ -170,4 +170,20 @@ def find_processes_with_session_id(session_id: str, provider: str) -> list[int]:
             continue
         if _process_kind(argv) == provider:
             matches.append(pid)
-    return matches
+    return _canonical_identity_pids(matches)
+
+
+def _canonical_identity_pids(pids: list[int]) -> list[int]:
+    """Collapse a provider launcher and its direct native child into one owner.
+
+    The npm Codex launcher and the native Codex binary both retain the resumed
+    thread UUID in argv. They are one client process tree, not two concurrent
+    opens. Separate trees remain separate so genuine concurrency stays visible.
+    """
+    matches = set(pids)
+    launcher_aliases = {
+        parent
+        for pid in matches
+        if (parent := parent_pid(pid)) is not None and parent in matches
+    }
+    return sorted(matches - launcher_aliases)

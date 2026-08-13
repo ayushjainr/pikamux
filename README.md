@@ -86,7 +86,7 @@ pika peek NAME --ack       explicitly acknowledge READY in a script
 pika wait NAME             wait for NEEDS YOU, unread READY, OPEN TWICE, or ERROR
 pika new NAME              create using the configured default provider
 pika new NAME --agent ...  override with codex or claude
-pika adopt [TMUX_TARGET]    tag an already-running agent pane
+pika adopt [TARGET|NAME]    tag a live agent by tmux target or Pika name
 pika doctor                print a recoverability receipt
 pika doctor --verbose      show every receipt check
 pika doctor --repair-stale remove confirmed stale launch locks (5m+)
@@ -134,6 +134,13 @@ pretending the score measures intelligence, and includes card freshness and
 source. Archived conversations disappear from lookup with the rest of Pika's
 daily surface. Cards created before the two-horizon contract are marked stale
 until a scheduled or explicit refresh supplies their current state.
+
+`pika adopt NAME` resolves the exact UUID and finds the untagged tmux pane that
+contains its live provider process. A process running under a normal SSH or
+terminal shell cannot be moved safely into tmux after it has started; in that
+case Pika names the PID and exact recovery command. Exit that agent normally,
+then run the displayed `pika open UUID` command to resume it inside a protected
+Pika home. This avoids both unsafe process reparenting and a duplicate thread.
 
 Agent and dashboard clients can keep a genuine multi-turn side open with
 `pika ask UUID --jsonl`. Send one `{"question":"..."}` object per line and end
@@ -224,11 +231,13 @@ implicit provider choice.
 
 Live hook ownership is bound to both a PID and its Linux process start time, so
 a recycled PID cannot counterfeit exact-UUID identity. A shared Codex app-server
-owner is a five-minute, hook-renewed lease rather than permanent hard identity;
-an expired claim is removed automatically when native UUID process evidence
-proves the exact pane. A real second UUID-bearing process remains fail-closed and
-is displayed as `OPEN TWICE`. Legacy owner rows without start-time evidence
-remain fail-closed.
+owner is advisory whenever a client process carries direct UUID evidence and is
+a five-minute, hook-renewed lease only when stronger evidence is absent; an
+expired claim is removed automatically. A Node launcher and its direct native
+Codex child count as one logical client even though both argv values contain the
+UUID. Separate UUID-bearing process trees remain fail-closed and are displayed
+as `OPEN TWICE`. Legacy owner rows without start-time evidence remain
+fail-closed.
 
 Each Pika-managed conversation gets one UUID-derived tmux session. A new Claude
 conversation is named natively with `--name`; a new Codex conversation is named

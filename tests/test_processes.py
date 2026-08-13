@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from pikamux.processes import (
+    _canonical_identity_pids,
     _process_kind,
     provider_ancestor,
     shared_provider_process,
@@ -11,6 +12,13 @@ from pikamux.processes import (
 
 
 class ProcessTests(unittest.TestCase):
+    def test_uuid_process_aliases_collapse_only_within_one_direct_tree(self) -> None:
+        parents = {200: 100, 300: 1}
+        with patch(
+            "pikamux.processes.parent_pid", side_effect=lambda pid: parents.get(pid)
+        ):
+            self.assertEqual(_canonical_identity_pids([100, 200, 300]), [200, 300])
+
     def test_agent_executables_are_classified_by_basename(self) -> None:
         self.assertEqual(_process_kind(["/usr/bin/claude", "--resume", "id"]), "claude")
         self.assertEqual(

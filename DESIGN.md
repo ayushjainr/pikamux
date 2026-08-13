@@ -30,6 +30,9 @@ Signature decisions:
   immutable UUID fingerprint.
 - Exact/protected language requires current UUID-to-PID pane evidence. Tags,
   attachment, and liveness alone never earn it.
+- Provider launcher/native-child aliases count as one logical client. Shared
+  app-server hook leases are advisory when direct UUID-bearing client evidence
+  exists; distinct UUID-bearing process trees remain `OPEN TWICE`.
 - Freshness, partial provider discovery, and refresh failure remain visible;
   stale data is never silently presented as current or fully synchronized.
 

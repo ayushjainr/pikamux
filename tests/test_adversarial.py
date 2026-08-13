@@ -55,6 +55,16 @@ class StaticTmux:
     def list_panes(self) -> list[Pane]:
         return self.panes
 
+    def get_pane(self, target: str) -> Pane | None:
+        return next(
+            (
+                item
+                for item in self.panes
+                if target in {item.pane_id, item.session_name}
+            ),
+            None,
+        )
+
     def available(self) -> bool:
         return True
 
@@ -313,7 +323,7 @@ class AdversarialTests(unittest.TestCase):
             self.assertEqual(pika.identity_pids(session), set())
         self.assertEqual(self.store.get_live_owners(*session.key), [])
 
-    def test_stale_shared_app_server_lease_auto_recovers_exact_pane(self) -> None:
+    def test_shared_app_server_lease_never_blocks_and_expires_normally(self) -> None:
         session_id = "12121212-1212-4212-8212-121212121212"
         session = Session(
             "codex",
@@ -347,9 +357,9 @@ class AdversarialTests(unittest.TestCase):
             patch("pikamux.core.process_tree", side_effect=tree),
             patch("pikamux.core.shared_provider_process", return_value=True),
         ):
-            blocked = pika.refresh()[0]
-            self.assertEqual(blocked.status, Status.ERROR.value)
-            self.assertFalse(blocked.exact_home)
+            exact = pika.refresh()[0]
+            self.assertEqual(exact.status, Status.READY.value)
+            self.assertTrue(exact.exact_home)
 
             with self.store.connect() as db:
                 db.execute(
@@ -366,7 +376,7 @@ class AdversarialTests(unittest.TestCase):
         self.assertIsNone(recovered.error)
         self.assertEqual(self.store.get_live_owners("codex", session_id), [])
 
-    def test_fresh_shared_app_server_lease_remains_fail_closed(self) -> None:
+    def test_exact_uuid_process_outranks_fresh_shared_app_server_lease(self) -> None:
         session_id = "13131313-1313-4313-8313-131313131313"
         session = Session("codex", session_id, cwd="/tmp")
         self.store.upsert_session(session)
@@ -389,10 +399,35 @@ class AdversarialTests(unittest.TestCase):
             patch("pikamux.core.process_tree", return_value=[123, 999]),
             patch("pikamux.core.shared_provider_process", return_value=True),
         ):
-            self.assertIsNone(pika.exact_pane_pid(session, tmux.panes[0]))
+            self.assertEqual(pika.exact_pane_pid(session, tmux.panes[0]), 999)
         self.assertEqual(
             self.store.get_live_owners("codex", session_id)[0][0], owner_root
         )
+
+    def test_fresh_dedicated_owner_lease_still_remains_fail_closed(self) -> None:
+        session_id = "14141414-1414-4414-8414-141414141414"
+        session = Session("codex", session_id, cwd="/tmp")
+        self.store.upsert_session(session)
+        owner_root = os.getpid()
+        self.assertTrue(self.store.set_live_owner("codex", session_id, owner_root))
+        tmux = StaticTmux([pane(provider="codex", session_id=session_id)])
+        pika = Pika(
+            self.store,
+            tmux,
+            {"codex": FakeProvider(active=[999])},
+        )
+
+        def provider_at_root(pid, provider=None):
+            if provider != "codex":
+                return None
+            return 999 if pid == 123 else 777 if pid == owner_root else None
+
+        with (
+            patch("pikamux.core.provider_process", side_effect=provider_at_root),
+            patch("pikamux.core.process_tree", return_value=[123, 999]),
+            patch("pikamux.core.shared_provider_process", return_value=False),
+        ):
+            self.assertIsNone(pika.exact_pane_pid(session, tmux.panes[0]))
 
     def test_open_refuses_to_replace_other_agent_in_saved_pane(self) -> None:
         session_id = "11111111-1111-4111-8111-111111111111"
@@ -703,6 +738,54 @@ class AdversarialTests(unittest.TestCase):
         imported = outside.import_candidate(second)
         self.assertEqual(imported.status, Status.UNBOUND.value)
         self.assertFalse(imported.managed)
+
+    def test_adopt_name_finds_the_untagged_tmux_pane(self) -> None:
+        session_id = "33333333-3333-4333-8333-333333333333"
+        session = Session("claude", session_id, name="named-agent", cwd="/tmp")
+        candidate = Candidate(
+            "claude",
+            session_id,
+            name="named-agent",
+            cwd="/tmp",
+            live=True,
+            pid=999,
+        )
+        tmux = StaticTmux([pane()])
+        pika = Pika(
+            self.store,
+            tmux,
+            {"claude": FakeProvider("claude", [candidate], active=[999])},
+        )
+
+        def provider_at_root(_pid, provider=None):
+            return 999 if provider == "claude" else None
+
+        with (
+            patch.object(pika, "resolve", return_value=session),
+            patch("pikamux.core.process_tree", return_value=[123, 999]),
+            patch("pikamux.core.provider_process", side_effect=provider_at_root),
+        ):
+            adopted = pika.adopt("named-agent")
+
+        self.assertEqual(adopted.session_id, session_id)
+        self.assertEqual(tmux.tags[0][0], "%1")
+
+    def test_adopt_name_explains_safe_transition_from_outside_tmux(self) -> None:
+        session_id = "44444444-4444-4444-8444-444444444444"
+        session = Session("claude", session_id, name="outside-agent", cwd="/tmp")
+        pika = Pika(
+            self.store,
+            StaticTmux(),
+            {"claude": FakeProvider("claude", active=[999])},
+        )
+        with (
+            patch.object(pika, "resolve", return_value=session),
+            self.assertRaisesRegex(
+                PikaError,
+                "running outside tmux.*cannot be moved safely.*pika open 44444444",
+            ),
+        ):
+            pika.adopt("outside-agent")
 
     def test_stale_pending_identity_is_not_pruned_by_refresh(self) -> None:
         self.store.add_pending("old-token", "codex", "unbound", "/tmp")

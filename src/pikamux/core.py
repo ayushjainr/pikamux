@@ -608,8 +608,21 @@ class Pika:
         return result
 
     def identity_pids(self, session: Session) -> set[int]:
-        """Return UUID evidence plus currently valid hook-owner leases."""
-        return self.uuid_identity_pids(session) | self._live_owner_pids(session)
+        """Return direct UUID evidence plus non-conflicting hook-owner leases.
+
+        A shared Codex app-server can emit hooks for several clients and cannot
+        compete with a process that carries this exact UUID in argv. It remains
+        useful as a short lease only when no direct UUID-bearing client exists.
+        """
+        uuid_pids = self.uuid_identity_pids(session)
+        lease_pids = self._live_owner_pids(session)
+        if uuid_pids:
+            lease_pids = {
+                pid
+                for pid in lease_pids
+                if not shared_provider_process(pid, session.provider)
+            }
+        return uuid_pids | lease_pids
 
     def _outside_uuid_pids(self, session: Session, pane: Pane) -> list[int]:
         inside = set(process_tree(pane.pane_pid))
@@ -689,8 +702,11 @@ class Pika:
             if outside:
                 pid_text = ", ".join(str(pid) for pid in outside)
                 raise PikaError(
-                    f"{current.display_name} is already running outside Pika tmux (PID {pid_text}). "
-                    "Pika refuses to open a duplicate conversation."
+                    f"{current.display_name} is already running outside Pika tmux "
+                    f"(PID {pid_text}). Pika refuses to open a duplicate "
+                    "conversation. If it is inside an untagged tmux pane, run "
+                    f"`pika adopt {current.session_id}` there; otherwise exit that "
+                    "agent normally, then rerun this command to resume it inside Pika."
                 )
         if not live_pid:
             provider = self.providers.get(current.provider)
@@ -1444,6 +1460,49 @@ class Pika:
                 "Specify a tmux target, or run `pika adopt` from inside tmux"
             )
         pane = self.tmux.get_pane(target)
+        named_session: Session | None = None
+        if pane is None:
+            try:
+                named_session = self.resolve(target)
+            except PikaError:
+                named_session = None
+            if named_session is not None:
+                direct_pids = self.uuid_identity_pids(named_session)
+                containing = [
+                    item
+                    for item in self.tmux.list_panes()
+                    if direct_pids.intersection(process_tree(item.pane_pid))
+                ]
+                if len(containing) == 1:
+                    pane = containing[0]
+                elif len(containing) > 1:
+                    homes = ", ".join(
+                        f"{item.session_name}:{item.pane_id}" for item in containing
+                    )
+                    raise PikaError(
+                        f"{terminal_text(named_session.display_name)} appears in "
+                        f"multiple tmux panes ({homes}); Pika will not guess."
+                    )
+                elif direct_pids:
+                    pid_text = ", ".join(map(str, sorted(direct_pids)))
+                    resume = shlex.join(
+                        ["pika", "open", named_session.session_id]
+                    )
+                    raise PikaError(
+                        f"{terminal_text(named_session.display_name)} is running "
+                        f"outside tmux (PID {pid_text}). A live process cannot be "
+                        "moved safely into tmux. Exit that agent normally, then run "
+                        f"`{resume}` to resume the exact UUID inside Pika."
+                    )
+                else:
+                    resume = shlex.join(
+                        ["pika", "open", named_session.session_id]
+                    )
+                    raise PikaError(
+                        f"{terminal_text(named_session.display_name)} is not running "
+                        f"inside a tmux pane. Run `{resume}` to create its exact Pika "
+                        "home."
+                    )
         if not pane:
             raise PikaError(f"No tmux pane matches {target!r}")
         running_agents: list[tuple[str, int]] = []

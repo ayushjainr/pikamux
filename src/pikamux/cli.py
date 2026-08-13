@@ -161,8 +161,10 @@ def _parser() -> argparse.ArgumentParser:
     new_parser.add_argument("--agent", choices=("codex", "claude"))
     new_parser.add_argument("--cwd")
 
-    adopt_parser = sub.add_parser("adopt", help="adopt a running agent pane")
-    adopt_parser.add_argument("target", nargs="?")
+    adopt_parser = sub.add_parser(
+        "adopt", help="adopt a running agent by tmux target or Pika name"
+    )
+    adopt_parser.add_argument("target", nargs="?", metavar="TMUX_TARGET_OR_NAME")
     adopt_parser.add_argument("--name")
 
     setup_parser = sub.add_parser("setup", help="preview and install lifecycle hooks")
