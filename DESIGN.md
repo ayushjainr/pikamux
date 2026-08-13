@@ -23,6 +23,9 @@ Signature decisions:
 
 - A commander's brief says where intervention is required, how many results are
   waiting, and what to open next; its underlying categories remain disjoint.
+- On wide terminals, a grouped workstream rail keeps the delegation portfolio
+  visible while a persistent inspector explains the selected exact identity,
+  expert card, live pane tail, and available actions.
 - One stable selection band binds every action to a visible provider, name, and
   immutable UUID fingerprint.
 - Exact/protected language requires current UUID-to-PID pane evidence. Tags,
@@ -32,29 +35,40 @@ Signature decisions:
 
 # Layout
 
-The operational topology is status → anomaly → explanation → action. The live
-monitor uses a header/freshness line, commander's brief, sortable workstream table,
-selected-workstream detail band, and persistent keyboard legend. Narrow
-terminals remove secondary columns before truncating identity or state. Below
-the supported minimum, show the required dimensions and retain a visible quit
-path. A persistent Pika Playbook strip rotates every five minutes through
-copyable, high-leverage operating habits selected from current state; it never
-displaces current state or keyboard recovery guidance. Usage is a deliberate
-secondary view, not default visual spectacle.
+The operational topology is status → anomaly → explanation → action. On wide
+terminals, the live monitor uses a compact status header, a left rail grouped by
+attention state, and a right inspector for the selected workstream. The
+inspector presents provider UUID proof before card-derived expertise, a
+read-only selected-pane tail, and UUID-bound actions. Narrow terminals fall
+back to the sortable table and selected-workstream detail band, removing
+secondary columns before truncating identity or state. Below the supported
+minimum, show the required dimensions and retain a visible quit path. A
+persistent Pika Playbook strip rotates every five minutes through copyable,
+high-leverage operating habits selected from current state; it never displaces
+current state or keyboard recovery guidance. Usage is a deliberate secondary
+view, not default visual spectacle.
 
 # Interaction & States
 
 `pika` opens the live monitor only on an interactive terminal. `pika list` and
 redirected bare output remain finite and stable. Arrow keys or j/k move the
-selection; Enter opens the exact selected identity; n opens the oldest attention
-item using the same ordering as `pika next`; p opens a sanitized pane peek; u
-toggles the usage view; r reconciles; ? explains controls; q or Esc recovers or
-exits.
+selection; Enter opens the exact selected identity; `a` leaves the monitor for
+an ephemeral side consultation with that exact UUID; n opens the oldest
+attention item using the same ordering as `pika next`; p opens a sanitized pane
+peek; u toggles the usage view; r reconciles; ? explains controls; q or Esc
+recovers or exits.
 
 Selection persists by `(provider, UUID)` across refresh and resort. An unbound
 live process cannot be opened as if managed. Refresh errors retain the last good
 screen and identify the failure. Empty, loading, narrow, overflow, unread,
 working, ready, parked, error, and unbound states are first-class.
+
+The wide inspector describes a stale expert card as `+NEW CONTEXT`: the exact
+machine state remains `STALE`, but the visible framing makes clear that the
+conversation advanced rather than the card failing. Card claims remain
+provider-authored evidence, not Pika's inference. The selected live-pane tail
+is read-only and never acknowledges unread work; expanding it with p retains
+the existing explicit acknowledgement contract.
 
 The first successful scan claims a committed event-ledger watermark and monitor
 visit in one transaction. First use briefly frames the current handoff; a visit
@@ -82,6 +96,10 @@ or delay an attach. The monitor uses the alternate screen and redraws text only;
 it adds no runtime dependency or persistent background daemon.
 Playbook rotation is derived from wall-clock five-minute buckets, so it requires
 no additional timer, task, or persistent state.
+Expert cards are loaded locally on a separate five-minute cadence; this display
+refresh never interviews a provider. A read-only tail captures only the selected
+tmux pane every two seconds in a daemon-scoped worker, does not read provider
+transcripts, and never changes unread state.
 
 # Sources
 
@@ -95,9 +113,13 @@ no additional timer, task, or persistent state.
 # Do's and Don'ts
 
 - Do prioritize intervention and exact identity over resource spectacle.
+- Do use the right inspector to explain one selected workstream rather than
+  widening the left rail with metadata columns.
 - Do preserve the last trustworthy snapshot when reconciliation fails.
 - Do remove secondary columns before compressing names into ambiguity.
 - Do label API-equivalent estimates with their pricing date and unavailable data
   with an em dash.
 - Don't make the default monitor the only scriptable inventory surface.
 - Don't infer transcript meaning or invent token/cost values for visual fullness.
+- Don't impose a terminal background palette; ANSI roles inherit the user's
+  terminal theme and `NO_COLOR` remains authoritative.

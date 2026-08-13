@@ -223,7 +223,12 @@ def _select_named(
 
 def _bare(pika: Pika) -> int:
     if sys.stdin.isatty() and sys.stdout.isatty():
-        return run_monitor(pika)
+        return run_monitor(
+            pika,
+            ask_handler=lambda session: _ask_session(
+                session, [], jsonl=False
+            ),
+        )
     # Preserve a useful, finite representation when bare `pika` is redirected.
     # Stable automation should continue to prefer `pika list --json`.
     sessions = pika.refresh(usage=True)
@@ -261,6 +266,12 @@ def _ask(
     pika: Pika, name: str, question_parts: list[str], *, jsonl: bool = False
 ) -> int:
     session = _select_named(pika, name)
+    return _ask_session(session, question_parts, jsonl=jsonl)
+
+
+def _ask_session(
+    session: Session, question_parts: list[str], *, jsonl: bool = False
+) -> int:
     if not session.transcript_path:
         raise PikaError(
             f"{session.display_name} has no durable provider transcript to consult"

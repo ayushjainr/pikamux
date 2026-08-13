@@ -133,13 +133,19 @@ all questions until close, so follow-ups retain side context without replaying
 answers or modifying the parent.
 
 The interactive `pika` monitor refreshes operational state every two seconds.
-Use arrows or j/k to select, Enter to open the selected identity, `n` for the
-oldest attention item, `p` for a sanitized pane peek, `u` to reveal or hide
-provider usage, `r` to reconcile immediately, `?` for keys, and `q` to leave.
-Usage collection starts separately every thirty seconds only while its view is
-visible, so it cannot delay operational updates, opening a workstream, or leaving
-the monitor. Selection is stable by provider UUID even when a status change
-reorders rows.
+On wide terminals it uses a grouped workstream rail and a selected-workstream
+inspector inspired by a live operations board: exact identity, signal, expert
+card, read-only pane tail, and actions remain visible together. Narrow terminals
+retain the compact table view. Use arrows or j/k to select, Enter to open the
+selected identity, `a` to begin an ephemeral side consultation with that exact
+UUID, `n` for the oldest attention item, `p` for a full sanitized pane peek, `u`
+to reveal or hide provider usage, `r` to reconcile immediately, `?` for keys,
+and `q` to leave. Usage collection starts separately every thirty seconds only
+while its view is visible, so it cannot delay operational updates, opening a
+workstream, or leaving the monitor. Expert cards are loaded locally every five
+minutes without spending provider quota. The selected-pane tail is read-only,
+transcript-free, and never acknowledges unread work. Selection remains stable
+by provider UUID even when a status change reorders rows.
 
 The monitor opens with a decision briefing rather than raw process totals. A
 first handoff describes current state; after six hours away, a temporary

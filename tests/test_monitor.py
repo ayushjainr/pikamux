@@ -10,11 +10,13 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from pikamux.models import Session, Status
+from pikamux.experts import ExpertCardState
+from pikamux.models import ExpertProfile, Session, Status
 from pikamux.monitor import (
     HandoffSummary,
     MonitorState,
     _briefing_lines,
+    _capture_preview,
     _handle_key,
     _identity_text,
     _morning_handoff,
@@ -79,13 +81,16 @@ class MonitorTests(unittest.TestCase):
             state, width=140, height=30, now=time.time(), refreshing=True, color=True
         )
         self.assertIn("PIKA // LIVE OPERATIONS", frame.plain)
-        self.assertIn("YOU'RE NEEDED IN 1 PLACE", frame.plain)
-        self.assertIn("1 RESULT WAITING", frame.plain)
+        self.assertIn("2 need you", frame.plain)
+        self.assertIn("NEEDS YOU", frame.plain)
+        self.assertIn("WORKING", frame.plain)
         self.assertIn("permission", frame.plain)
-        self.assertIn("SELECTED // needs-permission", frame.plain)
+        self.assertIn("needs-permission", frame.plain)
         self.assertNotIn("TOKENS", frame.plain)
         self.assertIn("EXACT HOME", frame.plain)
+        self.assertIn("LIVE PANE TAIL", frame.plain)
         self.assertIn("Enter open", frame.plain)
+        self.assertIn("a ask privately", frame.plain)
         self.assertIn("PIKA PLAYBOOK", frame.plain)
         lines = frame.plain.splitlines()
         self.assertEqual(len(lines), 30)
@@ -153,10 +158,10 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("REFRESH ERROR // provider database busy", frame.plain)
 
     def test_keyboard_and_mouse_sequences_are_decoded(self) -> None:
-        buffer = bytearray(b"ju\x1b[A\x1b[<65;10;5M\r?")
+        buffer = bytearray(b"jua\x1b[A\x1b[<65;10;5M\r?")
         self.assertEqual(
             decode_keys(buffer),
-            ["down", "usage", "up", "down", "enter", "help"],
+            ["down", "usage", "ask", "up", "down", "enter", "help"],
         )
         self.assertEqual(buffer, bytearray())
 
@@ -186,6 +191,19 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(action, "continue")
         self.assertIsNone(selected)
         self.assertIn("adopt", state.toast)
+
+        identity_error = Session(
+            "codex",
+            "identity-error",
+            name="blocked",
+            status=Status.ERROR.value,
+            home_state="identity-error",
+        )
+        state = MonitorState(sessions=[identity_error])
+        action, selected = _handle_key("enter", Mock(), state)
+        self.assertEqual(action, "continue")
+        self.assertIsNone(selected)
+        self.assertIn("opening remains blocked", state.toast)
 
     def test_terminal_sequence_stripping_protects_peek_surface(self) -> None:
         value = "safe\x1b[2Jrewritten\x1b]0;title\x07"
@@ -363,7 +381,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(action, "usage")
         self.assertTrue(state.show_usage)
         usage = render_monitor(state, width=140, height=24, color=False)
-        self.assertIn("USAGE VIEW", usage.plain)
+        self.assertIn("LIVE OPERATIONS · USAGE", usage.plain)
         self.assertIn("PROVIDER COUNTERS", usage.plain)
         self.assertIn("API-EQUIV", usage.plain)
         self.assertIn("2026-08-12", usage.plain)
@@ -520,6 +538,66 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(all(flag is False for flag in pika.refresh_usage_flags))
         self.assertEqual(pika.usage_calls, calls_after_hiding)
 
+    def test_runtime_leaves_monitor_for_exact_ephemeral_ask(self) -> None:
+        session = Session(
+            "codex",
+            "ask-parent",
+            name="expert",
+            transcript_path="/tmp/expert.jsonl",
+            status=Status.PARKED.value,
+        )
+
+        class FakeStore:
+            def claim_monitor_handoff(self, _timestamp):
+                return None, {}
+
+        class FakePika:
+            store = FakeStore()
+            discovery_errors: list[str] = []
+
+            def refresh(self, *, usage=False):
+                return [session]
+
+            def next_attention(self, _sessions=None):
+                return None
+
+            def open(self, _session, *, attach=True):
+                return 0
+
+        asked: list[Session] = []
+        master, slave = pty.openpty()
+        fcntl.ioctl(
+            slave,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", 24, 120, 0, 0),
+        )
+        result: list[int] = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                run_monitor(
+                    FakePika(),
+                    input_fd=slave,
+                    output_fd=slave,
+                    refresh_seconds=0.02,
+                    ask_handler=lambda selected: asked.append(selected) or 9,
+                )
+            )
+        )
+        try:
+            thread.start()
+            time.sleep(0.08)
+            os.write(master, b"a")
+            thread.join(1.0)
+        finally:
+            if thread.is_alive():
+                os.write(master, b"q")
+                thread.join(1.0)
+            os.close(master)
+            os.close(slave)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [9])
+        self.assertEqual(asked, [session])
+
     def test_tiny_viewport_never_writes_past_real_dimensions(self) -> None:
         frame = render_monitor(
             MonitorState(), width=10, height=6, now=1.0, color=False
@@ -528,6 +606,47 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(len(lines), 6)
         self.assertTrue(all(len(line) == 10 for line in lines))
         self.assertNotIn("20x6", frame.plain)
+
+    def test_split_detail_surfaces_card_freshness_and_ephemeral_ask(self) -> None:
+        session = self.sessions[0]
+        session.transcript_path = "/tmp/provider-thread.jsonl"
+        profile = ExpertProfile(
+            session.provider,
+            session.session_id,
+            "Verified the production returns reconciliation workflow.",
+            ("daily returns", "trade reconciliation", "PostgreSQL"),
+            ("ops/returns.md",),
+            100.0,
+            "interview",
+        )
+        card = ExpertCardState(session, profile, "STALE", "conversation changed")
+        state = MonitorState(
+            sessions=self.sessions,
+            last_update=time.time(),
+            expert_cards={session.key: card},
+            expert_cards_updated_at=time.time(),
+        )
+        frame = render_monitor(state, width=140, height=30, color=False)
+        self.assertIn("1 expert", frame.plain.splitlines()[0])
+        self.assertIn("EXPERT CARD", frame.plain)
+        self.assertIn("+NEW CONTEXT", frame.plain)
+        self.assertIn("trade reconciliation", frame.plain)
+        self.assertIn("[a] ask privately", frame.plain)
+
+        action, selected = _handle_key("ask", Mock(), state)
+        self.assertEqual(action, "ask")
+        self.assertIs(selected, session)
+
+    def test_live_tail_is_read_only_and_preserves_unread(self) -> None:
+        session = self.sessions[0]
+        pika = Mock()
+        pika.tmux.capture.return_value = "old\n\x1b[31mnew result\x1b[0m"
+        key, lines, error = _capture_preview(pika, session)
+        self.assertEqual(key, session.key)
+        self.assertEqual(lines[-1], "new result")
+        self.assertIsNone(error)
+        self.assertTrue(session.unread)
+        pika.acknowledge.assert_not_called()
 
 
 if __name__ == "__main__":

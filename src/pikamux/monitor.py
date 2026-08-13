@@ -12,9 +12,11 @@ import time
 import tty
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Protocol
+from textwrap import wrap
+from typing import Callable, Protocol
 
-from .models import Session, Status
+from .experts import ExpertCardState
+from .models import ExpertProfile, Session, Status
 from .pricing import PRICING_AS_OF
 from .ui import (
     PROVIDER_MARK,
@@ -29,12 +31,16 @@ from .ui import (
 
 REFRESH_SECONDS = 2.0
 USAGE_REFRESH_SECONDS = 30.0
+EXPERT_CARD_REFRESH_SECONDS = 300.0
+PREVIEW_REFRESH_SECONDS = 2.0
 PLAYBOOK_ROTATION_SECONDS = 300
 MORNING_GAP_SECONDS = 6 * 60 * 60
 HANDOFF_DISPLAY_SECONDS = 15.0
 SLOW_REFRESH_SECONDS = 1.0
 MIN_WIDTH = 58
 MIN_HEIGHT = 15
+SPLIT_MIN_WIDTH = 104
+SPLIT_MIN_HEIGHT = 20
 SPINNER = ("◐", "◓", "◑", "◒")
 PLAYBOOK_TIPS = (
     (
@@ -151,6 +157,10 @@ class MonitorPika(Protocol):
         self, sessions: list[Session] | None = None
     ) -> Session | None: ...
 
+    def expert_card_states(
+        self, sessions: list[Session] | None = None
+    ) -> list[ExpertCardState]: ...
+
     @property
     def tmux(self): ...
 
@@ -196,6 +206,12 @@ class MonitorState:
     emphasize_refresh: bool = False
     handoff: HandoffSummary | None = None
     handoff_until: float = 0.0
+    expert_cards: dict[tuple[str, str], ExpertCardState] = field(default_factory=dict)
+    expert_cards_updated_at: float = 0.0
+    preview_key: tuple[str, str] | None = None
+    preview_lines: list[str] = field(default_factory=list)
+    preview_error: str | None = None
+    preview_updated_at: float = 0.0
 
     def ordered(self) -> list[Session]:
         return sorted_sessions(self.sessions)
@@ -230,6 +246,9 @@ class MonitorState:
     def notify(self, message: str, *, now: float | None = None) -> None:
         self.toast = terminal_text(message)
         self.toast_until = (now or time.monotonic()) + 3.0
+
+    def expert_card(self, session: Session | None) -> ExpertCardState | None:
+        return self.expert_cards.get(session.key) if session is not None else None
 
 
 def strip_terminal_sequences(value: str) -> str:
@@ -555,7 +574,7 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
     if width < 80:
         items = [
             "↑↓/jk move · Enter open · n next",
-            "p peek · u usage · r refresh",
+            "a ask · p peek · u usage · r refresh",
             "g/G ends · ? close · q/Esc close",
             (
                 f"Need {counts['decisions']} · results {counts['results']} · "
@@ -566,9 +585,10 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
         items = [
             "↑/k  previous workstream        ↓/j  next workstream",
             "Enter open selected             n    open oldest attention",
-            "p     peek recent pane output   u    operations / usage view",
-            "r     reconcile now             g/G  first / last",
-            "?     close this help           q/Esc close this help",
+            "a     ask selected privately     p    peek recent pane output",
+            "u     operations / usage view    r    reconcile now",
+            "g/G   first / last               ?    close this help",
+            "q/Esc close this help",
             "",
             (
                 f"Inventory: {counts['decisions']} decisions · "
@@ -685,6 +705,468 @@ def _age_phrase(session: Session, now: float) -> str:
     }.get(session.status, f"last active {activity_age} ago")
 
 
+def _needs_you_group(session: Session) -> bool:
+    return session.status in {
+        Status.NEEDS_YOU.value,
+        Status.ERROR.value,
+        Status.OPEN_TWICE.value,
+    } or (session.status == Status.READY.value and session.unread)
+
+
+def _split_groups(sessions: list[Session]) -> list[tuple[str, list[Session]]]:
+    ordered = sorted_sessions(sessions)
+    definitions = (
+        ("NEEDS YOU", _needs_you_group),
+        ("WORKING", lambda item: item.status == Status.WORKING.value),
+        ("UNBOUND", lambda item: item.status == Status.UNBOUND.value),
+        (
+            "READY",
+            lambda item: item.status == Status.READY.value and not item.unread,
+        ),
+        ("PARKED", lambda item: item.status == Status.PARKED.value),
+    )
+    assigned: set[tuple[str, str]] = set()
+    groups: list[tuple[str, list[Session]]] = []
+    for label, predicate in definitions:
+        members = [item for item in ordered if predicate(item) and item.key not in assigned]
+        if members:
+            assigned.update(item.key for item in members)
+            groups.append((label, members))
+    other = [item for item in ordered if item.key not in assigned]
+    if other:
+        groups.append(("OTHER", other))
+    return groups
+
+
+def _group_color(label: str) -> str:
+    return {
+        "NEEDS YOU": FG_RED,
+        "WORKING": FG_CYAN,
+        "UNBOUND": FG_MAGENTA,
+        "READY": FG_GREEN,
+        "PARKED": FG_BRIGHT_BLACK,
+    }.get(label, FG_BLUE)
+
+
+def _split_left_pane(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    now: float,
+    color: bool,
+) -> tuple[list[str], list[str]]:
+    selected = state.selected()
+    entries: list[tuple[str, Session | None]] = []
+    for index, (label, members) in enumerate(_split_groups(state.sessions)):
+        if index:
+            entries.append(("", None))
+        entries.append((label, None))
+        entries.extend(("", item) for item in members)
+
+    selected_index = next(
+        (
+            index
+            for index, (_label, item) in enumerate(entries)
+            if item is not None and selected is not None and item.key == selected.key
+        ),
+        0,
+    )
+    if len(entries) > height:
+        start = max(0, min(len(entries) - height, selected_index - height // 2))
+        entries = entries[start : start + height]
+
+    plain_lines: list[str] = []
+    ansi_lines: list[str] = []
+    for label, item in entries:
+        if item is None:
+            plain = _fit(label, width)
+            ansi = _paint(plain, DIM + _group_color(label), color) if label else plain
+        else:
+            is_selected = selected is not None and item.key == selected.key
+            marker = "›" if is_selected else " "
+            signal = "◆" if _needs_you_group(item) else "□" if item.live else "·"
+            provider = PROVIDER_MARK.get(item.provider, "?")
+            age = (
+                "adopt"
+                if item.status == Status.UNBOUND.value
+                else _human_age_at(
+                    item.last_event_at
+                    if item.status
+                    in {
+                        Status.NEEDS_YOU.value,
+                        Status.READY.value,
+                        Status.ERROR.value,
+                        Status.OPEN_TWICE.value,
+                    }
+                    else item.last_activity_at,
+                    now,
+                )
+            )
+            prefix = f"{marker}{signal} {provider} "
+            name_width = max(4, width - len(prefix) - len(age) - 1)
+            plain = _fit(
+                f"{prefix}{_fit(item.display_name, name_width)} {age}", width
+            )
+            if is_selected:
+                ansi = _paint(plain, REVERSE + BOLD, color)
+            else:
+                ansi = _paint(plain, _status_code(item.status), color)
+        plain_lines.append(plain)
+        ansi_lines.append(ansi)
+
+    while len(plain_lines) < height:
+        plain_lines.append(" " * width)
+        ansi_lines.append(" " * width)
+    return plain_lines[:height], ansi_lines[:height]
+
+
+def _detail_value(label: str, value: str, width: int) -> str:
+    label_width = 9
+    return _fit(f"{_fit(label, label_width)}{terminal_text(value)}", width)
+
+
+def _wrapped_detail(
+    value: str, *, width: int, first_prefix: str = "", continuation: str = ""
+) -> list[str]:
+    available = max(1, width - len(first_prefix))
+    chunks = wrap(
+        terminal_text(value),
+        width=available,
+        break_long_words=False,
+        break_on_hyphens=False,
+    ) or [""]
+    lines = [_fit(first_prefix + chunks[0], width)]
+    continuation = continuation or " " * len(first_prefix)
+    following_width = max(1, width - len(continuation))
+    for chunk in chunks[1:]:
+        for part in wrap(
+            chunk,
+            width=following_width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [""]:
+            lines.append(_fit(continuation + part, width))
+    return lines
+
+
+def _card_display_status(card: ExpertCardState | None) -> str:
+    if card is None:
+        return "LOADING"
+    return {
+        "CURRENT": "CURRENT",
+        "STALE": "+NEW CONTEXT",
+        "MISSING": "NOT INTERVIEWED",
+        "UNKNOWN": "SOURCE UNAVAILABLE",
+    }.get(card.status, card.status)
+
+
+def _split_right_pane(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    now: float,
+    color: bool,
+) -> tuple[list[str], list[str]]:
+    selected = state.selected()
+    if selected is None:
+        plain = [
+            _fit("NO WORKSTREAM SELECTED", width),
+            _fit("Choose a workstream on the left.", width),
+        ]
+        return (
+            (plain + [" " * width] * height)[:height],
+            ([_paint(plain[0], BOLD, color), plain[1]] + [" " * width] * height)[
+                :height
+            ],
+        )
+
+    card = state.expert_card(selected)
+    profile = card.profile if card else None
+    signal = selected.error or selected.attention_reason or "no exception reported"
+    status_mark = "◆" if _needs_you_group(selected) else "□"
+    title = _line(selected.display_name, f"{status_mark} {selected.status}", width)
+    active_handoff = (
+        state.handoff
+        if state.handoff and time.monotonic() < state.handoff_until
+        else None
+    )
+
+    plain: list[str] = [title]
+    ansi: list[str] = [_paint(title, BOLD, color)]
+
+    if state.refresh_error:
+        notice = _fit(f"REFRESH ERROR // {state.refresh_error}", width)
+        plain.append(notice)
+        ansi.append(_paint(notice, FG_RED, color))
+    elif state.toast and time.monotonic() < state.toast_until:
+        notice = _fit(f"NOTICE // {state.toast}", width)
+        plain.append(notice)
+        ansi.append(_paint(notice, FG_YELLOW, color))
+    elif active_handoff is not None:
+        notice = _fit(_handoff_text(active_handoff), width)
+        plain.append(notice)
+        ansi.append(_paint(notice, FG_MAGENTA, color))
+
+    metadata = [
+        _detail_value("signal", f"{signal} · {_age_phrase(selected, now)}", width),
+        _detail_value(
+            "agent", f"{selected.provider.title()} · id {selected.session_id[:8]}", width
+        ),
+        _detail_value("path", selected.cwd or "—", width),
+        _detail_value("branch", selected.branch or "—", width),
+        _detail_value("home", _identity_text(selected), width),
+    ]
+    plain.extend(metadata)
+    ansi.extend(
+        [
+            metadata[0],
+            _paint(metadata[1], DIM, color),
+            metadata[2],
+            metadata[3],
+            _paint(metadata[4], FG_GREEN if selected.exact_home else FG_MAGENTA, color),
+        ]
+    )
+
+    plain.append(" " * width)
+    ansi.append(" " * width)
+    card_heading = _line(
+        "EXPERT CARD",
+        _card_display_status(card),
+        width,
+    )
+    plain.append(card_heading)
+    card_color = (
+        FG_GREEN
+        if card and card.status == "CURRENT"
+        else FG_YELLOW
+        if card and card.status == "STALE"
+        else FG_MAGENTA
+    )
+    ansi.append(_paint(card_heading, BOLD + card_color, color))
+
+    if profile is not None:
+        summary_lines = _wrapped_detail(profile.summary, width=width)
+        topic_lines = _wrapped_detail(
+            " · ".join(profile.topics),
+            width=width,
+            first_prefix="knows    ",
+            continuation="         ",
+        )
+        card_plain = [*summary_lines[:2], *topic_lines[:2]]
+        card_ansi = [
+            *summary_lines[:2],
+            *[_paint(line, FG_BLUE, color) for line in topic_lines[:2]],
+        ]
+        if profile.artifacts and height >= 24:
+            artifact = _detail_value("artifact", profile.artifacts[0], width)
+            card_plain.append(artifact)
+            card_ansi.append(_paint(artifact, DIM, color))
+        plain.extend(card_plain)
+        ansi.extend(card_ansi)
+    elif card is not None:
+        message = _fit(f"{card.detail}. Pika will keep this state explicit.", width)
+        plain.append(message)
+        ansi.append(_paint(message, DIM, color))
+    else:
+        message = _fit("Loading the UUID-bound expert card…", width)
+        plain.append(message)
+        ansi.append(_paint(message, DIM, color))
+
+    if state.show_usage:
+        plain.append(" " * width)
+        ansi.append(" " * width)
+        usage_heading = _fit(
+            f"USAGE // PROVIDER COUNTERS · API-EQUIV EST {PRICING_AS_OF}", width
+        )
+        usage = _fit(
+            (
+                f"CPU {selected.cpu_percent:.1f}%"
+                if selected.cpu_percent is not None
+                else "CPU —"
+            )
+            + (
+                f" · RAM {format_bytes(selected.rss_kb)} · "
+                f"TOKENS {format_tokens(selected.total_tokens)} · "
+                f"API-EQUIV {format_cost(selected.estimated_cost_usd)}"
+            ),
+            width,
+        )
+        plain.extend([usage_heading, usage])
+        ansi.extend([_paint(usage_heading, BOLD + FG_CYAN, color), usage])
+
+    action_heading = _fit("DO SOMETHING", width)
+    if selected.status == Status.UNBOUND.value and selected.live:
+        actions = "Enter blocked · run pika adopt to create an exact home"
+        reassurance = "Pika will not guess ownership for a live external process."
+    elif selected.home_state in {"identity-error", "open-twice"}:
+        ask = " · [a] ask privately" if selected.transcript_path else ""
+        actions = f"[Enter] blocked{ask} · run pika doctor --verbose"
+        reassurance = "The saved conversation remains visible; pane identity is fail-closed."
+    else:
+        open_label = (
+            "collect result"
+            if selected.status == Status.READY.value and selected.unread
+            else "open"
+        )
+        ask = " · [a] ask privately" if selected.transcript_path else ""
+        actions = f"[Enter] {open_label}{ask} · [p] peek"
+        reassurance = (
+            "Private asks are ephemeral; the parent transcript remains unchanged."
+            if selected.transcript_path
+            else "This conversation has no durable transcript available for side asks."
+        )
+    action_block = [
+        " " * width,
+        action_heading,
+        _fit(actions, width),
+        _fit(reassurance, width),
+    ]
+
+    preview_slots = height - len(plain) - len(action_block)
+    if preview_slots >= 3:
+        preview_heading = _line("LIVE PANE TAIL", "READ-ONLY · UNREAD PRESERVED", width)
+        preview_body_slots = preview_slots - 2
+        if state.preview_key == selected.key and state.preview_lines:
+            preview = state.preview_lines[-preview_body_slots:]
+        elif state.preview_key == selected.key and state.preview_error:
+            preview = [f"Preview unavailable: {state.preview_error}"]
+        elif selected.tmux_pane or selected.tmux_session:
+            preview = ["Waiting for the first selected-pane capture…"]
+        elif selected.home_state in {"identity-error", "open-twice"}:
+            preview = ["No trusted pane. Opening stays blocked until identity recovers."]
+        else:
+            preview = ["No live pane. Enter restores this exact saved conversation."]
+        preview = [_fit(line, width) for line in preview[:preview_body_slots]]
+        while len(preview) < preview_body_slots:
+            preview.append(" " * width)
+        plain.extend([" " * width, preview_heading, *preview])
+        ansi.extend(
+            [
+                " " * width,
+                _paint(preview_heading, DIM + FG_CYAN, color),
+                *[_paint(line, FG_BRIGHT_BLACK, color) for line in preview],
+            ]
+        )
+    if len(plain) + len(action_block) <= height:
+        plain.extend(action_block)
+        ansi.extend(
+            [
+                " " * width,
+                _paint(action_heading, DIM + FG_MAGENTA, color),
+                _paint(_fit(actions, width), BOLD, color),
+                _paint(_fit(reassurance, width), DIM, color),
+            ]
+        )
+
+    while len(plain) < height:
+        plain.append(" " * width)
+        ansi.append(" " * width)
+    return plain[:height], ansi[:height]
+
+
+def _render_split_monitor(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    now: float,
+    refreshing: bool,
+    color: bool,
+) -> MonitorFrame:
+    counts = _session_counts(state.sessions)
+    need_count = sum(_needs_you_group(item) for item in state.sessions)
+    expert_count = sum(
+        card.profile is not None for card in state.expert_cards.values()
+    )
+    refresh_age = max(0.0, now - state.refresh_started_at)
+    show_refresh = refreshing and (
+        not state.last_update
+        or state.emphasize_refresh
+        or refresh_age >= SLOW_REFRESH_SECONDS
+    )
+    if state.refresh_error:
+        sync = (
+            f"STALE {max(0, int(now - state.last_update))}s"
+            if state.last_update
+            else "SCAN FAILED"
+        )
+    elif state.refresh_warning:
+        sync = "PARTIAL"
+    elif show_refresh:
+        sync = f"{SPINNER[int(now * 4) % len(SPINNER)]} SYNCING"
+    else:
+        sync = "●"
+    clock = datetime.fromtimestamp(now).strftime("%H:%M:%S")
+    summary = [
+        f"{need_count} need you",
+        f"{counts['working']} working",
+        f"{counts['unbound']} unbound",
+    ]
+    if state.expert_cards_updated_at:
+        summary.append(f"{expert_count} {_noun(expert_count, 'expert')}")
+    status_clock = (
+        f"{sync} {clock}"
+        if sync == "●" or any(sync.startswith(frame) for frame in SPINNER)
+        else f"{sync} · {clock}"
+    )
+    summary.append(status_clock)
+    view = " · USAGE" if state.show_usage else ""
+    header_plain = _line(
+        f"PIKA // LIVE OPERATIONS{view}",
+        " · ".join(summary),
+        width,
+    )
+    header_ansi = _paint(header_plain, BOLD + FG_CYAN, color)
+
+    body_height = max(1, height - 3)
+    left_width = max(32, min(44, width // 3))
+    divider = " │ "
+    right_width = width - left_width - len(divider)
+    left_plain, left_ansi = _split_left_pane(
+        state, width=left_width, height=body_height, now=now, color=color
+    )
+    right_plain, right_ansi = _split_right_pane(
+        state, width=right_width, height=body_height, now=now, color=color
+    )
+    divider_ansi = _paint(divider, FG_BRIGHT_BLACK, color)
+    body_plain = [
+        left_plain[index] + divider + right_plain[index]
+        for index in range(body_height)
+    ]
+    body_ansi = [
+        left_ansi[index] + divider_ansi + right_ansi[index]
+        for index in range(body_height)
+    ]
+
+    selected = state.selected()
+    tip_index, tip_total, tip = playbook_tip(
+        now,
+        state.sessions,
+        selected=selected,
+        refresh_error=state.refresh_error,
+        compact=width < 120,
+    )
+    playbook_plain = _fit(
+        f"PIKA PLAYBOOK {tip_index + 1}/{tip_total} // {tip}", width
+    )
+    playbook_ansi = _paint(playbook_plain, FG_BLUE, color)
+    footer_plain = _fit(
+        "↑↓/jk move  Enter open  a ask privately  n next needed  p peek  "
+        f"u {'operations' if state.show_usage else 'usage'}  r refresh  ? keys  q quit",
+        width,
+    )
+    footer_ansi = _paint(footer_plain, REVERSE, color)
+    plain_lines = [header_plain, *body_plain, playbook_plain, footer_plain]
+    ansi_lines = [header_ansi, *body_ansi, playbook_ansi, footer_ansi]
+    return MonitorFrame(
+        "\n".join(ansi_lines[:height]),
+        "\n".join(_fit(line, width) for line in plain_lines[:height]),
+        state.selected_key,
+    )
+
+
 def render_monitor(
     state: MonitorState,
     *,
@@ -715,6 +1197,21 @@ def render_monitor(
         minimum = (minimum + [""] * height)[:height]
         plain = "\n".join(_fit(line, width) for line in minimum)
         return MonitorFrame(plain, plain, state.selected_key)
+
+    if (
+        width >= SPLIT_MIN_WIDTH
+        and height >= SPLIT_MIN_HEIGHT
+        and state.mode == "sessions"
+        and state.sessions
+    ):
+        return _render_split_monitor(
+            state,
+            width=width,
+            height=height,
+            now=now,
+            refreshing=refreshing,
+            color=color,
+        )
 
     refresh_age = max(0.0, now - state.refresh_started_at)
     show_refresh = refreshing and (
@@ -901,12 +1398,12 @@ def render_monitor(
 
     exit_copy = "q close" if state.mode in {"help", "peek"} else "q quit"
     footer_text = (
-        f"↑↓ move  ↵ open  n next  p peek  u usage  ? keys  {exit_copy}"
+        f"↑↓ move  ↵ open  a ask  p peek  u usage  ? keys  {exit_copy}"
         if width < 80
         else (
-            "↑↓/jk move  Enter open  n next  p peek  "
+            "↑↓/jk move  Enter open  a ask  n next  p peek  "
             f"u {'operations' if state.show_usage else 'usage'}  "
-            f"r refresh  ? keys  {exit_copy}"
+            f"? keys  {exit_copy}"
         )
     )
     footer_plain = _fit(footer_text, width)
@@ -1004,6 +1501,7 @@ def decode_keys(buffer: bytearray) -> list[str]:
                 "q": "quit",
                 "?": "help",
                 "p": "peek",
+                "a": "ask",
                 "n": "next",
                 "u": "usage",
                 "r": "refresh",
@@ -1089,6 +1587,20 @@ def _open_peek(pika: MonitorPika, state: MonitorState) -> None:
             state.notify("RESULT SEEN · unread state cleared")
 
 
+def _capture_preview(
+    pika: MonitorPika, session: Session
+) -> tuple[tuple[str, str], list[str], str | None]:
+    target = session.tmux_pane or session.tmux_session
+    if not target:
+        return session.key, [], None
+    try:
+        captured = pika.tmux.capture(target, 12)
+    except Exception as exc:  # noqa: BLE001 - preview is optional and read-only
+        return session.key, [], terminal_text(exc)
+    lines = [strip_terminal_sequences(line) for line in captured.splitlines()]
+    return session.key, lines[-12:], None
+
+
 def _handle_key(
     key: str,
     pika: MonitorPika,
@@ -1146,8 +1658,18 @@ def _handle_key(
         session = state.selected()
         if session and session.status == Status.UNBOUND.value and session.live:
             state.notify("Unbound live process — adopt it before opening")
+        elif session and session.home_state in {"identity-error", "open-twice"}:
+            state.notify("Exact pane identity is unverified — opening remains blocked")
         elif session:
             return "open", session
+    elif key == "ask":
+        session = state.selected()
+        if session and session.status == Status.UNBOUND.value and session.live:
+            state.notify("Unbound live process — adopt it before consulting")
+        elif session and not session.transcript_path:
+            state.notify("No durable provider transcript available for a side ask")
+        elif session:
+            return "ask", session
     elif key == "next":
         session = pika.next_attention(state.sessions)
         if session is None:
@@ -1236,6 +1758,7 @@ def run_monitor(
     input_fd: int | None = None,
     output_fd: int | None = None,
     refresh_seconds: float = REFRESH_SECONDS,
+    ask_handler: Callable[[Session], int] | None = None,
 ) -> int:
     input_fd = sys.stdin.fileno() if input_fd is None else input_fd
     output_fd = sys.stdout.fileno() if output_fd is None else output_fd
@@ -1244,10 +1767,17 @@ def run_monitor(
     input_buffer = bytearray()
     future: concurrent.futures.Future[list[Session]] | None = None
     usage_future: concurrent.futures.Future[list[Session]] | None = None
+    expert_future: concurrent.futures.Future[list[ExpertCardState]] | None = None
+    preview_future: concurrent.futures.Future[
+        tuple[tuple[str, str], list[str], str | None]
+    ] | None = None
     next_refresh = 0.0
     next_usage = 0.0
+    next_expert = 0.0
+    next_preview = 0.0
     manual_refresh_pending = False
     selected_to_open: Session | None = None
+    selected_to_ask: Session | None = None
     last_frame: str | None = None
     color = "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
     first_scan = True
@@ -1310,6 +1840,32 @@ def run_monitor(
                         usage_future = None
                         next_usage = monotonic + USAGE_REFRESH_SECONDS
 
+                    if expert_future is not None and expert_future.done():
+                        try:
+                            cards = expert_future.result()
+                        except Exception:  # noqa: BLE001 - cards never block operations
+                            pass
+                        else:
+                            state.expert_cards = {item.session.key: item for item in cards}
+                            state.expert_cards_updated_at = time.time()
+                        expert_future = None
+                        next_expert = monotonic + EXPERT_CARD_REFRESH_SECONDS
+
+                    if preview_future is not None and preview_future.done():
+                        try:
+                            preview_key, preview_lines, preview_error = (
+                                preview_future.result()
+                            )
+                        except Exception:  # noqa: BLE001 - optional surface
+                            pass
+                        else:
+                            state.preview_key = preview_key
+                            state.preview_lines = preview_lines
+                            state.preview_error = preview_error
+                            state.preview_updated_at = time.time()
+                        preview_future = None
+                        next_preview = monotonic + PREVIEW_REFRESH_SECONDS
+
                     if future is None and monotonic >= next_refresh:
                         state.refresh_started_at = time.time()
                         state.emphasize_refresh = manual_refresh_pending or not bool(
@@ -1328,6 +1884,46 @@ def run_monitor(
                             pika.hydrate_usage,
                             [replace(item) for item in state.sessions],
                         )
+
+                    expert_loader = getattr(pika, "expert_card_states", None)
+                    if (
+                        callable(expert_loader)
+                        and state.sessions
+                        and expert_future is None
+                        and monotonic >= next_expert
+                    ):
+                        expert_future = executor.submit(
+                            expert_loader,
+                            [replace(item) for item in state.sessions],
+                        )
+
+                    preview_session = state.selected()
+                    preview_target = (
+                        preview_session.tmux_pane or preview_session.tmux_session
+                        if preview_session is not None
+                        else None
+                    )
+                    if (
+                        preview_session is not None
+                        and preview_target
+                        and preview_future is None
+                        and (
+                            state.preview_key != preview_session.key
+                            or monotonic >= next_preview
+                        )
+                    ):
+                        preview_future = executor.submit(
+                            _capture_preview, pika, replace(preview_session)
+                        )
+                    elif (
+                        preview_session is not None
+                        and not preview_target
+                        and preview_future is None
+                        and state.preview_key != preview_session.key
+                    ):
+                        state.preview_key = preview_session.key
+                        state.preview_lines = []
+                        state.preview_error = None
 
                     size = os.get_terminal_size(output_fd)
                     frame = render_monitor(
@@ -1354,15 +1950,21 @@ def run_monitor(
                         if action == "quit":
                             future = None
                             selected_to_open = None
+                            selected_to_ask = None
                             break
                         if action == "open":
                             selected_to_open = session
+                            future = None
+                            break
+                        if action == "ask":
+                            selected_to_ask = session
                             future = None
                             break
                         if action == "refresh":
                             manual_refresh_pending = True
                             state.emphasize_refresh = True
                             next_refresh = 0.0
+                            next_expert = 0.0
                         if action == "usage" and state.show_usage:
                             next_usage = 0.0
                     else:
@@ -1370,9 +1972,11 @@ def run_monitor(
                     break
     finally:
         pass
-    if selected_to_open is None:
-        return 0
-    return pika.open(selected_to_open)
+    if selected_to_open is not None:
+        return pika.open(selected_to_open)
+    if selected_to_ask is not None and ask_handler is not None:
+        return ask_handler(selected_to_ask)
+    return 0
 
 
 def _demo_sessions(now: float) -> list[Session]:
@@ -1383,6 +1987,7 @@ def _demo_sessions(now: float) -> list[Session]:
             name="factor-history",
             cwd="/work/quant/SMART",
             branch="main",
+            transcript_path="/work/quant/SMART/.codex/factor-history.jsonl",
             tmux_pane="%12",
             status=Status.NEEDS_YOU.value,
             unread=True,
@@ -1401,6 +2006,7 @@ def _demo_sessions(now: float) -> list[Session]:
             "22222222-2222-4222-8222-222222222222",
             name="plugin-cleanup-with-a-deliberately-long-name",
             cwd="/work/qes/plugin",
+            transcript_path="/work/qes/plugin/.claude/plugin-cleanup.jsonl",
             status=Status.WORKING.value,
             last_event_at=now - 8,
             last_activity_at=now - 8,
@@ -1414,6 +2020,7 @@ def _demo_sessions(now: float) -> list[Session]:
             "33333333-3333-4333-8333-333333333333",
             name="research-paper",
             cwd="/work/research",
+            transcript_path="/work/research/.codex/research-paper.jsonl",
             status=Status.READY.value,
             unread=True,
             attention_reason="completed",
@@ -1425,6 +2032,7 @@ def _demo_sessions(now: float) -> list[Session]:
             "44444444-4444-4444-8444-444444444444",
             name="older-parked",
             cwd="/work/archive",
+            transcript_path="/work/archive/.codex/older-parked.jsonl",
             status=Status.PARKED.value,
             last_event_at=now - 172_800,
             last_activity_at=now - 172_800,
@@ -1439,9 +2047,35 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=30)
     args = parser.parse_args()
     now = time.time()
+    sessions = _demo_sessions(now)
+    selected = sessions[0]
+    profile = ExpertProfile(
+        selected.provider,
+        selected.session_id,
+        "Built and verified the SMART factor-history publication workflow.",
+        ("monthly factor weights", "S3 publication", "idempotent reruns"),
+        ("SMART/qis/SMART_factor_weights_history.parquet",),
+        now - 300,
+        "interview",
+    )
     state = MonitorState(
-        sessions=_demo_sessions(now),
+        sessions=sessions,
         last_update=now - 1,
+        expert_cards={
+            selected.key: ExpertCardState(
+                selected, profile, "CURRENT", "matches transcript"
+            )
+        },
+        expert_cards_updated_at=now - 1,
+        refresh_started_at=now,
+        preview_key=selected.key,
+        preview_lines=[
+            "17:13:02  reading monthly factor weights",
+            "17:13:44  verified 38 tests",
+            "17:14:11  unchanged rerun wrote nothing",
+            "17:14:47  done · history publication is idempotent",
+        ],
+        preview_updated_at=now - 1,
     )
     print(
         render_monitor(
