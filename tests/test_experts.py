@@ -36,11 +36,21 @@ class ExpertTests(unittest.TestCase):
             current = make_profile(
                 session,
                 summary="Did the work.",
+                current_state="No active task; the verified work is complete.",
                 topics=["work"],
                 transcript_mtime_ns=stat.st_mtime_ns,
                 transcript_size=stat.st_size,
             )
             self.assertEqual(card_state(session, current).status, "CURRENT")
+            legacy = make_profile(
+                session,
+                summary="Recent work only.",
+                topics=["work"],
+                transcript_mtime_ns=stat.st_mtime_ns,
+                transcript_size=stat.st_size,
+            )
+            self.assertEqual(card_state(session, legacy).status, "STALE")
+            self.assertIn("current-state", card_state(session, legacy).detail)
             transcript.write_text("one\ntwo\n")
             self.assertEqual(card_state(session, current).status, "STALE")
 
@@ -56,7 +66,10 @@ class ExpertTests(unittest.TestCase):
                 self.prompt = prompt
                 return json.dumps(
                     {
-                        "summary": "Built and verified exact identity recovery.",
+                        "scope": "Owns exact identity and recovery across Pika.",
+                        "current_state": (
+                            "Recovery is verified; lease handling is the current focus."
+                        ),
                         "topics": ["session identity", "tmux recovery", "PID leases"],
                         "artifacts": ["src/pikamux/core.py"],
                     }
@@ -72,7 +85,10 @@ class ExpertTests(unittest.TestCase):
             ):
                 profile = interview_profile(session)
             self.assertEqual(profile.source, "interview")
-            self.assertIn("personally completed", consultation.prompt)
+            self.assertEqual(profile.scope, "Owns exact identity and recovery across Pika.")
+            self.assertIn("lease handling", profile.current_state)
+            self.assertIn("entire inherited conversation", consultation.prompt)
+            self.assertIn("not a recap of the latest work", consultation.prompt)
             self.assertEqual(
                 (profile.transcript_mtime_ns, profile.transcript_size),
                 (transcript.stat().st_mtime_ns, transcript.stat().st_size),
@@ -110,6 +126,7 @@ class ExpertTests(unittest.TestCase):
                 ("factor attribution", "portfolio analytics"),
                 ("reports/attribution.md",),
                 100,
+                current_state="Investigating a live attribution mismatch.",
             ),
             ExpertProfile(
                 "claude",
@@ -118,22 +135,31 @@ class ExpertTests(unittest.TestCase):
                 ("factor research",),
                 (),
                 200,
+                current_state="No active task.",
             ),
         ]
         matches = rank_experts(profiles, sessions, "factor attribution")
         self.assertEqual([item.session.session_id for item in matches], ["one", "two"])
         self.assertIn("topic", matches[0].matched_on)
-        self.assertIn("summary", matches[0].matched_on)
+        self.assertIn("scope", matches[0].matched_on)
         self.assertGreater(matches[0].score, matches[1].score)
+        current = rank_experts(profiles, sessions, "live mismatch")
+        self.assertEqual(current[0].session.session_id, "one")
+        self.assertIn("now", current[0].matched_on)
+        payload = current[0].to_dict()
+        self.assertEqual(payload["scope"], profiles[0].scope)
+        self.assertEqual(payload["current_state"], profiles[0].current_state)
 
     def test_profiles_are_cleaned_but_not_invented(self) -> None:
         profile = make_profile(
             Session("codex", "one"),
             summary="  Built   real work. ",
+            current_state="  Validating   the next release. ",
             topics=["attribution", "Attribution", " risk "],
             artifacts=[" reports/result.md "],
         )
         self.assertEqual(profile.summary, "Built real work.")
+        self.assertEqual(profile.current_state, "Validating the next release.")
         self.assertEqual(profile.topics, ("attribution", "risk"))
         self.assertEqual(profile.artifacts, ("reports/result.md",))
         with self.assertRaisesRegex(ValueError, "at least one"):
@@ -172,7 +198,9 @@ class ExpertTests(unittest.TestCase):
             patch.object(pika, "exact_pane_pid", return_value=999),
         ):
             profile = pika.publish_expert(
-                summary="Owns this implementation.", topics=["identity"]
+                summary="Owns this implementation.",
+                current_state="Testing exact recovery now.",
+                topics=["identity"],
             )
         self.assertEqual(profile.session_id, "exact-id")
 
@@ -182,7 +210,11 @@ class ExpertTests(unittest.TestCase):
             patch.object(pika, "exact_pane_pid", return_value=None),
             self.assertRaisesRegex(PikaError, "cannot prove"),
         ):
-            pika.publish_expert(summary="Counterfeit", topics=["anything"])
+            pika.publish_expert(
+                summary="Counterfeit",
+                current_state="Pretending to work.",
+                topics=["anything"],
+            )
         self.assertEqual(
             store.get_expert_profile("codex", "exact-id").summary,
             "Owns this implementation.",

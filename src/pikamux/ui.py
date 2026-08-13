@@ -257,8 +257,8 @@ def print_experts(
             cells.append(value.ljust(size))
         print("  ".join(cells).rstrip())
     print(
-        "\nCards come from exact UUID-bound interviews; claims remain evidence "
-        "to inspect."
+        "\nCards come from exact UUID-bound interviews; durable scope and current "
+        "state remain evidence to inspect."
     )
 
 

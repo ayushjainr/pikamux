@@ -57,6 +57,7 @@ class ExpertRefreshTests(unittest.TestCase):
             source="interview",
             transcript_mtime_ns=stat.st_mtime_ns,
             transcript_size=stat.st_size,
+            current_state="Exact recovery is verified and currently stable.",
         )
 
     def test_due_refresh_uses_expiring_quota_once(self) -> None:

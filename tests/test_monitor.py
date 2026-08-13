@@ -8,6 +8,7 @@ import termios
 import threading
 import time
 import unittest
+from dataclasses import replace
 from unittest.mock import Mock, patch
 
 from pikamux.experts import ExpertCardState
@@ -673,6 +674,7 @@ class MonitorTests(unittest.TestCase):
             ("ops/returns.md",),
             100.0,
             "interview",
+            current_state="Reconciling three late source identifiers.",
         )
         card = ExpertCardState(session, profile, "STALE", "conversation changed")
         state = MonitorState(
@@ -686,7 +688,21 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("EXPERT CARD", frame.plain)
         self.assertIn("+NEW CONTEXT", frame.plain)
         self.assertIn("trade reconciliation", frame.plain)
+        self.assertIn("scope", frame.plain)
+        self.assertIn("Reconciling three late source", frame.plain)
         self.assertIn("[a] ask here", frame.plain)
+
+        legacy = replace(profile, current_state="")
+        state.expert_cards[session.key] = ExpertCardState(
+            session,
+            legacy,
+            "STALE",
+            "legacy card lacks a current-state snapshot",
+        )
+        legacy_frame = render_monitor(state, width=140, height=30, color=False)
+        self.assertIn("NEEDS REFRESH", legacy_frame.plain)
+        self.assertIn("now      not captured", legacy_frame.plain)
+        state.expert_cards[session.key] = card
 
         action, selected = _handle_key("ask", Mock(), state)
         self.assertEqual(action, "ask-open")

@@ -362,6 +362,7 @@ class StoreTests(unittest.TestCase):
                 "Built the factor attribution pipeline.",
                 ("factor attribution", "portfolio analytics"),
                 ("reports/attribution.md",),
+                current_state="Validating the production handoff.",
             )
         )
         self.assertGreater(first.updated_at, 0)
@@ -371,12 +372,17 @@ class StoreTests(unittest.TestCase):
             loaded.topics if loaded else None,
             ("factor attribution", "portfolio analytics"),
         )
+        self.assertEqual(
+            loaded.current_state if loaded else None,
+            "Validating the production handoff.",
+        )
         replacement = self.store.put_expert_profile(
             ExpertProfile(
                 "codex",
                 "expert",
                 "Owns the production attribution implementation.",
                 ("production attribution",),
+                current_state="No active blocker; awaiting the next run.",
             )
         )
         self.assertEqual(
@@ -420,6 +426,7 @@ class StoreTests(unittest.TestCase):
             db.execute("ALTER TABLE expert_profiles DROP COLUMN transcript_size")
             db.execute("ALTER TABLE expert_profiles DROP COLUMN transcript_mtime_ns")
             db.execute("ALTER TABLE expert_profiles DROP COLUMN source")
+            db.execute("ALTER TABLE expert_profiles DROP COLUMN current_state")
         migrated = Store(self.db_path)
         migrated.initialize()
         with migrated.connect() as db:
@@ -428,7 +435,12 @@ class StoreTests(unittest.TestCase):
                 for row in db.execute("PRAGMA table_info(expert_profiles)")
             }
         self.assertTrue(
-            {"source", "transcript_mtime_ns", "transcript_size"}.issubset(columns)
+            {
+                "source",
+                "transcript_mtime_ns",
+                "transcript_size",
+                "current_state",
+            }.issubset(columns)
         )
 
 

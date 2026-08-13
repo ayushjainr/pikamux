@@ -81,9 +81,13 @@ or failed provider turn.
 The wide inspector describes a stale expert card as `+NEW CONTEXT`: the exact
 machine state remains `STALE`, but the visible framing makes clear that the
 conversation advanced rather than the card failing. Card claims remain
-provider-authored evidence, not Pika's inference. The selected live-pane tail
-is read-only and never acknowledges unread work; expanding it with p retains
-the existing explicit acknowledgement contract.
+provider-authored evidence, not Pika's inference. Every current card has two
+visible horizons: `scope` is the durable thread mandate synthesized across the
+full inherited history, and `now` is the current objective, stage, blocker,
+decision, or next step. A recent-work receipt cannot satisfy the card contract;
+legacy cards without `now` are stale until refreshed. The selected live-pane
+tail is read-only and never acknowledges unread work; expanding it with p
+retains the existing explicit acknowledgement contract.
 
 The first successful scan claims a committed event-ledger watermark and monitor
 visit in one transaction. First use briefly frames the current handoff; a visit

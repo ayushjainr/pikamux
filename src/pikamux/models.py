@@ -155,10 +155,16 @@ class ExpertProfile:
     source: str = "self"
     transcript_mtime_ns: int | None = None
     transcript_size: int | None = None
+    current_state: str = ""
 
     @property
     def key(self) -> tuple[str, str]:
         return self.provider, self.session_id
+
+    @property
+    def scope(self) -> str:
+        """The durable mandate retained in the legacy summary field."""
+        return self.summary
 
 
 @dataclass(slots=True)

@@ -1161,6 +1161,7 @@ class Pika:
         self,
         *,
         summary: str,
+        current_state: str,
         topics: Iterable[str],
         artifacts: Iterable[str] = (),
     ) -> ExpertProfile:
@@ -1169,6 +1170,7 @@ class Pika:
         profile = make_profile(
             session,
             summary=summary,
+            current_state=current_state,
             topics=topics,
             artifacts=artifacts,
             transcript_mtime_ns=fingerprint[0] if fingerprint else None,

@@ -108,7 +108,12 @@ calls, even when many tracked conversations have missing or stale cards.
 the same read-only, ephemeral provider fork as `pika ask`, so a live parent keeps
 working and its transcript is unchanged. The interview is asked for only
 firsthand work, specific topics, and concrete artifacts. The saved card includes
-its provider UUID, source, and transcript fingerprint.
+its provider UUID, source, and transcript fingerprint. Each interview separates
+two horizons: `scope` describes the durable mandate across the whole thread,
+while `current_state` says what is actually happening now—the active objective,
+stage, blocker, decision, or next step. The prompt explicitly rejects a recap of
+the latest turn and asks the agent to weight early, recurring, and recent work
+against the entire inherited conversation.
 
 `pika expert status` reports `CURRENT`, `STALE`, `MISSING`, or `UNKNOWN` without
 reading transcript contents. `pika expert refresh NAME` and `--all` are explicit
@@ -120,13 +125,15 @@ remains. It reads provider-native reset telemetry, never hard-codes reset times,
 and makes no model call when telemetry is missing or stale. An attempted card is
 not retried in the same reset cycle.
 
-`pika expert publish --summary "..." --topic "..." --artifact "..."` remains an
-exact-pane correction surface; one agent cannot manually write another agent's
-card. `pika experts "factor attribution" --json` ranks cards deterministically
-from topics, summary, project, and artifacts, exposes `matched_on` rather than
+`pika expert publish --scope "..." --now "..." --topic "..." --artifact "..."`
+remains an exact-pane correction surface; one agent cannot manually write
+another agent's card. `--summary` remains an alias for `--scope`. `pika experts
+"factor attribution" --json` ranks cards deterministically from topics, durable
+scope, current state, project, and artifacts, exposes `matched_on` rather than
 pretending the score measures intelligence, and includes card freshness and
 source. Archived conversations disappear from lookup with the rest of Pika's
-daily surface.
+daily surface. Cards created before the two-horizon contract are marked stale
+until a scheduled or explicit refresh supplies their current state.
 
 Agent and dashboard clients can keep a genuine multi-turn side open with
 `pika ask UUID --jsonl`. Send one `{"question":"..."}` object per line and end

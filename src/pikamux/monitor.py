@@ -971,6 +971,8 @@ def _wrapped_detail(
 def _card_display_status(card: ExpertCardState | None) -> str:
     if card is None:
         return "LOADING"
+    if card.status == "STALE" and not (card.profile and card.profile.current_state):
+        return "NEEDS REFRESH"
     return {
         "CURRENT": "CURRENT",
         "STALE": "+NEW CONTEXT",
@@ -1122,10 +1124,14 @@ def _ask_panel_lines(
     )
     card = state.expert_cards.get(target.key)
     if card and card.profile:
+        now_line = _detail_value(
+            "now", card.profile.current_state or "not captured — refresh this card", width
+        )
         knows = _detail_value(
             "knows", " · ".join(card.profile.topics[:3]), width
         )
     else:
+        now_line = _detail_value("now", "expert card unavailable", width)
         knows = _detail_value("knows", "expert card unavailable", width)
     heading = _line(
         "CONVERSATION",
@@ -1136,7 +1142,7 @@ def _ask_panel_lines(
         f"ASK {target.display_name}", "PRIVATE · ONLY THIS SIDE SEES IT", width
     )
     input_rows = 2 if height >= 14 else 1
-    fixed = 7 + input_rows
+    fixed = 8 + input_rows
     history_slots = max(1, height - fixed)
     history_plain, history_ansi = _ask_history_lines(
         state, width=width, slots=history_slots, color=color
@@ -1149,6 +1155,7 @@ def _ask_panel_lines(
     plain = [
         title,
         receipt,
+        now_line,
         knows,
         " " * width,
         heading,
@@ -1160,6 +1167,7 @@ def _ask_panel_lines(
     ansi = [
         _paint(title, BOLD + FG_MAGENTA, color),
         _paint(receipt, DIM, color),
+        _paint(now_line, FG_MAGENTA, color),
         _paint(knows, FG_BLUE, color),
         " " * width,
         _paint(heading, DIM + FG_CYAN, color),
@@ -1284,19 +1292,31 @@ def _split_right_pane(
     ansi.append(_paint(card_heading, BOLD + card_color, color))
 
     if profile is not None:
-        summary_lines = _wrapped_detail(profile.summary, width=width)
+        scope_lines = _wrapped_detail(
+            profile.scope,
+            width=width,
+            first_prefix="scope    ",
+            continuation="         ",
+        )
+        now_lines = _wrapped_detail(
+            profile.current_state or "not captured — refresh this card",
+            width=width,
+            first_prefix="now      ",
+            continuation="         ",
+        )
         topic_lines = _wrapped_detail(
             " · ".join(profile.topics),
             width=width,
             first_prefix="knows    ",
             continuation="         ",
         )
-        card_plain = [*summary_lines[:2], *topic_lines[:2]]
+        card_plain = [*scope_lines[:2], *now_lines[:2], *topic_lines[:2]]
         card_ansi = [
-            *summary_lines[:2],
+            *scope_lines[:2],
+            *[_paint(line, FG_MAGENTA, color) for line in now_lines[:2]],
             *[_paint(line, FG_BLUE, color) for line in topic_lines[:2]],
         ]
-        if profile.artifacts and height >= 24:
+        if profile.artifacts and height >= 27:
             artifact = _detail_value("artifact", profile.artifacts[0], width)
             card_plain.append(artifact)
             card_ansi.append(_paint(artifact, DIM, color))
@@ -2554,6 +2574,9 @@ def main() -> None:
         ("SMART/qis/SMART_factor_weights_history.parquet",),
         now - 300,
         "interview",
+        current_state=(
+            "Validating that unchanged reruns preserve every published snapshot."
+        ),
     )
     state = MonitorState(
         sessions=sessions,

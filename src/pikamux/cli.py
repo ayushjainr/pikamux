@@ -80,7 +80,19 @@ def _parser() -> argparse.ArgumentParser:
     publish_parser = expert_sub.add_parser(
         "publish", help="publish a provenance-bound expert card from this Pika pane"
     )
-    publish_parser.add_argument("--summary", required=True)
+    publish_parser.add_argument(
+        "--scope",
+        "--summary",
+        dest="summary",
+        required=True,
+        help="durable mandate across the thread, not a recent-work recap",
+    )
+    publish_parser.add_argument(
+        "--now",
+        dest="current_state",
+        required=True,
+        help="current objective, stage, blocker, decision, or next step",
+    )
     publish_parser.add_argument(
         "--topic", action="append", required=True, help="repeat or comma-separate"
     )
@@ -387,6 +399,7 @@ def _expert(pika: Pika, args: argparse.Namespace) -> int:
         ]
         profile = pika.publish_expert(
             summary=args.summary,
+            current_state=args.current_state,
             topics=topics,
             artifacts=args.artifact,
         )

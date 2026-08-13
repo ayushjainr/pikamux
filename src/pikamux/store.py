@@ -159,6 +159,7 @@ class Store:
                     provider TEXT NOT NULL,
                     session_id TEXT NOT NULL,
                     summary TEXT NOT NULL,
+                    current_state TEXT NOT NULL DEFAULT '',
                     topics_json TEXT NOT NULL,
                     artifacts_json TEXT NOT NULL,
                     source TEXT NOT NULL DEFAULT 'self',
@@ -248,6 +249,11 @@ class Store:
             if "transcript_size" not in expert_columns:
                 db.execute(
                     "ALTER TABLE expert_profiles ADD COLUMN transcript_size INTEGER"
+                )
+            if "current_state" not in expert_columns:
+                db.execute(
+                    "ALTER TABLE expert_profiles "
+                    "ADD COLUMN current_state TEXT NOT NULL DEFAULT ''"
                 )
             event_columns = {
                 str(row["name"])
@@ -535,11 +541,13 @@ class Store:
             db.execute(
                 """
                 INSERT INTO expert_profiles(
-                    provider,session_id,summary,topics_json,artifacts_json,
-                    source,transcript_mtime_ns,transcript_size,updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?)
+                    provider,session_id,summary,current_state,topics_json,
+                    artifacts_json,source,transcript_mtime_ns,transcript_size,
+                    updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(provider,session_id) DO UPDATE SET
                     summary=excluded.summary,
+                    current_state=excluded.current_state,
                     topics_json=excluded.topics_json,
                     artifacts_json=excluded.artifacts_json,
                     source=excluded.source,
@@ -551,6 +559,7 @@ class Store:
                     profile.provider,
                     profile.session_id,
                     profile.summary,
+                    profile.current_state,
                     json.dumps(profile.topics, ensure_ascii=False),
                     json.dumps(profile.artifacts, ensure_ascii=False),
                     profile.source,
@@ -569,6 +578,7 @@ class Store:
             profile.source,
             profile.transcript_mtime_ns,
             profile.transcript_size,
+            profile.current_state,
         )
 
     def get_expert_profile(
@@ -1465,6 +1475,7 @@ class Store:
                 if row["transcript_size"] is not None
                 else None
             ),
+            current_state=str(row["current_state"]),
         )
 
 

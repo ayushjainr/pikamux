@@ -6,7 +6,15 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 
-from pikamux.cli import _bare, _normalize_argv, _peek, _peek_popup, _setup, _wait
+from pikamux.cli import (
+    _bare,
+    _normalize_argv,
+    _parser,
+    _peek,
+    _peek_popup,
+    _setup,
+    _wait,
+)
 from pikamux.models import Candidate, Pane, Session, Status
 from pikamux.setup_hooks import hook_spec_fingerprint
 from pikamux.tmux import TmuxError
@@ -80,6 +88,22 @@ class PeekPika:
 
 
 class CliTests(unittest.TestCase):
+    def test_manual_expert_card_requires_scope_and_current_state(self) -> None:
+        args = _parser().parse_args(
+            [
+                "expert",
+                "publish",
+                "--scope",
+                "Owns exact recovery.",
+                "--now",
+                "Validating PID lease expiry.",
+                "--topic",
+                "identity",
+            ]
+        )
+        self.assertEqual(args.summary, "Owns exact recovery.")
+        self.assertEqual(args.current_state, "Validating PID lease expiry.")
+
     def test_bare_name_normalizes_to_open_without_shadowing_commands(self) -> None:
         self.assertEqual(_normalize_argv(["research"]), ["open", "research"])
         self.assertEqual(_normalize_argv(["list"]), ["list"])
