@@ -165,7 +165,7 @@ class ProviderTests(unittest.TestCase):
         self.assertTrue(provider.is_resumable(active_id))
         self.assertFalse(provider.is_resumable(archived_id))
 
-    def test_codex_setup_excludes_ambiguous_legacy_name(self) -> None:
+    def test_codex_setup_includes_effective_renamed_thread(self) -> None:
         session_id = "11111111-1111-4111-8111-111111111111"
         rollout = self.root / "rollout.jsonl"
         rollout.write_text("{}\n")
@@ -185,7 +185,8 @@ class ProviderTests(unittest.TestCase):
 
         provider = CodexProvider(self.root)
         self.assertEqual(provider.discover()[0].name, "generated-looking title")
-        self.assertEqual(provider.import_candidates(), [])
+        candidates = provider.import_candidates()
+        self.assertEqual([item.name for item in candidates], ["generated-looking title"])
 
     def test_codex_setup_includes_current_native_name(self) -> None:
         session_id = "11111111-1111-4111-8111-111111111111"

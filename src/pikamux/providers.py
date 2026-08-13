@@ -142,18 +142,14 @@ class CodexProvider(Provider):
         return self.enrich(named)
 
     def import_candidates(self) -> list[Candidate]:
-        """Offer only current authoritative names during commissioning.
+        """Offer Codex's effective saved names during commissioning.
 
-        The legacy append-only index does not say whether a title was generated
-        or explicitly chosen, so it is useful for reconciling already-known
-        identities but too ambiguous for a one-time adoption prompt.
+        `/rename` persists names in the append-only session index, and Codex
+        hydrates its user-facing `thread.name` from that effective name. Setup
+        therefore uses the same reconciled view as normal discovery; the core
+        commissioning pass separately rejects archived and unresumable rows.
         """
-        archived_ids = self.hidden_session_ids()
-        return [
-            item
-            for item in self._database_records()
-            if item.session_id not in archived_ids
-        ]
+        return self.discover()
 
     def _database_records(self) -> list[Candidate]:
         return self._query_current_database(named_only=True)

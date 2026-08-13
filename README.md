@@ -37,9 +37,10 @@ existing files, preserves existing JSON key order, and merges lifecycle hooks
 into Codex and Claude user settings. It offers to adopt existing resumable
 conversations with explicit names plus any conversation that is currently live
 before asking for a default provider. Archived sessions, missing histories, and
-AI-generated Claude summaries stay out of this commissioning choice. Ambiguous
-Codex labels from the legacy append-only name index also stay out; setup trusts
-only current native Codex names. Nothing is imported silently. The final
+AI-generated Claude summaries stay out of this commissioning choice. For Codex,
+setup uses the effective saved name exposed by Codex: names created with
+`/rename` are eligible even when the internal SQLite `threads.name` column is
+empty. Nothing is imported silently. The final
 commissioning ledger distinguishes active hook definitions from observed live
 events. Codex requires one extra trust step: open
 `/hooks`, approve the Pika definitions, and use Codex once so `pika doctor` can
