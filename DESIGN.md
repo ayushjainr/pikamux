@@ -48,20 +48,35 @@ high-leverage operating habits selected from current state; it never displaces
 current state or keyboard recovery guidance. Usage is a deliberate secondary
 view, not default visual spectacle.
 
+Pressing a replaces only the inspector with an inline side conversation; the
+workstream rail and live operations header remain visible. On narrow terminals,
+the same side conversation becomes a focused full-width panel rather than
+forcing a compressed split.
+
 # Interaction & States
 
 `pika` opens the live monitor only on an interactive terminal. `pika list` and
 redirected bare output remain finite and stable. Arrow keys or j/k move the
-selection; Enter opens the exact selected identity; `a` leaves the monitor for
-an ephemeral side consultation with that exact UUID; n opens the oldest
-attention item using the same ordering as `pika next`; p opens a sanitized pane
-peek; u toggles the usage view; r reconciles; ? explains controls; q or Esc
-recovers or exits.
+selection; Enter opens the exact selected identity; `a` focuses an ephemeral
+multi-turn side consultation inside the inspector; n opens the oldest attention
+item using the same ordering as `pika next`; p opens a sanitized pane peek; u
+toggles the usage view; r reconciles; ? explains controls; q or Esc recovers or
+exits. Inside the side panel, ordinary keys type, Enter sends, Ctrl+J inserts a
+newline, Ctrl+U clears the draft, arrows scroll conversation history, and Esc
+closes and discards the side before returning focus to operations.
 
 Selection persists by `(provider, UUID)` across refresh and resort. An unbound
 live process cannot be opened as if managed. Refresh errors retain the last good
 screen and identify the failure. Empty, loading, narrow, overflow, unread,
 working, ready, parked, error, and unbound states are first-class.
+
+The side panel explicitly renders opening, ready, thinking, and error states.
+One provider process owns the side for its whole lifetime, so follow-ups retain
+side context. A visible block cursor and persistent control legend make input
+focus unambiguous; q is ordinary text while the side has focus. The panel names
+the parent UUID and repeats that the side is ephemeral and the parent transcript
+is unchanged. Closing is always available through Esc, including during a slow
+or failed provider turn.
 
 The wide inspector describes a stale expert card as `+NEW CONTEXT`: the exact
 machine state remains `STALE`, but the visible framing makes clear that the
@@ -100,6 +115,10 @@ Expert cards are loaded locally on a separate five-minute cadence; this display
 refresh never interviews a provider. A read-only tail captures only the selected
 tmux pane every two seconds in a daemon-scoped worker, does not read provider
 transcripts, and never changes unread state.
+Inline consultation construction and turns run on a dedicated daemon worker so
+provider latency cannot freeze dashboard refresh, typing, or Esc recovery. Esc
+requests cancellation immediately and terminates the transient provider process;
+the monitor itself remains open.
 
 # Sources
 

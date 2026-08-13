@@ -100,9 +100,7 @@ class CliTests(unittest.TestCase):
             patch("pikamux.cli.run_monitor", return_value=7) as monitor,
         ):
             self.assertEqual(_bare(pika), 7)
-        monitor.assert_called_once()
-        self.assertIs(monitor.call_args.args[0], pika)
-        self.assertTrue(callable(monitor.call_args.kwargs["ask_handler"]))
+        monitor.assert_called_once_with(pika)
 
     def test_bare_redirected_output_remains_static(self) -> None:
         pika = Mock()

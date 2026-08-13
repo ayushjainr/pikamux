@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from pikamux.experts import ExpertCardState
 from pikamux.models import ExpertProfile, Session, Status
 from pikamux.monitor import (
+    AskMessage,
     HandoffSummary,
     MonitorState,
     _briefing_lines,
@@ -90,7 +91,7 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("EXACT HOME", frame.plain)
         self.assertIn("LIVE PANE TAIL", frame.plain)
         self.assertIn("Enter open", frame.plain)
-        self.assertIn("a ask privately", frame.plain)
+        self.assertIn("a ask here", frame.plain)
         self.assertIn("PIKA PLAYBOOK", frame.plain)
         lines = frame.plain.splitlines()
         self.assertEqual(len(lines), 30)
@@ -164,6 +165,12 @@ class MonitorTests(unittest.TestCase):
             ["down", "usage", "ask", "up", "down", "enter", "help"],
         )
         self.assertEqual(buffer, bytearray())
+
+        text_buffer = bytearray("a quick?\nπ".encode() + b"\x7f")
+        self.assertEqual(
+            decode_keys(text_buffer, text_mode=True),
+            ["a", " ", "q", "u", "i", "c", "k", "?", "newline", "π", "backspace"],
+        )
 
     def test_selection_is_stable_and_next_uses_attention_order(self) -> None:
         state = MonitorState(sessions=self.sessions)
@@ -538,7 +545,7 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(all(flag is False for flag in pika.refresh_usage_flags))
         self.assertEqual(pika.usage_calls, calls_after_hiding)
 
-    def test_runtime_leaves_monitor_for_exact_ephemeral_ask(self) -> None:
+    def test_runtime_keeps_multi_turn_ephemeral_ask_inside_monitor(self) -> None:
         session = Session(
             "codex",
             "ask-parent",
@@ -564,13 +571,43 @@ class MonitorTests(unittest.TestCase):
             def open(self, _session, *, attach=True):
                 return 0
 
-        asked: list[Session] = []
+        questions: list[str] = []
+        first_seen = threading.Event()
+        second_seen = threading.Event()
+
+        class FakeConsultation:
+            def __init__(self):
+                self.closed = threading.Event()
+
+            def ask(self, question):
+                questions.append(question)
+                (first_seen if len(questions) == 1 else second_seen).set()
+                return f"answer to {question}"
+
+            def close(self):
+                self.closed.set()
+
+        consultation = FakeConsultation()
         master, slave = pty.openpty()
+        os.set_blocking(master, False)
         fcntl.ioctl(
             slave,
             termios.TIOCSWINSZ,
             struct.pack("HHHH", 24, 120, 0, 0),
         )
+        stop_drain = threading.Event()
+
+        def drain_output():
+            while not stop_drain.is_set():
+                try:
+                    os.read(master, 65_536)
+                except BlockingIOError:
+                    time.sleep(0.01)
+                except OSError:
+                    return
+
+        drainer = threading.Thread(target=drain_output, daemon=True)
+        drainer.start()
         result: list[int] = []
         thread = threading.Thread(
             target=lambda: result.append(
@@ -579,24 +616,42 @@ class MonitorTests(unittest.TestCase):
                     input_fd=slave,
                     output_fd=slave,
                     refresh_seconds=0.02,
-                    ask_handler=lambda selected: asked.append(selected) or 9,
                 )
             )
         )
         try:
-            thread.start()
-            time.sleep(0.08)
-            os.write(master, b"a")
-            thread.join(1.0)
-        finally:
-            if thread.is_alive():
+            with patch(
+                "pikamux.monitor.consultation_for", return_value=consultation
+            ):
+                thread.start()
+                time.sleep(0.08)
+                os.write(master, b"a")
+                time.sleep(0.08)
+                self.assertTrue(thread.is_alive())
+                os.write(master, b"first\r")
+                self.assertTrue(first_seen.wait(1.0))
+                time.sleep(0.08)
+                os.write(master, b"second\r")
+                self.assertTrue(second_seen.wait(1.0))
+                time.sleep(0.08)
+                self.assertTrue(thread.is_alive())
+                os.write(master, b"\x1b")
+                time.sleep(0.08)
+                self.assertTrue(thread.is_alive())
                 os.write(master, b"q")
                 thread.join(1.0)
+        finally:
+            if thread.is_alive():
+                os.write(master, b"\x1bq")
+                thread.join(1.0)
+            stop_drain.set()
+            drainer.join(0.2)
             os.close(master)
             os.close(slave)
         self.assertFalse(thread.is_alive())
-        self.assertEqual(result, [9])
-        self.assertEqual(asked, [session])
+        self.assertEqual(result, [0])
+        self.assertEqual(questions, ["first", "second"])
+        self.assertTrue(consultation.closed.wait(1.0))
 
     def test_tiny_viewport_never_writes_past_real_dimensions(self) -> None:
         frame = render_monitor(
@@ -631,11 +686,30 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("EXPERT CARD", frame.plain)
         self.assertIn("+NEW CONTEXT", frame.plain)
         self.assertIn("trade reconciliation", frame.plain)
-        self.assertIn("[a] ask privately", frame.plain)
+        self.assertIn("[a] ask here", frame.plain)
 
         action, selected = _handle_key("ask", Mock(), state)
-        self.assertEqual(action, "ask")
+        self.assertEqual(action, "ask-open")
         self.assertIs(selected, session)
+        self.assertEqual(state.mode, "ask")
+
+        state.ask_status = "ready"
+        state.ask_messages = [
+            AskMessage("user", "Why did three trades mismatch?"),
+            AskMessage("expert", "Their source identifiers arrived late."),
+        ]
+        state.ask_input = "Were the returns affected?"
+        side = render_monitor(state, width=140, height=30, color=False)
+        self.assertIn("LIVE OPERATIONS · SIDE", side.plain)
+        self.assertIn("SIDE // EPHEMERAL", side.plain)
+        self.assertIn("Why did three trades mismatch?", side.plain)
+        self.assertIn("Were the returns affected?█", side.plain)
+        self.assertIn("Esc close side", side.plain)
+
+        compact = render_monitor(state, width=72, height=20, color=False)
+        self.assertIn("SIDE // EPHEMERAL", compact.plain)
+        self.assertIn("Enter send", compact.plain)
+        self.assertTrue(all(len(line) == 72 for line in compact.plain.splitlines()))
 
     def test_live_tail_is_read_only_and_preserves_unread(self) -> None:
         session = self.sessions[0]
@@ -647,6 +721,29 @@ class MonitorTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertTrue(session.unread)
         pika.acknowledge.assert_not_called()
+
+    def test_inline_ask_editor_preserves_input_and_has_explicit_recovery(self) -> None:
+        session = self.sessions[0]
+        session.transcript_path = "/tmp/provider-thread.jsonl"
+        state = MonitorState(sessions=[session])
+        action, _ = _handle_key("ask", Mock(), state)
+        self.assertEqual(action, "ask-open")
+
+        for key in ["w", "h", "y", "newline", "n", "o", "w", "backspace", "?"]:
+            _handle_key(key, Mock(), state)
+        self.assertEqual(state.ask_input, "why\nno?")
+        action, target = _handle_key("enter", Mock(), state)
+        self.assertEqual(action, "ask-send")
+        self.assertEqual(target.key, session.key)
+        self.assertEqual(state.ask_outbox, "why\nno?")
+        self.assertTrue(state.ask_pending)
+        self.assertEqual(state.ask_messages, [AskMessage("user", "why\nno?")])
+
+        _handle_key("x", Mock(), state)
+        self.assertEqual(state.ask_input, "")
+        action, _ = _handle_key("escape", Mock(), state)
+        self.assertEqual(action, "ask-close")
+        self.assertEqual(state.mode, "sessions")
 
 
 if __name__ == "__main__":

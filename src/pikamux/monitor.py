@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import os
+import queue
 import re
 import select
 import sys
@@ -13,8 +14,9 @@ import tty
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from textwrap import wrap
-from typing import Callable, Protocol
+from typing import Protocol
 
+from .consult import Consultation, consultation_for
 from .experts import ExpertCardState
 from .models import ExpertProfile, Session, Status
 from .pricing import PRICING_AS_OF
@@ -188,6 +190,97 @@ class HandoffSummary:
         return bool(self.finished or self.decisions or self.errors)
 
 
+@dataclass(frozen=True, slots=True)
+class AskMessage:
+    role: str
+    text: str
+
+
+class _InlineAskWorker:
+    """Own one provider-native side process without blocking the TUI."""
+
+    def __init__(self, session: Session) -> None:
+        self.session = replace(session)
+        self._requests: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._closing = threading.Event()
+        self._consultation: Consultation | None = None
+        self._consultation_lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"pika-side-{session.provider}-{session.session_id[:8]}",
+            daemon=True,
+        )
+
+    @property
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def ask(self, question: str) -> None:
+        if not self._closing.is_set():
+            self._requests.put(("ask", question))
+
+    def poll(self) -> list[tuple[str, str]]:
+        events: list[tuple[str, str]] = []
+        while True:
+            try:
+                events.append(self._events.get_nowait())
+            except queue.Empty:
+                return events
+
+    def close(self) -> None:
+        if self._closing.is_set():
+            return
+        self._closing.set()
+        self._requests.put(("close", ""))
+        threading.Thread(
+            target=self._close_consultation,
+            name="pika-side-cancel",
+            daemon=True,
+        ).start()
+
+    def _close_consultation(self) -> None:
+        with self._consultation_lock:
+            consultation = self._consultation
+            self._consultation = None
+        if consultation is not None:
+            consultation.close()
+
+    def _run(self) -> None:
+        try:
+            consultation = consultation_for(self.session)
+            with self._consultation_lock:
+                if self._closing.is_set():
+                    should_close = True
+                else:
+                    self._consultation = consultation
+                    should_close = False
+            if should_close:
+                consultation.close()
+                return
+            self._events.put(("opened", ""))
+            while not self._closing.is_set():
+                command, value = self._requests.get()
+                if command == "close":
+                    break
+                try:
+                    answer = consultation.ask(value)
+                except Exception as exc:  # noqa: BLE001 - shown inside recoverable UI
+                    if not self._closing.is_set():
+                        self._events.put(("error", str(exc)))
+                else:
+                    self._events.put(("answer", answer))
+        except Exception as exc:  # noqa: BLE001 - provider startup is recoverable
+            if not self._closing.is_set():
+                self._events.put(("error", str(exc)))
+        finally:
+            self._close_consultation()
+            self._events.put(("closed", ""))
+
+
 @dataclass(slots=True)
 class MonitorState:
     sessions: list[Session] = field(default_factory=list)
@@ -212,6 +305,14 @@ class MonitorState:
     preview_lines: list[str] = field(default_factory=list)
     preview_error: str | None = None
     preview_updated_at: float = 0.0
+    ask_target: Session | None = None
+    ask_messages: list[AskMessage] = field(default_factory=list)
+    ask_input: str = ""
+    ask_outbox: str | None = None
+    ask_status: str = "closed"
+    ask_error: str | None = None
+    ask_pending: bool = False
+    ask_scroll: int = 0
 
     def ordered(self) -> list[Session]:
         return sorted_sessions(self.sessions)
@@ -249,6 +350,23 @@ class MonitorState:
 
     def expert_card(self, session: Session | None) -> ExpertCardState | None:
         return self.expert_cards.get(session.key) if session is not None else None
+
+    def begin_ask(self, session: Session) -> None:
+        self.mode = "ask"
+        self.ask_target = replace(session)
+        self.ask_messages = []
+        self.ask_input = ""
+        self.ask_outbox = None
+        self.ask_status = "opening"
+        self.ask_error = None
+        self.ask_pending = False
+        self.ask_scroll = 0
+
+    def close_ask(self) -> None:
+        self.mode = "sessions"
+        self.ask_status = "closed"
+        self.ask_pending = False
+        self.ask_outbox = None
 
 
 def strip_terminal_sequences(value: str) -> str:
@@ -585,7 +703,7 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
         items = [
             "↑/k  previous workstream        ↓/j  next workstream",
             "Enter open selected             n    open oldest attention",
-            "a     ask selected privately     p    peek recent pane output",
+            "a     ask here in side panel      p    peek recent pane output",
             "u     operations / usage view    r    reconcile now",
             "g/G   first / last               ?    close this help",
             "q/Esc close this help",
@@ -861,6 +979,221 @@ def _card_display_status(card: ExpertCardState | None) -> str:
     }.get(card.status, card.status)
 
 
+def _safe_chat_text(value: object) -> str:
+    clean = _ANSI_ESCAPE.sub("", str(value))
+    return "".join(
+        character
+        if character.isprintable() or character == "\n"
+        else "�"
+        for character in clean
+    )
+
+
+def _chat_message_lines(message: AskMessage, width: int) -> list[str]:
+    label = "YOU" if message.role == "user" else "EXPERT"
+    prefix = f"{label} // "
+    continuation = " " * len(prefix)
+    result: list[str] = []
+    paragraphs = _safe_chat_text(message.text).split("\n")
+    for paragraph_index, paragraph in enumerate(paragraphs):
+        line_prefix = prefix if paragraph_index == 0 else continuation
+        parts = wrap(
+            paragraph,
+            width=max(1, width - len(line_prefix)),
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [""]
+        result.extend(
+            _fit((line_prefix if index == 0 else continuation) + part, width)
+            for index, part in enumerate(parts)
+        )
+    return result
+
+
+def _ask_history_lines(
+    state: MonitorState, *, width: int, slots: int, color: bool
+) -> tuple[list[str], list[str]]:
+    entries: list[tuple[str, str]] = []
+    for index, message in enumerate(state.ask_messages):
+        if index:
+            entries.append(("blank", " " * width))
+        entries.extend(
+            (message.role, line) for line in _chat_message_lines(message, width)
+        )
+    if state.ask_pending:
+        if entries:
+            entries.append(("blank", " " * width))
+        entries.append(("status", _fit("EXPERT // thinking…", width)))
+    elif state.ask_error:
+        if entries:
+            entries.append(("blank", " " * width))
+        entries.extend(
+            ("error", line)
+            for line in _wrapped_detail(
+                f"SIDE ERROR // {state.ask_error}", width=width
+            )
+        )
+    elif not entries:
+        empty = (
+            "Opening an ephemeral side context… You can type while it connects."
+            if state.ask_status == "opening"
+            else "Ask from this agent's firsthand context. Follow-ups stay in this side."
+        )
+        entries.extend(
+            ("status", line) for line in _wrapped_detail(empty, width=width)
+        )
+
+    offset = min(state.ask_scroll, max(0, len(entries) - 1))
+    end = max(0, len(entries) - offset)
+    start = max(0, end - slots)
+    visible = entries[start:end]
+    plain = [line for _role, line in visible]
+    ansi: list[str] = []
+    for role, line in visible:
+        code = {
+            "user": FG_MAGENTA,
+            "expert": "",
+            "error": FG_RED,
+            "status": DIM + FG_CYAN,
+            "blank": "",
+        }.get(role, "")
+        ansi.append(_paint(line, code, color) if code else line)
+    padding = [" " * width] * max(0, slots - len(plain))
+    return plain + padding, ansi + padding
+
+
+def _ask_input_lines(state: MonitorState, *, width: int, rows: int) -> list[str]:
+    if state.ask_pending:
+        return [_fit("› waiting for this answer…", width)] + [
+            " " * width
+        ] * max(0, rows - 1)
+    cursor = "█"
+    value = state.ask_input + cursor
+    logical: list[str] = []
+    for paragraph in value.split("\n"):
+        logical.extend(
+            wrap(
+                paragraph,
+                width=max(1, width - 2),
+                break_long_words=True,
+                break_on_hyphens=False,
+                replace_whitespace=False,
+                drop_whitespace=False,
+            )
+            or [""]
+        )
+    visible = logical[-rows:]
+    lines = [
+        _fit(("› " if index == len(visible) - 1 else "  ") + line, width)
+        for index, line in enumerate(visible)
+    ]
+    return ([" " * width] * max(0, rows - len(lines)) + lines)[-rows:]
+
+
+def _ask_panel_lines(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    now: float,
+    color: bool,
+) -> tuple[list[str], list[str]]:
+    target = state.ask_target or state.selected()
+    if target is None:
+        plain = [_fit("SIDE // NO TARGET", width), _fit("Esc closes this side.", width)]
+        return (
+            (plain + [" " * width] * height)[:height],
+            ([_paint(plain[0], FG_RED, color), plain[1]] + [" " * width] * height)[
+                :height
+            ],
+        )
+
+    status = {
+        "opening": f"{SPINNER[int(now * 4) % len(SPINNER)]} OPENING",
+        "asking": f"{SPINNER[int(now * 4) % len(SPINNER)]} THINKING",
+        "ready": "● READY",
+        "error": "! ERROR",
+        "closed": "○ CLOSED",
+    }.get(state.ask_status, state.ask_status.upper())
+    title = _line(target.display_name, status, width)
+    receipt = _fit(
+        f"SIDE // EPHEMERAL · parent {target.session_id[:8]} · transcript unchanged",
+        width,
+    )
+    card = state.expert_cards.get(target.key)
+    if card and card.profile:
+        knows = _detail_value(
+            "knows", " · ".join(card.profile.topics[:3]), width
+        )
+    else:
+        knows = _detail_value("knows", "expert card unavailable", width)
+    heading = _line(
+        "CONVERSATION",
+        f"{len(state.ask_messages)} messages · ↑↓ scroll",
+        width,
+    )
+    input_heading = _line(
+        f"ASK {target.display_name}", "PRIVATE · ONLY THIS SIDE SEES IT", width
+    )
+    input_rows = 2 if height >= 14 else 1
+    fixed = 7 + input_rows
+    history_slots = max(1, height - fixed)
+    history_plain, history_ansi = _ask_history_lines(
+        state, width=width, slots=history_slots, color=color
+    )
+    input_plain = _ask_input_lines(state, width=width, rows=input_rows)
+    help_line = _fit(
+        "Enter send · Ctrl+J newline · Ctrl+U clear · Esc close and discard",
+        width,
+    )
+    plain = [
+        title,
+        receipt,
+        knows,
+        " " * width,
+        heading,
+        *history_plain,
+        input_heading,
+        *input_plain,
+        help_line,
+    ]
+    ansi = [
+        _paint(title, BOLD + FG_MAGENTA, color),
+        _paint(receipt, DIM, color),
+        _paint(knows, FG_BLUE, color),
+        " " * width,
+        _paint(heading, DIM + FG_CYAN, color),
+        *history_ansi,
+        _paint(input_heading, DIM + FG_MAGENTA, color),
+        *[_paint(line, REVERSE if not state.ask_pending else DIM, color) for line in input_plain],
+        _paint(help_line, DIM, color),
+    ]
+    return plain[:height], ansi[:height]
+
+
+def _render_compact_ask(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    now: float,
+    color: bool,
+) -> MonitorFrame:
+    body_height = max(1, height - 1)
+    plain, ansi = _ask_panel_lines(
+        state, width=width, height=body_height, now=now, color=color
+    )
+    footer = _fit(
+        "type  Enter send  ^J newline  ^U clear  ↑↓ history  Esc close side",
+        width,
+    )
+    return MonitorFrame(
+        "\n".join([*ansi, _paint(footer, REVERSE, color)]),
+        "\n".join([*plain, footer]),
+        state.selected_key,
+    )
+
+
 def _split_right_pane(
     state: MonitorState,
     *,
@@ -869,6 +1202,10 @@ def _split_right_pane(
     now: float,
     color: bool,
 ) -> tuple[list[str], list[str]]:
+    if state.mode == "ask":
+        return _ask_panel_lines(
+            state, width=width, height=height, now=now, color=color
+        )
     selected = state.selected()
     if selected is None:
         plain = [
@@ -1001,7 +1338,7 @@ def _split_right_pane(
         actions = "Enter blocked · run pika adopt to create an exact home"
         reassurance = "Pika will not guess ownership for a live external process."
     elif selected.home_state in {"identity-error", "open-twice"}:
-        ask = " · [a] ask privately" if selected.transcript_path else ""
+        ask = " · [a] ask here" if selected.transcript_path else ""
         actions = f"[Enter] blocked{ask} · run pika doctor --verbose"
         reassurance = "The saved conversation remains visible; pane identity is fail-closed."
     else:
@@ -1010,10 +1347,10 @@ def _split_right_pane(
             if selected.status == Status.READY.value and selected.unread
             else "open"
         )
-        ask = " · [a] ask privately" if selected.transcript_path else ""
+        ask = " · [a] ask here" if selected.transcript_path else ""
         actions = f"[Enter] {open_label}{ask} · [p] peek"
         reassurance = (
-            "Private asks are ephemeral; the parent transcript remains unchanged."
+            "Inline asks are ephemeral; the parent transcript remains unchanged."
             if selected.transcript_path
             else "This conversation has no durable transcript available for side asks."
         )
@@ -1112,7 +1449,7 @@ def _render_split_monitor(
         else f"{sync} · {clock}"
     )
     summary.append(status_clock)
-    view = " · USAGE" if state.show_usage else ""
+    view = " · SIDE" if state.mode == "ask" else " · USAGE" if state.show_usage else ""
     header_plain = _line(
         f"PIKA // LIVE OPERATIONS{view}",
         " · ".join(summary),
@@ -1141,22 +1478,36 @@ def _render_split_monitor(
     ]
 
     selected = state.selected()
-    tip_index, tip_total, tip = playbook_tip(
-        now,
-        state.sessions,
-        selected=selected,
-        refresh_error=state.refresh_error,
-        compact=width < 120,
-    )
-    playbook_plain = _fit(
-        f"PIKA PLAYBOOK {tip_index + 1}/{tip_total} // {tip}", width
-    )
-    playbook_ansi = _paint(playbook_plain, FG_BLUE, color)
-    footer_plain = _fit(
-        "↑↓/jk move  Enter open  a ask privately  n next needed  p peek  "
-        f"u {'operations' if state.show_usage else 'usage'}  r refresh  ? keys  q quit",
-        width,
-    )
+    if state.mode == "ask":
+        target = state.ask_target or selected
+        fingerprint = target.session_id[:8] if target else "—"
+        playbook_plain = _fit(
+            f"SIDE RECEIPT // EPHEMERAL · parent {fingerprint} unchanged · Esc discards",
+            width,
+        )
+        playbook_ansi = _paint(playbook_plain, FG_MAGENTA, color)
+        footer_plain = _fit(
+            "type your question  Enter send  Ctrl+J newline  Ctrl+U clear  "
+            "↑↓ history  Esc close side",
+            width,
+        )
+    else:
+        tip_index, tip_total, tip = playbook_tip(
+            now,
+            state.sessions,
+            selected=selected,
+            refresh_error=state.refresh_error,
+            compact=width < 120,
+        )
+        playbook_plain = _fit(
+            f"PIKA PLAYBOOK {tip_index + 1}/{tip_total} // {tip}", width
+        )
+        playbook_ansi = _paint(playbook_plain, FG_BLUE, color)
+        footer_plain = _fit(
+            "↑↓/jk move  Enter open  a ask here  n next needed  p peek  "
+            f"u {'operations' if state.show_usage else 'usage'}  r refresh  ? keys  q quit",
+            width,
+        )
     footer_ansi = _paint(footer_plain, REVERSE, color)
     plain_lines = [header_plain, *body_plain, playbook_plain, footer_plain]
     ansi_lines = [header_ansi, *body_ansi, playbook_ansi, footer_ansi]
@@ -1182,6 +1533,18 @@ def render_monitor(
     selected = state.selected()
 
     if width < MIN_WIDTH or height < MIN_HEIGHT:
+        if state.mode == "ask":
+            minimum = [
+                _line("PIKA // SIDE", "PAUSED", width),
+                "─" * width,
+                _fit(f"Terminal too small · need {MIN_WIDTH}x{MIN_HEIGHT}", width),
+                _fit(f"Current viewport · {width}x{height}", width),
+                "",
+                _fit("Esc closes and discards this side", width),
+            ]
+            minimum = (minimum + [""] * height)[:height]
+            plain = "\n".join(_fit(line, width) for line in minimum)
+            return MonitorFrame(plain, plain, state.selected_key)
         minimum = [
             _line(
                 "PIKA // LIVE",
@@ -1198,11 +1561,18 @@ def render_monitor(
         plain = "\n".join(_fit(line, width) for line in minimum)
         return MonitorFrame(plain, plain, state.selected_key)
 
+    if state.mode == "ask" and (
+        width < SPLIT_MIN_WIDTH or height < SPLIT_MIN_HEIGHT
+    ):
+        return _render_compact_ask(
+            state, width=width, height=height, now=now, color=color
+        )
+
     if (
         width >= SPLIT_MIN_WIDTH
         and height >= SPLIT_MIN_HEIGHT
-        and state.mode == "sessions"
-        and state.sessions
+        and state.mode in {"sessions", "ask"}
+        and (state.sessions or state.mode == "ask")
     ):
         return _render_split_monitor(
             state,
@@ -1451,7 +1821,30 @@ def render_monitor(
     )
 
 
-def decode_keys(buffer: bytearray) -> list[str]:
+def _pop_utf8_character(buffer: bytearray) -> str | None:
+    first = buffer[0]
+    if first < 0x80:
+        return chr(buffer.pop(0))
+    length = (
+        2
+        if first & 0xE0 == 0xC0
+        else 3
+        if first & 0xF0 == 0xE0
+        else 4
+        if first & 0xF8 == 0xF0
+        else 1
+    )
+    if len(buffer) < length:
+        return None
+    raw = bytes(buffer[:length])
+    del buffer[:length]
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "�"
+
+
+def decode_keys(buffer: bytearray, *, text_mode: bool = False) -> list[str]:
     keys: list[str] = []
     while buffer:
         mouse = _MOUSE.match(buffer)
@@ -1489,7 +1882,21 @@ def decode_keys(buffer: bytearray) -> list[str]:
             keys.append("escape")
             del buffer[0]
             continue
-        value = chr(buffer.pop(0))
+        value = _pop_utf8_character(buffer)
+        if value is None:
+            break
+        if text_mode:
+            keys.append(
+                {
+                    "\r": "enter",
+                    "\n": "newline",
+                    "\x08": "backspace",
+                    "\x7f": "backspace",
+                    "\x15": "clear-input",
+                    "\x17": "delete-word",
+                }.get(value, value)
+            )
+            continue
         keys.append(
             {
                 "\r": "enter",
@@ -1520,6 +1927,9 @@ class _Terminal:
     def __enter__(self) -> _Terminal:
         self.previous = termios.tcgetattr(self.input_fd)
         tty.setcbreak(self.input_fd, termios.TCSANOW)
+        current = termios.tcgetattr(self.input_fd)
+        current[0] &= ~termios.ICRNL
+        termios.tcsetattr(self.input_fd, termios.TCSANOW, current)
         os.write(
             self.output_fd,
             b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h",
@@ -1606,6 +2016,54 @@ def _handle_key(
     pika: MonitorPika,
     state: MonitorState,
 ) -> tuple[str, Session | None]:
+    if state.mode == "ask":
+        target = state.ask_target
+        if key == "escape":
+            state.close_ask()
+            return "ask-close", target
+        if key in {"up", "pageup"}:
+            state.ask_scroll += 8 if key == "pageup" else 1
+            return "continue", None
+        if key in {"down", "pagedown"}:
+            state.ask_scroll = max(
+                0, state.ask_scroll - (8 if key == "pagedown" else 1)
+            )
+            return "continue", None
+        if key == "enter":
+            question = state.ask_input.strip()
+            if not question or state.ask_pending:
+                return "continue", None
+            state.ask_messages.append(AskMessage("user", question))
+            state.ask_input = ""
+            state.ask_outbox = question
+            state.ask_pending = True
+            state.ask_status = "asking"
+            state.ask_error = None
+            state.ask_scroll = 0
+            return "ask-send", target
+        if key == "newline" and not state.ask_pending:
+            if len(state.ask_input) < 4000:
+                state.ask_input += "\n"
+            return "continue", None
+        if key == "backspace" and not state.ask_pending:
+            state.ask_input = state.ask_input[:-1]
+            return "continue", None
+        if key == "clear-input" and not state.ask_pending:
+            state.ask_input = ""
+            return "continue", None
+        if key == "delete-word" and not state.ask_pending:
+            stripped = state.ask_input.rstrip()
+            state.ask_input = stripped[: stripped.rfind(" ") + 1]
+            return "continue", None
+        if (
+            len(key) == 1
+            and key.isprintable()
+            and not state.ask_pending
+            and len(state.ask_input) < 4000
+        ):
+            state.ask_input += key
+        return "continue", None
+
     if state.mode in {"help", "peek"} and key in {"quit", "escape"}:
         state.mode = "sessions"
         return "continue", None
@@ -1669,7 +2127,8 @@ def _handle_key(
         elif session and not session.transcript_path:
             state.notify("No durable provider transcript available for a side ask")
         elif session:
-            return "ask", session
+            state.begin_ask(session)
+            return "ask-open", session
     elif key == "next":
         session = pika.next_attention(state.sessions)
         if session is None:
@@ -1758,7 +2217,6 @@ def run_monitor(
     input_fd: int | None = None,
     output_fd: int | None = None,
     refresh_seconds: float = REFRESH_SECONDS,
-    ask_handler: Callable[[Session], int] | None = None,
 ) -> int:
     input_fd = sys.stdin.fileno() if input_fd is None else input_fd
     output_fd = sys.stdout.fileno() if output_fd is None else output_fd
@@ -1777,7 +2235,7 @@ def run_monitor(
     next_preview = 0.0
     manual_refresh_pending = False
     selected_to_open: Session | None = None
-    selected_to_ask: Session | None = None
+    inline_ask: _InlineAskWorker | None = None
     last_frame: str | None = None
     color = "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
     first_scan = True
@@ -1787,6 +2245,31 @@ def run_monitor(
             with _Terminal(input_fd, output_fd) as terminal:
                 while True:
                     monotonic = time.monotonic()
+                    if inline_ask is not None:
+                        for event, value in inline_ask.poll():
+                            if event == "opened":
+                                state.ask_status = (
+                                    "asking" if state.ask_pending else "ready"
+                                )
+                            elif event == "answer" and state.mode == "ask":
+                                state.ask_messages.append(
+                                    AskMessage("expert", _safe_chat_text(value))
+                                )
+                                state.ask_pending = False
+                                state.ask_status = "ready"
+                                state.ask_error = None
+                                state.ask_scroll = 0
+                            elif event == "error" and state.mode == "ask":
+                                state.ask_pending = False
+                                state.ask_status = "error"
+                                state.ask_error = _safe_chat_text(value).replace("\n", " ")
+                            elif event == "closed":
+                                if state.mode == "ask" and state.ask_status != "error":
+                                    state.ask_pending = False
+                                    state.ask_status = "error"
+                                    state.ask_error = "side process closed unexpectedly"
+                        if not inline_ask.alive and state.mode != "ask":
+                            inline_ask = None
                     if future is not None and future.done():
                         try:
                             sessions = future.result()
@@ -1906,6 +2389,7 @@ def run_monitor(
                     if (
                         preview_session is not None
                         and preview_target
+                        and state.mode != "ask"
                         and preview_future is None
                         and (
                             state.preview_key != preview_session.key
@@ -1945,21 +2429,34 @@ def run_monitor(
                     if not data:
                         break
                     input_buffer.extend(data)
-                    for key in decode_keys(input_buffer):
+                    for key in decode_keys(
+                        input_buffer, text_mode=state.mode == "ask"
+                    ):
                         action, session = _handle_key(key, pika, state)
                         if action == "quit":
                             future = None
                             selected_to_open = None
-                            selected_to_ask = None
                             break
                         if action == "open":
                             selected_to_open = session
                             future = None
                             break
-                        if action == "ask":
-                            selected_to_ask = session
-                            future = None
-                            break
+                        if action == "ask-open" and session is not None:
+                            if inline_ask is not None:
+                                inline_ask.close()
+                            inline_ask = _InlineAskWorker(session)
+                            inline_ask.start()
+                        if action == "ask-send":
+                            question = state.ask_outbox
+                            state.ask_outbox = None
+                            if question and inline_ask is not None and inline_ask.alive:
+                                inline_ask.ask(question)
+                            else:
+                                state.ask_pending = False
+                                state.ask_status = "error"
+                                state.ask_error = "side process is unavailable; Esc closes it"
+                        if action == "ask-close" and inline_ask is not None:
+                            inline_ask.close()
                         if action == "refresh":
                             manual_refresh_pending = True
                             state.emphasize_refresh = True
@@ -1971,11 +2468,10 @@ def run_monitor(
                         continue
                     break
     finally:
-        pass
+        if inline_ask is not None:
+            inline_ask.close()
     if selected_to_open is not None:
         return pika.open(selected_to_open)
-    if selected_to_ask is not None and ask_handler is not None:
-        return ask_handler(selected_to_ask)
     return 0
 
 
@@ -2043,6 +2539,7 @@ def _demo_sessions(now: float) -> list[Session]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render a Pika monitor fixture")
     parser.add_argument("--demo", action="store_true", required=True)
+    parser.add_argument("--ask", action="store_true")
     parser.add_argument("--width", type=int, default=120)
     parser.add_argument("--height", type=int, default=30)
     args = parser.parse_args()
@@ -2077,6 +2574,19 @@ def main() -> None:
         ],
         preview_updated_at=now - 1,
     )
+    if args.ask:
+        state.begin_ask(selected)
+        state.ask_status = "ready"
+        state.ask_messages = [
+            AskMessage("user", "Why did the unchanged rerun write nothing?"),
+            AskMessage(
+                "expert",
+                "The publication is idempotent: it compares the day's existing "
+                "snapshot and skips both monthly and consolidated writes when "
+                "the model values are unchanged.",
+            ),
+        ]
+        state.ask_input = "Does the same rule protect older snapshots?"
     print(
         render_monitor(
             state,

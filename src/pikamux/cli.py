@@ -223,12 +223,7 @@ def _select_named(
 
 def _bare(pika: Pika) -> int:
     if sys.stdin.isatty() and sys.stdout.isatty():
-        return run_monitor(
-            pika,
-            ask_handler=lambda session: _ask_session(
-                session, [], jsonl=False
-            ),
-        )
+        return run_monitor(pika)
     # Preserve a useful, finite representation when bare `pika` is redirected.
     # Stable automation should continue to prefer `pika list --json`.
     sessions = pika.refresh(usage=True)
