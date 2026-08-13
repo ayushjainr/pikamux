@@ -215,6 +215,9 @@ closed, transcript-free event reason such as `permission`, `question`,
 `completed`, `failed`, or `exited`; `VIEW` means that exact pane is currently
 visible, not merely that its tmux session has a client. The wide view includes
 process-tree CPU/RAM and provider usage where structured counters are available.
+Codex `request_user_input` and Claude `AskUserQuestion` enter `NEEDS YOU` at the
+provider's pre-tool lifecycle boundary and return to `WORKING` after the answer
+completes; Pika does not inspect the question text.
 Dollar values are visibly labeled `~API$`: a dated, best-effort API-equivalent
 list-price estimate, never a subscription bill. Unknown models or unavailable
 usage render as `—` rather than zero. Applicable action hints teach `pika next`,

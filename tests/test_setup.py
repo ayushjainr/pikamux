@@ -58,6 +58,16 @@ class SetupTests(unittest.TestCase):
         claude_handler = claude_data["hooks"]["SessionStart"][0]["hooks"][0]
         self.assertIn("-m pikamux hook --provider claude", claude_handler["command"])
         self.assertNotIn("args", claude_handler)
+        self.assertIn("PreToolUse", codex_data["hooks"])
+        self.assertIn("PreToolUse", claude_data["hooks"])
+        self.assertEqual(
+            codex_data["hooks"]["PreToolUse"][0]["matcher"],
+            "^request_user_input$",
+        )
+        self.assertEqual(
+            claude_data["hooks"]["PreToolUse"][0]["matcher"],
+            "^AskUserQuestion$",
+        )
         self.assertFalse(codex_hooks_change(codex).changed)
         self.assertFalse(claude_settings_change(claude).changed)
 
@@ -126,6 +136,7 @@ class SetupTests(unittest.TestCase):
                     "SessionStart",
                     "UserPromptSubmit",
                     "PermissionRequest",
+                    "PreToolUse",
                     "PostToolUse",
                     "Stop",
                     "SessionEnd",

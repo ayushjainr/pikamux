@@ -23,6 +23,7 @@ CODEX_EVENTS = (
     "SessionStart",
     "UserPromptSubmit",
     "PermissionRequest",
+    "PreToolUse",
     "PostToolUse",
     "Stop",
     "SessionEnd",
@@ -31,6 +32,7 @@ CLAUDE_EVENTS = (
     "SessionStart",
     "UserPromptSubmit",
     "PermissionRequest",
+    "PreToolUse",
     "PostToolUse",
     "Notification",
     "Stop",
@@ -40,6 +42,10 @@ CLAUDE_EVENTS = (
 CLAUDE_NOTIFICATION_MATCHER = (
     "permission_prompt|idle_prompt|elicitation_dialog|agent_needs_input|agent_completed"
 )
+QUESTION_TOOL_MATCHERS = {
+    "codex": "^request_user_input$",
+    "claude": "^AskUserQuestion$",
+}
 FEATURE_HEADER = re.compile(r"^\s*\[features\]\s*(?:#.*)?$")
 SECTION_HEADER = re.compile(r"^\s*\[[^]]+\]\s*(?:#.*)?$")
 HOOKS_KEY = re.compile(
@@ -88,6 +94,14 @@ def _handler_timeout(event: str) -> int:
     return 3 if event == "SessionEnd" else 5
 
 
+def _event_matcher(provider: str, event: str) -> str | None:
+    if provider == "claude" and event == "Notification":
+        return CLAUDE_NOTIFICATION_MATCHER
+    if event == "PreToolUse":
+        return QUESTION_TOOL_MATCHERS[provider]
+    return None
+
+
 def _contains_handler(groups: Any, provider: str, event: str) -> bool:
     if not isinstance(groups, list):
         return False
@@ -95,11 +109,7 @@ def _contains_handler(groups: Any, provider: str, event: str) -> bool:
         if not isinstance(group, dict):
             continue
         matcher = group.get("matcher")
-        expected_matcher = (
-            CLAUDE_NOTIFICATION_MATCHER
-            if provider == "claude" and event == "Notification"
-            else None
-        )
+        expected_matcher = _event_matcher(provider, event)
         if expected_matcher is not None:
             if matcher != expected_matcher:
                 continue
@@ -174,11 +184,7 @@ def hook_spec_fingerprint(provider: str) -> str:
             "event": event,
             "command": _handler_command(provider),
             "timeout": _handler_timeout(event),
-            "matcher": (
-                CLAUDE_NOTIFICATION_MATCHER
-                if provider == "claude" and event == "Notification"
-                else None
-            ),
+            "matcher": _event_matcher(provider, event),
         }
         for event in events
     ]
@@ -206,17 +212,19 @@ def codex_hooks_change(home: Path | None = None) -> FileChange:
             continue
         groups[:] = [group for group in groups if not _is_pika_group(group, "codex")]
         timeout = _handler_timeout(event)
-        groups.append(
-            {
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": command,
-                        "timeout": timeout,
-                    }
-                ]
-            }
-        )
+        group: dict[str, Any] = {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command,
+                    "timeout": timeout,
+                }
+            ]
+        }
+        matcher = _event_matcher("codex", event)
+        if matcher is not None:
+            group["matcher"] = matcher
+        groups.append(group)
     after = json.dumps(data, indent=2) + "\n"
     return FileChange(target, before, after)
 
@@ -318,8 +326,9 @@ def claude_settings_change(home: Path | None = None) -> FileChange:
                 }
             ]
         }
-        if event == "Notification":
-            group["matcher"] = CLAUDE_NOTIFICATION_MATCHER
+        matcher = _event_matcher("claude", event)
+        if matcher is not None:
+            group["matcher"] = matcher
         groups.append(group)
     after = json.dumps(data, indent=2) + "\n"
     return FileChange(target, before, after)

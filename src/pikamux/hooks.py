@@ -18,6 +18,12 @@ def _event_state(
     provider: str, data: dict[str, Any]
 ) -> tuple[str, bool, str | None, str | None]:
     event = str(data.get("hook_event_name") or "")
+    tool_name = str(data.get("tool_name") or "")
+    if event == "PreToolUse" and (
+        (provider == "codex" and tool_name == "request_user_input")
+        or (provider == "claude" and tool_name == "AskUserQuestion")
+    ):
+        return Status.NEEDS_YOU.value, True, None, "question"
     if event == "UserPromptSubmit":
         return Status.WORKING.value, False, None, None
     if event == "PermissionRequest":

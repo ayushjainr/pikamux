@@ -115,6 +115,64 @@ class HookTests(unittest.TestCase):
         self.assertIn("thread-name (Codex) — completed", FakeTmux.alerts[-1])
 
     @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_codex_question_tool_waits_for_user_until_answered(self) -> None:
+        base = {
+            "session_id": "uuid-question",
+            "cwd": "/tmp",
+            "transcript_path": "/tmp/question.jsonl",
+            "tool_name": "request_user_input",
+        }
+        handle_hook(
+            "codex",
+            {**base, "hook_event_name": "PreToolUse"},
+            self.store,
+        )
+        waiting = self.store.get_session("codex", "uuid-question")
+        self.assertEqual(
+            waiting.status if waiting else None,
+            Status.NEEDS_YOU.value,
+        )
+        self.assertTrue(waiting.unread if waiting else False)
+        self.assertEqual(
+            waiting.attention_reason if waiting else None,
+            "question",
+        )
+
+        handle_hook(
+            "codex",
+            {**base, "hook_event_name": "PostToolUse"},
+            self.store,
+        )
+        answered = self.store.get_session("codex", "uuid-question")
+        self.assertEqual(
+            answered.status if answered else None,
+            Status.WORKING.value,
+        )
+        self.assertFalse(answered.unread if answered else True)
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_claude_question_tool_uses_same_attention_contract(self) -> None:
+        handle_hook(
+            "claude",
+            {
+                "session_id": "uuid-claude-question",
+                "cwd": "/tmp",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "AskUserQuestion",
+            },
+            self.store,
+        )
+        waiting = self.store.get_session("claude", "uuid-claude-question")
+        self.assertEqual(
+            waiting.status if waiting else None,
+            Status.NEEDS_YOU.value,
+        )
+        self.assertEqual(
+            waiting.attention_reason if waiting else None,
+            "question",
+        )
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_claude_question_reason_is_structured_without_transcript_text(self) -> None:
         handle_hook(
             "claude",

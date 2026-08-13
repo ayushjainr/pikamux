@@ -89,6 +89,12 @@ the parent UUID and repeats that the side is ephemeral and the parent transcript
 is unchanged. Closing is always available through Esc, including during a slow
 or failed provider turn.
 
+Provider question tools cross the attention boundary before their UI blocks:
+Codex `request_user_input` and Claude `AskUserQuestion` set `NEEDS YOU` from
+structured pre-tool lifecycle events without reading the question. Their
+matching post-tool event clears the wait and returns the workstream to
+`WORKING` after an answer.
+
 The wide inspector describes a stale expert card as `+NEW CONTEXT`: the exact
 machine state remains `STALE`, but the visible framing makes clear that the
 conversation advanced rather than the card failing. Card claims remain
