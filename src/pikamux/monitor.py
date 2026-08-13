@@ -16,7 +16,13 @@ from datetime import datetime
 from textwrap import wrap
 from typing import Protocol
 
-from .consult import Consultation, consultation_for
+from .consult import (
+    Consultation,
+    ConsultationError,
+    ConsultationPolicy,
+    consultation_for,
+    consultation_policy,
+)
 from .experts import ExpertCardState
 from .models import ExpertProfile, Session, Status
 from .pricing import PRICING_AS_OF
@@ -201,8 +207,9 @@ class AskMessage:
 class _InlineAskWorker:
     """Own one provider-native side process without blocking the TUI."""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, policy: ConsultationPolicy) -> None:
         self.session = replace(session)
+        self.policy = policy
         self._requests: queue.Queue[tuple[str, str]] = queue.Queue()
         self._events: queue.Queue[tuple[str, str]] = queue.Queue()
         self._closing = threading.Event()
@@ -253,7 +260,7 @@ class _InlineAskWorker:
 
     def _run(self) -> None:
         try:
-            consultation = consultation_for(self.session)
+            consultation = consultation_for(self.session, policy=self.policy)
             with self._consultation_lock:
                 if self._closing.is_set():
                     should_close = True
@@ -308,6 +315,8 @@ class MonitorState:
     preview_error: str | None = None
     preview_updated_at: float = 0.0
     ask_target: Session | None = None
+    ask_policy: ConsultationPolicy | None = None
+    ask_confirmed: bool = False
     ask_messages: list[AskMessage] = field(default_factory=list)
     ask_input: str = ""
     ask_outbox: str | None = None
@@ -354,9 +363,12 @@ class MonitorState:
     def expert_card(self, session: Session | None) -> ExpertCardState | None:
         return self.expert_cards.get(session.key) if session is not None else None
 
-    def begin_ask(self, session: Session) -> None:
+    def begin_ask(self, session: Session, *, fast: bool = False) -> None:
+        policy = consultation_policy(session, fast=fast)
         self.mode = "ask"
         self.ask_target = replace(session)
+        self.ask_policy = policy
+        self.ask_confirmed = False
         self.ask_messages = []
         self.ask_input = ""
         self.ask_outbox = None
@@ -368,6 +380,8 @@ class MonitorState:
     def close_ask(self) -> None:
         self.mode = "sessions"
         self.ask_status = "closed"
+        self.ask_policy = None
+        self.ask_confirmed = False
         self.ask_pending = False
         self.ask_outbox = None
 
@@ -703,7 +717,7 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
     if width < 80:
         items = [
             "↑↓/jk move · Enter open · n next",
-            "a ask · p peek · x stop watching",
+            "a ask · A fast ask · p peek · x stop watching",
             "u usage · r refresh · ? keys · q/Esc close",
             (
                 f"Need {counts['decisions']} · results {counts['results']} · "
@@ -714,7 +728,7 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
         items = [
             "↑/k  previous workstream        ↓/j  next workstream",
             "Enter open selected             n    open oldest attention",
-            "a     ask here in side panel      p    peek recent pane output",
+            "a/A   ask here / faster Codex     p    peek recent pane output",
             "u     operations / usage view    r    reconcile now",
             "x     stop watching selected     Esc  cancel confirmation",
             "g/G   first / last               ?    close this help",
@@ -1130,10 +1144,18 @@ def _ask_panel_lines(
         "closed": "○ CLOSED",
     }.get(state.ask_status, state.ask_status.upper())
     title = _line(target.display_name, status, width)
-    receipt = _fit(
-        f"SIDE // EPHEMERAL · parent {target.session_id[:8]} · transcript unchanged",
-        width,
-    )
+    policy = state.ask_policy or consultation_policy(target)
+    if state.ask_confirmed:
+        receipt_text = (
+            f"SIDE RECEIPT // EPHEMERAL · parent {target.session_id[:8]} · "
+            f"{policy.label} · transcript unchanged"
+        )
+    else:
+        receipt_text = (
+            f"SIDE REQUEST // parent {target.session_id[:8]} · "
+            f"requested {policy.label} · awaiting provider confirmation"
+        )
+    receipt = _fit(receipt_text, width)
     card = state.expert_cards.get(target.key)
     if card and card.profile:
         now_line = _detail_value(
@@ -1597,10 +1619,20 @@ def _render_split_monitor(
     if state.mode == "ask":
         target = state.ask_target or selected
         fingerprint = target.session_id[:8] if target else "—"
-        playbook_plain = _fit(
-            f"SIDE RECEIPT // EPHEMERAL · parent {fingerprint} unchanged · Esc discards",
-            width,
+        policy = state.ask_policy or (
+            consultation_policy(target) if target else None
         )
+        if state.ask_confirmed:
+            playbook_text = (
+                f"SIDE RECEIPT // EPHEMERAL · parent {fingerprint} unchanged · "
+                f"{policy.label if policy else 'provider native'} · Esc discards"
+            )
+        else:
+            playbook_text = (
+                f"SIDE REQUEST // parent {fingerprint} · requested "
+                f"{policy.label if policy else 'provider native'} · awaiting confirmation"
+            )
+        playbook_plain = _fit(playbook_text, width)
         playbook_ansi = _paint(playbook_plain, FG_MAGENTA, color)
         footer_plain = _fit(
             "type your question  Enter send  Ctrl+J newline  Ctrl+U clear  "
@@ -2047,6 +2079,7 @@ def decode_keys(buffer: bytearray, *, text_mode: bool = False) -> list[str]:
                 "?": "help",
                 "p": "peek",
                 "a": "ask",
+                "A": "ask-fast",
                 "n": "next",
                 "u": "usage",
                 "r": "refresh",
@@ -2270,15 +2303,19 @@ def _handle_key(
             state.notify("Exact pane identity is unverified — opening remains blocked")
         elif session:
             return "open", session
-    elif key == "ask":
+    elif key in {"ask", "ask-fast"}:
         session = state.selected()
         if session and session.status == Status.UNBOUND.value and session.live:
             state.notify("Unbound live process — adopt it before consulting")
         elif session and not session.transcript_path:
             state.notify("No durable provider transcript available for a side ask")
         elif session:
-            state.begin_ask(session)
-            return "ask-open", session
+            try:
+                state.begin_ask(session, fast=key == "ask-fast")
+            except ConsultationError as exc:
+                state.notify(str(exc))
+            else:
+                return "ask-open", session
     elif key == "untrack":
         session = state.selected()
         if session and session.session_id.startswith("unbound:"):
@@ -2404,6 +2441,7 @@ def run_monitor(
                     if inline_ask is not None:
                         for event, value in inline_ask.poll():
                             if event == "opened":
+                                state.ask_confirmed = True
                                 state.ask_status = (
                                     "asking" if state.ask_pending else "ready"
                                 )
@@ -2600,7 +2638,12 @@ def run_monitor(
                         if action == "ask-open" and session is not None:
                             if inline_ask is not None:
                                 inline_ask.close()
-                            inline_ask = _InlineAskWorker(session)
+                            if state.ask_policy is None:
+                                state.notify(
+                                    "Side policy unavailable; reopen the consultation"
+                                )
+                                continue
+                            inline_ask = _InlineAskWorker(session, state.ask_policy)
                             inline_ask.start()
                         if action == "ask-send":
                             question = state.ask_outbox

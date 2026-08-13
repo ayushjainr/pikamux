@@ -190,6 +190,9 @@ class ExpertRefreshResult:
     name: str | None = None
     remaining_percent: float | None = None
     reset_at: int | None = None
+    consultation_mode: str | None = None
+    model: str | None = None
+    effort: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

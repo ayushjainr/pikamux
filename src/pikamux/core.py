@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
+from .consult import consultation_policy
 from .experts import (
     ExpertCardState,
     ExpertMatch,
@@ -1272,6 +1273,10 @@ class Pika:
         profile = interview_profile(session, existing)
         return self.store.put_expert_profile(profile)
 
+    @staticmethod
+    def _expert_consultation_receipt(session: Session) -> dict[str, str | None]:
+        return consultation_policy(session).receipt()
+
     def bootstrap_experts(
         self, sessions: Iterable[Session]
     ) -> list[ExpertRefreshResult]:
@@ -1313,6 +1318,7 @@ class Pika:
                         "exact ephemeral interview",
                         session.session_id,
                         session.display_name,
+                        **self._expert_consultation_receipt(session),
                     )
                 )
         return results
@@ -1474,6 +1480,7 @@ class Pika:
                         selected.session_id,
                         selected.display_name,
                         **common,
+                        **self._expert_consultation_receipt(selected),
                     )
                 )
         return results

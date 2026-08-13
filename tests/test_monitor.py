@@ -11,6 +11,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
+from pikamux.consult import FAST_CODEX_EFFORT, FAST_CODEX_MODEL
 from pikamux.experts import ExpertCardState
 from pikamux.models import ExpertProfile, Session, Status
 from pikamux.monitor import (
@@ -166,6 +167,7 @@ class MonitorTests(unittest.TestCase):
             ["down", "usage", "ask", "up", "down", "enter", "help"],
         )
         self.assertEqual(buffer, bytearray())
+        self.assertEqual(decode_keys(bytearray(b"A")), ["ask-fast"])
 
         text_buffer = bytearray("a quick?\nπ".encode() + b"\x7f")
         self.assertEqual(
@@ -433,6 +435,39 @@ class MonitorTests(unittest.TestCase):
 
     def test_x_decodes_to_stop_watching_action(self) -> None:
         self.assertEqual(decode_keys(bytearray(b"x")), ["untrack"])
+
+    def test_fast_side_ask_keeps_the_selected_policy_in_monitor_state(self) -> None:
+        session = replace(self.sessions[0], transcript_path="/tmp/codex.jsonl")
+        state = MonitorState(sessions=[session])
+        action, target = _handle_key("ask-fast", Mock(), state)
+        self.assertEqual(action, "ask-open")
+        self.assertIsNotNone(target)
+        self.assertIsNotNone(state.ask_policy)
+        self.assertEqual(state.ask_policy.model, FAST_CODEX_MODEL)
+        self.assertEqual(state.ask_policy.effort, FAST_CODEX_EFFORT)
+        opening = render_monitor(state, width=140, height=30, color=False)
+        self.assertIn("SIDE REQUEST", opening.plain)
+        self.assertIn("awaiting confirmation", opening.plain)
+        self.assertNotIn("transcript unchanged", opening.plain)
+        state.ask_confirmed = True
+        state.ask_status = "ready"
+        confirmed = render_monitor(state, width=140, height=30, color=False)
+        self.assertIn("SIDE RECEIPT // EPHEMERAL", confirmed.plain)
+        self.assertIn(FAST_CODEX_MODEL, confirmed.plain)
+        self.assertNotIn("gpt-5.6-sol", confirmed.plain)
+
+    def test_fast_side_ask_fails_closed_for_claude(self) -> None:
+        session = Session(
+            "claude",
+            "22222222-2222-4222-8222-222222222222",
+            name="claude-expert",
+            transcript_path="/tmp/claude.jsonl",
+        )
+        state = MonitorState(sessions=[session])
+        action, target = _handle_key("ask-fast", Mock(), state)
+        self.assertEqual((action, target), ("continue", None))
+        self.assertEqual(state.mode, "sessions")
+        self.assertIn("not benchmarked for Claude", state.toast or "")
 
     def test_placeholder_cannot_offer_weak_stop_watching_guarantee(self) -> None:
         placeholder = Session(
@@ -751,6 +786,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(state.mode, "ask")
 
         state.ask_status = "ready"
+        state.ask_confirmed = True
         state.ask_messages = [
             AskMessage("user", "Why did three trades mismatch?"),
             AskMessage("expert", "Their source identifiers arrived late."),
@@ -758,13 +794,14 @@ class MonitorTests(unittest.TestCase):
         state.ask_input = "Were the returns affected?"
         side = render_monitor(state, width=140, height=30, color=False)
         self.assertIn("LIVE OPERATIONS · SIDE", side.plain)
-        self.assertIn("SIDE // EPHEMERAL", side.plain)
+        self.assertIn("SIDE RECEIPT // EPHEMERAL", side.plain)
+        self.assertIn("gpt-5.6-sol · medium", side.plain)
         self.assertIn("Why did three trades mismatch?", side.plain)
         self.assertIn("Were the returns affected?█", side.plain)
         self.assertIn("Esc close side", side.plain)
 
         compact = render_monitor(state, width=72, height=20, color=False)
-        self.assertIn("SIDE // EPHEMERAL", compact.plain)
+        self.assertIn("SIDE RECEIPT // EPHEMERAL", compact.plain)
         self.assertIn("Enter send", compact.plain)
         self.assertTrue(all(len(line) == 72 for line in compact.plain.splitlines()))
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pikamux.core import Pika
+from pikamux.consult import DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL
 from pikamux.models import ExpertProfile, Session
 from pikamux.quota import QuotaSnapshot
 from pikamux.store import Store
@@ -72,6 +73,9 @@ class ExpertRefreshTests(unittest.TestCase):
             first = self.pika.refresh_due_experts(now=now)
             second = self.pika.refresh_due_experts(now=now)
         self.assertEqual(first[0].status, "REFRESHED")
+        self.assertEqual(first[0].consultation_mode, "default")
+        self.assertEqual(first[0].model, DEFAULT_CODEX_MODEL)
+        self.assertEqual(first[0].effort, DEFAULT_CODEX_EFFORT)
         self.assertEqual(second[0].status, "CURRENT")
         ask.assert_called_once()
 
@@ -87,6 +91,8 @@ class ExpertRefreshTests(unittest.TestCase):
             first = self.pika.refresh_due_experts(now=now)
             second = self.pika.refresh_due_experts(now=now)
         self.assertEqual(first[0].status, "FAILED")
+        self.assertIsNone(first[0].model)
+        self.assertIsNone(first[0].effort)
         self.assertEqual(second[0].status, "DEFERRED")
         ask.assert_called_once()
 

@@ -88,6 +88,16 @@ class PeekPika:
 
 
 class CliTests(unittest.TestCase):
+    def test_ask_fast_selects_the_benchmarked_fast_profile(self) -> None:
+        args = _parser().parse_args(["ask", "expert", "why", "--fast"])
+        self.assertTrue(args.fast)
+        self.assertEqual(args.question, ["why"])
+        leading = _parser().parse_args(
+            _normalize_argv(["ask", "expert", "--fast", "why"])
+        )
+        self.assertTrue(leading.fast)
+        self.assertEqual(leading.question, ["why"])
+
     def test_manual_expert_card_requires_scope_and_current_state(self) -> None:
         args = _parser().parse_args(
             [

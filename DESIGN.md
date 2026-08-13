@@ -67,9 +67,10 @@ forcing a compressed split.
 
 `pika` opens the live monitor only on an interactive terminal. `pika list` and
 redirected bare output remain finite and stable. Arrow keys or j/k move the
-selection; Enter opens the exact selected identity; `a` focuses an ephemeral
-multi-turn side consultation inside the inspector; n opens the oldest attention
-item using the same ordering as `pika next`; p opens a sanitized pane peek; u
+selection; Enter opens the exact selected identity; `a` focuses the default
+Sol-medium ephemeral multi-turn side consultation inside the inspector; `A`
+uses the faster Luna-medium Codex profile; n opens the oldest attention item
+using the same ordering as `pika next`; p opens a sanitized pane peek; u
 toggles the usage view; r reconciles; ? explains controls; q or Esc recovers or
 exits. `x` asks to stop watching the selected UUID; x or Enter confirms and Esc
 or q cancels. Inside the side panel, ordinary keys type, Enter sends, Ctrl+J
@@ -88,6 +89,13 @@ focus unambiguous; q is ordinary text while the side has focus. The panel names
 the parent UUID and repeats that the side is ephemeral and the parent transcript
 is unchanged. Closing is always available through Esc, including during a slow
 or failed provider turn.
+
+The consultation policy is explicit and immutable for the side's lifetime.
+Codex defaults to `gpt-5.6-sol` at medium effort; the narrow fast path uses
+`gpt-5.6-luna` at medium effort. Both the ephemeral fork and every turn pin that
+selection, and visible receipts report it. Claude stays provider-native and
+rejects the fast path until separately benchmarked. Pika's fast path is a model
+profile, not Codex Fast mode or a service-tier setting.
 
 Provider question tools cross the attention boundary before their UI blocks:
 Codex `request_user_input` and Claude `AskUserQuestion` set `NEEDS YOU` from

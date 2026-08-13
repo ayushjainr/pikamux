@@ -70,7 +70,8 @@ original file; Pika never deletes backups.
 pika                       open the live operations monitor
 pika NAME                  open or resurrect an exact conversation
 pika open NAME             unambiguous form, including `pika open list`
-pika ask NAME "QUESTION"  ephemeral multi-turn consultation with that parent
+pika ask NAME "QUESTION"   ephemeral multi-turn consultation with that parent
+pika ask NAME --fast ...   faster Codex consultation using Luna medium
 pika ask NAME --jsonl      persistent JSON-lines side channel for agents/apps
 pika experts QUERY         find provenance-bound experts across projects
 pika experts QUERY --json  stable machine-readable expert matches
@@ -99,12 +100,20 @@ pika doctor --repair-stale remove confirmed stale launch locks (5m+)
 
 `pika ask master_quant "What assumption is weakest here?"` opens a temporary
 side conversation based on that exact provider UUID. In a terminal, ask
-follow-ups at the `side>` prompt and type `/close` when finished. Codex uses an
-in-memory ephemeral fork. Claude uses one streamed, non-persistent fork with its
-tool surface disabled. The parent can keep working; the side is read-only, does
-not append to the parent transcript, and is discarded on close. Claude support
-is capability-gated to the tested CLI version, and Pika fails closed if it
-cannot verify support.
+follow-ups at the `side>` prompt and type `/close` when finished. Codex defaults
+to `gpt-5.6-sol` with medium reasoning; `--fast` selects the benchmarked
+`gpt-5.6-luna` medium profile. Pika verifies the provider-confirmed model and
+effort before showing them in terminal and JSONL open/close receipts. The inline
+monitor and expert-card interviews use the same
+Sol-medium default. Claude remains provider-native because it has not been
+benchmarked for this override; `--fast` therefore fails closed for Claude.
+Pika's `--fast` means the Luna-medium profile; it is not Codex Fast mode and
+does not select a service tier.
+Codex uses an in-memory ephemeral fork. Claude uses one streamed,
+non-persistent fork with its tool surface disabled. The parent can keep working;
+the side is read-only, does not append to the parent transcript, and is
+discarded on close. Claude support is capability-gated to the tested CLI
+version, and Pika fails closed if it cannot verify support.
 
 Pika normally builds expert cards itself, but `pika setup` never interviews
 agents. Commissioning and bulk adoption therefore finish without hidden model
@@ -150,9 +159,11 @@ Pika home. This avoids both unsafe process reparenting and a duplicate thread.
 Agent and dashboard clients can keep a genuine multi-turn side open with
 `pika ask UUID --jsonl`. Send one `{"question":"..."}` object per line and end
 with `{"close":true}`. Responses identify the exact parent UUID and explicitly
-confirm the discarded ephemeral lifecycle. The same provider process handles
-all questions until close, so follow-ups retain side context without replaying
-answers or modifying the parent.
+confirm the discarded ephemeral lifecycle. Open and close receipts also report
+`consultation_mode`, `model`, and `effort`; Claude reports null model/effort and
+provider-native mode. The same provider process handles all questions until
+close, so follow-ups retain side context without replaying answers or modifying
+the parent.
 
 The interactive `pika` monitor refreshes operational state every two seconds.
 On wide terminals it uses a grouped workstream rail and a selected-workstream
@@ -160,8 +171,9 @@ inspector inspired by a live operations board: exact identity, signal, expert
 card, read-only pane tail, and actions remain visible together. Narrow terminals
 retain the compact table view. Use arrows or j/k to select, Enter to open the
 selected identity, and `a` to focus an ephemeral multi-turn side consultation
-inside the Pika panel for that exact UUID. The left operations rail remains
-visible on wide terminals; narrow terminals use a focused full-width side panel.
+inside the Pika panel for that exact UUID. Press `A` instead for the faster
+Luna-medium Codex profile. The left operations rail remains visible on wide
+terminals; narrow terminals use a focused full-width side panel.
 Inside the side, type normally, press Enter to send, Ctrl+J for a newline,
 Ctrl+U to clear the draft, arrows to scroll, and Esc to close and discard the
 side without leaving Pika. Use `n` for the oldest attention item, `p` for a full

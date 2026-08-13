@@ -12,7 +12,12 @@ import tty
 from pathlib import Path
 
 from . import __version__
-from .consult import Consultation, ConsultationError, consultation_for
+from .consult import (
+    Consultation,
+    ConsultationError,
+    consultation_for,
+    consultation_policy,
+)
 from .core import Pika, PikaError
 from .doctor import repair_stale_state, run_doctor
 from .expert_schedule import TIMER_NAME, activate_timer
@@ -75,6 +80,14 @@ def _parser() -> argparse.ArgumentParser:
         "--jsonl",
         action="store_true",
         help="keep one consultation open using JSON-lines requests and responses",
+    )
+    ask_parser.add_argument(
+        "--fast",
+        action="store_true",
+        help=(
+            "use the benchmarked Luna-medium Codex profile "
+            "(not Codex Fast service tier)"
+        ),
     )
 
     expert_parser = sub.add_parser(
@@ -226,6 +239,13 @@ def _normalize_argv(argv: list[str]) -> list[str]:
     if not argv:
         return argv
     first = argv[0]
+    if first == "ask" and "--" not in argv:
+        options = [item for item in argv[1:] if item in {"--fast", "--jsonl"}]
+        if options:
+            positional = [
+                item for item in argv[1:] if item not in {"--fast", "--jsonl"}
+            ]
+            return [first, *positional, *options]
     if first in PUBLIC_COMMANDS | INTERNAL_COMMANDS or first in {
         "-h",
         "--help",
@@ -282,14 +302,23 @@ def _peek(pika: Pika, name: str, lines: int | None, *, ack: bool = False) -> int
 
 
 def _ask(
-    pika: Pika, name: str, question_parts: list[str], *, jsonl: bool = False
+    pika: Pika,
+    name: str,
+    question_parts: list[str],
+    *,
+    jsonl: bool = False,
+    fast: bool = False,
 ) -> int:
     session = _select_named(pika, name)
-    return _ask_session(session, question_parts, jsonl=jsonl)
+    return _ask_session(session, question_parts, jsonl=jsonl, fast=fast)
 
 
 def _ask_session(
-    session: Session, question_parts: list[str], *, jsonl: bool = False
+    session: Session,
+    question_parts: list[str],
+    *,
+    jsonl: bool = False,
+    fast: bool = False,
 ) -> int:
     if not session.transcript_path:
         raise PikaError(
@@ -303,13 +332,13 @@ def _ask_session(
         raise PikaError("Provide a question as arguments or on stdin")
 
     try:
-        with consultation_for(session) as consultation:
+        with consultation_for(session, fast=fast) as consultation:
             if jsonl:
                 return _ask_jsonl(consultation, session, initial)
             print(
                 f"SIDE · {terminal_text(session.display_name)} · "
                 f"{session.provider.title()} · parent {session.session_id[:8]} · "
-                "EPHEMERAL"
+                f"EPHEMERAL · {consultation.policy.label}"
             )
             pending = initial
             while True:
@@ -341,9 +370,18 @@ def _ask_session(
                     break
     except ConsultationError as exc:
         if jsonl:
+            try:
+                policy = consultation_policy(session, fast=fast)
+                receipt = {
+                    "consultation_mode": policy.mode,
+                    "requested_model": policy.model,
+                    "requested_effort": policy.effort,
+                }
+            except ConsultationError:
+                receipt = {}
             print(
                 json.dumps(
-                    {"type": "error", "message": str(exc)},
+                    {"type": "error", "message": str(exc), **receipt},
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
@@ -351,7 +389,10 @@ def _ask_session(
             )
             return 1
         raise PikaError(str(exc)) from exc
-    print("SIDE CLOSED · discarded · parent transcript unchanged")
+    print(
+        "SIDE CLOSED · discarded · parent transcript unchanged · "
+        f"{consultation.policy.label}"
+    )
     return 0
 
 
@@ -366,11 +407,18 @@ def _ask_jsonl(consultation: Consultation, session: Session, initial: str) -> in
             "provider": session.provider,
             "parent_id": session.session_id,
             "name": session.display_name,
+            **consultation.policy.receipt(),
         }
     )
 
     def handle(question: str) -> None:
-        emit({"type": "answer", "text": consultation.ask(question)})
+        emit(
+            {
+                "type": "answer",
+                "text": consultation.ask(question),
+                **consultation.policy.receipt(),
+            }
+        )
 
     if initial:
         handle(initial)
@@ -396,6 +444,7 @@ def _ask_jsonl(consultation: Consultation, session: Session, initial: str) -> in
             "type": "closed",
             "discarded": True,
             "parent_transcript_unchanged": True,
+            **consultation.policy.receipt(),
         }
     )
     return 0
@@ -513,9 +562,16 @@ def _print_expert_refresh_results(results, *, as_json: bool = False) -> None:
             if item.remaining_percent is not None
             else ""
         )
+        policy = (
+            f" · {item.model} · {item.effort}"
+            if item.model and item.effort
+            else " · provider native"
+            if item.consultation_mode == "provider-native"
+            else ""
+        )
         print(
             f"{item.status} · {subject} · {item.provider.title()}"
-            f"{quota} · {terminal_text(item.detail)}"
+            f"{quota}{policy} · {terminal_text(item.detail)}"
         )
 
 
@@ -890,7 +946,13 @@ def run(argv: list[str] | None = None) -> int:
     if args.command == "open":
         return pika.open(_select_named(pika, args.name))
     if args.command == "ask":
-        return _ask(pika, args.name, args.question, jsonl=args.jsonl)
+        return _ask(
+            pika,
+            args.name,
+            args.question,
+            jsonl=args.jsonl,
+            fast=args.fast,
+        )
     if args.command == "expert":
         return _expert(pika, args)
     if args.command == "experts":

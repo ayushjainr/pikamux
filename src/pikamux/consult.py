@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,11 +19,72 @@ class ConsultationError(RuntimeError):
     pass
 
 
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+DEFAULT_CODEX_EFFORT = "medium"
+FAST_CODEX_MODEL = "gpt-5.6-luna"
+FAST_CODEX_EFFORT = "medium"
+
+
+@dataclass(frozen=True, slots=True)
+class ConsultationPolicy:
+    mode: str
+    model: str | None
+    effort: str | None
+
+    @property
+    def label(self) -> str:
+        if self.model and self.effort:
+            return f"{self.model} · {self.effort}"
+        return "provider native"
+
+    def receipt(self) -> dict[str, str | None]:
+        return {
+            "consultation_mode": self.mode,
+            "model": self.model,
+            "effort": self.effort,
+        }
+
+
+def consultation_policy(session: Session, *, fast: bool = False) -> ConsultationPolicy:
+    if session.provider == "codex":
+        if fast:
+            return ConsultationPolicy("fast", FAST_CODEX_MODEL, FAST_CODEX_EFFORT)
+        return ConsultationPolicy(
+            "default", DEFAULT_CODEX_MODEL, DEFAULT_CODEX_EFFORT
+        )
+    if session.provider == "claude":
+        if fast:
+            raise ConsultationError(
+                "Fast consultations are not benchmarked for Claude; "
+                "omit --fast to use its provider-native model"
+            )
+        return ConsultationPolicy("provider-native", None, None)
+    raise ConsultationError(f"Unsupported provider: {session.provider}")
+
+
+def _validated_policy(
+    session: Session,
+    policy: ConsultationPolicy | None = None,
+    *,
+    fast: bool = False,
+) -> ConsultationPolicy:
+    if fast and policy is not None:
+        raise ConsultationError("Choose either fast mode or an explicit policy, not both")
+    candidate = policy or consultation_policy(session, fast=fast)
+    expected = consultation_policy(session, fast=candidate.mode == "fast")
+    if candidate != expected:
+        raise ConsultationError(
+            f"Invalid {session.provider} consultation policy: {candidate.label}"
+        )
+    return candidate
+
+
 class Consultation(ABC):
     """A provider-native, non-persistent side conversation."""
 
-    def __init__(self, session: Session):
+    def __init__(self, session: Session, policy: ConsultationPolicy):
         self.session = session
+        self.policy = policy
 
     @abstractmethod
     def ask(self, question: str) -> str:
@@ -96,8 +158,18 @@ class CodexConsultation(Consultation):
     FORK_TIMEOUT_SECONDS = 180.0
     TURN_START_TIMEOUT_SECONDS = 60.0
 
-    def __init__(self, session: Session, *, timeout: float = 900.0):
-        super().__init__(session)
+    def __init__(
+        self,
+        session: Session,
+        *,
+        timeout: float = 900.0,
+        policy: ConsultationPolicy | None = None,
+    ):
+        if session.provider != "codex":
+            raise ConsultationError(
+                f"Codex consultation cannot open a {session.provider} session"
+            )
+        super().__init__(session, _validated_policy(session, policy))
         self.timeout = timeout
         self.process: subprocess.Popen[str] | None = None
         self.thread_id: str | None = None
@@ -132,20 +204,29 @@ class CodexConsultation(Consultation):
                 timeout=15.0,
             )
             self._send({"method": "initialized"})
+            fork_params: dict[str, Any] = {
+                "threadId": self.session.session_id,
+                "ephemeral": True,
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "developerInstructions": (
+                    "This is an ephemeral side consultation. Answer from the "
+                    "inherited conversation context without modifying files or "
+                    "external state. If tools would be required, explain what "
+                    "needs checking instead. Keep dated or named historical "
+                    "work separate from later current state; state the chronology "
+                    "when both are relevant."
+                ),
+            }
+            if self.policy.model:
+                fork_params["model"] = self.policy.model
+            if self.policy.effort:
+                fork_params["config"] = {
+                    "model_reasoning_effort": self.policy.effort
+                }
             result = self._request(
                 "thread/fork",
-                {
-                    "threadId": self.session.session_id,
-                    "ephemeral": True,
-                    "approvalPolicy": "never",
-                    "sandbox": "read-only",
-                    "developerInstructions": (
-                        "This is an ephemeral side consultation. Answer from the "
-                        "inherited conversation context without modifying files or "
-                        "external state. If tools would be required, explain what "
-                        "needs checking instead."
-                    ),
-                },
+                fork_params,
                 timeout=self.FORK_TIMEOUT_SECONDS,
             )
         except (OSError, BrokenPipeError, ValueError, ConsultationError):
@@ -157,6 +238,18 @@ class CodexConsultation(Consultation):
             self.close()
             raise ConsultationError(
                 "Codex did not confirm an ephemeral fork; refusing to continue"
+            )
+        observed_model = result.get("model")
+        observed_effort = result.get("reasoningEffort")
+        if (
+            observed_model != self.policy.model
+            or observed_effort != self.policy.effort
+        ):
+            self.close()
+            raise ConsultationError(
+                "Codex did not confirm the requested consultation profile; "
+                f"requested {self.policy.label}, observed "
+                f"{observed_model or 'unknown'} · {observed_effort or 'unknown'}"
             )
         self.thread_id = str(thread_id)
         self._notifications.clear()
@@ -206,13 +299,16 @@ class CodexConsultation(Consultation):
         if not self.thread_id or self.process is None:
             raise ConsultationError("Codex side consultation is closed")
         self._notifications.clear()
+        params: dict[str, Any] = {
+            "threadId": self.thread_id,
+            "input": [{"type": "text", "text": question}],
+        }
+        if self.policy.model:
+            params["model"] = self.policy.model
+        if self.policy.effort:
+            params["effort"] = self.policy.effort
         result = self._request(
-            "turn/start",
-            {
-                "threadId": self.thread_id,
-                "input": [{"type": "text", "text": question}],
-            },
-            timeout=self.TURN_START_TIMEOUT_SECONDS,
+            "turn/start", params, timeout=self.TURN_START_TIMEOUT_SECONDS
         )
         turn = result.get("turn") if isinstance(result, dict) else None
         turn_id = turn.get("id") if isinstance(turn, dict) else None
@@ -287,8 +383,18 @@ class CodexConsultation(Consultation):
 class ClaudeConsultation(Consultation):
     MIN_SIDE_QUESTION_VERSION = (2, 1, 228)
 
-    def __init__(self, session: Session, *, timeout: float = 900.0):
-        super().__init__(session)
+    def __init__(
+        self,
+        session: Session,
+        *,
+        timeout: float = 900.0,
+        policy: ConsultationPolicy | None = None,
+    ):
+        if session.provider != "claude":
+            raise ConsultationError(
+                f"Claude consultation cannot open a {session.provider} session"
+            )
+        super().__init__(session, _validated_policy(session, policy))
         self.timeout = timeout
         self.process: subprocess.Popen[str] | None = None
         self._check_capability()
@@ -398,11 +504,17 @@ class ClaudeConsultation(Consultation):
         self.process = None
 
 
-def consultation_for(session: Session) -> Consultation:
+def consultation_for(
+    session: Session,
+    *,
+    fast: bool = False,
+    policy: ConsultationPolicy | None = None,
+) -> Consultation:
+    policy = _validated_policy(session, policy, fast=fast)
     if session.provider == "codex":
-        return CodexConsultation(session)
+        return CodexConsultation(session, policy=policy)
     if session.provider == "claude":
-        return ClaudeConsultation(session)
+        return ClaudeConsultation(session, policy=policy)
     raise ConsultationError(f"Unsupported provider: {session.provider}")
 
 
