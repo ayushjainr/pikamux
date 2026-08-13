@@ -57,6 +57,9 @@ def handle_hook(
     if not session_id:
         return None
     store.set_meta(f"hook_seen:{provider}", hook_spec_fingerprint(provider))
+    if store.is_untracked(provider, session_id):
+        store.delete_live_owner(provider, session_id)
+        return None
     owner_pid = provider_ancestor(os.getppid(), provider)
     if data.get("hook_event_name") == "SessionEnd":
         if owner_pid:
@@ -149,6 +152,8 @@ def handle_hook(
         last_activity_at=now,
     )
     store.upsert_session(session)
+    if store.is_untracked(provider, session_id):
+        return None
     if placeholder and placeholder.session_id != session_id:
         store.delete_session(provider, placeholder.session_id)
     if pane:
@@ -244,6 +249,10 @@ def handle_process_exit(
     store: Store | None = None,
 ) -> None:
     store = store or Store()
+    if session_id and store.is_untracked(provider, session_id):
+        if launch_token:
+            store.delete_launch_binding(launch_token)
+        return
     target: Session | None = None
     if session_id:
         target = store.get_session(provider, session_id)

@@ -229,6 +229,40 @@ class HookTests(unittest.TestCase):
         self.assertIsNone(self.store.get_session("codex", "ephemeral-id"))
         self.assertEqual(self.store.get_live_owners("codex", "ephemeral-id"), [])
 
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_untracked_session_hook_cannot_restore_tracking_or_tags(self) -> None:
+        self.store.untrack_session("codex", "ignored-id")
+        result = handle_hook(
+            "codex",
+            {
+                "session_id": "ignored-id",
+                "cwd": "/tmp",
+                "hook_event_name": "Stop",
+            },
+            self.store,
+        )
+        self.assertIsNone(result)
+        self.assertIsNone(self.store.get_session("codex", "ignored-id"))
+        self.assertEqual(self.store.get_live_owners("codex", "ignored-id"), [])
+        self.assertEqual(FakeTmux.tags, [])
+
+    def test_untracked_process_exit_does_not_create_hidden_attention(self) -> None:
+        self.store.upsert_session(
+            Session("codex", "ignored-exit", name="quiet", status=Status.WORKING.value)
+        )
+        self.store.untrack_session("codex", "ignored-exit")
+
+        handle_process_exit(
+            "codex",
+            7,
+            session_id="ignored-exit",
+            store=self.store,
+        )
+
+        hidden = self.store.get_session("codex", "ignored-exit")
+        self.assertEqual(hidden.status if hidden else None, Status.PARKED.value)
+        self.assertFalse(hidden.unread if hidden else True)
+
     @patch("pikamux.hooks.CodexProvider")
     @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_codex_session_start_sets_native_name(self, provider_class) -> None:

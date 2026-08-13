@@ -147,6 +147,7 @@ class Pika:
     def import_candidate(
         self, candidate: Candidate, *, managed: bool = False
     ) -> Session:
+        self.store.restore_tracking(candidate.provider, candidate.session_id)
         now = time.time()
         adopted_pane: Pane | None = None
         if candidate.live and candidate.pid:
@@ -209,10 +210,12 @@ class Pika:
         tracked_sessions = self.store.list_sessions()
         candidates = self.discover_candidates(tracked_sessions)
         hidden_keys = self.hidden_session_keys()
+        untracked_keys = self.store.untracked_session_keys()
+        excluded_keys = hidden_keys | untracked_keys
         candidates = [
             item
             for item in candidates
-            if (item.provider, item.session_id) not in hidden_keys
+            if (item.provider, item.session_id) not in excluded_keys
         ]
         candidate_map = {(item.provider, item.session_id): item for item in candidates}
         panes = self.tmux.list_panes()
@@ -228,15 +231,23 @@ class Pika:
                 panes_by_key.setdefault(
                     (pane.pika_provider, pane.pika_session_id), []
                 ).append(pane)
+        # An untracked live process may keep emitting provider hooks. Its Pika
+        # tombstone is authoritative, and stale pane tags must not resurrect it.
+        for key in untracked_keys:
+            for pane in panes_by_key.get(key, []):
+                try:
+                    self.tmux.clear_pika_tags(pane.pane_id)
+                except (AttributeError, OSError, TmuxError):
+                    pass
         # Recover tagged panes even if the ledger was lost.
         known_keys = {
             session.key
             for session in self.store.list_sessions()
-            if session.key not in hidden_keys
+            if session.key not in excluded_keys
         }
         for key, pane in pane_by_key.items():
             assert key[0] is not None and key[1] is not None
-            if key in known_keys or key in hidden_keys:
+            if key in known_keys or key in excluded_keys:
                 continue
             candidate = candidate_map.get((key[0], key[1]))
             now = time.time()
@@ -265,7 +276,7 @@ class Pika:
         sessions = [
             session
             for session in self.store.list_sessions()
-            if session.key not in hidden_keys
+            if session.key not in excluded_keys
         ]
         exact_panes = {(p.pika_provider, p.pika_session_id): p for p in panes}
         for session in sessions:
@@ -307,6 +318,17 @@ class Pika:
             if candidate:
                 if candidate.name:
                     fields["name"] = candidate.name
+                    if pane and pane.pika_name != candidate.name:
+                        try:
+                            self.tmux.tag_pane(
+                                pane.pane_id,
+                                name=candidate.name,
+                            )
+                        except (AttributeError, OSError, TmuxError) as exc:
+                            self.discovery_errors.append(
+                                f"{session.provider}:{session.session_id} "
+                                f"pane name tag: {exc}"
+                            )
                     if session.provider == "codex":
                         self.store.delete_meta(
                             f"native_name_error:codex:{session.session_id}"
@@ -436,7 +458,7 @@ class Pika:
         sessions = [
             session
             for session in self.store.list_sessions()
-            if session.key not in hidden_keys
+            if session.key not in excluded_keys
         ]
         for session in sessions:
             pane = pane_by_id.get(session.tmux_pane or "")
@@ -526,7 +548,35 @@ class Pika:
         if len(prefix) == 1:
             return prefix[0]
         if not supplied_sessions:
+            untracked = self.store.list_untracked_sessions()
+            hidden_exact = [item for item in untracked if item.session_id == query]
+            hidden_named = [
+                item
+                for item in untracked
+                if item.name and item.name.casefold() == query_folded
+            ]
+            hidden_prefix = [
+                item for item in untracked if item.session_id.startswith(query)
+            ]
+            hidden_matches = hidden_exact or hidden_named
+            if not hidden_matches and len(hidden_prefix) == 1:
+                hidden_matches = hidden_prefix
+            if hidden_matches:
+                restored = choose_session(
+                    hidden_matches,
+                    "Two untracked conversations share that name",
+                )
+                self.store.restore_tracking(*restored.key)
+                return restored
             discovered = self.discover_candidates()
+            discovered_uuid = [item for item in discovered if item.session_id == query]
+            if discovered_uuid:
+                return self.import_candidate(choose_session(discovered_uuid))
+            discovered_prefix = [
+                item for item in discovered if item.session_id.startswith(query)
+            ]
+            if len(discovered_prefix) == 1:
+                return self.import_candidate(discovered_prefix[0])
             discovered_matches = [
                 item
                 for item in discovered
@@ -1560,6 +1610,7 @@ class Pika:
             last_event_at=now,
             last_activity_at=pane.activity,
         )
+        self.store.restore_tracking(provider_name, session_id)
         self.store.upsert_session(session)
         self.tmux.tag_pane(
             pane.pane_id,
@@ -1568,3 +1619,28 @@ class Pika:
             name=session.display_name,
         )
         return session
+
+    def untrack(self, session: Session) -> int:
+        """Stop showing an exact UUID without stopping or archiving its agent."""
+        if session.session_id.startswith("unbound:"):
+            raise PikaError(
+                "Pika cannot stop watching this placeholder safely because its "
+                "provider UUID is not known yet. Wait for it to bind, or exit the "
+                "agent normally."
+            )
+        panes = [
+            pane
+            for pane in self.tmux.list_panes()
+            if (pane.pika_provider, pane.pika_session_id) == session.key
+        ]
+        # Commit the tombstone before clearing transport metadata so a racing
+        # hook cannot persist the conversation again.
+        self.store.untrack_session(*session.key)
+        cleared = 0
+        for pane in panes:
+            try:
+                self.tmux.clear_pika_tags(pane.pane_id)
+            except (AttributeError, OSError, TmuxError):
+                continue
+            cleared += 1
+        return cleared

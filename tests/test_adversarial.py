@@ -194,6 +194,73 @@ class AdversarialTests(unittest.TestCase):
         self.assertEqual(resolved.session_id, candidate.session_id)
         self.assertIsNotNone(self.store.get_session("codex", candidate.session_id))
 
+    @patch("pikamux.core.process_tree", side_effect=lambda pid: {pid})
+    @patch("pikamux.core.provider_process", side_effect=lambda pid, _provider: pid)
+    def test_provider_rename_updates_ledger_and_recovery_tag(
+        self, _provider_process, _process_tree
+    ) -> None:
+        session_id = "12121212-1212-4212-8212-121212121212"
+        self.store.upsert_session(
+            Session("codex", session_id, name="old-name", tmux_pane="%1")
+        )
+        old_pane = pane(provider="codex", session_id=session_id)
+        old_pane.pika_name = "old-name"
+        tmux = StaticTmux([old_pane])
+        candidate = Candidate(
+            "codex",
+            session_id,
+            name="new-name",
+            live=True,
+            pid=123,
+            updated_at=time.time(),
+        )
+        pika = Pika(
+            self.store,
+            tmux,
+            {"codex": FakeProvider(candidates=[candidate], active=[123])},
+        )
+
+        refreshed = pika.refresh()
+
+        self.assertEqual(refreshed[0].name, "new-name")
+        self.assertIn(("%1", {"name": "new-name"}), tmux.tags)
+
+    def test_untrack_clears_tags_and_stays_hidden_until_explicit_reopen(self) -> None:
+        session_id = "13131313-1313-4313-8313-131313131313"
+        tracked = Session(
+            "codex", session_id, name="quiet-work", tmux_pane="%1", managed=True
+        )
+        self.store.upsert_session(tracked)
+        tmux = StaticTmux([pane(provider="codex", session_id=session_id)])
+        pika = Pika(
+            self.store,
+            tmux,
+            {"codex": FakeProvider(candidates=[])},
+        )
+
+        self.assertEqual(pika.untrack(tracked), 1)
+        self.assertEqual(tmux.cleared, ["%1"])
+        self.assertEqual(pika.refresh(), [])
+        self.assertTrue(self.store.is_untracked("codex", session_id))
+
+        restored = pika.resolve(session_id)
+        self.assertEqual(restored.session_id, session_id)
+        self.assertFalse(self.store.is_untracked("codex", session_id))
+
+    def test_untrack_refuses_placeholder_without_exact_uuid(self) -> None:
+        placeholder = Session(
+            "codex", "unbound:%9", name="unknown", tmux_pane="%9"
+        )
+        self.store.upsert_session(placeholder)
+        pika = Pika(
+            self.store,
+            StaticTmux([pane(pane_id="%9")]),
+            {"codex": FakeProvider()},
+        )
+        with self.assertRaisesRegex(PikaError, "provider UUID is not known"):
+            pika.untrack(placeholder)
+        self.assertIsNotNone(self.store.get_session(*placeholder.key))
+
     def test_provider_hidden_session_stays_out_of_refresh_and_pane_recovery(
         self,
     ) -> None:

@@ -403,6 +403,47 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("q/Esc close", minimum.plain)
         self.assertIn("q close", minimum.plain.splitlines()[-1])
 
+    def test_stop_watching_confirmation_is_explicit_and_recoverable(self) -> None:
+        state = MonitorState(sessions=self.sessions, last_update=time.time())
+        selected = state.selected()
+        action, target = _handle_key("untrack", Mock(), state)
+        self.assertEqual((action, target), ("continue", None))
+        self.assertEqual(state.mode, "untrack")
+
+        wide = render_monitor(state, width=140, height=30, color=False)
+        self.assertIn("STOP WATCHING", wide.plain)
+        self.assertIn("The agent keeps running", wide.plain)
+        self.assertIn("not archived", wide.plain)
+        self.assertIn("x / Enter", wide.plain)
+
+        action, target = _handle_key("escape", Mock(), state)
+        self.assertEqual((action, target), ("continue", None))
+        self.assertEqual(state.mode, "sessions")
+
+        _handle_key("untrack", Mock(), state)
+        narrow = render_monitor(state, width=72, height=20, color=False)
+        self.assertIn("STOP WATCHING", narrow.plain)
+        action, target = _handle_key("enter", Mock(), state)
+        self.assertEqual(action, "untrack")
+        self.assertEqual(
+            target.key if target else None,
+            selected.key if selected else None,
+        )
+        self.assertEqual(state.mode, "sessions")
+
+    def test_x_decodes_to_stop_watching_action(self) -> None:
+        self.assertEqual(decode_keys(bytearray(b"x")), ["untrack"])
+
+    def test_placeholder_cannot_offer_weak_stop_watching_guarantee(self) -> None:
+        placeholder = Session(
+            "codex", "unbound:%9", name="unknown", status=Status.UNBOUND.value
+        )
+        state = MonitorState(sessions=[placeholder])
+        action, target = _handle_key("untrack", Mock(), state)
+        self.assertEqual((action, target), ("continue", None))
+        self.assertEqual(state.mode, "sessions")
+        self.assertIn("exact UUID", state.toast or "")
+
     def test_morning_handoff_has_first_and_long_gap_semantics(self) -> None:
         now = time.time()
         first = HandoffSummary(now, 2, 1, 0, first=True)

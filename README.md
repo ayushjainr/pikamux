@@ -47,6 +47,10 @@ events. Codex requires one extra trust step: open
 observe a real lifecycle event. Pika uses “commissioned” only when both
 integrations are currently active and have delivered the current hook
 definition; otherwise it names every remaining activation or observation proof.
+Commissioning finishes with a transcript-free reconciliation of already tracked
+conversations, so provider-native renames update both the Pika inventory and the
+tmux recovery tag. It never interviews agents to do this.
+Conversations you explicitly untracked stay out of later setup import choices.
 
 For automation, review a dry run and then apply it explicitly:
 
@@ -87,6 +91,7 @@ pika wait NAME             wait for NEEDS YOU, unread READY, OPEN TWICE, or ERRO
 pika new NAME              create using the configured default provider
 pika new NAME --agent ...  override with codex or claude
 pika adopt [TARGET|NAME]    tag a live agent by tmux target or Pika name
+pika untrack NAME           stop watching without stopping or archiving the agent
 pika doctor                print a recoverability receipt
 pika doctor --verbose      show every receipt check
 pika doctor --repair-stale remove confirmed stale launch locks (5m+)
@@ -162,6 +167,15 @@ Ctrl+U to clear the draft, arrows to scroll, and Esc to close and discard the
 side without leaving Pika. Use `n` for the oldest attention item, `p` for a full
 sanitized pane peek, `u` to reveal or hide provider usage, `r` to reconcile
 immediately, `?` for keys, and `q` to leave from the operations view.
+Press `x` to stop watching the selected workstream. Pika asks for confirmation
+inside the panel, then removes that UUID from Live Operations while leaving its
+agent process, provider conversation, and expert card intact. This differs from
+tmux's `Ctrl-b d`, which only detaches your current view and keeps the workstream
+on Pika. An untracked live hook cannot silently add the row back; explicitly
+open its UUID or adopt the conversation when you want Pika to watch it again.
+An `unbound:%pane` placeholder cannot be removed until Pika learns the immutable
+provider UUID; the panel explains that boundary rather than creating a weak
+pane-only ignore rule.
 
 The inline side keeps one provider process for all follow-ups and shows opening,
 thinking, ready, and error states without blocking dashboard refresh or input.
@@ -228,6 +242,11 @@ in `~/.local/state/pika/pika.db`. The durable key is `(provider, UUID)`; Pika
 refreshes provider-native names and may therefore show collisions. A collision
 always produces a chooser (or an error in a non-interactive process), never an
 implicit provider choice.
+
+Renaming an adopted conversation remains provider-owned. The next ordinary
+reconciliation, including `pika`, `pika list`, or `pika setup`, updates the
+tracked display name and the pane's recovery metadata when the provider exposes
+the new name.
 
 Live hook ownership is bound to both a PID and its Linux process start time, so
 a recycled PID cannot counterfeit exact-UUID identity. A shared Codex app-server

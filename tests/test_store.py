@@ -351,6 +351,47 @@ class StoreTests(unittest.TestCase):
             self.assertFalse(self.store.set_live_owner("codex", "exact-uuid", 123))
         self.assertEqual(self.store.get_live_owners("codex", "exact-uuid"), [])
 
+    def test_untracking_blocks_hook_writes_and_retains_expert_card(self) -> None:
+        session = Session("codex", "watched", name="researcher")
+        self.store.upsert_session(session)
+        self.store.put_expert_profile(
+            ExpertProfile(
+                "codex",
+                "watched",
+                "Owns the research pipeline.",
+                ("research", "pipeline", "operations"),
+                current_state="Monitoring the current run.",
+            )
+        )
+        with patch("pikamux.store.process_start_time", return_value=100):
+            self.assertTrue(self.store.set_live_owner("codex", "watched", 123))
+
+        self.store.untrack_session("codex", "watched")
+
+        self.assertTrue(self.store.is_untracked("codex", "watched"))
+        self.assertIn(("codex", "watched"), self.store.untracked_session_keys())
+        self.assertEqual(self.store.list_sessions(), [])
+        hidden = self.store.get_session("codex", "watched")
+        self.assertIsNotNone(hidden)
+        self.assertEqual(hidden.status if hidden else None, Status.PARKED.value)
+        self.assertEqual(
+            [item.session_id for item in self.store.list_untracked_sessions()],
+            ["watched"],
+        )
+        self.assertIsNotNone(self.store.get_expert_profile("codex", "watched"))
+        self.assertEqual(self.store.get_live_owners("codex", "watched"), [])
+        self.store.upsert_session(session)
+        self.assertEqual(self.store.list_sessions(), [])
+        with patch("pikamux.store.process_start_time", return_value=100):
+            self.assertFalse(self.store.set_live_owner("codex", "watched", 123))
+
+        self.store.restore_tracking("codex", "watched")
+        self.store.upsert_session(session)
+        self.assertEqual(
+            [item.session_id for item in self.store.list_sessions()],
+            ["watched"],
+        )
+
     def test_expert_profile_round_trip_replaces_and_follows_session_lifetime(
         self,
     ) -> None:

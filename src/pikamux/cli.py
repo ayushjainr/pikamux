@@ -41,6 +41,7 @@ PUBLIC_COMMANDS = {
     "wait",
     "new",
     "adopt",
+    "untrack",
     "setup",
     "doctor",
 }
@@ -55,7 +56,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"pikamux {__version__}")
     sub = parser.add_subparsers(
         dest="command",
-        metavar="{open,ask,expert,experts,list,next,peek,wait,new,adopt,setup,doctor}",
+        metavar=(
+            "{open,ask,expert,experts,list,next,peek,wait,new,adopt,"
+            "untrack,setup,doctor}"
+        ),
     )
 
     open_parser = sub.add_parser("open", help="open a named conversation")
@@ -166,6 +170,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     adopt_parser.add_argument("target", nargs="?", metavar="TMUX_TARGET_OR_NAME")
     adopt_parser.add_argument("--name")
+
+    untrack_parser = sub.add_parser(
+        "untrack",
+        help="stop watching a conversation without stopping or archiving it",
+    )
+    untrack_parser.add_argument("name")
 
     setup_parser = sub.add_parser("setup", help="preview and install lifecycle hooks")
     setup_parser.add_argument("--default-provider", choices=("codex", "claude"))
@@ -615,15 +625,23 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
     print("Pika commissioning · exact recovery for Codex + Claude")
     print("Preview first · existing settings retained · backups before writes\n")
     selected = []
+    tracked_sessions = [] if args.dry_run else pika.store.list_sessions()
+    tracked_names = {session.key: session.display_name for session in tracked_sessions}
+    untracked_keys = (
+        set()
+        if args.dry_run
+        else pika.store.untracked_session_keys()
+    )
     if not args.no_import and not args.dry_run:
         candidates = [
             item for item in pika.discover_import_candidates() if item.name or item.live
         ]
-        tracked = {session.key for session in pika.store.list_sessions()}
+        tracked = {session.key for session in tracked_sessions}
         candidates = [
             item
             for item in candidates
             if (item.provider, item.session_id) not in tracked
+            and (item.provider, item.session_id) not in untracked_keys
         ]
         if args.import_all:
             selected = candidates
@@ -736,12 +754,34 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
             if not observed[provider]:
                 incomplete.append(f"{provider.title()} observation")
         print("\nPika not yet commissioned · pending: " + ", ".join(incomplete) + ".")
-    if args.no_import:
-        return 0
     for candidate in selected:
         pika.import_candidate(candidate)
     if selected:
         print(f"Adopted {len(selected)} existing conversation(s).")
+    synchronized = pika.refresh(usage=False)
+    renamed = [
+        (tracked_names[session.key], session.display_name, session)
+        for session in synchronized
+        if session.key in tracked_names
+        and tracked_names[session.key] != session.display_name
+    ]
+    if renamed:
+        print(f"Refreshed {len(renamed)} provider rename(s):")
+        for old_name, new_name, session in renamed:
+            print(
+                f"  {session.provider.title():<6} {session.session_id[:8]}  "
+                f"{terminal_text(old_name)} → {terminal_text(new_name)}"
+            )
+    elif tracked_sessions:
+        print(f"Reconciled {len(tracked_sessions)} tracked conversation name(s).")
+    sync_errors = getattr(pika, "discovery_errors", [])
+    if isinstance(sync_errors, list) and sync_errors:
+        print(
+            "Name reconciliation partial · "
+            + "; ".join(terminal_text(error) for error in sync_errors)
+        )
+    if args.no_import:
+        return 0
     print("\nExpert cards deferred · setup did not interview any agents.")
     print(
         "Missing or stale cards remain visible in `pika expert status`; the "
@@ -882,6 +922,18 @@ def run(argv: list[str] | None = None) -> int:
         if session.transcript_path:
             print("Building its UUID-bound expert card…", flush=True)
         _print_expert_refresh_results(pika.bootstrap_experts([session]))
+        return 0
+    if args.command == "untrack":
+        session = _select_named(pika, args.name)
+        pika.untrack(session)
+        print(
+            f"Stopped watching {terminal_text(session.display_name)} "
+            f"({session.provider}, {session.session_id[:8]})."
+        )
+        print(
+            "The agent and provider conversation were left running and unarchived. "
+            f"Use `pika adopt` or `pika open {session.session_id}` to track it again."
+        )
         return 0
     if args.command == "setup":
         return _setup(pika, args)

@@ -155,6 +155,8 @@ class MonitorPika(Protocol):
 
     def acknowledge(self, session: Session, *, attaching: bool = False) -> bool: ...
 
+    def untrack(self, session: Session) -> int: ...
+
     def next_attention(
         self, sessions: list[Session] | None = None
     ) -> Session | None: ...
@@ -313,6 +315,7 @@ class MonitorState:
     ask_error: str | None = None
     ask_pending: bool = False
     ask_scroll: int = 0
+    untrack_target: Session | None = None
 
     def ordered(self) -> list[Session]:
         return sorted_sessions(self.sessions)
@@ -367,6 +370,14 @@ class MonitorState:
         self.ask_status = "closed"
         self.ask_pending = False
         self.ask_outbox = None
+
+    def begin_untrack(self, session: Session) -> None:
+        self.mode = "untrack"
+        self.untrack_target = replace(session)
+
+    def close_untrack(self) -> None:
+        self.mode = "sessions"
+        self.untrack_target = None
 
 
 def strip_terminal_sequences(value: str) -> str:
@@ -692,8 +703,8 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
     if width < 80:
         items = [
             "↑↓/jk move · Enter open · n next",
-            "a ask · p peek · u usage · r refresh",
-            "g/G ends · ? close · q/Esc close",
+            "a ask · p peek · x stop watching",
+            "u usage · r refresh · ? keys · q/Esc close",
             (
                 f"Need {counts['decisions']} · results {counts['results']} · "
                 f"failed {counts['errors']} · unbound {counts['unbound']}"
@@ -705,6 +716,7 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
             "Enter open selected             n    open oldest attention",
             "a     ask here in side panel      p    peek recent pane output",
             "u     operations / usage view    r    reconcile now",
+            "x     stop watching selected     Esc  cancel confirmation",
             "g/G   first / last               ?    close this help",
             "q/Esc close this help",
             "",
@@ -1179,6 +1191,59 @@ def _ask_panel_lines(
     return plain[:height], ansi[:height]
 
 
+def _untrack_panel_lines(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    color: bool,
+) -> tuple[list[str], list[str]]:
+    target = state.untrack_target or state.selected()
+    if target is None:
+        plain = [_fit("STOP WATCHING // NO TARGET", width), _fit("Esc returns.", width)]
+        return (
+            (plain + [" " * width] * height)[:height],
+            ([_paint(plain[0], FG_RED, color), plain[1]] + [" " * width] * height)[
+                :height
+            ],
+        )
+    title = _line("STOP WATCHING", "CONFIRM", width)
+    identity = _detail_value(
+        "target", f"{target.provider.title()} · {target.session_id[:8]}", width
+    )
+    name = _detail_value("name", target.display_name, width)
+    lines = [
+        title,
+        " " * width,
+        name,
+        identity,
+        " " * width,
+        _fit("Pika will remove this workstream from Live Operations.", width),
+        _fit("The agent keeps running. The conversation is not archived.", width),
+        _fit("Its expert card is retained for a later re-adoption.", width),
+        " " * width,
+        _fit("Use pika adopt or explicitly open it to watch it again.", width),
+        " " * width,
+        _fit("[x / Enter] stop watching    [Esc / q] keep watching", width),
+    ]
+    ansi = [
+        _paint(title, BOLD + FG_YELLOW, color),
+        " " * width,
+        _paint(name, BOLD, color),
+        _paint(identity, DIM, color),
+        " " * width,
+        lines[5],
+        _paint(lines[6], FG_GREEN, color),
+        _paint(lines[7], FG_BLUE, color),
+        " " * width,
+        _paint(lines[9], DIM, color),
+        " " * width,
+        _paint(lines[11], REVERSE, color),
+    ]
+    padding = [" " * width] * max(0, height - len(lines))
+    return (lines + padding)[:height], (ansi + padding)[:height]
+
+
 def _render_compact_ask(
     state: MonitorState,
     *,
@@ -1202,6 +1267,25 @@ def _render_compact_ask(
     )
 
 
+def _render_compact_untrack(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    color: bool,
+) -> MonitorFrame:
+    body_height = max(1, height - 1)
+    plain, ansi = _untrack_panel_lines(
+        state, width=width, height=body_height, color=color
+    )
+    footer = _fit("x / Enter confirm  Esc / q cancel", width)
+    return MonitorFrame(
+        "\n".join([*ansi, _paint(footer, REVERSE, color)]),
+        "\n".join([*plain, footer]),
+        state.selected_key,
+    )
+
+
 def _split_right_pane(
     state: MonitorState,
     *,
@@ -1213,6 +1297,10 @@ def _split_right_pane(
     if state.mode == "ask":
         return _ask_panel_lines(
             state, width=width, height=height, now=now, color=color
+        )
+    if state.mode == "untrack":
+        return _untrack_panel_lines(
+            state, width=width, height=height, color=color
         )
     selected = state.selected()
     if selected is None:
@@ -1368,7 +1456,7 @@ def _split_right_pane(
             else "open"
         )
         ask = " · [a] ask here" if selected.transcript_path else ""
-        actions = f"[Enter] {open_label}{ask} · [p] peek"
+        actions = f"[Enter] {open_label}{ask} · [p] peek · [x] stop watching"
         reassurance = (
             "Inline asks are ephemeral; the parent transcript remains unchanged."
             if selected.transcript_path
@@ -1469,7 +1557,15 @@ def _render_split_monitor(
         else f"{sync} · {clock}"
     )
     summary.append(status_clock)
-    view = " · SIDE" if state.mode == "ask" else " · USAGE" if state.show_usage else ""
+    view = (
+        " · SIDE"
+        if state.mode == "ask"
+        else " · CONFIRM"
+        if state.mode == "untrack"
+        else " · USAGE"
+        if state.show_usage
+        else ""
+    )
     header_plain = _line(
         f"PIKA // LIVE OPERATIONS{view}",
         " · ".join(summary),
@@ -1511,6 +1607,15 @@ def _render_split_monitor(
             "↑↓ history  Esc close side",
             width,
         )
+    elif state.mode == "untrack":
+        playbook_plain = _fit(
+            "STOP WATCHING // process stays alive · provider history stays intact",
+            width,
+        )
+        playbook_ansi = _paint(playbook_plain, FG_YELLOW, color)
+        footer_plain = _fit(
+            "x / Enter confirm stop watching    Esc / q cancel", width
+        )
     else:
         tip_index, tip_total, tip = playbook_tip(
             now,
@@ -1524,7 +1629,7 @@ def _render_split_monitor(
         )
         playbook_ansi = _paint(playbook_plain, FG_BLUE, color)
         footer_plain = _fit(
-            "↑↓/jk move  Enter open  a ask here  n next needed  p peek  "
+            "↑↓/jk move  Enter open  a ask here  n next needed  p peek  x stop watching  "
             f"u {'operations' if state.show_usage else 'usage'}  r refresh  ? keys  q quit",
             width,
         )
@@ -1553,14 +1658,20 @@ def render_monitor(
     selected = state.selected()
 
     if width < MIN_WIDTH or height < MIN_HEIGHT:
-        if state.mode == "ask":
+        if state.mode in {"ask", "untrack"}:
+            label = "SIDE" if state.mode == "ask" else "CONFIRM"
+            recovery = (
+                "Esc closes and discards this side"
+                if state.mode == "ask"
+                else "Esc keeps this workstream on Pika"
+            )
             minimum = [
-                _line("PIKA // SIDE", "PAUSED", width),
+                _line(f"PIKA // {label}", "PAUSED", width),
                 "─" * width,
                 _fit(f"Terminal too small · need {MIN_WIDTH}x{MIN_HEIGHT}", width),
                 _fit(f"Current viewport · {width}x{height}", width),
                 "",
-                _fit("Esc closes and discards this side", width),
+                _fit(recovery, width),
             ]
             minimum = (minimum + [""] * height)[:height]
             plain = "\n".join(_fit(line, width) for line in minimum)
@@ -1588,11 +1699,18 @@ def render_monitor(
             state, width=width, height=height, now=now, color=color
         )
 
+    if state.mode == "untrack" and (
+        width < SPLIT_MIN_WIDTH or height < SPLIT_MIN_HEIGHT
+    ):
+        return _render_compact_untrack(
+            state, width=width, height=height, color=color
+        )
+
     if (
         width >= SPLIT_MIN_WIDTH
         and height >= SPLIT_MIN_HEIGHT
-        and state.mode in {"sessions", "ask"}
-        and (state.sessions or state.mode == "ask")
+        and state.mode in {"sessions", "ask", "untrack"}
+        and (state.sessions or state.mode in {"ask", "untrack"})
     ):
         return _render_split_monitor(
             state,
@@ -1788,10 +1906,10 @@ def render_monitor(
 
     exit_copy = "q close" if state.mode in {"help", "peek"} else "q quit"
     footer_text = (
-        f"↑↓ move  ↵ open  a ask  p peek  u usage  ? keys  {exit_copy}"
+        f"↑↓ move  ↵ open  a ask  p peek  x untrack  ? keys  {exit_copy}"
         if width < 80
         else (
-            "↑↓/jk move  Enter open  a ask  n next  p peek  "
+            "↑↓/jk move  Enter open  a ask  n next  p peek  x stop watching  "
             f"u {'operations' if state.show_usage else 'usage'}  "
             f"? keys  {exit_copy}"
         )
@@ -1932,6 +2050,7 @@ def decode_keys(buffer: bytearray, *, text_mode: bool = False) -> list[str]:
                 "n": "next",
                 "u": "usage",
                 "r": "refresh",
+                "x": "untrack",
                 "\x0c": "refresh",
             }.get(value, value)
         )
@@ -2084,6 +2203,17 @@ def _handle_key(
             state.ask_input += key
         return "continue", None
 
+    if state.mode == "untrack":
+        target = state.untrack_target
+        if key in {"escape", "quit"}:
+            state.close_untrack()
+            return "continue", None
+        if key in {"enter", "untrack"}:
+            state.close_untrack()
+            return "untrack", target
+        state.notify("Confirm with x / Enter · cancel with Esc / q")
+        return "continue", None
+
     if state.mode in {"help", "peek"} and key in {"quit", "escape"}:
         state.mode = "sessions"
         return "continue", None
@@ -2149,6 +2279,12 @@ def _handle_key(
         elif session:
             state.begin_ask(session)
             return "ask-open", session
+    elif key == "untrack":
+        session = state.selected()
+        if session and session.session_id.startswith("unbound:"):
+            state.notify("Cannot stop watching until this process has an exact UUID")
+        elif session:
+            state.begin_untrack(session)
     elif key == "next":
         session = pika.next_attention(state.sessions)
         if session is None:
@@ -2409,7 +2545,7 @@ def run_monitor(
                     if (
                         preview_session is not None
                         and preview_target
-                        and state.mode != "ask"
+                        and state.mode not in {"ask", "untrack"}
                         and preview_future is None
                         and (
                             state.preview_key != preview_session.key
@@ -2477,6 +2613,26 @@ def run_monitor(
                                 state.ask_error = "side process is unavailable; Esc closes it"
                         if action == "ask-close" and inline_ask is not None:
                             inline_ask.close()
+                        if action == "untrack" and session is not None:
+                            try:
+                                pika.untrack(session)
+                            except Exception as exc:  # noqa: BLE001 - UI stays live
+                                state.notify(f"Stop watching failed: {exc}")
+                            else:
+                                state.sessions = [
+                                    item
+                                    for item in state.sessions
+                                    if item.key != session.key
+                                ]
+                                state.expert_cards.pop(session.key, None)
+                                state.selected_key = None
+                                state.selected()
+                                state.notify(
+                                    f"Stopped watching {session.display_name} · "
+                                    "agent left running"
+                                )
+                                future = None
+                                next_refresh = 0.0
                         if action == "refresh":
                             manual_refresh_pending = True
                             state.emphasize_refresh = True
@@ -2559,7 +2715,9 @@ def _demo_sessions(now: float) -> list[Session]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render a Pika monitor fixture")
     parser.add_argument("--demo", action="store_true", required=True)
-    parser.add_argument("--ask", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--ask", action="store_true")
+    mode.add_argument("--untrack", action="store_true")
     parser.add_argument("--width", type=int, default=120)
     parser.add_argument("--height", type=int, default=30)
     args = parser.parse_args()
@@ -2610,6 +2768,8 @@ def main() -> None:
             ),
         ]
         state.ask_input = "Does the same rule protect older snapshots?"
+    elif args.untrack:
+        state.begin_untrack(selected)
     print(
         render_monitor(
             state,

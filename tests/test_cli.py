@@ -211,10 +211,19 @@ class CliTests(unittest.TestCase):
     def test_setup_frames_configuration_as_a_commissioning_contract(self) -> None:
         class MetaStore:
             @staticmethod
+            def list_sessions():
+                return []
+
+            @staticmethod
+            def untracked_session_keys():
+                return set()
+
+            @staticmethod
             def get_meta(_key):
                 return None
 
         pika = Mock(store=MetaStore())
+        pika.refresh.return_value = []
         args = argparse.Namespace(
             no_import=True,
             dry_run=False,
@@ -242,11 +251,20 @@ class CliTests(unittest.TestCase):
     def test_setup_never_claims_commissioned_from_stale_observation(self) -> None:
         class MetaStore:
             @staticmethod
+            def list_sessions():
+                return []
+
+            @staticmethod
+            def untracked_session_keys():
+                return set()
+
+            @staticmethod
             def get_meta(key):
                 provider = key.rsplit(":", 1)[-1]
                 return hook_spec_fingerprint(provider)
 
         pika = Mock(store=MetaStore())
+        pika.refresh.return_value = []
         args = argparse.Namespace(
             no_import=True,
             dry_run=False,
@@ -273,10 +291,19 @@ class CliTests(unittest.TestCase):
     def test_setup_one_proof_copy_requires_claude_fully_commissioned(self) -> None:
         class MetaStore:
             @staticmethod
+            def list_sessions():
+                return []
+
+            @staticmethod
+            def untracked_session_keys():
+                return set()
+
+            @staticmethod
             def get_meta(_key):
                 return None
 
         pika = Mock(store=MetaStore())
+        pika.refresh.return_value = []
         args = argparse.Namespace(
             no_import=True,
             dry_run=False,
@@ -310,9 +337,11 @@ class CliTests(unittest.TestCase):
         )
         store = Mock()
         store.list_sessions.return_value = []
+        store.untracked_session_keys.return_value = set()
         store.get_meta.return_value = None
         pika = Mock(store=store)
         pika.discover_import_candidates.return_value = [candidate]
+        pika.refresh.return_value = []
         args = argparse.Namespace(
             no_import=False,
             dry_run=False,
@@ -331,10 +360,68 @@ class CliTests(unittest.TestCase):
 
         pika.import_candidate.assert_called_once_with(candidate)
         pika.bootstrap_experts.assert_not_called()
-        pika.refresh.assert_not_called()
+        pika.refresh.assert_called_once_with(usage=False)
         self.assertIn("Adopted 1 existing conversation", output.getvalue())
         self.assertIn("setup did not interview any agents", output.getvalue())
         self.assertIn("pika expert refresh --all", output.getvalue())
+
+    def test_setup_reports_provider_renames_without_interviewing(self) -> None:
+        old = Session("codex", "rename-id", name="before")
+        new = Session("codex", "rename-id", name="after")
+        store = Mock()
+        store.list_sessions.return_value = [old]
+        store.untracked_session_keys.return_value = set()
+        store.get_meta.return_value = None
+        pika = Mock(store=store)
+        pika.refresh.return_value = [new]
+        args = argparse.Namespace(
+            no_import=True,
+            dry_run=False,
+            import_all=False,
+            yes=True,
+            default_provider="codex",
+        )
+        output = io.StringIO()
+        with (
+            patch("pikamux.cli.proposed_changes", return_value=[]),
+            patch("pikamux.cli.hooks_installed", return_value=True),
+            patch("pikamux.cli.load_config", return_value={}),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_setup(pika, args), 0)
+
+        pika.refresh.assert_called_once_with(usage=False)
+        pika.bootstrap_experts.assert_not_called()
+        self.assertIn("Refreshed 1 provider rename", output.getvalue())
+        self.assertIn("before → after", output.getvalue())
+
+    def test_setup_respects_explicitly_untracked_conversations(self) -> None:
+        candidate = Candidate("codex", "ignored-id", "do-not-watch")
+        store = Mock()
+        store.list_sessions.return_value = []
+        store.untracked_session_keys.return_value = {
+            (candidate.provider, candidate.session_id)
+        }
+        store.get_meta.return_value = None
+        pika = Mock(store=store)
+        pika.discover_import_candidates.return_value = [candidate]
+        pika.refresh.return_value = []
+        args = argparse.Namespace(
+            no_import=False,
+            dry_run=False,
+            import_all=True,
+            yes=True,
+            default_provider="codex",
+        )
+        with (
+            patch("pikamux.cli.proposed_changes", return_value=[]),
+            patch("pikamux.cli.hooks_installed", return_value=True),
+            patch("pikamux.cli.load_config", return_value={}),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(_setup(pika, args), 0)
+
+        pika.import_candidate.assert_not_called()
 
 
 if __name__ == "__main__":

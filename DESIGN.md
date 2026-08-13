@@ -51,6 +51,13 @@ high-leverage operating habits selected from current state; it never displaces
 current state or keyboard recovery guidance. Usage is a deliberate secondary
 view, not default visual spectacle.
 
+Stopping observation is distinct from detaching a tmux client. `x` opens a
+UUID-bound confirmation in the inspector: Pika removes the workstream from Live
+Operations while leaving the agent process, provider conversation, and expert
+card intact. The action is reversible through explicit opening or adoption,
+and a durable tombstone prevents lifecycle hooks from silently adding the
+workstream back before then.
+
 Pressing a replaces only the inspector with an inline side conversation; the
 workstream rail and live operations header remain visible. On narrow terminals,
 the same side conversation becomes a focused full-width panel rather than
@@ -64,9 +71,10 @@ selection; Enter opens the exact selected identity; `a` focuses an ephemeral
 multi-turn side consultation inside the inspector; n opens the oldest attention
 item using the same ordering as `pika next`; p opens a sanitized pane peek; u
 toggles the usage view; r reconciles; ? explains controls; q or Esc recovers or
-exits. Inside the side panel, ordinary keys type, Enter sends, Ctrl+J inserts a
-newline, Ctrl+U clears the draft, arrows scroll conversation history, and Esc
-closes and discards the side before returning focus to operations.
+exits. `x` asks to stop watching the selected UUID; x or Enter confirms and Esc
+or q cancels. Inside the side panel, ordinary keys type, Enter sends, Ctrl+J
+inserts a newline, Ctrl+U clears the draft, arrows scroll conversation history,
+and Esc closes and discards the side before returning focus to operations.
 
 Selection persists by `(provider, UUID)` across refresh and resort. An unbound
 live process cannot be opened as if managed. Refresh errors retain the last good
@@ -132,6 +140,10 @@ setup` may discover and adopt conversations, but never opens provider-side
 consultations. Missing and stale cards are left to the quota-aware refresh policy
 unless the user explicitly runs an expert refresh command. `pika adopt` may
 interview only the single exact UUID it just adopted.
+
+Commissioning finishes with a transcript-free operational reconciliation so
+provider-native renames update tracked rows and pane recovery tags. This name
+sync never opens an expert consultation.
 
 # Sources
 

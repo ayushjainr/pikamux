@@ -113,6 +113,12 @@ class Store:
                     last_seen REAL NOT NULL,
                     PRIMARY KEY (provider, session_id, pid)
                 );
+                CREATE TABLE IF NOT EXISTS untracked_sessions (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    untracked_at REAL NOT NULL,
+                    PRIMARY KEY (provider, session_id)
+                );
                 CREATE TABLE IF NOT EXISTS usage_cache (
                     provider TEXT NOT NULL,
                     session_id TEXT NOT NULL,
@@ -312,6 +318,12 @@ class Store:
         activity = session.last_activity_at or session.updated_at or now
         event_at = session.last_event_at or now
         with self.connect() as db:
+            if db.execute(
+                "SELECT 1 FROM untracked_sessions "
+                "WHERE provider=? AND session_id=?",
+                session.key,
+            ).fetchone():
+                return
             existing = db.execute(
                 "SELECT name,status,unread,attention_reason,error "
                 "FROM sessions WHERE provider=? AND session_id=?",
@@ -415,8 +427,84 @@ class Store:
     def list_sessions(self) -> list[Session]:
         self.initialize()
         with self.connect() as db:
-            rows = db.execute("SELECT * FROM sessions").fetchall()
+            rows = db.execute(
+                "SELECT sessions.* FROM sessions "
+                "LEFT JOIN untracked_sessions USING(provider,session_id) "
+                "WHERE untracked_sessions.session_id IS NULL"
+            ).fetchall()
         return [self._row_to_session(row) for row in rows]
+
+    def list_untracked_sessions(self) -> list[Session]:
+        self.initialize()
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT sessions.* FROM sessions "
+                "JOIN untracked_sessions USING(provider,session_id)"
+            ).fetchall()
+        return [self._row_to_session(row) for row in rows]
+
+    def is_untracked(self, provider: str, session_id: str) -> bool:
+        self.initialize()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT 1 FROM untracked_sessions "
+                "WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            ).fetchone()
+        return row is not None
+
+    def untracked_session_keys(self) -> set[tuple[str, str]]:
+        self.initialize()
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT provider,session_id FROM untracked_sessions"
+            ).fetchall()
+        return {(str(row["provider"]), str(row["session_id"])) for row in rows}
+
+    def restore_tracking(self, provider: str, session_id: str) -> None:
+        self.initialize()
+        with self.connect() as db:
+            db.execute(
+                "DELETE FROM untracked_sessions WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            )
+
+    def untrack_session(self, provider: str, session_id: str) -> None:
+        """Remove operational tracking while retaining provider data and expertise."""
+        self.initialize()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT INTO untracked_sessions(provider,session_id,untracked_at) "
+                "VALUES (?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET "
+                "untracked_at=excluded.untracked_at",
+                (provider, session_id, time.time()),
+            )
+            for table in (
+                "usage_cache",
+                "session_events",
+                "identity_interruptions",
+                "expert_refresh_attempts",
+                "live_owners",
+                "launch_reservations",
+            ):
+                db.execute(
+                    f"DELETE FROM {table} WHERE provider=? AND session_id=?",
+                    (provider, session_id),
+                )
+            db.execute(
+                "DELETE FROM launch_bindings WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            )
+            db.execute(
+                """
+                UPDATE sessions
+                SET tmux_session=NULL,tmux_pane=NULL,root_pid=NULL,
+                    status=?,unread=0,error=NULL,attention_reason=NULL,updated_at=?
+                WHERE provider=? AND session_id=?
+                """,
+                (Status.PARKED.value, time.time(), provider, session_id),
+            )
 
     def update_session(self, provider: str, session_id: str, **fields: Any) -> None:
         if not fields:
@@ -1022,6 +1110,12 @@ class Store:
         if start_time is None:
             return False
         with self.connect() as db:
+            if db.execute(
+                "SELECT 1 FROM untracked_sessions "
+                "WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            ).fetchone():
+                return False
             db.execute(
                 """
                 INSERT INTO live_owners(
