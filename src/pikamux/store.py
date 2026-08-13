@@ -21,6 +21,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "peek_lines": 200,
 }
 
+# Hook ownership is corroborating evidence, not durable conversation identity.
+# Five minutes comfortably spans normal hook delivery while ensuring a shared
+# Codex app-server cannot claim an exited client forever.
+LIVE_OWNER_LEASE_SECONDS = 300.0
+
 
 class Store:
     def __init__(self, path: Path | None = None):
@@ -177,9 +182,7 @@ class Store:
                     DROP TABLE live_owners_legacy;
                     """
                 )
-                owner_columns = db.execute(
-                    "PRAGMA table_info(live_owners)"
-                ).fetchall()
+                owner_columns = db.execute("PRAGMA table_info(live_owners)").fetchall()
             live_owner_columns = {str(row["name"]) for row in owner_columns}
             if "start_time" not in live_owner_columns:
                 db.execute("ALTER TABLE live_owners ADD COLUMN start_time INTEGER")
@@ -206,9 +209,7 @@ class Store:
                 db.execute("ALTER TABLE sessions ADD COLUMN attention_reason TEXT")
             event_columns = {
                 str(row["name"])
-                for row in db.execute(
-                    "PRAGMA table_info(session_events)"
-                ).fetchall()
+                for row in db.execute("PRAGMA table_info(session_events)").fetchall()
             }
             if "event_id" not in event_columns:
                 db.executescript(
@@ -274,7 +275,7 @@ class Store:
                 else session.name
             )
             if not (
-                session.status == Status.ERROR.value
+                session.status in {Status.ERROR.value, Status.OPEN_TWICE.value}
                 and session.attention_reason == "identity"
             ):
                 # A real provider lifecycle event may arrive while identity is
@@ -463,8 +464,7 @@ class Store:
                 (provider, session_id),
             )
             db.execute(
-                "DELETE FROM identity_interruptions "
-                "WHERE provider=? AND session_id=?",
+                "DELETE FROM identity_interruptions WHERE provider=? AND session_id=?",
                 (provider, session_id),
             )
             db.execute(
@@ -485,6 +485,7 @@ class Store:
             Status.NEEDS_YOU.value,
             Status.READY.value,
             Status.ERROR.value,
+            Status.OPEN_TWICE.value,
         }:
             return False
         if existing is None:
@@ -533,9 +534,7 @@ class Store:
             ).fetchall()
         return {str(row["status"]): int(row["count"]) for row in rows}
 
-    def capture_identity_interruption(
-        self, provider: str, session_id: str
-    ) -> None:
+    def capture_identity_interruption(self, provider: str, session_id: str) -> None:
         """Remember the lifecycle state hidden by a temporary identity fault."""
         self.initialize()
         with self.connect() as db:
@@ -573,14 +572,11 @@ class Store:
             "last_event_at": float(row["last_event_at"]),
         }
 
-    def clear_identity_interruption(
-        self, provider: str, session_id: str
-    ) -> None:
+    def clear_identity_interruption(self, provider: str, session_id: str) -> None:
         self.initialize()
         with self.connect() as db:
             db.execute(
-                "DELETE FROM identity_interruptions "
-                "WHERE provider=? AND session_id=?",
+                "DELETE FROM identity_interruptions WHERE provider=? AND session_id=?",
                 (provider, session_id),
             )
 
@@ -599,7 +595,7 @@ class Store:
             if not current:
                 return False
             if not (
-                str(current["status"]) == Status.ERROR.value
+                str(current["status"]) in {Status.ERROR.value, Status.OPEN_TWICE.value}
                 and current["attention_reason"] == "identity"
             ):
                 # A provider lifecycle event already replaced the fault. It is
@@ -650,7 +646,7 @@ class Store:
                 SET status=?,unread=?,attention_reason=?,error=?,last_event_at=?,
                     updated_at=?
                 WHERE provider=? AND session_id=?
-                  AND status=? AND attention_reason='identity'
+                  AND status IN (?,?) AND attention_reason='identity'
                 """,
                 (
                     *values,
@@ -658,11 +654,11 @@ class Store:
                     provider,
                     session_id,
                     Status.ERROR.value,
+                    Status.OPEN_TWICE.value,
                 ),
             )
             db.execute(
-                "DELETE FROM identity_interruptions "
-                "WHERE provider=? AND session_id=?",
+                "DELETE FROM identity_interruptions WHERE provider=? AND session_id=?",
                 (provider, session_id),
             )
             return True
@@ -681,7 +677,7 @@ class Store:
                   AND EXISTS (
                     SELECT 1 FROM sessions
                     WHERE provider=? AND session_id=?
-                      AND NOT (status=? AND attention_reason='identity')
+                      AND NOT (status IN (?,?) AND attention_reason='identity')
                   )
                 """,
                 (
@@ -690,6 +686,7 @@ class Store:
                     provider,
                     session_id,
                     Status.ERROR.value,
+                    Status.OPEN_TWICE.value,
                 ),
             )
 
@@ -825,7 +822,7 @@ class Store:
             )
 
     def set_live_owner(self, provider: str, session_id: str, pid: int) -> bool:
-        """Record a hook owner using non-recyclable Linux process identity."""
+        """Renew a hook-owner lease using non-recyclable process identity."""
         self.initialize()
         start_time = process_start_time(pid)
         if start_time is None:
@@ -844,13 +841,14 @@ class Store:
             )
         return True
 
-    def get_live_owners(
+    def get_live_owner_leases(
         self, provider: str, session_id: str
-    ) -> list[tuple[int, int | None]]:
+    ) -> list[tuple[int, int | None, float]]:
+        """Return hook claims with timestamps required for lease validation."""
         self.initialize()
         with self.connect() as db:
             rows = db.execute(
-                "SELECT pid,start_time FROM live_owners "
+                "SELECT pid,start_time,last_seen FROM live_owners "
                 "WHERE provider=? AND session_id=? ORDER BY pid",
                 (provider, session_id),
             ).fetchall()
@@ -858,8 +856,19 @@ class Store:
             (
                 int(row["pid"]),
                 int(row["start_time"]) if row["start_time"] is not None else None,
+                float(row["last_seen"]),
             )
             for row in rows
+        ]
+
+    def get_live_owners(
+        self, provider: str, session_id: str
+    ) -> list[tuple[int, int | None]]:
+        return [
+            (pid, start_time)
+            for pid, start_time, _last_seen in self.get_live_owner_leases(
+                provider, session_id
+            )
         ]
 
     def list_live_owners(
@@ -929,8 +938,7 @@ class Store:
                 if owner_alive or existing_pid is None or existing_start is None:
                     return False
                 db.execute(
-                    "DELETE FROM launch_reservations "
-                    "WHERE provider=? AND session_id=?",
+                    "DELETE FROM launch_reservations WHERE provider=? AND session_id=?",
                     (provider, session_id),
                 )
             try:
@@ -1066,8 +1074,7 @@ class Store:
             if cursor.rowcount != 1:
                 return None
             row = db.execute(
-                "SELECT COUNT(*) AS count FROM sessions "
-                "WHERE status=? AND unread=1",
+                "SELECT COUNT(*) AS count FROM sessions WHERE status=? AND unread=1",
                 (Status.READY.value,),
             ).fetchone()
             return int(row["count"])

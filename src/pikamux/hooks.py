@@ -48,6 +48,8 @@ def _event_state(
 def handle_hook(
     provider: str, data: dict[str, Any], store: Store | None = None
 ) -> dict[str, Any] | None:
+    if os.environ.get("PIKA_EPHEMERAL") == "1":
+        return None
     store = store or Store()
     store.initialize()
     tmux = Tmux()
@@ -185,11 +187,17 @@ def handle_hook(
             store.delete_meta(name_error_key)
         else:
             store.set_meta(name_error_key, desired_name)
-    if unread and newly_actionable and not (pane and pane.attached) and status in {
-        Status.NEEDS_YOU.value,
-        Status.READY.value,
-        Status.ERROR.value,
-    }:
+    if (
+        unread
+        and newly_actionable
+        and not (pane and pane.attached)
+        and status
+        in {
+            Status.NEEDS_YOU.value,
+            Status.READY.value,
+            Status.ERROR.value,
+        }
+    ):
         config = load_config()
         if config.get("alerts") == "tmux":
             label = f"{terminal_text(session.display_name)} ({provider.title()})"
@@ -263,6 +271,7 @@ def handle_process_exit(
         Status.READY.value,
         Status.NEEDS_YOU.value,
         Status.ERROR.value,
+        Status.OPEN_TWICE.value,
     }:
         updates = {"root_pid": None}
     else:

@@ -12,6 +12,7 @@ import tty
 from pathlib import Path
 
 from . import __version__
+from .consult import ConsultationError, consultation_for
 from .core import Pika, PikaError
 from .doctor import repair_stale_state, run_doctor
 from .hooks import handle_hook, handle_process_exit, hook_stdout
@@ -26,9 +27,10 @@ from .setup_hooks import (
 )
 from .store import load_config
 from .tmux import TmuxError
-from .ui import choose_candidates, choose_session, print_sessions, terminal_text
+from .ui import choose_candidates, print_sessions, terminal_text
 
 PUBLIC_COMMANDS = {
+    "ask",
     "open",
     "list",
     "next",
@@ -50,11 +52,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"pikamux {__version__}")
     sub = parser.add_subparsers(
         dest="command",
-        metavar="{open,list,next,peek,wait,new,adopt,setup,doctor}",
+        metavar="{open,ask,list,next,peek,wait,new,adopt,setup,doctor}",
     )
 
     open_parser = sub.add_parser("open", help="open a named conversation")
     open_parser.add_argument("name")
+
+    ask_parser = sub.add_parser(
+        "ask",
+        help="ask an ephemeral multi-turn side question without changing the parent",
+    )
+    ask_parser.add_argument("name")
+    ask_parser.add_argument("question", nargs="*")
 
     list_parser = sub.add_parser("list", help="list all tracked conversations")
     list_parser.add_argument("--json", action="store_true")
@@ -201,6 +210,60 @@ def _peek(pika: Pika, name: str, lines: int | None, *, ack: bool = False) -> int
     return result
 
 
+def _ask(pika: Pika, name: str, question_parts: list[str]) -> int:
+    session = _select_named(pika, name)
+    if not session.transcript_path:
+        raise PikaError(
+            f"{session.display_name} has no durable provider transcript to consult"
+        )
+    initial = " ".join(question_parts).strip()
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if not initial and not interactive:
+        initial = sys.stdin.read().strip()
+    if not initial and not interactive:
+        raise PikaError("Provide a question as arguments or on stdin")
+
+    try:
+        with consultation_for(session) as consultation:
+            print(
+                f"SIDE · {terminal_text(session.display_name)} · "
+                f"{session.provider.title()} · parent {session.session_id[:8]} · "
+                "EPHEMERAL"
+            )
+            pending = initial
+            while True:
+                if not pending:
+                    try:
+                        pending = input("side> ").strip()
+                    except EOFError:
+                        break
+                if not pending:
+                    if interactive:
+                        continue
+                    break
+                if pending in {"/close", "/exit", "/quit"}:
+                    break
+                if pending == "/help":
+                    print("Ask a follow-up, or use /close to discard the side chat.")
+                    pending = ""
+                    continue
+                answer = consultation.ask(pending)
+                safe_answer = "".join(
+                    character
+                    if character.isprintable() or character in {"\n", "\t"}
+                    else "�"
+                    for character in answer
+                )
+                print(f"\n{safe_answer}\n")
+                pending = ""
+                if not interactive:
+                    break
+    except ConsultationError as exc:
+        raise PikaError(str(exc)) from exc
+    print("SIDE CLOSED · discarded · parent transcript unchanged")
+    return 0
+
+
 def _print_actions(pika: Pika, sessions: list[Session]) -> None:
     if not sessions:
         return
@@ -262,7 +325,8 @@ def _wait(pika: Pika, args: argparse.Namespace) -> int:
             "any": session.needs_attention,
             "needs-you": session.status == Status.NEEDS_YOU.value,
             "ready": session.status == Status.READY.value and session.unread,
-            "error": session.status == Status.ERROR.value and session.unread,
+            "error": session.status in {Status.ERROR.value, Status.OPEN_TWICE.value}
+            and session.unread,
         }[args.wait_for]
         if matches:
             if args.json:
@@ -524,6 +588,8 @@ def run(argv: list[str] | None = None) -> int:
         return _bare(pika)
     if args.command == "open":
         return pika.open(_select_named(pika, args.name))
+    if args.command == "ask":
+        return _ask(pika, args.name, args.question)
     if args.command == "list":
         sessions = pika.refresh(usage=not args.no_usage)
         print_sessions(sessions, as_json=args.json)

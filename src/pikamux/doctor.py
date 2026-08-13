@@ -12,9 +12,9 @@ from pathlib import Path
 from .core import Pika
 from .models import Status
 from .paths import config_path, database_path
-from .processes import process_start_time, provider_process
+from .processes import process_start_time, provider_process, shared_provider_process
 from .setup_hooks import codex_hooks_enabled, hook_spec_fingerprint, hooks_installed
-from .store import load_config
+from .store import LIVE_OWNER_LEASE_SECONDS, load_config
 
 
 @dataclass(slots=True)
@@ -59,8 +59,7 @@ def repair_stale_state(pika: Pika, *, older_than_seconds: float = 300) -> list[s
             or item.pika_launch_token == token
         ]
         live = any(
-            provider_process(item.pane_pid, str(row["provider"]))
-            for item in candidates
+            provider_process(item.pane_pid, str(row["provider"])) for item in candidates
         )
         if live:
             continue
@@ -293,9 +292,13 @@ def run_doctor(
             )
     tracked_keys = {session.key for session in sessions}
     hidden_live_owners: list[str] = []
-    for provider, session_id, pid, start_time, _last_seen in (
-        pika.store.list_live_owners()
-    ):
+    for (
+        provider,
+        session_id,
+        pid,
+        start_time,
+        last_seen,
+    ) in pika.store.list_live_owners():
         if (provider, session_id) in tracked_keys:
             continue
         live_pid = (
@@ -303,6 +306,12 @@ def run_doctor(
             if start_time is not None and process_start_time(pid) == start_time
             else None
         )
+        if (
+            live_pid
+            and shared_provider_process(live_pid, provider)
+            and time.time() - last_seen > LIVE_OWNER_LEASE_SECONDS
+        ):
+            live_pid = None
         if live_pid:
             hidden_live_owners.append(f"{provider}:{session_id} PID {live_pid}")
         else:
@@ -363,8 +372,7 @@ def run_doctor(
                 "identity",
                 "warn",
                 f"{unbound} unbound session(s), {pending} pending launch(es), "
-                f"{reservations} active resume(s)"
-                + (f"; {detail}" if detail else ""),
+                f"{reservations} active resume(s)" + (f"; {detail}" if detail else ""),
             )
         )
     else:

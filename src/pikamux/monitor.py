@@ -27,7 +27,6 @@ from .ui import (
     terminal_text,
 )
 
-
 REFRESH_SECONDS = 2.0
 USAGE_REFRESH_SECONDS = 30.0
 PLAYBOOK_ROTATION_SECONDS = 300
@@ -38,6 +37,14 @@ MIN_WIDTH = 58
 MIN_HEIGHT = 15
 SPINNER = ("◐", "◓", "◑", "◒")
 PLAYBOOK_TIPS = (
+    (
+        "ask",
+        (
+            "pika ask NAME opens a multi-turn side consultation without touching "
+            "the parent transcript."
+        ),
+        "pika ask NAME explores without touching the parent.",
+    ),
     (
         "detach",
         "Delegate, then Ctrl-b d. The agent keeps working; /exit stops it.",
@@ -237,6 +244,7 @@ def _paint(value: str, code: str, enabled: bool) -> str:
 def _status_code(status: str) -> str:
     return {
         Status.NEEDS_YOU.value: FG_YELLOW,
+        Status.OPEN_TWICE.value: FG_RED,
         Status.ERROR.value: FG_RED,
         Status.READY.value: FG_GREEN,
         Status.WORKING.value: FG_CYAN,
@@ -256,16 +264,15 @@ def _line(left: str, right: str, width: int) -> str:
 
 def _session_counts(sessions: list[Session]) -> dict[str, int]:
     return {
-        "decisions": sum(
-            item.status == Status.NEEDS_YOU.value for item in sessions
-        ),
+        "decisions": sum(item.status == Status.NEEDS_YOU.value for item in sessions),
         "results": sum(
             item.status == Status.READY.value and item.unread for item in sessions
         ),
         "working": sum(item.status == Status.WORKING.value for item in sessions),
         "parked": sum(item.status == Status.PARKED.value for item in sessions),
         "errors": sum(
-            item.status == Status.ERROR.value and item.unread for item in sessions
+            item.status in {Status.ERROR.value, Status.OPEN_TWICE.value} and item.unread
+            for item in sessions
         ),
         "unbound": sum(item.status == Status.UNBOUND.value for item in sessions),
         "protected": sum(item.exact_home for item in sessions),
@@ -287,10 +294,11 @@ def build_handoff(
         finished=sum(
             item.status == Status.READY.value and item.unread for item in recent
         ),
-        decisions=sum(
-            item.status == Status.NEEDS_YOU.value for item in recent
+        decisions=sum(item.status == Status.NEEDS_YOU.value for item in recent),
+        errors=sum(
+            item.status in {Status.ERROR.value, Status.OPEN_TWICE.value}
+            for item in recent
         ),
-        errors=sum(item.status == Status.ERROR.value for item in recent),
     )
 
 
@@ -363,9 +371,7 @@ def _briefing_lines(
         if attention:
             next_item = attention[0]
             reason = next_item.error or next_item.attention_reason or next_item.status
-            context = (
-                f"NEXT → {next_item.display_name} · {reason} · n to open"
-            )
+            context = f"NEXT → {next_item.display_name} · {reason} · n to open"
         else:
             unbound = next(
                 (item for item in sessions if item.status == Status.UNBOUND.value),
@@ -430,9 +436,7 @@ def _columns(width: int, *, show_usage: bool) -> list[_Column]:
     )
     if extra:
         item = mutable[flexible_index]
-        mutable[flexible_index] = _Column(
-            item.label, item.width + extra, item.field
-        )
+        mutable[flexible_index] = _Column(item.label, item.width + extra, item.field)
     return mutable
 
 
@@ -455,6 +459,7 @@ def _human_age_at(timestamp: float, now: float) -> str:
 def semantic_age(session: Session, now: float) -> str:
     prefix = {
         Status.NEEDS_YOU.value: "WAIT",
+        Status.OPEN_TWICE.value: "DUPLICATE",
         Status.READY.value: "RESULT",
         Status.WORKING.value: "ACTIVE",
         Status.PARKED.value: "IDLE",
@@ -464,7 +469,12 @@ def semantic_age(session: Session, now: float) -> str:
     timestamp = (
         session.last_event_at
         if session.status
-        in {Status.NEEDS_YOU.value, Status.READY.value, Status.ERROR.value}
+        in {
+            Status.NEEDS_YOU.value,
+            Status.READY.value,
+            Status.ERROR.value,
+            Status.OPEN_TWICE.value,
+        }
         else session.last_activity_at
     )
     return f"{prefix} {_human_age_at(timestamp, now)}"
@@ -481,9 +491,7 @@ def _field(session: Session, field: str, width: int, now: float) -> str:
         "branch": session.branch or "—",
         "age": semantic_age(session, now),
         "cpu": (
-            f"{session.cpu_percent:.1f}%"
-            if session.cpu_percent is not None
-            else "—"
+            f"{session.cpu_percent:.1f}%" if session.cpu_percent is not None else "—"
         ),
         "ram": format_bytes(session.rss_kb),
         "tokens": format_tokens(session.total_tokens),
@@ -506,9 +514,7 @@ def _table_row(
         _fit(_field(session, item.field, item.width, now), item.width)
         for item in columns
     ]
-    row_width = (
-        sum(item.width for item in columns) + 2 * (len(columns) - 1) + 3
-    )
+    row_width = sum(item.width for item in columns) + 2 * (len(columns) - 1) + 3
     plain = _fit(f"{marker} " + "  ".join(plain_cells), row_width)
     if selected:
         return plain, _paint(plain, REVERSE + BOLD, color)
@@ -576,19 +582,23 @@ def _playbook_options(
 ) -> list[tuple[str, str, str]]:
     if refresh_error:
         categories = ["refresh", "doctor"]
-    elif selected and selected.status == Status.ERROR.value:
+    elif selected and selected.status in {
+        Status.ERROR.value,
+        Status.OPEN_TWICE.value,
+    }:
         categories = ["doctor", "peek"]
     elif selected and selected.status == Status.UNBOUND.value:
         categories = ["adopt", "doctor"]
-    elif any(item.status == Status.ERROR.value for item in sessions):
+    elif any(
+        item.status in {Status.ERROR.value, Status.OPEN_TWICE.value}
+        for item in sessions
+    ):
         categories = ["doctor", "next"]
     elif any(item.status == Status.UNBOUND.value for item in sessions):
         categories = ["adopt", "doctor"]
     elif any(item.status == Status.NEEDS_YOU.value for item in sessions):
         categories = ["next", "peek"]
-    elif any(
-        item.status == Status.READY.value and item.unread for item in sessions
-    ):
+    elif any(item.status == Status.READY.value and item.unread for item in sessions):
         categories = ["peek", "next"]
     elif any(item.status == Status.WORKING.value for item in sessions):
         categories = ["detach", "wait"]
@@ -640,6 +650,8 @@ def _identity_text(session: Session) -> str:
         return f"EXACT HOME · {provider} · id {fingerprint} · PROTECTED LIVE"
     if session.home_state == "identity-error":
         return f"IDENTITY UNVERIFIED · {provider} · id {fingerprint} · OPEN BLOCKED"
+    if session.home_state == "open-twice":
+        return f"OPEN TWICE · {provider} · id {fingerprint} · CLOSE ONE COPY"
     if session.home_state == "unbound":
         return f"UNBOUND PROCESS · {provider} · id {fingerprint} · ADOPT REQUIRED"
     if session.home_state == "outside-live":
@@ -659,6 +671,7 @@ def _age_phrase(session: Session, now: float) -> str:
         Status.READY.value: f"result ready for {event_age}",
         Status.WORKING.value: f"last active {activity_age} ago",
         Status.PARKED.value: f"last active {activity_age} ago",
+        Status.OPEN_TWICE.value: f"duplicate open for {event_age}",
         Status.ERROR.value: f"failed {event_age} ago",
         Status.UNBOUND.value: f"last active {activity_age} ago",
     }.get(session.status, f"last active {activity_age} ago")
@@ -841,11 +854,7 @@ def render_monitor(
             width,
         )
         identity = _identity_text(selected)
-        signal = (
-            selected.error
-            or selected.attention_reason
-            or "No exception reported"
-        )
+        signal = selected.error or selected.attention_reason or "No exception reported"
         if state.show_usage:
             resources = (
                 f"CPU {selected.cpu_percent:.1f}%"
@@ -1176,7 +1185,8 @@ def _morning_handoff(
         since=previous,
         finished=int(counts.get(Status.READY.value, 0)),
         decisions=int(counts.get(Status.NEEDS_YOU.value, 0)),
-        errors=int(counts.get(Status.ERROR.value, 0)),
+        errors=int(counts.get(Status.ERROR.value, 0))
+        + int(counts.get(Status.OPEN_TWICE.value, 0)),
     )
     return journal if journal.changed or not snapshot.changed else snapshot
 
@@ -1250,9 +1260,7 @@ def run_monitor(
                             state.selected()
                             state.last_update = time.time()
                             state.refresh_error = None
-                            discovery_errors = getattr(
-                                pika, "discovery_errors", []
-                            )
+                            discovery_errors = getattr(pika, "discovery_errors", [])
                             state.refresh_warning = (
                                 "; ".join(map(terminal_text, discovery_errors))
                                 if discovery_errors
@@ -1326,9 +1334,7 @@ def run_monitor(
                         last_frame = frame.ansi
 
                     poll_seconds = min(0.12, max(0.01, refresh_seconds / 2))
-                    readable, _, _ = select.select(
-                        [input_fd], [], [], poll_seconds
-                    )
+                    readable, _, _ = select.select([input_fd], [], [], poll_seconds)
                     if not readable:
                         continue
                     data = os.read(input_fd, 256)

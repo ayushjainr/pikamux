@@ -7,6 +7,7 @@ from typing import Any
 
 class Status(str, Enum):
     NEEDS_YOU = "NEEDS YOU"
+    OPEN_TWICE = "OPEN TWICE"
     WORKING = "WORKING"
     READY = "READY"
     PARKED = "PARKED"
@@ -16,11 +17,12 @@ class Status(str, Enum):
 
 ATTENTION_ORDER = {
     Status.NEEDS_YOU.value: 0,
-    Status.ERROR.value: 1,
-    Status.READY.value: 2,
-    Status.WORKING.value: 3,
-    Status.PARKED.value: 4,
-    Status.UNBOUND.value: 5,
+    Status.OPEN_TWICE.value: 1,
+    Status.ERROR.value: 2,
+    Status.READY.value: 3,
+    Status.WORKING.value: 4,
+    Status.PARKED.value: 5,
+    Status.UNBOUND.value: 6,
 }
 
 
@@ -69,7 +71,13 @@ class Session:
     @property
     def needs_attention(self) -> bool:
         return self.status == Status.NEEDS_YOU.value or (
-            self.unread and self.status in {Status.READY.value, Status.ERROR.value}
+            self.unread
+            and self.status
+            in {
+                Status.READY.value,
+                Status.ERROR.value,
+                Status.OPEN_TWICE.value,
+            }
         )
 
     @property

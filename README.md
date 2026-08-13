@@ -16,7 +16,7 @@ Pika owns that bridge.
 - It resumes exact UUIDs. It never falls back to `--last` or `--continue`.
 - It refuses to open a second copy of a conversation already running elsewhere.
 - It routes attention using `NEEDS YOU`, `WORKING`, `READY`, `PARKED`,
-  `UNBOUND`, and `ERROR` states.
+  `UNBOUND`, `OPEN TWICE`, and `ERROR` states.
 - It stores metadata only. Ordinary views never index or display transcript
   contents; `peek` explicitly captures the visible tmux pane.
 - It uses hooks plus command-time reconciliation, with no background daemon.
@@ -66,6 +66,7 @@ original file; Pika never deletes backups.
 pika                       open the live operations monitor
 pika NAME                  open or resurrect an exact conversation
 pika open NAME             unambiguous form, including `pika open list`
+pika ask NAME "QUESTION"  ephemeral multi-turn consultation with that parent
 pika .                     open the relevant conversation for this repository
 pika -                     return to the previously attached Pika conversation
 pika list                  show all tracked live and parked conversations
@@ -73,7 +74,7 @@ pika list --json           stable machine-readable inventory
 pika next                  open the oldest conversation needing attention
 pika peek NAME             inspect recent pane output without attaching
 pika peek NAME --ack       explicitly acknowledge READY in a script
-pika wait NAME             wait for NEEDS YOU, unread READY, or ERROR
+pika wait NAME             wait for NEEDS YOU, unread READY, OPEN TWICE, or ERROR
 pika new NAME              create using the configured default provider
 pika new NAME --agent ...  override with codex or claude
 pika adopt [TMUX_TARGET]    tag an already-running agent pane
@@ -81,6 +82,15 @@ pika doctor                print a recoverability receipt
 pika doctor --verbose      show every receipt check
 pika doctor --repair-stale remove confirmed stale launch locks (5m+)
 ```
+
+`pika ask master_quant "What assumption is weakest here?"` opens a temporary
+side conversation based on that exact provider UUID. In a terminal, ask
+follow-ups at the `side>` prompt and type `/close` when finished. Codex uses an
+in-memory ephemeral fork. Claude uses one streamed, non-persistent fork with its
+tool surface disabled. The parent can keep working; the side is read-only, does
+not append to the parent transcript, and is discarded on close. Claude support
+is capability-gated to the tested CLI version, and Pika fails closed if it
+cannot verify support.
 
 The interactive `pika` monitor refreshes operational state every two seconds.
 Use arrows or j/k to select, Enter to open the selected identity, `n` for the
@@ -148,8 +158,12 @@ always produces a chooser (or an error in a non-interactive process), never an
 implicit provider choice.
 
 Live hook ownership is bound to both a PID and its Linux process start time, so
-a recycled PID cannot counterfeit exact-UUID identity. Legacy owner rows without
-that evidence remain fail-closed.
+a recycled PID cannot counterfeit exact-UUID identity. A shared Codex app-server
+owner is a five-minute, hook-renewed lease rather than permanent hard identity;
+an expired claim is removed automatically when native UUID process evidence
+proves the exact pane. A real second UUID-bearing process remains fail-closed and
+is displayed as `OPEN TWICE`. Legacy owner rows without start-time evidence
+remain fail-closed.
 
 Each Pika-managed conversation gets one UUID-derived tmux session. A new Claude
 conversation is named natively with `--name`; a new Codex conversation is named

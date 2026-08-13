@@ -115,6 +115,19 @@ def provider_process(root_pid: int | None, provider: str | None = None) -> int |
     return matches[-1] if matches else None
 
 
+def shared_provider_process(pid: int | None, provider: str) -> bool:
+    """Return whether ``pid`` is shared provider infrastructure.
+
+    Codex hooks may execute beneath the long-lived app-server used by multiple
+    clients. That process is useful as a short-lived ownership hint, but its
+    continued existence cannot permanently prove that any one thread is open.
+    """
+    if not pid or provider != "codex":
+        return False
+    argv = cmdline(pid)
+    return _process_kind(argv) == provider and "app-server" in argv
+
+
 def process_stats(root_pid: int | None) -> tuple[float | None, int | None]:
     pids = process_tree(root_pid)
     if not pids:

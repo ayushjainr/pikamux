@@ -125,9 +125,8 @@ def print_sessions(sessions: list[Session], *, as_json: bool = False) -> None:
         print("No Pika sessions yet. Run `pika setup` or `pika new NAME`.")
         return
     counts = {
-        "waiting on you": sum(
-            item.status == "NEEDS YOU" for item in sessions
-        ),
+        "waiting on you": sum(item.status == "NEEDS YOU" for item in sessions),
+        "open twice": sum(item.status == "OPEN TWICE" for item in sessions),
         "failed": sum(item.status == "ERROR" for item in sessions),
         "result unread": sum(
             item.status == "READY" and item.unread for item in sessions
@@ -188,16 +187,14 @@ def print_sessions(sessions: list[Session], *, as_json: bool = False) -> None:
             cells.append(value.ljust(size))
         print("  ".join(cells).rstrip())
     exceptions = [
-        item
-        for item in sessions
-        if item.status in {"ERROR", "UNBOUND"}
+        item for item in sessions if item.status in {"ERROR", "OPEN TWICE", "UNBOUND"}
     ]
     if exceptions:
         print("\nExceptions:")
         for item in exceptions:
             detail = item.error or (
                 "provider reported an error"
-                if item.status == "ERROR"
+                if item.status in {"ERROR", "OPEN TWICE"}
                 else "not yet managed in a Pika tmux home"
             )
             print(
@@ -269,11 +266,7 @@ def choose_candidates(candidates: list[Candidate]) -> list[Candidate]:
     print("\nPika found conversations worth adopting:")
     for index, item in enumerate(candidates, 1):
         live = " live" if item.live else ""
-        label = (
-            item.name
-            if item.name
-            else f"<unnamed live · {item.session_id[:8]}>"
-        )
+        label = item.name if item.name else f"<unnamed live · {item.session_id[:8]}>"
         print(
             f"  {index:>2}. {item.provider:<6} "
             f"{terminal_text(label):<28} "

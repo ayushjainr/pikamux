@@ -105,9 +105,7 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
         with Store(self.db_path).connect() as db:
-            row = db.execute(
-                "SELECT event_id,status FROM session_events"
-            ).fetchone()
+            row = db.execute("SELECT event_id,status FROM session_events").fetchone()
         self.assertEqual((row["event_id"], row["status"]), (1, "READY"))
 
     def test_attach_history_and_pending_launches(self) -> None:
@@ -197,9 +195,7 @@ class StoreTests(unittest.TestCase):
                 last_event_at=200.0,
             )
         )
-        interrupted = self.store.get_identity_interruption(
-            "codex", "interrupted"
-        )
+        interrupted = self.store.get_identity_interruption("codex", "interrupted")
         self.assertEqual(interrupted["status"], Status.READY.value)
         self.assertTrue(interrupted["unread"])
         self.assertEqual(interrupted["last_event_at"], 200.0)
@@ -214,16 +210,12 @@ class StoreTests(unittest.TestCase):
             error="duplicate Pika tmux homes",
         )
         self.assertTrue(
-            self.store.restore_identity_interruption(
-                "codex", "interrupted", live=True
-            )
+            self.store.restore_identity_interruption("codex", "interrupted", live=True)
         )
         restored = self.store.get_session("codex", "interrupted")
         self.assertEqual(restored.status if restored else None, Status.READY.value)
         self.assertTrue(restored.unread if restored else False)
-        self.assertIsNone(
-            self.store.get_identity_interruption("codex", "interrupted")
-        )
+        self.assertIsNone(self.store.get_identity_interruption("codex", "interrupted"))
 
     def test_identity_restore_cannot_overwrite_a_concurrent_lifecycle_winner(
         self,
@@ -241,9 +233,7 @@ class StoreTests(unittest.TestCase):
             last_event_at=300.0,
         )
         self.assertFalse(
-            self.store.restore_identity_interruption(
-                "codex", "winner", live=True
-            )
+            self.store.restore_identity_interruption("codex", "winner", live=True)
         )
         winner = self.store.get_session("codex", "winner")
         self.assertEqual(winner.status if winner else None, Status.READY.value)
@@ -263,9 +253,7 @@ class StoreTests(unittest.TestCase):
             error="identity fault",
         )
         self.assertTrue(
-            self.store.restore_identity_interruption(
-                "codex", "dead-work", live=False
-            )
+            self.store.restore_identity_interruption("codex", "dead-work", live=False)
         )
         restored = self.store.get_session("codex", "dead-work")
         self.assertEqual(restored.status if restored else None, Status.PARKED.value)
@@ -285,20 +273,14 @@ class StoreTests(unittest.TestCase):
                 )
             )
         self.assertEqual(
-            self.store.collect_result(
-                "codex", "result-0", expected_event_at=100.0
-            ),
+            self.store.collect_result("codex", "result-0", expected_event_at=100.0),
             1,
         )
         self.assertIsNone(
-            self.store.collect_result(
-                "codex", "result-0", expected_event_at=100.0
-            )
+            self.store.collect_result("codex", "result-0", expected_event_at=100.0)
         )
         self.assertIsNone(
-            self.store.collect_result(
-                "codex", "result-1", expected_event_at=999.0
-            )
+            self.store.collect_result("codex", "result-1", expected_event_at=999.0)
         )
         self.assertTrue(self.store.get_session("codex", "result-1").unread)
 
@@ -325,8 +307,7 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(self.store.reserve_resume("codex", "abc", "second"))
         with self.store.connect() as db:
             db.execute(
-                "UPDATE launch_reservations "
-                "SET owner_pid=?, owner_start_time=?",
+                "UPDATE launch_reservations SET owner_pid=?, owner_start_time=?",
                 (99999999, 1),
             )
         self.assertTrue(self.store.reserve_resume("codex", "abc", "dead-owner"))
@@ -349,6 +330,15 @@ class StoreTests(unittest.TestCase):
             self.store.get_live_owners("codex", "exact-uuid"),
             [(123, 1001), (456, 1002)],
         )
+        leases = self.store.get_live_owner_leases("codex", "exact-uuid")
+        self.assertEqual(
+            [(pid, start) for pid, start, _seen in leases],
+            [
+                (123, 1001),
+                (456, 1002),
+            ],
+        )
+        self.assertTrue(all(seen > 0 for _pid, _start, seen in leases))
         self.store.delete_live_owner("codex", "exact-uuid", pid=123)
         self.assertEqual(
             self.store.get_live_owners("codex", "exact-uuid"), [(456, 1002)]
@@ -368,9 +358,7 @@ class StoreTests(unittest.TestCase):
         migrated = Store(self.db_path)
         migrated.initialize()
         with migrated.connect() as db:
-            columns = {
-                row["name"] for row in db.execute("PRAGMA table_info(sessions)")
-            }
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(sessions)")}
         self.assertIn("attention_reason", columns)
 
     def test_existing_database_migrates_live_owner_start_time_column(self) -> None:

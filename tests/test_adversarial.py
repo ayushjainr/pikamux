@@ -184,7 +184,9 @@ class AdversarialTests(unittest.TestCase):
         self.assertEqual(resolved.session_id, candidate.session_id)
         self.assertIsNotNone(self.store.get_session("codex", candidate.session_id))
 
-    def test_provider_hidden_session_stays_out_of_refresh_and_pane_recovery(self) -> None:
+    def test_provider_hidden_session_stays_out_of_refresh_and_pane_recovery(
+        self,
+    ) -> None:
         archived_id = "22222222-2222-4222-8222-222222222222"
         self.store.upsert_session(
             Session("codex", archived_id, name="master_quant", cwd="/tmp")
@@ -199,7 +201,9 @@ class AdversarialTests(unittest.TestCase):
         self.assertEqual(pika.refresh(), [])
         self.assertIsNotNone(self.store.get_session("codex", archived_id))
 
-    def test_setup_import_excludes_unresumable_history_but_keeps_live_work(self) -> None:
+    def test_setup_import_excludes_unresumable_history_but_keeps_live_work(
+        self,
+    ) -> None:
         stale = Candidate(
             "codex",
             "11111111-1111-4111-8111-111111111111",
@@ -309,6 +313,87 @@ class AdversarialTests(unittest.TestCase):
             self.assertEqual(pika.identity_pids(session), set())
         self.assertEqual(self.store.get_live_owners(*session.key), [])
 
+    def test_stale_shared_app_server_lease_auto_recovers_exact_pane(self) -> None:
+        session_id = "12121212-1212-4212-8212-121212121212"
+        session = Session(
+            "codex",
+            session_id,
+            name="lease-recovery",
+            cwd="/tmp",
+            status=Status.READY.value,
+            unread=True,
+            last_event_at=10.0,
+        )
+        self.store.upsert_session(session)
+        owner_root = os.getpid()
+        self.assertTrue(self.store.set_live_owner("codex", session_id, owner_root))
+        tmux = StaticTmux([pane(provider="codex", session_id=session_id)])
+        pika = Pika(
+            self.store,
+            tmux,
+            {"codex": FakeProvider(active=[999])},
+        )
+
+        def provider_at_root(pid, provider=None):
+            if provider != "codex":
+                return None
+            return 999 if pid == 123 else 777 if pid == owner_root else None
+
+        def tree(pid):
+            return [123, 999] if pid == 123 else [pid]
+
+        with (
+            patch("pikamux.core.provider_process", side_effect=provider_at_root),
+            patch("pikamux.core.process_tree", side_effect=tree),
+            patch("pikamux.core.shared_provider_process", return_value=True),
+        ):
+            blocked = pika.refresh()[0]
+            self.assertEqual(blocked.status, Status.ERROR.value)
+            self.assertFalse(blocked.exact_home)
+
+            with self.store.connect() as db:
+                db.execute(
+                    "UPDATE live_owners SET last_seen=? "
+                    "WHERE provider=? AND session_id=? AND pid=?",
+                    (time.time() - 301, "codex", session_id, owner_root),
+                )
+
+            recovered = pika.refresh()[0]
+
+        self.assertTrue(recovered.exact_home)
+        self.assertEqual(recovered.status, Status.READY.value)
+        self.assertTrue(recovered.unread)
+        self.assertIsNone(recovered.error)
+        self.assertEqual(self.store.get_live_owners("codex", session_id), [])
+
+    def test_fresh_shared_app_server_lease_remains_fail_closed(self) -> None:
+        session_id = "13131313-1313-4313-8313-131313131313"
+        session = Session("codex", session_id, cwd="/tmp")
+        self.store.upsert_session(session)
+        owner_root = os.getpid()
+        self.assertTrue(self.store.set_live_owner("codex", session_id, owner_root))
+        tmux = StaticTmux([pane(provider="codex", session_id=session_id)])
+        pika = Pika(
+            self.store,
+            tmux,
+            {"codex": FakeProvider(active=[999])},
+        )
+
+        def provider_at_root(pid, provider=None):
+            if provider != "codex":
+                return None
+            return 999 if pid == 123 else 777 if pid == owner_root else None
+
+        with (
+            patch("pikamux.core.provider_process", side_effect=provider_at_root),
+            patch("pikamux.core.process_tree", return_value=[123, 999]),
+            patch("pikamux.core.shared_provider_process", return_value=True),
+        ):
+            self.assertIsNone(pika.exact_pane_pid(session, tmux.panes[0]))
+        self.assertEqual(
+            self.store.get_live_owners("codex", session_id)[0][0], owner_root
+        )
+
     def test_open_refuses_to_replace_other_agent_in_saved_pane(self) -> None:
         session_id = "11111111-1111-4111-8111-111111111111"
         session = Session(
@@ -413,8 +498,8 @@ class AdversarialTests(unittest.TestCase):
         ):
             refreshed = pika.refresh()[0]
             self.assertFalse(refreshed.exact_home)
-            self.assertEqual(refreshed.status, Status.ERROR.value)
-            with self.assertRaisesRegex(PikaError, "cannot be tied to exact UUID"):
+            self.assertEqual(refreshed.status, Status.OPEN_TWICE.value)
+            with self.assertRaisesRegex(PikaError, "OPEN TWICE"):
                 pika.open(session)
         self.assertTrue(self.store.get_session("codex", session_id).unread)
 
@@ -631,9 +716,7 @@ class AdversarialTests(unittest.TestCase):
 
     def test_doctor_repair_removes_only_confirmed_stale_launch_state(self) -> None:
         self.store.add_pending("missing-pane", "codex", "lost", "/tmp")
-        self.store.add_pending(
-            "active-pane", "codex", "active", "/tmp", "home", "%1"
-        )
+        self.store.add_pending("active-pane", "codex", "active", "/tmp", "home", "%1")
         self.store.add_pending(
             "session-only", "codex", "binding", "/tmp", "manual", None
         )
@@ -717,6 +800,32 @@ class AdversarialTests(unittest.TestCase):
         receipt = json.loads(output.getvalue())
         self.assertEqual(receipt["repairs"], ["removed stale lock"])
         self.assertIn("outside Pika tracking", output.getvalue())
+
+    def test_doctor_expires_stale_untracked_shared_app_server_lease(self) -> None:
+        config = self.root / "config.json"
+        config.write_text('{"default_provider":"codex"}\n')
+        os.chmod(config, 0o600)
+        session_id = "14141414-1414-4414-8414-141414141414"
+        owner_pid = os.getpid()
+        self.assertTrue(self.store.set_live_owner("codex", session_id, owner_pid))
+        with self.store.connect() as db:
+            db.execute(
+                "UPDATE live_owners SET last_seen=? "
+                "WHERE provider=? AND session_id=? AND pid=?",
+                (time.time() - 301, "codex", session_id, owner_pid),
+            )
+        pika = Pika(self.store, StaticTmux(), {"codex": FakeProvider()})
+        with (
+            patch("pikamux.doctor.config_path", return_value=config),
+            patch("pikamux.doctor.database_path", return_value=self.store.path),
+            patch("pikamux.doctor.hooks_installed", return_value=True),
+            patch("pikamux.doctor.codex_hooks_enabled", return_value=True),
+            patch("pikamux.doctor.provider_process", return_value=owner_pid),
+            patch("pikamux.doctor.shared_provider_process", return_value=True),
+            redirect_stdout(io.StringIO()),
+        ):
+            run_doctor(pika, as_json=True)
+        self.assertEqual(self.store.get_live_owners("codex", session_id), [])
 
     def test_doctor_rejects_tracked_live_owner_outside_pika_tmux(self) -> None:
         session_id = "77777777-7777-4777-8777-777777777777"
@@ -963,9 +1072,7 @@ class AdversarialTests(unittest.TestCase):
         def provider_in_new_home(pid, provider=None):
             return 888 if pid == 456 and provider == "codex" else None
 
-        with patch(
-            "pikamux.core.provider_process", side_effect=provider_in_new_home
-        ):
+        with patch("pikamux.core.provider_process", side_effect=provider_in_new_home):
             self.assertEqual(pika.open(current), 0)
         self.assertIn("IDENTITY PENDING", tmux.receipts[0])
         self.assertNotIn("RESULT COLLECTED", tmux.receipts[0])
@@ -990,9 +1097,7 @@ class AdversarialTests(unittest.TestCase):
         def provider_in_new_home(pid, provider=None):
             return 888 if pid == 456 and provider == "codex" else None
 
-        with patch(
-            "pikamux.core.provider_process", side_effect=provider_in_new_home
-        ):
+        with patch("pikamux.core.provider_process", side_effect=provider_in_new_home):
             self.assertEqual(pika.open(session, attach=False), 0)
         current = self.store.get_session(*session.key)
         self.assertEqual(current.status if current else None, Status.WORKING.value)

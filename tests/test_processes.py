@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from pikamux.processes import _process_kind, provider_ancestor
+from pikamux.processes import (
+    _process_kind,
+    provider_ancestor,
+    shared_provider_process,
+)
 
 
 class ProcessTests(unittest.TestCase):
@@ -37,6 +41,21 @@ class ProcessTests(unittest.TestCase):
             ),
         ):
             self.assertEqual(provider_ancestor(30, "codex"), 10)
+
+    def test_codex_app_server_is_shared_infrastructure(self) -> None:
+        with patch(
+            "pikamux.processes.cmdline",
+            return_value=["/opt/codex", "-c", "feature=true", "app-server"],
+        ):
+            self.assertTrue(shared_provider_process(123, "codex"))
+            self.assertFalse(shared_provider_process(123, "claude"))
+
+    def test_regular_codex_resume_is_not_shared_infrastructure(self) -> None:
+        with patch(
+            "pikamux.processes.cmdline",
+            return_value=["/opt/codex", "resume", "exact-uuid"],
+        ):
+            self.assertFalse(shared_provider_process(123, "codex"))
 
 
 if __name__ == "__main__":

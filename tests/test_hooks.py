@@ -158,9 +158,7 @@ class HookTests(unittest.TestCase):
         handle_hook("codex", {**base, "hook_event_name": "Stop"}, self.store)
         before = self.store.get_session("codex", "uuid-result-age")
         assert before is not None
-        handle_hook(
-            "codex", {**base, "hook_event_name": "SessionEnd"}, self.store
-        )
+        handle_hook("codex", {**base, "hook_event_name": "SessionEnd"}, self.store)
         after = self.store.get_session("codex", "uuid-result-age")
         assert after is not None
         self.assertEqual(after.status, Status.READY.value)
@@ -215,6 +213,21 @@ class HookTests(unittest.TestCase):
 
     def test_codex_noop_output_is_valid_json(self) -> None:
         self.assertEqual(hook_stdout("codex", None), "{}")
+
+    def test_ephemeral_consultation_hook_is_ignored(self) -> None:
+        with patch.dict(os.environ, {"PIKA_EPHEMERAL": "1"}, clear=False):
+            result = handle_hook(
+                "codex",
+                {
+                    "session_id": "ephemeral-id",
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionStart",
+                },
+                self.store,
+            )
+        self.assertIsNone(result)
+        self.assertIsNone(self.store.get_session("codex", "ephemeral-id"))
+        self.assertEqual(self.store.get_live_owners("codex", "ephemeral-id"), [])
 
     @patch("pikamux.hooks.CodexProvider")
     @patch("pikamux.hooks.Tmux", FakeTmux)
