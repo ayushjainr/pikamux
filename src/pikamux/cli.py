@@ -727,26 +727,12 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         pika.import_candidate(candidate)
     if selected:
         print(f"Adopted {len(selected)} existing conversation(s).")
-    tracked = pika.refresh(usage=False)
-    pending_cards = [
-        item
-        for item in pika.expert_card_states(tracked)
-        if item.status in {"MISSING", "STALE"}
-    ]
-    if pending_cards:
-        print(
-            f"\nBuilding {len(pending_cards)} provenance-bound expert card(s) "
-            "from exact ephemeral interviews."
-        )
-        for index, state in enumerate(pending_cards, 1):
-            print(
-                f"  [{index}/{len(pending_cards)}] "
-                f"{terminal_text(state.session.display_name)}…",
-                flush=True,
-            )
-            _print_expert_refresh_results(
-                pika.bootstrap_experts([state.session]), as_json=False
-            )
+    print("\nExpert cards deferred · setup did not interview any agents.")
+    print(
+        "Missing or stale cards remain visible in `pika expert status`; the "
+        "quota-aware refresher handles them gradually. Use "
+        "`pika expert refresh --all` only when you want to spend quota now."
+    )
     return 0
 
 

@@ -120,6 +120,12 @@ provider latency cannot freeze dashboard refresh, typing, or Esc recovery. Esc
 requests cancellation immediately and terminates the transient provider process;
 the monitor itself remains open.
 
+Commissioning and expert interviews are separate latency boundaries. `pika
+setup` may discover and adopt conversations, but never opens provider-side
+consultations. Missing and stale cards are left to the quota-aware refresh policy
+unless the user explicitly runs an expert refresh command. `pika adopt` may
+interview only the single exact UUID it just adopted.
+
 # Sources
 
 - `src/pikamux/monitor.py` is the canonical implementation for layout, styling,

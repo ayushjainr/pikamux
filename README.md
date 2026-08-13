@@ -101,16 +101,19 @@ not append to the parent transcript, and is discarded on close. Claude support
 is capability-gated to the tested CLI version, and Pika fails closed if it
 cannot verify support.
 
-Pika normally builds expert cards itself. `pika setup` interviews tracked
-conversations and `pika adopt` interviews the exact adopted UUID immediately.
-Both use the same read-only, ephemeral provider fork as `pika ask`, so a live
-parent keeps working and its transcript is unchanged. The interview is asked
-for only firsthand work, specific topics, and concrete artifacts. The saved
-card includes its provider UUID, source, and transcript fingerprint.
+Pika normally builds expert cards itself, but `pika setup` never interviews
+agents. Commissioning and bulk adoption therefore finish without hidden model
+calls, even when many tracked conversations have missing or stale cards.
+`pika adopt` interviews only the one exact UUID it just adopted. Interviews use
+the same read-only, ephemeral provider fork as `pika ask`, so a live parent keeps
+working and its transcript is unchanged. The interview is asked for only
+firsthand work, specific topics, and concrete artifacts. The saved card includes
+its provider UUID, source, and transcript fingerprint.
 
 `pika expert status` reports `CURRENT`, `STALE`, `MISSING`, or `UNKNOWN` without
 reading transcript contents. `pika expert refresh NAME` and `--all` are explicit
-ways to spend quota now. A user-level one-shot timer checks every ten minutes,
+ways to spend quota now. Setup leaves missing and stale cards to the quota-aware
+policy. A user-level one-shot timer checks every ten minutes,
 but calls at most one changed conversation per provider only during the final
 six hours before that provider's weekly reset and only while more than 10%
 remains. It reads provider-native reset telemetry, never hard-codes reset times,

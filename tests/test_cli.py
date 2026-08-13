@@ -7,7 +7,7 @@ from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 
 from pikamux.cli import _bare, _normalize_argv, _peek, _peek_popup, _setup, _wait
-from pikamux.models import Pane, Session, Status
+from pikamux.models import Candidate, Pane, Session, Status
 from pikamux.setup_hooks import hook_spec_fingerprint
 from pikamux.tmux import TmuxError
 
@@ -276,6 +276,41 @@ class CliTests(unittest.TestCase):
         self.assertIn("Codex observation", rendered)
         self.assertIn("Claude activation", rendered)
         self.assertIn("Claude observation", rendered)
+
+    def test_setup_imports_without_interviewing_tracked_agents(self) -> None:
+        candidate = Candidate(
+            "codex",
+            "11111111-1111-4111-8111-111111111111",
+            "newly-adopted",
+            transcript_path="/tmp/provider-thread.jsonl",
+        )
+        store = Mock()
+        store.list_sessions.return_value = []
+        store.get_meta.return_value = None
+        pika = Mock(store=store)
+        pika.discover_import_candidates.return_value = [candidate]
+        args = argparse.Namespace(
+            no_import=False,
+            dry_run=False,
+            import_all=True,
+            yes=True,
+            default_provider="codex",
+        )
+        output = io.StringIO()
+        with (
+            patch("pikamux.cli.proposed_changes", return_value=[]),
+            patch("pikamux.cli.hooks_installed", return_value=True),
+            patch("pikamux.cli.load_config", return_value={}),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_setup(pika, args), 0)
+
+        pika.import_candidate.assert_called_once_with(candidate)
+        pika.bootstrap_experts.assert_not_called()
+        pika.refresh.assert_not_called()
+        self.assertIn("Adopted 1 existing conversation", output.getvalue())
+        self.assertIn("setup did not interview any agents", output.getvalue())
+        self.assertIn("pika expert refresh --all", output.getvalue())
 
 
 if __name__ == "__main__":
