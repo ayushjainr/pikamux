@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from pikamux.core import Pika, PikaError
+from pikamux.experts import make_profile, rank_experts
+from pikamux.models import ExpertProfile, Pane, Session, Status
+from pikamux.store import Store
+
+
+class OnePaneTmux:
+    def __init__(self, pane: Pane):
+        self.pane = pane
+
+    def get_pane(self, target: str):
+        return (
+            self.pane if target in {self.pane.pane_id, self.pane.session_name} else None
+        )
+
+
+class ExpertTests(unittest.TestCase):
+    def test_rank_is_deterministic_and_exposes_why(self) -> None:
+        sessions = [
+            Session(
+                "codex",
+                "one",
+                name="master_attr",
+                cwd="/work/attribution",
+                status=Status.WORKING.value,
+                live=True,
+            ),
+            Session(
+                "claude",
+                "two",
+                name="research",
+                cwd="/work/research",
+                status=Status.PARKED.value,
+            ),
+        ]
+        profiles = [
+            ExpertProfile(
+                "codex",
+                "one",
+                "Built the production factor attribution pipeline.",
+                ("factor attribution", "portfolio analytics"),
+                ("reports/attribution.md",),
+                100,
+            ),
+            ExpertProfile(
+                "claude",
+                "two",
+                "Studied factor definitions.",
+                ("factor research",),
+                (),
+                200,
+            ),
+        ]
+        matches = rank_experts(profiles, sessions, "factor attribution")
+        self.assertEqual([item.session.session_id for item in matches], ["one", "two"])
+        self.assertIn("topic", matches[0].matched_on)
+        self.assertIn("summary", matches[0].matched_on)
+        self.assertGreater(matches[0].score, matches[1].score)
+
+    def test_profiles_are_cleaned_but_not_invented(self) -> None:
+        profile = make_profile(
+            Session("codex", "one"),
+            summary="  Built   real work. ",
+            topics=["attribution", "Attribution", " risk "],
+            artifacts=[" reports/result.md "],
+        )
+        self.assertEqual(profile.summary, "Built real work.")
+        self.assertEqual(profile.topics, ("attribution", "risk"))
+        self.assertEqual(profile.artifacts, ("reports/result.md",))
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            make_profile(Session("codex", "one"), summary="work", topics=[])
+
+    def test_only_the_exact_calling_pane_can_publish(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = Store(Path(temporary.name) / "pika.db")
+        session = Session(
+            "codex",
+            "exact-id",
+            name="expert",
+            tmux_session="home",
+            tmux_pane="%1",
+        )
+        store.upsert_session(session)
+        pane = Pane(
+            "home",
+            "%1",
+            123,
+            "/tmp",
+            "codex",
+            True,
+            False,
+            None,
+            1,
+            1,
+            pika_provider="codex",
+            pika_session_id="exact-id",
+        )
+        pika = Pika(store, OnePaneTmux(pane), {})
+        with (
+            patch.dict(os.environ, {"TMUX_PANE": "%1"}),
+            patch.object(pika, "refresh", return_value=[session]),
+            patch.object(pika, "exact_pane_pid", return_value=999),
+        ):
+            profile = pika.publish_expert(
+                summary="Owns this implementation.", topics=["identity"]
+            )
+        self.assertEqual(profile.session_id, "exact-id")
+
+        with (
+            patch.dict(os.environ, {"TMUX_PANE": "%1"}),
+            patch.object(pika, "refresh", return_value=[session]),
+            patch.object(pika, "exact_pane_pid", return_value=None),
+            self.assertRaisesRegex(PikaError, "cannot prove"),
+        ):
+            pika.publish_expert(summary="Counterfeit", topics=["anything"])
+        self.assertEqual(
+            store.get_expert_profile("codex", "exact-id").summary,
+            "Owns this implementation.",
+        )

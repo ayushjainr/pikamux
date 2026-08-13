@@ -204,6 +204,36 @@ class ConsultationTests(unittest.TestCase):
         self.assertIn("EPHEMERAL", output.getvalue())
         self.assertIn("parent transcript unchanged", output.getvalue())
 
+    def test_jsonl_ask_keeps_one_consultation_for_multiple_turns(self) -> None:
+        session = Session(
+            "codex", "parent-id", name="parent", transcript_path="/tmp/parent.jsonl"
+        )
+        pika = Mock()
+        pika.resolve.return_value = session
+        consultation = Mock()
+        consultation.__enter__ = Mock(return_value=consultation)
+        consultation.__exit__ = Mock(return_value=None)
+        consultation.ask.side_effect = ["first answer", "second answer"]
+        requests = io.StringIO(
+            '{"question":"first"}\n{"question":"second"}\n{"close":true}\n'
+        )
+        with (
+            patch("pikamux.cli.consultation_for", return_value=consultation),
+            patch("pikamux.cli.sys.stdin", requests),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(_ask(pika, "parent", [], jsonl=True), 0)
+        messages = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(
+            [item["type"] for item in messages],
+            ["opened", "answer", "answer", "closed"],
+        )
+        self.assertEqual(
+            [call.args[0] for call in consultation.ask.call_args_list],
+            ["first", "second"],
+        )
+        self.assertTrue(messages[-1]["parent_transcript_unchanged"])
+
     def test_ask_is_a_public_command(self) -> None:
         self.assertEqual(_normalize_argv(["ask", "name", "why"])[0], "ask")
 

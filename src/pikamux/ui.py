@@ -9,6 +9,7 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .experts import ExpertMatch, project_label
 from .models import ATTENTION_ORDER, Candidate, Session
 from .pricing import PRICING_AS_OF
 
@@ -205,6 +206,57 @@ def print_sessions(sessions: list[Session], *, as_json: bool = False) -> None:
     if any(label == "~API$" for label, _size in columns):
         legend += f"  ~API$=API-equivalent estimate ({PRICING_AS_OF})"
     print(f"\n{legend}")
+
+
+def print_experts(
+    matches: list[ExpertMatch], *, query: str = "", as_json: bool = False
+) -> None:
+    if as_json:
+        print(
+            json.dumps([item.to_dict() for item in matches], indent=2, sort_keys=True)
+        )
+        return
+    if not matches:
+        suffix = f" matching {query!r}" if query else ""
+        print(f"No published Pika experts{suffix}.")
+        print("An agent can publish its own card with `pika expert publish`.")
+        return
+    title = f"Pika experts for {query!r}" if query else "Pika expert directory"
+    print(title)
+    print()
+    columns = [
+        ("AG", 2),
+        ("EXPERT", 22),
+        ("PROJECT", 20),
+        ("STATE", 10),
+        ("TOPICS", 32),
+        ("WHY", 15),
+        ("ID", 8),
+    ]
+    print("  ".join(label.ljust(size) for label, size in columns).rstrip())
+    print("  ".join("─" * size for _, size in columns).rstrip())
+    for match in matches:
+        values = [
+            PROVIDER_MARK.get(match.session.provider, "?"),
+            match.session.display_name,
+            project_label(match.session.cwd),
+            match.session.status,
+            ", ".join(match.profile.topics),
+            ", ".join(match.matched_on)
+            if query
+            else human_age(match.profile.updated_at),
+            match.session.session_id[:8],
+        ]
+        cells: list[str] = []
+        for value, (_label, size) in zip(values, columns):
+            value = terminal_text(value)
+            if len(value) > size:
+                value = value[: max(1, size - 1)] + "…"
+            cells.append(value.ljust(size))
+        print("  ".join(cells).rstrip())
+    print(
+        "\nCards are self-published from exact Pika panes; claims remain evidence to inspect."
+    )
 
 
 def choose_session(

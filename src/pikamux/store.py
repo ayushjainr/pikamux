@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .models import Session, Status, Usage
+from .models import ExpertProfile, Session, Status, Usage
 from .paths import config_path, database_path
 from .processes import process_start_time
 
@@ -155,6 +155,17 @@ class Store:
                     last_event_at REAL NOT NULL,
                     PRIMARY KEY (provider, session_id)
                 );
+                CREATE TABLE IF NOT EXISTS expert_profiles (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    topics_json TEXT NOT NULL,
+                    artifacts_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (provider, session_id)
+                );
+                CREATE INDEX IF NOT EXISTS expert_profiles_updated_idx
+                ON expert_profiles(updated_at DESC);
                 """
             )
             owner_columns = db.execute("PRAGMA table_info(live_owners)").fetchall()
@@ -468,9 +479,79 @@ class Store:
                 (provider, session_id),
             )
             db.execute(
+                "DELETE FROM expert_profiles WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            )
+            db.execute(
                 "DELETE FROM sessions WHERE provider=? AND session_id=?",
                 (provider, session_id),
             )
+
+    def put_expert_profile(self, profile: ExpertProfile) -> ExpertProfile:
+        self.initialize()
+        updated_at = profile.updated_at or time.time()
+        with self.connect() as db:
+            if not db.execute(
+                "SELECT 1 FROM sessions WHERE provider=? AND session_id=?",
+                profile.key,
+            ).fetchone():
+                raise ValueError("Expert profile requires a tracked Pika session")
+            db.execute(
+                """
+                INSERT INTO expert_profiles(
+                    provider,session_id,summary,topics_json,artifacts_json,updated_at
+                ) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(provider,session_id) DO UPDATE SET
+                    summary=excluded.summary,
+                    topics_json=excluded.topics_json,
+                    artifacts_json=excluded.artifacts_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    profile.provider,
+                    profile.session_id,
+                    profile.summary,
+                    json.dumps(profile.topics, ensure_ascii=False),
+                    json.dumps(profile.artifacts, ensure_ascii=False),
+                    updated_at,
+                ),
+            )
+        return ExpertProfile(
+            profile.provider,
+            profile.session_id,
+            profile.summary,
+            profile.topics,
+            profile.artifacts,
+            updated_at,
+        )
+
+    def get_expert_profile(
+        self, provider: str, session_id: str
+    ) -> ExpertProfile | None:
+        self.initialize()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM expert_profiles WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            ).fetchone()
+        return self._row_to_expert_profile(row) if row else None
+
+    def list_expert_profiles(self) -> list[ExpertProfile]:
+        self.initialize()
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM expert_profiles ORDER BY updated_at DESC"
+            ).fetchall()
+        return [self._row_to_expert_profile(row) for row in rows]
+
+    def delete_expert_profile(self, provider: str, session_id: str) -> bool:
+        self.initialize()
+        with self.connect() as db:
+            cursor = db.execute(
+                "DELETE FROM expert_profiles WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            )
+        return cursor.rowcount == 1
 
     @staticmethod
     def _became_actionable(
@@ -1249,6 +1330,27 @@ class Store:
             updated_at=row["updated_at"],
             last_event_at=row["last_event_at"],
             last_activity_at=row["last_activity_at"],
+        )
+
+    @staticmethod
+    def _row_to_expert_profile(row: sqlite3.Row) -> ExpertProfile:
+        topics = json.loads(row["topics_json"])
+        artifacts = json.loads(row["artifacts_json"])
+        if not isinstance(topics, list) or not all(
+            isinstance(item, str) for item in topics
+        ):
+            raise ValueError("Invalid expert profile topics")
+        if not isinstance(artifacts, list) or not all(
+            isinstance(item, str) for item in artifacts
+        ):
+            raise ValueError("Invalid expert profile artifacts")
+        return ExpertProfile(
+            provider=str(row["provider"]),
+            session_id=str(row["session_id"]),
+            summary=str(row["summary"]),
+            topics=tuple(topics),
+            artifacts=tuple(artifacts),
+            updated_at=float(row["updated_at"]),
         )
 
 

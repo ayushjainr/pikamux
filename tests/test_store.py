@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from pikamux.models import Session, Status, Usage
+from pikamux.models import ExpertProfile, Session, Status, Usage
 from pikamux.store import Store
 
 
@@ -350,6 +350,47 @@ class StoreTests(unittest.TestCase):
         with patch("pikamux.store.process_start_time", return_value=None):
             self.assertFalse(self.store.set_live_owner("codex", "exact-uuid", 123))
         self.assertEqual(self.store.get_live_owners("codex", "exact-uuid"), [])
+
+    def test_expert_profile_round_trip_replaces_and_follows_session_lifetime(
+        self,
+    ) -> None:
+        self.store.upsert_session(Session("codex", "expert", name="researcher"))
+        first = self.store.put_expert_profile(
+            ExpertProfile(
+                "codex",
+                "expert",
+                "Built the factor attribution pipeline.",
+                ("factor attribution", "portfolio analytics"),
+                ("reports/attribution.md",),
+            )
+        )
+        self.assertGreater(first.updated_at, 0)
+        loaded = self.store.get_expert_profile("codex", "expert")
+        self.assertEqual(loaded.summary if loaded else None, first.summary)
+        self.assertEqual(
+            loaded.topics if loaded else None,
+            ("factor attribution", "portfolio analytics"),
+        )
+        replacement = self.store.put_expert_profile(
+            ExpertProfile(
+                "codex",
+                "expert",
+                "Owns the production attribution implementation.",
+                ("production attribution",),
+            )
+        )
+        self.assertEqual(
+            self.store.list_expert_profiles()[0].summary,
+            replacement.summary,
+        )
+        self.store.delete_session("codex", "expert")
+        self.assertIsNone(self.store.get_expert_profile("codex", "expert"))
+
+    def test_expert_profile_requires_a_tracked_session(self) -> None:
+        with self.assertRaisesRegex(ValueError, "tracked Pika session"):
+            self.store.put_expert_profile(
+                ExpertProfile("codex", "missing", "Unknown", ("topic",))
+            )
 
     def test_existing_database_migrates_attention_reason_column(self) -> None:
         self.store.initialize()

@@ -12,7 +12,7 @@ import tty
 from pathlib import Path
 
 from . import __version__
-from .consult import ConsultationError, consultation_for
+from .consult import Consultation, ConsultationError, consultation_for
 from .core import Pika, PikaError
 from .doctor import repair_stale_state, run_doctor
 from .hooks import handle_hook, handle_process_exit, hook_stdout
@@ -27,10 +27,12 @@ from .setup_hooks import (
 )
 from .store import load_config
 from .tmux import TmuxError
-from .ui import choose_candidates, print_sessions, terminal_text
+from .ui import choose_candidates, print_experts, print_sessions, terminal_text
 
 PUBLIC_COMMANDS = {
     "ask",
+    "expert",
+    "experts",
     "open",
     "list",
     "next",
@@ -52,7 +54,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"pikamux {__version__}")
     sub = parser.add_subparsers(
         dest="command",
-        metavar="{open,ask,list,next,peek,wait,new,adopt,setup,doctor}",
+        metavar="{open,ask,expert,experts,list,next,peek,wait,new,adopt,setup,doctor}",
     )
 
     open_parser = sub.add_parser("open", help="open a named conversation")
@@ -64,6 +66,31 @@ def _parser() -> argparse.ArgumentParser:
     )
     ask_parser.add_argument("name")
     ask_parser.add_argument("question", nargs="*")
+    ask_parser.add_argument(
+        "--jsonl",
+        action="store_true",
+        help="keep one consultation open using JSON-lines requests and responses",
+    )
+
+    expert_parser = sub.add_parser(
+        "expert", help="publish or clear this exact conversation's expert card"
+    )
+    expert_sub = expert_parser.add_subparsers(dest="expert_command", required=True)
+    publish_parser = expert_sub.add_parser(
+        "publish", help="publish a provenance-bound expert card from this Pika pane"
+    )
+    publish_parser.add_argument("--summary", required=True)
+    publish_parser.add_argument(
+        "--topic", action="append", required=True, help="repeat or comma-separate"
+    )
+    publish_parser.add_argument("--artifact", action="append", default=[])
+    expert_sub.add_parser("clear", help="remove this conversation's expert card")
+
+    experts_parser = sub.add_parser(
+        "experts", help="find self-published experts by topic, project, or artifact"
+    )
+    experts_parser.add_argument("query", nargs="*")
+    experts_parser.add_argument("--json", action="store_true")
 
     list_parser = sub.add_parser("list", help="list all tracked conversations")
     list_parser.add_argument("--json", action="store_true")
@@ -210,7 +237,9 @@ def _peek(pika: Pika, name: str, lines: int | None, *, ack: bool = False) -> int
     return result
 
 
-def _ask(pika: Pika, name: str, question_parts: list[str]) -> int:
+def _ask(
+    pika: Pika, name: str, question_parts: list[str], *, jsonl: bool = False
+) -> int:
     session = _select_named(pika, name)
     if not session.transcript_path:
         raise PikaError(
@@ -218,13 +247,15 @@ def _ask(pika: Pika, name: str, question_parts: list[str]) -> int:
         )
     initial = " ".join(question_parts).strip()
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
-    if not initial and not interactive:
+    if not initial and not interactive and not jsonl:
         initial = sys.stdin.read().strip()
-    if not initial and not interactive:
+    if not initial and not interactive and not jsonl:
         raise PikaError("Provide a question as arguments or on stdin")
 
     try:
         with consultation_for(session) as consultation:
+            if jsonl:
+                return _ask_jsonl(consultation, session, initial)
             print(
                 f"SIDE · {terminal_text(session.display_name)} · "
                 f"{session.provider.title()} · parent {session.session_id[:8]} · "
@@ -259,8 +290,101 @@ def _ask(pika: Pika, name: str, question_parts: list[str]) -> int:
                 if not interactive:
                     break
     except ConsultationError as exc:
+        if jsonl:
+            print(
+                json.dumps(
+                    {"type": "error", "message": str(exc)},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return 1
         raise PikaError(str(exc)) from exc
     print("SIDE CLOSED · discarded · parent transcript unchanged")
+    return 0
+
+
+def _ask_jsonl(consultation: Consultation, session: Session, initial: str) -> int:
+    def emit(payload: dict[str, object]) -> None:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+
+    emit(
+        {
+            "type": "opened",
+            "ephemeral": True,
+            "provider": session.provider,
+            "parent_id": session.session_id,
+            "name": session.display_name,
+        }
+    )
+
+    def handle(question: str) -> None:
+        emit({"type": "answer", "text": consultation.ask(question)})
+
+    if initial:
+        handle(initial)
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            request = json.loads(line)
+        except ValueError as exc:
+            raise ConsultationError(f"Invalid JSONL request: {exc}") from exc
+        if not isinstance(request, dict):
+            raise ConsultationError("Each JSONL request must be an object")
+        if request.get("close") is True:
+            break
+        question = request.get("question")
+        if not isinstance(question, str) or not question.strip():
+            raise ConsultationError(
+                'Each JSONL request needs a non-empty "question" or {"close":true}'
+            )
+        handle(question)
+    emit(
+        {
+            "type": "closed",
+            "discarded": True,
+            "parent_transcript_unchanged": True,
+        }
+    )
+    return 0
+
+
+def _expert(pika: Pika, args: argparse.Namespace) -> int:
+    if args.expert_command == "publish":
+        topics = [
+            topic.strip()
+            for value in args.topic
+            for topic in value.split(",")
+            if topic.strip()
+        ]
+        profile = pika.publish_expert(
+            summary=args.summary,
+            topics=topics,
+            artifacts=args.artifact,
+        )
+        session = pika.store.get_session(*profile.key)
+        name = session.display_name if session else profile.session_id[:8]
+        print(
+            f"EXPERT CARD PUBLISHED · {terminal_text(name)} · "
+            f"{profile.provider.title()} · {profile.session_id[:8]} · "
+            f"{len(profile.topics)} topics"
+        )
+        return 0
+    if args.expert_command == "clear":
+        session = pika.clear_current_expert()
+        print(
+            f"EXPERT CARD CLEARED · {terminal_text(session.display_name)} · "
+            f"{session.provider.title()} · {session.session_id[:8]}"
+        )
+        return 0
+    raise PikaError(f"Unknown expert command: {args.expert_command}")
+
+
+def _experts(pika: Pika, query_parts: list[str], *, as_json: bool) -> int:
+    query = " ".join(query_parts).strip()
+    print_experts(pika.expert_matches(query), query=query, as_json=as_json)
     return 0
 
 
@@ -589,7 +713,11 @@ def run(argv: list[str] | None = None) -> int:
     if args.command == "open":
         return pika.open(_select_named(pika, args.name))
     if args.command == "ask":
-        return _ask(pika, args.name, args.question)
+        return _ask(pika, args.name, args.question, jsonl=args.jsonl)
+    if args.command == "expert":
+        return _expert(pika, args)
+    if args.command == "experts":
+        return _experts(pika, args.query, as_json=args.json)
     if args.command == "list":
         sessions = pika.refresh(usage=not args.no_usage)
         print_sessions(sessions, as_json=args.json)

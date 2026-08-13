@@ -38,6 +38,14 @@ MIN_HEIGHT = 15
 SPINNER = ("◐", "◓", "◑", "◒")
 PLAYBOOK_TIPS = (
     (
+        "experts",
+        (
+            "pika experts QUERY finds self-published, UUID-bound expertise across "
+            "projects."
+        ),
+        "pika experts QUERY finds the agent who did the work.",
+    ),
+    (
         "ask",
         (
             "pika ask NAME opens a multi-turn side consultation without touching "
@@ -601,11 +609,11 @@ def _playbook_options(
     elif any(item.status == Status.READY.value and item.unread for item in sessions):
         categories = ["peek", "next"]
     elif any(item.status == Status.WORKING.value for item in sessions):
-        categories = ["detach", "wait"]
+        categories = ["detach", "wait", "experts", "ask"]
     elif any(item.status == Status.PARKED.value for item in sessions):
-        categories = ["resume", "switch"]
+        categories = ["resume", "switch", "experts", "ask"]
     else:
-        categories = ["name", "switch", "doctor"]
+        categories = ["name", "switch", "experts", "ask", "doctor"]
     names: dict[str, set[str]] = {}
     for item in sessions:
         names.setdefault(item.display_name.casefold(), set()).add(item.provider)

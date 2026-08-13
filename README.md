@@ -67,6 +67,11 @@ pika                       open the live operations monitor
 pika NAME                  open or resurrect an exact conversation
 pika open NAME             unambiguous form, including `pika open list`
 pika ask NAME "QUESTION"  ephemeral multi-turn consultation with that parent
+pika ask NAME --jsonl      persistent JSON-lines side channel for agents/apps
+pika experts QUERY         find provenance-bound experts across projects
+pika experts QUERY --json  stable machine-readable expert matches
+pika expert publish ...    publish this exact pane's own expert card
+pika expert clear          remove this exact pane's expert card
 pika .                     open the relevant conversation for this repository
 pika -                     return to the previously attached Pika conversation
 pika list                  show all tracked live and parked conversations
@@ -91,6 +96,22 @@ tool surface disabled. The parent can keep working; the side is read-only, does
 not append to the parent transcript, and is discarded on close. Claude support
 is capability-gated to the tested CLI version, and Pika fails closed if it
 cannot verify support.
+
+`pika expert publish --summary "..." --topic "..." --artifact "..."` lets a
+conversation advertise specific firsthand work. Publication is allowed only
+from the conversation's exact UUID-bearing Pika pane; one agent cannot write
+another agent's card. `pika experts "factor attribution" --json` ranks the
+self-published cards deterministically from topics, summary, project, and
+artifacts and exposes `matched_on` rather than pretending the score measures
+intelligence. Archived conversations disappear from lookup with the rest of
+Pika's daily surface.
+
+Agent and dashboard clients can keep a genuine multi-turn side open with
+`pika ask UUID --jsonl`. Send one `{"question":"..."}` object per line and end
+with `{"close":true}`. Responses identify the exact parent UUID and explicitly
+confirm the discarded ephemeral lifecycle. The same provider process handles
+all questions until close, so follow-ups retain side context without replaying
+answers or modifying the parent.
 
 The interactive `pika` monitor refreshes operational state every two seconds.
 Use arrows or j/k to select, Enter to open the selected identity, `n` for the

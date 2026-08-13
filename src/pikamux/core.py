@@ -8,7 +8,8 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
-from .models import Candidate, Pane, Session, Status
+from .experts import ExpertMatch, make_profile, rank_experts
+from .models import Candidate, ExpertProfile, Pane, Session, Status
 from .processes import (
     find_processes_with_session_id,
     process_alive,
@@ -1103,6 +1104,67 @@ class Pika:
             key=lambda item: (not item.needs_attention, -item.last_activity_at)
         )
         return choose_session(candidates, "Choose a continuation for this repository")
+
+    def current_exact_session(self) -> Session:
+        """Resolve the calling pane to one exact Pika conversation."""
+        target = os.environ.get("TMUX_PANE")
+        if not target:
+            raise PikaError(
+                "Expert cards can only be changed from inside their exact Pika pane"
+            )
+        pane = self.tmux.get_pane(target)
+        if not pane or not pane.pika_provider or not pane.pika_session_id:
+            raise PikaError(
+                "This pane has no exact Pika identity; adopt or open it with Pika first"
+            )
+        if pane.pika_session_id.startswith("unbound:"):
+            raise PikaError("An unbound pane cannot publish an expert card")
+        session = next(
+            (
+                item
+                for item in self.refresh()
+                if item.key == (pane.pika_provider, pane.pika_session_id)
+            ),
+            None,
+        )
+        fresh_pane = self.tmux.get_pane(target)
+        if (
+            not session
+            or not fresh_pane
+            or not self.exact_pane_pid(session, fresh_pane)
+        ):
+            raise PikaError(
+                "Pika cannot prove this pane owns that provider UUID; expert card unchanged"
+            )
+        return session
+
+    def publish_expert(
+        self,
+        *,
+        summary: str,
+        topics: Iterable[str],
+        artifacts: Iterable[str] = (),
+    ) -> ExpertProfile:
+        session = self.current_exact_session()
+        profile = make_profile(
+            session,
+            summary=summary,
+            topics=topics,
+            artifacts=artifacts,
+        )
+        return self.store.put_expert_profile(profile)
+
+    def clear_current_expert(self) -> Session:
+        session = self.current_exact_session()
+        self.store.delete_expert_profile(*session.key)
+        return session
+
+    def expert_matches(self, query: str = "") -> list[ExpertMatch]:
+        return rank_experts(
+            self.store.list_expert_profiles(),
+            self.refresh(usage=False),
+            query,
+        )
 
     @staticmethod
     def _git_root(path: Path) -> Path:

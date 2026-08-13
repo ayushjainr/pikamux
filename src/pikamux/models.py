@@ -142,3 +142,17 @@ class Usage:
     cache_write_tokens: int = 0
     total_tokens: int = 0
     estimated_cost_usd: float | None = None
+
+
+@dataclass(slots=True)
+class ExpertProfile:
+    provider: str
+    session_id: str
+    summary: str
+    topics: tuple[str, ...]
+    artifacts: tuple[str, ...] = ()
+    updated_at: float = 0.0
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.provider, self.session_id
