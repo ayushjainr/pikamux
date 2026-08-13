@@ -70,6 +70,10 @@ pika ask NAME "QUESTION"  ephemeral multi-turn consultation with that parent
 pika ask NAME --jsonl      persistent JSON-lines side channel for agents/apps
 pika experts QUERY         find provenance-bound experts across projects
 pika experts QUERY --json  stable machine-readable expert matches
+pika expert status         show current, stale, missing, and unknown cards
+pika expert refresh NAME   interview one exact conversation now
+pika expert refresh --all  build/update the tracked expert directory now
+pika expert refresh --due  enforce the weekly quota-aware refresh policy
 pika expert publish ...    publish this exact pane's own expert card
 pika expert clear          remove this exact pane's expert card
 pika .                     open the relevant conversation for this repository
@@ -97,14 +101,29 @@ not append to the parent transcript, and is discarded on close. Claude support
 is capability-gated to the tested CLI version, and Pika fails closed if it
 cannot verify support.
 
-`pika expert publish --summary "..." --topic "..." --artifact "..."` lets a
-conversation advertise specific firsthand work. Publication is allowed only
-from the conversation's exact UUID-bearing Pika pane; one agent cannot write
-another agent's card. `pika experts "factor attribution" --json` ranks the
-self-published cards deterministically from topics, summary, project, and
-artifacts and exposes `matched_on` rather than pretending the score measures
-intelligence. Archived conversations disappear from lookup with the rest of
-Pika's daily surface.
+Pika normally builds expert cards itself. `pika setup` interviews tracked
+conversations and `pika adopt` interviews the exact adopted UUID immediately.
+Both use the same read-only, ephemeral provider fork as `pika ask`, so a live
+parent keeps working and its transcript is unchanged. The interview is asked
+for only firsthand work, specific topics, and concrete artifacts. The saved
+card includes its provider UUID, source, and transcript fingerprint.
+
+`pika expert status` reports `CURRENT`, `STALE`, `MISSING`, or `UNKNOWN` without
+reading transcript contents. `pika expert refresh NAME` and `--all` are explicit
+ways to spend quota now. A user-level one-shot timer checks every ten minutes,
+but calls at most one changed conversation per provider only during the final
+six hours before that provider's weekly reset and only while more than 10%
+remains. It reads provider-native reset telemetry, never hard-codes reset times,
+and makes no model call when telemetry is missing or stale. An attempted card is
+not retried in the same reset cycle.
+
+`pika expert publish --summary "..." --topic "..." --artifact "..."` remains an
+exact-pane correction surface; one agent cannot manually write another agent's
+card. `pika experts "factor attribution" --json` ranks cards deterministically
+from topics, summary, project, and artifacts, exposes `matched_on` rather than
+pretending the score measures intelligence, and includes card freshness and
+source. Archived conversations disappear from lookup with the rest of Pika's
+daily surface.
 
 Agent and dashboard clients can keep a genuine multi-turn side open with
 `pika ask UUID --jsonl`. Send one `{"question":"..."}` object per line and end

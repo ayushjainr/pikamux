@@ -8,8 +8,24 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
-from .experts import ExpertMatch, make_profile, rank_experts
-from .models import Candidate, ExpertProfile, Pane, Session, Status
+from .experts import (
+    ExpertCardState,
+    ExpertMatch,
+    card_state,
+    interview_profile,
+    make_profile,
+    rank_experts,
+    transcript_fingerprint,
+)
+from .models import (
+    Candidate,
+    ExpertProfile,
+    ExpertRefreshAttempt,
+    ExpertRefreshResult,
+    Pane,
+    Session,
+    Status,
+)
 from .processes import (
     find_processes_with_session_id,
     process_alive,
@@ -20,6 +36,7 @@ from .processes import (
     shared_provider_process,
 )
 from .providers import Provider, providers
+from .quota import read_provider_quota
 from .setup_hooks import hook_spec_fingerprint, hooks_installed
 from .store import LIVE_OWNER_LEASE_SECONDS, Store, load_config
 from .tmux import Tmux, TmuxError
@@ -28,6 +45,8 @@ from .ui import choose_session, sorted_attention_sessions, terminal_text
 DUPLICATE_TMUX_ERROR = "duplicate Pika tmux homes"
 UNVERIFIED_PANE_ERROR = "tagged provider PID lacks exact-UUID evidence"
 OPEN_TWICE_ERROR = "exact provider UUID is open in multiple process trees"
+EXPERT_REFRESH_WINDOW_SECONDS = 6 * 60 * 60
+EXPERT_QUOTA_RESERVE_PERCENT = 10.0
 
 
 class PikaError(RuntimeError):
@@ -1146,11 +1165,14 @@ class Pika:
         artifacts: Iterable[str] = (),
     ) -> ExpertProfile:
         session = self.current_exact_session()
+        fingerprint = transcript_fingerprint(session)
         profile = make_profile(
             session,
             summary=summary,
             topics=topics,
             artifacts=artifacts,
+            transcript_mtime_ns=fingerprint[0] if fingerprint else None,
+            transcript_size=fingerprint[1] if fingerprint else None,
         )
         return self.store.put_expert_profile(profile)
 
@@ -1165,6 +1187,228 @@ class Pika:
             self.refresh(usage=False),
             query,
         )
+
+    def expert_card_states(
+        self, sessions: list[Session] | None = None
+    ) -> list[ExpertCardState]:
+        visible = sessions if sessions is not None else self.refresh(usage=False)
+        profiles = {item.key: item for item in self.store.list_expert_profiles()}
+        return [
+            card_state(session, profiles.get(session.key))
+            for session in visible
+            if not session.session_id.startswith("unbound:")
+        ]
+
+    def refresh_expert(self, session: Session) -> ExpertProfile:
+        existing = self.store.get_expert_profile(*session.key)
+        profile = interview_profile(session, existing)
+        return self.store.put_expert_profile(profile)
+
+    def bootstrap_experts(
+        self, sessions: Iterable[Session]
+    ) -> list[ExpertRefreshResult]:
+        results: list[ExpertRefreshResult] = []
+        for session in sessions:
+            state = card_state(
+                session, self.store.get_expert_profile(*session.key)
+            )
+            if state.status == "CURRENT":
+                continue
+            if state.status == "UNKNOWN":
+                results.append(
+                    ExpertRefreshResult(
+                        session.provider,
+                        "UNKNOWN",
+                        state.detail,
+                        session.session_id,
+                        session.display_name,
+                    )
+                )
+                continue
+            try:
+                self.refresh_expert(session)
+            except Exception as exc:  # noqa: BLE001 - one card must not block others
+                results.append(
+                    ExpertRefreshResult(
+                        session.provider,
+                        "FAILED",
+                        str(exc),
+                        session.session_id,
+                        session.display_name,
+                    )
+                )
+            else:
+                results.append(
+                    ExpertRefreshResult(
+                        session.provider,
+                        "REFRESHED",
+                        "exact ephemeral interview",
+                        session.session_id,
+                        session.display_name,
+                    )
+                )
+        return results
+
+    def refresh_due_experts(
+        self,
+        *,
+        provider_name: str | None = None,
+        now: float | None = None,
+    ) -> list[ExpertRefreshResult]:
+        """Refresh at most one changed card per provider and reset cycle run."""
+        now = time.time() if now is None else now
+        sessions = self.refresh(usage=False)
+        provider_names = (
+            [provider_name] if provider_name else sorted(self.providers)
+        )
+        states = self.expert_card_states(sessions)
+        results: list[ExpertRefreshResult] = []
+        for provider in provider_names:
+            provider_states = [
+                item for item in states if item.session.provider == provider
+            ]
+            pending_states = [
+                item
+                for item in provider_states
+                if item.status in {"MISSING", "STALE"}
+            ]
+            if not pending_states:
+                unknown = any(item.status == "UNKNOWN" for item in provider_states)
+                results.append(
+                    ExpertRefreshResult(
+                        provider,
+                        "UNKNOWN" if unknown else "CURRENT",
+                        (
+                            "one or more cards lack a durable transcript"
+                            if unknown
+                            else "no changed expert cards"
+                        ),
+                    )
+                )
+                continue
+            quota = read_provider_quota(provider)
+            if quota is None:
+                results.append(
+                    ExpertRefreshResult(
+                        provider,
+                        "UNKNOWN",
+                        "fresh weekly quota telemetry unavailable; no model call made",
+                    )
+                )
+                continue
+            common = {
+                "remaining_percent": quota.remaining_percent,
+                "reset_at": quota.reset_at,
+            }
+            seconds_left = quota.reset_at - now
+            if seconds_left > EXPERT_REFRESH_WINDOW_SECONDS:
+                results.append(
+                    ExpertRefreshResult(
+                        provider,
+                        "WAITING",
+                        "outside final 6h before weekly reset",
+                        **common,
+                    )
+                )
+                continue
+            if seconds_left <= 0:
+                results.append(
+                    ExpertRefreshResult(
+                        provider,
+                        "UNKNOWN",
+                        "weekly quota observation has expired; no model call made",
+                    )
+                )
+                continue
+            if quota.remaining_percent <= EXPERT_QUOTA_RESERVE_PERCENT:
+                results.append(
+                    ExpertRefreshResult(
+                        provider,
+                        "DEFERRED",
+                        "10% weekly reserve protected; skipped this reset cycle",
+                        **common,
+                    )
+                )
+                continue
+            candidates = sorted(
+                (
+                    item
+                    for item in pending_states
+                    if self.store.get_expert_refresh_attempt(
+                        provider, item.session.session_id, quota.reset_at
+                    )
+                    is None
+                ),
+                key=lambda item: (
+                    item.status != "MISSING",
+                    not item.session.live,
+                    -item.session.last_activity_at,
+                ),
+            )
+            if not candidates:
+                results.append(
+                    ExpertRefreshResult(
+                        provider,
+                        "DEFERRED",
+                        "changed cards already attempted in this reset cycle",
+                        **common,
+                    )
+                )
+                continue
+            selected = candidates[0].session
+            self.store.put_expert_refresh_attempt(
+                ExpertRefreshAttempt(
+                    provider,
+                    selected.session_id,
+                    quota.reset_at,
+                    "STARTED",
+                    "claimed before provider call",
+                )
+            )
+            try:
+                self.refresh_expert(selected)
+            except Exception as exc:  # noqa: BLE001 - scheduled work is fail-closed
+                detail = str(exc)
+                self.store.put_expert_refresh_attempt(
+                    ExpertRefreshAttempt(
+                        provider,
+                        selected.session_id,
+                        quota.reset_at,
+                        "FAILED",
+                        detail,
+                    )
+                )
+                results.append(
+                    ExpertRefreshResult(
+                        provider,
+                        "FAILED",
+                        detail,
+                        selected.session_id,
+                        selected.display_name,
+                        **common,
+                    )
+                )
+            else:
+                self.store.put_expert_refresh_attempt(
+                    ExpertRefreshAttempt(
+                        provider,
+                        selected.session_id,
+                        quota.reset_at,
+                        "REFRESHED",
+                        "exact ephemeral interview",
+                    )
+                )
+                results.append(
+                    ExpertRefreshResult(
+                        provider,
+                        "REFRESHED",
+                        "exact ephemeral interview",
+                        selected.session_id,
+                        selected.display_name,
+                        **common,
+                    )
+                )
+        return results
 
     @staticmethod
     def _git_root(path: Path) -> Path:

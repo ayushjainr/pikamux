@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .experts import ExpertMatch, project_label
+from .experts import ExpertMatch, card_state, project_label
 from .models import ATTENTION_ORDER, Candidate, Session
 from .pricing import PRICING_AS_OF
 
@@ -218,8 +218,8 @@ def print_experts(
         return
     if not matches:
         suffix = f" matching {query!r}" if query else ""
-        print(f"No published Pika experts{suffix}.")
-        print("An agent can publish its own card with `pika expert publish`.")
+        print(f"No Pika experts{suffix}.")
+        print("Build cards with `pika expert refresh --all`.")
         return
     title = f"Pika experts for {query!r}" if query else "Pika expert directory"
     print(title)
@@ -229,6 +229,7 @@ def print_experts(
         ("EXPERT", 22),
         ("PROJECT", 20),
         ("STATE", 10),
+        ("CARD", 8),
         ("TOPICS", 32),
         ("WHY", 15),
         ("ID", 8),
@@ -241,6 +242,7 @@ def print_experts(
             match.session.display_name,
             project_label(match.session.cwd),
             match.session.status,
+            card_state(match.session, match.profile).status,
             ", ".join(match.profile.topics),
             ", ".join(match.matched_on)
             if query
@@ -255,7 +257,8 @@ def print_experts(
             cells.append(value.ljust(size))
         print("  ".join(cells).rstrip())
     print(
-        "\nCards are self-published from exact Pika panes; claims remain evidence to inspect."
+        "\nCards come from exact UUID-bound interviews; claims remain evidence "
+        "to inspect."
     )
 
 

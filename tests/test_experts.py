@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -7,7 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pikamux.core import Pika, PikaError
-from pikamux.experts import make_profile, rank_experts
+from pikamux.consult import ConsultationError
+from pikamux.experts import card_state, interview_profile, make_profile, rank_experts
 from pikamux.models import ExpertProfile, Pane, Session, Status
 from pikamux.store import Store
 
@@ -23,6 +25,65 @@ class OnePaneTmux:
 
 
 class ExpertTests(unittest.TestCase):
+    def test_card_freshness_tracks_the_provider_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = Path(directory) / "thread.jsonl"
+            transcript.write_text("one\n")
+            session = Session("codex", "one", transcript_path=str(transcript))
+            missing = card_state(session, None)
+            self.assertEqual(missing.status, "MISSING")
+            stat = transcript.stat()
+            current = make_profile(
+                session,
+                summary="Did the work.",
+                topics=["work"],
+                transcript_mtime_ns=stat.st_mtime_ns,
+                transcript_size=stat.st_size,
+            )
+            self.assertEqual(card_state(session, current).status, "CURRENT")
+            transcript.write_text("one\ntwo\n")
+            self.assertEqual(card_state(session, current).status, "STALE")
+
+    def test_interview_requires_strict_provider_authored_json(self) -> None:
+        class Consultation:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def ask(self, prompt):
+                self.prompt = prompt
+                return json.dumps(
+                    {
+                        "summary": "Built and verified exact identity recovery.",
+                        "topics": ["session identity", "tmux recovery", "PID leases"],
+                        "artifacts": ["src/pikamux/core.py"],
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = Path(directory) / "thread.jsonl"
+            transcript.write_text("history\n")
+            session = Session("codex", "one", transcript_path=str(transcript))
+            consultation = Consultation()
+            with patch(
+                "pikamux.experts.consultation_for", return_value=consultation
+            ):
+                profile = interview_profile(session)
+            self.assertEqual(profile.source, "interview")
+            self.assertIn("personally completed", consultation.prompt)
+            self.assertEqual(
+                (profile.transcript_mtime_ns, profile.transcript_size),
+                (transcript.stat().st_mtime_ns, transcript.stat().st_size),
+            )
+
+            consultation.ask = lambda _prompt: "not JSON"
+            with (
+                patch("pikamux.experts.consultation_for", return_value=consultation),
+                self.assertRaisesRegex(ConsultationError, "valid JSON"),
+            ):
+                interview_profile(session)
     def test_rank_is_deterministic_and_exposes_why(self) -> None:
         sessions = [
             Session(

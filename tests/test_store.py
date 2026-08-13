@@ -414,6 +414,23 @@ class StoreTests(unittest.TestCase):
             }
         self.assertIn("start_time", columns)
 
+    def test_existing_database_migrates_expert_freshness_columns(self) -> None:
+        self.store.initialize()
+        with self.store.connect() as db:
+            db.execute("ALTER TABLE expert_profiles DROP COLUMN transcript_size")
+            db.execute("ALTER TABLE expert_profiles DROP COLUMN transcript_mtime_ns")
+            db.execute("ALTER TABLE expert_profiles DROP COLUMN source")
+        migrated = Store(self.db_path)
+        migrated.initialize()
+        with migrated.connect() as db:
+            columns = {
+                row["name"]
+                for row in db.execute("PRAGMA table_info(expert_profiles)")
+            }
+        self.assertTrue(
+            {"source", "transcript_mtime_ns", "transcript_size"}.issubset(columns)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

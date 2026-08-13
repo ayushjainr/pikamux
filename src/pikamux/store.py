@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .models import ExpertProfile, Session, Status, Usage
+from .models import ExpertProfile, ExpertRefreshAttempt, Session, Status, Usage
 from .paths import config_path, database_path
 from .processes import process_start_time
 
@@ -161,11 +161,23 @@ class Store:
                     summary TEXT NOT NULL,
                     topics_json TEXT NOT NULL,
                     artifacts_json TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'self',
+                    transcript_mtime_ns INTEGER,
+                    transcript_size INTEGER,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (provider, session_id)
                 );
                 CREATE INDEX IF NOT EXISTS expert_profiles_updated_idx
                 ON expert_profiles(updated_at DESC);
+                CREATE TABLE IF NOT EXISTS expert_refresh_attempts (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    reset_at INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    detail TEXT,
+                    attempted_at REAL NOT NULL,
+                    PRIMARY KEY (provider, session_id, reset_at)
+                );
                 """
             )
             owner_columns = db.execute("PRAGMA table_info(live_owners)").fetchall()
@@ -218,6 +230,25 @@ class Store:
             }
             if "attention_reason" not in session_columns:
                 db.execute("ALTER TABLE sessions ADD COLUMN attention_reason TEXT")
+            expert_columns = {
+                str(row["name"])
+                for row in db.execute(
+                    "PRAGMA table_info(expert_profiles)"
+                ).fetchall()
+            }
+            if "source" not in expert_columns:
+                db.execute(
+                    "ALTER TABLE expert_profiles "
+                    "ADD COLUMN source TEXT NOT NULL DEFAULT 'self'"
+                )
+            if "transcript_mtime_ns" not in expert_columns:
+                db.execute(
+                    "ALTER TABLE expert_profiles ADD COLUMN transcript_mtime_ns INTEGER"
+                )
+            if "transcript_size" not in expert_columns:
+                db.execute(
+                    "ALTER TABLE expert_profiles ADD COLUMN transcript_size INTEGER"
+                )
             event_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(session_events)").fetchall()
@@ -483,6 +514,11 @@ class Store:
                 (provider, session_id),
             )
             db.execute(
+                "DELETE FROM expert_refresh_attempts "
+                "WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            )
+            db.execute(
                 "DELETE FROM sessions WHERE provider=? AND session_id=?",
                 (provider, session_id),
             )
@@ -499,12 +535,16 @@ class Store:
             db.execute(
                 """
                 INSERT INTO expert_profiles(
-                    provider,session_id,summary,topics_json,artifacts_json,updated_at
-                ) VALUES (?,?,?,?,?,?)
+                    provider,session_id,summary,topics_json,artifacts_json,
+                    source,transcript_mtime_ns,transcript_size,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(provider,session_id) DO UPDATE SET
                     summary=excluded.summary,
                     topics_json=excluded.topics_json,
                     artifacts_json=excluded.artifacts_json,
+                    source=excluded.source,
+                    transcript_mtime_ns=excluded.transcript_mtime_ns,
+                    transcript_size=excluded.transcript_size,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -513,6 +553,9 @@ class Store:
                     profile.summary,
                     json.dumps(profile.topics, ensure_ascii=False),
                     json.dumps(profile.artifacts, ensure_ascii=False),
+                    profile.source,
+                    profile.transcript_mtime_ns,
+                    profile.transcript_size,
                     updated_at,
                 ),
             )
@@ -523,6 +566,9 @@ class Store:
             profile.topics,
             profile.artifacts,
             updated_at,
+            profile.source,
+            profile.transcript_mtime_ns,
+            profile.transcript_size,
         )
 
     def get_expert_profile(
@@ -552,6 +598,63 @@ class Store:
                 (provider, session_id),
             )
         return cursor.rowcount == 1
+
+    def put_expert_refresh_attempt(
+        self, attempt: ExpertRefreshAttempt
+    ) -> ExpertRefreshAttempt:
+        self.initialize()
+        attempted_at = attempt.attempted_at or time.time()
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO expert_refresh_attempts(
+                    provider,session_id,reset_at,status,detail,attempted_at
+                ) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(provider,session_id,reset_at) DO UPDATE SET
+                    status=excluded.status,
+                    detail=excluded.detail,
+                    attempted_at=excluded.attempted_at
+                """,
+                (
+                    attempt.provider,
+                    attempt.session_id,
+                    attempt.reset_at,
+                    attempt.status,
+                    attempt.detail,
+                    attempted_at,
+                ),
+            )
+        return ExpertRefreshAttempt(
+            attempt.provider,
+            attempt.session_id,
+            attempt.reset_at,
+            attempt.status,
+            attempt.detail,
+            attempted_at,
+        )
+
+    def get_expert_refresh_attempt(
+        self, provider: str, session_id: str, reset_at: int
+    ) -> ExpertRefreshAttempt | None:
+        self.initialize()
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT * FROM expert_refresh_attempts
+                WHERE provider=? AND session_id=? AND reset_at=?
+                """,
+                (provider, session_id, reset_at),
+            ).fetchone()
+        if not row:
+            return None
+        return ExpertRefreshAttempt(
+            provider=str(row["provider"]),
+            session_id=str(row["session_id"]),
+            reset_at=int(row["reset_at"]),
+            status=str(row["status"]),
+            detail=str(row["detail"]) if row["detail"] is not None else None,
+            attempted_at=float(row["attempted_at"]),
+        )
 
     @staticmethod
     def _became_actionable(
@@ -1351,6 +1454,17 @@ class Store:
             topics=tuple(topics),
             artifacts=tuple(artifacts),
             updated_at=float(row["updated_at"]),
+            source=str(row["source"]),
+            transcript_mtime_ns=(
+                int(row["transcript_mtime_ns"])
+                if row["transcript_mtime_ns"] is not None
+                else None
+            ),
+            transcript_size=(
+                int(row["transcript_size"])
+                if row["transcript_size"] is not None
+                else None
+            ),
         )
 
 

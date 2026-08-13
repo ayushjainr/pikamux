@@ -152,7 +152,38 @@ class ExpertProfile:
     topics: tuple[str, ...]
     artifacts: tuple[str, ...] = ()
     updated_at: float = 0.0
+    source: str = "self"
+    transcript_mtime_ns: int | None = None
+    transcript_size: int | None = None
 
     @property
     def key(self) -> tuple[str, str]:
         return self.provider, self.session_id
+
+
+@dataclass(slots=True)
+class ExpertRefreshAttempt:
+    provider: str
+    session_id: str
+    reset_at: int
+    status: str
+    detail: str | None = None
+    attempted_at: float = 0.0
+
+    @property
+    def key(self) -> tuple[str, str, int]:
+        return self.provider, self.session_id, self.reset_at
+
+
+@dataclass(frozen=True, slots=True)
+class ExpertRefreshResult:
+    provider: str
+    status: str
+    detail: str
+    session_id: str | None = None
+    name: str | None = None
+    remaining_percent: float | None = None
+    reset_at: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)

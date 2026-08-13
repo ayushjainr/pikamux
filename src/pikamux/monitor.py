@@ -40,7 +40,7 @@ PLAYBOOK_TIPS = (
     (
         "experts",
         (
-            "pika experts QUERY finds self-published, UUID-bound expertise across "
+            "pika experts QUERY finds UUID-bound firsthand expertise across "
             "projects."
         ),
         "pika experts QUERY finds the agent who did the work.",

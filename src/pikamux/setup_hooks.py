@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import claude_home, codex_home, config_path
+from .expert_schedule import unit_contents
 from .store import DEFAULT_CONFIG
 
 CODEX_EVENTS = (
@@ -343,12 +344,17 @@ def pika_config_change(default_provider: str) -> FileChange:
 
 
 def proposed_changes(default_provider: str) -> list[FileChange]:
-    return [
+    changes = [
         pika_config_change(default_provider),
         codex_hooks_change(),
         codex_config_change(),
         claude_settings_change(),
     ]
+    changes.extend(
+        FileChange(path, path.read_text() if path.exists() else "", content)
+        for path, content in unit_contents().items()
+    )
+    return changes
 
 
 def apply_changes(changes: list[FileChange]) -> list[Path]:

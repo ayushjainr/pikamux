@@ -93,6 +93,9 @@ def _read_json_line(
 
 
 class CodexConsultation(Consultation):
+    FORK_TIMEOUT_SECONDS = 180.0
+    TURN_START_TIMEOUT_SECONDS = 60.0
+
     def __init__(self, session: Session, *, timeout: float = 900.0):
         super().__init__(session)
         self.timeout = timeout
@@ -143,7 +146,7 @@ class CodexConsultation(Consultation):
                         "needs checking instead."
                     ),
                 },
-                timeout=30.0,
+                timeout=self.FORK_TIMEOUT_SECONDS,
             )
         except (OSError, BrokenPipeError, ValueError, ConsultationError):
             self.close()
@@ -209,7 +212,7 @@ class CodexConsultation(Consultation):
                 "threadId": self.thread_id,
                 "input": [{"type": "text", "text": question}],
             },
-            timeout=30.0,
+            timeout=self.TURN_START_TIMEOUT_SECONDS,
         )
         turn = result.get("turn") if isinstance(result, dict) else None
         turn_id = turn.get("id") if isinstance(turn, dict) else None

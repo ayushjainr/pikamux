@@ -15,6 +15,7 @@ from . import __version__
 from .consult import Consultation, ConsultationError, consultation_for
 from .core import Pika, PikaError
 from .doctor import repair_stale_state, run_doctor
+from .expert_schedule import TIMER_NAME, activate_timer
 from .hooks import handle_hook, handle_process_exit, hook_stdout
 from .models import Session, Status
 from .monitor import run_monitor
@@ -73,7 +74,7 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     expert_parser = sub.add_parser(
-        "expert", help="publish or clear this exact conversation's expert card"
+        "expert", help="inspect, refresh, publish, or clear expert cards"
     )
     expert_sub = expert_parser.add_subparsers(dest="expert_command", required=True)
     publish_parser = expert_sub.add_parser(
@@ -85,9 +86,28 @@ def _parser() -> argparse.ArgumentParser:
     )
     publish_parser.add_argument("--artifact", action="append", default=[])
     expert_sub.add_parser("clear", help="remove this conversation's expert card")
+    refresh_parser = expert_sub.add_parser(
+        "refresh", help="interview exact conversations and refresh their expert cards"
+    )
+    refresh_parser.add_argument("name", nargs="?")
+    refresh_mode = refresh_parser.add_mutually_exclusive_group()
+    refresh_mode.add_argument(
+        "--all", action="store_true", help="refresh all missing or changed cards now"
+    )
+    refresh_mode.add_argument(
+        "--due",
+        action="store_true",
+        help="refresh only when weekly quota is near reset with >10%% left",
+    )
+    refresh_parser.add_argument("--provider", choices=("codex", "claude"))
+    refresh_parser.add_argument("--json", action="store_true")
+    status_parser = expert_sub.add_parser(
+        "status", help="show which expert cards are current, stale, or missing"
+    )
+    status_parser.add_argument("--json", action="store_true")
 
     experts_parser = sub.add_parser(
-        "experts", help="find self-published experts by topic, project, or artifact"
+        "experts", help="find UUID-bound experts by topic, project, or artifact"
     )
     experts_parser.add_argument("query", nargs="*")
     experts_parser.add_argument("--json", action="store_true")
@@ -379,7 +399,93 @@ def _expert(pika: Pika, args: argparse.Namespace) -> int:
             f"{session.provider.title()} · {session.session_id[:8]}"
         )
         return 0
+    if args.expert_command == "status":
+        states = pika.expert_card_states()
+        if args.json:
+            print(
+                json.dumps(
+                    [item.to_dict() for item in states], indent=2, sort_keys=True
+                )
+            )
+        elif not states:
+            print("No resumable Pika conversations are eligible for expert cards.")
+        else:
+            for item in states:
+                print(
+                    f"{item.status:<8} · {item.session.provider.title():<6} · "
+                    f"{terminal_text(item.session.display_name)} · "
+                    f"{item.session.session_id[:8]} · {terminal_text(item.detail)}"
+                )
+        return 0
+    if args.expert_command == "refresh":
+        if args.due:
+            results = pika.refresh_due_experts(provider_name=args.provider)
+        elif args.all:
+            sessions = [
+                item
+                for item in pika.refresh(usage=False)
+                if args.provider is None or item.provider == args.provider
+            ]
+            if args.json:
+                results = pika.bootstrap_experts(sessions)
+            else:
+                pending = [
+                    item
+                    for item in pika.expert_card_states(sessions)
+                    if item.status in {"MISSING", "STALE"}
+                ]
+                results = []
+                if pending:
+                    print(
+                        f"Building {len(pending)} provenance-bound expert card(s) "
+                        "from exact ephemeral interviews."
+                    )
+                for index, state in enumerate(pending, 1):
+                    print(
+                        f"  [{index}/{len(pending)}] "
+                        f"{terminal_text(state.session.display_name)}…",
+                        flush=True,
+                    )
+                    result = pika.bootstrap_experts([state.session])
+                    results.extend(result)
+                    _print_expert_refresh_results(result)
+                return 1 if any(item.status == "FAILED" for item in results) else 0
+        else:
+            if args.provider:
+                raise PikaError("--provider is only valid with --all or --due")
+            session = (
+                _select_named(pika, args.name)
+                if args.name
+                else pika.current_exact_session()
+            )
+            results = pika.bootstrap_experts([session])
+        _print_expert_refresh_results(results, as_json=args.json)
+        return 1 if any(item.status == "FAILED" for item in results) else 0
     raise PikaError(f"Unknown expert command: {args.expert_command}")
+
+
+def _print_expert_refresh_results(results, *, as_json: bool = False) -> None:
+    if as_json:
+        print(
+            json.dumps(
+                [item.to_dict() for item in results], indent=2, sort_keys=True
+            )
+        )
+        return
+    if not results:
+        print("Expert cards already current.")
+        return
+    for item in results:
+        subject = terminal_text(item.name or item.provider.title())
+        quota = (
+            f" · {item.remaining_percent:.0f}% left"
+            if item.remaining_percent is not None
+            else ""
+        )
+        print(
+            f"{item.status} · {subject} · {item.provider.title()}"
+            f"{quota} · {terminal_text(item.detail)}"
+        )
 
 
 def _experts(pika: Pika, query_parts: list[str], *, as_json: bool) -> int:
@@ -549,6 +655,10 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
     backups = apply_changes(changes) if changed else []
     for backup in backups:
         print(f"Backup: {backup}")
+    timer_in_scope = any(change.path.name == TIMER_NAME for change in changes)
+    if timer_in_scope:
+        active, detail = activate_timer()
+        print(f"Expert refresh timer {'active' if active else 'inactive'} · {detail}")
     if changed:
         inactive = [
             provider
@@ -611,6 +721,26 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         pika.import_candidate(candidate)
     if selected:
         print(f"Adopted {len(selected)} existing conversation(s).")
+    tracked = pika.refresh(usage=False)
+    pending_cards = [
+        item
+        for item in pika.expert_card_states(tracked)
+        if item.status in {"MISSING", "STALE"}
+    ]
+    if pending_cards:
+        print(
+            f"\nBuilding {len(pending_cards)} provenance-bound expert card(s) "
+            "from exact ephemeral interviews."
+        )
+        for index, state in enumerate(pending_cards, 1):
+            print(
+                f"  [{index}/{len(pending_cards)}] "
+                f"{terminal_text(state.session.display_name)}…",
+                flush=True,
+            )
+            _print_expert_refresh_results(
+                pika.bootstrap_experts([state.session]), as_json=False
+            )
     return 0
 
 
@@ -742,6 +872,9 @@ def run(argv: list[str] | None = None) -> int:
             f"Adopted {terminal_text(session.display_name)} "
             f"({terminal_text(session.provider)}, {terminal_text(session.status)})."
         )
+        if session.transcript_path:
+            print("Building its UUID-bound expert card…", flush=True)
+        _print_expert_refresh_results(pika.bootstrap_experts([session]))
         return 0
     if args.command == "setup":
         return _setup(pika, args)
