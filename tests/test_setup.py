@@ -15,6 +15,7 @@ from pikamux.setup_hooks import (
     codex_hooks_change,
     codex_hooks_enabled,
     hooks_installed,
+    pika_config_change,
 )
 
 
@@ -25,6 +26,12 @@ class SetupTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_machine_alias_is_persisted_as_deployment_configuration(self) -> None:
+        target = self.root / "config.json"
+        with patch("pikamux.setup_hooks.config_path", return_value=target):
+            change = pika_config_change("codex", "rstudio-6")
+        self.assertEqual(json.loads(change.after)["machine_alias"], "rstudio-6")
 
     def test_json_hook_merges_preserve_existing_entries_and_are_idempotent(
         self,

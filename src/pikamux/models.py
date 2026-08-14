@@ -92,6 +92,104 @@ class Session:
         return values
 
 
+@dataclass(frozen=True, slots=True)
+class NodeCandidate:
+    """A passively discovered address.  It is not trusted until handshake."""
+
+    alias: str
+    ssh_target: str
+    sources: tuple[str, ...]
+    hostname: str | None = None
+    online: bool | None = None
+    os_name: str | None = None
+
+    @property
+    def key(self) -> str:
+        return self.ssh_target.casefold()
+
+
+@dataclass(frozen=True, slots=True)
+class FleetNode:
+    """An explicitly adopted Pika node with immutable remote identity."""
+
+    node_id: str
+    alias: str
+    ssh_target: str
+    sources: tuple[str, ...] = ()
+    status: str = "unknown"
+    protocol_version: int | None = None
+    package_version: str | None = None
+    capabilities: tuple[str, ...] = ()
+    last_seen: float = 0.0
+    last_attempt_at: float = 0.0
+    last_error: str | None = None
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+@dataclass(slots=True)
+class FleetSession:
+    """A routed, read-through view of a session authoritative on another node."""
+
+    node_id: str
+    node_name: str
+    session: Session
+    stale: bool = False
+    remote_error: str | None = None
+    seen_at: float = 0.0
+    card_status: str | None = None
+    card_detail: str | None = None
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return self.node_id, self.session.provider, self.session.session_id
+
+    @property
+    def local_key(self) -> tuple[str, str]:
+        return self.session.key
+
+    @property
+    def provider(self) -> str:
+        return self.session.provider
+
+    @property
+    def session_id(self) -> str:
+        return self.session.session_id
+
+    @property
+    def name(self) -> str | None:
+        return self.session.name
+
+    @property
+    def display_name(self) -> str:
+        return f"{self.session.display_name}@{self.node_name}"
+
+    @property
+    def qualified_name(self) -> str:
+        return self.display_name
+
+    @property
+    def needs_attention(self) -> bool:
+        return not self.stale and self.session.needs_attention
+
+    def __getattr__(self, name: str) -> Any:
+        # The presentation layer can reuse Session renderers without allowing a
+        # remote row into local persistence or identity code.
+        return getattr(self.session, name)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "machine": self.node_name,
+            "stale": self.stale,
+            "remote_error": self.remote_error,
+            "seen_at": self.seen_at,
+            "card_status": self.card_status,
+            "card_detail": self.card_detail,
+            "session": self.session.to_dict(),
+        }
+
+
 @dataclass(slots=True)
 class Candidate:
     provider: str

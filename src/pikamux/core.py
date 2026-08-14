@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
-from .consult import consultation_policy
+from .consult import ConsultationPolicy, consultation_for, consultation_policy
 from .experts import (
     ExpertCardState,
     ExpertMatch,
@@ -18,11 +18,13 @@ from .experts import (
     rank_experts,
     transcript_fingerprint,
 )
+from .fleet import FleetManager
 from .models import (
     Candidate,
     ExpertProfile,
     ExpertRefreshAttempt,
     ExpertRefreshResult,
+    FleetSession,
     Pane,
     Session,
     Status,
@@ -60,6 +62,7 @@ class Pika:
         store: Store | None = None,
         tmux: Tmux | None = None,
         provider_map: dict[str, Provider] | None = None,
+        fleet: FleetManager | None = None,
     ):
         self.store = store or Store()
         self.tmux = tmux or Tmux()
@@ -67,6 +70,7 @@ class Pika:
         self.discovery_errors: list[str] = []
         self.usage_errors: list[str] = []
         self.store.initialize()
+        self.fleet = fleet or FleetManager(self.store)
 
     def discover_candidates(
         self, tracked_sessions: list[Session] | None = None
@@ -508,10 +512,14 @@ class Pika:
                 )
         return self.hydrate_usage(sessions) if usage else sessions
 
-    def hydrate_usage(self, sessions: list[Session]) -> list[Session]:
+    def hydrate_usage(
+        self, sessions: list[Session | FleetSession]
+    ) -> list[Session | FleetSession]:
         """Add provider usage without delaying operational reconciliation."""
         self.usage_errors = []
         for session in sessions:
+            if isinstance(session, FleetSession):
+                continue
             provider = self.providers.get(session.provider)
             if not provider:
                 continue
@@ -529,6 +537,74 @@ class Pika:
                 session.estimated_cost_usd = values.estimated_cost_usd
                 session.model = values.model or session.model
         return sessions
+
+    def monitor_sessions(
+        self, local: list[Session] | None = None
+    ) -> list[Session | FleetSession]:
+        """Combine fresh local truth with cache-only remote views."""
+        return [
+            *(local if local is not None else self.refresh()),
+            *self.fleet.cached_sessions(),
+        ]
+
+    def refresh_remote_node(self, node_id: str) -> list[FleetSession]:
+        return self.fleet.refresh_node(node_id)
+
+    def resolve_target(self, query: str) -> Session | FleetSession:
+        """Resolve a local name or an explicit thread@machine route."""
+        if "@" in query:
+            _thread, alias = query.rsplit("@", 1)
+            if self.store.get_fleet_node(alias) is not None:
+                remote = self.fleet.resolve(query, fresh=True)
+                if remote is not None:
+                    local_exact = [
+                        item
+                        for item in self.refresh()
+                        if item.name and item.name.casefold() == query.casefold()
+                    ]
+                    if local_exact:
+                        return choose_session(
+                            [*local_exact, remote],
+                            f"{query!r} is both a local name and a remote route",
+                        )
+                    return remote
+        try:
+            return self.resolve(query)
+        except PikaError as exc:
+            remote_matches = [
+                item.display_name
+                for item in self.fleet.cached_sessions()
+                if item.name and item.name.casefold() == query.casefold()
+            ]
+            if remote_matches:
+                raise PikaError(
+                    f"{exc} Remote matches: {', '.join(remote_matches)}. "
+                    "Use a machine-qualified name."
+                ) from exc
+            raise
+
+    def consultation(
+        self,
+        session: Session | FleetSession,
+        *,
+        fast: bool = False,
+        policy: ConsultationPolicy | None = None,
+    ):
+        base = session.session if isinstance(session, FleetSession) else session
+        selected = policy or consultation_policy(base, fast=fast)
+        if isinstance(session, FleetSession):
+            return self.fleet.consultation(session, selected)
+        return consultation_for(session, policy=selected)
+
+    def capture(self, session: Session | FleetSession, lines: int) -> str:
+        if isinstance(session, FleetSession):
+            return self.fleet.capture(session, lines)
+        pane = self.tmux.get_pane(session.tmux_pane or session.tmux_session or "")
+        if pane is None:
+            raise PikaError(
+                f"{session.display_name} has no surviving tmux pane to peek"
+            )
+        return self.tmux.capture(pane.pane_id, lines)
 
     def resolve(self, query: str, sessions: list[Session] | None = None) -> Session:
         supplied_sessions = sessions is not None
@@ -694,7 +770,13 @@ class Pika:
             return None
         return pid
 
-    def open(self, session: Session, *, attach: bool = True) -> int:
+    def open(self, session: Session | FleetSession, *, attach: bool = True) -> int:
+        if isinstance(session, FleetSession):
+            if not attach:
+                raise PikaError(
+                    "Remote Pika sessions require an interactive SSH attach"
+                )
+            return self.fleet.attach(session)
         sessions = self.refresh()
         current = next((item for item in sessions if item.key == session.key), session)
         collecting_result = current.status == Status.READY.value and current.unread
@@ -1147,7 +1229,11 @@ class Pika:
                 return None
         return None
 
-    def acknowledge(self, session: Session, *, attaching: bool = False) -> bool:
+    def acknowledge(
+        self, session: Session | FleetSession, *, attaching: bool = False
+    ) -> bool:
+        if isinstance(session, FleetSession):
+            return self.fleet.acknowledge(session)
         return self.store.acknowledge_attention(
             session.provider,
             session.session_id,
@@ -1155,7 +1241,9 @@ class Pika:
             attaching=attaching,
         )
 
-    def next_attention(self, sessions: list[Session] | None = None) -> Session | None:
+    def next_attention(
+        self, sessions: list[Session | FleetSession] | None = None
+    ) -> Session | FleetSession | None:
         sessions = sessions or self.refresh()
         attention = [item for item in sessions if item.needs_attention]
         if not attention:
@@ -1251,22 +1339,43 @@ class Pika:
         return session
 
     def expert_matches(self, query: str = "") -> list[ExpertMatch]:
-        return rank_experts(
+        local = rank_experts(
             self.store.list_expert_profiles(),
             self.refresh(usage=False),
             query,
         )
+        return sorted(
+            [*local, *self.fleet.expert_matches(query)],
+            key=lambda item: (
+                not isinstance(item.session, FleetSession) or not item.session.stale,
+                item.score,
+                item.profile.updated_at,
+            ),
+            reverse=True,
+        )
 
     def expert_card_states(
-        self, sessions: list[Session] | None = None
+        self, sessions: list[Session | FleetSession] | None = None
     ) -> list[ExpertCardState]:
-        visible = sessions if sessions is not None else self.refresh(usage=False)
+        visible = (
+            sessions
+            if sessions is not None
+            else self.monitor_sessions(self.refresh(usage=False))
+        )
+        local_visible = [item for item in visible if isinstance(item, Session)]
         profiles = {item.key: item for item in self.store.list_expert_profiles()}
-        return [
+        local = [
             card_state(session, profiles.get(session.key))
-            for session in visible
+            for session in local_visible
             if not session.session_id.startswith("unbound:")
         ]
+        remote_keys = {item.key for item in visible if isinstance(item, FleetSession)}
+        remote = [
+            item
+            for item in self.fleet.expert_card_states()
+            if item.session.key in remote_keys
+        ]
+        return [*local, *remote]
 
     def refresh_expert(self, session: Session) -> ExpertProfile:
         existing = self.store.get_expert_profile(*session.key)
@@ -1282,9 +1391,7 @@ class Pika:
     ) -> list[ExpertRefreshResult]:
         results: list[ExpertRefreshResult] = []
         for session in sessions:
-            state = card_state(
-                session, self.store.get_expert_profile(*session.key)
-            )
+            state = card_state(session, self.store.get_expert_profile(*session.key))
             if state.status == "CURRENT":
                 continue
             if state.status == "UNKNOWN":
@@ -1332,9 +1439,7 @@ class Pika:
         """Refresh at most one changed card per provider and reset cycle run."""
         now = time.time() if now is None else now
         sessions = self.refresh(usage=False)
-        provider_names = (
-            [provider_name] if provider_name else sorted(self.providers)
-        )
+        provider_names = [provider_name] if provider_name else sorted(self.providers)
         states = self.expert_card_states(sessions)
         results: list[ExpertRefreshResult] = []
         for provider in provider_names:
@@ -1342,9 +1447,7 @@ class Pika:
                 item for item in states if item.session.provider == provider
             ]
             pending_states = [
-                item
-                for item in provider_states
-                if item.status in {"MISSING", "STALE"}
+                item for item in provider_states if item.status in {"MISSING", "STALE"}
             ]
             if not pending_states:
                 unknown = any(item.status == "UNKNOWN" for item in provider_states)
@@ -1542,9 +1645,7 @@ class Pika:
                     )
                 elif direct_pids:
                     pid_text = ", ".join(map(str, sorted(direct_pids)))
-                    resume = shlex.join(
-                        ["pika", "open", named_session.session_id]
-                    )
+                    resume = shlex.join(["pika", "open", named_session.session_id])
                     raise PikaError(
                         f"{terminal_text(named_session.display_name)} is running "
                         f"outside tmux (PID {pid_text}). A live process cannot be "
@@ -1552,9 +1653,7 @@ class Pika:
                         f"`{resume}` to resume the exact UUID inside Pika."
                     )
                 else:
-                    resume = shlex.join(
-                        ["pika", "open", named_session.session_id]
-                    )
+                    resume = shlex.join(["pika", "open", named_session.session_id])
                     raise PikaError(
                         f"{terminal_text(named_session.display_name)} is not running "
                         f"inside a tmux pane. Run `{resume}` to create its exact Pika "
@@ -1627,8 +1726,10 @@ class Pika:
         )
         return session
 
-    def untrack(self, session: Session) -> int:
+    def untrack(self, session: Session | FleetSession) -> int:
         """Stop showing an exact UUID without stopping or archiving its agent."""
+        if isinstance(session, FleetSession):
+            return self.fleet.untrack(session)
         if session.session_id.startswith("unbound:"):
             raise PikaError(
                 "Pika cannot stop watching this placeholder safely because its "

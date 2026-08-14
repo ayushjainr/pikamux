@@ -11,6 +11,7 @@ import termios
 import threading
 import time
 import tty
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from textwrap import wrap
@@ -24,7 +25,7 @@ from .consult import (
     consultation_policy,
 )
 from .experts import ExpertCardState
-from .models import ExpertProfile, Session, Status
+from .models import ExpertProfile, FleetNode, FleetSession, Session, Status
 from .pricing import PRICING_AS_OF
 from .ui import (
     PROVIDER_MARK,
@@ -53,10 +54,7 @@ SPINNER = ("◐", "◓", "◑", "◒")
 PLAYBOOK_TIPS = (
     (
         "experts",
-        (
-            "pika experts QUERY finds UUID-bound firsthand expertise across "
-            "projects."
-        ),
+        ("pika experts QUERY finds UUID-bound firsthand expertise across projects."),
         "pika experts QUERY finds the agent who did the work.",
     ),
     (
@@ -155,20 +153,26 @@ _MOUSE = re.compile(rb"^\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 class MonitorPika(Protocol):
     def refresh(self, *, usage: bool = False) -> list[Session]: ...
 
-    def hydrate_usage(self, sessions: list[Session]) -> list[Session]: ...
+    def hydrate_usage(
+        self, sessions: list[Session | FleetSession]
+    ) -> list[Session | FleetSession]: ...
 
-    def open(self, session: Session, *, attach: bool = True) -> int: ...
+    def open(self, session: Session | FleetSession, *, attach: bool = True) -> int: ...
 
-    def acknowledge(self, session: Session, *, attaching: bool = False) -> bool: ...
+    def acknowledge(
+        self, session: Session | FleetSession, *, attaching: bool = False
+    ) -> bool: ...
 
-    def untrack(self, session: Session) -> int: ...
+    def untrack(self, session: Session | FleetSession) -> int: ...
+
+    def capture(self, session: Session | FleetSession, lines: int) -> str: ...
 
     def next_attention(
-        self, sessions: list[Session] | None = None
-    ) -> Session | None: ...
+        self, sessions: list[Session | FleetSession] | None = None
+    ) -> Session | FleetSession | None: ...
 
     def expert_card_states(
-        self, sessions: list[Session] | None = None
+        self, sessions: list[Session | FleetSession] | None = None
     ) -> list[ExpertCardState]: ...
 
     @property
@@ -182,7 +186,7 @@ class MonitorPika(Protocol):
 class MonitorFrame:
     ansi: str
     plain: str
-    selected_key: tuple[str, str] | None
+    selected_key: tuple[str, ...] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,9 +211,15 @@ class AskMessage:
 class _InlineAskWorker:
     """Own one provider-native side process without blocking the TUI."""
 
-    def __init__(self, session: Session, policy: ConsultationPolicy) -> None:
+    def __init__(
+        self,
+        session: Session | FleetSession,
+        policy: ConsultationPolicy,
+        opener: Callable[[], Consultation] | None = None,
+    ) -> None:
         self.session = replace(session)
         self.policy = policy
+        self._opener = opener or (lambda: consultation_for(session, policy=policy))
         self._requests: queue.Queue[tuple[str, str]] = queue.Queue()
         self._events: queue.Queue[tuple[str, str]] = queue.Queue()
         self._closing = threading.Event()
@@ -260,7 +270,7 @@ class _InlineAskWorker:
 
     def _run(self) -> None:
         try:
-            consultation = consultation_for(self.session, policy=self.policy)
+            consultation = self._opener()
             with self._consultation_lock:
                 if self._closing.is_set():
                     should_close = True
@@ -292,8 +302,8 @@ class _InlineAskWorker:
 
 @dataclass(slots=True)
 class MonitorState:
-    sessions: list[Session] = field(default_factory=list)
-    selected_key: tuple[str, str] | None = None
+    sessions: list[Session | FleetSession] = field(default_factory=list)
+    selected_key: tuple[str, ...] | None = None
     last_update: float = 0.0
     refresh_error: str | None = None
     refresh_warning: str | None = None
@@ -308,13 +318,13 @@ class MonitorState:
     emphasize_refresh: bool = False
     handoff: HandoffSummary | None = None
     handoff_until: float = 0.0
-    expert_cards: dict[tuple[str, str], ExpertCardState] = field(default_factory=dict)
+    expert_cards: dict[tuple[str, ...], ExpertCardState] = field(default_factory=dict)
     expert_cards_updated_at: float = 0.0
-    preview_key: tuple[str, str] | None = None
+    preview_key: tuple[str, ...] | None = None
     preview_lines: list[str] = field(default_factory=list)
     preview_error: str | None = None
     preview_updated_at: float = 0.0
-    ask_target: Session | None = None
+    ask_target: Session | FleetSession | None = None
     ask_policy: ConsultationPolicy | None = None
     ask_confirmed: bool = False
     ask_messages: list[AskMessage] = field(default_factory=list)
@@ -324,12 +334,13 @@ class MonitorState:
     ask_error: str | None = None
     ask_pending: bool = False
     ask_scroll: int = 0
-    untrack_target: Session | None = None
+    untrack_target: Session | FleetSession | None = None
+    machines: list[FleetNode] = field(default_factory=list)
 
-    def ordered(self) -> list[Session]:
+    def ordered(self) -> list[Session | FleetSession]:
         return sorted_sessions(self.sessions)
 
-    def selected(self) -> Session | None:
+    def selected(self) -> Session | FleetSession | None:
         ordered = self.ordered()
         if not ordered:
             self.selected_key = None
@@ -363,8 +374,9 @@ class MonitorState:
     def expert_card(self, session: Session | None) -> ExpertCardState | None:
         return self.expert_cards.get(session.key) if session is not None else None
 
-    def begin_ask(self, session: Session, *, fast: bool = False) -> None:
-        policy = consultation_policy(session, fast=fast)
+    def begin_ask(self, session: Session | FleetSession, *, fast: bool = False) -> None:
+        base = session.session if isinstance(session, FleetSession) else session
+        policy = consultation_policy(base, fast=fast)
         self.mode = "ask"
         self.ask_target = replace(session)
         self.ask_policy = policy
@@ -385,7 +397,7 @@ class MonitorState:
         self.ask_pending = False
         self.ask_outbox = None
 
-    def begin_untrack(self, session: Session) -> None:
+    def begin_untrack(self, session: Session | FleetSession) -> None:
         self.mode = "untrack"
         self.untrack_target = replace(session)
 
@@ -432,20 +444,24 @@ def _line(left: str, right: str, width: int) -> str:
     return _fit(left, room) + "  " + right
 
 
-def _session_counts(sessions: list[Session]) -> dict[str, int]:
+def _session_counts(sessions: list[Session | FleetSession]) -> dict[str, int]:
+    current = [
+        item for item in sessions if not (isinstance(item, FleetSession) and item.stale)
+    ]
     return {
-        "decisions": sum(item.status == Status.NEEDS_YOU.value for item in sessions),
+        "decisions": sum(item.status == Status.NEEDS_YOU.value for item in current),
         "results": sum(
-            item.status == Status.READY.value and item.unread for item in sessions
+            item.status == Status.READY.value and item.unread for item in current
         ),
-        "working": sum(item.status == Status.WORKING.value for item in sessions),
-        "parked": sum(item.status == Status.PARKED.value for item in sessions),
+        "working": sum(item.status == Status.WORKING.value for item in current),
+        "parked": sum(item.status == Status.PARKED.value for item in current),
         "errors": sum(
             item.status in {Status.ERROR.value, Status.OPEN_TWICE.value} and item.unread
-            for item in sessions
+            for item in current
         ),
-        "unbound": sum(item.status == Status.UNBOUND.value for item in sessions),
-        "protected": sum(item.exact_home for item in sessions),
+        "unbound": sum(item.status == Status.UNBOUND.value for item in current),
+        "protected": sum(item.exact_home for item in current),
+        "cached": len(sessions) - len(current),
     }
 
 
@@ -488,7 +504,7 @@ def _handoff_text(handoff: HandoffSummary) -> str:
 
 
 def _briefing_lines(
-    sessions: list[Session],
+    sessions: list[Session | FleetSession],
     *,
     width: int,
     handoff: HandoffSummary | None,
@@ -508,6 +524,8 @@ def _briefing_lines(
             f"{prefix} · {counts['working']} working · "
             f"{counts['parked']} parked · {counts['protected']} exact live"
         )
+        if counts["cached"]:
+            headline += f" · {counts['cached']} cached"
     elif not interventions:
         headline = (
             f"{counts['results']} {_noun(counts['results'], 'RESULT')} "
@@ -815,7 +833,19 @@ def _peek_view(state: MonitorState, width: int, slots: int) -> list[str]:
     return [_fit(line, width) for line in visible]
 
 
-def _identity_text(session: Session) -> str:
+def _identity_text(session: Session | FleetSession) -> str:
+    if isinstance(session, FleetSession):
+        age = _human_age_at(session.seen_at, time.time())
+        if session.stale:
+            return (
+                f"CACHED ON {session.node_name.upper()} · {session.provider.title()} · "
+                f"id {session.session_id[:8]} · last sync {age} ago"
+            )
+        proof = "REMOTE EXACT" if session.exact_home else "REMOTE TRACKED"
+        return (
+            f"{proof} · {session.node_name} · {session.provider.title()} · "
+            f"id {session.session_id[:8]}"
+        )
     provider = session.provider.title()
     fingerprint = session.session_id[:8]
     if session.home_state == "exact-live":
@@ -835,7 +865,9 @@ def _identity_text(session: Session) -> str:
     return f"HOME STATE UNKNOWN · {provider} · id {fingerprint}"
 
 
-def _age_phrase(session: Session, now: float) -> str:
+def _age_phrase(session: Session | FleetSession, now: float) -> str:
+    if isinstance(session, FleetSession) and session.stale:
+        return f"cached {_human_age_at(session.seen_at, now)} ago"
     event_age = _human_age_at(session.last_event_at, now)
     activity_age = _human_age_at(session.last_activity_at, now)
     return {
@@ -849,7 +881,9 @@ def _age_phrase(session: Session, now: float) -> str:
     }.get(session.status, f"last active {activity_age} ago")
 
 
-def _needs_you_group(session: Session) -> bool:
+def _needs_you_group(session: Session | FleetSession) -> bool:
+    if isinstance(session, FleetSession) and session.stale:
+        return False
     return session.status in {
         Status.NEEDS_YOU.value,
         Status.ERROR.value,
@@ -857,7 +891,9 @@ def _needs_you_group(session: Session) -> bool:
     } or (session.status == Status.READY.value and session.unread)
 
 
-def _split_groups(sessions: list[Session]) -> list[tuple[str, list[Session]]]:
+def _split_groups(
+    sessions: list[Session | FleetSession],
+) -> list[tuple[str, list[Session | FleetSession]]]:
     ordered = sorted_sessions(sessions)
     definitions = (
         ("NEEDS YOU", _needs_you_group),
@@ -869,16 +905,22 @@ def _split_groups(sessions: list[Session]) -> list[tuple[str, list[Session]]]:
         ),
         ("PARKED", lambda item: item.status == Status.PARKED.value),
     )
-    assigned: set[tuple[str, str]] = set()
-    groups: list[tuple[str, list[Session]]] = []
+    assigned: set[tuple[str, ...]] = set()
+    groups: list[tuple[str, list[Session | FleetSession]]] = []
+    cached = [item for item in ordered if isinstance(item, FleetSession) and item.stale]
+    assigned.update(item.key for item in cached)
     for label, predicate in definitions:
-        members = [item for item in ordered if predicate(item) and item.key not in assigned]
+        members = [
+            item for item in ordered if predicate(item) and item.key not in assigned
+        ]
         if members:
             assigned.update(item.key for item in members)
             groups.append((label, members))
     other = [item for item in ordered if item.key not in assigned]
     if other:
         groups.append(("OTHER", other))
+    if cached:
+        groups.append(("CACHED", cached))
     return groups
 
 
@@ -889,6 +931,7 @@ def _group_color(label: str) -> str:
         "UNBOUND": FG_MAGENTA,
         "READY": FG_GREEN,
         "PARKED": FG_BRIGHT_BLACK,
+        "CACHED": FG_BRIGHT_BLACK,
     }.get(label, FG_BLUE)
 
 
@@ -949,9 +992,7 @@ def _split_left_pane(
             )
             prefix = f"{marker}{signal} {provider} "
             name_width = max(4, width - len(prefix) - len(age) - 1)
-            plain = _fit(
-                f"{prefix}{_fit(item.display_name, name_width)} {age}", width
-            )
+            plain = _fit(f"{prefix}{_fit(item.display_name, name_width)} {age}", width)
             if is_selected:
                 ansi = _paint(plain, REVERSE + BOLD, color)
             else:
@@ -1010,9 +1051,7 @@ def _card_display_status(card: ExpertCardState | None) -> str:
 def _safe_chat_text(value: object) -> str:
     clean = _ANSI_ESCAPE.sub("", str(value))
     return "".join(
-        character
-        if character.isprintable() or character == "\n"
-        else "�"
+        character if character.isprintable() or character == "\n" else "�"
         for character in clean
     )
 
@@ -1057,9 +1096,7 @@ def _ask_history_lines(
             entries.append(("blank", " " * width))
         entries.extend(
             ("error", line)
-            for line in _wrapped_detail(
-                f"SIDE ERROR // {state.ask_error}", width=width
-            )
+            for line in _wrapped_detail(f"SIDE ERROR // {state.ask_error}", width=width)
         )
     elif not entries:
         empty = (
@@ -1067,9 +1104,7 @@ def _ask_history_lines(
             if state.ask_status == "opening"
             else "Ask from this agent's firsthand context. Follow-ups stay in this side."
         )
-        entries.extend(
-            ("status", line) for line in _wrapped_detail(empty, width=width)
-        )
+        entries.extend(("status", line) for line in _wrapped_detail(empty, width=width))
 
     offset = min(state.ask_scroll, max(0, len(entries) - 1))
     end = max(0, len(entries) - offset)
@@ -1092,9 +1127,9 @@ def _ask_history_lines(
 
 def _ask_input_lines(state: MonitorState, *, width: int, rows: int) -> list[str]:
     if state.ask_pending:
-        return [_fit("› waiting for this answer…", width)] + [
-            " " * width
-        ] * max(0, rows - 1)
+        return [_fit("› waiting for this answer…", width)] + [" " * width] * max(
+            0, rows - 1
+        )
     cursor = "█"
     value = state.ask_input + cursor
     logical: list[str] = []
@@ -1159,11 +1194,11 @@ def _ask_panel_lines(
     card = state.expert_cards.get(target.key)
     if card and card.profile:
         now_line = _detail_value(
-            "now", card.profile.current_state or "not captured — refresh this card", width
+            "now",
+            card.profile.current_state or "not captured — refresh this card",
+            width,
         )
-        knows = _detail_value(
-            "knows", " · ".join(card.profile.topics[:3]), width
-        )
+        knows = _detail_value("knows", " · ".join(card.profile.topics[:3]), width)
     else:
         now_line = _detail_value("now", "expert card unavailable", width)
         knows = _detail_value("knows", "expert card unavailable", width)
@@ -1207,7 +1242,10 @@ def _ask_panel_lines(
         _paint(heading, DIM + FG_CYAN, color),
         *history_ansi,
         _paint(input_heading, DIM + FG_MAGENTA, color),
-        *[_paint(line, REVERSE if not state.ask_pending else DIM, color) for line in input_plain],
+        *[
+            _paint(line, REVERSE if not state.ask_pending else DIM, color)
+            for line in input_plain
+        ],
         _paint(help_line, DIM, color),
     ]
     return plain[:height], ansi[:height]
@@ -1317,13 +1355,9 @@ def _split_right_pane(
     color: bool,
 ) -> tuple[list[str], list[str]]:
     if state.mode == "ask":
-        return _ask_panel_lines(
-            state, width=width, height=height, now=now, color=color
-        )
+        return _ask_panel_lines(state, width=width, height=height, now=now, color=color)
     if state.mode == "untrack":
-        return _untrack_panel_lines(
-            state, width=width, height=height, color=color
-        )
+        return _untrack_panel_lines(state, width=width, height=height, color=color)
     selected = state.selected()
     if selected is None:
         plain = [
@@ -1339,7 +1373,11 @@ def _split_right_pane(
 
     card = state.expert_card(selected)
     profile = card.profile if card else None
-    signal = selected.error or selected.attention_reason or "no exception reported"
+    signal = (
+        selected.remote_error
+        if isinstance(selected, FleetSession) and selected.remote_error
+        else selected.error or selected.attention_reason or "no exception reported"
+    )
     status_mark = "◆" if _needs_you_group(selected) else "□"
     title = _line(selected.display_name, f"{status_mark} {selected.status}", width)
     active_handoff = (
@@ -1367,7 +1405,9 @@ def _split_right_pane(
     metadata = [
         _detail_value("signal", f"{signal} · {_age_phrase(selected, now)}", width),
         _detail_value(
-            "agent", f"{selected.provider.title()} · id {selected.session_id[:8]}", width
+            "agent",
+            f"{selected.provider.title()} · id {selected.session_id[:8]}",
+            width,
         ),
         _detail_value("path", selected.cwd or "—", width),
         _detail_value("branch", selected.branch or "—", width),
@@ -1380,7 +1420,14 @@ def _split_right_pane(
             _paint(metadata[1], DIM, color),
             metadata[2],
             metadata[3],
-            _paint(metadata[4], FG_GREEN if selected.exact_home else FG_MAGENTA, color),
+            _paint(
+                metadata[4],
+                FG_GREEN
+                if selected.exact_home
+                and not (isinstance(selected, FleetSession) and selected.stale)
+                else FG_MAGENTA,
+                color,
+            ),
         ]
     )
 
@@ -1464,24 +1511,32 @@ def _split_right_pane(
         ansi.extend([_paint(usage_heading, BOLD + FG_CYAN, color), usage])
 
     action_heading = _fit("DO SOMETHING", width)
-    if selected.status == Status.UNBOUND.value and selected.live:
+    can_ask = isinstance(selected, FleetSession) or bool(selected.transcript_path)
+    if isinstance(selected, FleetSession) and selected.stale:
+        actions = "Actions paused · press r to retry this machine"
+        reassurance = (
+            "Cached metadata is visible, but Pika will not act as if it is current."
+        )
+    elif selected.status == Status.UNBOUND.value and selected.live:
         actions = "Enter blocked · run pika adopt to create an exact home"
         reassurance = "Pika will not guess ownership for a live external process."
     elif selected.home_state in {"identity-error", "open-twice"}:
-        ask = " · [a] ask here" if selected.transcript_path else ""
+        ask = " · [a] ask here" if can_ask else ""
         actions = f"[Enter] blocked{ask} · run pika doctor --verbose"
-        reassurance = "The saved conversation remains visible; pane identity is fail-closed."
+        reassurance = (
+            "The saved conversation remains visible; pane identity is fail-closed."
+        )
     else:
         open_label = (
             "collect result"
             if selected.status == Status.READY.value and selected.unread
             else "open"
         )
-        ask = " · [a] ask here" if selected.transcript_path else ""
+        ask = " · [a] ask here" if can_ask else ""
         actions = f"[Enter] {open_label}{ask} · [p] peek · [x] stop watching"
         reassurance = (
             "Inline asks are ephemeral; the parent transcript remains unchanged."
-            if selected.transcript_path
+            if can_ask
             else "This conversation has no durable transcript available for side asks."
         )
     action_block = [
@@ -1502,7 +1557,9 @@ def _split_right_pane(
         elif selected.tmux_pane or selected.tmux_session:
             preview = ["Waiting for the first selected-pane capture…"]
         elif selected.home_state in {"identity-error", "open-twice"}:
-            preview = ["No trusted pane. Opening stays blocked until identity recovers."]
+            preview = [
+                "No trusted pane. Opening stays blocked until identity recovers."
+            ]
         else:
             preview = ["No live pane. Enter restores this exact saved conversation."]
         preview = [_fit(line, width) for line in preview[:preview_body_slots]]
@@ -1544,9 +1601,7 @@ def _render_split_monitor(
 ) -> MonitorFrame:
     counts = _session_counts(state.sessions)
     need_count = sum(_needs_you_group(item) for item in state.sessions)
-    expert_count = sum(
-        card.profile is not None for card in state.expert_cards.values()
-    )
+    expert_count = sum(card.profile is not None for card in state.expert_cards.values())
     refresh_age = max(0.0, now - state.refresh_started_at)
     show_refresh = refreshing and (
         not state.last_update
@@ -1571,6 +1626,14 @@ def _render_split_monitor(
         f"{counts['working']} working",
         f"{counts['unbound']} unbound",
     ]
+    if counts["cached"]:
+        summary.append(f"{counts['cached']} cached")
+    if state.machines:
+        unavailable = sum(node.status != "ready" for node in state.machines)
+        summary.append(
+            f"{len(state.machines) + 1} machines"
+            + (f"/{unavailable} offline" if unavailable else "")
+        )
     if state.expert_cards_updated_at:
         summary.append(f"{expert_count} {_noun(expert_count, 'expert')}")
     status_clock = (
@@ -1607,8 +1670,7 @@ def _render_split_monitor(
     )
     divider_ansi = _paint(divider, FG_BRIGHT_BLACK, color)
     body_plain = [
-        left_plain[index] + divider + right_plain[index]
-        for index in range(body_height)
+        left_plain[index] + divider + right_plain[index] for index in range(body_height)
     ]
     body_ansi = [
         left_ansi[index] + divider_ansi + right_ansi[index]
@@ -1619,9 +1681,7 @@ def _render_split_monitor(
     if state.mode == "ask":
         target = state.ask_target or selected
         fingerprint = target.session_id[:8] if target else "—"
-        policy = state.ask_policy or (
-            consultation_policy(target) if target else None
-        )
+        policy = state.ask_policy or (consultation_policy(target) if target else None)
         if state.ask_confirmed:
             playbook_text = (
                 f"SIDE RECEIPT // EPHEMERAL · parent {fingerprint} unchanged · "
@@ -1645,9 +1705,7 @@ def _render_split_monitor(
             width,
         )
         playbook_ansi = _paint(playbook_plain, FG_YELLOW, color)
-        footer_plain = _fit(
-            "x / Enter confirm stop watching    Esc / q cancel", width
-        )
+        footer_plain = _fit("x / Enter confirm stop watching    Esc / q cancel", width)
     else:
         tip_index, tip_total, tip = playbook_tip(
             now,
@@ -1724,9 +1782,7 @@ def render_monitor(
         plain = "\n".join(_fit(line, width) for line in minimum)
         return MonitorFrame(plain, plain, state.selected_key)
 
-    if state.mode == "ask" and (
-        width < SPLIT_MIN_WIDTH or height < SPLIT_MIN_HEIGHT
-    ):
+    if state.mode == "ask" and (width < SPLIT_MIN_WIDTH or height < SPLIT_MIN_HEIGHT):
         return _render_compact_ask(
             state, width=width, height=height, now=now, color=color
         )
@@ -1734,9 +1790,7 @@ def render_monitor(
     if state.mode == "untrack" and (
         width < SPLIT_MIN_WIDTH or height < SPLIT_MIN_HEIGHT
     ):
-        return _render_compact_untrack(
-            state, width=width, height=height, color=color
-        )
+        return _render_compact_untrack(state, width=width, height=height, color=color)
 
     if (
         width >= SPLIT_MIN_WIDTH
@@ -2121,7 +2175,8 @@ class _Terminal:
 
 
 def _carry_usage(
-    sessions: list[Session], cache: dict[tuple[str, str], dict[str, object]]
+    sessions: list[Session | FleetSession],
+    cache: dict[tuple[str, ...], dict[str, object]],
 ) -> None:
     fields = (
         "model",
@@ -2150,11 +2205,16 @@ def _open_peek(pika: MonitorPika, state: MonitorState) -> None:
         state.notify("No workstream selected")
         return
     target = session.tmux_pane or session.tmux_session
-    if not target:
+    if not target and not isinstance(session, FleetSession):
         state.notify("No surviving Pika pane to peek")
         return
     try:
-        captured = pika.tmux.capture(target, 300)
+        capture = getattr(pika, "capture", None)
+        captured = (
+            capture(session, 300)
+            if callable(capture)
+            else pika.tmux.capture(target, 300)
+        )
     except Exception as exc:  # noqa: BLE001 - monitor stays recoverable
         state.notify(f"Peek failed: {exc}")
         return
@@ -2170,8 +2230,11 @@ def _open_peek(pika: MonitorPika, state: MonitorState) -> None:
 
 
 def _capture_preview(
-    pika: MonitorPika, session: Session
-) -> tuple[tuple[str, str], list[str], str | None]:
+    pika: MonitorPika, session: Session | FleetSession
+) -> tuple[tuple[str, ...], list[str], str | None]:
+    if isinstance(session, FleetSession):
+        # Remote pane tails are fetched only on explicit `p`, never every 2s.
+        return session.key, [], None
     target = session.tmux_pane or session.tmux_session
     if not target:
         return session.key, [], None
@@ -2183,11 +2246,50 @@ def _capture_preview(
     return session.key, lines[-12:], None
 
 
+def _capture_remote_peek(
+    pika: MonitorPika, session: FleetSession
+) -> tuple[tuple[str, ...], list[str], str | None]:
+    try:
+        captured = pika.capture(session, 300)
+    except Exception as exc:  # noqa: BLE001 - explicit remote view stays recoverable
+        return session.key, [], terminal_text(exc)
+    lines = [strip_terminal_sequences(line) for line in captured.splitlines()]
+    return session.key, lines, None
+
+
+def _next_remote_node(
+    nodes: list[FleetNode],
+    *,
+    selected_node_id: str | None,
+    now: float,
+    manual: bool,
+) -> FleetNode | None:
+    due = (
+        nodes
+        if manual
+        else [
+            node
+            for node in nodes
+            if now - node.last_attempt_at >= (15.0 if node.status == "ready" else 30.0)
+        ]
+    )
+    if not due:
+        return None
+    return min(
+        due,
+        key=lambda item: (
+            0 if manual and item.node_id == selected_node_id else 1,
+            item.last_attempt_at,
+            item.node_id,
+        ),
+    )
+
+
 def _handle_key(
     key: str,
     pika: MonitorPika,
     state: MonitorState,
-) -> tuple[str, Session | None]:
+) -> tuple[str, Session | FleetSession | None]:
     if state.mode == "ask":
         target = state.ask_target
         if key == "escape":
@@ -2291,13 +2393,21 @@ def _handle_key(
     elif key == "help":
         state.mode = "help"
     elif key == "peek":
-        _open_peek(pika, state)
+        session = state.selected()
+        if isinstance(session, FleetSession) and session.stale:
+            state.notify("Cached remote row — press r to retry its machine first")
+        elif isinstance(session, FleetSession):
+            return "peek-remote", session
+        else:
+            _open_peek(pika, state)
     elif key == "usage":
         state.show_usage = not state.show_usage
         return "usage", None
     elif key == "enter":
         session = state.selected()
-        if session and session.status == Status.UNBOUND.value and session.live:
+        if isinstance(session, FleetSession) and session.stale:
+            state.notify("Cached remote row — press r to retry its machine first")
+        elif session and session.status == Status.UNBOUND.value and session.live:
             state.notify("Unbound live process — adopt it before opening")
         elif session and session.home_state in {"identity-error", "open-twice"}:
             state.notify("Exact pane identity is unverified — opening remains blocked")
@@ -2305,9 +2415,15 @@ def _handle_key(
             return "open", session
     elif key in {"ask", "ask-fast"}:
         session = state.selected()
-        if session and session.status == Status.UNBOUND.value and session.live:
+        if isinstance(session, FleetSession) and session.stale:
+            state.notify("Cached remote row — press r to retry its machine first")
+        elif session and session.status == Status.UNBOUND.value and session.live:
             state.notify("Unbound live process — adopt it before consulting")
-        elif session and not session.transcript_path:
+        elif (
+            session
+            and not isinstance(session, FleetSession)
+            and not session.transcript_path
+        ):
             state.notify("No durable provider transcript available for a side ask")
         elif session:
             try:
@@ -2318,7 +2434,9 @@ def _handle_key(
                 return "ask-open", session
     elif key == "untrack":
         session = state.selected()
-        if session and session.session_id.startswith("unbound:"):
+        if isinstance(session, FleetSession) and session.stale:
+            state.notify("Cached remote row — press r to retry its machine first")
+        elif session and session.session_id.startswith("unbound:"):
             state.notify("Cannot stop watching until this process has an exact UUID")
         elif session:
             state.begin_untrack(session)
@@ -2414,24 +2532,37 @@ def run_monitor(
     input_fd = sys.stdin.fileno() if input_fd is None else input_fd
     output_fd = sys.stdout.fileno() if output_fd is None else output_fd
     state = MonitorState()
-    usage_cache: dict[tuple[str, str], dict[str, object]] = {}
+    usage_cache: dict[tuple[str, ...], dict[str, object]] = {}
     input_buffer = bytearray()
     future: concurrent.futures.Future[list[Session]] | None = None
-    usage_future: concurrent.futures.Future[list[Session]] | None = None
+    usage_future: concurrent.futures.Future[list[Session | FleetSession]] | None = None
     expert_future: concurrent.futures.Future[list[ExpertCardState]] | None = None
-    preview_future: concurrent.futures.Future[
-        tuple[tuple[str, str], list[str], str | None]
-    ] | None = None
+    fleet_future: concurrent.futures.Future[list[FleetSession]] | None = None
+    preview_future: (
+        concurrent.futures.Future[tuple[tuple[str, ...], list[str], str | None]] | None
+    ) = None
+    remote_peek_future: (
+        concurrent.futures.Future[tuple[tuple[str, ...], list[str], str | None]] | None
+    ) = None
+    remote_ack_future: concurrent.futures.Future[tuple[FleetSession, bool]] | None = (
+        None
+    )
+    remote_untrack_future: (
+        concurrent.futures.Future[tuple[FleetSession, int]] | None
+    ) = None
     next_refresh = 0.0
     next_usage = 0.0
     next_expert = 0.0
+    next_fleet = 0.0
     next_preview = 0.0
     manual_refresh_pending = False
+    manual_fleet_refresh_pending = False
     selected_to_open: Session | None = None
     inline_ask: _InlineAskWorker | None = None
     last_frame: str | None = None
     color = "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
     first_scan = True
+    local_sessions: list[Session] = []
 
     try:
         with _DaemonExecutor() as executor:
@@ -2456,7 +2587,9 @@ def run_monitor(
                             elif event == "error" and state.mode == "ask":
                                 state.ask_pending = False
                                 state.ask_status = "error"
-                                state.ask_error = _safe_chat_text(value).replace("\n", " ")
+                                state.ask_error = _safe_chat_text(value).replace(
+                                    "\n", " "
+                                )
                             elif event == "closed":
                                 if state.mode == "ask" and state.ask_status != "error":
                                     state.ask_pending = False
@@ -2471,7 +2604,13 @@ def run_monitor(
                             state.refresh_error = terminal_text(exc)
                         else:
                             _carry_usage(sessions, usage_cache)
-                            state.sessions = sessions
+                            local_sessions = sessions
+                            aggregator = getattr(pika, "monitor_sessions", None)
+                            state.sessions = (
+                                aggregator(sessions)
+                                if callable(aggregator)
+                                else sessions
+                            )
                             state.selected()
                             state.last_update = time.time()
                             state.refresh_error = None
@@ -2484,7 +2623,7 @@ def run_monitor(
                             if first_scan:
                                 state.handoff = _morning_handoff(
                                     pika,
-                                    sessions,
+                                    local_sessions,
                                     now=state.last_update,
                                 )
                                 if state.handoff is not None:
@@ -2499,6 +2638,21 @@ def run_monitor(
                             if manual_refresh_pending
                             else monotonic + refresh_seconds
                         )
+
+                    if fleet_future is not None and fleet_future.done():
+                        try:
+                            fleet_future.result()
+                        except Exception:  # noqa: BLE001 - cache remains last-good
+                            pass
+                        aggregator = getattr(pika, "monitor_sessions", None)
+                        if callable(aggregator):
+                            state.sessions = aggregator(local_sessions)
+                            state.selected()
+                            state.last_update = time.time()
+                        fleet_future = None
+                        # Per-node last_attempt_at enforces each node's cadence.
+                        # Do not idle while another node is already due.
+                        next_fleet = monotonic
 
                     if usage_future is not None and usage_future.done():
                         try:
@@ -2523,7 +2677,9 @@ def run_monitor(
                         except Exception:  # noqa: BLE001 - cards never block operations
                             pass
                         else:
-                            state.expert_cards = {item.session.key: item for item in cards}
+                            state.expert_cards = {
+                                item.session.key: item for item in cards
+                            }
                             state.expert_cards_updated_at = time.time()
                         expert_future = None
                         next_expert = monotonic + EXPERT_CARD_REFRESH_SECONDS
@@ -2543,6 +2699,86 @@ def run_monitor(
                         preview_future = None
                         next_preview = monotonic + PREVIEW_REFRESH_SECONDS
 
+                    if remote_peek_future is not None and remote_peek_future.done():
+                        try:
+                            peek_key, peek_lines, peek_error = (
+                                remote_peek_future.result()
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            state.notify(f"Remote peek failed: {exc}")
+                        else:
+                            if peek_error:
+                                state.notify(f"Remote peek failed: {peek_error}")
+                            else:
+                                state.selected_key = peek_key
+                                state.peek_lines = peek_lines
+                                state.peek_offset = 0
+                                state.mode = "peek"
+                                selected_peek = state.selected()
+                                if (
+                                    isinstance(selected_peek, FleetSession)
+                                    and selected_peek.status == Status.READY.value
+                                    and selected_peek.unread
+                                    and remote_ack_future is None
+                                ):
+                                    # Show the fetched result before starting a
+                                    # second, best-effort acknowledgement SSH.
+                                    remote_ack_future = executor.submit(
+                                        lambda item: (item, pika.acknowledge(item)),
+                                        replace(selected_peek),
+                                    )
+                        remote_peek_future = None
+
+                    if remote_ack_future is not None and remote_ack_future.done():
+                        try:
+                            acknowledged_session, acknowledged = (
+                                remote_ack_future.result()
+                            )
+                        except Exception:  # noqa: BLE001 - reconcile uncertain outcome
+                            state.notify(
+                                "Result shown · acknowledgement outcome unknown · "
+                                "press r to reconcile"
+                            )
+                        else:
+                            if acknowledged:
+                                current = next(
+                                    (
+                                        item
+                                        for item in state.sessions
+                                        if item.key == acknowledged_session.key
+                                    ),
+                                    None,
+                                )
+                                if isinstance(current, FleetSession):
+                                    current.session.unread = False
+                                state.notify(
+                                    "RESULT SEEN · unread state cleared remotely"
+                                )
+                        remote_ack_future = None
+
+                    if (
+                        remote_untrack_future is not None
+                        and remote_untrack_future.done()
+                    ):
+                        try:
+                            removed, _cleared = remote_untrack_future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            state.notify(f"Remote stop watching failed: {exc}")
+                        else:
+                            state.sessions = [
+                                item
+                                for item in state.sessions
+                                if item.key != removed.key
+                            ]
+                            state.expert_cards.pop(removed.key, None)
+                            state.selected_key = None
+                            state.selected()
+                            state.notify(
+                                f"Stopped watching {removed.display_name} · "
+                                "remote agent left running"
+                            )
+                        remote_untrack_future = None
+
                     if future is None and monotonic >= next_refresh:
                         state.refresh_started_at = time.time()
                         state.emphasize_refresh = manual_refresh_pending or not bool(
@@ -2550,6 +2786,35 @@ def run_monitor(
                         )
                         manual_refresh_pending = False
                         future = executor.submit(pika.refresh, usage=False)
+
+                    fleet = getattr(pika, "fleet", None)
+                    node_loader = getattr(fleet, "nodes", None)
+                    remote_refresh = getattr(pika, "refresh_remote_node", None)
+                    if (
+                        fleet_future is None
+                        and callable(node_loader)
+                        and callable(remote_refresh)
+                        and monotonic >= next_fleet
+                    ):
+                        nodes = node_loader()
+                        state.machines = nodes
+                        selected_remote = state.selected()
+                        selected_node_id = (
+                            selected_remote.node_id
+                            if isinstance(selected_remote, FleetSession)
+                            else None
+                        )
+                        node = _next_remote_node(
+                            nodes,
+                            selected_node_id=selected_node_id,
+                            now=time.time(),
+                            manual=manual_fleet_refresh_pending,
+                        )
+                        if node is not None:
+                            fleet_future = executor.submit(remote_refresh, node.node_id)
+                            manual_fleet_refresh_pending = False
+                        else:
+                            next_fleet = monotonic + 5.0
 
                     if (
                         state.show_usage
@@ -2582,6 +2847,7 @@ def run_monitor(
                     )
                     if (
                         preview_session is not None
+                        and not isinstance(preview_session, FleetSession)
                         and preview_target
                         and state.mode not in {"ask", "untrack"}
                         and preview_future is None
@@ -2623,9 +2889,7 @@ def run_monitor(
                     if not data:
                         break
                     input_buffer.extend(data)
-                    for key in decode_keys(
-                        input_buffer, text_mode=state.mode == "ask"
-                    ):
+                    for key in decode_keys(input_buffer, text_mode=state.mode == "ask"):
                         action, session = _handle_key(key, pika, state)
                         if action == "quit":
                             future = None
@@ -2643,7 +2907,17 @@ def run_monitor(
                                     "Side policy unavailable; reopen the consultation"
                                 )
                                 continue
-                            inline_ask = _InlineAskWorker(session, state.ask_policy)
+                            consultation = getattr(pika, "consultation", None)
+                            opener = (
+                                lambda session=session, policy=state.ask_policy, consultation=consultation: (
+                                    consultation(session, policy=policy)
+                                    if callable(consultation)
+                                    else consultation_for(session, policy=policy)
+                                )
+                            )
+                            inline_ask = _InlineAskWorker(
+                                session, state.ask_policy, opener
+                            )
                             inline_ask.start()
                         if action == "ask-send":
                             question = state.ask_outbox
@@ -2653,10 +2927,30 @@ def run_monitor(
                             else:
                                 state.ask_pending = False
                                 state.ask_status = "error"
-                                state.ask_error = "side process is unavailable; Esc closes it"
+                                state.ask_error = (
+                                    "side process is unavailable; Esc closes it"
+                                )
                         if action == "ask-close" and inline_ask is not None:
                             inline_ask.close()
+                        if action == "peek-remote" and isinstance(
+                            session, FleetSession
+                        ):
+                            if remote_peek_future is None:
+                                state.notify(f"Fetching {session.display_name}…")
+                                remote_peek_future = executor.submit(
+                                    _capture_remote_peek, pika, replace(session)
+                                )
                         if action == "untrack" and session is not None:
+                            if isinstance(session, FleetSession):
+                                if remote_untrack_future is None:
+                                    state.notify(
+                                        f"Stopping watch on {session.display_name}…"
+                                    )
+                                    remote_untrack_future = executor.submit(
+                                        lambda item: (item, pika.untrack(item)),
+                                        replace(session),
+                                    )
+                                continue
                             try:
                                 pika.untrack(session)
                             except Exception as exc:  # noqa: BLE001 - UI stays live
@@ -2678,9 +2972,11 @@ def run_monitor(
                                 next_refresh = 0.0
                         if action == "refresh":
                             manual_refresh_pending = True
+                            manual_fleet_refresh_pending = True
                             state.emphasize_refresh = True
                             next_refresh = 0.0
                             next_expert = 0.0
+                            next_fleet = 0.0
                         if action == "usage" and state.show_usage:
                             next_usage = 0.0
                     else:

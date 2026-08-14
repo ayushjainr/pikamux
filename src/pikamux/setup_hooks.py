@@ -334,7 +334,9 @@ def claude_settings_change(home: Path | None = None) -> FileChange:
     return FileChange(target, before, after)
 
 
-def pika_config_change(default_provider: str) -> FileChange:
+def pika_config_change(
+    default_provider: str, machine_alias: str | None = None
+) -> FileChange:
     target = config_path()
     before = target.read_text() if target.exists() else ""
     data = dict(DEFAULT_CONFIG)
@@ -348,13 +350,17 @@ def pika_config_change(default_provider: str) -> FileChange:
                 f"Cannot safely merge invalid JSON at {target}: {exc}"
             ) from exc
     data["default_provider"] = default_provider
+    if machine_alias:
+        data["machine_alias"] = machine_alias
     after = json.dumps(data, indent=2, sort_keys=True) + "\n"
     return FileChange(target, before, after)
 
 
-def proposed_changes(default_provider: str) -> list[FileChange]:
+def proposed_changes(
+    default_provider: str, machine_alias: str | None = None
+) -> list[FileChange]:
     changes = [
-        pika_config_change(default_provider),
+        pika_config_change(default_provider, machine_alias),
         codex_hooks_change(),
         codex_config_change(),
         claude_settings_change(),

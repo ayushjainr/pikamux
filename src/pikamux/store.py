@@ -5,12 +5,20 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .models import ExpertProfile, ExpertRefreshAttempt, Session, Status, Usage
+from .models import (
+    FleetNode,
+    ExpertProfile,
+    ExpertRefreshAttempt,
+    Session,
+    Status,
+    Usage,
+)
 from .paths import config_path, database_path
 from .processes import process_start_time
 
@@ -185,6 +193,30 @@ class Store:
                     attempted_at REAL NOT NULL,
                     PRIMARY KEY (provider, session_id, reset_at)
                 );
+                CREATE TABLE IF NOT EXISTS fleet_nodes (
+                    node_id TEXT PRIMARY KEY,
+                    alias TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    ssh_target TEXT NOT NULL,
+                    sources_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'unknown',
+                    protocol_version INTEGER,
+                    package_version TEXT,
+                    capabilities_json TEXT NOT NULL DEFAULT '[]',
+                    last_seen REAL NOT NULL DEFAULT 0,
+                    last_attempt_at REAL NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS remote_snapshots (
+                    node_id TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    captured_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ignored_node_candidates (
+                    candidate_key TEXT PRIMARY KEY,
+                    ignored_at REAL NOT NULL
+                );
                 """
             )
             owner_columns = db.execute("PRAGMA table_info(live_owners)").fetchall()
@@ -239,9 +271,7 @@ class Store:
                 db.execute("ALTER TABLE sessions ADD COLUMN attention_reason TEXT")
             expert_columns = {
                 str(row["name"])
-                for row in db.execute(
-                    "PRAGMA table_info(expert_profiles)"
-                ).fetchall()
+                for row in db.execute("PRAGMA table_info(expert_profiles)").fetchall()
             }
             if "source" not in expert_columns:
                 db.execute(
@@ -290,6 +320,17 @@ class Store:
                     ON session_events(event_at);
                     """
                 )
+            fleet_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(fleet_nodes)").fetchall()
+            }
+            if "last_attempt_at" not in fleet_columns:
+                db.execute(
+                    "ALTER TABLE fleet_nodes ADD COLUMN last_attempt_at "
+                    "REAL NOT NULL DEFAULT 0"
+                )
+            if "package_version" not in fleet_columns:
+                db.execute("ALTER TABLE fleet_nodes ADD COLUMN package_version TEXT")
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -319,8 +360,7 @@ class Store:
         event_at = session.last_event_at or now
         with self.connect() as db:
             if db.execute(
-                "SELECT 1 FROM untracked_sessions "
-                "WHERE provider=? AND session_id=?",
+                "SELECT 1 FROM untracked_sessions WHERE provider=? AND session_id=?",
                 session.key,
             ).fetchone():
                 return
@@ -447,8 +487,7 @@ class Store:
         self.initialize()
         with self.connect() as db:
             row = db.execute(
-                "SELECT 1 FROM untracked_sessions "
-                "WHERE provider=? AND session_id=?",
+                "SELECT 1 FROM untracked_sessions WHERE provider=? AND session_id=?",
                 (provider, session_id),
             ).fetchone()
         return row is not None
@@ -608,8 +647,7 @@ class Store:
                 (provider, session_id),
             )
             db.execute(
-                "DELETE FROM expert_refresh_attempts "
-                "WHERE provider=? AND session_id=?",
+                "DELETE FROM expert_refresh_attempts WHERE provider=? AND session_id=?",
                 (provider, session_id),
             )
             db.execute(
@@ -1111,8 +1149,7 @@ class Store:
             return False
         with self.connect() as db:
             if db.execute(
-                "SELECT 1 FROM untracked_sessions "
-                "WHERE provider=? AND session_id=?",
+                "SELECT 1 FROM untracked_sessions WHERE provider=? AND session_id=?",
                 (provider, session_id),
             ).fetchone():
                 return False
@@ -1260,6 +1297,209 @@ class Store:
                 """,
                 (provider, session_id, token),
             )
+
+    def local_node_id(self) -> str:
+        """Return this installation's stable identity without exposing host secrets."""
+        self.initialize()
+        proposed = str(uuid.uuid4())
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT OR IGNORE INTO meta(key,value) VALUES ('fleet:node_id',?)",
+                (proposed,),
+            )
+            row = db.execute(
+                "SELECT value FROM meta WHERE key='fleet:node_id'"
+            ).fetchone()
+        assert row is not None
+        try:
+            return str(uuid.UUID(str(row["value"])))
+        except ValueError:
+            raise ValueError("Pika's stored fleet node UUID is invalid") from None
+
+    def upsert_fleet_node(self, node: FleetNode) -> FleetNode:
+        self.initialize()
+        now = time.time()
+        created_at = node.created_at or now
+        updated_at = node.updated_at or now
+        with self.connect() as db:
+            existing = db.execute(
+                "SELECT last_seen,last_attempt_at,created_at FROM fleet_nodes "
+                "WHERE node_id=?",
+                (node.node_id,),
+            ).fetchone()
+            if existing:
+                created_at = node.created_at or float(existing["created_at"])
+            last_seen = node.last_seen or (
+                float(existing["last_seen"]) if existing else 0.0
+            )
+            last_attempt_at = node.last_attempt_at or (
+                float(existing["last_attempt_at"]) if existing else updated_at
+            )
+            collision = db.execute(
+                "SELECT node_id FROM fleet_nodes WHERE alias=? COLLATE NOCASE",
+                (node.alias,),
+            ).fetchone()
+            if collision and str(collision["node_id"]) != node.node_id:
+                raise ValueError(
+                    f"Machine alias {node.alias!r} already belongs to another node"
+                )
+            db.execute(
+                """
+                INSERT INTO fleet_nodes(
+                    node_id,alias,ssh_target,sources_json,status,protocol_version,
+                    package_version,capabilities_json,last_seen,last_attempt_at,last_error,
+                    created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(node_id) DO UPDATE SET
+                    alias=excluded.alias,
+                    ssh_target=excluded.ssh_target,
+                    sources_json=excluded.sources_json,
+                    status=excluded.status,
+                    protocol_version=excluded.protocol_version,
+                    package_version=excluded.package_version,
+                    capabilities_json=excluded.capabilities_json,
+                    last_seen=excluded.last_seen,
+                    last_attempt_at=excluded.last_attempt_at,
+                    last_error=excluded.last_error,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    node.node_id,
+                    node.alias,
+                    node.ssh_target,
+                    json.dumps(node.sources, ensure_ascii=False),
+                    node.status,
+                    node.protocol_version,
+                    node.package_version,
+                    json.dumps(node.capabilities, ensure_ascii=False),
+                    last_seen,
+                    last_attempt_at,
+                    node.last_error,
+                    created_at,
+                    updated_at,
+                ),
+            )
+        return FleetNode(
+            node_id=node.node_id,
+            alias=node.alias,
+            ssh_target=node.ssh_target,
+            sources=node.sources,
+            status=node.status,
+            protocol_version=node.protocol_version,
+            package_version=node.package_version,
+            capabilities=node.capabilities,
+            last_seen=last_seen,
+            last_attempt_at=last_attempt_at,
+            last_error=node.last_error,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+
+    def list_fleet_nodes(self) -> list[FleetNode]:
+        self.initialize()
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM fleet_nodes ORDER BY alias COLLATE NOCASE"
+            ).fetchall()
+        return [self._row_to_fleet_node(row) for row in rows]
+
+    def get_fleet_node(self, value: str) -> FleetNode | None:
+        self.initialize()
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM fleet_nodes WHERE node_id=? OR alias=? COLLATE NOCASE",
+                (value, value),
+            ).fetchall()
+        if len(rows) > 1:
+            raise ValueError(f"Ambiguous machine identity {value!r}")
+        return self._row_to_fleet_node(rows[0]) if rows else None
+
+    def delete_fleet_node(self, node_id: str) -> bool:
+        self.initialize()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM remote_snapshots WHERE node_id=?", (node_id,))
+            db.execute(
+                "DELETE FROM meta WHERE key LIKE ? OR key LIKE ?",
+                (
+                    f"fleet:pending-adopt:{node_id}:%",
+                    f"fleet:pending-untrack:{node_id}:%",
+                ),
+            )
+            cursor = db.execute("DELETE FROM fleet_nodes WHERE node_id=?", (node_id,))
+        return cursor.rowcount == 1
+
+    def mark_fleet_node_error(self, node_id: str, status: str, error: str) -> None:
+        allowed = {"unreachable", "auth", "incompatible", "quarantined", "error"}
+        if status not in allowed:
+            raise ValueError(f"Unsupported fleet node status: {status}")
+        self.initialize()
+        with self.connect() as db:
+            db.execute(
+                "UPDATE fleet_nodes SET status=?,last_error=?,last_attempt_at=?,updated_at=? "
+                "WHERE node_id=?",
+                (status, error, time.time(), time.time(), node_id),
+            )
+
+    def put_remote_snapshot(
+        self, node_id: str, payload: dict[str, Any], *, captured_at: float | None = None
+    ) -> None:
+        self.initialize()
+        captured_at = captured_at or time.time()
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute(
+                "SELECT 1 FROM fleet_nodes WHERE node_id=?", (node_id,)
+            ).fetchone():
+                raise ValueError("Remote snapshot requires an adopted fleet node")
+            db.execute(
+                """
+                INSERT INTO remote_snapshots(node_id,payload_json,captured_at)
+                VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET
+                    payload_json=excluded.payload_json,
+                    captured_at=excluded.captured_at
+                """,
+                (node_id, encoded, captured_at),
+            )
+            db.execute(
+                "UPDATE fleet_nodes SET status='ready',last_seen=?,last_error=NULL,"
+                "last_attempt_at=?,updated_at=? WHERE node_id=?",
+                (captured_at, captured_at, time.time(), node_id),
+            )
+
+    def get_remote_snapshot(self, node_id: str) -> tuple[dict[str, Any], float] | None:
+        self.initialize()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT payload_json,captured_at FROM remote_snapshots WHERE node_id=?",
+                (node_id,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = json.loads(str(row["payload_json"]))
+        if not isinstance(payload, dict):
+            raise ValueError("Stored remote snapshot is not an object")
+        return payload, float(row["captured_at"])
+
+    def ignore_node_candidate(self, candidate_key: str) -> None:
+        self.initialize()
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO ignored_node_candidates(candidate_key,ignored_at) "
+                "VALUES (?,?) ON CONFLICT(candidate_key) DO UPDATE SET "
+                "ignored_at=excluded.ignored_at",
+                (candidate_key.casefold(), time.time()),
+            )
+
+    def ignored_node_candidate_keys(self) -> set[str]:
+        self.initialize()
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT candidate_key FROM ignored_node_candidates"
+            ).fetchall()
+        return {str(row["candidate_key"]) for row in rows}
 
     def set_meta(self, key: str, value: str) -> None:
         self.initialize()
@@ -1570,6 +1810,34 @@ class Store:
                 else None
             ),
             current_state=str(row["current_state"]),
+        )
+
+    @staticmethod
+    def _row_to_fleet_node(row: sqlite3.Row) -> FleetNode:
+        return FleetNode(
+            node_id=str(row["node_id"]),
+            alias=str(row["alias"]),
+            ssh_target=str(row["ssh_target"]),
+            sources=tuple(json.loads(str(row["sources_json"]))),
+            status=str(row["status"]),
+            protocol_version=(
+                int(row["protocol_version"])
+                if row["protocol_version"] is not None
+                else None
+            ),
+            package_version=(
+                str(row["package_version"])
+                if row["package_version"] is not None
+                else None
+            ),
+            capabilities=tuple(json.loads(str(row["capabilities_json"]))),
+            last_seen=float(row["last_seen"]),
+            last_attempt_at=float(row["last_attempt_at"]),
+            last_error=(
+                str(row["last_error"]) if row["last_error"] is not None else None
+            ),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
         )
 
 

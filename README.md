@@ -64,6 +64,95 @@ Backups are written beside each changed file with a
 `.pika-backup-YYYYMMDDTHHMMSSZ` suffix. Restore one by copying it back over its
 original file; Pika never deletes backups.
 
+## Multiple machines
+
+Any Pika installation can be a **coordinator** for other Pika machines. The
+role is selected by the user; no hostname, cloud, Tailscale account, or machine
+such as `rstudio-6` is built into the product. Each remote Pika remains the sole
+authority for its own provider UUIDs, processes, transcripts, tmux panes, and
+expert cards. The coordinator stores only an explicitly trusted node UUID and a
+sanitized last-good metadata snapshot. It never copies transcript content.
+
+Pika uses the SSH access you already have. It does not copy private keys, edit
+`known_hosts`, weaken host-key checking, change Tailscale ACLs, scan subnets, or
+open a Pika network port. A hidden versioned JSONL protocol runs over an
+ordinary non-interactive SSH process; human attaches use an SSH PTY. Network
+visibility is not treated as authorization.
+
+Interactive `pika setup` has a two-stage federation step:
+
+1. It passively reads concrete aliases from `~/.ssh/config` and peers already
+   visible in `tailscale status --json`, then asks which machines to contact.
+2. After a selected machine proves its immutable Pika node UUID and protocol,
+   Pika asks which eligible conversations to adopt there.
+
+Unselected candidates receive no network traffic. Selecting a remote
+conversation updates Pika only on that remote machine; it does not start, move,
+resume, or interview the agent. If Pika is missing remotely, setup displays the
+exact version-tagged install command and requires a separate confirmation before
+running it. Handshakes report the remote package version, and `pika machines
+upgrade MACHINE` is the explicit rolling-upgrade path; Pika never follows a
+mutable branch during remote installation.
+`pika setup --yes` never selects machines or installs remotely by itself.
+
+For an explicit non-interactive rollout:
+
+```bash
+pika setup --yes --machine rstudio-5 --remote-import-all
+```
+
+Useful fleet commands:
+
+```text
+pika machines discover            passive candidates; zero SSH connections
+pika machines add HOST --alias A  verify and trust one existing Pika node
+pika machines list                node UUID, address, health, and last error
+pika machines remove A            delete local trust/cache; remote untouched
+pika machines upgrade A           install the pinned matching release, then reverify
+pika machines ignore HOST         stop offering one discovery candidate
+pika sync A                       refresh one node in the foreground
+pika list --all-machines          local truth plus cached remote snapshots
+pika list --all-machines --json   versioned pikamux-fleet-list/v1 envelope
+```
+
+The human locator is `thread@machine`:
+
+```bash
+pika master_quant@rstudio-5
+pika ask master_quant@rstudio-5 "What is the current blocker?"
+pika peek master_quant@rstudio-5
+pika untrack master_quant@rstudio-5
+```
+
+Names are routing conveniences. Before every remote action, the coordinator
+refreshes that one node, resolves the name there, and sends only the exact
+provider plus conversation UUID. `UUID@machine` therefore survives renames.
+Same-name Codex/Claude sessions retain Pika's explicit chooser. If a literal
+local name such as `build@atlas` also parses as a configured route, Pika asks
+instead of guessing; non-interactive callers must use an exact UUID.
+
+The live monitor merges fresh local sessions with cached remote snapshots.
+Local reconciliation remains independent every two seconds. At most one remote
+inventory refresh is in flight, selected oldest-attempt-first from due machines;
+there is no artificial gap while more machines are due, and selection affects
+only an explicit manual refresh. A machine whose SSH latency pushes the serial
+fleet past the 45-second freshness budget is honestly marked `CACHED`; it never
+blocks typing, local state, or quitting. Remote
+pane tails are fetched only after explicit `p`, and remote side questions keep
+one ephemeral SSH/JSONL process for all follow-ups. Stale rows move to a
+`CACHED` group, lose actionable attention status, retain their last-success age,
+and never disappear merely because a machine is offline.
+
+Remote errors remain distinct: `UNREACHABLE`, `SSH TRUST OR AUTH FAILED`,
+`INCOMPATIBLE`, and `NODE IDENTITY CHANGED`. An identity change quarantines
+actions and preserves the last-good cache until the operator verifies and
+re-adds that machine. `pika doctor` remains a local recovery certificate;
+optional remote availability cannot make a locally recoverable session unsafe.
+Remote mutation receipts are separate from follow-up cache reconciliation: a
+proven adoption or untrack remains successful if the next snapshot fails, with
+the node left visibly stale for later reconciliation. Remote peek displays its
+captured output before starting any separate acknowledgement.
+
 ## Daily commands
 
 ```text
@@ -85,6 +174,10 @@ pika .                     open the relevant conversation for this repository
 pika -                     return to the previously attached Pika conversation
 pika list                  show all tracked live and parked conversations
 pika list --json           stable machine-readable inventory
+pika list --all-machines   include cache-only remote Pika snapshots
+pika machines discover     passively find SSH/Tailscale candidates
+pika machines list         show trusted nodes and connection health
+pika sync MACHINE          refresh one remote node now
 pika next                  open the oldest conversation needing attention
 pika peek NAME             inspect recent pane output without attaching
 pika peek NAME --ack       explicitly acknowledge READY in a script

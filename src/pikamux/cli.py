@@ -9,6 +9,7 @@ import sys
 import termios
 import time
 import tty
+from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__
@@ -21,8 +22,16 @@ from .consult import (
 from .core import Pika, PikaError
 from .doctor import repair_stale_state, run_doctor
 from .expert_schedule import TIMER_NAME, activate_timer
+from .fleet import (
+    REMOTE_INSTALL_ARGV,
+    FleetError,
+    handle_fleet_stdio,
+    machine_alias,
+    suggest_alias,
+    suggest_local_machine_alias,
+)
 from .hooks import handle_hook, handle_process_exit, hook_stdout
-from .models import Session, Status
+from .models import Candidate, FleetSession, NodeCandidate, Session, Status
 from .monitor import run_monitor
 from .paths import config_path, database_path
 from .setup_hooks import (
@@ -33,7 +42,16 @@ from .setup_hooks import (
 )
 from .store import load_config
 from .tmux import TmuxError
-from .ui import choose_candidates, print_experts, print_sessions, terminal_text
+from .ui import (
+    choose_fleet_candidates,
+    choose_node_candidates,
+    print_experts,
+    print_fleet_sessions,
+    print_machines,
+    print_node_candidates,
+    print_sessions,
+    terminal_text,
+)
 
 PUBLIC_COMMANDS = {
     "ask",
@@ -49,8 +67,17 @@ PUBLIC_COMMANDS = {
     "untrack",
     "setup",
     "doctor",
+    "machines",
+    "sync",
 }
-INTERNAL_COMMANDS = {"hook", "_process-exit", "_peek-popup"}
+INTERNAL_COMMANDS = {
+    "hook",
+    "_process-exit",
+    "_peek-popup",
+    "_fleet",
+    "_fleet-open",
+    "_fleet-ask",
+}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -63,7 +90,7 @@ def _parser() -> argparse.ArgumentParser:
         dest="command",
         metavar=(
             "{open,ask,expert,experts,list,next,peek,wait,new,adopt,"
-            "untrack,setup,doctor}"
+            "untrack,setup,doctor,machines,sync}"
         ),
     )
 
@@ -146,6 +173,11 @@ def _parser() -> argparse.ArgumentParser:
     list_parser.add_argument(
         "--no-usage", action="store_true", help="skip token and cost calculation"
     )
+    list_parser.add_argument(
+        "--all-machines",
+        action="store_true",
+        help="include cache-only snapshots from adopted Pika machines",
+    )
 
     sub.add_parser("next", help="open the oldest conversation needing attention")
 
@@ -193,11 +225,62 @@ def _parser() -> argparse.ArgumentParser:
     setup_parser = sub.add_parser("setup", help="preview and install lifecycle hooks")
     setup_parser.add_argument("--default-provider", choices=("codex", "claude"))
     setup_parser.add_argument(
+        "--machine-alias",
+        help="human name for this Pika node (for example rstudio-6)",
+    )
+    setup_parser.add_argument(
         "--yes", action="store_true", help="apply the displayed changes"
     )
     setup_parser.add_argument("--dry-run", action="store_true")
     setup_parser.add_argument("--no-import", action="store_true")
     setup_parser.add_argument("--import-all", action="store_true")
+    setup_parser.add_argument(
+        "--no-machines", action="store_true", help="skip passive machine discovery"
+    )
+    setup_parser.add_argument(
+        "--machine",
+        action="append",
+        default=[],
+        metavar="SSH_TARGET",
+        help="explicitly handshake with this SSH target; repeatable",
+    )
+    setup_parser.add_argument(
+        "--remote-import-all",
+        action="store_true",
+        help="adopt every eligible conversation on explicitly selected machines",
+    )
+
+    machines_parser = sub.add_parser(
+        "machines", help="discover and manage trusted remote Pika nodes"
+    )
+    machine_sub = machines_parser.add_subparsers(dest="machines_command")
+    machine_list = machine_sub.add_parser("list", help="list adopted machines")
+    machine_list.add_argument("--json", action="store_true")
+    machine_discover = machine_sub.add_parser(
+        "discover", help="passively list SSH and Tailscale candidates"
+    )
+    machine_discover.add_argument("--json", action="store_true")
+    machine_add = machine_sub.add_parser("add", help="handshake and adopt one machine")
+    machine_add.add_argument("ssh_target")
+    machine_add.add_argument("--alias")
+    machine_remove = machine_sub.add_parser(
+        "remove", help="forget local trust and cache; remote Pika is untouched"
+    )
+    machine_remove.add_argument("machine")
+    machine_upgrade = machine_sub.add_parser(
+        "upgrade", help="install this coordinator's pinned Pika release remotely"
+    )
+    machine_upgrade.add_argument("machine")
+    machine_upgrade.add_argument(
+        "--yes", action="store_true", help="run the displayed pinned install command"
+    )
+    machine_ignore = machine_sub.add_parser(
+        "ignore", help="dismiss a passive discovery candidate"
+    )
+    machine_ignore.add_argument("ssh_target")
+
+    sync_parser = sub.add_parser("sync", help="refresh one adopted machine now")
+    sync_parser.add_argument("machine")
 
     doctor_parser = sub.add_parser("doctor", help="verify Pika recoverability")
     doctor_parser.add_argument("--json", action="store_true")
@@ -225,6 +308,20 @@ def _parser() -> argparse.ArgumentParser:
     popup_parser.add_argument("--name", required=True)
     popup_parser.add_argument("--provider", required=True, choices=("codex", "claude"))
     popup_parser.add_argument("--session-id", required=True)
+
+    fleet_parser = sub.add_parser("_fleet", help=argparse.SUPPRESS)
+    fleet_parser.add_argument("--stdio", action="store_true", required=True)
+
+    fleet_open = sub.add_parser("_fleet-open", help=argparse.SUPPRESS)
+    fleet_open.add_argument("--expected-node-id", required=True)
+    fleet_open.add_argument("--provider", required=True, choices=("codex", "claude"))
+    fleet_open.add_argument("--session-id", required=True)
+
+    fleet_ask = sub.add_parser("_fleet-ask", help=argparse.SUPPRESS)
+    fleet_ask.add_argument("--expected-node-id", required=True)
+    fleet_ask.add_argument("--provider", required=True, choices=("codex", "claude"))
+    fleet_ask.add_argument("--session-id", required=True)
+    fleet_ask.add_argument("--fast", action="store_true")
     # argparse otherwise renders hidden implementation commands as
     # ``==SUPPRESS==`` entries in the public command list.
     sub._choices_actions = [
@@ -256,13 +353,28 @@ def _normalize_argv(argv: list[str]) -> list[str]:
 
 
 def _select_named(
-    pika: Pika, value: str, *, sessions: list[Session] | None = None
-) -> Session:
+    pika: Pika,
+    value: str,
+    *,
+    sessions: list[Session | FleetSession] | None = None,
+) -> Session | FleetSession:
     if value == ".":
         return pika.current_repo(sessions)
     if value == "-":
         return pika.previous(sessions)
-    return pika.resolve(value, sessions)
+    if sessions is not None:
+        matches = [
+            item
+            for item in sessions
+            if item.session_id == value
+            or (item.name and item.name.casefold() == value.casefold())
+            or item.display_name.casefold() == value.casefold()
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    if hasattr(type(pika), "resolve_target"):
+        return pika.resolve_target(value)
+    return pika.resolve(value)
 
 
 def _bare(pika: Pika) -> int:
@@ -270,22 +382,33 @@ def _bare(pika: Pika) -> int:
         return run_monitor(pika)
     # Preserve a useful, finite representation when bare `pika` is redirected.
     # Stable automation should continue to prefer `pika list --json`.
-    sessions = pika.refresh(usage=True)
-    print_sessions(sessions)
-    _print_actions(pika, sessions)
+    local = pika.refresh(usage=True)
+    sessions = (
+        pika.monitor_sessions(local)
+        if hasattr(type(pika), "monitor_sessions")
+        else local
+    )
+    if len(sessions) == len(local):
+        print_sessions(local)
+        _print_actions(pika, local)
+    else:
+        print_fleet_sessions(sessions)
     return 0
 
 
 def _peek(pika: Pika, name: str, lines: int | None, *, ack: bool = False) -> int:
     session = _select_named(pika, name)
     lines = lines or int(load_config().get("peek_lines") or 200)
-    pane = pika.tmux.get_pane(session.tmux_pane or session.tmux_session or "")
-    if pane is None:
-        raise PikaError(
-            f"{session.display_name} has no surviving tmux pane to peek. Use `pika {session.display_name}` to resurrect it."
-        )
     human_view = sys.stdin.isatty() and sys.stdout.isatty()
-    if os.environ.get("TMUX") and human_view:
+    pane = None
+    if not isinstance(session, FleetSession):
+        pane = pika.tmux.get_pane(session.tmux_pane or session.tmux_session or "")
+        if pane is None:
+            raise PikaError(
+                f"{session.display_name} has no surviving tmux pane to peek. "
+                f"Use `pika {session.display_name}` to resurrect it."
+            )
+    if pane is not None and os.environ.get("TMUX") and human_view:
         result = pika.tmux.popup(
             pane.pane_id,
             lines,
@@ -294,7 +417,12 @@ def _peek(pika: Pika, name: str, lines: int | None, *, ack: bool = False) -> int
             session.session_id,
         )
     else:
-        print(pika.tmux.capture(pane.pane_id, lines))
+        capture = getattr(pika, "capture", None)
+        print(
+            capture(session, lines)
+            if callable(capture)
+            else pika.tmux.capture(pane.pane_id, lines)
+        )
         result = 0
     if result == 0 and session.status == Status.READY.value and (human_view or ack):
         pika.acknowledge(session)
@@ -310,17 +438,18 @@ def _ask(
     fast: bool = False,
 ) -> int:
     session = _select_named(pika, name)
-    return _ask_session(session, question_parts, jsonl=jsonl, fast=fast)
+    return _ask_session(pika, session, question_parts, jsonl=jsonl, fast=fast)
 
 
 def _ask_session(
-    session: Session,
+    pika: Pika,
+    session: Session | FleetSession,
     question_parts: list[str],
     *,
     jsonl: bool = False,
     fast: bool = False,
 ) -> int:
-    if not session.transcript_path:
+    if not isinstance(session, FleetSession) and not session.transcript_path:
         raise PikaError(
             f"{session.display_name} has no durable provider transcript to consult"
         )
@@ -332,7 +461,12 @@ def _ask_session(
         raise PikaError("Provide a question as arguments or on stdin")
 
     try:
-        with consultation_for(session, fast=fast) as consultation:
+        consultation = (
+            pika.consultation(session, fast=fast)
+            if hasattr(type(pika), "consultation")
+            else consultation_for(session, fast=fast)
+        )
+        with consultation:
             if jsonl:
                 return _ask_jsonl(consultation, session, initial)
             print(
@@ -538,6 +672,15 @@ def _expert(pika: Pika, args: argparse.Namespace) -> int:
                 if args.name
                 else pika.current_exact_session()
             )
+            if isinstance(session, FleetSession):
+                node = pika.store.get_fleet_node(session.node_id)
+                target = node.ssh_target if node else session.node_name
+                raise PikaError(
+                    "Expert-card interviews run on the authoritative machine. "
+                    f"Run `ssh {shlex.quote(target)} pika expert refresh "
+                    f"{shlex.quote(session.session_id)}`, then `pika sync "
+                    f"{shlex.quote(session.node_name)}`."
+                )
             results = pika.bootstrap_experts([session])
         _print_expert_refresh_results(results, as_json=args.json)
         return 1 if any(item.status == "FAILED" for item in results) else 0
@@ -547,9 +690,7 @@ def _expert(pika: Pika, args: argparse.Namespace) -> int:
 def _print_expert_refresh_results(results, *, as_json: bool = False) -> None:
     if as_json:
         print(
-            json.dumps(
-                [item.to_dict() for item in results], indent=2, sort_keys=True
-            )
+            json.dumps([item.to_dict() for item in results], indent=2, sort_keys=True)
         )
         return
     if not results:
@@ -677,38 +818,215 @@ def _wait(pika: Pika, args: argparse.Namespace) -> int:
         time.sleep(0.5)
 
 
+def _machines(pika: Pika, args: argparse.Namespace) -> int:
+    command = args.machines_command or "list"
+    if command == "list":
+        print_machines(
+            pika.fleet.nodes(),
+            local_name=machine_alias(
+                str(load_config().get("machine_alias") or suggest_local_machine_alias())
+            ),
+            local_node_id=pika.store.get_meta("fleet:node_id"),
+            as_json=getattr(args, "json", False),
+        )
+        return 0
+    if command == "discover":
+        candidates = pika.fleet.discover()
+        if args.json:
+            print(
+                json.dumps(
+                    [asdict(item) for item in candidates], indent=2, sort_keys=True
+                )
+            )
+        else:
+            print_node_candidates(candidates)
+            print("\nPassive discovery made no SSH connections and changed no machine.")
+        return 0
+    if command == "add":
+        candidate = NodeCandidate(
+            alias=args.alias or suggest_alias(args.ssh_target),
+            ssh_target=args.ssh_target,
+            sources=("explicit",),
+        )
+        try:
+            node = pika.fleet.add(candidate, alias=args.alias)
+        except FleetError as exc:
+            if exc.kind == "missing":
+                preview = shlex.join(REMOTE_INSTALL_ARGV)
+                raise PikaError(
+                    f"Pika is missing on {candidate.ssh_target}. Nothing was installed. "
+                    f"Run this there, then retry: `{preview}`"
+                ) from exc
+            raise PikaError(str(exc)) from exc
+        print(
+            f"ADDED · {node.alias} · node {node.node_id[:8]} · "
+            "identity and protocol verified"
+        )
+        return 0
+    if command == "remove":
+        node = pika.store.get_fleet_node(args.machine)
+        if node is None:
+            raise PikaError(f"Unknown Pika machine {args.machine!r}")
+        pika.store.delete_fleet_node(node.node_id)
+        print(
+            f"REMOVED · {node.alias} · local trust and cache deleted · "
+            "remote Pika untouched"
+        )
+        return 0
+    if command == "upgrade":
+        node = pika.store.get_fleet_node(args.machine)
+        if node is None:
+            raise PikaError(f"Unknown Pika machine {args.machine!r}")
+        preview = shlex.join(REMOTE_INSTALL_ARGV)
+        print(f"PINNED REMOTE UPGRADE · {node.alias}")
+        print(f"Exact command: {preview}")
+        approved = args.yes
+        if not approved and sys.stdin.isatty():
+            approved = input(
+                f"Upgrade Pika on {node.alias}? [y/N] "
+            ).strip().casefold() in {
+                "y",
+                "yes",
+            }
+        if not approved:
+            print("Nothing installed.")
+            return 0
+        code, detail = pika.fleet.transport.install(node.ssh_target)
+        if code:
+            raise PikaError(f"Remote upgrade failed on {node.alias}: {detail}")
+        refreshed = pika.fleet.add(
+            NodeCandidate(node.alias, node.ssh_target, node.sources), alias=node.alias
+        )
+        print(
+            f"UPGRADED · {refreshed.alias} · pika {refreshed.package_version} · "
+            f"node {refreshed.node_id[:8]} · identity reverified"
+        )
+        return 0
+    if command == "ignore":
+        pika.store.ignore_node_candidate(args.ssh_target)
+        print(
+            f"IGNORED · {terminal_text(args.ssh_target)} · no SSH connection was made"
+        )
+        return 0
+    raise PikaError(f"Unknown machines command {command!r}")
+
+
+def _sync_machine(pika: Pika, machine: str) -> int:
+    node = pika.store.get_fleet_node(machine)
+    if node is None:
+        raise PikaError(f"Unknown Pika machine {machine!r}")
+    try:
+        sessions = pika.fleet.refresh_node(node.node_id)
+    except FleetError as exc:
+        labels = {
+            "unreachable": "UNREACHABLE",
+            "auth": "SSH TRUST OR AUTH FAILED",
+            "incompatible": "INCOMPATIBLE",
+            "quarantined": "NODE IDENTITY CHANGED",
+        }
+        raise PikaError(
+            f"{labels.get(exc.kind, 'SYNC FAILED')} · {node.alias} · {exc}"
+        ) from exc
+    print(
+        f"SYNCED · {node.alias} · {len(sessions)} conversations · node {node.node_id[:8]}"
+    )
+    return 0
+
+
+def _setup_machine_candidates(
+    pika: Pika, args: argparse.Namespace
+) -> list[NodeCandidate]:
+    if getattr(args, "no_machines", False) or args.dry_run:
+        return []
+    explicit = getattr(args, "machine", [])
+    if explicit:
+        discovered = {
+            item.ssh_target.casefold(): item for item in pika.fleet.discover()
+        }
+        return [
+            discovered.get(
+                target.casefold(),
+                NodeCandidate(
+                    alias=suggest_alias(target),
+                    ssh_target=target,
+                    sources=("explicit",),
+                ),
+            )
+            for target in explicit
+        ]
+    if args.yes or not sys.stdin.isatty():
+        return []
+    print("Pika machines · 1/2 FIND")
+    print("Discovery is passive; only selected machines receive an SSH handshake.")
+    return choose_node_candidates(pika.fleet.discover())
+
+
+def _add_setup_machine(pika: Pika, candidate: NodeCandidate):
+    try:
+        return pika.fleet.add(candidate)
+    except FleetError as exc:
+        if exc.kind != "missing":
+            print(
+                f"NOT ADDED · {candidate.alias} · {terminal_text(exc)}",
+                file=sys.stderr,
+            )
+            return None
+        preview = shlex.join(REMOTE_INSTALL_ARGV)
+        print(f"PIKA MISSING · {candidate.alias}")
+        print(f"Exact remote install preview: {preview}")
+        if not sys.stdin.isatty():
+            print("Nothing installed · rerun interactively to approve this command.")
+            return None
+        answer = input(f"Install Pika on {candidate.alias}? [y/N] ").strip().casefold()
+        if answer not in {"y", "yes"}:
+            print("Nothing installed.")
+            return None
+        code, detail = pika.fleet.transport.install(candidate.ssh_target)
+        if code:
+            print(f"INSTALL FAILED · {candidate.alias} · {detail}", file=sys.stderr)
+            return None
+        try:
+            return pika.fleet.add(candidate)
+        except FleetError as retry_error:
+            print(
+                f"INSTALLED BUT NOT ADDED · {candidate.alias} · {retry_error}",
+                file=sys.stderr,
+            )
+            return None
+
+
 def _setup(pika: Pika, args: argparse.Namespace) -> int:
     print("Pika commissioning · exact recovery for Codex + Claude")
     print("Preview first · existing settings retained · backups before writes\n")
-    selected = []
+    if not args.dry_run:
+        identity_loader = getattr(pika.store, "local_node_id", None)
+        if callable(identity_loader):
+            identity_loader()
+    selected_machine_candidates = _setup_machine_candidates(pika, args)
+    selected: list[Candidate] = []
+    local_candidates: list[Candidate] = []
     tracked_sessions = [] if args.dry_run else pika.store.list_sessions()
     tracked_names = {session.key: session.display_name for session in tracked_sessions}
-    untracked_keys = (
-        set()
-        if args.dry_run
-        else pika.store.untracked_session_keys()
-    )
+    untracked_keys = set() if args.dry_run else pika.store.untracked_session_keys()
     if not args.no_import and not args.dry_run:
-        candidates = [
+        local_candidates = [
             item for item in pika.discover_import_candidates() if item.name or item.live
         ]
         tracked = {session.key for session in tracked_sessions}
-        candidates = [
+        local_candidates = [
             item
-            for item in candidates
+            for item in local_candidates
             if (item.provider, item.session_id) not in tracked
             and (item.provider, item.session_id) not in untracked_keys
         ]
         if args.import_all:
-            selected = candidates
+            selected = local_candidates
         elif args.yes or not sys.stdin.isatty():
-            if candidates:
+            if local_candidates:
                 print(
-                    f"Pika found {len(candidates)} import candidate(s); "
+                    f"Pika found {len(local_candidates)} local import candidate(s); "
                     "rerun interactively to choose them or use `--import-all`.\n"
                 )
-        else:
-            selected = choose_candidates(candidates)
     config = load_config()
     default_provider = args.default_provider
     first_interactive_setup = (
@@ -723,7 +1041,18 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         default_provider = "claude" if answer == "2" else "codex"
     default_provider = default_provider or config.get("default_provider") or "codex"
     print(f"Default for new conversations: {str(default_provider).title()}\n")
-    changes = proposed_changes(str(default_provider))
+    configured_alias = config.get("machine_alias")
+    alias = getattr(args, "machine_alias", None) or configured_alias
+    if not alias:
+        suggestion = suggest_local_machine_alias()
+        if not args.yes and not args.dry_run and sys.stdin.isatty():
+            answer = input(f"Name this Pika machine [{suggestion}]: ").strip()
+            alias = answer or suggestion
+        else:
+            alias = suggestion
+    alias = machine_alias(str(alias))
+    print(f"This Pika machine: {alias}\n")
+    changes = proposed_changes(str(default_provider), alias)
     changed = [item for item in changes if item.changed]
     if changed:
         print("Pika proposes these configuration changes:\n")
@@ -810,10 +1139,77 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
             if not observed[provider]:
                 incomplete.append(f"{provider.title()} observation")
         print("\nPika not yet commissioned · pending: " + ", ".join(incomplete) + ".")
+    ready_nodes = []
+    for candidate in selected_machine_candidates:
+        node = _add_setup_machine(pika, candidate)
+        if node is not None:
+            ready_nodes.append(node)
+            print(
+                f"ADDED · {node.alias} · node {node.node_id[:8]} · "
+                "identity and protocol verified"
+            )
+
+    remote_candidates: list[tuple[object, Candidate]] = []
+    if not args.no_import:
+        for node in ready_nodes:
+            try:
+                values = pika.fleet.remote_candidates(node)
+            except FleetError as exc:
+                print(
+                    f"REMOTE INVENTORY UNAVAILABLE · {node.alias} · {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            remote_candidates.extend((node, item) for item in values)
+
+    selected_remote: list[tuple[object, Candidate]] = []
+    if (
+        not args.no_import
+        and not args.dry_run
+        and sys.stdin.isatty()
+        and not args.yes
+        and not args.import_all
+        and not getattr(args, "remote_import_all", False)
+    ):
+        chosen = choose_fleet_candidates(
+            [(None, item) for item in local_candidates] + remote_candidates
+        )
+        selected = [item for node, item in chosen if node is None]
+        selected_remote = [(node, item) for node, item in chosen if node is not None]
+    elif getattr(args, "remote_import_all", False):
+        selected_remote = remote_candidates
+
     for candidate in selected:
         pika.import_candidate(candidate)
     if selected:
+        for candidate in selected:
+            print(
+                f"ADOPTED HERE · {candidate.provider.title()} · "
+                f"{terminal_text(candidate.display_name)} · id {candidate.session_id[:8]}"
+            )
         print(f"Adopted {len(selected)} existing conversation(s).")
+    for node, candidate in selected_remote:
+        try:
+            adopted = pika.fleet.adopt(node, candidate)
+        except FleetError as exc:
+            print(
+                f"NOT ADOPTED · {node.alias} · {candidate.display_name} · {exc}",
+                file=sys.stderr,
+            )
+            continue
+        print(
+            f"ADOPTED ON {node.alias} · {adopted.provider.title()} · "
+            f"{terminal_text(adopted.display_name)} · id {adopted.session_id[:8]}"
+        )
+        current_node = pika.store.get_fleet_node(node.node_id)
+        if current_node is not None and current_node.status == "ready":
+            print(
+                "REMOTE PIKA UPDATED · local metadata cache refreshed · no agent moved"
+            )
+        else:
+            print(
+                "REMOTE ADOPTION PROVEN · cache reconciliation pending · no agent moved"
+            )
     synchronized = pika.refresh(usage=False)
     renamed = [
         (tracked_names[session.key], session.display_name, session)
@@ -941,6 +1337,33 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             return _database_error_receipt(exc, as_json=args.json)
         raise PikaError(f"Pika state database is unreadable: {exc}") from exc
+    if args.command == "_fleet":
+        return handle_fleet_stdio(pika, sys.stdin, sys.stdout)
+    if args.command in {"_fleet-open", "_fleet-ask"}:
+        actual_node_id = pika.store.local_node_id()
+        if args.expected_node_id != actual_node_id:
+            raise PikaError(
+                "NODE IDENTITY CHANGED: expected "
+                f"{args.expected_node_id[:8]}, received {actual_node_id[:8]}"
+            )
+        saved = pika.store.get_session(args.provider, args.session_id)
+        if saved is None:
+            raise PikaError("Exact remote session is not tracked on this Pika node")
+        current = next(
+            (item for item in pika.refresh() if item.key == saved.key),
+            None,
+        )
+        if current is None:
+            raise PikaError("Exact remote session disappeared during reconciliation")
+        if args.command == "_fleet-open":
+            return pika.open(current)
+        return _ask_session(
+            pika,
+            current,
+            [],
+            jsonl=True,
+            fast=args.fast,
+        )
     if args.command is None:
         return _bare(pika)
     if args.command == "open":
@@ -958,13 +1381,16 @@ def run(argv: list[str] | None = None) -> int:
     if args.command == "experts":
         return _experts(pika, args.query, as_json=args.json)
     if args.command == "list":
-        sessions = pika.refresh(usage=not args.no_usage)
-        print_sessions(sessions, as_json=args.json)
-        if not args.json:
-            _print_actions(pika, sessions)
+        local = pika.refresh(usage=not args.no_usage)
+        if args.all_machines:
+            print_fleet_sessions(pika.monitor_sessions(local), as_json=args.json)
+        else:
+            print_sessions(local, as_json=args.json)
+            if not args.json:
+                _print_actions(pika, local)
         return 0
     if args.command == "next":
-        session = pika.next_attention()
+        session = pika.next_attention(pika.monitor_sessions(pika.refresh()))
         if session is None:
             print("No Pika session currently needs attention.")
             return 0
@@ -972,6 +1398,12 @@ def run(argv: list[str] | None = None) -> int:
     if args.command == "peek":
         return _peek(pika, args.name, args.lines, ack=args.ack)
     if args.command == "wait":
+        selected = _select_named(pika, args.name)
+        if isinstance(selected, FleetSession):
+            raise PikaError(
+                "Remote wait is not yet a durable stream; use `pika sync MACHINE` "
+                "or the live monitor"
+            )
         return _wait(pika, args)
     if args.command == "new":
         return pika.new(args.name, args.agent, args.cwd)
@@ -992,13 +1424,25 @@ def run(argv: list[str] | None = None) -> int:
             f"Stopped watching {terminal_text(session.display_name)} "
             f"({session.provider}, {session.session_id[:8]})."
         )
-        print(
-            "The agent and provider conversation were left running and unarchived. "
-            f"Use `pika adopt` or `pika open {session.session_id}` to track it again."
-        )
+        if isinstance(session, FleetSession):
+            node = pika.store.get_fleet_node(session.node_id)
+            target = node.ssh_target if node else session.node_name
+            print(
+                "The remote agent and provider conversation were left running and "
+                f"unarchived. Re-adopt it with `pika setup --machine {shlex.quote(target)}`."
+            )
+        else:
+            print(
+                "The agent and provider conversation were left running and unarchived. "
+                f"Use `pika adopt` or `pika open {session.session_id}` to track it again."
+            )
         return 0
     if args.command == "setup":
         return _setup(pika, args)
+    if args.command == "machines":
+        return _machines(pika, args)
+    if args.command == "sync":
+        return _sync_machine(pika, args.machine)
     if args.command == "doctor":
         try:
             repairs = repair_stale_state(pika) if args.repair_stale else []
@@ -1022,7 +1466,7 @@ def run(argv: list[str] | None = None) -> int:
 def main() -> None:
     try:
         raise SystemExit(run())
-    except (PikaError, TmuxError, TypeError, ValueError) as exc:
+    except (FleetError, PikaError, TmuxError, TypeError, ValueError) as exc:
         print(f"pika: {terminal_text(exc)}", file=sys.stderr)
         raise SystemExit(1) from exc
     except KeyboardInterrupt:

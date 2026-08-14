@@ -35,6 +35,9 @@ Signature decisions:
   exists; distinct UUID-bearing process trees remain `OPEN TWICE`.
 - Freshness, partial provider discovery, and refresh failure remain visible;
   stale data is never silently presented as current or fully synchronized.
+- Federation is location, not migration. A user-selected coordinator may show
+  another Pika node, but the remote node remains authoritative and transcript
+  content never enters the coordinator cache.
 
 # Layout
 
@@ -77,10 +80,13 @@ or q cancels. Inside the side panel, ordinary keys type, Enter sends, Ctrl+J
 inserts a newline, Ctrl+U clears the draft, arrows scroll conversation history,
 and Esc closes and discards the side before returning focus to operations.
 
-Selection persists by `(provider, UUID)` across refresh and resort. An unbound
-live process cannot be opened as if managed. Refresh errors retain the last good
-screen and identify the failure. Empty, loading, narrow, overflow, unread,
-working, ready, parked, error, and unbound states are first-class.
+Local selection persists by `(provider, UUID)`; federated selection persists by
+`(node UUID, provider, UUID)` across refresh and resort. The human spelling is
+`thread@machine`, while every action is freshly routed by immutable identities.
+An unbound live process cannot be opened as if managed. Refresh errors retain
+the last good screen and identify the failure. Empty, loading, narrow, overflow,
+unread, working, ready, parked, error, unbound, remote, and cached-offline states
+are first-class.
 
 The side panel explicitly renders opening, ready, thinking, and error states.
 One provider process owns the side for its whole lifetime, so follow-ups retain
@@ -149,6 +155,37 @@ provider latency cannot freeze dashboard refresh, typing, or Esc recovery. Esc
 requests cancellation immediately and terminates the transient provider process;
 the monitor itself remains open.
 
+Federation adds no daemon and no listener. Passive discovery reads existing SSH
+configuration and Tailscale's local status document without probing candidates.
+The monitor's local two-second reconciliation never performs SSH. It keeps at
+most one bounded remote inventory request in flight and replaces a node's cache
+only after receiving and validating a complete versioned snapshot. Failed,
+truncated, incompatible, or identity-mismatched responses preserve the last-good
+snapshot and make its age/error visible. Remote pane previews are never polled;
+`p` launches one explicit background fetch. Remote side questions use one SSH
+JSONL process for the consultation lifetime, and remote mutations use exact node,
+provider, and conversation UUIDs with no name fallback.
+
+Remote inventory is a fair single-flight queue, ordered by oldest attempted
+node. Ready nodes become due after 15 seconds and failed nodes after 30 seconds;
+completion immediately admits the next due node. The 45-second snapshot limit is
+a truth threshold, not an availability promise: if aggregate SSH tail latency
+exceeds that budget, affected rows become visibly `CACHED` and non-actionable
+instead of increasing concurrency or pretending freshness. Selection can jump
+the queue only for an explicit manual refresh. Mutation receipts are durable
+operation outcomes; the follow-up snapshot is a separate best-effort cache
+reconciliation. A result fetched by remote peek is rendered before any separate
+acknowledgement begins, so acknowledgement uncertainty cannot hide the result.
+
+Every fleet envelope is versioned and bounded while streaming. Sessions declare
+whether their identity is an exact provider conversation or an unbound pane
+placeholder; placeholder rows may be inventoried but remain blocked from exact
+UUID actions. Expert profiles, card states, mutation receipts, booleans, numeric
+fields, node IDs, and request IDs are validated before a last-good cache changes.
+Human expert lookup labels stale remote evidence `CACHED` and ranks fresh evidence
+first. Handshakes expose the package version, and remote installation or upgrade
+uses the coordinator release's version tag rather than a moving branch.
+
 Commissioning and expert interviews are separate latency boundaries. `pika
 setup` may discover and adopt conversations, but never opens provider-side
 consultations. Missing and stale cards are left to the quota-aware refresh policy
@@ -174,6 +211,10 @@ sync never opens an expert consultation.
 - Do use the right inspector to explain one selected workstream rather than
   widening the left rail with metadata columns.
 - Do preserve the last trustworthy snapshot when reconciliation fails.
+- Do call the coordinating role generic; a deployment hostname is never a
+  product assumption.
+- Do keep remote cache rows out of the local session ledger, tmux tags, hook
+  leases, resume locks, usage readers, and recovery certificate.
 - Do remove secondary columns before compressing names into ambiguity.
 - Do label API-equivalent estimates with their pricing date and unavailable data
   with an em dash.
@@ -181,3 +222,5 @@ sync never opens an expert consultation.
 - Don't infer transcript meaning or invent token/cost values for visual fullness.
 - Don't impose a terminal background palette; ANSI roles inherit the user's
   terminal theme and `NO_COLOR` remains authoritative.
+- Don't treat Tailscale visibility as SSH authorization or silently install,
+  trust, acknowledge, or retry work across machines.

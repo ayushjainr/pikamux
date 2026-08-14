@@ -6,11 +6,20 @@ import shutil
 import sys
 import time
 from collections.abc import Iterable
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .experts import ExpertMatch, card_state, project_label
-from .models import ATTENTION_ORDER, Candidate, Session
+from .models import (
+    ATTENTION_ORDER,
+    Candidate,
+    FleetNode,
+    FleetSession,
+    NodeCandidate,
+    Session,
+)
 from .pricing import PRICING_AS_OF
 
 PROVIDER_MARK = {"codex": "C", "claude": "A"}
@@ -208,6 +217,208 @@ def print_sessions(sessions: list[Session], *, as_json: bool = False) -> None:
     print(f"\n{legend}")
 
 
+def print_fleet_sessions(
+    sessions: list[Session | FleetSession], *, as_json: bool = False
+) -> None:
+    """Print the cache-only cross-machine view without changing local JSON."""
+    ordered = sorted_sessions(sessions)
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "schema": "pikamux-fleet-list/v1",
+                    "generated_at": time.time(),
+                    "sessions": [
+                        (
+                            item.to_dict()
+                            if isinstance(item, FleetSession)
+                            else {
+                                "node_id": "local",
+                                "machine": "this-machine",
+                                "stale": False,
+                                "remote_error": None,
+                                "seen_at": time.time(),
+                                "session": item.to_dict(),
+                            }
+                        )
+                        for item in ordered
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    if not ordered:
+        print("No Pika sessions on this machine or its adopted nodes.")
+        return
+    print("Pika fleet · cached remote metadata · transcripts stay on their machines\n")
+    columns = [
+        ("AG", 2),
+        ("THREAD@MACHINE", 34),
+        ("STATE", 11),
+        ("FRESH", 8),
+        ("REPO", 24),
+        ("AGE", 7),
+        ("ID", 8),
+    ]
+    print("  ".join(label.ljust(size) for label, size in columns).rstrip())
+    print("  ".join("─" * size for _, size in columns).rstrip())
+    now = time.time()
+    for item in ordered:
+        remote = isinstance(item, FleetSession)
+        machine = item.node_name if remote else "here"
+        name = (
+            f"{item.session.display_name}@{machine}"
+            if remote
+            else f"{item.display_name}@here"
+        )
+        freshness = (
+            f"{human_age(item.seen_at)}{'*' if item.stale else ''}" if remote else "now"
+        )
+        state = "CACHED" if remote and item.stale else item.status
+        values = [
+            PROVIDER_MARK.get(item.provider, "?"),
+            name,
+            state,
+            freshness,
+            short_path(item.cwd, 24),
+            _fleet_age(item.last_activity_at, now),
+            item.session_id[:8],
+        ]
+        cells = []
+        for value, (_label, size) in zip(values, columns):
+            text_value = terminal_text(value)
+            if len(text_value) > size:
+                text_value = text_value[: max(1, size - 1)] + "…"
+            cells.append(text_value.ljust(size))
+        print("  ".join(cells).rstrip())
+    stale_nodes = sorted(
+        {
+            item.node_name
+            for item in ordered
+            if isinstance(item, FleetSession) and item.stale
+        }
+    )
+    if stale_nodes:
+        print(
+            "\n* Cached from unavailable or overdue machines: " + ", ".join(stale_nodes)
+        )
+
+
+def _fleet_age(timestamp: float, now: float) -> str:
+    if not timestamp:
+        return "—"
+    return human_age(min(timestamp, now))
+
+
+def print_machines(
+    nodes: list[FleetNode],
+    *,
+    local_name: str | None = None,
+    local_node_id: str | None = None,
+    as_json: bool = False,
+) -> None:
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "schema": "pikamux-machines/v1",
+                    "local": {
+                        "alias": local_name,
+                        "node_id": local_node_id,
+                        "status": "ready" if local_node_id else "not-commissioned",
+                    },
+                    "remote": [asdict(item) for item in nodes],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    print("Pika machines")
+    if local_name:
+        fingerprint = local_node_id[:8] if local_node_id else "not set"
+        print(f"  {local_name:<18} HERE         node {fingerprint} · coordinator")
+    for node in nodes:
+        detail = f" · {terminal_text(node.last_error)}" if node.last_error else ""
+        version = f" · pika {node.package_version}" if node.package_version else ""
+        print(
+            f"  {node.alias:<18} {node.status.upper():<12} "
+            f"node {node.node_id[:8]} · {node.ssh_target}{version}{detail}"
+        )
+    if not nodes:
+        print(
+            "\nNo remote nodes adopted. Run `pika setup` or `pika machines discover`."
+        )
+
+
+def print_node_candidates(candidates: list[NodeCandidate]) -> None:
+    if not candidates:
+        print("No new SSH or Tailscale machine candidates found.")
+        return
+    print("Pika found these machine candidates without connecting:")
+    for index, item in enumerate(candidates, 1):
+        presence = (
+            "online"
+            if item.online is True
+            else "offline"
+            if item.online is False
+            else "unknown"
+        )
+        print(
+            f"  {index:>2}. {item.alias:<18} {item.ssh_target:<38} "
+            f"{'+'.join(item.sources)} · {presence}"
+        )
+
+
+def choose_node_candidates(candidates: list[NodeCandidate]) -> list[NodeCandidate]:
+    print_node_candidates(candidates)
+    if not candidates or not sys.stdin.isatty():
+        return []
+    raw = input("Add machine numbers, `all`, or press Enter for none: ").strip().lower()
+    return _choose_numbered(candidates, raw)
+
+
+def choose_fleet_candidates(
+    values: list[tuple[FleetNode | None, Candidate]],
+) -> list[tuple[FleetNode | None, Candidate]]:
+    if not values:
+        return []
+    print("\nPika conversations · 2/2 ADOPT")
+    print(
+        "Selecting a remote item updates only Pika on that machine; no transcript is copied."
+    )
+    for index, (node, item) in enumerate(values, 1):
+        machine = node.alias if node else "here"
+        live = " live" if item.live else ""
+        label = item.name or f"<unnamed live · {item.session_id[:8]}>"
+        print(
+            f"  {index:>2}. {item.provider:<6} {terminal_text(label):<28} "
+            f"@{machine:<16} {short_path(item.cwd, 28)}{live}"
+        )
+    if not sys.stdin.isatty():
+        return []
+    raw = input("Adopt numbers, `all`, or press Enter for none: ").strip().lower()
+    return _choose_numbered(values, raw)
+
+
+def _choose_numbered(values: list[Any], raw: str) -> list[Any]:
+    if not raw:
+        return []
+    if raw == "all":
+        return values
+    selected = []
+    for part in raw.replace(",", " ").split():
+        try:
+            index = int(part)
+        except ValueError:
+            continue
+        if 1 <= index <= len(values) and values[index - 1] not in selected:
+            selected.append(values[index - 1])
+    return selected
+
+
 def print_experts(
     matches: list[ExpertMatch], *, query: str = "", as_json: bool = False
 ) -> None:
@@ -230,6 +441,7 @@ def print_experts(
         ("PROJECT", 20),
         ("STATE", 10),
         ("CARD", 8),
+        ("CACHE", 12),
         ("TOPICS", 32),
         ("WHY", 15),
         ("ID", 8),
@@ -242,7 +454,16 @@ def print_experts(
             match.session.display_name,
             project_label(match.session.cwd),
             match.session.status,
-            card_state(match.session, match.profile).status,
+            (
+                match.session.card_status or "UNKNOWN"
+                if isinstance(match.session, FleetSession)
+                else card_state(match.session, match.profile).status
+            ),
+            (
+                f"CACHED {_fleet_age(match.session.seen_at, time.time())}"
+                if isinstance(match.session, FleetSession) and match.session.stale
+                else "FRESH"
+            ),
             ", ".join(match.profile.topics),
             ", ".join(match.matched_on)
             if query

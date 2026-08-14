@@ -197,7 +197,7 @@ class CodexConsultation(Consultation):
                     "clientInfo": {
                         "name": "pikamux",
                         "title": "Pika side consultation",
-                        "version": "0.1.0",
+                        "version": "0.2.0",
                     },
                     "capabilities": {"experimentalApi": True},
                 },

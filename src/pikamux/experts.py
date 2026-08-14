@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .consult import ConsultationError, consultation_for
-from .models import ExpertProfile, Session
+from .models import ExpertProfile, FleetSession, Session
 
 _TERM = re.compile(r"[\w.-]+", re.UNICODE)
 
@@ -20,8 +21,13 @@ class ExpertMatch:
     matched_on: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
-        freshness = card_state(self.session, self.profile)
-        return {
+        remote = isinstance(self.session, FleetSession)
+        freshness = (
+            getattr(self.session, "card_status", None) or "UNKNOWN"
+            if remote
+            else card_state(self.session, self.profile).status
+        )
+        result = {
             "provider": self.session.provider,
             "session_id": self.session.session_id,
             "name": self.session.name,
@@ -37,10 +43,18 @@ class ExpertMatch:
             "artifacts": list(self.profile.artifacts),
             "profile_updated_at": self.profile.updated_at,
             "profile_source": self.profile.source,
-            "card_status": freshness.status,
+            "card_status": freshness,
             "score": self.score,
             "matched_on": list(self.matched_on),
         }
+        if remote:
+            result.update(
+                machine=self.session.node_name,
+                node_id=self.session.node_id,
+                snapshot_stale=self.session.stale,
+                snapshot_seen_at=self.session.seen_at,
+            )
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +65,7 @@ class ExpertCardState:
     detail: str
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "provider": self.session.provider,
             "session_id": self.session.session_id,
             "name": self.session.display_name,
@@ -63,6 +77,14 @@ class ExpertCardState:
             "profile_updated_at": self.profile.updated_at if self.profile else None,
             "profile_source": self.profile.source if self.profile else None,
         }
+        if isinstance(self.session, FleetSession):
+            result.update(
+                machine=self.session.node_name,
+                node_id=self.session.node_id,
+                snapshot_stale=self.session.stale,
+                snapshot_seen_at=self.session.seen_at,
+            )
+        return result
 
 
 def make_profile(
@@ -78,9 +100,7 @@ def make_profile(
 ) -> ExpertProfile:
     clean_summary = _clean(summary, label="scope", limit=600)
     clean_current_state = (
-        _clean(current_state, label="current state", limit=600)
-        if current_state
-        else ""
+        _clean(current_state, label="current state", limit=600) if current_state else ""
     )
     clean_topics = _clean_many(topics, label="topic", limit=80, maximum=12)
     clean_artifacts = _clean_many(

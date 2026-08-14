@@ -335,7 +335,7 @@ class CodexProvider(Provider):
                     "method": "initialize",
                     "id": 1,
                     "params": {
-                        "clientInfo": {"name": "pikamux", "version": "0.1.0"},
+                        "clientInfo": {"name": "pikamux", "version": "0.2.0"},
                         "capabilities": {"experimentalApi": True},
                     },
                 }

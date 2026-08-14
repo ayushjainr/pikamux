@@ -62,7 +62,7 @@ def read_codex_quota() -> QuotaSnapshot | None:
                 "clientInfo": {
                     "name": "pikamux",
                     "title": "Pika quota observer",
-                    "version": "0.1.0",
+                    "version": "0.2.0",
                 },
                 "capabilities": {"experimentalApi": True},
             },
