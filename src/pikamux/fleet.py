@@ -24,6 +24,7 @@ from .models import (
     FleetNode,
     FleetSession,
     NodeCandidate,
+    NodeDiscoveryReport,
     Session,
     Status,
 )
@@ -324,6 +325,61 @@ def discover_tailscale_candidates(
             os_name=str(record.get("OS")) if record.get("OS") else None,
         )
     return sorted(found.values(), key=lambda item: item.alias)
+
+
+def tailscale_discovery_summary(
+    *, executable: str = "tailscale", timeout: float = 3.0
+) -> dict[str, int | str | None]:
+    """Explain passive Tailscale filtering without contacting any peer."""
+    empty: dict[str, int | str | None] = {
+        "total": 0,
+        "compatible": 0,
+        "non_linux": 0,
+        "no_target": 0,
+        "error": None,
+    }
+    try:
+        result = subprocess.run(
+            [executable, "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {**empty, "error": str(exc)}
+    if result.returncode != 0:
+        return {
+            **empty,
+            "error": (result.stderr or "tailscale status failed").strip(),
+        }
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        return {**empty, "error": "invalid Tailscale status JSON"}
+    peers = payload.get("Peer", {}) if isinstance(payload, dict) else {}
+    records = list(peers.values()) if isinstance(peers, dict) else list(peers or [])
+    total = compatible = non_linux = no_target = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        total += 1
+        os_name = str(record.get("OS") or "").casefold()
+        if os_name and os_name != "linux":
+            non_linux += 1
+            continue
+        ips = record.get("TailscaleIPs")
+        if not (record.get("DNSName") or (isinstance(ips, list) and ips)):
+            no_target += 1
+            continue
+        compatible += 1
+    return {
+        "total": total,
+        "compatible": compatible,
+        "non_linux": non_linux,
+        "no_target": no_target,
+        "error": None,
+    }
 
 
 def discover_node_candidates(store: Store) -> list[NodeCandidate]:
@@ -948,6 +1004,21 @@ class FleetManager:
 
     def discover(self) -> list[NodeCandidate]:
         return discover_node_candidates(self.store)
+
+    def discover_report(self) -> NodeDiscoveryReport:
+        candidates = self.discover()
+        ssh_files = _ssh_config_files(Path.home() / ".ssh")
+        tailscale = tailscale_discovery_summary()
+        return NodeDiscoveryReport(
+            candidates=tuple(candidates),
+            ssh_aliases=len(discover_ssh_candidates()),
+            ssh_config_files=len(ssh_files),
+            tailscale_total=int(tailscale["total"] or 0),
+            tailscale_compatible=int(tailscale["compatible"] or 0),
+            excluded_non_linux=int(tailscale["non_linux"] or 0),
+            excluded_no_target=int(tailscale["no_target"] or 0),
+            tailscale_error=str(tailscale["error"]) if tailscale["error"] else None,
+        )
 
     def nodes(self) -> list[FleetNode]:
         return self.store.list_fleet_nodes()

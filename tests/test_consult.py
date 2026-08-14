@@ -97,7 +97,11 @@ class ConsultationTests(unittest.TestCase):
         process = FakeProcess(messages)
         session = Session("codex", "parent-id", cwd="/tmp")
         with (
-            patch("pikamux.consult.shutil.which", return_value="/usr/bin/codex"),
+            patch(
+                "pikamux.consult.configured_executable",
+                return_value="/usr/bin/codex",
+            ),
+            patch("pikamux.consult.executable_available", return_value=True),
             patch("pikamux.consult.subprocess.Popen", return_value=process),
             patch(
                 "pikamux.consult.select.select",
@@ -156,7 +160,8 @@ class ConsultationTests(unittest.TestCase):
         process = FakeProcess(messages)
         policy = ConsultationPolicy("fast", FAST_CODEX_MODEL, FAST_CODEX_EFFORT)
         with (
-            patch("pikamux.consult.shutil.which", return_value="codex"),
+            patch("pikamux.consult.configured_executable", return_value="codex"),
+            patch("pikamux.consult.executable_available", return_value=True),
             patch("pikamux.consult.subprocess.Popen", return_value=process),
             patch(
                 "pikamux.consult.select.select",
@@ -216,7 +221,8 @@ class ConsultationTests(unittest.TestCase):
             ]
         )
         with (
-            patch("pikamux.consult.shutil.which", return_value="codex"),
+            patch("pikamux.consult.configured_executable", return_value="codex"),
+            patch("pikamux.consult.executable_available", return_value=True),
             patch("pikamux.consult.subprocess.Popen", return_value=process),
             patch(
                 "pikamux.consult.select.select",
@@ -235,7 +241,8 @@ class ConsultationTests(unittest.TestCase):
             ]
         )
         with (
-            patch("pikamux.consult.shutil.which", return_value="codex"),
+            patch("pikamux.consult.configured_executable", return_value="codex"),
+            patch("pikamux.consult.executable_available", return_value=True),
             patch("pikamux.consult.subprocess.Popen", return_value=process),
             patch(
                 "pikamux.consult.select.select",
@@ -276,7 +283,8 @@ class ConsultationTests(unittest.TestCase):
         version = Mock(stdout="2.1.228", stderr="")
         popen = Mock(return_value=process)
         with (
-            patch("pikamux.consult.shutil.which", return_value="claude"),
+            patch("pikamux.consult.configured_executable", return_value="claude"),
+            patch("pikamux.consult.executable_available", return_value=True),
             patch("pikamux.consult.subprocess.run", return_value=version),
             patch("pikamux.consult.subprocess.Popen", popen),
             patch(

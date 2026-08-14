@@ -34,32 +34,44 @@ pika setup
 `pika setup` is presented as a commissioning flow, not a blind installer. It
 states the integration contract, shows a diff before changing anything, backs up
 existing files, preserves existing JSON key order, and merges lifecycle hooks
-into Codex and Claude user settings. It offers to adopt existing resumable
-conversations with explicit names plus any conversation that is currently live
-before asking for a default provider. Archived sessions, missing histories, and
+into Codex and Claude user settings. On first setup it offers to add existing
+resumable conversations with explicit names plus any conversation that is
+currently live before asking for a default provider. Later setup runs configure
+and verify the integration without rescanning conversation inventory or machines;
+use `--import-all`, `--machine`, or the daily `pika NAME` entry point when that
+work is intentional. Archived sessions, missing histories, and
 AI-generated Claude summaries stay out of this commissioning choice. For Codex,
 setup uses the effective saved name exposed by Codex: names created with
 `/rename` are eligible even when the internal SQLite `threads.name` column is
-empty. Short-lived Codex workers from known automation harness origins are also
-excluded. Pika reads only the immutable `session_meta.originator` field and
-requires its UUID to match the candidate; it never guesses from a generated
-name. The built-in origins are `agentic_fund` and `quant_agent_autonomy`.
+empty. Subordinate Codex threads (`thread_source=subagent`, including native
+side work) and short-lived workers from known automation harness origins are
+also excluded. Pika reads only immutable `session_meta` provenance and requires
+its UUID to match the candidate; it never guesses from a generated name. The
+built-in automation origins are `agentic_fund` and `quant_agent_autonomy`.
 Installations can extend `codex_worker_originators` in Pika's `config.json` for
 their own runners. The parent conversation or run remains the visible
 workstream. Nothing is imported silently. The final
 commissioning ledger distinguishes active hook definitions from observed live
 events. Codex requires one extra trust step: open
 `/hooks`, approve the Pika definitions, and use Codex once so `pika doctor` can
-observe a real lifecycle event. Pika uses “commissioned” only when both
-integrations are currently active and have delivered the current hook
-definition; otherwise it names every remaining activation or observation proof.
-Commissioning finishes with a transcript-free reconciliation of already tracked
-conversations, so provider-native renames update both the Pika inventory and the
-tmux recovery tag. It never interviews agents to do this.
+observe a real lifecycle event. Pika uses “commissioned” only when both provider
+executables pass a version probe, both integrations are currently active, and
+both have delivered the current hook definition; otherwise it names every
+remaining executable, activation, or observation proof.
+Ordinary monitor/list/name reconciliation keeps provider-native renames current;
+setup itself does not use conversation refresh as a hidden side effect. It never
+interviews agents.
 Conversations you explicitly untracked stay out of later setup import choices;
-setup reports that suppression and gives the explicit `pika open <uuid>` restore
-path. An explicit Claude title (including `/rename` and `customTitle` history)
+first setup and explicit import runs report that suppression and give the simple
+`pika <conversation-name>` restore path. An explicit Claude title (including
+`/rename` and `customTitle` history)
 outranks a later generated summary.
+
+Setup also pins the exact Codex and Claude executables it commissions, and uses
+the same stable runtime PATH for the expert-refresh timer. A later shell, NVM, or
+PATH change therefore cannot silently make Pika launch a different provider
+binary. Override a choice explicitly with `--codex-executable PATH` or
+`--claude-executable PATH`.
 
 For automation, review a dry run and then apply it explicitly:
 
@@ -93,7 +105,7 @@ Interactive `pika setup` has a two-stage federation step:
 1. It passively reads concrete aliases from `~/.ssh/config` and peers already
    visible in `tailscale status --json`, then asks which machines to contact.
 2. After a selected machine proves its immutable Pika node UUID and protocol,
-   Pika asks which eligible conversations to adopt there.
+   Pika asks which eligible conversations to add there.
 
 Unselected candidates receive no network traffic. Selecting a remote
 conversation updates Pika only on that remote machine; it does not start, move,
@@ -166,8 +178,7 @@ captured output before starting any separate acknowledgement.
 
 ```text
 pika                       open the live operations monitor
-pika NAME                  open or resurrect an exact conversation
-pika open NAME             unambiguous form, including `pika open list`
+pika NAME                  find, protect, attach, resume, or safely create by name
 pika ask NAME "QUESTION"   ephemeral multi-turn consultation with that parent
 pika ask NAME --fast ...   faster Codex consultation using Luna medium
 pika ask NAME --jsonl      persistent JSON-lines side channel for agents/apps
@@ -191,14 +202,30 @@ pika next                  open the oldest conversation needing attention
 pika peek NAME             inspect recent pane output without attaching
 pika peek NAME --ack       explicitly acknowledge READY in a script
 pika wait NAME             wait for NEEDS YOU, unread READY, OPEN TWICE, or ERROR
-pika new NAME              create using the configured default provider
-pika new NAME --agent ...  override with codex or claude
-pika adopt [TARGET|NAME]    tag a live agent by tmux target or Pika name
 pika untrack NAME           stop watching without stopping or archiving the agent
 pika doctor                print a recoverability receipt
 pika doctor --verbose      show every receipt check
 pika doctor --repair-stale remove confirmed stale launch locks (5m+)
 ```
+
+`pika NAME` is the normal lifecycle command. If that exact name is already
+tracked, Pika attaches or resumes its immutable provider UUID. If it is a native
+Codex/Claude conversation Pika has not tracked yet, Pika protects it and opens it.
+If it is already running in an untagged tmux pane, Pika can tag that pane and
+attach. A process that started in an ordinary terminal cannot be moved safely;
+Pika names the live PID and asks you to exit normally, after which the same
+`pika NAME` command resumes it inside Pika. Genuine duplicate UUID processes are
+reported as `OPEN TWICE`. Same-name providers or machines produce an explicit
+chooser. Only a genuinely unknown, non-UUID, non-near-match name creates a new
+conversation using the configured default provider and native provider name.
+Implicit creation requires an interactive terminal. Scripts must use the
+advanced `pika new NAME` command explicitly. When any trusted machine has a
+missing or stale inventory, Pika also pauses implicit creation and names the
+`pika sync MACHINE` command needed before retrying; explicit `pika new NAME`
+remains the deliberate local escape hatch.
+
+`pika open`, `pika new`, and `pika adopt` remain advanced diagnostic controls;
+daily use should not require knowing which mechanism applies.
 
 `pika ask master_quant "What assumption is weakest here?"` opens a temporary
 side conversation based on that exact provider UUID. In a terminal, ask
@@ -251,12 +278,9 @@ source. Archived conversations disappear from lookup with the rest of Pika's
 daily surface. Cards created before the two-horizon contract are marked stale
 until a scheduled or explicit refresh supplies their current state.
 
-`pika adopt NAME` resolves the exact UUID and finds the untagged tmux pane that
-contains its live provider process. A process running under a normal SSH or
-terminal shell cannot be moved safely into tmux after it has started; in that
-case Pika names the PID and exact recovery command. Exit that agent normally,
-then run the displayed `pika open UUID` command to resume it inside a protected
-Pika home. This avoids both unsafe process reparenting and a duplicate thread.
+The advanced `pika adopt NAME` command resolves the exact UUID and finds an
+untagged tmux pane that contains its live provider process. It is mainly useful
+for diagnosis because `pika NAME` performs the safe lifecycle decision itself.
 
 Agent and dashboard clients can keep a genuine multi-turn side open with
 `pika ask UUID --jsonl`. Send one `{"question":"..."}` object per line and end
@@ -322,7 +346,8 @@ When multiple conversations share a name, Pika displays a numbered chooser with
 provider, short immutable UUID fingerprint, repository, branch, recency, and
 state. Cross-provider collisions explicitly say that both Codex and Claude have
 the name; `q`, Esc, or EOF cancels without opening anything. A missing name
-prints close matches and never creates a conversation implicitly.
+prints close matches and never creates a near-duplicate accidentally. A name
+with no exact or close match creates a new default-provider conversation.
 
 `pika list` opens with a compact delegation briefing. Its `WHY` field is a
 closed, transcript-free event reason such as `permission`, `question`,
@@ -372,7 +397,7 @@ Receipts show the current exact UUID as well as the stable home fingerprint when
 they differ.
 
 Renaming an adopted conversation remains provider-owned. The next ordinary
-reconciliation, including `pika`, `pika list`, or `pika setup`, updates the
+reconciliation, including `pika`, `pika NAME`, or `pika list`, updates the
 tracked display name and the pane's recovery metadata when the provider exposes
 the new name.
 
@@ -388,7 +413,15 @@ fail-closed.
 
 Each Pika-managed conversation gets one UUID-derived tmux session. A new Claude
 conversation is named natively with `--name`; a new Codex conversation is named
-through Codex's local app-server thread API after SessionStart reveals its UUID.
+through Codex's local app-server thread API after its exact UUID is proven.
+If a launch hook is delayed or missed, the launch remains visible as `STARTING`
+on the board instead of disappearing. Command-time reconciliation can recover
+it only from one token-bearing pane, one matching provider process and PID start
+time, a successful pre-launch provider snapshot, a settling interval, one
+UUID-matched provider record created in the exact directory and launch window,
+and no competing exact UUID process. A missing baseline, subordinate Codex
+thread, or ambiguous evidence remains
+`IDENTITY PENDING`; after the grace period it becomes an actionable error.
 Pika disables the tmux status bar only for sessions it creates, keeping the
 Codex or Claude interface visually unchanged while leaving global tmux settings
 and explicitly adopted sessions untouched. It also launches the agent with the
@@ -418,7 +451,8 @@ the safety decision.
 `pika doctor` is deliberately strict. “Safe to close this terminal” requires
 valid provider UUIDs, durable provider history (or an exact live tagged pane),
 existing saved directories, owner-only state, one owner per identity, installed
-hooks, and observed Codex hook trust when Codex is in use. A warning is never
+hooks, and a current structured hook observation for each provider in use. A
+worker session cannot satisfy that commissioning proof. A warning is never
 reported as safe.
 
 A successful human receipt is deliberately scoped: `Recovery verified` includes
@@ -448,7 +482,7 @@ the selected tmux pane.
 The package uses only the Python standard library at runtime.
 
 ```bash
-python3 -m unittest discover -s tests -v
+PYTHONPATH=src python3 -m unittest discover -s tests -v
 PYTHONPATH=src python3 -m pikamux --help
 ```
 

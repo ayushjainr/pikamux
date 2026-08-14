@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import io
+import time
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from pikamux.cli import (
@@ -114,10 +116,19 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.summary, "Owns exact recovery.")
         self.assertEqual(args.current_state, "Validating PID lease expiry.")
 
-    def test_bare_name_normalizes_to_open_without_shadowing_commands(self) -> None:
-        self.assertEqual(_normalize_argv(["research"]), ["open", "research"])
+    def test_bare_name_normalizes_to_universal_entry_without_shadowing_commands(
+        self,
+    ) -> None:
+        self.assertEqual(_normalize_argv(["research"]), ["_enter", "research"])
         self.assertEqual(_normalize_argv(["list"]), ["list"])
         self.assertEqual(_normalize_argv(["open", "list"]), ["open", "list"])
+
+    def test_primary_help_teaches_one_name_command_not_lifecycle_mechanics(self) -> None:
+        rendered = _parser().format_help()
+        self.assertIn("pika NAME", rendered)
+        self.assertNotIn("open a named conversation", rendered)
+        self.assertNotIn("start a new managed conversation", rendered)
+        self.assertNotIn("adopt a running agent", rendered)
 
     def test_bare_interactive_terminal_opens_live_monitor(self) -> None:
         class BarePika:
@@ -298,6 +309,147 @@ class CliTests(unittest.TestCase):
         self.assertIn("Claude activation", rendered)
         self.assertNotIn("Pika commissioned ·", rendered)
 
+    def test_setup_never_commissions_with_nondefault_provider_missing(self) -> None:
+        class MetaStore:
+            @staticmethod
+            def list_sessions():
+                return []
+
+            @staticmethod
+            def untracked_session_keys():
+                return set()
+
+            @staticmethod
+            def list_pending():
+                return []
+
+            @staticmethod
+            def get_hook_observation(provider):
+                return {
+                    "fingerprint": hook_spec_fingerprint(provider),
+                    "event_name": "SessionStart",
+                    "session_id": f"{provider}-uuid",
+                    "observed_at": time.time(),
+                }
+
+            @staticmethod
+            def get_meta(_key):
+                return None
+
+        pika = Mock(store=MetaStore())
+        args = argparse.Namespace(
+            no_import=True,
+            dry_run=False,
+            import_all=False,
+            yes=True,
+            default_provider="codex",
+        )
+        output = io.StringIO()
+        with (
+            patch(
+                "pikamux.cli.setup_executables",
+                return_value={"codex": "/bin/codex", "claude": None},
+            ),
+            patch(
+                "pikamux.cli.executable_available",
+                side_effect=lambda value: value == "/bin/codex",
+            ),
+            patch("pikamux.cli.executable_version", return_value="test"),
+            patch("pikamux.cli.proposed_changes", return_value=[]),
+            patch("pikamux.cli.hooks_installed", return_value=True),
+            patch("pikamux.cli.load_config", return_value={}),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_setup(pika, args), 0)
+        rendered = output.getvalue()
+        self.assertIn("Claude executable", rendered)
+        self.assertNotIn("Pika commissioned ·", rendered)
+
+    def test_setup_reports_overdue_pending_launch_as_degraded(self) -> None:
+        class MetaStore:
+            @staticmethod
+            def list_sessions():
+                return []
+
+            @staticmethod
+            def untracked_session_keys():
+                return set()
+
+            @staticmethod
+            def list_pending():
+                return [
+                    {
+                        "provider": "codex",
+                        "name": "qis_dash",
+                        "created_at": 0,
+                    }
+                ]
+
+            @staticmethod
+            def get_hook_observation(provider):
+                return {
+                    "fingerprint": hook_spec_fingerprint(provider),
+                    "event_name": "SessionStart",
+                    "session_id": f"{provider}-uuid",
+                    "observed_at": 0,
+                }
+
+            @staticmethod
+            def get_meta(_key):
+                return None
+
+        pika = Mock(store=MetaStore())
+        args = argparse.Namespace(
+            no_import=True,
+            dry_run=False,
+            import_all=False,
+            yes=True,
+            default_provider="codex",
+        )
+        output = io.StringIO()
+        with (
+            patch("pikamux.cli.proposed_changes", return_value=[]),
+            patch("pikamux.cli.hooks_installed", return_value=True),
+            patch("pikamux.cli.load_config", return_value={}),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_setup(pika, args), 0)
+        rendered = output.getvalue()
+        self.assertIn("launches DEGRADED", rendered)
+        self.assertIn("Codex launch qis_dash identity pending", rendered)
+        self.assertNotIn("Pika commissioned ·", rendered)
+
+    def test_setup_reloads_systemd_for_a_service_only_path_change(self) -> None:
+        store = Mock()
+        store.list_sessions.return_value = []
+        store.untracked_session_keys.return_value = set()
+        store.list_pending.return_value = []
+        store.get_meta.return_value = None
+        pika = Mock(store=store)
+        change = Mock(
+            changed=True,
+            path=Path("/tmp/pika-expert-refresh.service"),
+        )
+        change.diff.return_value = "service path changed\n"
+        args = argparse.Namespace(
+            no_import=True,
+            dry_run=False,
+            import_all=False,
+            yes=True,
+            default_provider="codex",
+        )
+        with (
+            patch("pikamux.cli.proposed_changes", return_value=[change]),
+            patch("pikamux.cli.apply_changes", return_value=[]),
+            patch("pikamux.cli.activate_timer", return_value=(True, "reloaded"))
+            as activate,
+            patch("pikamux.cli.hooks_installed", return_value=True),
+            patch("pikamux.cli.load_config", return_value={}),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(_setup(pika, args), 0)
+        activate.assert_called_once_with()
+
     def test_setup_one_proof_copy_requires_claude_fully_commissioned(self) -> None:
         class MetaStore:
             @staticmethod
@@ -371,11 +523,11 @@ class CliTests(unittest.TestCase):
         pika.import_candidate.assert_called_once_with(candidate)
         pika.bootstrap_experts.assert_not_called()
         pika.refresh.assert_called_once_with(usage=False)
-        self.assertIn("Adopted 1 existing conversation", output.getvalue())
+        self.assertIn("Added 1 existing conversation", output.getvalue())
         self.assertIn("setup did not interview any agents", output.getvalue())
         self.assertIn("pika expert refresh --all", output.getvalue())
 
-    def test_setup_reports_provider_renames_without_interviewing(self) -> None:
+    def test_routine_setup_does_not_refresh_conversation_inventory(self) -> None:
         old = Session("codex", "rename-id", name="before")
         new = Session("codex", "rename-id", name="after")
         store = Mock()
@@ -400,10 +552,10 @@ class CliTests(unittest.TestCase):
         ):
             self.assertEqual(_setup(pika, args), 0)
 
-        pika.refresh.assert_called_once_with(usage=False)
+        pika.refresh.assert_not_called()
         pika.bootstrap_experts.assert_not_called()
-        self.assertIn("Refreshed 1 provider rename", output.getvalue())
-        self.assertIn("before → after", output.getvalue())
+        self.assertNotIn("Refreshed 1 provider rename", output.getvalue())
+        self.assertNotIn("before → after", output.getvalue())
 
     def test_setup_respects_explicitly_untracked_conversations(self) -> None:
         candidate = Candidate("claude", "ignored-id", "qes_plugin")

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .core import Pika
+from .executables import configured_executable
 from .models import Status
 from .paths import config_path, database_path
 from .processes import process_start_time, provider_process, shared_provider_process
@@ -106,16 +107,18 @@ def run_doctor(
     sessions = pika.refresh()
     for error in pika.discovery_errors:
         checks.append(Check("provider discovery", "warn", error))
+    config = load_config()
     required_providers = {session.provider for session in sessions}
-    required_providers.add(str(load_config().get("default_provider") or "codex"))
+    required_providers.add(str(config.get("default_provider") or "codex"))
     for name, provider in pika.providers.items():
         version = provider.version()
+        executable = configured_executable(name, config=config)
         required = name in required_providers
         checks.append(
             Check(
                 name,
                 "ok" if version or not required else "error",
-                version
+                (f"{version} · {executable}" if version else None)
                 or (
                     f"{name} is not on PATH"
                     if required
@@ -126,20 +129,33 @@ def run_doctor(
         installed = hooks_installed(name)
         message = "Pika lifecycle hooks installed"
         hook_level = "ok" if installed or not required else "warn"
-        if name == "codex" and installed and required:
-            if not codex_hooks_enabled():
+        if installed and required:
+            if name == "codex" and not codex_hooks_enabled():
                 hook_level = "warn"
                 message += "; Codex hooks are disabled in config.toml"
-            elif pika.store.get_meta("hook_seen:codex") == hook_spec_fingerprint(
-                "codex"
-            ):
-                message += "; a Codex lifecycle event has been observed"
             else:
-                hook_level = "warn"
-                message += (
-                    "; current hook definition has not run—review `/hooks`, "
-                    "then use Codex once"
-                )
+                fingerprint = hook_spec_fingerprint(name)
+                observation = pika.store.get_hook_observation(name)
+                if observation and observation.get("fingerprint") == fingerprint:
+                    age = int(
+                        max(0, time.time() - float(observation["observed_at"]))
+                    )
+                    message += (
+                        f"; last {observation['event_name']} event {age}s ago "
+                        f"for {str(observation['session_id'])[:8]}"
+                    )
+                elif pika.store.get_meta(f"hook_seen:{name}") == fingerprint:
+                    hook_level = "warn"
+                    message += (
+                        "; previous event matched, but time and session proof "
+                        "are unavailable—use Codex once"
+                    )
+                else:
+                    hook_level = "warn"
+                    message += (
+                        "; current hook definition has not run—use the provider "
+                        "once"
+                    )
         checks.append(
             Check(
                 f"{name} hooks",
@@ -356,7 +372,8 @@ def run_doctor(
     elif unbound or pending or reservations:
         now = time.time()
         pending_details = [
-            f"{row['launch_token']} {int(max(0, now - float(row['created_at'])))}s "
+            f"{row['name']} token={str(row['launch_token'])[:8]} "
+            f"{int(max(0, now - float(row['created_at'])))}s "
             f"pane={row['tmux_pane'] or '-'}"
             for row in pending_rows
         ]

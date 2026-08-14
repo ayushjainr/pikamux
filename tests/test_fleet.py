@@ -498,6 +498,38 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(_setup_machine_candidates(pika, args), [])
         pika.fleet.discover.assert_not_called()
 
+    def test_discovery_report_explains_passive_candidate_filtering(self) -> None:
+        manager = FleetManager(self.store)
+        candidate = NodeCandidate(
+            "atlas", "atlas.tail.test", ("tailscale",), os_name="linux"
+        )
+        with (
+            patch.object(manager, "discover", return_value=[candidate]),
+            patch("pikamux.fleet._ssh_config_files", return_value=[Path("config")]),
+            patch(
+                "pikamux.fleet.discover_ssh_candidates",
+                return_value=[NodeCandidate("build", "build", ("ssh-config",))],
+            ),
+            patch(
+                "pikamux.fleet.tailscale_discovery_summary",
+                return_value={
+                    "total": 7,
+                    "compatible": 3,
+                    "non_linux": 3,
+                    "no_target": 1,
+                    "error": None,
+                },
+            ),
+        ):
+            report = manager.discover_report()
+        self.assertEqual(report.candidates, (candidate,))
+        self.assertEqual(report.ssh_aliases, 1)
+        self.assertEqual(report.ssh_config_files, 1)
+        self.assertEqual(report.tailscale_total, 7)
+        self.assertEqual(report.tailscale_compatible, 3)
+        self.assertEqual(report.excluded_non_linux, 3)
+        self.assertEqual(report.excluded_no_target, 1)
+
     def test_snapshot_rejects_duplicate_exact_identity(self) -> None:
         node_id = str(uuid.uuid4())
         value = snapshot(node_id)

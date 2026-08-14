@@ -18,6 +18,7 @@ from .models import (
     FleetNode,
     FleetSession,
     NodeCandidate,
+    NodeDiscoveryReport,
     Session,
 )
 from .pricing import PRICING_AS_OF
@@ -132,7 +133,7 @@ def print_sessions(sessions: list[Session], *, as_json: bool = False) -> None:
         )
         return
     if not sessions:
-        print("No Pika sessions yet. Run `pika setup` or `pika new NAME`.")
+        print("No Pika sessions yet. Run `pika NAME` to start one safely.")
         return
     counts = {
         "waiting on you": sum(item.status == "NEEDS YOU" for item in sessions),
@@ -142,6 +143,7 @@ def print_sessions(sessions: list[Session], *, as_json: bool = False) -> None:
             item.status == "READY" and item.unread for item in sessions
         ),
         "working": sum(item.status == "WORKING" for item in sessions),
+        "starting": sum(item.status == "STARTING" for item in sessions),
         "parked": sum(item.status == "PARKED" for item in sessions),
         "unbound": sum(item.status == "UNBOUND" for item in sessions),
     }
@@ -372,8 +374,35 @@ def print_node_candidates(candidates: list[NodeCandidate]) -> None:
         )
 
 
-def choose_node_candidates(candidates: list[NodeCandidate]) -> list[NodeCandidate]:
-    print_node_candidates(candidates)
+def print_node_discovery_report(report: NodeDiscoveryReport) -> None:
+    print(
+        f"SSH configuration: {report.ssh_aliases} named host(s) from "
+        f"{report.ssh_config_files} file(s)"
+    )
+    if report.tailscale_error:
+        print(f"Tailscale: unavailable · {terminal_text(report.tailscale_error)}")
+    else:
+        excluded = report.excluded_non_linux + report.excluded_no_target
+        print(
+            f"Tailscale: {report.tailscale_total} peer(s) · "
+            f"{report.tailscale_compatible} compatible Linux host(s) · "
+            f"{excluded} excluded"
+        )
+        if excluded:
+            print(
+                f"  excluded: {report.excluded_non_linux} non-Linux · "
+                f"{report.excluded_no_target} without an address"
+            )
+    print_node_candidates(list(report.candidates))
+
+
+def choose_node_candidates(
+    candidates: list[NodeCandidate], *, report: NodeDiscoveryReport | None = None
+) -> list[NodeCandidate]:
+    if report is not None:
+        print_node_discovery_report(report)
+    else:
+        print_node_candidates(candidates)
     if not candidates or not sys.stdin.isatty():
         return []
     raw = input("Add machine numbers, `all`, or press Enter for none: ").strip().lower()
@@ -385,7 +414,7 @@ def choose_fleet_candidates(
 ) -> list[tuple[FleetNode | None, Candidate]]:
     if not values:
         return []
-    print("\nPika conversations · 2/2 ADOPT")
+    print("\nPika conversations · 2/2 ADD")
     print(
         "Selecting a remote item updates only Pika on that machine; no transcript is copied."
     )
@@ -399,7 +428,7 @@ def choose_fleet_candidates(
         )
     if not sys.stdin.isatty():
         return []
-    raw = input("Adopt numbers, `all`, or press Enter for none: ").strip().lower()
+    raw = input("Add numbers, `all`, or press Enter for none: ").strip().lower()
     return _choose_numbered(values, raw)
 
 
@@ -539,7 +568,7 @@ def choose_session(
 def choose_candidates(candidates: list[Candidate]) -> list[Candidate]:
     if not candidates:
         return []
-    print("\nPika found conversations worth adopting:")
+    print("\nPika found conversations worth adding:")
     for index, item in enumerate(candidates, 1):
         live = " live" if item.live else ""
         label = item.name if item.name else f"<unnamed live · {item.session_id[:8]}>"
@@ -555,7 +584,7 @@ def choose_candidates(candidates: list[Candidate]) -> list[Candidate]:
         )
     if not sys.stdin.isatty():
         return []
-    raw = input("Adopt numbers, `all`, or press Enter for none: ").strip().lower()
+    raw = input("Add numbers, `all`, or press Enter for none: ").strip().lower()
     if not raw:
         return []
     if raw == "all":

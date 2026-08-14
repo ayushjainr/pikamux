@@ -50,6 +50,11 @@ class FakeTmux:
         self.cleared.append(target)
 
 
+class FailingTagTmux(FakeTmux):
+    def tag_pane(self, target, **values):
+        raise OSError("tmux tag failed")
+
+
 class HookTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -95,6 +100,148 @@ class HookTests(unittest.TestCase):
         session = self.store.get_session("codex", "uuid-1")
         self.assertEqual(session.name if session else None, "thread-name")
         self.assertIsNone(self.store.get_pending("launch"))
+        observation = self.store.get_hook_observation("codex")
+        self.assertEqual(observation["event_name"], "SessionStart")
+        self.assertEqual(observation["session_id"], "uuid-1")
+        self.assertEqual(observation["managed"], 1)
+
+    @patch("pikamux.hooks.Tmux", FailingTagTmux)
+    def test_hook_keeps_pending_launch_when_exact_pane_tag_fails(self) -> None:
+        event = {
+            "session_id": "uuid-tag-retry",
+            "cwd": "/tmp",
+            "hook_event_name": "SessionStart",
+        }
+        handle_hook("codex", event, self.store)
+        self.assertEqual(
+            self.store.get_launch_binding("launch"),
+            ("codex", "uuid-tag-retry"),
+        )
+        self.assertIsNotNone(self.store.get_session("codex", "uuid-tag-retry"))
+        self.assertIsNotNone(self.store.get_pending("launch"))
+        with patch("pikamux.hooks.Tmux", FakeTmux):
+            handle_hook("codex", event, self.store)
+        self.assertEqual(
+            self.store.get_launch_binding("launch"),
+            ("codex", "uuid-tag-retry"),
+        )
+        self.assertIsNone(self.store.get_pending("launch"))
+        self.assertEqual(FakeTmux.tags[-1][1]["session_id"], "uuid-tag-retry")
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_wrong_provider_hook_cannot_claim_pending_launch(self) -> None:
+        handle_hook(
+            "claude",
+            {
+                "session_id": "claude-wrong-provider",
+                "cwd": "/tmp",
+                "hook_event_name": "SessionStart",
+            },
+            self.store,
+        )
+        self.assertIsNone(self.store.get_launch_binding("launch"))
+        self.assertIsNotNone(self.store.get_pending("launch"))
+        self.assertIsNone(
+            self.store.get_session("claude", "claude-wrong-provider")
+        )
+        self.assertIn(
+            "expected provider codex",
+            self.store.get_meta("launch_binding_error:launch") or "",
+        )
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_wrong_expected_uuid_hook_cannot_claim_pending_launch(self) -> None:
+        self.store.delete_pending("launch")
+        self.store.add_pending(
+            "launch",
+            "codex",
+            "thread-name",
+            "/tmp",
+            "pika-c-token",
+            "%9",
+            expected_session_id="expected-uuid",
+        )
+        handle_hook(
+            "codex",
+            {
+                "session_id": "wrong-uuid",
+                "cwd": "/tmp",
+                "hook_event_name": "SessionStart",
+            },
+            self.store,
+        )
+        self.assertIsNone(self.store.get_launch_binding("launch"))
+        self.assertIsNone(self.store.get_session("codex", "wrong-uuid"))
+        self.assertIn(
+            "expected UUID expected-uuid",
+            self.store.get_meta("launch_binding_error:launch") or "",
+        )
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_wrong_pane_or_cwd_hook_cannot_claim_pending_launch(self) -> None:
+        with patch.dict(os.environ, {"TMUX_PANE": "%other"}, clear=False):
+            handle_hook(
+                "codex",
+                {
+                    "session_id": "wrong-pane",
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionStart",
+                },
+                self.store,
+            )
+        self.assertIsNone(self.store.get_launch_binding("launch"))
+        self.store.delete_meta("launch_binding_error:launch")
+        handle_hook(
+            "codex",
+            {
+                "session_id": "wrong-cwd",
+                "cwd": "/different",
+                "hook_event_name": "SessionStart",
+            },
+            self.store,
+        )
+        self.assertIsNone(self.store.get_launch_binding("launch"))
+        self.assertIsNone(self.store.get_session("codex", "wrong-cwd"))
+        self.assertIn(
+            "expected cwd /tmp",
+            self.store.get_meta("launch_binding_error:launch") or "",
+        )
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_session_end_mismatch_does_not_publish_launch_conflict(self) -> None:
+        handle_hook(
+            "claude",
+            {
+                "session_id": "exiting-claude",
+                "cwd": "/tmp",
+                "hook_event_name": "SessionEnd",
+            },
+            self.store,
+        )
+        self.assertIsNone(self.store.get_launch_binding("launch"))
+        self.assertIsNone(self.store.get_meta("launch_binding_error:launch"))
+        self.assertIsNotNone(self.store.get_pending("launch"))
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_missing_launch_token_cannot_claim_matching_pending_pane(self) -> None:
+        with patch.dict(os.environ, {"PIKA_LAUNCH_TOKEN": ""}, clear=False):
+            handle_hook(
+                "codex",
+                {
+                    "session_id": "otherwise-matching",
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionStart",
+                },
+                self.store,
+            )
+        self.assertIsNone(self.store.get_launch_binding("launch"))
+        self.assertIsNone(self.store.get_session("codex", "otherwise-matching"))
+        self.assertIsNotNone(self.store.get_pending("launch"))
+        self.assertEqual(FakeTmux.tags, [])
+        self.assertIn(
+            "missing or wrong PIKA_LAUNCH_TOKEN",
+            self.store.get_meta("launch_binding_error:launch") or "",
+        )
 
     @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_state_transitions(self) -> None:
@@ -126,6 +273,24 @@ class HookTests(unittest.TestCase):
         self.assertTrue(session.unread)
         self.assertEqual(session.attention_reason, "completed")
         self.assertIn("thread-name (Codex) — completed", FakeTmux.alerts[-1])
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_claude_hook_records_current_structured_observation(self) -> None:
+        self.store.delete_pending("launch")
+        with patch.dict(os.environ, {"PIKA_LAUNCH_TOKEN": ""}, clear=False):
+            handle_hook(
+                "claude",
+                {
+                    "session_id": "claude-uuid",
+                    "cwd": "/tmp",
+                    "hook_event_name": "UserPromptSubmit",
+                },
+                self.store,
+            )
+        observation = self.store.get_hook_observation("claude")
+        self.assertEqual(observation["event_name"], "UserPromptSubmit")
+        self.assertEqual(observation["session_id"], "claude-uuid")
+        self.assertEqual(observation["managed"], 0)
 
     @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_codex_question_tool_waits_for_user_until_answered(self) -> None:
@@ -165,16 +330,18 @@ class HookTests(unittest.TestCase):
 
     @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_claude_question_tool_uses_same_attention_contract(self) -> None:
-        handle_hook(
-            "claude",
-            {
-                "session_id": "uuid-claude-question",
-                "cwd": "/tmp",
-                "hook_event_name": "PreToolUse",
-                "tool_name": "AskUserQuestion",
-            },
-            self.store,
-        )
+        self.store.delete_pending("launch")
+        with patch.dict(os.environ, {"PIKA_LAUNCH_TOKEN": ""}, clear=False):
+            handle_hook(
+                "claude",
+                {
+                    "session_id": "uuid-claude-question",
+                    "cwd": "/tmp",
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "AskUserQuestion",
+                },
+                self.store,
+            )
         waiting = self.store.get_session("claude", "uuid-claude-question")
         self.assertEqual(
             waiting.status if waiting else None,
@@ -187,16 +354,18 @@ class HookTests(unittest.TestCase):
 
     @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_claude_question_reason_is_structured_without_transcript_text(self) -> None:
-        handle_hook(
-            "claude",
-            {
-                "session_id": "uuid-question",
-                "cwd": "/tmp",
-                "hook_event_name": "Notification",
-                "notification_type": "agent_needs_input",
-            },
-            self.store,
-        )
+        self.store.delete_pending("launch")
+        with patch.dict(os.environ, {"PIKA_LAUNCH_TOKEN": ""}, clear=False):
+            handle_hook(
+                "claude",
+                {
+                    "session_id": "uuid-question",
+                    "cwd": "/tmp",
+                    "hook_event_name": "Notification",
+                    "notification_type": "agent_needs_input",
+                },
+                self.store,
+            )
         session = self.store.get_session("claude", "uuid-question")
         self.assertEqual(session.attention_reason if session else None, "question")
         self.assertIn("(Claude) — question waiting", FakeTmux.alerts[-1])
@@ -243,7 +412,12 @@ class HookTests(unittest.TestCase):
 
     @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_claude_session_start_sets_native_title(self) -> None:
-        with patch.dict(os.environ, {"PIKA_NAME": "native-title"}, clear=False):
+        self.store.delete_pending("launch")
+        with patch.dict(
+            os.environ,
+            {"PIKA_NAME": "native-title", "PIKA_LAUNCH_TOKEN": ""},
+            clear=False,
+        ):
             result = handle_hook(
                 "claude",
                 {
@@ -350,6 +524,7 @@ class HookTests(unittest.TestCase):
             )
         self.assertIsNone(result)
         self.assertIsNone(self.store.get_session("codex", worker_id))
+        self.assertIsNone(self.store.get_hook_observation("codex"))
         self.assertIsNotNone(self.store.get_session("codex", "parent-id"))
         self.assertEqual(self.store.get_live_owners("codex", worker_id), [])
         self.assertEqual(FakeTmux.tags, [])
@@ -399,6 +574,52 @@ class HookTests(unittest.TestCase):
             ],
         )
         self.assertEqual(FakeTmux.cleared, [])
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_native_side_thread_stays_subordinate_to_parent(self) -> None:
+        parent_id = "11111111-1111-4111-8111-111111111111"
+        child_id = "22222222-2222-4222-8222-222222222222"
+        transcript = Path(self.temp.name) / "side.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": child_id,
+                        "forked_from_id": parent_id,
+                        "thread_source": "subagent",
+                        "source": {"subagent": {"thread_spawn": {}}},
+                    },
+                }
+            )
+            + "\n"
+        )
+        self.store.delete_pending("launch")
+        self.store.upsert_session(
+            Session(
+                "codex",
+                parent_id,
+                name="master_quant",
+                cwd="/tmp",
+                tmux_pane="%9",
+                status=Status.WORKING.value,
+            )
+        )
+        with patch.dict(os.environ, {"PIKA_LAUNCH_TOKEN": ""}, clear=False):
+            handle_hook(
+                "codex",
+                {
+                    "session_id": child_id,
+                    "cwd": "/tmp",
+                    "hook_event_name": "Stop",
+                    "transcript_path": str(transcript),
+                },
+                self.store,
+            )
+        parent = self.store.get_session("codex", parent_id)
+        self.assertEqual(parent.status if parent else None, Status.WORKING.value)
+        self.assertIsNone(self.store.get_session("codex", child_id))
+        self.assertEqual(FakeTmux.alerts, [])
 
     @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_interactive_same_name_still_gets_tracked(self) -> None:
@@ -462,6 +683,10 @@ class HookTests(unittest.TestCase):
             parent_session_id=parent_id,
             lifecycle_status=Status.WORKING.value,
         )
+        # This is a later continuation of an already bound Pika launch, not
+        # the first hook that is allowed to claim the launch token.
+        self.store.bind_launch("launch", "codex", parent_id)
+        self.store.delete_pending("launch")
         with patch.object(CodexProvider, "thread_candidate", return_value=candidate):
             handle_hook(
                 "codex",
@@ -512,6 +737,8 @@ class HookTests(unittest.TestCase):
             parent_session_id=parent_id,
             lifecycle_status=Status.WORKING.value,
         )
+        self.store.bind_launch("launch", "codex", parent_id)
+        self.store.delete_pending("launch")
         with patch.object(CodexProvider, "thread_candidate", return_value=candidate):
             handle_hook(
                 "codex",
@@ -649,6 +876,30 @@ class HookTests(unittest.TestCase):
         self.assertEqual(session.status if session else None, Status.ERROR.value)
         self.assertIn("status 7", session.error if session else "")
         self.assertEqual(session.attention_reason if session else None, "exited")
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_late_competing_hook_cannot_overwrite_recovered_launch(self) -> None:
+        winner = "11111111-1111-4111-8111-111111111111"
+        competitor = "22222222-2222-4222-8222-222222222222"
+        self.assertTrue(self.store.bind_launch("launch", "codex", winner))
+        self.store.delete_pending("launch")
+        handle_hook(
+            "codex",
+            {
+                "session_id": competitor,
+                "cwd": "/tmp",
+                "hook_event_name": "SessionStart",
+            },
+            self.store,
+        )
+        self.assertEqual(
+            self.store.get_launch_binding("launch"), ("codex", winner)
+        )
+        self.assertIsNone(self.store.get_session("codex", competitor))
+        self.assertIn(
+            competitor,
+            self.store.get_meta("launch_binding_error:launch") or "",
+        )
 
     def test_nonzero_exit_overrides_stale_unread_ready_state(self) -> None:
         self.store.upsert_session(

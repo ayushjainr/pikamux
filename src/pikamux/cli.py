@@ -19,9 +19,15 @@ from .consult import (
     consultation_for,
     consultation_policy,
 )
-from .core import Pika, PikaError
+from .core import PENDING_LAUNCH_GRACE_SECONDS, Pika, PikaError
 from .doctor import repair_stale_state, run_doctor
-from .expert_schedule import TIMER_NAME, activate_timer
+from .executables import (
+    executable_available,
+    executable_version,
+    setup_executables,
+    setup_runtime_path,
+)
+from .expert_schedule import SERVICE_NAME, TIMER_NAME, activate_timer
 from .fleet import (
     REMOTE_INSTALL_ARGV,
     FleetError,
@@ -31,7 +37,7 @@ from .fleet import (
     suggest_local_machine_alias,
 )
 from .hooks import handle_hook, handle_process_exit, hook_stdout
-from .models import Candidate, FleetSession, NodeCandidate, Session, Status
+from .models import Candidate, FleetSession, NodeCandidate, PendingLaunch, Session, Status
 from .monitor import run_monitor
 from .paths import config_path, database_path
 from .setup_hooks import (
@@ -49,6 +55,7 @@ from .ui import (
     print_fleet_sessions,
     print_machines,
     print_node_candidates,
+    print_node_discovery_report,
     print_sessions,
     terminal_text,
 )
@@ -71,6 +78,7 @@ PUBLIC_COMMANDS = {
     "sync",
 }
 INTERNAL_COMMANDS = {
+    "_enter",
     "hook",
     "_process-exit",
     "_peek-popup",
@@ -78,23 +86,25 @@ INTERNAL_COMMANDS = {
     "_fleet-open",
     "_fleet-ask",
 }
+ADVANCED_COMMANDS = {"open", "new", "adopt"}
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pika",
         description="Persistent Identity Keeper for Codex and Claude sessions in tmux.",
+        epilog="Use `pika NAME` to find, protect, attach, resume, or create safely.",
     )
     parser.add_argument("--version", action="version", version=f"pikamux {__version__}")
     sub = parser.add_subparsers(
         dest="command",
         metavar=(
-            "{open,ask,expert,experts,list,next,peek,wait,new,adopt,"
-            "untrack,setup,doctor,machines,sync}"
+            "{ask,expert,experts,list,next,peek,wait,untrack,setup,doctor,"
+            "machines,sync}"
         ),
     )
 
-    open_parser = sub.add_parser("open", help="open a named conversation")
+    open_parser = sub.add_parser("open", help=argparse.SUPPRESS)
     open_parser.add_argument("name")
 
     ask_parser = sub.add_parser(
@@ -205,14 +215,12 @@ def _parser() -> argparse.ArgumentParser:
     wait_parser.add_argument("--timeout", type=float)
     wait_parser.add_argument("--json", action="store_true")
 
-    new_parser = sub.add_parser("new", help="start a new managed conversation")
+    new_parser = sub.add_parser("new", help=argparse.SUPPRESS)
     new_parser.add_argument("name")
     new_parser.add_argument("--agent", choices=("codex", "claude"))
     new_parser.add_argument("--cwd")
 
-    adopt_parser = sub.add_parser(
-        "adopt", help="adopt a running agent by tmux target or Pika name"
-    )
+    adopt_parser = sub.add_parser("adopt", help=argparse.SUPPRESS)
     adopt_parser.add_argument("target", nargs="?", metavar="TMUX_TARGET_OR_NAME")
     adopt_parser.add_argument("--name")
 
@@ -224,6 +232,8 @@ def _parser() -> argparse.ArgumentParser:
 
     setup_parser = sub.add_parser("setup", help="preview and install lifecycle hooks")
     setup_parser.add_argument("--default-provider", choices=("codex", "claude"))
+    setup_parser.add_argument("--codex-executable")
+    setup_parser.add_argument("--claude-executable")
     setup_parser.add_argument(
         "--machine-alias",
         help="human name for this Pika node (for example rstudio-6)",
@@ -254,13 +264,13 @@ def _parser() -> argparse.ArgumentParser:
         "machines", help="discover and manage trusted remote Pika nodes"
     )
     machine_sub = machines_parser.add_subparsers(dest="machines_command")
-    machine_list = machine_sub.add_parser("list", help="list adopted machines")
+    machine_list = machine_sub.add_parser("list", help="list trusted machines")
     machine_list.add_argument("--json", action="store_true")
     machine_discover = machine_sub.add_parser(
         "discover", help="passively list SSH and Tailscale candidates"
     )
     machine_discover.add_argument("--json", action="store_true")
-    machine_add = machine_sub.add_parser("add", help="handshake and adopt one machine")
+    machine_add = machine_sub.add_parser("add", help="verify and trust one machine")
     machine_add.add_argument("ssh_target")
     machine_add.add_argument("--alias")
     machine_remove = machine_sub.add_parser(
@@ -279,7 +289,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     machine_ignore.add_argument("ssh_target")
 
-    sync_parser = sub.add_parser("sync", help="refresh one adopted machine now")
+    sync_parser = sub.add_parser("sync", help="refresh one trusted machine now")
     sync_parser.add_argument("machine")
 
     doctor_parser = sub.add_parser("doctor", help="verify Pika recoverability")
@@ -322,12 +332,14 @@ def _parser() -> argparse.ArgumentParser:
     fleet_ask.add_argument("--provider", required=True, choices=("codex", "claude"))
     fleet_ask.add_argument("--session-id", required=True)
     fleet_ask.add_argument("--fast", action="store_true")
+    enter_parser = sub.add_parser("_enter", help=argparse.SUPPRESS)
+    enter_parser.add_argument("name")
     # argparse otherwise renders hidden implementation commands as
     # ``==SUPPRESS==`` entries in the public command list.
     sub._choices_actions = [
         action
         for action in sub._choices_actions
-        if action.dest not in INTERNAL_COMMANDS
+        if action.dest not in INTERNAL_COMMANDS | ADVANCED_COMMANDS
     ]
     return parser
 
@@ -349,7 +361,7 @@ def _normalize_argv(argv: list[str]) -> list[str]:
         "--version",
     }:
         return argv
-    return ["open", *argv]
+    return ["_enter", *argv]
 
 
 def _select_named(
@@ -831,7 +843,8 @@ def _machines(pika: Pika, args: argparse.Namespace) -> int:
         )
         return 0
     if command == "discover":
-        candidates = pika.fleet.discover()
+        report = pika.fleet.discover_report()
+        candidates = list(report.candidates)
         if args.json:
             print(
                 json.dumps(
@@ -839,7 +852,7 @@ def _machines(pika: Pika, args: argparse.Namespace) -> int:
                 )
             )
         else:
-            print_node_candidates(candidates)
+            print_node_discovery_report(report)
             print("\nPassive discovery made no SSH connections and changed no machine.")
         return 0
     if command == "add":
@@ -958,7 +971,8 @@ def _setup_machine_candidates(
         return []
     print("Pika machines · 1/2 FIND")
     print("Discovery is passive; only selected machines receive an SSH handshake.")
-    return choose_node_candidates(pika.fleet.discover())
+    report = pika.fleet.discover_report()
+    return choose_node_candidates(list(report.candidates), report=report)
 
 
 def _add_setup_machine(pika: Pika, candidate: NodeCandidate):
@@ -1002,14 +1016,28 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         identity_loader = getattr(pika.store, "local_node_id", None)
         if callable(identity_loader):
             identity_loader()
-    selected_machine_candidates = _setup_machine_candidates(pika, args)
+    first_setup = not config_path().exists()
+    explicit_machine_setup = bool(getattr(args, "machine", []))
+    selected_machine_candidates = (
+        _setup_machine_candidates(pika, args)
+        if first_setup or explicit_machine_setup
+        else []
+    )
     selected: list[Candidate] = []
     local_candidates: list[Candidate] = []
     original_tracked = [] if args.dry_run else pika.store.list_sessions()
     tracked_names = {session.key: session.display_name for session in original_tracked}
-    tracked_sessions = [] if args.dry_run else pika.refresh(usage=False)
+    explicit_import = bool(args.import_all or getattr(args, "remote_import_all", False))
+    routine_inventory = first_setup or explicit_import
+    tracked_sessions = (
+        []
+        if args.dry_run
+        else pika.refresh(usage=False)
+        if routine_inventory
+        else original_tracked
+    )
     untracked_keys = set() if args.dry_run else pika.store.untracked_session_keys()
-    if not args.no_import and not args.dry_run:
+    if not args.no_import and not args.dry_run and (first_setup or explicit_import):
         discovered_local = [
             item for item in pika.discover_import_candidates() if item.name or item.live
         ]
@@ -1027,7 +1055,7 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         if suppressed:
             print(
                 f"Pika is keeping {len(suppressed)} explicitly untracked "
-                "conversation(s) out of adoption choices:"
+                "conversation(s) out of setup choices:"
             )
             for item in suppressed[:3]:
                 print(
@@ -1036,7 +1064,7 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
                 )
             if len(suppressed) > 3:
                 print(f"  … and {len(suppressed) - 3} more")
-            print("Restore one explicitly with `pika open <uuid>`.\n")
+            print("Restore one explicitly with `pika <conversation-name>`.\n")
         local_candidates = [
             item
             for item in discovered_local
@@ -1076,7 +1104,35 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
             alias = suggestion
     alias = machine_alias(str(alias))
     print(f"This Pika machine: {alias}\n")
-    changes = proposed_changes(str(default_provider), alias)
+    selected_executables = setup_executables(
+        config,
+        overrides={
+            "codex": getattr(args, "codex_executable", None),
+            "claude": getattr(args, "claude_executable", None),
+        },
+    )
+    runtime_path = setup_runtime_path(config, selected_executables)
+    print("Provider executables")
+    provider_versions: dict[str, str | None] = {}
+    for provider in ("codex", "claude"):
+        executable = selected_executables.get(provider)
+        version = executable_version(executable)
+        provider_versions[provider] = version
+        state = version or "MISSING"
+        print(f"  {provider.title():<6} {state} · {executable or 'not found'}")
+    print()
+    missing_default = selected_executables.get(str(default_provider))
+    if not executable_available(missing_default):
+        raise PikaError(
+            f"Configured {default_provider} executable is unavailable: "
+            f"{missing_default or 'not found'}. Supply --{default_provider}-executable."
+        )
+    changes = proposed_changes(
+        str(default_provider),
+        alias,
+        provider_executables=selected_executables,
+        provider_runtime_path=runtime_path,
+    )
     changed = [item for item in changes if item.changed]
     if changed:
         print("Pika proposes these configuration changes:\n")
@@ -1103,11 +1159,17 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
     backups = apply_changes(changes) if changed else []
     for backup in backups:
         print(f"Backup: {backup}")
-    timer_in_scope = any(change.path.name == TIMER_NAME for change in changes)
-    if timer_in_scope:
+    schedule_in_scope = any(
+        change.path.name in {SERVICE_NAME, TIMER_NAME} for change in changed
+    )
+    if schedule_in_scope:
         active, detail = activate_timer()
         print(f"Expert refresh timer {'active' if active else 'inactive'} · {detail}")
-    if changed:
+    changed_names = {change.path.name for change in changed}
+    hook_configuration_changed = bool(
+        changed_names & {"hooks.json", "settings.json", "config.toml"}
+    )
+    if hook_configuration_changed:
         inactive = [
             provider
             for provider in ("codex", "claude")
@@ -1129,27 +1191,74 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
     print("\nCommissioning status")
     observed: dict[str, bool] = {}
     active_hooks: dict[str, bool] = {}
+    available_executables = {
+        provider: bool(
+            executable_available(selected_executables.get(provider))
+            and provider_versions.get(provider)
+        )
+        for provider in ("codex", "claude")
+    }
+    pending_reader = getattr(pika.store, "list_pending", None)
+    pending_value = pending_reader() if callable(pending_reader) else []
+    pending_rows = (
+        list(pending_value) if isinstance(pending_value, (list, tuple)) else []
+    )
+    overdue = {
+        str(row["provider"]): row
+        for row in pending_rows
+        if time.time() - float(row["created_at"]) > PENDING_LAUNCH_GRACE_SECONDS
+    }
     for provider in ("codex", "claude"):
         active = hooks_installed(provider)
         active_hooks[provider] = active
-        observed[provider] = pika.store.get_meta(
-            f"hook_seen:{provider}"
-        ) == hook_spec_fingerprint(provider)
+        fingerprint = hook_spec_fingerprint(provider)
+        observation_reader = getattr(pika.store, "get_hook_observation", None)
+        observation = (
+            observation_reader(provider) if callable(observation_reader) else None
+        )
+        if not isinstance(observation, dict):
+            observation = None
+        observed[provider] = bool(
+            observation and observation.get("fingerprint") == fingerprint
+        )
+        if observed[provider] and observation:
+            age = int(max(0, time.time() - float(observation["observed_at"])))
+            proof = (
+                f"{observation['event_name']} · id "
+                f"{str(observation['session_id'])[:8]} · {age}s ago"
+            )
+        elif pika.store.get_meta(f"hook_seen:{provider}") == fingerprint:
+            proof = "previous proof · time/session unavailable"
+        else:
+            proof = "not yet proven"
+        launch = "DEGRADED" if provider in overdue else "healthy"
         print(
-            f"  {provider.title():<6} hooks {'✓' if active else '✗'}  "
-            f"observed {'✓' if observed[provider] else '○'}"
+            f"  {provider.title():<6} binary "
+            f"{'✓' if available_executables[provider] else '✗'}  "
+            f"hooks {'✓' if active else '✗'}  "
+            f"observed {'✓' if observed[provider] else '○'} · {proof} · "
+            f"launches {launch}"
         )
     commissioned = all(
-        active_hooks[provider] and observed[provider]
+        available_executables[provider]
+        and active_hooks[provider]
+        and observed[provider]
+        and provider not in overdue
         for provider in ("codex", "claude")
     )
     if commissioned:
-        print("\nPika commissioned · both agent integrations active and observed.")
+        print(
+            "\nPika commissioned · both integrations configured, observed, "
+            "and healthy now."
+        )
     elif (
         active_hooks["codex"]
+        and available_executables["codex"]
         and not observed["codex"]
         and active_hooks["claude"]
+        and available_executables["claude"]
         and observed["claude"]
+        and not overdue
     ):
         print(
             "\nOne required proof remains: Codex → `/hooks` → trust Pika → "
@@ -1158,10 +1267,18 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
     else:
         incomplete = []
         for provider in ("codex", "claude"):
+            if not available_executables[provider]:
+                incomplete.append(f"{provider.title()} executable/version proof")
             if not active_hooks[provider]:
                 incomplete.append(f"{provider.title()} activation")
             if not observed[provider]:
                 incomplete.append(f"{provider.title()} observation")
+            if provider in overdue:
+                row = overdue[provider]
+                age = int(time.time() - float(row["created_at"]))
+                incomplete.append(
+                    f"{provider.title()} launch {row['name']} identity pending {age}s"
+                )
         print("\nPika not yet commissioned · pending: " + ", ".join(incomplete) + ".")
     ready_nodes = []
     for candidate in selected_machine_candidates:
@@ -1208,10 +1325,10 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
     if selected:
         for candidate in selected:
             print(
-                f"ADOPTED HERE · {candidate.provider.title()} · "
+                f"ADDED HERE · {candidate.provider.title()} · "
                 f"{terminal_text(candidate.display_name)} · id {candidate.session_id[:8]}"
             )
-        print(f"Adopted {len(selected)} existing conversation(s).")
+        print(f"Added {len(selected)} existing conversation(s) to Pika.")
     for node, candidate in selected_remote:
         try:
             adopted = pika.fleet.adopt(node, candidate)
@@ -1222,7 +1339,7 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
             )
             continue
         print(
-            f"ADOPTED ON {node.alias} · {adopted.provider.title()} · "
+                f"ADDED ON {node.alias} · {adopted.provider.title()} · "
             f"{terminal_text(adopted.display_name)} · id {adopted.session_id[:8]}"
         )
         current_node = pika.store.get_fleet_node(node.node_id)
@@ -1241,14 +1358,14 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         if session.key in tracked_names
         and tracked_names[session.key] != session.display_name
     ]
-    if renamed:
+    if routine_inventory and renamed:
         print(f"Refreshed {len(renamed)} provider rename(s):")
         for old_name, new_name, session in renamed:
             print(
                 f"  {session.provider.title():<6} {session.session_id[:8]}  "
                 f"{terminal_text(old_name)} → {terminal_text(new_name)}"
             )
-    elif tracked_sessions:
+    elif routine_inventory and tracked_sessions:
         print(f"Reconciled {len(tracked_sessions)} tracked conversation name(s).")
     sync_errors = getattr(pika, "discovery_errors", [])
     if isinstance(sync_errors, list) and sync_errors:
@@ -1390,6 +1507,8 @@ def run(argv: list[str] | None = None) -> int:
         )
     if args.command is None:
         return _bare(pika)
+    if args.command == "_enter":
+        return pika.enter(args.name)
     if args.command == "open":
         return pika.open(_select_named(pika, args.name))
     if args.command == "ask":
@@ -1409,7 +1528,8 @@ def run(argv: list[str] | None = None) -> int:
         if args.all_machines:
             print_fleet_sessions(pika.monitor_sessions(local), as_json=args.json)
         else:
-            print_sessions(local, as_json=args.json)
+            visible = [*local, *pika.pending_launches()]
+            print_sessions(visible, as_json=args.json)
             if not args.json:
                 _print_actions(pika, local)
         return 0
@@ -1418,7 +1538,11 @@ def run(argv: list[str] | None = None) -> int:
         if session is None:
             print("No Pika session currently needs attention.")
             return 0
-        return pika.open(session)
+        return (
+            pika.open_pending(session)
+            if isinstance(session, PendingLaunch)
+            else pika.open(session)
+        )
     if args.command == "peek":
         return _peek(pika, args.name, args.lines, ack=args.ack)
     if args.command == "wait":
@@ -1458,7 +1582,7 @@ def run(argv: list[str] | None = None) -> int:
         else:
             print(
                 "The agent and provider conversation were left running and unarchived. "
-                f"Use `pika adopt` or `pika open {session.session_id}` to track it again."
+                f"Use `pika {terminal_text(session.display_name)}` to track it again."
             )
         return 0
     if args.command == "setup":

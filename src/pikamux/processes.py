@@ -23,6 +23,21 @@ def cmdline(pid: int) -> list[str]:
     return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
 
 
+def process_environment(pid: int) -> dict[str, str]:
+    """Read one same-user process environment without invoking a shell."""
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {}
+    result: dict[str, str] = {}
+    for entry in raw.split(b"\0"):
+        if b"=" not in entry:
+            continue
+        key, value = entry.split(b"=", 1)
+        result[key.decode(errors="replace")] = value.decode(errors="replace")
+    return result
+
+
 def _process_kind(argv: list[str]) -> str | None:
     """Classify agent executables without matching unrelated path fragments."""
     names = {Path(value).name.lower() for value in argv[:4]}

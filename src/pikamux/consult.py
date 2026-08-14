@@ -4,7 +4,6 @@ import json
 import os
 import re
 import select
-import shutil
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -13,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .executables import configured_executable, executable_available
 from .models import Session
 
 
@@ -179,11 +179,12 @@ class CodexConsultation(Consultation):
         self._start()
 
     def _start(self) -> None:
-        if shutil.which("codex") is None:
-            raise ConsultationError("Codex is not installed or not on PATH")
+        executable = configured_executable("codex")
+        if not executable_available(executable):
+            raise ConsultationError("Configured Codex executable is unavailable")
         try:
             self.process = subprocess.Popen(
-                ["codex", "app-server", "--stdio"],
+                [str(executable), "app-server", "--stdio"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -402,11 +403,12 @@ class ClaudeConsultation(Consultation):
         self._start()
 
     def _check_capability(self) -> None:
-        if shutil.which("claude") is None:
-            raise ConsultationError("Claude is not installed or not on PATH")
+        executable = configured_executable("claude")
+        if not executable_available(executable):
+            raise ConsultationError("Configured Claude executable is unavailable")
         try:
             result = subprocess.run(
-                ["claude", "--version"],
+                [str(executable), "--version"],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -426,10 +428,13 @@ class ClaudeConsultation(Consultation):
             )
 
     def _start(self) -> None:
+        executable = configured_executable("claude")
+        if not executable_available(executable):
+            raise ConsultationError("Configured Claude executable is unavailable")
         try:
             self.process = subprocess.Popen(
                 [
-                    "claude",
+                    str(executable),
                     "-p",
                     "--resume",
                     self.session.session_id,

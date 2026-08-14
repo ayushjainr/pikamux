@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import select
-import shutil
 import sqlite3
 import subprocess
 import time
@@ -14,6 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .executables import (
+    configured_executable,
+    executable_available,
+    executable_version,
+)
 from .models import Candidate, Session, Status, Usage
 from .paths import claude_home, codex_home
 from .pricing import estimate_cost
@@ -103,8 +107,20 @@ def codex_worker_originator(
     originator: object = None,
 ) -> str | None:
     """Return a configured automation origin, otherwise preserve the session."""
+    metadata = codex_session_metadata(session_id, transcript_path)
+    source = metadata.get("source")
+    if metadata.get("thread_source") == "subagent" or (
+        isinstance(source, dict) and "subagent" in source
+    ):
+        # Native /side, /btw, and delegated worker threads are subordinate to
+        # their parent conversation and must never become Pika workstreams.
+        return "codex-subagent"
     value = str(originator).strip() if originator else None
-    value = value or _codex_originator(session_id, transcript_path)
+    value = value or (
+        str(metadata.get("originator")).strip()
+        if metadata.get("originator")
+        else None
+    )
     if not value:
         return None
     configured = load_config().get("codex_worker_originators", ())
@@ -149,26 +165,31 @@ class Provider(ABC):
         raise NotImplementedError
 
     def installed(self) -> bool:
-        return shutil.which(self.name) is not None
+        return executable_available(self.executable())
+
+    def executable(self) -> str | None:
+        return configured_executable(self.name)
 
     def version(self) -> str | None:
-        if not self.installed():
-            return None
-        try:
-            proc = subprocess.run(
-                [self.name, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        return (proc.stdout or proc.stderr).strip() or None
+        return executable_version(self.executable())
 
     def import_candidates(self) -> list[Candidate]:
         """Return the broader, potentially slower one-time import surface."""
         return self.discover()
+
+    def launch_candidates(self) -> list[Candidate]:
+        """Return launch-time identities, including unnamed provider records."""
+        return self.import_candidates()
+
+    def find_candidates(self, query: str) -> list[Candidate]:
+        """Return exact name/UUID matches without a bulk resumability pass."""
+        folded = query.casefold()
+        return [
+            item
+            for item in self.import_candidates()
+            if item.session_id == query
+            or (item.name and item.name.casefold() == folded)
+        ]
 
     def active_pids(self, session_id: str) -> list[int]:
         return find_processes_with_session_id(session_id, self.name)
@@ -253,6 +274,20 @@ class CodexProvider(Provider):
         """
         return self.discover()
 
+    def find_candidates(self, query: str) -> list[Candidate]:
+        folded = query.casefold()
+        records = {
+            item.session_id: item
+            for item in self.discover()
+            if item.session_id == query
+            or (item.name and item.name.casefold() == folded)
+        }
+        if query not in self.hidden_session_ids():
+            for item in self._query_current_database(session_ids=[query]):
+                if not self.worker_originator(item.session_id, item.transcript_path):
+                    records[item.session_id] = item
+        return sorted(records.values(), key=lambda item: item.updated_at, reverse=True)
+
     def thread_candidate(
         self, session_id: str, transcript_path: str | None = None
     ) -> Candidate | None:
@@ -310,7 +345,11 @@ class CodexProvider(Provider):
             item
             for item in self._query_current_database()
             if item.session_id not in archived_ids
+            and not self.worker_originator(item.session_id, item.transcript_path)
         ]
+
+    def launch_candidates(self) -> list[Candidate]:
+        return self._all_database_records()
 
     def hidden_session_ids(self) -> set[str]:
         databases = sorted(
@@ -455,7 +494,7 @@ class CodexProvider(Provider):
         return result
 
     def new_argv(self, name: str, session_id: str | None = None) -> list[str]:
-        return ["codex"]
+        return [self.executable() or self.name]
 
     def set_native_name(
         self, session_id: str, name: str, *, timeout: float = 3.5
@@ -467,7 +506,7 @@ class CodexProvider(Provider):
             environment = os.environ.copy()
             environment["CODEX_HOME"] = str(self.home)
             process = subprocess.Popen(
-                ["codex", "app-server", "--stdio"],
+                [self.executable() or self.name, "app-server", "--stdio"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -543,7 +582,7 @@ class CodexProvider(Provider):
         )
 
     def resume_argv(self, session_id: str) -> list[str]:
-        return ["codex", "resume", session_id]
+        return [self.executable() or self.name, "resume", session_id]
 
     def usage(self, session: Session, store: Store) -> Usage | None:
         if not session.transcript_path:
@@ -630,6 +669,7 @@ class ClaudeProvider(Provider):
                 name=str(explicit_name) if explicit_name else None,
                 cwd=data.get("cwd"),
                 updated_at=_timestamp(data.get("updatedAt") or data.get("startedAt")),
+                created_at=_timestamp(data.get("startedAt")),
                 live=bool(pid),
                 pid=pid,
                 source="claude-live",
@@ -662,6 +702,42 @@ class ClaudeProvider(Provider):
                 existing.updated_at = max(existing.updated_at, item.updated_at)
             else:
                 records[item.session_id] = item
+        return sorted(records.values(), key=lambda item: item.updated_at, reverse=True)
+
+    def find_candidates(self, query: str) -> list[Candidate]:
+        folded = query.casefold()
+        records = {
+            item.session_id: item
+            for item in self.discover()
+            if item.session_id == query
+            or (item.name and item.name.casefold() == folded)
+        }
+        for item in self._historical_titles(explicit_only=True):
+            if item.session_id != query and not (
+                item.name and item.name.casefold() == folded
+            ):
+                continue
+            existing = records.get(item.session_id)
+            if existing:
+                existing.name = item.name or existing.name
+                existing.transcript_path = (
+                    existing.transcript_path or item.transcript_path
+                )
+            else:
+                records[item.session_id] = item
+        # Names stay explicit, but an exact immutable UUID must remain
+        # recoverable even when Claude never assigned a user-facing title.
+        if query not in records:
+            transcript = self._find_transcript(query)
+            if transcript is not None:
+                records[query] = Candidate(
+                    provider=self.name,
+                    session_id=query,
+                    name=self._title_from_transcript(transcript),
+                    transcript_path=str(transcript),
+                    updated_at=transcript.stat().st_mtime,
+                    source="claude-history",
+                )
         return sorted(records.values(), key=lambda item: item.updated_at, reverse=True)
 
     def tracked_candidates(self, sessions: Iterable[Session]) -> list[Candidate]:
@@ -800,13 +876,13 @@ class ClaudeProvider(Provider):
             return None
 
     def new_argv(self, name: str, session_id: str | None = None) -> list[str]:
-        argv = ["claude", "--name", name]
+        argv = [self.executable() or self.name, "--name", name]
         if session_id:
             argv.extend(["--session-id", session_id])
         return argv
 
     def resume_argv(self, session_id: str) -> list[str]:
-        return ["claude", "--resume", session_id]
+        return [self.executable() or self.name, "--resume", session_id]
 
     def usage(self, session: Session, store: Store) -> Usage | None:
         if not session.transcript_path:

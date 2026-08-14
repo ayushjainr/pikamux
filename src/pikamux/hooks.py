@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 from .models import Candidate, Session, Status
@@ -16,6 +17,106 @@ from .setup_hooks import hook_spec_fingerprint
 from .store import Store, load_config
 from .tmux import Tmux, TmuxError
 from .ui import terminal_text
+
+
+def _same_path(left: object, right: object) -> bool:
+    if not left or not right:
+        return False
+    try:
+        return Path(str(left)).resolve() == Path(str(right)).resolve()
+    except OSError:
+        return str(left) == str(right)
+
+
+def _launch_hook_mismatch(
+    pending: dict[str, Any],
+    *,
+    provider: str,
+    thread_id: str,
+    pane_id: str | None,
+    cwd: object,
+    parent_session_id: str | None = None,
+) -> str | None:
+    if str(pending["provider"]) != provider:
+        return f"expected provider {pending['provider']}, observed {provider}"
+    expected_id = str(pending.get("expected_session_id") or "")
+    if expected_id and expected_id != thread_id:
+        return f"expected UUID {expected_id}, observed {thread_id}"
+    if str(pending["provider"]) == "codex" and parent_session_id:
+        return f"expected a new root thread, observed child of {parent_session_id}"
+    expected_pane = str(pending.get("tmux_pane") or "")
+    if expected_pane and expected_pane != str(pane_id or ""):
+        return f"expected pane {expected_pane}, observed {pane_id or 'none'}"
+    if not _same_path(pending.get("cwd"), cwd):
+        return f"expected cwd {pending.get('cwd')}, observed {cwd or 'none'}"
+    return None
+
+
+def _record_launch_conflict(
+    store: Store,
+    launch_token: str,
+    provider: str,
+    session_id: str,
+    detail: str,
+) -> None:
+    store.set_meta(f"launch_binding_error:{launch_token}", detail)
+    store.set_meta(
+        f"launch_binding_competitor:{launch_token}",
+        json.dumps([provider, session_id]),
+    )
+    binding = store.get_launch_binding(launch_token)
+    if binding is None:
+        return
+    winner = store.get_session(*binding)
+    if winner is None or binding == (provider, session_id):
+        return
+    store.capture_identity_interruption(*winner.key)
+    now = time.time()
+    store.update_session(
+        *winner.key,
+        status=Status.OPEN_TWICE.value,
+        unread=True,
+        error=(
+            "launch token observed competing provider UUIDs: "
+            f"{binding[0]}:{binding[1][:8]}, {provider}:{session_id[:8]}"
+        ),
+        attention_reason="identity",
+        last_event_at=now,
+        last_activity_at=now,
+    )
+
+
+def _apply_launch_conflict(
+    store: Store, launch_token: str, winner: Session
+) -> None:
+    raw = store.get_meta(f"launch_binding_competitor:{launch_token}")
+    if not raw:
+        return
+    try:
+        provider, session_id = json.loads(raw)
+    except (TypeError, ValueError):
+        return
+    if (provider, session_id) == winner.key:
+        return
+    store.capture_identity_interruption(*winner.key)
+    now = time.time()
+    store.update_session(
+        *winner.key,
+        status=(
+            Status.OPEN_TWICE.value
+            if provider == winner.provider
+            else Status.ERROR.value
+        ),
+        unread=True,
+        error=(
+            "launch token observed competing provider UUIDs: "
+            f"{winner.provider}:{winner.session_id[:8]}, "
+            f"{provider}:{str(session_id)[:8]}"
+        ),
+        attention_reason="identity",
+        last_event_at=now,
+        last_activity_at=now,
+    )
 
 
 def _event_state(
@@ -117,7 +218,6 @@ def handle_hook(
         or transcript_metadata.get("session_id")
         or reported_session_id
     )
-    store.set_meta(f"hook_seen:{provider}", hook_spec_fingerprint(provider))
     if provider == "codex" and codex_worker_originator(
         thread_id,
         transcript_path,
@@ -129,6 +229,17 @@ def handle_hook(
         _repair_worker_pane_claim(provider, thread_id, store, tmux)
         store.delete_session(provider, thread_id)
         return None
+    fingerprint = hook_spec_fingerprint(provider)
+    store.set_meta(f"hook_seen:{provider}", fingerprint)
+    store.record_hook_observation(
+        provider,
+        fingerprint,
+        str(data.get("hook_event_name") or "unknown"),
+        thread_id,
+        source=str(data.get("source") or transcript_metadata.get("source") or "")
+        or None,
+        managed=bool(os.environ.get("PIKA_LAUNCH_TOKEN")),
+    )
     existing = store.get_session_by_thread(provider, thread_id)
     provider_candidate = None
     if provider == "codex" and existing is None:
@@ -185,19 +296,74 @@ def handle_hook(
     ):
         store.delete_live_owner(provider, canonical_session_id)
         return None
+    pane_id = os.environ.get("TMUX_PANE")
+    launch_token = os.environ.get("PIKA_LAUNCH_TOKEN")
+    pending = store.get_pending(launch_token) if launch_token else None
+    pane_pending = store.find_pending_for_pane(pane_id) if pane_id else None
+    if pane_pending and (
+        not launch_token or launch_token != str(pane_pending["launch_token"])
+    ):
+        # Pane location is context, not launch identity. A provider hook must
+        # carry the exact token Pika injected before it can bind, tag, or
+        # delete a pending launch.
+        if data.get("hook_event_name") != "SessionEnd":
+            _record_launch_conflict(
+                store,
+                str(pane_pending["launch_token"]),
+                provider,
+                canonical_session_id,
+                "refused launch hook: missing or wrong PIKA_LAUNCH_TOKEN",
+            )
+        return None
+    if (
+        launch_token
+        and pending is None
+        and store.get_launch_binding(launch_token) is None
+    ):
+        # Unknown/stale environment values cannot mint a launch binding.
+        launch_token = None
+    if pending:
+        mismatch = _launch_hook_mismatch(
+            pending,
+            provider=provider,
+            thread_id=thread_id,
+            pane_id=pane_id,
+            cwd=data.get("cwd"),
+            parent_session_id=(
+                str(provider_candidate.parent_session_id)
+                if provider_candidate and provider_candidate.parent_session_id
+                else None
+            ),
+        )
+        if mismatch:
+            assert launch_token is not None
+            if data.get("hook_event_name") != "SessionEnd":
+                _record_launch_conflict(
+                    store,
+                    launch_token,
+                    provider,
+                    canonical_session_id,
+                    "refused launch hook: " + mismatch,
+                )
+            return None
+    if launch_token and not store.bind_launch(
+        launch_token, provider, canonical_session_id
+    ):
+        if data.get("hook_event_name") != "SessionEnd":
+            _record_launch_conflict(
+                store,
+                launch_token,
+                provider,
+                canonical_session_id,
+                f"refused competing {provider}:{canonical_session_id}",
+            )
+        return None
     owner_pid = provider_ancestor(os.getppid(), provider)
     if data.get("hook_event_name") == "SessionEnd":
         if owner_pid:
             store.delete_live_owner(provider, canonical_session_id, pid=owner_pid)
     elif owner_pid:
         store.set_live_owner(provider, canonical_session_id, owner_pid)
-    pane_id = os.environ.get("TMUX_PANE")
-    launch_token = os.environ.get("PIKA_LAUNCH_TOKEN")
-    pending = store.get_pending(launch_token) if launch_token else None
-    if pending is None and pane_id:
-        pending = store.find_pending_for_pane(pane_id)
-        if pending:
-            launch_token = str(pending["launch_token"])
     placeholder = store.get_session(provider, f"unbound:{pane_id}") if pane_id else None
     pane = tmux.get_pane(pane_id) if pane_id else None
     provider_name = data.get("session_title")
@@ -281,10 +447,13 @@ def handle_hook(
         last_activity_at=now,
     )
     store.upsert_session(session)
+    if launch_token:
+        _apply_launch_conflict(store, launch_token, session)
     if store.is_untracked(provider, canonical_session_id):
         return None
     if placeholder and placeholder.session_id != canonical_session_id:
         store.delete_session(provider, placeholder.session_id)
+    pane_tagged = False
     if pane:
         try:
             tmux.tag_pane(
@@ -296,9 +465,14 @@ def handle_hook(
             )
         except (OSError, TmuxError):
             pass
+        else:
+            pane_tagged = True
     if launch_token:
-        store.bind_launch(launch_token, provider, canonical_session_id)
-        store.delete_pending(launch_token)
+        # A provider UUID is known, but a pending launch is not complete until
+        # its physical home carries the same exact identity. A later hook can
+        # retry a transient tmux failure using the insert-or-confirm binding.
+        if pending is None or pane_tagged:
+            store.delete_pending(launch_token)
         attach_key = f"attached_launch:{launch_token}"
         if store.get_meta(attach_key):
             store.record_attach(provider, canonical_session_id)

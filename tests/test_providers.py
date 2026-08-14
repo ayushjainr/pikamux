@@ -62,6 +62,17 @@ class ProviderTests(unittest.TestCase):
         )
         self.assertEqual(ClaudeProvider(self.root).import_candidates(), [])
 
+    def test_claude_exact_uuid_finds_unnamed_resumable_history(self) -> None:
+        project = self.root / "projects" / "repo"
+        project.mkdir(parents=True)
+        session_id = "11111111-1111-4111-8111-111111111111"
+        (project / f"{session_id}.jsonl").write_text(
+            json.dumps({"type": "user", "message": "hello"}) + "\n"
+        )
+        matches = ClaudeProvider(self.root).find_candidates(session_id)
+        self.assertEqual([item.session_id for item in matches], [session_id])
+        self.assertIsNone(matches[0].name)
+
     def test_claude_import_includes_explicit_historical_title(self) -> None:
         project = self.root / "projects" / "repo"
         project.mkdir(parents=True)
@@ -201,6 +212,34 @@ class ProviderTests(unittest.TestCase):
                 "77777777-7777-7777-8777-777777777777"
             )
         )
+
+    def test_codex_exact_uuid_finds_unnamed_resumable_thread(self) -> None:
+        session_id = "11111111-1111-4111-8111-111111111111"
+        rollout = self.root / "unnamed.jsonl"
+        rollout.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": session_id, "cwd": "/tmp"},
+                }
+            )
+            + "\n"
+        )
+        with sqlite3.connect(self.root / "state_current.sqlite") as db:
+            db.execute(
+                "CREATE TABLE threads "
+                "(id TEXT PRIMARY KEY, name TEXT, cwd TEXT, rollout_path TEXT, "
+                "archived INTEGER, updated_at INTEGER)"
+            )
+            db.execute(
+                "INSERT INTO threads VALUES (?,?,?,?,0,1)",
+                (session_id, None, "/tmp", str(rollout)),
+            )
+        provider = CodexProvider(self.root)
+        self.assertEqual(provider.discover(), [])
+        matches = provider.find_candidates(session_id)
+        self.assertEqual([item.session_id for item in matches], [session_id])
+        self.assertIsNone(matches[0].name)
 
     def test_codex_archived_row_is_hidden_even_with_legacy_name(self) -> None:
         active_id = "11111111-1111-4111-8111-111111111111"
@@ -345,6 +384,10 @@ class ProviderTests(unittest.TestCase):
         process = FakeAppServer()
         with (
             patch.object(CodexProvider, "installed", return_value=True),
+            patch(
+                "pikamux.providers.configured_executable",
+                return_value="codex",
+            ),
             patch("pikamux.providers.subprocess.Popen", return_value=process) as popen,
             patch(
                 "pikamux.providers.select.select",

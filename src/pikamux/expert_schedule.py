@@ -17,12 +17,12 @@ def unit_directory() -> Path:
     return base / "systemd" / "user"
 
 
-def unit_contents() -> dict[Path, str]:
+def unit_contents(*, runtime_path: str | None = None) -> dict[Path, str]:
     directory = unit_directory()
     command = shlex.join(
         [sys.executable, "-m", "pikamux", "expert", "refresh", "--due", "--json"]
     )
-    service_path = _systemd_escape(_service_path())
+    service_path = _systemd_escape(runtime_path or _service_path())
     return {
         directory / SERVICE_NAME: (
             "[Unit]\n"

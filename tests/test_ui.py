@@ -77,7 +77,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(choose_candidates([candidate]), [])
         rendered = output.getvalue()
         self.assertIn("<unnamed live · 22222222>", rendered)
-        self.assertIn("conversations worth adopting", rendered)
+        self.assertIn("conversations worth adding", rendered)
 
     def test_large_token_counts_use_a_legible_billions_unit(self) -> None:
         self.assertEqual(format_tokens(9_417_690_000), "9.42b")

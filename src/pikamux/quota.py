@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import select
-import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -12,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .executables import configured_executable, executable_available
 from .paths import claude_home
 
 WEEK_MINUTES = 7 * 24 * 60
@@ -41,8 +41,8 @@ def read_provider_quota(provider: str) -> QuotaSnapshot | None:
 
 def read_codex_quota() -> QuotaSnapshot | None:
     """Read the authenticated account snapshot without starting a model turn."""
-    executable = shutil.which("codex")
-    if executable is None:
+    executable = configured_executable("codex")
+    if not executable_available(executable):
         return None
     process: subprocess.Popen[str] | None = None
     try:

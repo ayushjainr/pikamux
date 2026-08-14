@@ -6,6 +6,7 @@ from typing import Any
 
 
 class Status(str, Enum):
+    STARTING = "STARTING"
     NEEDS_YOU = "NEEDS YOU"
     OPEN_TWICE = "OPEN TWICE"
     WORKING = "WORKING"
@@ -21,8 +22,9 @@ ATTENTION_ORDER = {
     Status.ERROR.value: 2,
     Status.READY.value: 3,
     Status.WORKING.value: 4,
-    Status.PARKED.value: 5,
-    Status.UNBOUND.value: 6,
+    Status.STARTING.value: 5,
+    Status.PARKED.value: 6,
+    Status.UNBOUND.value: 7,
 }
 
 
@@ -113,6 +115,18 @@ class NodeCandidate:
     @property
     def key(self) -> str:
         return self.ssh_target.casefold()
+
+
+@dataclass(frozen=True, slots=True)
+class NodeDiscoveryReport:
+    candidates: tuple[NodeCandidate, ...]
+    ssh_aliases: int = 0
+    ssh_config_files: int = 0
+    tailscale_total: int = 0
+    tailscale_compatible: int = 0
+    excluded_non_linux: int = 0
+    excluded_no_target: int = 0
+    tailscale_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +231,85 @@ class Candidate:
     @property
     def display_name(self) -> str:
         return self.name or f"{self.provider}-{self.session_id[:8]}"
+
+
+@dataclass(slots=True)
+class PendingLaunch:
+    launch_token: str
+    provider: str
+    name: str
+    cwd: str
+    tmux_session: str | None
+    tmux_pane: str | None
+    created_at: float
+    expected_session_id: str | None = None
+    root_pid: int | None = None
+    root_pid_start: int | None = None
+    status: str = Status.STARTING.value
+    live: bool = False
+    attached: bool = False
+    error: str | None = None
+    attention_reason: str | None = "identity pending"
+    last_activity_at: float = 0.0
+    last_event_at: float = 0.0
+    unread: bool = False
+    managed: bool = True
+    source: str = "pending-launch"
+    branch: str | None = None
+    transcript_path: str | None = None
+    model: str | None = None
+    home_state: str = "identity-pending"
+    cpu_percent: float | None = None
+    rss_kb: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    total_tokens: int | None = None
+    estimated_cost_usd: float | None = None
+    active_thread_id: str | None = None
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return "pending", self.launch_token
+
+    @property
+    def session_id(self) -> str:
+        """Compatibility fingerprint for presentation; never provider identity."""
+        return self.launch_token
+
+    @property
+    def display_name(self) -> str:
+        return self.name
+
+    @property
+    def needs_attention(self) -> bool:
+        return self.status == Status.ERROR.value and self.unread
+
+    @property
+    def exact_home(self) -> bool:
+        return False
+
+    @property
+    def provider_thread_id(self) -> str:
+        return self.expected_session_id or self.launch_token
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "pending-launch",
+            "launch_token": self.launch_token,
+            "provider": self.provider,
+            "name": self.name,
+            "cwd": self.cwd,
+            "tmux_session": self.tmux_session,
+            "tmux_pane": self.tmux_pane,
+            "created_at": self.created_at,
+            "expected_session_id": self.expected_session_id,
+            "status": self.status,
+            "live": self.live,
+            "attached": self.attached,
+            "error": self.error,
+        }
 
 
 @dataclass(slots=True)

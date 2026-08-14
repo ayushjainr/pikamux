@@ -33,6 +33,24 @@ class SetupTests(unittest.TestCase):
             change = pika_config_change("codex", "rstudio-6")
         self.assertEqual(json.loads(change.after)["machine_alias"], "rstudio-6")
 
+    def test_provider_executables_and_runtime_path_are_persisted(self) -> None:
+        target = self.root / "config.json"
+        with patch("pikamux.setup_hooks.config_path", return_value=target):
+            change = pika_config_change(
+                "codex",
+                provider_executables={
+                    "codex": "/opt/codex/bin/codex",
+                    "claude": "/opt/claude/bin/claude",
+                },
+                provider_runtime_path="/opt/codex/bin:/opt/claude/bin:/usr/bin",
+            )
+        data = json.loads(change.after)
+        self.assertEqual(data["provider_executables"]["codex"], "/opt/codex/bin/codex")
+        self.assertEqual(
+            data["provider_runtime_path"],
+            "/opt/codex/bin:/opt/claude/bin:/usr/bin",
+        )
+
     def test_json_hook_merges_preserve_existing_entries_and_are_idempotent(
         self,
     ) -> None:

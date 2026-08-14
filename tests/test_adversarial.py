@@ -818,9 +818,14 @@ class AdversarialTests(unittest.TestCase):
         )
         tmux = StaticTmux([pane()])
         pika = Pika(self.store, tmux, {"codex": FakeProvider(active=[999])})
-        with patch("pikamux.core.provider_process", return_value=999):
+        with patch(
+            "pikamux.core.provider_process",
+            side_effect=lambda _pid, provider=None: 999
+            if provider == "codex"
+            else None,
+        ):
             imported = pika.import_candidate(candidate)
-        self.assertEqual(imported.status, Status.READY.value)
+        self.assertEqual(imported.status, Status.WORKING.value)
         self.assertTrue(imported.managed)
         self.assertEqual(imported.tmux_pane, "%1")
         self.assertEqual(tmux.tags[0][1]["session_id"], candidate.session_id)
@@ -837,6 +842,31 @@ class AdversarialTests(unittest.TestCase):
         imported = outside.import_candidate(second)
         self.assertEqual(imported.status, Status.UNBOUND.value)
         self.assertFalse(imported.managed)
+
+    def test_live_import_rejects_mixed_provider_pane(self) -> None:
+        candidate = Candidate(
+            "codex",
+            "11111111-1111-4111-8111-111111111111",
+            name="mixed",
+            cwd="/tmp",
+            live=True,
+            pid=999,
+        )
+        tmux = StaticTmux([pane()])
+        pika = Pika(self.store, tmux, {"codex": FakeProvider(active=[999])})
+
+        def mixed_provider(_pid, provider=None):
+            return 999 if provider == "codex" else 888
+
+        with (
+            patch("pikamux.core.provider_process", side_effect=mixed_provider),
+            patch("pikamux.core.process_tree", return_value=[123, 999, 888]),
+        ):
+            imported = pika.import_candidate(candidate)
+        self.assertEqual(imported.status, Status.UNBOUND.value)
+        self.assertEqual(tmux.tags, [])
+        self.assertFalse(imported.managed)
+        self.assertIsNone(imported.tmux_pane)
 
     def test_adopt_name_finds_the_untagged_tmux_pane(self) -> None:
         session_id = "33333333-3333-4333-8333-333333333333"
@@ -881,7 +911,7 @@ class AdversarialTests(unittest.TestCase):
             patch.object(pika, "resolve", return_value=session),
             self.assertRaisesRegex(
                 PikaError,
-                "running outside tmux.*cannot be moved safely.*pika open 44444444",
+                "running outside tmux.*cannot be moved safely.*pika outside-agent",
             ),
         ):
             pika.adopt("outside-agent")
@@ -948,13 +978,15 @@ class AdversarialTests(unittest.TestCase):
                 1,
             )
 
-    def test_new_codex_requires_observed_current_hook_definition(self) -> None:
+    def test_new_codex_can_start_before_first_hook_observation(self) -> None:
         pika = Pika(self.store, StaticTmux(), {"codex": FakeProvider()})
-        with (
-            patch("pikamux.core.hooks_installed", return_value=True),
-            self.assertRaisesRegex(PikaError, "current Codex hook definition"),
-        ):
-            pika.new("guarded", "codex", "/tmp", attach=False)
+        provider = pika.providers["codex"]
+        provider.new_argv = lambda name, session_id=None: ["codex"]
+        with patch("pikamux.core.hooks_installed", return_value=True):
+            self.assertEqual(pika.new("guarded", "codex", "/tmp", attach=False), 0)
+        pending = self.store.list_pending()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["name"], "guarded")
 
     def test_doctor_rejects_untracked_live_owner(self) -> None:
         config = self.root / "config.json"
@@ -1094,7 +1126,12 @@ class AdversarialTests(unittest.TestCase):
         config.write_text('{"default_provider":"codex"}\n')
         os.chmod(config, 0o600)
         self.store.initialize()
-        self.store.set_meta("hook_seen:codex", hook_spec_fingerprint("codex"))
+        self.store.record_hook_observation(
+            "codex",
+            hook_spec_fingerprint("codex"),
+            "session_start",
+            "11111111-1111-4111-8111-111111111111",
+        )
         pika = Pika(self.store, StaticTmux(), {"codex": FakeProvider()})
         output = io.StringIO()
         with (

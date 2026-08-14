@@ -27,6 +27,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "default_provider": "codex",
     "alerts": "tmux",
     "peek_lines": 200,
+    "provider_executables": {},
     # Codex app-server clients used as automation harnesses create real UUIDs,
     # but their short-lived workers are not user-facing conversations.  Keep
     # the known harness origins out of Pika while allowing installations to
@@ -102,6 +103,12 @@ class Store:
                     cwd TEXT NOT NULL,
                     tmux_session TEXT,
                     tmux_pane TEXT,
+                    expected_session_id TEXT,
+                    root_pid INTEGER,
+                    root_pid_start INTEGER,
+                    preexisting_session_ids_json TEXT,
+                    candidate_session_id TEXT,
+                    candidate_observed_at REAL,
                     created_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS launch_reservations (
@@ -126,6 +133,15 @@ class Store:
                     start_time INTEGER,
                     last_seen REAL NOT NULL,
                     PRIMARY KEY (provider, session_id, pid)
+                );
+                CREATE TABLE IF NOT EXISTS recovery_owners (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    pid INTEGER NOT NULL,
+                    start_time INTEGER NOT NULL,
+                    launch_token TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (provider, session_id)
                 );
                 CREATE TABLE IF NOT EXISTS untracked_sessions (
                     provider TEXT NOT NULL,
@@ -152,6 +168,15 @@ class Store:
                 CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS hook_observations (
+                    provider TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL,
+                    event_name TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    observed_at REAL NOT NULL,
+                    source TEXT,
+                    managed INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS session_events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -268,6 +293,33 @@ class Store:
                 db.execute(
                     "ALTER TABLE launch_reservations "
                     "ADD COLUMN owner_start_time INTEGER"
+                )
+            pending_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(pending_launches)").fetchall()
+            }
+            if "expected_session_id" not in pending_columns:
+                db.execute(
+                    "ALTER TABLE pending_launches ADD COLUMN expected_session_id TEXT"
+                )
+            if "root_pid" not in pending_columns:
+                db.execute("ALTER TABLE pending_launches ADD COLUMN root_pid INTEGER")
+            if "root_pid_start" not in pending_columns:
+                db.execute(
+                    "ALTER TABLE pending_launches ADD COLUMN root_pid_start INTEGER"
+                )
+            if "preexisting_session_ids_json" not in pending_columns:
+                db.execute(
+                    "ALTER TABLE pending_launches "
+                    "ADD COLUMN preexisting_session_ids_json TEXT"
+                )
+            if "candidate_session_id" not in pending_columns:
+                db.execute(
+                    "ALTER TABLE pending_launches ADD COLUMN candidate_session_id TEXT"
+                )
+            if "candidate_observed_at" not in pending_columns:
+                db.execute(
+                    "ALTER TABLE pending_launches ADD COLUMN candidate_observed_at REAL"
                 )
             session_columns = {
                 str(row["name"])
@@ -551,6 +603,7 @@ class Store:
                 "identity_interruptions",
                 "expert_refresh_attempts",
                 "live_owners",
+                "recovery_owners",
                 "launch_reservations",
             ):
                 db.execute(
@@ -664,6 +717,7 @@ class Store:
                 "expert_profiles",
                 "expert_refresh_attempts",
                 "live_owners",
+                "recovery_owners",
                 "launch_reservations",
             ):
                 db.execute(
@@ -1042,17 +1096,39 @@ class Store:
         cwd: str,
         tmux_session: str | None = None,
         tmux_pane: str | None = None,
-    ) -> None:
+        expected_session_id: str | None = None,
+        preexisting_session_ids: list[str] | None = None,
+    ) -> bool:
         self.initialize()
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            competing = db.execute(
+                """
+                SELECT launch_token FROM pending_launches
+                WHERE provider=? AND name=? COLLATE NOCASE AND launch_token!=?
+                LIMIT 1
+                """,
+                (provider, name, launch_token),
+            ).fetchone()
+            if competing:
+                return False
             db.execute(
                 """
                 INSERT INTO pending_launches
-                    (launch_token, provider, name, cwd, tmux_session, tmux_pane, created_at)
-                VALUES (?,?,?,?,?,?,?)
+                    (launch_token, provider, name, cwd, tmux_session, tmux_pane,
+                     expected_session_id, preexisting_session_ids_json, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(launch_token) DO UPDATE SET
                     tmux_session=COALESCE(excluded.tmux_session, pending_launches.tmux_session),
-                    tmux_pane=COALESCE(excluded.tmux_pane, pending_launches.tmux_pane)
+                    tmux_pane=COALESCE(excluded.tmux_pane, pending_launches.tmux_pane),
+                    expected_session_id=COALESCE(
+                        excluded.expected_session_id,
+                        pending_launches.expected_session_id
+                    ),
+                    preexisting_session_ids_json=COALESCE(
+                        excluded.preexisting_session_ids_json,
+                        pending_launches.preexisting_session_ids_json
+                    )
                 """,
                 (
                     launch_token,
@@ -1061,9 +1137,53 @@ class Store:
                     cwd,
                     tmux_session,
                     tmux_pane,
+                    expected_session_id,
+                    (
+                        json.dumps(sorted(set(preexisting_session_ids)))
+                        if preexisting_session_ids is not None
+                        else None
+                    ),
                     time.time(),
                 ),
             )
+        return True
+
+    def list_pending(self) -> list[dict[str, Any]]:
+        self.initialize()
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM pending_launches ORDER BY created_at"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def observe_pending_candidate(
+        self, launch_token: str, session_id: str
+    ) -> float | None:
+        """Record one stable recovery candidate; return its first-seen time."""
+        self.initialize()
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT candidate_session_id,candidate_observed_at "
+                "FROM pending_launches WHERE launch_token=?",
+                (launch_token,),
+            ).fetchone()
+            if row is None:
+                return None
+            if str(row["candidate_session_id"] or "") == session_id:
+                return (
+                    float(row["candidate_observed_at"])
+                    if row["candidate_observed_at"] is not None
+                    else None
+                )
+            db.execute(
+                "UPDATE pending_launches "
+                "SET candidate_session_id=?,candidate_observed_at=? "
+                "WHERE launch_token=?",
+                (session_id, now, launch_token),
+            )
+        return None
 
     def get_pending(self, launch_token: str) -> dict[str, Any] | None:
         self.initialize()
@@ -1087,6 +1207,8 @@ class Store:
         launch_token: str,
         tmux_session: str,
         tmux_pane: str,
+        root_pid: int | None = None,
+        root_pid_start: int | None = None,
     ) -> tuple[str, str] | None:
         """Record a created pane without resurrecting an already-bound launch."""
         self.initialize()
@@ -1105,10 +1227,10 @@ class Store:
             db.execute(
                 """
                 UPDATE pending_launches
-                SET tmux_session=?, tmux_pane=?
+                SET tmux_session=?, tmux_pane=?, root_pid=?, root_pid_start=?
                 WHERE launch_token=?
                 """,
-                (tmux_session, tmux_pane, launch_token),
+                (tmux_session, tmux_pane, root_pid, root_pid_start, launch_token),
             )
         return None
 
@@ -1132,20 +1254,28 @@ class Store:
             )
             return cur.rowcount
 
-    def bind_launch(self, launch_token: str, provider: str, session_id: str) -> None:
+    def bind_launch(self, launch_token: str, provider: str, session_id: str) -> bool:
+        """Claim a launch once; a competing UUID can never overwrite it."""
         self.initialize()
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                "SELECT provider,session_id FROM launch_bindings WHERE launch_token=?",
+                (launch_token,),
+            ).fetchone()
+            if existing:
+                return (str(existing["provider"]), str(existing["session_id"])) == (
+                    provider,
+                    session_id,
+                )
             db.execute(
                 """
                 INSERT INTO launch_bindings(launch_token, provider, session_id, created_at)
                 VALUES (?,?,?,?)
-                ON CONFLICT(launch_token) DO UPDATE SET
-                    provider=excluded.provider,
-                    session_id=excluded.session_id,
-                    created_at=excluded.created_at
                 """,
                 (launch_token, provider, session_id, time.time()),
             )
+        return True
 
     def get_launch_binding(self, launch_token: str) -> tuple[str, str] | None:
         self.initialize()
@@ -1239,6 +1369,53 @@ class Store:
             )
             for row in rows
         ]
+
+    def set_recovery_owner(
+        self,
+        provider: str,
+        session_id: str,
+        pid: int,
+        start_time: int,
+        launch_token: str,
+    ) -> None:
+        """Persist command-recovery provenance separately from hook leases."""
+        self.initialize()
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO recovery_owners(
+                    provider,session_id,pid,start_time,launch_token,created_at
+                ) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(provider,session_id) DO UPDATE SET
+                    pid=excluded.pid,
+                    start_time=excluded.start_time,
+                    launch_token=excluded.launch_token,
+                    created_at=excluded.created_at
+                """,
+                (provider, session_id, pid, start_time, launch_token, time.time()),
+            )
+
+    def get_recovery_owner(
+        self, provider: str, session_id: str
+    ) -> tuple[int, int, str] | None:
+        self.initialize()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT pid,start_time,launch_token FROM recovery_owners "
+                "WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return int(row["pid"]), int(row["start_time"]), str(row["launch_token"])
+
+    def delete_recovery_owner(self, provider: str, session_id: str) -> None:
+        self.initialize()
+        with self.connect() as db:
+            db.execute(
+                "DELETE FROM recovery_owners WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            )
 
     def delete_live_owner(
         self, provider: str, session_id: str, pid: int | None = None
@@ -1532,6 +1709,51 @@ class Store:
                 "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value),
             )
+
+    def record_hook_observation(
+        self,
+        provider: str,
+        fingerprint: str,
+        event_name: str,
+        session_id: str,
+        *,
+        source: str | None = None,
+        managed: bool = False,
+        observed_at: float | None = None,
+    ) -> None:
+        self.initialize()
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO hook_observations(
+                    provider,fingerprint,event_name,session_id,observed_at,source,managed
+                ) VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(provider) DO UPDATE SET
+                    fingerprint=excluded.fingerprint,
+                    event_name=excluded.event_name,
+                    session_id=excluded.session_id,
+                    observed_at=excluded.observed_at,
+                    source=excluded.source,
+                    managed=excluded.managed
+                """,
+                (
+                    provider,
+                    fingerprint,
+                    event_name,
+                    session_id,
+                    observed_at if observed_at is not None else time.time(),
+                    source,
+                    int(managed),
+                ),
+            )
+
+    def get_hook_observation(self, provider: str) -> dict[str, Any] | None:
+        self.initialize()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM hook_observations WHERE provider=?", (provider,)
+            ).fetchone()
+        return dict(row) if row else None
 
     def get_meta(self, key: str) -> str | None:
         self.initialize()

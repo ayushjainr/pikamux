@@ -132,7 +132,7 @@ class MonitorTests(unittest.TestCase):
             MonitorState(last_update=time.time()), width=90, height=20, color=False
         )
         self.assertIn("No managed homes yet", empty.plain)
-        self.assertIn("pika new NAME", empty.plain)
+        self.assertIn("pika NAME", empty.plain)
 
         minimum = render_monitor(
             MonitorState(sessions=self.sessions, last_update=time.time()),
@@ -198,9 +198,8 @@ class MonitorTests(unittest.TestCase):
         )
         state = MonitorState(sessions=[unbound])
         action, selected = _handle_key("enter", Mock(), state)
-        self.assertEqual(action, "continue")
-        self.assertIsNone(selected)
-        self.assertIn("adopt", state.toast)
+        self.assertEqual(action, "enter")
+        self.assertEqual(selected, unbound)
 
         identity_error = Session(
             "codex",
@@ -319,7 +318,7 @@ class MonitorTests(unittest.TestCase):
         _index, _total, tip = playbook_tip(
             0.0, [*self.sessions, unbound], selected=unbound, compact=True
         )
-        self.assertIn("pika adopt", tip)
+        self.assertIn("pika NAME", tip)
         self.assertLessEqual(len(f"PIKA TIP 1/2 // {tip}"), 58)
 
         failed = Session("codex", "failed", status=Status.ERROR.value)

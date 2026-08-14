@@ -25,7 +25,7 @@ from .consult import (
     consultation_policy,
 )
 from .experts import ExpertCardState
-from .models import ExpertProfile, FleetNode, FleetSession, Session, Status
+from .models import ExpertProfile, FleetNode, FleetSession, PendingLaunch, Session, Status
 from .pricing import PRICING_AS_OF
 from .ui import (
     PROVIDER_MARK,
@@ -118,8 +118,8 @@ PLAYBOOK_TIPS = (
     (
         "adopt",
         "A live process outside an exact home stays unbound; "
-        "use pika adopt to protect it.",
-        "UNBOUND? Run pika adopt for an exact home.",
+        "use pika NAME to protect it.",
+        "UNBOUND? Exit agent; rerun pika NAME.",
     ),
     (
         "resume",
@@ -158,6 +158,10 @@ class MonitorPika(Protocol):
     ) -> list[Session | FleetSession]: ...
 
     def open(self, session: Session | FleetSession, *, attach: bool = True) -> int: ...
+
+    def open_pending(self, session: PendingLaunch, *, attach: bool = True) -> int: ...
+
+    def enter(self, query: str, *, attach: bool = True) -> int: ...
 
     def acknowledge(
         self, session: Session | FleetSession, *, attaching: bool = False
@@ -430,6 +434,7 @@ def _status_code(status: str) -> str:
         Status.ERROR.value: FG_RED,
         Status.READY.value: FG_GREEN,
         Status.WORKING.value: FG_CYAN,
+        Status.STARTING.value: FG_YELLOW,
         Status.PARKED.value: FG_BRIGHT_BLACK,
         Status.UNBOUND.value: FG_MAGENTA,
     }.get(status, "")
@@ -454,6 +459,7 @@ def _session_counts(sessions: list[Session | FleetSession]) -> dict[str, int]:
             item.status == Status.READY.value and item.unread for item in current
         ),
         "working": sum(item.status == Status.WORKING.value for item in current),
+        "starting": sum(item.status == Status.STARTING.value for item in current),
         "parked": sum(item.status == Status.PARKED.value for item in current),
         "errors": sum(
             item.status in {Status.ERROR.value, Status.OPEN_TWICE.value} and item.unread
@@ -522,7 +528,8 @@ def _briefing_lines(
         prefix = "LAST KNOWN" if refresh_error else "NO ATTENTION PENDING"
         headline = (
             f"{prefix} · {counts['working']} working · "
-            f"{counts['parked']} parked · {counts['protected']} exact live"
+            f"{counts['starting']} starting · {counts['parked']} parked · "
+            f"{counts['protected']} exact live"
         )
         if counts["cached"]:
             headline += f" · {counts['cached']} cached"
@@ -530,7 +537,8 @@ def _briefing_lines(
         headline = (
             f"{counts['results']} {_noun(counts['results'], 'RESULT')} "
             "READY TO COLLECT · "
-            f"{counts['working']} STILL WORKING"
+            f"{counts['working']} STILL WORKING · "
+            f"{counts['starting']} STARTING"
         )
     elif width < 80:
         headline = (
@@ -543,7 +551,8 @@ def _briefing_lines(
             f"{_noun(interventions, 'PLACE')} · "
             f"{counts['results']} "
             f"{_noun(counts['results'], 'RESULT', 'RESULTS')} WAITING · "
-            f"{counts['working']} STILL WORKING"
+            f"{counts['working']} STILL WORKING · "
+            f"{counts['starting']} STARTING"
         )
         if counts["errors"]:
             headline += f" · {counts['errors']} FAILED"
@@ -566,7 +575,7 @@ def _briefing_lines(
                 None,
             )
             context = (
-                f"NEXT → {unbound.display_name} · run pika adopt"
+                f"NEXT → {unbound.display_name} · run pika {unbound.display_name}"
                 if unbound
                 else (
                     f"WORKING {counts['working']} · PARKED {counts['parked']} · "
@@ -650,6 +659,7 @@ def semantic_age(session: Session, now: float) -> str:
         Status.OPEN_TWICE.value: "DUPLICATE",
         Status.READY.value: "RESULT",
         Status.WORKING.value: "ACTIVE",
+        Status.STARTING.value: "STARTING",
         Status.PARKED.value: "IDLE",
         Status.ERROR.value: "FAILED",
         Status.UNBOUND.value: "UNBOUND",
@@ -739,7 +749,8 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
             "u usage · r refresh · ? keys · q/Esc close",
             (
                 f"Need {counts['decisions']} · results {counts['results']} · "
-                f"failed {counts['errors']} · unbound {counts['unbound']}"
+                f"starting {counts['starting']} · failed {counts['errors']} · "
+                f"unbound {counts['unbound']}"
             ),
         ]
     else:
@@ -755,7 +766,8 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
             (
                 f"Inventory: {counts['decisions']} decisions · "
                 f"{counts['results']} results · "
-                f"{counts['working']} working · {counts['parked']} parked · "
+                f"{counts['working']} working · {counts['starting']} starting · "
+                f"{counts['parked']} parked · "
                 f"{counts['errors']} errors · {counts['unbound']} unbound"
             ),
             "Pika never guesses identity. Enter acts on the selected provider + UUID.",
@@ -846,6 +858,11 @@ def _identity_text(session: Session | FleetSession) -> str:
             f"{proof} · {session.node_name} · {session.provider.title()} · "
             f"id {session.session_id[:8]}"
         )
+    if isinstance(session, PendingLaunch):
+        return (
+            f"IDENTITY PENDING · {session.provider.title()} · "
+            f"launch {session.launch_token[:8]} · PIKA HOME LIVE"
+        )
     provider = session.provider.title()
     fingerprint = session.session_id[:8]
     if session.home_state == "exact-live":
@@ -855,7 +872,7 @@ def _identity_text(session: Session | FleetSession) -> str:
     if session.home_state == "open-twice":
         return f"OPEN TWICE · {provider} · id {fingerprint} · CLOSE ONE COPY"
     if session.home_state == "unbound":
-        return f"UNBOUND PROCESS · {provider} · id {fingerprint} · ADOPT REQUIRED"
+        return f"UNBOUND PROCESS · {provider} · id {fingerprint} · EXIT + PIKA NAME"
     if session.home_state == "outside-live":
         return f"LIVE OUTSIDE PIKA · {provider} · id {fingerprint} · NOT PROTECTED"
     if session.home_state == "saved-idle":
@@ -874,6 +891,7 @@ def _age_phrase(session: Session | FleetSession, now: float) -> str:
         Status.NEEDS_YOU.value: f"waiting on you for {event_age}",
         Status.READY.value: f"result ready for {event_age}",
         Status.WORKING.value: f"last active {activity_age} ago",
+        Status.STARTING.value: f"identity pending for {event_age}",
         Status.PARKED.value: f"last active {activity_age} ago",
         Status.OPEN_TWICE.value: f"duplicate open for {event_age}",
         Status.ERROR.value: f"failed {event_age} ago",
@@ -897,6 +915,7 @@ def _split_groups(
     ordered = sorted_sessions(sessions)
     definitions = (
         ("NEEDS YOU", _needs_you_group),
+        ("STARTING", lambda item: item.status == Status.STARTING.value),
         ("WORKING", lambda item: item.status == Status.WORKING.value),
         ("UNBOUND", lambda item: item.status == Status.UNBOUND.value),
         (
@@ -928,6 +947,7 @@ def _group_color(label: str) -> str:
     return {
         "NEEDS YOU": FG_RED,
         "WORKING": FG_CYAN,
+        "STARTING": FG_YELLOW,
         "UNBOUND": FG_MAGENTA,
         "READY": FG_GREEN,
         "PARKED": FG_BRIGHT_BLACK,
@@ -975,7 +995,7 @@ def _split_left_pane(
             signal = "◆" if _needs_you_group(item) else "□" if item.live else "·"
             provider = PROVIDER_MARK.get(item.provider, "?")
             age = (
-                "adopt"
+                "resolve"
                 if item.status == Status.UNBOUND.value
                 else _human_age_at(
                     item.last_event_at
@@ -1280,9 +1300,9 @@ def _untrack_panel_lines(
         " " * width,
         _fit("Pika will remove this workstream from Live Operations.", width),
         _fit("The agent keeps running. The conversation is not archived.", width),
-        _fit("Its expert card is retained for a later re-adoption.", width),
+        _fit("Its expert card is retained until pika NAME watches it again.", width),
         " " * width,
-        _fit("Use pika adopt or explicitly open it to watch it again.", width),
+        _fit("Use pika NAME to watch it again.", width),
         " " * width,
         _fit("[x / Enter] stop watching    [Esc / q] keep watching", width),
     ]
@@ -1517,8 +1537,11 @@ def _split_right_pane(
         reassurance = (
             "Cached metadata is visible, but Pika will not act as if it is current."
         )
+    elif isinstance(selected, PendingLaunch):
+        actions = "[Enter] open Pika home · identity reconciliation continues"
+        reassurance = "The conversation is visible; Pika has not guessed its UUID."
     elif selected.status == Status.UNBOUND.value and selected.live:
-        actions = "Enter blocked · run pika adopt to create an exact home"
+        actions = "Enter blocked · exit the external agent, then run pika NAME"
         reassurance = "Pika will not guess ownership for a live external process."
     elif selected.home_state in {"identity-error", "open-twice"}:
         ask = " · [a] ask here" if can_ask else ""
@@ -1624,8 +1647,10 @@ def _render_split_monitor(
     summary = [
         f"{need_count} need you",
         f"{counts['working']} working",
-        f"{counts['unbound']} unbound",
     ]
+    if counts["starting"]:
+        summary.append(f"{counts['starting']} starting")
+    summary.append(f"{counts['unbound']} unbound")
     if counts["cached"]:
         summary.append(f"{counts['cached']} cached")
     if state.machines:
@@ -1902,7 +1927,7 @@ def render_monitor(
             table_header,
             _fit("", width),
             _fit(message, width),
-            _fit("Start one with: pika new NAME --agent codex|claude", width),
+            _fit("Start one with: pika NAME", width),
         ]
         table_ansi = [
             _paint(table_header, DIM, color),
@@ -2408,17 +2433,19 @@ def _handle_key(
         if isinstance(session, FleetSession) and session.stale:
             state.notify("Cached remote row — press r to retry its machine first")
         elif session and session.status == Status.UNBOUND.value and session.live:
-            state.notify("Unbound live process — adopt it before opening")
+            return "enter", session
         elif session and session.home_state in {"identity-error", "open-twice"}:
             state.notify("Exact pane identity is unverified — opening remains blocked")
         elif session:
             return "open", session
     elif key in {"ask", "ask-fast"}:
         session = state.selected()
-        if isinstance(session, FleetSession) and session.stale:
+        if isinstance(session, PendingLaunch):
+            state.notify("Identity is still pending — side asks require an exact UUID")
+        elif isinstance(session, FleetSession) and session.stale:
             state.notify("Cached remote row — press r to retry its machine first")
         elif session and session.status == Status.UNBOUND.value and session.live:
-            state.notify("Unbound live process — adopt it before consulting")
+            state.notify("Exit the external agent; rerun pika NAME before consulting")
         elif (
             session
             and not isinstance(session, FleetSession)
@@ -2434,7 +2461,9 @@ def _handle_key(
                 return "ask-open", session
     elif key == "untrack":
         session = state.selected()
-        if isinstance(session, FleetSession) and session.stale:
+        if isinstance(session, PendingLaunch):
+            state.notify("A starting launch cannot be hidden until identity resolves")
+        elif isinstance(session, FleetSession) and session.stale:
             state.notify("Cached remote row — press r to retry its machine first")
         elif session and session.session_id.startswith("unbound:"):
             state.notify("Cannot stop watching until this process has an exact UUID")
@@ -2557,7 +2586,8 @@ def run_monitor(
     next_preview = 0.0
     manual_refresh_pending = False
     manual_fleet_refresh_pending = False
-    selected_to_open: Session | None = None
+    selected_to_open: Session | FleetSession | PendingLaunch | None = None
+    selected_to_enter: str | None = None
     inline_ask: _InlineAskWorker | None = None
     last_frame: str | None = None
     color = "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
@@ -2894,9 +2924,14 @@ def run_monitor(
                         if action == "quit":
                             future = None
                             selected_to_open = None
+                            selected_to_enter = None
                             break
                         if action == "open":
                             selected_to_open = session
+                            future = None
+                            break
+                        if action == "enter" and session is not None:
+                            selected_to_enter = session.display_name
                             future = None
                             break
                         if action == "ask-open" and session is not None:
@@ -2986,7 +3021,11 @@ def run_monitor(
         if inline_ask is not None:
             inline_ask.close()
     if selected_to_open is not None:
+        if isinstance(selected_to_open, PendingLaunch):
+            return pika.open_pending(selected_to_open)
         return pika.open(selected_to_open)
+    if selected_to_enter is not None:
+        return pika.enter(selected_to_enter)
     return 0
 
 

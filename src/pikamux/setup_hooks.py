@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import claude_home, codex_home, config_path
+from .executables import configured_executable, executable_available
 from .expert_schedule import unit_contents
 from .store import DEFAULT_CONFIG
 
@@ -276,8 +277,8 @@ def codex_config_change(home: Path | None = None) -> FileChange:
 
 
 def _validate_codex_config(value: str) -> None:
-    executable = shutil.which("codex")
-    if executable is None:
+    executable = configured_executable("codex")
+    if not executable_available(executable):
         return
     try:
         with tempfile.TemporaryDirectory(prefix="pika-codex-config-") as directory:
@@ -335,7 +336,11 @@ def claude_settings_change(home: Path | None = None) -> FileChange:
 
 
 def pika_config_change(
-    default_provider: str, machine_alias: str | None = None
+    default_provider: str,
+    machine_alias: str | None = None,
+    *,
+    provider_executables: dict[str, str] | None = None,
+    provider_runtime_path: str | None = None,
 ) -> FileChange:
     target = config_path()
     before = target.read_text() if target.exists() else ""
@@ -352,22 +357,35 @@ def pika_config_change(
     data["default_provider"] = default_provider
     if machine_alias:
         data["machine_alias"] = machine_alias
+    if provider_executables is not None:
+        data["provider_executables"] = provider_executables
+    if provider_runtime_path:
+        data["provider_runtime_path"] = provider_runtime_path
     after = json.dumps(data, indent=2, sort_keys=True) + "\n"
     return FileChange(target, before, after)
 
 
 def proposed_changes(
-    default_provider: str, machine_alias: str | None = None
+    default_provider: str,
+    machine_alias: str | None = None,
+    *,
+    provider_executables: dict[str, str] | None = None,
+    provider_runtime_path: str | None = None,
 ) -> list[FileChange]:
     changes = [
-        pika_config_change(default_provider, machine_alias),
+        pika_config_change(
+            default_provider,
+            machine_alias,
+            provider_executables=provider_executables,
+            provider_runtime_path=provider_runtime_path,
+        ),
         codex_hooks_change(),
         codex_config_change(),
         claude_settings_change(),
     ]
     changes.extend(
         FileChange(path, path.read_text() if path.exists() else "", content)
-        for path, content in unit_contents().items()
+        for path, content in unit_contents(runtime_path=provider_runtime_path).items()
     )
     return changes
 
@@ -425,8 +443,8 @@ def hooks_installed(provider: str) -> bool:
 
 def codex_hooks_enabled(home: Path | None = None) -> bool:
     selected_home = home or codex_home()
-    executable = shutil.which("codex")
-    if executable:
+    executable = configured_executable("codex")
+    if executable_available(executable):
         environment = os.environ.copy()
         environment["CODEX_HOME"] = str(selected_home)
         try:

@@ -1,0 +1,132 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from .paths import config_path
+
+
+PROVIDER_NAMES = ("codex", "claude")
+_PATH_LINE = re.compile(r'^Environment="PATH=(?P<value>.*)"$')
+
+
+def _raw_config() -> dict[str, Any]:
+    try:
+        value = json.loads(config_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def configured_executable(
+    provider: str, *, config: dict[str, Any] | None = None
+) -> str | None:
+    """Return Pika's pinned provider command, falling back only for old configs."""
+    values = (config if config is not None else _raw_config()).get(
+        "provider_executables"
+    )
+    if isinstance(values, dict):
+        saved = values.get(provider)
+        if isinstance(saved, str) and saved.strip():
+            return str(Path(saved).expanduser())
+    return shutil.which(provider)
+
+
+def executable_available(value: str | None) -> bool:
+    return bool(value and Path(value).is_file() and os.access(value, os.X_OK))
+
+
+def executable_version(value: str | None) -> str | None:
+    if not executable_available(value):
+        return None
+    try:
+        result = subprocess.run(
+            [str(value), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return (result.stdout or result.stderr).strip() or None
+
+
+def _service_path() -> str | None:
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    target = base / "systemd" / "user" / "pika-expert-refresh.service"
+    try:
+        lines = target.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        match = _PATH_LINE.match(line.strip())
+        if match:
+            return match.group("value").replace("%%", "%").replace('\\"', '"')
+    return None
+
+
+def _from_path(provider: str, value: str | None) -> str | None:
+    if not value:
+        return None
+    for directory in value.split(os.pathsep):
+        candidate = Path(directory).expanduser() / provider
+        if executable_available(str(candidate)):
+            return str(candidate.absolute())
+    return None
+
+
+def setup_executables(
+    config: dict[str, Any], *, overrides: dict[str, str | None] | None = None
+) -> dict[str, str]:
+    """Choose provider commands once and preserve the choice across shells."""
+    overrides = overrides or {}
+    existing = config.get("provider_executables")
+    existing = existing if isinstance(existing, dict) else {}
+    prior_service_path = _service_path()
+    result: dict[str, str] = {}
+    for provider in PROVIDER_NAMES:
+        explicit = overrides.get(provider)
+        saved = existing.get(provider)
+        selected = (
+            str(Path(explicit).expanduser().absolute())
+            if explicit
+            else str(Path(saved).expanduser())
+            if isinstance(saved, str) and saved.strip()
+            else _from_path(provider, prior_service_path)
+            or shutil.which(provider)
+        )
+        if selected:
+            result[provider] = selected
+    return result
+
+
+def setup_runtime_path(
+    config: dict[str, Any], executables: dict[str, str]
+) -> str:
+    """Pin the PATH needed by provider wrappers used by the systemd timer."""
+    saved = config.get("provider_runtime_path")
+    directories: list[str] = []
+    for executable in executables.values():
+        if not executable:
+            continue
+        path = Path(executable)
+        directories.extend((str(path.parent), str(path.resolve().parent)))
+    previous = (
+        saved
+        if isinstance(saved, str) and saved.strip()
+        else _service_path()
+    )
+    if previous:
+        directories.extend(str(previous).split(os.pathsep))
+    else:
+        node = shutil.which("node")
+        if node:
+            directories.append(str(Path(node).parent))
+        directories.extend(os.defpath.split(os.pathsep))
+    return os.pathsep.join(dict.fromkeys(directories))
