@@ -7,7 +7,7 @@ from typing import Any
 
 from .models import Session, Status
 from .processes import provider_ancestor, provider_process
-from .providers import CodexProvider
+from .providers import CodexProvider, codex_worker_originator
 from .setup_hooks import hook_spec_fingerprint
 from .store import Store, load_config
 from .tmux import Tmux, TmuxError
@@ -51,6 +51,48 @@ def _event_state(
     return Status.WORKING.value, False, None, None
 
 
+def _repair_worker_pane_claim(
+    provider: str,
+    session_id: str,
+    store: Store,
+    tmux: Tmux,
+) -> None:
+    """Undo only a stale Pika tag previously written for this worker UUID."""
+    pane_id = os.environ.get("TMUX_PANE")
+    if not pane_id:
+        return
+    try:
+        pane = tmux.get_pane(pane_id)
+    except (OSError, TmuxError):
+        return
+    if pane is None or (pane.pika_provider, pane.pika_session_id) != (
+        provider,
+        session_id,
+    ):
+        return
+    previous = [
+        item
+        for item in store.list_sessions()
+        if item.key != (provider, session_id)
+        and item.tmux_pane == pane_id
+        and not item.session_id.startswith("unbound:")
+    ]
+    try:
+        if len(previous) == 1:
+            owner = previous[0]
+            tmux.tag_pane(
+                pane_id,
+                provider=owner.provider,
+                session_id=owner.session_id,
+                name=owner.display_name,
+                launch_token="",
+            )
+        else:
+            tmux.clear_pika_tags(pane_id)
+    except (AttributeError, OSError, TmuxError):
+        pass
+
+
 def handle_hook(
     provider: str, data: dict[str, Any], store: Store | None = None
 ) -> dict[str, Any] | None:
@@ -63,6 +105,17 @@ def handle_hook(
     if not session_id:
         return None
     store.set_meta(f"hook_seen:{provider}", hook_spec_fingerprint(provider))
+    if provider == "codex" and codex_worker_originator(
+        session_id,
+        data.get("transcript_path"),
+        originator=data.get("originator"),
+    ):
+        # App-server automation workers are subordinate execution units, not
+        # conversations.  Remove any record created by an earlier hook and
+        # return before ownership, attention, or tmux identity can be changed.
+        _repair_worker_pane_claim(provider, session_id, store, tmux)
+        store.delete_session(provider, session_id)
+        return None
     if store.is_untracked(provider, session_id):
         store.delete_live_owner(provider, session_id)
         return None

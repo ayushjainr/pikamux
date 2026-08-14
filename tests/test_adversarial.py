@@ -134,12 +134,14 @@ class FakeProvider:
         active: list[int] | None = None,
         resumable: bool = True,
         hidden: set[str] | None = None,
+        workers: dict[str, str] | None = None,
     ):
         self.name = name
         self.candidates = candidates or []
         self.active = active or []
         self.resumable = resumable
         self.hidden = hidden or set()
+        self.workers = workers or {}
 
     def discover(self) -> list[Candidate]:
         return self.candidates
@@ -149,6 +151,11 @@ class FakeProvider:
 
     def hidden_session_ids(self) -> set[str]:
         return self.hidden
+
+    def worker_originator(
+        self, session_id: str, _transcript_path: str | None
+    ) -> str | None:
+        return self.workers.get(session_id)
 
     def active_pids(self, _session_id: str) -> list[int]:
         return self.active
@@ -177,6 +184,31 @@ class AdversarialTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_refresh_prunes_proven_worker_but_preserves_parent_run(self) -> None:
+        worker_id = "11111111-1111-4111-8111-111111111111"
+        parent_id = "22222222-2222-4222-8222-222222222222"
+        self.store.upsert_session(
+            Session(
+                "codex",
+                worker_id,
+                name="codex-01a00072",
+                status=Status.READY.value,
+                unread=True,
+            )
+        )
+        self.store.upsert_session(Session("codex", parent_id, name="learning-study-v3"))
+        pika = Pika(
+            self.store,
+            StaticTmux(),
+            {"codex": FakeProvider(workers={worker_id: "agentic_fund"})},
+        )
+
+        refreshed = pika.refresh()
+
+        self.assertEqual([item.session_id for item in refreshed], [parent_id])
+        self.assertIsNone(self.store.get_session("codex", worker_id))
+        self.assertIsNotNone(self.store.get_session("codex", parent_id))
 
     def test_resolve_promotes_native_name_from_empty_ledger(self) -> None:
         candidate = Candidate(

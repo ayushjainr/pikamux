@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -16,6 +17,9 @@ class FakeTmux:
     tags: ClassVar[list] = []
     alerts: ClassVar[list] = []
     attached: ClassVar[bool] = False
+    pika_provider: ClassVar[str | None] = None
+    pika_session_id: ClassVar[str | None] = None
+    cleared: ClassVar[list[str]] = []
 
     def get_pane(self, target):
         if not target:
@@ -31,6 +35,8 @@ class FakeTmux:
             dead_status=None,
             activity=1,
             created=1,
+            pika_provider=self.pika_provider,
+            pika_session_id=self.pika_session_id,
         )
 
     def tag_pane(self, target, **values):
@@ -38,6 +44,9 @@ class FakeTmux:
 
     def display_alert(self, message):
         self.alerts.append(message)
+
+    def clear_pika_tags(self, target):
+        self.cleared.append(target)
 
 
 class HookTests(unittest.TestCase):
@@ -60,6 +69,9 @@ class HookTests(unittest.TestCase):
         FakeTmux.tags = []
         FakeTmux.alerts = []
         FakeTmux.attached = False
+        FakeTmux.pika_provider = None
+        FakeTmux.pika_session_id = None
+        FakeTmux.cleared = []
 
     def tearDown(self) -> None:
         self.env.stop()
@@ -286,6 +298,134 @@ class HookTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIsNone(self.store.get_session("codex", "ephemeral-id"))
         self.assertEqual(self.store.get_live_owners("codex", "ephemeral-id"), [])
+
+    @patch("pikamux.hooks.provider_ancestor", return_value=4321)
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_automation_worker_never_becomes_attention_or_owns_inherited_pane(
+        self, _owner
+    ) -> None:
+        worker_id = "11111111-1111-4111-8111-111111111111"
+        transcript = Path(self.temp.name) / "worker.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": worker_id, "originator": "agentic_fund"},
+                }
+            )
+            + "\n"
+        )
+        self.store.delete_pending("launch")
+        self.store.upsert_session(
+            Session("codex", "parent-id", name="learning-study-v3")
+        )
+        self.store.upsert_session(
+            Session(
+                "codex",
+                worker_id,
+                name="codex-01a00072",
+                status=Status.READY.value,
+                unread=True,
+                attention_reason="completed",
+            )
+        )
+        with patch("pikamux.store.process_start_time", return_value=12345):
+            self.store.set_live_owner("codex", worker_id, 9999)
+        FakeTmux.pika_provider = "codex"
+        FakeTmux.pika_session_id = worker_id
+        with patch.dict(
+            os.environ, {"PIKA_LAUNCH_TOKEN": "", "TMUX_PANE": "%9"}, clear=False
+        ):
+            result = handle_hook(
+                "codex",
+                {
+                    "session_id": worker_id,
+                    "session_title": "codex-01a00072",
+                    "cwd": "/tmp",
+                    "hook_event_name": "Stop",
+                    "transcript_path": str(transcript),
+                },
+                self.store,
+            )
+        self.assertIsNone(result)
+        self.assertIsNone(self.store.get_session("codex", worker_id))
+        self.assertIsNotNone(self.store.get_session("codex", "parent-id"))
+        self.assertEqual(self.store.get_live_owners("codex", worker_id), [])
+        self.assertEqual(FakeTmux.tags, [])
+        self.assertEqual(FakeTmux.cleared, ["%9"])
+        self.assertEqual(FakeTmux.alerts, [])
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_automation_worker_restores_unique_parent_pane_tag(self) -> None:
+        worker_id = "11111111-1111-4111-8111-111111111111"
+        parent_id = "22222222-2222-4222-8222-222222222222"
+        self.store.delete_pending("launch")
+        self.store.upsert_session(
+            Session(
+                "codex",
+                parent_id,
+                name="parent-run",
+                tmux_pane="%9",
+                tmux_session="pika-parent",
+            )
+        )
+        FakeTmux.pika_provider = "codex"
+        FakeTmux.pika_session_id = worker_id
+        with patch.dict(
+            os.environ, {"PIKA_LAUNCH_TOKEN": "", "TMUX_PANE": "%9"}, clear=False
+        ):
+            handle_hook(
+                "codex",
+                {
+                    "session_id": worker_id,
+                    "originator": "agentic_fund",
+                    "hook_event_name": "Stop",
+                },
+                self.store,
+            )
+        self.assertEqual(
+            FakeTmux.tags,
+            [
+                (
+                    "%9",
+                    {
+                        "provider": "codex",
+                        "session_id": parent_id,
+                        "name": "parent-run",
+                        "launch_token": "",
+                    },
+                )
+            ],
+        )
+        self.assertEqual(FakeTmux.cleared, [])
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_interactive_same_name_still_gets_tracked(self) -> None:
+        session_id = "22222222-2222-4222-8222-222222222222"
+        transcript = Path(self.temp.name) / "human.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": session_id, "originator": "codex-tui"},
+                }
+            )
+            + "\n"
+        )
+        handle_hook(
+            "codex",
+            {
+                "session_id": session_id,
+                "session_title": "codex-01a00072",
+                "cwd": "/tmp",
+                "hook_event_name": "Stop",
+                "transcript_path": str(transcript),
+            },
+            self.store,
+        )
+        session = self.store.get_session("codex", session_id)
+        self.assertEqual(session.status if session else None, Status.READY.value)
+        self.assertTrue(session.unread if session else False)
 
     @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_untracked_session_hook_cannot_restore_tracking_or_tags(self) -> None:

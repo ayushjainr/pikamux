@@ -136,7 +136,9 @@ class Pika:
         by_key = {(item.provider, item.session_id): item for item in result}
         return sorted(by_key.values(), key=lambda item: item.updated_at, reverse=True)
 
-    def hidden_session_keys(self) -> set[tuple[str, str]]:
+    def hidden_session_keys(
+        self, tracked_sessions: Iterable[Session] = ()
+    ) -> set[tuple[str, str]]:
         """Return provider-owned records that should not enter the daily surface."""
         result: set[tuple[str, str]] = set()
         for provider in self.providers.values():
@@ -147,6 +149,20 @@ class Pika:
                 result.update((provider.name, session_id) for session_id in hidden())
             except Exception as exc:  # noqa: BLE001 - discovery remains best-effort
                 self.discovery_errors.append(f"{provider.name} hidden sessions: {exc}")
+        for session in tracked_sessions:
+            provider = self.providers.get(session.provider)
+            if provider is None:
+                continue
+            classifier = getattr(provider, "worker_originator", None)
+            if classifier is None:
+                continue
+            try:
+                if classifier(session.session_id, session.transcript_path):
+                    result.add(session.key)
+            except Exception as exc:  # noqa: BLE001 - provenance is fail-open
+                self.discovery_errors.append(
+                    f"{session.provider}:{session.session_id} provenance: {exc}"
+                )
         return result
 
     def import_candidate(
@@ -214,7 +230,17 @@ class Pika:
     def refresh(self, *, usage: bool = False) -> list[Session]:
         tracked_sessions = self.store.list_sessions()
         candidates = self.discover_candidates(tracked_sessions)
-        hidden_keys = self.hidden_session_keys()
+        hidden_keys = self.hidden_session_keys(tracked_sessions)
+        # Hidden provider rows stay provider-owned.  Automation workers are
+        # also removed from Pika's operational ledger so stale READY/error
+        # events cannot survive after their short-lived transcripts disappear.
+        for session in tracked_sessions:
+            if session.key not in hidden_keys:
+                continue
+            provider = self.providers.get(session.provider)
+            classifier = getattr(provider, "worker_originator", None)
+            if classifier and classifier(session.session_id, session.transcript_path):
+                self.store.delete_session(*session.key)
         untracked_keys = self.store.untracked_session_keys()
         excluded_keys = hidden_keys | untracked_keys
         candidates = [

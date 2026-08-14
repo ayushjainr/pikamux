@@ -52,7 +52,7 @@ REMOTE_INSTALL_ARGV = (
     "pip",
     "install",
     "--user",
-    "git+ssh://git@github.com/ajainwolfe/pikamux.git@v0.2.0",
+    f"git+ssh://git@github.com/ajainwolfe/pikamux.git@v{__version__}",
 )
 
 _ALIAS = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")

@@ -9,7 +9,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pikamux.models import Session
-from pikamux.providers import ClaudeProvider, CodexProvider, _timestamp
+from pikamux.providers import (
+    ClaudeProvider,
+    CodexProvider,
+    _timestamp,
+    codex_worker_originator,
+)
 
 
 class FakeAppServer:
@@ -204,6 +209,71 @@ class ProviderTests(unittest.TestCase):
 
         candidates = CodexProvider(self.root).import_candidates()
         self.assertEqual([item.name for item in candidates], ["chosen name"])
+
+    def test_codex_automation_origin_is_hidden_without_name_heuristics(self) -> None:
+        worker_id = "11111111-1111-4111-8111-111111111111"
+        human_id = "22222222-2222-4222-8222-222222222222"
+        worker_rollout = self.root / "worker.jsonl"
+        human_rollout = self.root / "human.jsonl"
+        worker_rollout.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": worker_id,
+                        "originator": "agentic_fund",
+                        "thread_source": "user",
+                    },
+                }
+            )
+            + "\n"
+        )
+        human_rollout.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": human_id,
+                        "originator": "codex-tui",
+                        "thread_source": "user",
+                    },
+                }
+            )
+            + "\n"
+        )
+        with sqlite3.connect(self.root / "state_current.sqlite") as db:
+            db.execute(
+                "CREATE TABLE threads "
+                "(id TEXT PRIMARY KEY, name TEXT, rollout_path TEXT, archived INTEGER)"
+            )
+            db.executemany(
+                "INSERT INTO threads(id,name,rollout_path,archived) VALUES (?,?,?,0)",
+                (
+                    (worker_id, "codex-01a00072", str(worker_rollout)),
+                    (human_id, "codex-01a00072", str(human_rollout)),
+                ),
+            )
+
+        provider = CodexProvider(self.root)
+        self.assertEqual([item.session_id for item in provider.discover()], [human_id])
+        self.assertFalse(provider.is_resumable(worker_id))
+        self.assertTrue(provider.is_resumable(human_id))
+
+    def test_codex_worker_provenance_requires_matching_uuid(self) -> None:
+        transcript = self.root / "mismatched.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "different-uuid",
+                        "originator": "agentic_fund",
+                    },
+                }
+            )
+            + "\n"
+        )
+        self.assertIsNone(codex_worker_originator("wanted-uuid", transcript))
 
     def test_codex_native_name_uses_official_thread_rpc(self) -> None:
         process = FakeAppServer()

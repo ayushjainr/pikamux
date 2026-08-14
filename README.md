@@ -40,7 +40,13 @@ before asking for a default provider. Archived sessions, missing histories, and
 AI-generated Claude summaries stay out of this commissioning choice. For Codex,
 setup uses the effective saved name exposed by Codex: names created with
 `/rename` are eligible even when the internal SQLite `threads.name` column is
-empty. Nothing is imported silently. The final
+empty. Short-lived Codex workers from known automation harness origins are also
+excluded. Pika reads only the immutable `session_meta.originator` field and
+requires its UUID to match the candidate; it never guesses from a generated
+name. The built-in origins are `agentic_fund` and `quant_agent_autonomy`.
+Installations can extend `codex_worker_originators` in Pika's `config.json` for
+their own runners. The parent conversation or run remains the visible
+workstream. Nothing is imported silently. The final
 commissioning ledger distinguishes active hook definitions from observed live
 events. Codex requires one extra trust step: open
 `/hooks`, approve the Pika definitions, and use Codex once so `pika doctor` can

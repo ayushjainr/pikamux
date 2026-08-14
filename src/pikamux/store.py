@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
-    FleetNode,
     ExpertProfile,
     ExpertRefreshAttempt,
+    FleetNode,
     Session,
     Status,
     Usage,
@@ -27,6 +27,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "default_provider": "codex",
     "alerts": "tmux",
     "peek_lines": 200,
+    # Codex app-server clients used as automation harnesses create real UUIDs,
+    # but their short-lived workers are not user-facing conversations.  Keep
+    # the known harness origins out of Pika while allowing installations to
+    # extend the list for their own runners.
+    "codex_worker_originators": ["agentic_fund", "quant_agent_autonomy"],
 }
 
 # Hook ownership is corroborating evidence, not durable conversation identity.
@@ -630,24 +635,21 @@ class Store:
     def delete_session(self, provider: str, session_id: str) -> None:
         self.initialize()
         with self.connect() as db:
+            for table in (
+                "usage_cache",
+                "session_events",
+                "identity_interruptions",
+                "expert_profiles",
+                "expert_refresh_attempts",
+                "live_owners",
+                "launch_reservations",
+            ):
+                db.execute(
+                    f"DELETE FROM {table} WHERE provider=? AND session_id=?",
+                    (provider, session_id),
+                )
             db.execute(
-                "DELETE FROM usage_cache WHERE provider=? AND session_id=?",
-                (provider, session_id),
-            )
-            db.execute(
-                "DELETE FROM session_events WHERE provider=? AND session_id=?",
-                (provider, session_id),
-            )
-            db.execute(
-                "DELETE FROM identity_interruptions WHERE provider=? AND session_id=?",
-                (provider, session_id),
-            )
-            db.execute(
-                "DELETE FROM expert_profiles WHERE provider=? AND session_id=?",
-                (provider, session_id),
-            )
-            db.execute(
-                "DELETE FROM expert_refresh_attempts WHERE provider=? AND session_id=?",
+                "DELETE FROM launch_bindings WHERE provider=? AND session_id=?",
                 (provider, session_id),
             )
             db.execute(

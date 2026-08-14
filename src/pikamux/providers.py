@@ -13,15 +13,60 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .models import Candidate, Session, Usage
 from .paths import claude_home, codex_home
 from .pricing import estimate_cost
 from .processes import find_processes_with_session_id, provider_process
-from .store import Store
+from .store import Store, load_config
 
 
 class ProviderError(RuntimeError):
     pass
+
+
+def _codex_originator(
+    session_id: str,
+    transcript_path: str | os.PathLike[str] | None,
+) -> str | None:
+    """Read the immutable Codex origin without inspecting conversation text."""
+    if not transcript_path:
+        return None
+    try:
+        with Path(transcript_path).open(errors="replace") as stream:
+            first = json.loads(stream.readline())
+    except (OSError, TypeError, ValueError):
+        return None
+    if first.get("type") != "session_meta":
+        return None
+    payload = first.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    recorded_id = str(payload.get("id") or payload.get("session_id") or "")
+    if recorded_id != session_id:
+        return None
+    originator = payload.get("originator")
+    return str(originator).strip() if originator else None
+
+
+def codex_worker_originator(
+    session_id: str,
+    transcript_path: str | os.PathLike[str] | None,
+    *,
+    originator: object = None,
+) -> str | None:
+    """Return a configured automation origin, otherwise preserve the session."""
+    value = str(originator).strip() if originator else None
+    value = value or _codex_originator(session_id, transcript_path)
+    if not value:
+        return None
+    configured = load_config().get("codex_worker_originators", ())
+    if isinstance(configured, str):
+        configured = [configured]
+    if not isinstance(configured, (list, tuple, set, frozenset)):
+        return None
+    origins = {str(item).strip().casefold() for item in configured if str(item).strip()}
+    return value if value.casefold() in origins else None
 
 
 def _timestamp(value: Any) -> float:
@@ -91,6 +136,12 @@ class Provider(ABC):
         """Return provider-owned conversations that must stay out of Pika."""
         return set()
 
+    def worker_originator(
+        self, session_id: str, transcript_path: str | None
+    ) -> str | None:
+        """Return non-interactive automation provenance, when proven."""
+        return None
+
 
 class CodexProvider(Provider):
     name = "codex"
@@ -139,7 +190,11 @@ class CodexProvider(Provider):
             key=lambda item: item.updated_at,
             reverse=True,
         )
-        return self.enrich(named)
+        return [
+            item
+            for item in self.enrich(named)
+            if not self.worker_originator(item.session_id, item.transcript_path)
+        ]
 
     def import_candidates(self) -> list[Candidate]:
         """Offer Codex's effective saved names during commissioning.
@@ -192,6 +247,15 @@ class CodexProvider(Provider):
             if result is not None:
                 return result
         return set()
+
+    def worker_originator(
+        self, session_id: str, transcript_path: str | None
+    ) -> str | None:
+        path = transcript_path
+        if not path:
+            records = self._query_current_database(session_ids=[session_id])
+            path = records[0].transcript_path if records else None
+        return codex_worker_originator(session_id, path)
 
     @staticmethod
     def _query_archived_ids(path: Path) -> set[str] | None:
@@ -335,7 +399,7 @@ class CodexProvider(Provider):
                     "method": "initialize",
                     "id": 1,
                     "params": {
-                        "clientInfo": {"name": "pikamux", "version": "0.2.0"},
+                        "clientInfo": {"name": "pikamux", "version": __version__},
                         "capabilities": {"experimentalApi": True},
                     },
                 }
@@ -381,7 +445,9 @@ class CodexProvider(Provider):
             return False
         records = self._query_current_database(session_ids=[session_id])
         return any(
-            item.transcript_path and Path(item.transcript_path).is_file()
+            item.transcript_path
+            and Path(item.transcript_path).is_file()
+            and not self.worker_originator(item.session_id, item.transcript_path)
             for item in records
         )
 

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .models import Session
 
 
@@ -197,7 +198,7 @@ class CodexConsultation(Consultation):
                     "clientInfo": {
                         "name": "pikamux",
                         "title": "Pika side consultation",
-                        "version": "0.2.0",
+                        "version": __version__,
                     },
                     "capabilities": {"experimentalApi": True},
                 },

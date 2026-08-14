@@ -103,6 +103,13 @@ selection, and visible receipts report it. Claude stays provider-native and
 rejects the fast path until separately benchmarked. Pika's fast path is a model
 profile, not Codex Fast mode or a service-tier setting.
 
+Codex automation provenance is classified before lifecycle or tmux identity.
+A UUID-matching `session_meta.originator` on the configured worker-origin list
+keeps that short-lived execution unit outside setup, ownership leases, pane
+tags, and attention; missing, malformed, or mismatched metadata fails open and
+preserves the conversation. The parent run remains the user-facing workstream.
+This is a provenance decision, never a title or UUID-prefix heuristic.
+
 Provider question tools cross the attention boundary before their UI blocks:
 Codex `request_user_input` and Claude `AskUserQuestion` set `NEEDS YOU` from
 structured pre-tool lifecycle events without reading the question. Their

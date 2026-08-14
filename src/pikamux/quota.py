@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .paths import claude_home
 
 WEEK_MINUTES = 7 * 24 * 60
@@ -62,7 +63,7 @@ def read_codex_quota() -> QuotaSnapshot | None:
                 "clientInfo": {
                     "name": "pikamux",
                     "title": "Pika quota observer",
-                    "version": "0.2.0",
+                    "version": __version__,
                 },
                 "capabilities": {"experimentalApi": True},
             },
