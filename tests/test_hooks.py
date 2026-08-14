@@ -9,7 +9,8 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from pikamux.hooks import handle_hook, handle_process_exit, hook_stdout
-from pikamux.models import Pane, Session, Status
+from pikamux.models import Candidate, Pane, Session, Status
+from pikamux.providers import CodexProvider
 from pikamux.store import Store
 
 
@@ -426,6 +427,109 @@ class HookTests(unittest.TestCase):
         session = self.store.get_session("codex", session_id)
         self.assertEqual(session.status if session else None, Status.READY.value)
         self.assertTrue(session.unread if session else False)
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_codex_child_hook_updates_stable_parent_conversation(self) -> None:
+        parent_id = "11111111-1111-4111-8111-111111111111"
+        child_id = "22222222-2222-4222-8222-222222222222"
+        transcript = Path(self.temp.name) / f"{child_id}.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": child_id, "forked_from_id": parent_id},
+                }
+            )
+            + "\n"
+        )
+        self.store.upsert_session(
+            Session(
+                "codex",
+                parent_id,
+                name="master_quant",
+                cwd="/tmp",
+                tmux_session="pika-parent",
+                tmux_pane="%1",
+                status=Status.READY.value,
+            )
+        )
+        candidate = Candidate(
+            "codex",
+            child_id,
+            "master_quant",
+            cwd="/tmp",
+            transcript_path=str(transcript),
+            parent_session_id=parent_id,
+            lifecycle_status=Status.WORKING.value,
+        )
+        with patch.object(CodexProvider, "thread_candidate", return_value=candidate):
+            handle_hook(
+                "codex",
+                {
+                    "session_id": parent_id,
+                    "cwd": "/tmp",
+                    "hook_event_name": "UserPromptSubmit",
+                    "transcript_path": str(transcript),
+                },
+                self.store,
+            )
+
+        current = self.store.get_session("codex", parent_id)
+        self.assertEqual(current.status if current else None, Status.WORKING.value)
+        self.assertEqual(current.active_thread_id if current else None, child_id)
+        self.assertIsNone(self.store.get_session("codex", child_id))
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_concurrent_codex_child_hook_keeps_one_fail_closed_home(self) -> None:
+        parent_id = "11111111-1111-4111-8111-111111111111"
+        child_id = "22222222-2222-4222-8222-222222222222"
+        transcript = Path(self.temp.name) / f"{child_id}.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": child_id, "forked_from_id": parent_id},
+                }
+            )
+            + "\n"
+        )
+        self.store.upsert_session(
+            Session(
+                "codex",
+                parent_id,
+                name="master_quant",
+                cwd="/tmp",
+                tmux_session="pika-parent",
+                tmux_pane="%1",
+                status=Status.WORKING.value,
+            )
+        )
+        candidate = Candidate(
+            "codex",
+            child_id,
+            "master_quant",
+            cwd="/tmp",
+            parent_session_id=parent_id,
+            lifecycle_status=Status.WORKING.value,
+        )
+        with patch.object(CodexProvider, "thread_candidate", return_value=candidate):
+            handle_hook(
+                "codex",
+                {
+                    "session_id": parent_id,
+                    "cwd": "/tmp",
+                    "hook_event_name": "UserPromptSubmit",
+                    "transcript_path": str(transcript),
+                },
+                self.store,
+            )
+
+        current = self.store.get_session("codex", parent_id)
+        self.assertEqual(current.status if current else None, Status.OPEN_TWICE.value)
+        self.assertTrue(current.unread if current else False)
+        self.assertIn("multiple active Codex continuation", current.error or "")
+        self.assertIsNone(self.store.get_session("codex", child_id))
+        self.assertEqual(FakeTmux.tags, [])
 
     @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_untracked_session_hook_cannot_restore_tracking_or_tags(self) -> None:

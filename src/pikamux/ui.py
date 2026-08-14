@@ -543,10 +543,15 @@ def choose_candidates(candidates: list[Candidate]) -> list[Candidate]:
     for index, item in enumerate(candidates, 1):
         live = " live" if item.live else ""
         label = item.name if item.name else f"<unnamed live · {item.session_id[:8]}>"
+        lineage = (
+            f" · fork of {item.parent_session_id[:8]}"
+            if item.parent_session_id
+            else ""
+        )
         print(
             f"  {index:>2}. {item.provider:<6} "
             f"{terminal_text(label):<28} "
-            f"{short_path(item.cwd, 34)}{live}"
+            f"{short_path(item.cwd, 34)}{live}{lineage}"
         )
     if not sys.stdin.isatty():
         return []

@@ -72,6 +72,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS sessions (
                     provider TEXT NOT NULL,
                     session_id TEXT NOT NULL,
+                    active_thread_id TEXT,
                     name TEXT,
                     cwd TEXT,
                     branch TEXT,
@@ -274,6 +275,12 @@ class Store:
             }
             if "attention_reason" not in session_columns:
                 db.execute("ALTER TABLE sessions ADD COLUMN attention_reason TEXT")
+            if "active_thread_id" not in session_columns:
+                db.execute("ALTER TABLE sessions ADD COLUMN active_thread_id TEXT")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS sessions_active_thread_idx "
+                "ON sessions(provider, active_thread_id)"
+            )
             expert_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(expert_profiles)").fetchall()
@@ -404,12 +411,13 @@ class Store:
             db.execute(
                 """
                 INSERT INTO sessions (
-                    provider, session_id, name, cwd, branch, transcript_path,
+                    provider, session_id, active_thread_id, name, cwd, branch, transcript_path,
                     tmux_session, tmux_pane, root_pid, status, unread, model,
                     source, managed, error, attention_reason, created_at, updated_at,
                     last_event_at, last_activity_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(provider, session_id) DO UPDATE SET
+                    active_thread_id=COALESCE(excluded.active_thread_id, sessions.active_thread_id),
                     name=COALESCE(excluded.name, sessions.name),
                     cwd=COALESCE(excluded.cwd, sessions.cwd),
                     branch=COALESCE(excluded.branch, sessions.branch),
@@ -431,6 +439,7 @@ class Store:
                 (
                     session.provider,
                     session.session_id,
+                    session.active_thread_id,
                     name,
                     session.cwd,
                     session.branch,
@@ -466,6 +475,18 @@ class Store:
             row = db.execute(
                 "SELECT * FROM sessions WHERE provider=? AND session_id=?",
                 (provider, session_id),
+            ).fetchone()
+        return self._row_to_session(row) if row else None
+
+    def get_session_by_thread(self, provider: str, thread_id: str) -> Session | None:
+        """Resolve either Pika's stable key or the provider's active leaf UUID."""
+        self.initialize()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM sessions WHERE provider=? AND "
+                "(session_id=? OR active_thread_id=?) "
+                "ORDER BY CASE WHEN session_id=? THEN 0 ELSE 1 END LIMIT 1",
+                (provider, thread_id, thread_id, thread_id),
             ).fetchone()
         return self._row_to_session(row) if row else None
 
@@ -554,6 +575,7 @@ class Store:
         if not fields:
             return
         allowed = {
+            "active_thread_id",
             "name",
             "cwd",
             "branch",
@@ -1761,6 +1783,7 @@ class Store:
         return Session(
             provider=row["provider"],
             session_id=row["session_id"],
+            active_thread_id=row["active_thread_id"],
             name=row["name"],
             cwd=row["cwd"],
             branch=row["branch"],

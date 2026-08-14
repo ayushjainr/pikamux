@@ -1331,6 +1331,111 @@ class AdversarialTests(unittest.TestCase):
         refreshed = pika.refresh()
         self.assertEqual(refreshed[0].name, "after")
 
+    def test_refresh_follows_one_live_codex_continuation_in_same_home(self) -> None:
+        now = time.time()
+        parent_id = "11111111-1111-4111-8111-111111111111"
+        child_id = "22222222-2222-4222-8222-222222222222"
+        self.store.upsert_session(
+            Session(
+                "codex",
+                parent_id,
+                name="master_quant",
+                cwd="/repo",
+                tmux_session="manual",
+                tmux_pane="%1",
+                status=Status.READY.value,
+                last_event_at=now - 120,
+            )
+        )
+        provider = FakeProvider(
+            candidates=[
+                Candidate(
+                    "codex",
+                    parent_id,
+                    "master_quant",
+                    cwd="/repo",
+                    updated_at=now - 100,
+                    lifecycle_status=Status.READY.value,
+                ),
+                Candidate(
+                    "codex",
+                    child_id,
+                    "master_quant",
+                    cwd="/repo",
+                    transcript_path="/repo/child.jsonl",
+                    updated_at=now,
+                    parent_session_id=parent_id,
+                    lifecycle_status=Status.WORKING.value,
+                ),
+            ],
+            active=[999],
+        )
+        pika = Pika(
+            self.store,
+            StaticTmux([pane(provider="codex", session_id=parent_id)]),
+            {"codex": provider},
+        )
+        with patch("pikamux.core.provider_process", return_value=999):
+            refreshed = pika.refresh()
+
+        self.assertEqual(len(refreshed), 1)
+        self.assertEqual(refreshed[0].session_id, parent_id)
+        self.assertEqual(refreshed[0].active_thread_id, child_id)
+        self.assertEqual(refreshed[0].status, Status.WORKING.value)
+        self.assertEqual(refreshed[0].transcript_path, "/repo/child.jsonl")
+        self.assertTrue(refreshed[0].exact_home)
+        resolved = self.store.get_session_by_thread("codex", child_id)
+        self.assertEqual(resolved.session_id if resolved else None, parent_id)
+
+    def test_two_live_codex_continuations_fail_closed_as_open_twice(self) -> None:
+        now = time.time()
+        parent_id = "11111111-1111-4111-8111-111111111111"
+        first_child_id = "22222222-2222-4222-8222-222222222222"
+        self.store.upsert_session(
+            Session(
+                "codex",
+                parent_id,
+                active_thread_id=first_child_id,
+                name="master_quant",
+                cwd="/repo",
+                tmux_session="manual",
+                tmux_pane="%1",
+                status=Status.READY.value,
+                last_event_at=now - 120,
+            )
+        )
+        children = [
+            Candidate(
+                provider="codex",
+                session_id=(
+                    first_child_id
+                    if number == 2
+                    else "33333333-3333-4333-8333-333333333333"
+                ),
+                name="master_quant",
+                cwd="/repo",
+                updated_at=now - number,
+                parent_session_id=parent_id,
+                lifecycle_status=Status.WORKING.value,
+            )
+            for number in (2, 3)
+        ]
+        # Both are sibling forks of the stable home. The first is already the
+        # active leaf; discovering the second must still fail closed.
+        self.assertEqual(children[0].session_id, first_child_id)
+        pika = Pika(
+            self.store,
+            StaticTmux([pane(provider="codex", session_id=parent_id)]),
+            {"codex": FakeProvider(candidates=children, active=[999])},
+        )
+        with patch("pikamux.core.provider_process", return_value=999):
+            refreshed = pika.refresh()
+
+        self.assertEqual(refreshed[0].status, Status.OPEN_TWICE.value)
+        self.assertTrue(refreshed[0].unread)
+        self.assertIn("multiple active Codex continuation", refreshed[0].error)
+        self.assertEqual(refreshed[0].active_thread_id, first_child_id)
+
 
 if __name__ == "__main__":
     unittest.main()

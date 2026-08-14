@@ -59,6 +59,9 @@ class Session:
     cache_write_tokens: int | None = None
     total_tokens: int | None = None
     estimated_cost_usd: float | None = None
+    # Pika's stable conversation key can outlive a provider-created continuation.
+    # When set, provider operations resume and verify this exact current thread.
+    active_thread_id: str | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -83,6 +86,10 @@ class Session:
     @property
     def exact_home(self) -> bool:
         return self.home_state == "exact-live"
+
+    @property
+    def provider_thread_id(self) -> str:
+        return self.active_thread_id or self.session_id
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
@@ -203,6 +210,9 @@ class Candidate:
     live: bool = False
     pid: int | None = None
     source: str = "discovered"
+    parent_session_id: str | None = None
+    created_at: float = 0.0
+    lifecycle_status: str | None = None
 
     @property
     def display_name(self) -> str:

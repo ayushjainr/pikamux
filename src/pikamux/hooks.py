@@ -5,9 +5,13 @@ import os
 import time
 from typing import Any
 
-from .models import Session, Status
+from .models import Candidate, Session, Status
 from .processes import provider_ancestor, provider_process
-from .providers import CodexProvider, codex_worker_originator
+from .providers import (
+    CodexProvider,
+    codex_transcript_metadata,
+    codex_worker_originator,
+)
 from .setup_hooks import hook_spec_fingerprint
 from .store import Store, load_config
 from .tmux import Tmux, TmuxError
@@ -101,30 +105,92 @@ def handle_hook(
     store = store or Store()
     store.initialize()
     tmux = Tmux()
-    session_id = str(data.get("session_id") or "")
-    if not session_id:
+    reported_session_id = str(data.get("session_id") or "")
+    if not reported_session_id:
         return None
+    transcript_path = data.get("transcript_path")
+    transcript_metadata = (
+        codex_transcript_metadata(transcript_path) if provider == "codex" else {}
+    )
+    thread_id = str(
+        transcript_metadata.get("id")
+        or transcript_metadata.get("session_id")
+        or reported_session_id
+    )
     store.set_meta(f"hook_seen:{provider}", hook_spec_fingerprint(provider))
     if provider == "codex" and codex_worker_originator(
-        session_id,
-        data.get("transcript_path"),
+        thread_id,
+        transcript_path,
         originator=data.get("originator"),
     ):
         # App-server automation workers are subordinate execution units, not
         # conversations.  Remove any record created by an earlier hook and
         # return before ownership, attention, or tmux identity can be changed.
-        _repair_worker_pane_claim(provider, session_id, store, tmux)
-        store.delete_session(provider, session_id)
+        _repair_worker_pane_claim(provider, thread_id, store, tmux)
+        store.delete_session(provider, thread_id)
         return None
-    if store.is_untracked(provider, session_id):
-        store.delete_live_owner(provider, session_id)
+    existing = store.get_session_by_thread(provider, thread_id)
+    provider_candidate = None
+    if provider == "codex" and existing is None:
+        try:
+            provider_candidate = CodexProvider().thread_candidate(
+                thread_id, str(transcript_path) if transcript_path else None
+            )
+        except (OSError, RuntimeError):
+            provider_candidate = None
+        if not isinstance(provider_candidate, Candidate):
+            provider_candidate = None
+        if provider_candidate and provider_candidate.parent_session_id:
+            parent = store.get_session_by_thread(
+                provider, provider_candidate.parent_session_id
+            )
+            same_name = bool(
+                parent
+                and parent.name
+                and provider_candidate.name
+                and parent.name.casefold() == provider_candidate.name.casefold()
+            )
+            same_cwd = bool(
+                parent
+                and (
+                    not parent.cwd
+                    or not provider_candidate.cwd
+                    or parent.cwd == provider_candidate.cwd
+                )
+            )
+            if parent and parent.tmux_pane and same_name and same_cwd:
+                if parent.status == Status.WORKING.value:
+                    # A second UUID started while the stable home's current
+                    # thread is still working. Keep the pane bound to its
+                    # canonical Pika identity and fail closed on the one row.
+                    store.capture_identity_interruption(*parent.key)
+                    now = time.time()
+                    store.update_session(
+                        *parent.key,
+                        status=Status.OPEN_TWICE.value,
+                        unread=True,
+                        error=(
+                            "multiple active Codex continuation threads: "
+                            f"{parent.provider_thread_id[:8]}, {thread_id[:8]}"
+                        ),
+                        attention_reason="identity",
+                        last_event_at=now,
+                        last_activity_at=now,
+                    )
+                    return None
+                existing = parent
+    canonical_session_id = existing.session_id if existing else thread_id
+    if store.is_untracked(provider, canonical_session_id) or store.is_untracked(
+        provider, thread_id
+    ):
+        store.delete_live_owner(provider, canonical_session_id)
         return None
     owner_pid = provider_ancestor(os.getppid(), provider)
     if data.get("hook_event_name") == "SessionEnd":
         if owner_pid:
-            store.delete_live_owner(provider, session_id, pid=owner_pid)
+            store.delete_live_owner(provider, canonical_session_id, pid=owner_pid)
     elif owner_pid:
-        store.set_live_owner(provider, session_id, owner_pid)
+        store.set_live_owner(provider, canonical_session_id, owner_pid)
     pane_id = os.environ.get("TMUX_PANE")
     launch_token = os.environ.get("PIKA_LAUNCH_TOKEN")
     pending = store.get_pending(launch_token) if launch_token else None
@@ -132,7 +198,6 @@ def handle_hook(
         pending = store.find_pending_for_pane(pane_id)
         if pending:
             launch_token = str(pending["launch_token"])
-    existing = store.get_session(provider, session_id)
     placeholder = store.get_session(provider, f"unbound:{pane_id}") if pane_id else None
     pane = tmux.get_pane(pane_id) if pane_id else None
     provider_name = data.get("session_title")
@@ -142,6 +207,7 @@ def handle_hook(
         if provider_name
         else (str(pending["name"]) if pending else None)
         or (existing.name if existing else None)
+        or (provider_candidate.name if provider_candidate else None)
         or (placeholder.name if placeholder else None)
         or desired_name
         or (pane.pika_name if pane else None)
@@ -172,14 +238,18 @@ def handle_hook(
     now = time.time()
     session = Session(
         provider=provider,
-        session_id=session_id,
+        session_id=canonical_session_id,
+        active_thread_id=(
+            thread_id if thread_id != canonical_session_id else None
+        ),
         name=name,
         cwd=data.get("cwd")
         or (existing.cwd if existing else None)
         or (placeholder.cwd if placeholder else None)
         or (pending["cwd"] if pending else None),
         branch=existing.branch if existing else None,
-        transcript_path=data.get("transcript_path")
+        transcript_path=transcript_path
+        or (provider_candidate.transcript_path if provider_candidate else None)
         or (existing.transcript_path if existing else None),
         tmux_session=pane.session_name
         if pane
@@ -211,29 +281,29 @@ def handle_hook(
         last_activity_at=now,
     )
     store.upsert_session(session)
-    if store.is_untracked(provider, session_id):
+    if store.is_untracked(provider, canonical_session_id):
         return None
-    if placeholder and placeholder.session_id != session_id:
+    if placeholder and placeholder.session_id != canonical_session_id:
         store.delete_session(provider, placeholder.session_id)
     if pane:
         try:
             tmux.tag_pane(
                 pane.pane_id,
                 provider=provider,
-                session_id=session_id,
+                session_id=canonical_session_id,
                 name=session.display_name,
                 launch_token="",
             )
         except (OSError, TmuxError):
             pass
     if launch_token:
-        store.bind_launch(launch_token, provider, session_id)
+        store.bind_launch(launch_token, provider, canonical_session_id)
         store.delete_pending(launch_token)
         attach_key = f"attached_launch:{launch_token}"
         if store.get_meta(attach_key):
-            store.record_attach(provider, session_id)
+            store.record_attach(provider, canonical_session_id)
             store.delete_meta(attach_key)
-    name_error_key = f"native_name_error:codex:{session_id}"
+    name_error_key = f"native_name_error:codex:{thread_id}"
     if (
         provider == "codex"
         and (
@@ -244,7 +314,7 @@ def handle_hook(
         and not provider_name
     ):
         try:
-            named = CodexProvider().set_native_name(session_id, desired_name)
+            named = CodexProvider().set_native_name(thread_id, desired_name)
         except (OSError, RuntimeError):
             named = False
         if named:

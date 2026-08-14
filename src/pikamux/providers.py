@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .models import Candidate, Session, Usage
+from .models import Candidate, Session, Status, Usage
 from .paths import claude_home, codex_home
 from .pricing import estimate_cost
 from .processes import find_processes_with_session_id, provider_process
@@ -25,28 +25,75 @@ class ProviderError(RuntimeError):
     pass
 
 
-def _codex_originator(
-    session_id: str,
+def codex_transcript_metadata(
     transcript_path: str | os.PathLike[str] | None,
-) -> str | None:
-    """Read the immutable Codex origin without inspecting conversation text."""
+) -> dict[str, Any]:
+    """Read the first immutable Codex metadata record."""
     if not transcript_path:
-        return None
+        return {}
     try:
         with Path(transcript_path).open(errors="replace") as stream:
             first = json.loads(stream.readline())
     except (OSError, TypeError, ValueError):
-        return None
+        return {}
     if first.get("type") != "session_meta":
-        return None
+        return {}
     payload = first.get("payload")
     if not isinstance(payload, dict):
-        return None
+        return {}
+    return payload
+
+
+def codex_session_metadata(
+    session_id: str,
+    transcript_path: str | os.PathLike[str] | None,
+) -> dict[str, Any]:
+    """Read UUID-matched Codex lineage without inspecting conversation text."""
+    payload = codex_transcript_metadata(transcript_path)
     recorded_id = str(payload.get("id") or payload.get("session_id") or "")
     if recorded_id != session_id:
-        return None
+        return {}
+    return payload
+
+
+def _codex_originator(
+    session_id: str,
+    transcript_path: str | os.PathLike[str] | None,
+) -> str | None:
+    payload = codex_session_metadata(session_id, transcript_path)
     originator = payload.get("originator")
     return str(originator).strip() if originator else None
+
+
+def codex_lifecycle_status(
+    transcript_path: str | os.PathLike[str] | None,
+) -> str | None:
+    """Return the newest structured turn state from a rollout tail."""
+    if not transcript_path:
+        return None
+    try:
+        for line in _reverse_lines(Path(transcript_path)):
+            if '"event_msg"' not in line or not (
+                '"task_started"' in line or '"task_complete"' in line
+            ):
+                continue
+            try:
+                data = json.loads(line)
+            except ValueError:
+                continue
+            if data.get("type") != "event_msg":
+                continue
+            payload = data.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            event = payload.get("type")
+            if event == "task_started":
+                return Status.WORKING.value
+            if event == "task_complete":
+                return Status.READY.value
+    except OSError:
+        return None
+    return None
 
 
 def codex_worker_originator(
@@ -206,6 +253,35 @@ class CodexProvider(Provider):
         """
         return self.discover()
 
+    def thread_candidate(
+        self, session_id: str, transcript_path: str | None = None
+    ) -> Candidate | None:
+        """Return one exact provider thread with immutable lineage metadata."""
+        records = self._query_current_database(session_ids=[session_id])
+        if records:
+            return records[0]
+        if not transcript_path:
+            return None
+        path = Path(transcript_path)
+        if not path.is_file():
+            return None
+        metadata = codex_session_metadata(session_id, path)
+        if not metadata:
+            return None
+        parent = metadata.get("forked_from_id")
+        return Candidate(
+            self.name,
+            session_id,
+            None,
+            cwd=metadata.get("cwd"),
+            transcript_path=str(path),
+            updated_at=path.stat().st_mtime,
+            source="codex-rollout",
+            parent_session_id=str(parent) if parent else None,
+            created_at=_timestamp(metadata.get("timestamp")),
+            lifecycle_status=codex_lifecycle_status(path),
+        )
+
     def _database_records(self) -> list[Candidate]:
         return self._query_current_database(named_only=True)
 
@@ -324,6 +400,8 @@ class CodexProvider(Provider):
                 "git_branch",
                 "rollout_path",
                 "model",
+                "created_at",
+                "created_at_ms",
                 "updated_at",
                 "updated_at_ms",
             )
@@ -348,20 +426,33 @@ class CodexProvider(Provider):
         finally:
             if db is not None:
                 db.close()
-        return [
-            Candidate(
-                provider=self.name,
-                session_id=str(row["id"]),
-                name=str(row["name"]) if row["name"] else None,
-                cwd=row["cwd"],
-                branch=row["git_branch"],
-                transcript_path=row["rollout_path"],
-                model=row["model"],
-                updated_at=_timestamp(row["updated_at_ms"] or row["updated_at"]),
-                source="codex-state",
+        result: list[Candidate] = []
+        for row in rows:
+            session_id = str(row["id"])
+            transcript_path = row["rollout_path"]
+            metadata = codex_session_metadata(session_id, transcript_path)
+            parent = metadata.get("forked_from_id")
+            result.append(
+                Candidate(
+                    provider=self.name,
+                    session_id=session_id,
+                    name=str(row["name"]) if row["name"] else None,
+                    cwd=row["cwd"],
+                    branch=row["git_branch"],
+                    transcript_path=transcript_path,
+                    model=row["model"],
+                    updated_at=_timestamp(
+                        row["updated_at_ms"] or row["updated_at"]
+                    ),
+                    source="codex-state",
+                    parent_session_id=str(parent) if parent else None,
+                    created_at=_timestamp(
+                        row["created_at_ms"] or row["created_at"]
+                    ),
+                    lifecycle_status=codex_lifecycle_status(transcript_path),
+                )
             )
-            for row in rows
-        ]
+        return result
 
     def new_argv(self, name: str, session_id: str | None = None) -> list[str]:
         return ["codex"]
@@ -561,9 +652,10 @@ class ClaudeProvider(Provider):
         for item in self._historical_titles(explicit_only=True):
             existing = records.get(item.session_id)
             if existing:
-                if not existing.name:
-                    existing.name = item.name
-                    existing.source = "claude-live+explicit-history"
+                # A user-authored title is authoritative even when Claude's
+                # live registry still carries an older generated title.
+                existing.name = item.name
+                existing.source = "claude-live+explicit-history"
                 existing.transcript_path = (
                     existing.transcript_path or item.transcript_path
                 )
@@ -657,7 +749,8 @@ class ClaudeProvider(Provider):
     def _title_from_transcript(
         path: Path, *, explicit_only: bool = False
     ) -> str | None:
-        title: str | None = None
+        explicit_title: str | None = None
+        generated_title: str | None = None
         try:
             with path.open(errors="replace") as stream:
                 for line in stream:
@@ -678,21 +771,23 @@ class ClaudeProvider(Provider):
                         continue
                     record_type = str(data.get("type") or "")
                     if record_type in {"custom-title", "session-title"}:
-                        title = (
-                            data.get("title")
+                        explicit_title = (
+                            data.get("customTitle")
+                            or data.get("title")
                             or data.get("sessionTitle")
                             or data.get("name")
                         )
                     elif data.get("sessionTitle"):
-                        title = data["sessionTitle"]
+                        explicit_title = data["sessionTitle"]
                     elif (
                         not explicit_only
                         and record_type == "ai-title"
                         and data.get("aiTitle")
                     ):
-                        title = data["aiTitle"]
+                        generated_title = data["aiTitle"]
         except OSError:
             return None
+        title = explicit_title or (None if explicit_only else generated_title)
         return str(title) if title else None
 
     def _find_transcript(self, session_id: str) -> Path | None:

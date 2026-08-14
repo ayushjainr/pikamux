@@ -13,6 +13,7 @@ from pikamux.providers import (
     ClaudeProvider,
     CodexProvider,
     _timestamp,
+    codex_lifecycle_status,
     codex_worker_originator,
 )
 
@@ -90,6 +91,71 @@ class ProviderTests(unittest.TestCase):
         candidates = ClaudeProvider(self.root).tracked_candidates([session])
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].name, "renamed-parked")
+
+    def test_claude_explicit_title_beats_later_generated_titles(self) -> None:
+        project = self.root / "projects" / "repo"
+        sessions = self.root / "sessions"
+        project.mkdir(parents=True)
+        sessions.mkdir()
+        session_id = "11111111-1111-4111-8111-111111111111"
+        (sessions / f"{session_id}.json").write_text(
+            json.dumps(
+                {
+                    "sessionId": session_id,
+                    "kind": "interactive",
+                    "name": "generated-old-name",
+                    "cwd": "/tmp",
+                }
+            )
+        )
+        (project / f"{session_id}.jsonl").write_text(
+            json.dumps({"type": "custom-title", "customTitle": "qes_plugin"})
+            + "\n"
+            + json.dumps({"type": "ai-title", "aiTitle": "generated-old-name"})
+            + "\n"
+        )
+
+        candidate = ClaudeProvider(self.root).import_candidates()[0]
+        self.assertEqual(candidate.name, "qes_plugin")
+        self.assertEqual(candidate.source, "claude-live+explicit-history")
+
+    def test_codex_candidate_exposes_lineage_and_structured_lifecycle(self) -> None:
+        parent = "11111111-1111-4111-8111-111111111111"
+        child = "22222222-2222-4222-8222-222222222222"
+        rollout = self.root / "child.jsonl"
+        rollout.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": child,
+                        "forked_from_id": parent,
+                        "originator": "Codex Desktop",
+                    },
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {"type": "event_msg", "payload": {"type": "task_started"}}
+            )
+            + "\n"
+        )
+        with sqlite3.connect(self.root / "state_current.sqlite") as db:
+            db.execute(
+                "CREATE TABLE threads "
+                "(id TEXT PRIMARY KEY, name TEXT, cwd TEXT, rollout_path TEXT, "
+                "created_at INTEGER, updated_at INTEGER, archived INTEGER)"
+            )
+            db.execute(
+                "INSERT INTO threads VALUES (?,?,?,?,?,?,0)",
+                (child, "master_quant", "/repo", str(rollout), 10, 20),
+            )
+
+        candidate = CodexProvider(self.root).discover()[0]
+        self.assertEqual(candidate.parent_session_id, parent)
+        self.assertEqual(candidate.lifecycle_status, "WORKING")
+        self.assertEqual(candidate.created_at, 10)
+        self.assertEqual(codex_lifecycle_status(rollout), "WORKING")
 
     def test_codex_database_reader_tolerates_older_schema(self) -> None:
         database = self.root / "state_old.sqlite"

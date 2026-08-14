@@ -56,7 +56,10 @@ definition; otherwise it names every remaining activation or observation proof.
 Commissioning finishes with a transcript-free reconciliation of already tracked
 conversations, so provider-native renames update both the Pika inventory and the
 tmux recovery tag. It never interviews agents to do this.
-Conversations you explicitly untracked stay out of later setup import choices.
+Conversations you explicitly untracked stay out of later setup import choices;
+setup reports that suppression and gives the explicit `pika open <uuid>` restore
+path. An explicit Claude title (including `/rename` and `customTitle` history)
+outranks a later generated summary.
 
 For automation, review a dry run and then apply it explicitly:
 
@@ -356,6 +359,17 @@ in `~/.local/state/pika/pika.db`. The durable key is `(provider, UUID)`; Pika
 refreshes provider-native names and may therefore show collisions. A collision
 always produces a chooser (or an error in a non-interactive process), never an
 implicit provider choice.
+
+Codex can continue work in a newly forked thread while the original client and
+Pika pane remain alive. Pika treats that as one conversation: the original UUID
+stays the stable Pika home, while provider operations and exact-process checks
+follow the current immutable child UUID. One fresh, working, direct child with
+the same saved name and working directory is reconciled automatically, so the
+inventory shows the real current state instead of a stale `READY` parent plus a
+second setup candidate. If the parent and child—or two children—are genuinely
+working at once, Pika refuses to guess and marks the single home `OPEN TWICE`.
+Receipts show the current exact UUID as well as the stable home fingerprint when
+they differ.
 
 Renaming an adopted conversation remains provider-owned. The next ordinary
 reconciliation, including `pika`, `pika list`, or `pika setup`, updates the

@@ -1005,17 +1005,41 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
     selected_machine_candidates = _setup_machine_candidates(pika, args)
     selected: list[Candidate] = []
     local_candidates: list[Candidate] = []
-    tracked_sessions = [] if args.dry_run else pika.store.list_sessions()
-    tracked_names = {session.key: session.display_name for session in tracked_sessions}
+    original_tracked = [] if args.dry_run else pika.store.list_sessions()
+    tracked_names = {session.key: session.display_name for session in original_tracked}
+    tracked_sessions = [] if args.dry_run else pika.refresh(usage=False)
     untracked_keys = set() if args.dry_run else pika.store.untracked_session_keys()
     if not args.no_import and not args.dry_run:
-        local_candidates = [
+        discovered_local = [
             item for item in pika.discover_import_candidates() if item.name or item.live
         ]
         tracked = {session.key for session in tracked_sessions}
+        tracked.update(
+            (session.provider, session.active_thread_id)
+            for session in tracked_sessions
+            if session.active_thread_id
+        )
+        suppressed = [
+            item
+            for item in discovered_local
+            if (item.provider, item.session_id) in untracked_keys
+        ]
+        if suppressed:
+            print(
+                f"Pika is keeping {len(suppressed)} explicitly untracked "
+                "conversation(s) out of adoption choices:"
+            )
+            for item in suppressed[:3]:
+                print(
+                    f"  {item.provider.title():<6} "
+                    f"{terminal_text(item.display_name)} · {item.session_id[:8]}"
+                )
+            if len(suppressed) > 3:
+                print(f"  … and {len(suppressed) - 3} more")
+            print("Restore one explicitly with `pika open <uuid>`.\n")
         local_candidates = [
             item
-            for item in local_candidates
+            for item in discovered_local
             if (item.provider, item.session_id) not in tracked
             and (item.provider, item.session_id) not in untracked_keys
         ]
@@ -1210,7 +1234,7 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
             print(
                 "REMOTE ADOPTION PROVEN · cache reconciliation pending · no agent moved"
             )
-    synchronized = pika.refresh(usage=False)
+    synchronized = pika.store.list_sessions() if selected else tracked_sessions
     renamed = [
         (tracked_names[session.key], session.display_name, session)
         for session in synchronized

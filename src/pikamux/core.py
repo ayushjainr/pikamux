@@ -48,6 +48,8 @@ from .ui import choose_session, sorted_attention_sessions, terminal_text
 DUPLICATE_TMUX_ERROR = "duplicate Pika tmux homes"
 UNVERIFIED_PANE_ERROR = "tagged provider PID lacks exact-UUID evidence"
 OPEN_TWICE_ERROR = "exact provider UUID is open in multiple process trees"
+CONTINUATION_CONFLICT_ERROR = "multiple active Codex continuation threads"
+CONTINUATION_FRESH_SECONDS = 30 * 60
 EXPERT_REFRESH_WINDOW_SECONDS = 6 * 60 * 60
 EXPERT_QUOTA_RESERVE_PERCENT = 10.0
 
@@ -108,6 +110,13 @@ class Pika:
                 primary.transcript_path or secondary.transcript_path
             )
             primary.model = primary.model or secondary.model
+            primary.parent_session_id = (
+                primary.parent_session_id or secondary.parent_session_id
+            )
+            primary.created_at = max(primary.created_at, secondary.created_at)
+            primary.lifecycle_status = (
+                primary.lifecycle_status or secondary.lifecycle_status
+            )
             live_pid = next(
                 (
                     candidate.pid
@@ -311,7 +320,6 @@ class Pika:
         ]
         exact_panes = {(p.pika_provider, p.pika_session_id): p for p in panes}
         for session in sessions:
-            candidate = candidate_map.get(session.key)
             pane = exact_panes.get(session.key)
             conflicting_stored_pane = False
             if pane is None and session.tmux_pane:
@@ -328,6 +336,14 @@ class Pika:
                     conflicting_stored_pane = True
                     pane = None
             fields: dict[str, object] = {}
+            candidate, continuation_conflicts = self._continuation_candidate(
+                session,
+                candidates,
+                pane=pane,
+            )
+            if candidate and candidate.session_id != session.session_id:
+                fields["active_thread_id"] = candidate.session_id
+                session.active_thread_id = candidate.session_id
             if conflicting_stored_pane:
                 fields.update(tmux_session=None, tmux_pane=None, root_pid=None)
             duplicate_panes = panes_by_key.get(session.key, [])
@@ -346,6 +362,27 @@ class Pika:
                     error=f"{DUPLICATE_TMUX_ERROR}: {homes}",
                     attention_reason="identity",
                 )
+            elif continuation_conflicts:
+                if not (
+                    session.status == Status.OPEN_TWICE.value
+                    and session.attention_reason == "identity"
+                ):
+                    self.store.capture_identity_interruption(*session.key)
+                fields.update(
+                    status=Status.OPEN_TWICE.value,
+                    unread=True,
+                    error=(
+                        f"{CONTINUATION_CONFLICT_ERROR}: "
+                        + ", ".join(
+                            item.session_id[:8] for item in continuation_conflicts
+                        )
+                    ),
+                    attention_reason="identity",
+                )
+                session.status = Status.OPEN_TWICE.value
+                session.unread = True
+                session.error = str(fields["error"])
+                session.attention_reason = "identity"
             if candidate:
                 if candidate.name:
                     fields["name"] = candidate.name
@@ -375,6 +412,25 @@ class Pika:
                 fields["last_activity_at"] = max(
                     session.last_activity_at, candidate.updated_at
                 )
+                if (
+                    candidate.lifecycle_status
+                    and candidate.updated_at > session.last_event_at
+                    and not continuation_conflicts
+                ):
+                    fields.update(
+                        status=candidate.lifecycle_status,
+                        unread=(
+                            candidate.lifecycle_status == Status.READY.value
+                            and not bool(pane and pane.attached)
+                        ),
+                        error=None,
+                        attention_reason=(
+                            "completed"
+                            if candidate.lifecycle_status == Status.READY.value
+                            else None
+                        ),
+                        last_event_at=candidate.updated_at,
+                    )
             live_pid: int | None = None
             raw_pid: int | None = None
             if pane:
@@ -447,12 +503,14 @@ class Pika:
                 )
             identity_repaired = False
             if (
-                len(duplicate_panes) <= 1
+                not continuation_conflicts
+                and len(duplicate_panes) <= 1
                 and session.error
                 and (
                     session.error.startswith(DUPLICATE_TMUX_ERROR)
                     or session.error.startswith(UNVERIFIED_PANE_ERROR)
                     or session.error.startswith(OPEN_TWICE_ERROR)
+                    or session.error.startswith(CONTINUATION_CONFLICT_ERROR)
                 )
                 and not (raw_pid and not live_pid)
             ):
@@ -537,6 +595,69 @@ class Pika:
                     pane.pane_pid if pane else live_pid
                 )
         return self.hydrate_usage(sessions) if usage else sessions
+
+    @staticmethod
+    def _same_continuation_identity(session: Session, candidate: Candidate) -> bool:
+        if not session.name or not candidate.name:
+            return False
+        if session.name.casefold() != candidate.name.casefold():
+            return False
+        if session.cwd and candidate.cwd:
+            try:
+                if Path(session.cwd).resolve() != Path(candidate.cwd).resolve():
+                    return False
+            except OSError:
+                if session.cwd != candidate.cwd:
+                    return False
+        return True
+
+    def _continuation_candidate(
+        self,
+        session: Session,
+        candidates: list[Candidate],
+        *,
+        pane: Pane | None,
+    ) -> tuple[Candidate | None, list[Candidate]]:
+        """Select one live Codex continuation or fail closed on concurrency."""
+        current_id = session.provider_thread_id
+        current = next(
+            (
+                item
+                for item in candidates
+                if (item.provider, item.session_id) == (session.provider, current_id)
+            ),
+            None,
+        )
+        if session.provider != "codex" or pane is None:
+            return current, []
+        if not provider_process(pane.pane_pid, session.provider):
+            return current, []
+        cutoff = time.time() - CONTINUATION_FRESH_SECONDS
+        working: list[Candidate] = []
+        if (
+            current
+            and current.lifecycle_status == Status.WORKING.value
+            and current.updated_at >= cutoff
+        ):
+            working.append(current)
+        continuation_parents = {session.session_id, current_id}
+        working.extend(
+            item
+            for item in candidates
+            if item.provider == session.provider
+            and item.parent_session_id in continuation_parents
+            and item.lifecycle_status == Status.WORKING.value
+            and item.updated_at >= cutoff
+            and self._same_continuation_identity(session, item)
+        )
+        unique = {item.session_id: item for item in working}
+        if len(unique) > 1:
+            return current, sorted(
+                unique.values(), key=lambda item: item.updated_at, reverse=True
+            )
+        if unique:
+            return next(iter(unique.values())), []
+        return current, []
 
     def hydrate_usage(
         self, sessions: list[Session | FleetSession]
@@ -637,7 +758,11 @@ class Pika:
         sessions = sessions or self.refresh()
         discovered: list[Candidate] = []
         query_folded = query.casefold()
-        uuid_matches = [item for item in sessions if item.session_id == query]
+        uuid_matches = [
+            item
+            for item in sessions
+            if item.session_id == query or item.provider_thread_id == query
+        ]
         if uuid_matches:
             return choose_session(uuid_matches)
         exact = [
@@ -647,7 +772,12 @@ class Pika:
         ]
         if exact:
             return choose_session(exact, "Two continuations share that name")
-        prefix = [item for item in sessions if item.session_id.startswith(query)]
+        prefix = [
+            item
+            for item in sessions
+            if item.session_id.startswith(query)
+            or item.provider_thread_id.startswith(query)
+        ]
         if len(prefix) == 1:
             return prefix[0]
         if not supplied_sessions:
@@ -713,14 +843,18 @@ class Pika:
                 and not pane.pika_provider
             ):
                 owned_pane_pids.update(process_tree(pane.pane_pid))
-        candidates = set(
-            find_processes_with_session_id(session.session_id, session.provider)
-        )
+        thread_ids = {session.session_id, session.provider_thread_id}
+        candidates: set[int] = set()
+        for thread_id in thread_ids:
+            candidates.update(
+                find_processes_with_session_id(thread_id, session.provider)
+            )
         provider = self.providers.get(session.provider)
         if provider:
             active_pids = getattr(provider, "active_pids", None)
             if active_pids:
-                candidates.update(active_pids(session.session_id))
+                for thread_id in thread_ids:
+                    candidates.update(active_pids(thread_id))
         candidates.update(self._live_owner_pids(session))
         return sorted(pid for pid in candidates if pid and pid not in owned_pane_pids)
 
@@ -731,10 +865,11 @@ class Pika:
         if provider:
             active_pids = getattr(provider, "active_pids", None)
             if active_pids:
-                try:
-                    exact.update(active_pids(session.session_id))
-                except (OSError, RuntimeError):
-                    pass
+                for thread_id in {session.session_id, session.provider_thread_id}:
+                    try:
+                        exact.update(active_pids(thread_id))
+                    except (OSError, RuntimeError):
+                        pass
         return exact
 
     def _live_owner_pids(self, session: Session) -> set[int]:
@@ -836,15 +971,16 @@ class Pika:
             if outside_exact and raw_pane_pid in self.uuid_identity_pids(current):
                 raise PikaError(
                     f"OPEN TWICE: {current.display_name} has exact UUID "
-                    f"{current.session_id} in its Pika pane (PID {raw_pane_pid}) "
+                    f"{current.provider_thread_id} in its Pika pane "
+                    f"(PID {raw_pane_pid}) "
                     f"and outside it (PID {', '.join(map(str, outside_exact))}). "
                     "Close one copy before attaching."
                 )
             raise PikaError(
                 f"{current.display_name}'s tagged pane contains a running "
                 f"{current.provider} process (PID {raw_pane_pid}) that cannot be tied "
-                f"to exact UUID {current.session_id}. Pika refuses to attach or "
-                "issue an exact-thread receipt."
+                f"to exact UUID {current.provider_thread_id}. Pika refuses to "
+                "attach or issue an exact-thread receipt."
             )
         outcome = "ATTACHED LIVE" if live_pid else "RESUMED EXACT"
         preserved: str | None = None
@@ -876,7 +1012,7 @@ class Pika:
             resumable_check = getattr(provider, "is_resumable", None)
             if resumable_check:
                 try:
-                    resumable = resumable_check(current.session_id)
+                    resumable = resumable_check(current.provider_thread_id)
                 except (OSError, RuntimeError):
                     resumable = False
                 if not resumable:
@@ -887,11 +1023,12 @@ class Pika:
             cwd = current.cwd or os.getcwd()
             if not Path(cwd).is_dir():
                 raise PikaError(f"Saved working directory no longer exists: {cwd}")
-            argv = provider.resume_argv(current.session_id)
+            argv = provider.resume_argv(current.provider_thread_id)
             environment = {
                 "PIKA_NAME": current.display_name,
                 "PIKA_PROVIDER": current.provider,
                 "PIKA_SESSION_ID": current.session_id,
+                "PIKA_ACTIVE_THREAD_ID": current.provider_thread_id,
             }
             reservation_token = str(uuid.uuid4())
             if not self.store.reserve_resume(
@@ -1039,8 +1176,10 @@ class Pika:
                 f"Pika → {terminal_text(current.display_name)}",
                 current.provider.title(),
                 open_outcome(exact),
-                f"{'exact id' if exact else 'id'} {current.session_id[:8]}",
+                f"{'exact id' if exact else 'id'} {current.provider_thread_id[:8]}",
             ]
+            if current.active_thread_id:
+                parts.append(f"home {current.session_id[:8]}")
             if preserved:
                 parts.append(terminal_text(preserved))
             elif current.attention_reason:

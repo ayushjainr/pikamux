@@ -406,7 +406,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("before → after", output.getvalue())
 
     def test_setup_respects_explicitly_untracked_conversations(self) -> None:
-        candidate = Candidate("codex", "ignored-id", "do-not-watch")
+        candidate = Candidate("claude", "ignored-id", "qes_plugin")
         store = Mock()
         store.list_sessions.return_value = []
         store.untracked_session_keys.return_value = {
@@ -416,6 +416,47 @@ class CliTests(unittest.TestCase):
         pika = Mock(store=store)
         pika.discover_import_candidates.return_value = [candidate]
         pika.refresh.return_value = []
+        args = argparse.Namespace(
+            no_import=False,
+            dry_run=False,
+            import_all=True,
+            yes=True,
+            default_provider="codex",
+        )
+        output = io.StringIO()
+        with (
+            patch("pikamux.cli.proposed_changes", return_value=[]),
+            patch("pikamux.cli.hooks_installed", return_value=True),
+            patch("pikamux.cli.load_config", return_value={}),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_setup(pika, args), 0)
+
+        pika.import_candidate.assert_not_called()
+        self.assertIn("explicitly untracked", output.getvalue())
+        self.assertIn("qes_plugin", output.getvalue())
+
+    def test_setup_does_not_reoffer_active_codex_continuation(self) -> None:
+        child_id = "22222222-2222-4222-8222-222222222222"
+        tracked = Session(
+            "codex",
+            "11111111-1111-4111-8111-111111111111",
+            name="master_quant",
+            active_thread_id=child_id,
+        )
+        candidate = Candidate(
+            "codex",
+            child_id,
+            "master_quant",
+            parent_session_id=tracked.session_id,
+        )
+        store = Mock()
+        store.list_sessions.return_value = [tracked]
+        store.untracked_session_keys.return_value = set()
+        store.get_meta.return_value = None
+        pika = Mock(store=store)
+        pika.refresh.return_value = [tracked]
+        pika.discover_import_candidates.return_value = [candidate]
         args = argparse.Namespace(
             no_import=False,
             dry_run=False,
