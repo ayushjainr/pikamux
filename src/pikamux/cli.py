@@ -27,7 +27,7 @@ from .consult import (
     consultation_for,
     consultation_policy,
 )
-from .core import PENDING_LAUNCH_GRACE_SECONDS, Pika, PikaError
+from .core import PENDING_LAUNCH_GRACE_SECONDS, Pika, PikaError, SharedLeaseConflict
 from .doctor import repair_stale_state, run_doctor
 from .executables import (
     executable_available,
@@ -73,7 +73,6 @@ PUBLIC_COMMANDS = {
     "expert",
     "experts",
     "open",
-    "recover-closed",
     "list",
     "next",
     "peek",
@@ -88,6 +87,7 @@ PUBLIC_COMMANDS = {
 }
 INTERNAL_COMMANDS = {
     "_enter",
+    "recover-closed",
     "hook",
     "_process-exit",
     "_peek-popup",
@@ -109,7 +109,7 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(
         dest="command",
         metavar=(
-            "{ask,expert,experts,list,next,peek,wait,recover-closed,untrack,setup,doctor,"
+            "{ask,expert,experts,list,next,peek,wait,untrack,setup,doctor,"
             "machines,sync}"
         ),
     )
@@ -117,11 +117,10 @@ def _parser() -> argparse.ArgumentParser:
     open_parser = sub.add_parser("open", help=argparse.SUPPRESS)
     open_parser.add_argument("name")
 
-    recover_parser = sub.add_parser(
-        "recover-closed",
-        help="resume after confirming every provider client has exited",
-    )
-    recover_parser.add_argument("name")
+    # v0.4.3 printed this exact command in recovery receipts. Keep a hidden,
+    # safe compatibility route while the daily product remains just `pika NAME`.
+    legacy_recover = sub.add_parser("recover-closed", help=argparse.SUPPRESS)
+    legacy_recover.add_argument("name")
 
     ask_parser = sub.add_parser(
         "ask",
@@ -381,6 +380,43 @@ def _normalize_argv(argv: list[str]) -> list[str]:
     }:
         return argv
     return ["_enter", *argv]
+
+
+def _confirm_shared_lease(pika: Pika, conflict: SharedLeaseConflict) -> int:
+    session = conflict.session
+    reopen_command = shlex.join(["pika", session.display_name])
+    if not sys.stdin.isatty():
+        raise PikaError(
+            f"{conflict} Interactive confirmation is required; run exactly: "
+            f"`{reopen_command}` in a terminal."
+        ) from conflict
+    print(
+        f"pika: {terminal_text(session.display_name)} may still be open in another "
+        f"{session.provider.title()} client. Exit it everywhere before confirming; "
+        "Pika will then resume the exact UUID in its protected home.",
+        file=sys.stderr,
+    )
+    answer = input(
+        f"Have you exited {terminal_text(session.display_name)!r} in every "
+        f"{session.provider.title()} client? [y/N] "
+    ).strip().casefold()
+    if answer not in {"y", "yes"}:
+        print(
+            f"pika: No state changed. Exit it everywhere, then run exactly: "
+            f"`{reopen_command}`.",
+            file=sys.stderr,
+        )
+        return 1
+    return pika.recover_after_closed_confirmation(session)
+
+
+def _open_with_shared_lease_confirmation(
+    pika: Pika, session: Session | FleetSession
+) -> int:
+    try:
+        return pika.open(session)
+    except SharedLeaseConflict as exc:
+        return _confirm_shared_lease(pika, exc)
 
 
 def _select_named(
@@ -1446,7 +1482,7 @@ def _peek_popup(args: argparse.Namespace) -> int:
         session = pika.store.get_session(args.provider, args.session_id)
         if session is None:
             raise PikaError("The selected Pika conversation is no longer tracked")
-        return pika.open(session)
+        return _open_with_shared_lease_confirmation(pika, session)
     return 0
 
 
@@ -1587,7 +1623,7 @@ def run(argv: list[str] | None = None) -> int:
         if current is None:
             raise PikaError("Exact remote session disappeared during reconciliation")
         if args.command == "_fleet-open":
-            return pika.open(current)
+            return _open_with_shared_lease_confirmation(pika, current)
         return _ask_session(
             pika,
             current,
@@ -1596,18 +1632,23 @@ def run(argv: list[str] | None = None) -> int:
             fast=args.fast,
         )
     if args.command is None:
-        return _bare(pika)
+        try:
+            return _bare(pika)
+        except SharedLeaseConflict as exc:
+            return _confirm_shared_lease(pika, exc)
     if args.command == "_enter":
-        return pika.enter(args.name)
+        try:
+            return pika.enter(args.name)
+        except SharedLeaseConflict as exc:
+            return _confirm_shared_lease(pika, exc)
     if args.command == "open":
-        return pika.open(_select_named(pika, args.name))
+        return _open_with_shared_lease_confirmation(
+            pika, _select_named(pika, args.name)
+        )
     if args.command == "recover-closed":
-        selected = _select_named(pika, args.name)
-        if isinstance(selected, FleetSession):
-            raise PikaError(
-                "recover-closed must be run on the machine that owns the conversation"
-            )
-        return pika.recover_closed(selected)
+        return _open_with_shared_lease_confirmation(
+            pika, _select_named(pika, args.name)
+        )
     if args.command == "ask":
         return _ask(
             pika,
@@ -1635,11 +1676,9 @@ def run(argv: list[str] | None = None) -> int:
         if session is None:
             print("No Pika session currently needs attention.")
             return 0
-        return (
-            pika.open_pending(session)
-            if isinstance(session, PendingLaunch)
-            else pika.open(session)
-        )
+        if isinstance(session, PendingLaunch):
+            return pika.open_pending(session)
+        return _open_with_shared_lease_confirmation(pika, session)
     if args.command == "peek":
         return _peek(pika, args.name, args.lines, ack=args.ack)
     if args.command == "wait":

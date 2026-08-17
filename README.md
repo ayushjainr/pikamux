@@ -97,7 +97,7 @@ Install the same release on Windows, then pair each server whose agents may be
 opened locally:
 
 ```powershell
-uv tool install "git+ssh://git@github.com/ajainwolfe/pikamux.git@v0.4.3"
+uv tool install "git+ssh://git@github.com/ajainwolfe/pikamux.git@v0.4.4"
 pika setup rstudio-6
 ```
 
@@ -263,7 +263,6 @@ pika next                  open the oldest conversation needing attention
 pika peek NAME             inspect recent pane output without attaching
 pika peek NAME --ack       explicitly acknowledge READY in a script
 pika wait NAME             wait for NEEDS YOU, unread READY, OPEN TWICE, or ERROR
-pika recover-closed NAME   clear only a weak shared lease after every client exited
 pika untrack NAME           stop watching without stopping or archiving the agent
 pika doctor                print a recoverability receipt
 pika doctor --verbose      show every receipt check
@@ -296,13 +295,15 @@ Pika resumes the exact UUID in its existing idle pane or a new home. Modern
 Codex CLI, IDE, and desktop clients can all use the same app-server, so Pika
 does not label that shared PID as a desktop app. If it also sees a live
 `codex resume NAME` process, the receipt says `ACTIVE IN CODEX CLI` and gives
-the exact `/exit` then `pika recover-closed NAME` sequence. Otherwise it says
-`ACTIVE THROUGH CODEX APP-SERVER`, without guessing which client owns the
-lease. `recover-closed` is a narrow user assertion: after every provider client
-has exited, it can revoke only shared-infrastructure leases; an exact UUID PID,
-dedicated process, or running tagged pane remains fail-closed. The ordinary
-receipt also gives the UTC lease deadline as a wait-only alternative. Shared
-app-server PIDs are explicitly marked as infrastructure that must not be killed.
+the exact `/exit` then `pika NAME` sequence. Otherwise it reports ambiguous
+shared client state without guessing which client owns the lease. The same
+`pika NAME` invocation asks once whether every provider client has exited; a
+confirmed answer revokes only shared-infrastructure leases and resumes the exact
+UUID. An exact UUID PID, dedicated process, or running tagged pane remains
+fail-closed. Non-interactive calls never assume confirmation. The receipt also
+gives the UTC lease deadline as a wait-only alternative. Shared app-server PIDs
+are explicitly marked as infrastructure that must not be killed. No recovery
+subcommand is part of the user model.
 
 `pika ask master_quant "What assumption is weakest here?"` opens a temporary
 side conversation based on that exact provider UUID. In a terminal, ask

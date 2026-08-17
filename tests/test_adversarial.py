@@ -430,13 +430,13 @@ class AdversarialTests(unittest.TestCase):
             pika.open(session, attach=False)
 
         message = str(raised.exception)
-        self.assertIn("ACTIVE THROUGH CODEX APP-SERVER", message)
-        self.assertIn("Required steps: 1)", message)
-        self.assertIn("run exactly: `pika recover-closed 'recover me'`", message)
+        self.assertIn("CODEX CLIENT STATE AMBIGUOUS", message)
+        self.assertIn("needs one confirmation", message)
+        self.assertIn("Run exactly: `pika 'recover me'`", message)
         self.assertIn("Do not kill PID", message)
         self.assertNotIn("Exit that copy normally", message)
 
-    def test_recover_closed_revokes_only_shared_lease_and_resumes(self) -> None:
+    def test_confirmed_recovery_revokes_only_shared_lease_and_resumes(self) -> None:
         session = Session(
             "codex",
             "15151515-1515-4515-8515-151515151515",
@@ -467,7 +467,9 @@ class AdversarialTests(unittest.TestCase):
                 side_effect=lambda pid, provider: provider == "codex" and pid == 777,
             ),
         ):
-            self.assertEqual(pika.recover_closed(session, attach=False), 0)
+            self.assertEqual(
+                pika.recover_after_closed_confirmation(session, attach=False), 0
+            )
 
         self.assertEqual(self.store.get_live_owners(*session.key), [])
         self.assertEqual(len(tmux.panes), 1)
@@ -498,14 +500,14 @@ class AdversarialTests(unittest.TestCase):
             with self.assertRaises(PikaError) as open_error:
                 pika.open(session, attach=False)
             with self.assertRaisesRegex(PikaError, "RECOVERY REFUSED"):
-                pika.recover_closed(session, attach=False)
+                pika.recover_after_closed_confirmation(session, attach=False)
 
         message = str(open_error.exception)
         self.assertIn("ACTIVE IN CODEX CLI", message)
         self.assertIn("run `/exit` and wait for the shell prompt", message)
-        self.assertIn("run exactly: `pika recover-closed 'named live'`", message)
+        self.assertIn("run exactly: `pika 'named live'`", message)
 
-    def test_recover_closed_remains_fail_closed_for_dedicated_process(self) -> None:
+    def test_confirmed_recovery_remains_fail_closed_for_dedicated_process(self) -> None:
         session = Session(
             "codex",
             "16161616-1616-4616-8616-161616161616",
@@ -519,7 +521,166 @@ class AdversarialTests(unittest.TestCase):
             {"codex": FakeProvider(active=[999])},
         )
         with self.assertRaisesRegex(PikaError, "RECOVERY REFUSED"):
-            pika.recover_closed(session, attach=False)
+            pika.recover_after_closed_confirmation(session, attach=False)
+
+    def test_confirmed_recovery_rechecks_exact_uuid_before_launch(self) -> None:
+        session = Session(
+            "codex",
+            "18181818-1818-4818-8818-181818181818",
+            name="late exact",
+            cwd="/tmp",
+        )
+        self.store.upsert_session(session)
+        owner_pid = os.getpid()
+        self.assertTrue(self.store.set_live_owner(*session.key, owner_pid))
+        provider = FakeProvider()
+        tmux = StaticTmux()
+        pika = Pika(self.store, tmux, {"codex": provider})
+        original_outside = pika._outside_processes
+        outside_calls = 0
+
+        def staged_outside(current, panes):
+            nonlocal outside_calls
+            outside_calls += 1
+            result = original_outside(current, panes)
+            if outside_calls == 2:
+                provider.active = [888]
+            return result
+
+        with (
+            patch(
+                "pikamux.core.provider_process",
+                side_effect=lambda pid, provider=None: (
+                    777 if pid == owner_pid and provider == "codex" else None
+                ),
+            ),
+            patch(
+                "pikamux.core.shared_provider_process",
+                side_effect=lambda pid, provider: provider == "codex" and pid == 777,
+            ),
+            patch.object(pika, "_outside_processes", side_effect=staged_outside),
+            self.assertRaisesRegex(PikaError, "already running outside"),
+        ):
+            pika.recover_after_closed_confirmation(session, attach=False)
+
+        self.assertEqual(tmux.panes, [])
+
+    def test_confirmed_recovery_reports_late_genuine_duplicate_as_open_twice(
+        self,
+    ) -> None:
+        session = Session(
+            "codex",
+            "19191919-1919-4919-8919-191919191919",
+            name="late duplicate",
+            cwd="/tmp",
+        )
+        self.store.upsert_session(session)
+        owner_pid = os.getpid()
+        self.assertTrue(self.store.set_live_owner(*session.key, owner_pid))
+        provider = FakeProvider()
+        tmux = StaticTmux()
+        pika = Pika(self.store, tmux, {"codex": provider})
+        original_outside = pika._outside_processes
+        outside_calls = 0
+
+        def staged_outside(current, panes):
+            nonlocal outside_calls
+            outside_calls += 1
+            result = original_outside(current, panes)
+            # The third check is open()'s pre-reservation check. Introduce the
+            # duplicates immediately after it so only the reserved recheck can
+            # catch and classify the race.
+            if outside_calls == 3:
+                provider.active = [888, 999]
+            return result
+
+        with (
+            patch(
+                "pikamux.core.provider_process",
+                side_effect=lambda pid, provider=None: (
+                    777 if pid == owner_pid and provider == "codex" else None
+                ),
+            ),
+            patch(
+                "pikamux.core.shared_provider_process",
+                side_effect=lambda pid, provider: provider == "codex" and pid == 777,
+            ),
+            patch.object(pika, "_outside_processes", side_effect=staged_outside),
+            self.assertRaisesRegex(PikaError, "OPEN TWICE"),
+        ):
+            pika.recover_after_closed_confirmation(session, attach=False)
+
+        self.assertEqual(tmux.panes, [])
+
+    def test_confirmed_recovery_refuses_a_renewed_shared_lease(self) -> None:
+        session = Session(
+            "codex",
+            "20202020-2020-4020-8020-202020202020",
+            name="renewed lease",
+            cwd="/tmp",
+        )
+        self.store.upsert_session(session)
+        owner_pid = os.getpid()
+        self.assertTrue(
+            self.store.set_live_owner(*session.key, owner_pid, owner_token="initial")
+        )
+        tmux = StaticTmux()
+        pika = Pika(self.store, tmux, {"codex": FakeProvider()})
+        original_outside = pika._outside_processes
+        outside_calls = 0
+
+        def renew_before_recheck(current, panes):
+            nonlocal outside_calls
+            outside_calls += 1
+            if outside_calls == 2:
+                self.store.set_live_owner(
+                    *session.key, owner_pid, owner_token="renewed"
+                )
+            return original_outside(current, panes)
+
+        with (
+            patch(
+                "pikamux.core.provider_process",
+                side_effect=lambda pid, provider=None: (
+                    777 if pid == owner_pid and provider == "codex" else None
+                ),
+            ),
+            patch("pikamux.core.shared_provider_process", return_value=True),
+            patch.object(
+                pika, "_outside_processes", side_effect=renew_before_recheck
+            ),
+            self.assertRaisesRegex(PikaError, "live ownership evidence"),
+        ):
+            pika.recover_after_closed_confirmation(session, attach=False)
+
+        self.assertEqual(tmux.panes, [])
+        self.assertEqual(len(self.store.get_live_owner_leases(*session.key)), 1)
+
+    def test_confirmed_recovery_rejects_exact_client_after_pid_reuse(self) -> None:
+        session = Session(
+            "codex",
+            "21212121-2121-4121-8121-212121212121",
+            name="reused pid",
+            cwd="/tmp",
+        )
+        self.store.upsert_session(session)
+        with patch("pikamux.store.process_start_time", return_value=100):
+            self.assertTrue(self.store.set_live_owner(*session.key, 456))
+        tmux = StaticTmux()
+        pika = Pika(
+            self.store,
+            tmux,
+            {"codex": FakeProvider(active=[456])},
+        )
+
+        with (
+            patch("pikamux.core.process_start_time", return_value=200),
+            patch("pikamux.core.provider_process", return_value=456),
+            self.assertRaisesRegex(PikaError, "UUID-bearing"),
+        ):
+            pika.recover_after_closed_confirmation(session, attach=False)
+
+        self.assertEqual(tmux.panes, [])
 
     def test_reused_live_owner_pid_cannot_prove_exact_identity(self) -> None:
         session = Session(

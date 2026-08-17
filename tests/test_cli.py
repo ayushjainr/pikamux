@@ -4,19 +4,22 @@ import argparse
 import io
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from pikamux.cli import (
     _bare,
+    _confirm_shared_lease,
     _normalize_argv,
     _parser,
     _peek,
     _peek_popup,
     _setup,
     _wait,
+    run,
 )
+from pikamux.core import PikaError, SharedLeaseConflict
 from pikamux.models import Candidate, Pane, Session, Status
 from pikamux.setup_hooks import hook_spec_fingerprint
 from pikamux.tmux import TmuxError
@@ -123,14 +126,113 @@ class CliTests(unittest.TestCase):
         self.assertEqual(_normalize_argv(["list"]), ["list"])
         self.assertEqual(_normalize_argv(["open", "list"]), ["open", "list"])
 
-    def test_recover_closed_is_an_explicit_public_command(self) -> None:
-        args = _parser().parse_args(["recover-closed", "master_pika"])
-        self.assertEqual(args.command, "recover-closed")
-        self.assertEqual(args.name, "master_pika")
+    def test_shared_lease_confirmation_recovers_without_a_new_command(self) -> None:
+        session = Session("codex", "uuid", name="master pika")
+        conflict = SharedLeaseConflict("shared lease", session)
+        pika = Mock()
+        pika.recover_after_closed_confirmation.return_value = 17
+        fake_stdin = Mock()
+        fake_stdin.isatty.return_value = True
+        with (
+            patch("pikamux.cli.sys.stdin", fake_stdin),
+            patch("builtins.input", return_value="yes"),
+            redirect_stderr(io.StringIO()) as error,
+        ):
+            self.assertEqual(_confirm_shared_lease(pika, conflict), 17)
+        pika.recover_after_closed_confirmation.assert_called_once_with(session)
+        self.assertIn("may still be open in another Codex client", error.getvalue())
+        self.assertNotIn("run exactly", error.getvalue())
+
+    def test_shared_lease_decline_changes_nothing_and_repeats_same_command(self) -> None:
+        session = Session("codex", "uuid", name="master pika")
+        conflict = SharedLeaseConflict("shared lease", session)
+        pika = Mock()
+        fake_stdin = Mock()
+        fake_stdin.isatty.return_value = True
+        with (
+            patch("pikamux.cli.sys.stdin", fake_stdin),
+            patch("builtins.input", return_value=""),
+            redirect_stderr(io.StringIO()) as error,
+        ):
+            self.assertEqual(_confirm_shared_lease(pika, conflict), 1)
+        pika.recover_after_closed_confirmation.assert_not_called()
+        self.assertIn("`pika 'master pika'`", error.getvalue())
+
+    def test_shared_lease_noninteractive_call_stays_fail_closed(self) -> None:
+        session = Session("codex", "uuid", name="master_pika")
+        conflict = SharedLeaseConflict("shared lease", session)
+        fake_stdin = Mock()
+        fake_stdin.isatty.return_value = False
+        with (
+            patch("pikamux.cli.sys.stdin", fake_stdin),
+            self.assertRaisesRegex(PikaError, "Interactive confirmation is required"),
+        ):
+            _confirm_shared_lease(Mock(), conflict)
+
+    def test_one_name_entry_routes_ambiguous_lease_to_confirmation(self) -> None:
+        session = Session("codex", "uuid", name="master_pika")
+        conflict = SharedLeaseConflict("shared lease", session)
+        pika = Mock()
+        pika.enter.side_effect = conflict
+        with (
+            patch("pikamux.cli.Pika", return_value=pika),
+            patch("pikamux.cli._confirm_shared_lease", return_value=23) as confirm,
+        ):
+            self.assertEqual(run(["master_pika"]), 23)
+        pika.enter.assert_called_once_with("master_pika")
+        confirm.assert_called_once_with(pika, conflict)
+
+    def test_remote_exact_open_routes_ambiguous_lease_to_confirmation(self) -> None:
+        session = Session("codex", "uuid", name="master_remote")
+        conflict = SharedLeaseConflict("shared lease", session)
+        pika = Mock()
+        pika.store.local_node_id.return_value = "node-1"
+        pika.store.get_session.return_value = session
+        pika.refresh.return_value = [session]
+        pika.open.side_effect = conflict
+        with (
+            patch("pikamux.cli.Pika", return_value=pika),
+            patch("pikamux.cli._confirm_shared_lease", return_value=29) as confirm,
+        ):
+            self.assertEqual(
+                run(
+                    [
+                        "_fleet-open",
+                        "--expected-node-id",
+                        "node-1",
+                        "--provider",
+                        "codex",
+                        "--session-id",
+                        "uuid",
+                    ]
+                ),
+                29,
+            )
+        pika.open.assert_called_once_with(session)
+        confirm.assert_called_once_with(pika, conflict)
+
+    def test_legacy_recovery_receipt_remains_a_hidden_safe_alias(self) -> None:
+        session = Session("codex", "uuid", name="master_pika")
+        conflict = SharedLeaseConflict("shared lease", session)
+        pika = Mock()
+        pika.resolve.return_value = session
+        pika.open.side_effect = conflict
+        self.assertEqual(
+            _normalize_argv(["recover-closed", "master_pika"]),
+            ["recover-closed", "master_pika"],
+        )
+        with (
+            patch("pikamux.cli.Pika", return_value=pika),
+            patch("pikamux.cli._confirm_shared_lease", return_value=31) as confirm,
+        ):
+            self.assertEqual(run(["recover-closed", "master_pika"]), 31)
+        pika.open.assert_called_once_with(session)
+        confirm.assert_called_once_with(pika, conflict)
 
     def test_primary_help_teaches_one_name_command_not_lifecycle_mechanics(self) -> None:
         rendered = _parser().format_help()
         self.assertIn("pika NAME", rendered)
+        self.assertNotIn("recover-closed", rendered)
         self.assertNotIn("open a named conversation", rendered)
         self.assertNotIn("start a new managed conversation", rendered)
         self.assertNotIn("adopt a running agent", rendered)
@@ -206,6 +308,30 @@ class CliTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertNotIn("\x1b", rendered)
         self.assertIn("peek�[2J�renamed", rendered)
+
+    def test_peek_popup_enter_routes_ambiguous_lease_to_confirmation(self) -> None:
+        session = Session("codex", "uuid", name="peeked")
+        conflict = SharedLeaseConflict("shared lease", session)
+        pika = Mock()
+        pika.tmux.capture.return_value = "pane output"
+        pika.store.get_session.return_value = session
+        pika.open.side_effect = conflict
+        args = argparse.Namespace(
+            target="%1",
+            lines=20,
+            name="peeked",
+            provider="codex",
+            session_id="uuid",
+        )
+        with (
+            patch("pikamux.cli.Pika", return_value=pika),
+            patch("pikamux.cli.sys.stdin", io.StringIO("\n")),
+            patch("pikamux.cli._confirm_shared_lease", return_value=37) as confirm,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(_peek_popup(args), 37)
+        pika.open.assert_called_once_with(session)
+        confirm.assert_called_once_with(pika, conflict)
 
     def test_failed_peek_does_not_acknowledge_unread_ready(self) -> None:
         pika = PeekPika(fail=True)

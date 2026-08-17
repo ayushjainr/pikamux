@@ -1,3 +1,3 @@
 """Pikamux: persistent identity and attention routing for terminal agents."""
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
