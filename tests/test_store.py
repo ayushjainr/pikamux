@@ -332,19 +332,47 @@ class StoreTests(unittest.TestCase):
         )
         leases = self.store.get_live_owner_leases("codex", "exact-uuid")
         self.assertEqual(
-            [(pid, start) for pid, start, _seen in leases],
+            [(pid, start) for pid, start, _seen, _token in leases],
             [
                 (123, 1001),
                 (456, 1002),
             ],
         )
-        self.assertTrue(all(seen > 0 for _pid, _start, seen in leases))
+        self.assertTrue(all(seen > 0 for _pid, _start, seen, _token in leases))
         self.store.delete_live_owner("codex", "exact-uuid", pid=123)
         self.assertEqual(
             self.store.get_live_owners("codex", "exact-uuid"), [(456, 1002)]
         )
         self.store.delete_live_owner("codex", "exact-uuid")
         self.assertEqual(self.store.get_live_owners("codex", "exact-uuid"), [])
+
+    def test_live_owner_tokens_isolate_clients_sharing_one_app_server(self) -> None:
+        with patch("pikamux.store.process_start_time", return_value=1001):
+            self.assertTrue(
+                self.store.set_live_owner(
+                    "codex", "exact-uuid", 123, owner_token="pika-client"
+                )
+            )
+            self.assertTrue(
+                self.store.set_live_owner(
+                    "codex", "exact-uuid", 123, owner_token="desktop-client"
+                )
+            )
+        leases = self.store.get_live_owner_leases("codex", "exact-uuid")
+        self.assertEqual(
+            [token for _pid, _start, _seen, token in leases],
+            ["desktop-client", "pika-client"],
+        )
+
+        self.store.delete_live_owner(
+            "codex", "exact-uuid", owner_token="pika-client"
+        )
+
+        remaining = self.store.get_live_owner_leases("codex", "exact-uuid")
+        self.assertEqual(
+            [token for _pid, _start, _seen, token in remaining],
+            ["desktop-client"],
+        )
 
     def test_live_owner_requires_process_start_identity(self) -> None:
         with patch("pikamux.store.process_start_time", return_value=None):
@@ -460,6 +488,43 @@ class StoreTests(unittest.TestCase):
                 row["name"] for row in db.execute("PRAGMA table_info(live_owners)")
             }
         self.assertIn("start_time", columns)
+
+    def test_existing_database_migrates_live_owner_client_tokens(self) -> None:
+        self.store.initialize()
+        with self.store.connect() as db:
+            db.executescript(
+                """
+                ALTER TABLE live_owners RENAME TO live_owners_current;
+                CREATE TABLE live_owners (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    pid INTEGER NOT NULL,
+                    start_time INTEGER,
+                    last_seen REAL NOT NULL,
+                    PRIMARY KEY (provider, session_id, pid)
+                );
+                INSERT INTO live_owners VALUES ('codex','legacy',123,456,789.0);
+                DROP TABLE live_owners_current;
+                """
+            )
+        migrated = Store(self.db_path)
+        migrated.initialize()
+        with migrated.connect() as db:
+            columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(live_owners)")
+            }
+            owner_pk = [
+                row["name"]
+                for row in db.execute("PRAGMA table_info(live_owners)")
+                if row["pk"]
+            ]
+        self.assertIn("owner_token", columns)
+        self.assertEqual(
+            owner_pk, ["provider", "session_id", "pid", "owner_token"]
+        )
+        self.assertEqual(
+            migrated.get_live_owner_leases("codex", "legacy")[0][3], ""
+        )
 
     def test_existing_database_migrates_expert_freshness_columns(self) -> None:
         self.store.initialize()

@@ -378,6 +378,9 @@ class Tmux:
             exit_argv.extend(["--session-id", session_id])
         if launch_token:
             exit_argv.extend(["--launch-token", launch_token])
+        owner_token = launch_environment.get("PIKA_OWNER_TOKEN")
+        if owner_token:
+            exit_argv.extend(["--owner-token", owner_token])
         shell = os.environ.get("SHELL") or "/bin/bash"
         shell_argv = [shell, "-l"]
         if palette is not None:

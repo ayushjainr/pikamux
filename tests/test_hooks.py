@@ -877,6 +877,62 @@ class HookTests(unittest.TestCase):
         self.assertIn("status 7", session.error if session else "")
         self.assertEqual(session.attention_reason if session else None, "exited")
 
+    def test_ctrl_c_exit_revokes_only_its_owner_lease_and_parks(self) -> None:
+        self.store.upsert_session(
+            Session(
+                "codex",
+                "uuid-interrupted",
+                name="interrupted",
+                status=Status.WORKING.value,
+            )
+        )
+        with patch("pikamux.store.process_start_time", return_value=12345):
+            self.store.set_live_owner(
+                "codex",
+                "uuid-interrupted",
+                4321,
+                owner_token="pika-client",
+            )
+            self.store.set_live_owner(
+                "codex",
+                "uuid-interrupted",
+                4321,
+                owner_token="desktop-client",
+            )
+
+        handle_process_exit(
+            "codex",
+            130,
+            session_id="uuid-interrupted",
+            owner_token="pika-client",
+            store=self.store,
+        )
+
+        session = self.store.get_session("codex", "uuid-interrupted")
+        self.assertEqual(session.status if session else None, Status.PARKED.value)
+        self.assertFalse(session.unread if session else True)
+        self.assertIsNone(session.error if session else "missing")
+        leases = self.store.get_live_owner_leases("codex", "uuid-interrupted")
+        self.assertEqual(
+            [token for _pid, _start, _seen, token in leases],
+            ["desktop-client"],
+        )
+
+    def test_legacy_process_exit_clears_undifferentiated_owner_lease(self) -> None:
+        self.store.upsert_session(
+            Session("codex", "uuid-legacy-exit", status=Status.WORKING.value)
+        )
+        with patch("pikamux.store.process_start_time", return_value=12345):
+            self.store.set_live_owner("codex", "uuid-legacy-exit", 4321)
+
+        handle_process_exit(
+            "codex", 130, session_id="uuid-legacy-exit", store=self.store
+        )
+
+        self.assertEqual(
+            self.store.get_live_owners("codex", "uuid-legacy-exit"), []
+        )
+
     @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_late_competing_hook_cannot_overwrite_recovered_launch(self) -> None:
         winner = "11111111-1111-4111-8111-111111111111"

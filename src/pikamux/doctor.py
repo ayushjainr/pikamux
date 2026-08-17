@@ -314,6 +314,7 @@ def run_doctor(
         pid,
         start_time,
         last_seen,
+        owner_token,
     ) in pika.store.list_live_owners():
         if (provider, session_id) in tracked_keys:
             continue
@@ -331,7 +332,12 @@ def run_doctor(
         if live_pid:
             hidden_live_owners.append(f"{provider}:{session_id} PID {live_pid}")
         else:
-            pika.store.delete_live_owner(provider, session_id, pid=pid)
+            pika.store.delete_live_owner(
+                provider,
+                session_id,
+                pid=pid,
+                owner_token=owner_token,
+            )
     identity_duplicates = duplicate_ids + duplicate_homes + duplicate_processes
     if (
         identity_duplicates

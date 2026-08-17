@@ -405,6 +405,34 @@ class AdversarialTests(unittest.TestCase):
         ):
             pika.open(session, attach=False)
 
+    def test_shared_app_lease_names_the_real_blocker_and_recovery(self) -> None:
+        session = Session(
+            "codex",
+            "11111111-1111-4111-8111-111111111111",
+            name="recover-me",
+            cwd="/tmp",
+        )
+        self.store.upsert_session(session)
+        owner_pid = os.getpid()
+        self.store.set_live_owner("codex", session.session_id, owner_pid)
+        pika = Pika(self.store, StaticTmux(), {"codex": FakeProvider()})
+
+        def provider_at_root(pid, provider=None):
+            return 999 if pid == owner_pid and provider == "codex" else None
+
+        with (
+            patch("pikamux.core.provider_process", side_effect=provider_at_root),
+            patch("pikamux.core.shared_provider_process", return_value=True),
+            self.assertRaises(PikaError) as raised,
+        ):
+            pika.open(session, attach=False)
+
+        message = str(raised.exception)
+        self.assertIn("ACTIVE IN CODEX APP", message)
+        self.assertIn("recreate the exact home automatically", message)
+        self.assertIn("No re-adoption or cleanup is needed", message)
+        self.assertNotIn("Exit that copy normally", message)
+
     def test_reused_live_owner_pid_cannot_prove_exact_identity(self) -> None:
         session = Session(
             "codex",

@@ -1460,9 +1460,8 @@ class Pika:
         """Return valid hook leases, pruning dead, reused, and expired claims."""
         result: set[int] = set()
         now = time.time()
-        for owner, owner_start, last_seen in self.store.get_live_owner_leases(
-            *session.key
-        ):
+        leases = self.store.get_live_owner_leases(*session.key)
+        for owner, owner_start, last_seen, owner_token in leases:
             live_owner = (
                 provider_process(owner, session.provider)
                 if owner_start is not None and process_start_time(owner) == owner_start
@@ -1474,7 +1473,9 @@ class Pika:
                 and now - last_seen > LIVE_OWNER_LEASE_SECONDS
             )
             if not live_owner or expired_shared_lease:
-                self.store.delete_live_owner(*session.key, pid=owner)
+                self.store.delete_live_owner(
+                    *session.key, pid=owner, owner_token=owner_token
+                )
                 continue
             result.add(live_owner)
         return result
@@ -1677,12 +1678,26 @@ class Pika:
             outside = self._outside_processes(current, panes)
             if outside:
                 pid_text = ", ".join(str(pid) for pid in outside)
-                if len(self.uuid_identity_pids(current)) > 1:
+                direct_uuid_pids = self.uuid_identity_pids(current)
+                if len(direct_uuid_pids) > 1:
                     raise PikaError(
                         f"OPEN TWICE: {current.display_name} has exact UUID "
                         f"{current.provider_thread_id} in multiple process trees "
                         f"(PID {pid_text}). Close one copy, then rerun "
                         f"`pika {current.display_name}`."
+                    )
+                if not direct_uuid_pids and all(
+                    shared_provider_process(pid, current.provider) for pid in outside
+                ):
+                    raise PikaError(
+                        f"ACTIVE IN {current.provider.upper()} APP: "
+                        f"{current.display_name}'s exact UUID has a fresh app lease "
+                        f"(PID {pid_text}). Pika will not open a second client while "
+                        "that view may still be live. Close or leave that conversation, "
+                        f"then rerun `pika {current.display_name}`; Pika will recreate "
+                        "the exact home automatically. No re-adoption or cleanup is needed. "
+                        "If the app is already closed, its lease expires no later than "
+                        "five minutes after the last activity."
                     )
                 raise PikaError(
                     f"{current.display_name} is already running outside its Pika "
@@ -1716,6 +1731,7 @@ class Pika:
                 "PIKA_PROVIDER": current.provider,
                 "PIKA_SESSION_ID": current.session_id,
                 "PIKA_ACTIVE_THREAD_ID": current.provider_thread_id,
+                "PIKA_OWNER_TOKEN": str(uuid.uuid4()),
             }
             reservation_token = str(uuid.uuid4())
             if not self.store.reserve_resume(
@@ -1996,6 +2012,7 @@ class Pika:
             "PIKA_NAME": name,
             "PIKA_PROVIDER": provider_name,
             "PIKA_LAUNCH_TOKEN": token,
+            "PIKA_OWNER_TOKEN": token,
         }
         if reserved_id:
             environment["PIKA_SESSION_ID"] = reserved_id

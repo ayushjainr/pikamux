@@ -88,6 +88,18 @@ class TmuxTests(unittest.TestCase):
         self.assertNotIn("-u NO_COLOR", wrapper)
         self.assertIn("NO_COLOR=1", wrapper)
 
+    def test_agent_wrapper_reports_exact_owner_token_on_exit(self) -> None:
+        with patch.dict(os.environ, {"PATH": "/caller/bin"}, clear=True):
+            wrapper = Tmux("test")._agent_wrapper(
+                "codex",
+                ["codex", "resume", "uuid"],
+                {"PIKA_OWNER_TOKEN": "owner-123"},
+                "uuid",
+                None,
+            )
+        self.assertIn("PIKA_OWNER_TOKEN=owner-123", wrapper)
+        self.assertIn("--owner-token owner-123", wrapper)
+
     def test_codex_uses_palette_bridge_when_outer_colors_are_known(self) -> None:
         with patch.dict(
             os.environ,

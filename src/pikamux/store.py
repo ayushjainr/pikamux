@@ -134,8 +134,9 @@ class Store:
                     session_id TEXT NOT NULL,
                     pid INTEGER NOT NULL,
                     start_time INTEGER,
+                    owner_token TEXT NOT NULL DEFAULT '',
                     last_seen REAL NOT NULL,
-                    PRIMARY KEY (provider, session_id, pid)
+                    PRIMARY KEY (provider, session_id, pid, owner_token)
                 );
                 CREATE TABLE IF NOT EXISTS recovery_owners (
                     provider TEXT NOT NULL,
@@ -268,14 +269,43 @@ class Store:
                         session_id TEXT NOT NULL,
                         pid INTEGER NOT NULL,
                         start_time INTEGER,
+                        owner_token TEXT NOT NULL DEFAULT '',
                         last_seen REAL NOT NULL,
-                        PRIMARY KEY (provider, session_id, pid)
+                        PRIMARY KEY (provider, session_id, pid, owner_token)
                     );
                     INSERT OR IGNORE INTO live_owners(
-                        provider,session_id,pid,start_time,last_seen
+                        provider,session_id,pid,start_time,owner_token,last_seen
                     )
-                    SELECT provider,session_id,pid,NULL,last_seen FROM live_owners_legacy;
+                    SELECT provider,session_id,pid,NULL,'',last_seen
+                    FROM live_owners_legacy;
                     DROP TABLE live_owners_legacy;
+                    """
+                )
+                owner_columns = db.execute("PRAGMA table_info(live_owners)").fetchall()
+                owner_pk = [
+                    str(row["name"])
+                    for row in sorted(owner_columns, key=lambda row: int(row["pk"]))
+                    if row["pk"]
+                ]
+            if owner_pk == ["provider", "session_id", "pid"]:
+                db.executescript(
+                    """
+                    ALTER TABLE live_owners RENAME TO live_owners_pid_legacy;
+                    CREATE TABLE live_owners (
+                        provider TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        pid INTEGER NOT NULL,
+                        start_time INTEGER,
+                        owner_token TEXT NOT NULL DEFAULT '',
+                        last_seen REAL NOT NULL,
+                        PRIMARY KEY (provider, session_id, pid, owner_token)
+                    );
+                    INSERT OR IGNORE INTO live_owners(
+                        provider,session_id,pid,start_time,owner_token,last_seen
+                    )
+                    SELECT provider,session_id,pid,start_time,'',last_seen
+                    FROM live_owners_pid_legacy;
+                    DROP TABLE live_owners_pid_legacy;
                     """
                 )
                 owner_columns = db.execute("PRAGMA table_info(live_owners)").fetchall()
@@ -1298,12 +1328,20 @@ class Store:
                 "DELETE FROM launch_bindings WHERE launch_token=?", (launch_token,)
             )
 
-    def set_live_owner(self, provider: str, session_id: str, pid: int) -> bool:
+    def set_live_owner(
+        self,
+        provider: str,
+        session_id: str,
+        pid: int,
+        *,
+        owner_token: str | None = None,
+    ) -> bool:
         """Renew a hook-owner lease using non-recyclable process identity."""
         self.initialize()
         start_time = process_start_time(pid)
         if start_time is None:
             return False
+        claim = owner_token or ""
         with self.connect() as db:
             if db.execute(
                 "SELECT 1 FROM untracked_sessions WHERE provider=? AND session_id=?",
@@ -1313,25 +1351,25 @@ class Store:
             db.execute(
                 """
                 INSERT INTO live_owners(
-                    provider,session_id,pid,start_time,last_seen
-                ) VALUES (?,?,?,?,?)
-                ON CONFLICT(provider,session_id,pid) DO UPDATE SET
+                    provider,session_id,pid,start_time,owner_token,last_seen
+                ) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(provider,session_id,pid,owner_token) DO UPDATE SET
                     start_time=excluded.start_time,
                     last_seen=excluded.last_seen
                 """,
-                (provider, session_id, pid, start_time, time.time()),
+                (provider, session_id, pid, start_time, claim, time.time()),
             )
         return True
 
     def get_live_owner_leases(
         self, provider: str, session_id: str
-    ) -> list[tuple[int, int | None, float]]:
+    ) -> list[tuple[int, int | None, float, str]]:
         """Return hook claims with timestamps required for lease validation."""
         self.initialize()
         with self.connect() as db:
             rows = db.execute(
-                "SELECT pid,start_time,last_seen FROM live_owners "
-                "WHERE provider=? AND session_id=? ORDER BY pid",
+                "SELECT pid,start_time,last_seen,owner_token FROM live_owners "
+                "WHERE provider=? AND session_id=? ORDER BY pid,owner_token",
                 (provider, session_id),
             ).fetchall()
         return [
@@ -1339,6 +1377,7 @@ class Store:
                 int(row["pid"]),
                 int(row["start_time"]) if row["start_time"] is not None else None,
                 float(row["last_seen"]),
+                str(row["owner_token"]),
             )
             for row in rows
         ]
@@ -1346,21 +1385,22 @@ class Store:
     def get_live_owners(
         self, provider: str, session_id: str
     ) -> list[tuple[int, int | None]]:
-        return [
-            (pid, start_time)
-            for pid, start_time, _last_seen in self.get_live_owner_leases(
-                provider, session_id
-            )
-        ]
+        owners: dict[int, int | None] = {}
+        for pid, start_time, _last_seen, _owner_token in self.get_live_owner_leases(
+            provider, session_id
+        ):
+            if pid not in owners or owners[pid] is None:
+                owners[pid] = start_time
+        return sorted(owners.items())
 
     def list_live_owners(
         self,
-    ) -> list[tuple[str, str, int, int | None, float]]:
+    ) -> list[tuple[str, str, int, int | None, float, str]]:
         self.initialize()
         with self.connect() as db:
             rows = db.execute(
-                "SELECT provider,session_id,pid,start_time,last_seen "
-                "FROM live_owners ORDER BY provider,session_id,pid"
+                "SELECT provider,session_id,pid,start_time,last_seen,owner_token "
+                "FROM live_owners ORDER BY provider,session_id,pid,owner_token"
             ).fetchall()
         return [
             (
@@ -1369,6 +1409,7 @@ class Store:
                 int(row["pid"]),
                 int(row["start_time"]) if row["start_time"] is not None else None,
                 float(row["last_seen"]),
+                str(row["owner_token"]),
             )
             for row in rows
         ]
@@ -1421,19 +1462,36 @@ class Store:
             )
 
     def delete_live_owner(
-        self, provider: str, session_id: str, pid: int | None = None
+        self,
+        provider: str,
+        session_id: str,
+        pid: int | None = None,
+        *,
+        owner_token: str | None = None,
     ) -> None:
         self.initialize()
         with self.connect() as db:
-            if pid is None:
+            if pid is None and owner_token is None:
                 db.execute(
                     "DELETE FROM live_owners WHERE provider=? AND session_id=?",
                     (provider, session_id),
                 )
-            else:
+            elif pid is not None and owner_token is None:
                 db.execute(
                     "DELETE FROM live_owners WHERE provider=? AND session_id=? AND pid=?",
                     (provider, session_id, pid),
+                )
+            elif pid is None:
+                db.execute(
+                    "DELETE FROM live_owners WHERE provider=? AND session_id=? "
+                    "AND owner_token=?",
+                    (provider, session_id, owner_token),
+                )
+            else:
+                db.execute(
+                    "DELETE FROM live_owners WHERE provider=? AND session_id=? "
+                    "AND pid=? AND owner_token=?",
+                    (provider, session_id, pid, owner_token),
                 )
 
     def reserve_resume(

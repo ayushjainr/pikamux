@@ -319,6 +319,7 @@ def _parser() -> argparse.ArgumentParser:
     exit_parser.add_argument("--provider", required=True, choices=("codex", "claude"))
     exit_parser.add_argument("--session-id")
     exit_parser.add_argument("--launch-token")
+    exit_parser.add_argument("--owner-token")
     exit_parser.add_argument("--code", required=True, type=int)
 
     popup_parser = sub.add_parser("_peek-popup", help=argparse.SUPPRESS)
@@ -1547,6 +1548,7 @@ def run(argv: list[str] | None = None) -> int:
             args.code,
             session_id=args.session_id,
             launch_token=args.launch_token,
+            owner_token=args.owner_token,
         )
         return 0
     if args.command == "_peek-popup":

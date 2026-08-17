@@ -97,7 +97,7 @@ Install the same release on Windows, then pair each server whose agents may be
 opened locally:
 
 ```powershell
-uv tool install "git+ssh://git@github.com/ajainwolfe/pikamux.git@v0.4.0"
+uv tool install "git+ssh://git@github.com/ajainwolfe/pikamux.git@v0.4.1"
 pika setup rstudio-6
 ```
 
@@ -287,6 +287,14 @@ remains the deliberate local escape hatch.
 
 `pika open`, `pika new`, and `pika adopt` remain advanced diagnostic controls;
 daily use should not require knowing which mechanism applies.
+
+If Ctrl+C exits a Pika-managed Codex or Claude client, the wrapper immediately
+releases only that client's live-owner lease and leaves the conversation
+`PARKED`, not in a false error state. Run the same `pika NAME` command again and
+Pika resumes the exact UUID in its existing idle pane or a new home. A distinct
+Codex app client remains fail-closed: Pika reports `ACTIVE IN CODEX APP`, keeps
+its independently renewed lease, and explains that no adoption or manual state
+cleanup is required.
 
 `pika ask master_quant "What assumption is weakest here?"` opens a temporary
 side conversation based on that exact provider UUID. In a terminal, ask

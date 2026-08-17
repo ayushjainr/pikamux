@@ -298,6 +298,7 @@ def handle_hook(
         return None
     pane_id = os.environ.get("TMUX_PANE")
     launch_token = os.environ.get("PIKA_LAUNCH_TOKEN")
+    owner_token = os.environ.get("PIKA_OWNER_TOKEN") or ""
     pending = store.get_pending(launch_token) if launch_token else None
     pane_pending = store.find_pending_for_pane(pane_id) if pane_id else None
     if pane_pending and (
@@ -361,9 +362,19 @@ def handle_hook(
     owner_pid = provider_ancestor(os.getppid(), provider)
     if data.get("hook_event_name") == "SessionEnd":
         if owner_pid:
-            store.delete_live_owner(provider, canonical_session_id, pid=owner_pid)
+            store.delete_live_owner(
+                provider,
+                canonical_session_id,
+                pid=owner_pid,
+                owner_token=owner_token,
+            )
     elif owner_pid:
-        store.set_live_owner(provider, canonical_session_id, owner_pid)
+        store.set_live_owner(
+            provider,
+            canonical_session_id,
+            owner_pid,
+            owner_token=owner_token,
+        )
     placeholder = store.get_session(provider, f"unbound:{pane_id}") if pane_id else None
     pane = tmux.get_pane(pane_id) if pane_id else None
     provider_name = data.get("session_title")
@@ -549,6 +560,7 @@ def handle_process_exit(
     *,
     session_id: str | None = None,
     launch_token: str | None = None,
+    owner_token: str | None = None,
     store: Store | None = None,
 ) -> None:
     store = store or Store()
@@ -571,7 +583,18 @@ def handle_process_exit(
             return
     if target is None:
         return
-    if code != 0:
+    # The wrapper is stronger evidence than an expiring hook: this exact Pika
+    # client has returned. Revoke only its claim so a genuine app/second-client
+    # claim remains fail-closed. Wrappers from releases before owner tokens
+    # clear the legacy undifferentiated claim as a one-time compatibility path.
+    store.delete_live_owner(
+        provider,
+        target.session_id,
+        owner_token=owner_token,
+    )
+    store.delete_recovery_owner(provider, target.session_id)
+    clean_exit = code in {0, 130}
+    if not clean_exit:
         updates = {
             "status": Status.ERROR.value,
             "unread": True,
