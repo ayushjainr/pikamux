@@ -1678,32 +1678,47 @@ class Pika:
             outside = self._outside_processes(current, panes)
             if outside:
                 pid_text = ", ".join(str(pid) for pid in outside)
+                reopen_command = shlex.join(["pika", current.display_name])
                 direct_uuid_pids = self.uuid_identity_pids(current)
                 if len(direct_uuid_pids) > 1:
                     raise PikaError(
                         f"OPEN TWICE: {current.display_name} has exact UUID "
                         f"{current.provider_thread_id} in multiple process trees "
-                        f"(PID {pid_text}). Close one copy, then rerun "
-                        f"`pika {current.display_name}`."
+                        f"(PID {pid_text}). Required steps: 1) close all but one "
+                        f"of those provider clients; 2) run exactly: "
+                        f"`{reopen_command}`."
                     )
                 if not direct_uuid_pids and all(
                     shared_provider_process(pid, current.provider) for pid in outside
                 ):
+                    leases = self.store.get_live_owner_leases(*current.key)
+                    retry_at = max(
+                        (
+                            last_seen + LIVE_OWNER_LEASE_SECONDS
+                            for _pid, _start, last_seen, _token in leases
+                        ),
+                        default=time.time() + LIVE_OWNER_LEASE_SECONDS,
+                    )
+                    retry_time = time.strftime(
+                        "%Y-%m-%d %H:%M:%S UTC", time.gmtime(retry_at)
+                    )
                     raise PikaError(
                         f"ACTIVE IN {current.provider.upper()} APP: "
                         f"{current.display_name}'s exact UUID has a fresh app lease "
                         f"(PID {pid_text}). Pika will not open a second client while "
-                        "that view may still be live. Close or leave that conversation, "
-                        f"then rerun `pika {current.display_name}`; Pika will recreate "
-                        "the exact home automatically. No re-adoption or cleanup is needed. "
-                        "If the app is already closed, its lease expires no later than "
-                        "five minutes after the last activity."
+                        f"that view may still be live. Required steps: 1) in the "
+                        f"{current.provider.title()} app, leave conversation "
+                        f"{current.display_name!r}; 2) run exactly: `{reopen_command}`. "
+                        f"If the same receipt appears, run that exact command again after "
+                        f"{retry_time}. Do not kill PID {pid_text}; it is shared provider "
+                        "infrastructure. No adoption, setup, or manual cleanup is needed."
                     )
                 raise PikaError(
                     f"{current.display_name} is already running outside its Pika "
                     f"home (PID {pid_text}) and cannot be moved safely while live. "
-                    "Exit that copy normally, then rerun "
-                    f"`pika {current.display_name}`. Pika will resume the exact UUID."
+                    f"Required steps: 1) return to the terminal owning PID {pid_text} "
+                    f"and exit {current.provider.title()} normally; 2) run exactly: "
+                    f"`{reopen_command}`. Pika will resume the exact UUID."
                 )
         if not live_pid:
             provider = self.providers.get(current.provider)

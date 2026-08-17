@@ -97,7 +97,7 @@ Install the same release on Windows, then pair each server whose agents may be
 opened locally:
 
 ```powershell
-uv tool install "git+ssh://git@github.com/ajainwolfe/pikamux.git@v0.4.1"
+uv tool install "git+ssh://git@github.com/ajainwolfe/pikamux.git@v0.4.2"
 pika setup rstudio-6
 ```
 
@@ -293,8 +293,11 @@ releases only that client's live-owner lease and leaves the conversation
 `PARKED`, not in a false error state. Run the same `pika NAME` command again and
 Pika resumes the exact UUID in its existing idle pane or a new home. A distinct
 Codex app client remains fail-closed: Pika reports `ACTIVE IN CODEX APP`, keeps
-its independently renewed lease, and explains that no adoption or manual state
-cleanup is required.
+its independently renewed lease, and prints ordered recovery steps plus the
+exact shell-quoted `pika NAME` command. If the app does not emit a closing hook,
+the receipt also gives the current UTC lease deadline and repeats the command to
+run after it. Shared app-server PIDs are explicitly marked as infrastructure
+that must not be killed. No adoption or manual state cleanup is required.
 
 `pika ask master_quant "What assumption is weakest here?"` opens a temporary
 side conversation based on that exact provider UUID. In a terminal, ask

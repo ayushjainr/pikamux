@@ -367,7 +367,7 @@ class AdversarialTests(unittest.TestCase):
         session = Session(
             "codex",
             "11111111-1111-4111-8111-111111111111",
-            name="owned-elsewhere",
+            name="owned elsewhere",
             cwd="/tmp",
         )
         self.store.upsert_session(session)
@@ -376,11 +376,13 @@ class AdversarialTests(unittest.TestCase):
             StaticTmux([pane()]),
             {"codex": FakeProvider(active=[999])},
         )
-        with (
-            patch("pikamux.core.provider_process", return_value=999),
-            self.assertRaisesRegex(PikaError, "already running outside"),
-        ):
+        with patch("pikamux.core.provider_process", return_value=999), self.assertRaises(
+            PikaError
+        ) as raised:
             pika.open(session, attach=False)
+        message = str(raised.exception)
+        self.assertIn("already running outside", message)
+        self.assertIn("run exactly: `pika 'owned elsewhere'`", message)
 
     def test_hook_live_owner_blocks_duplicate_even_when_process_argv_is_opaque(
         self,
@@ -409,7 +411,7 @@ class AdversarialTests(unittest.TestCase):
         session = Session(
             "codex",
             "11111111-1111-4111-8111-111111111111",
-            name="recover-me",
+            name="recover me",
             cwd="/tmp",
         )
         self.store.upsert_session(session)
@@ -429,8 +431,10 @@ class AdversarialTests(unittest.TestCase):
 
         message = str(raised.exception)
         self.assertIn("ACTIVE IN CODEX APP", message)
-        self.assertIn("recreate the exact home automatically", message)
-        self.assertIn("No re-adoption or cleanup is needed", message)
+        self.assertIn("Required steps: 1)", message)
+        self.assertIn("run exactly: `pika 'recover me'`", message)
+        self.assertIn("Do not kill PID", message)
+        self.assertIn("No adoption, setup, or manual cleanup is needed", message)
         self.assertNotIn("Exit that copy normally", message)
 
     def test_reused_live_owner_pid_cannot_prove_exact_identity(self) -> None:
