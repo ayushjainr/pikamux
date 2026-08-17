@@ -123,6 +123,11 @@ class CliTests(unittest.TestCase):
         self.assertEqual(_normalize_argv(["list"]), ["list"])
         self.assertEqual(_normalize_argv(["open", "list"]), ["open", "list"])
 
+    def test_recover_closed_is_an_explicit_public_command(self) -> None:
+        args = _parser().parse_args(["recover-closed", "master_pika"])
+        self.assertEqual(args.command, "recover-closed")
+        self.assertEqual(args.name, "master_pika")
+
     def test_primary_help_teaches_one_name_command_not_lifecycle_mechanics(self) -> None:
         rendered = _parser().format_help()
         self.assertIn("pika NAME", rendered)

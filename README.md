@@ -97,7 +97,7 @@ Install the same release on Windows, then pair each server whose agents may be
 opened locally:
 
 ```powershell
-uv tool install "git+ssh://git@github.com/ajainwolfe/pikamux.git@v0.4.2"
+uv tool install "git+ssh://git@github.com/ajainwolfe/pikamux.git@v0.4.3"
 pika setup rstudio-6
 ```
 
@@ -263,6 +263,7 @@ pika next                  open the oldest conversation needing attention
 pika peek NAME             inspect recent pane output without attaching
 pika peek NAME --ack       explicitly acknowledge READY in a script
 pika wait NAME             wait for NEEDS YOU, unread READY, OPEN TWICE, or ERROR
+pika recover-closed NAME   clear only a weak shared lease after every client exited
 pika untrack NAME           stop watching without stopping or archiving the agent
 pika doctor                print a recoverability receipt
 pika doctor --verbose      show every receipt check
@@ -291,13 +292,17 @@ daily use should not require knowing which mechanism applies.
 If Ctrl+C exits a Pika-managed Codex or Claude client, the wrapper immediately
 releases only that client's live-owner lease and leaves the conversation
 `PARKED`, not in a false error state. Run the same `pika NAME` command again and
-Pika resumes the exact UUID in its existing idle pane or a new home. A distinct
-Codex app client remains fail-closed: Pika reports `ACTIVE IN CODEX APP`, keeps
-its independently renewed lease, and prints ordered recovery steps plus the
-exact shell-quoted `pika NAME` command. If the app does not emit a closing hook,
-the receipt also gives the current UTC lease deadline and repeats the command to
-run after it. Shared app-server PIDs are explicitly marked as infrastructure
-that must not be killed. No adoption or manual state cleanup is required.
+Pika resumes the exact UUID in its existing idle pane or a new home. Modern
+Codex CLI, IDE, and desktop clients can all use the same app-server, so Pika
+does not label that shared PID as a desktop app. If it also sees a live
+`codex resume NAME` process, the receipt says `ACTIVE IN CODEX CLI` and gives
+the exact `/exit` then `pika recover-closed NAME` sequence. Otherwise it says
+`ACTIVE THROUGH CODEX APP-SERVER`, without guessing which client owns the
+lease. `recover-closed` is a narrow user assertion: after every provider client
+has exited, it can revoke only shared-infrastructure leases; an exact UUID PID,
+dedicated process, or running tagged pane remains fail-closed. The ordinary
+receipt also gives the UTC lease deadline as a wait-only alternative. Shared
+app-server PIDs are explicitly marked as infrastructure that must not be killed.
 
 `pika ask master_quant "What assumption is weakest here?"` opens a temporary
 side conversation based on that exact provider UUID. In a terminal, ask

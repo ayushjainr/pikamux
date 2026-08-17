@@ -1605,6 +1605,98 @@ class Pika:
         # attach path. Keep transport diagnostics out of normal dashboard UX.
         return None
 
+    def recover_closed(self, session: Session, *, attach: bool = True) -> int:
+        """Resume after the user confirms every provider client is closed.
+
+        This is deliberately narrower than a force-open. It can revoke only
+        weak leases whose surviving process is shared provider infrastructure;
+        direct UUID processes and running tagged panes remain fail-closed.
+        """
+        sessions = self.refresh()
+        current = next((item for item in sessions if item.key == session.key), session)
+        panes = self.tmux.list_panes()
+        matching_panes = [
+            pane
+            for pane in panes
+            if (pane.pika_provider, pane.pika_session_id) == current.key
+            or (
+                current.tmux_pane == pane.pane_id
+                and not pane.pika_session_id
+                and not pane.pika_provider
+            )
+        ]
+        running_panes = [
+            (pane, provider_process(pane.pane_pid, current.provider))
+            for pane in matching_panes
+        ]
+        running_panes = [(pane, pid) for pane, pid in running_panes if pid]
+        if running_panes:
+            pane, pid = running_panes[0]
+            raise PikaError(
+                f"RECOVERY REFUSED: {current.display_name}'s Pika pane "
+                f"{pane.session_name}:{pane.pane_id} still runs "
+                f"{current.provider.title()} PID {pid}. Run exactly: "
+                f"`{shlex.join(['pika', current.display_name])}` to attach it."
+            )
+        direct_uuid_pids = self.uuid_identity_pids(current)
+        if direct_uuid_pids:
+            raise PikaError(
+                f"RECOVERY REFUSED: {current.display_name} still has an exact "
+                f"UUID-bearing {current.provider.title()} client (PID "
+                f"{', '.join(map(str, sorted(direct_uuid_pids)))}). Exit it first, "
+                f"then run exactly: "
+                f"`{shlex.join(['pika', 'recover-closed', current.display_name])}`."
+            )
+        named_client_pids = (
+            find_processes_with_session_id(current.display_name, current.provider)
+            if current.name
+            else []
+        )
+        if named_client_pids:
+            raise PikaError(
+                f"RECOVERY REFUSED: a live {current.provider.title()} client was "
+                f"launched with saved name {current.display_name!r} (PID "
+                f"{', '.join(map(str, named_client_pids))}). In that client, run "
+                f"`/exit` and wait for the shell prompt; then run exactly: "
+                f"`{shlex.join(['pika', 'recover-closed', current.display_name])}`."
+            )
+        outside = self._outside_processes(current, panes)
+        non_shared = [
+            pid
+            for pid in outside
+            if not shared_provider_process(pid, current.provider)
+        ]
+        if non_shared:
+            raise PikaError(
+                f"RECOVERY REFUSED: {current.display_name} still has a dedicated "
+                f"{current.provider.title()} process (PID "
+                f"{', '.join(map(str, non_shared))}). Exit it first, then run "
+                f"exactly: "
+                f"`{shlex.join(['pika', 'recover-closed', current.display_name])}`."
+            )
+        for owner, owner_start, _last_seen, owner_token in (
+            self.store.get_live_owner_leases(*current.key)
+        ):
+            live_owner = (
+                provider_process(owner, current.provider)
+                if owner_start is not None
+                and process_start_time(owner) == owner_start
+                else None
+            )
+            if live_owner and shared_provider_process(live_owner, current.provider):
+                self.store.delete_live_owner(
+                    *current.key,
+                    pid=owner,
+                    owner_token=owner_token,
+                )
+        remaining = self._outside_processes(current, self.tmux.list_panes())
+        if remaining:
+            raise PikaError(
+                f"RECOVERY REFUSED: {current.display_name} still has live ownership "
+                f"evidence (PID {', '.join(map(str, remaining))})."
+            )
+        return self.open(current, attach=attach)
+
     def open(self, session: Session | FleetSession, *, attach: bool = True) -> int:
         if isinstance(session, FleetSession):
             if not attach:
@@ -1702,16 +1794,38 @@ class Pika:
                     retry_time = time.strftime(
                         "%Y-%m-%d %H:%M:%S UTC", time.gmtime(retry_at)
                     )
+                    recover_command = shlex.join(
+                        ["pika", "recover-closed", current.display_name]
+                    )
+                    named_client_pids = (
+                        find_processes_with_session_id(
+                            current.display_name, current.provider
+                        )
+                        if current.name
+                        else []
+                    )
+                    if named_client_pids:
+                        named_pid_text = ", ".join(map(str, named_client_pids))
+                        raise PikaError(
+                        f"ACTIVE IN {current.provider.upper()} CLI: a live client "
+                        f"was launched with saved name {current.display_name!r} "
+                        f"(PID {named_pid_text}) and the exact UUID has a fresh "
+                        f"shared app-server lease. Required steps: 1) in that client, run "
+                            f"`/exit` and wait for the shell prompt; 2) run exactly: "
+                            f"`{recover_command}`. Do not kill app-server PID "
+                            f"{pid_text}; it is shared provider infrastructure."
+                        )
                     raise PikaError(
-                        f"ACTIVE IN {current.provider.upper()} APP: "
+                        f"ACTIVE THROUGH {current.provider.upper()} APP-SERVER: "
                         f"{current.display_name}'s exact UUID has a fresh app lease "
                         f"(PID {pid_text}). Pika will not open a second client while "
-                        f"that view may still be live. Required steps: 1) in the "
-                        f"{current.provider.title()} app, leave conversation "
-                        f"{current.display_name!r}; 2) run exactly: `{reopen_command}`. "
-                        f"If the same receipt appears, run that exact command again after "
-                        f"{retry_time}. Do not kill PID {pid_text}; it is shared provider "
-                        "infrastructure. No adoption, setup, or manual cleanup is needed."
+                        "a CLI, IDE, or desktop view may still be live. Required steps: "
+                        f"1) exit {current.display_name!r} in every {current.provider.title()} "
+                        f"client and wait for its shell/UI to close; 2) run exactly: "
+                        f"`{recover_command}`. That command revokes only the weak shared "
+                        f"lease and resumes the saved UUID. Or wait until {retry_time}, "
+                        f"then run `{reopen_command}`. Do not kill PID {pid_text}; it is "
+                        "shared provider infrastructure."
                     )
                 raise PikaError(
                     f"{current.display_name} is already running outside its Pika "

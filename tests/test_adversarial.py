@@ -430,12 +430,96 @@ class AdversarialTests(unittest.TestCase):
             pika.open(session, attach=False)
 
         message = str(raised.exception)
-        self.assertIn("ACTIVE IN CODEX APP", message)
+        self.assertIn("ACTIVE THROUGH CODEX APP-SERVER", message)
         self.assertIn("Required steps: 1)", message)
-        self.assertIn("run exactly: `pika 'recover me'`", message)
+        self.assertIn("run exactly: `pika recover-closed 'recover me'`", message)
         self.assertIn("Do not kill PID", message)
-        self.assertIn("No adoption, setup, or manual cleanup is needed", message)
         self.assertNotIn("Exit that copy normally", message)
+
+    def test_recover_closed_revokes_only_shared_lease_and_resumes(self) -> None:
+        session = Session(
+            "codex",
+            "15151515-1515-4515-8515-151515151515",
+            name="closed client",
+            cwd="/tmp",
+        )
+        self.store.upsert_session(session)
+        owner_pid = os.getpid()
+        self.assertTrue(
+            self.store.set_live_owner("codex", session.session_id, owner_pid)
+        )
+        tmux = StaticTmux()
+        pika = Pika(self.store, tmux, {"codex": FakeProvider()})
+
+        def provider_at_root(pid, provider=None):
+            if provider != "codex":
+                return None
+            if pid == owner_pid:
+                return 777
+            if pid == 456:
+                return 888
+            return None
+
+        with (
+            patch("pikamux.core.provider_process", side_effect=provider_at_root),
+            patch(
+                "pikamux.core.shared_provider_process",
+                side_effect=lambda pid, provider: provider == "codex" and pid == 777,
+            ),
+        ):
+            self.assertEqual(pika.recover_closed(session, attach=False), 0)
+
+        self.assertEqual(self.store.get_live_owners(*session.key), [])
+        self.assertEqual(len(tmux.panes), 1)
+        self.assertEqual(tmux.panes[0].pika_session_id, session.session_id)
+
+    def test_named_cli_client_gets_exact_exit_then_recovery_steps(self) -> None:
+        session = Session(
+            "codex",
+            "17171717-1717-4717-8717-171717171717",
+            name="named live",
+            cwd="/tmp",
+        )
+        self.store.upsert_session(session)
+        owner_pid = os.getpid()
+        self.assertTrue(
+            self.store.set_live_owner("codex", session.session_id, owner_pid)
+        )
+        pika = Pika(self.store, StaticTmux(), {"codex": FakeProvider()})
+
+        def provider_at_root(pid, provider=None):
+            return 777 if pid == owner_pid and provider == "codex" else None
+
+        with (
+            patch("pikamux.core.provider_process", side_effect=provider_at_root),
+            patch("pikamux.core.shared_provider_process", return_value=True),
+            patch("pikamux.core.find_processes_with_session_id", return_value=[654]),
+        ):
+            with self.assertRaises(PikaError) as open_error:
+                pika.open(session, attach=False)
+            with self.assertRaisesRegex(PikaError, "RECOVERY REFUSED"):
+                pika.recover_closed(session, attach=False)
+
+        message = str(open_error.exception)
+        self.assertIn("ACTIVE IN CODEX CLI", message)
+        self.assertIn("run `/exit` and wait for the shell prompt", message)
+        self.assertIn("run exactly: `pika recover-closed 'named live'`", message)
+
+    def test_recover_closed_remains_fail_closed_for_dedicated_process(self) -> None:
+        session = Session(
+            "codex",
+            "16161616-1616-4616-8616-161616161616",
+            name="still open",
+            cwd="/tmp",
+        )
+        self.store.upsert_session(session)
+        pika = Pika(
+            self.store,
+            StaticTmux(),
+            {"codex": FakeProvider(active=[999])},
+        )
+        with self.assertRaisesRegex(PikaError, "RECOVERY REFUSED"):
+            pika.recover_closed(session, attach=False)
 
     def test_reused_live_owner_pid_cannot_prove_exact_identity(self) -> None:
         session = Session(

@@ -73,6 +73,7 @@ PUBLIC_COMMANDS = {
     "expert",
     "experts",
     "open",
+    "recover-closed",
     "list",
     "next",
     "peek",
@@ -108,13 +109,19 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(
         dest="command",
         metavar=(
-            "{ask,expert,experts,list,next,peek,wait,untrack,setup,doctor,"
+            "{ask,expert,experts,list,next,peek,wait,recover-closed,untrack,setup,doctor,"
             "machines,sync}"
         ),
     )
 
     open_parser = sub.add_parser("open", help=argparse.SUPPRESS)
     open_parser.add_argument("name")
+
+    recover_parser = sub.add_parser(
+        "recover-closed",
+        help="resume after confirming every provider client has exited",
+    )
+    recover_parser.add_argument("name")
 
     ask_parser = sub.add_parser(
         "ask",
@@ -1594,6 +1601,13 @@ def run(argv: list[str] | None = None) -> int:
         return pika.enter(args.name)
     if args.command == "open":
         return pika.open(_select_named(pika, args.name))
+    if args.command == "recover-closed":
+        selected = _select_named(pika, args.name)
+        if isinstance(selected, FleetSession):
+            raise PikaError(
+                "recover-closed must be run on the machine that owns the conversation"
+            )
+        return pika.recover_closed(selected)
     if args.command == "ask":
         return _ask(
             pika,
