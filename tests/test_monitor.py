@@ -12,6 +12,7 @@ from dataclasses import replace
 from unittest.mock import Mock, patch
 
 from pikamux.consult import FAST_CODEX_EFFORT, FAST_CODEX_MODEL
+from pikamux.client_bridge import ClientLaunchReceipt
 from pikamux.experts import ExpertCardState
 from pikamux.models import ExpertProfile, Session, Status
 from pikamux.monitor import (
@@ -728,6 +729,81 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(result, [0])
         self.assertEqual(questions, ["first", "second"])
         self.assertTrue(consultation.closed.wait(1.0))
+
+    def test_runtime_client_window_receipt_keeps_monitor_open(self) -> None:
+        session_id = "99999999-9999-4999-8999-999999999999"
+        session = Session(
+            "codex",
+            session_id,
+            name="remote-window",
+            status=Status.WORKING.value,
+            home_state="exact-live",
+        )
+        launched = threading.Event()
+
+        class FakeStore:
+            def claim_monitor_handoff(self, _timestamp):
+                return None, {}
+
+        class FakePika:
+            store = FakeStore()
+            discovery_errors: list[str] = []
+
+            def refresh(self, *, usage=False):
+                return [session]
+
+            def next_attention(self, _sessions=None):
+                return None
+
+            def open_on_client(self, selected):
+                self.assert_identity = selected.session_id
+                launched.set()
+                return ClientLaunchReceipt(
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    "codex",
+                    session_id,
+                    "WINDOW LAUNCHED · rstudio-6 · id 99999999",
+                )
+
+            def open(self, _session, *, attach=True):
+                raise AssertionError("current-terminal fallback must not run")
+
+        pika = FakePika()
+        master, slave = pty.openpty()
+        fcntl.ioctl(
+            slave,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", 24, 100, 0, 0),
+        )
+        result: list[int] = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                run_monitor(
+                    pika,
+                    input_fd=slave,
+                    output_fd=slave,
+                    refresh_seconds=0.02,
+                )
+            )
+        )
+        try:
+            thread.start()
+            time.sleep(0.08)
+            os.write(master, b"\r")
+            self.assertTrue(launched.wait(1.0))
+            time.sleep(0.08)
+            self.assertTrue(thread.is_alive())
+            os.write(master, b"q")
+            thread.join(1.0)
+        finally:
+            if thread.is_alive():
+                os.write(master, b"q")
+                thread.join(1.0)
+            os.close(master)
+            os.close(slave)
+        self.assertEqual(result, [0])
+        self.assertEqual(pika.assert_identity, session_id)
 
     def test_tiny_viewport_never_writes_past_real_dimensions(self) -> None:
         frame = render_monitor(

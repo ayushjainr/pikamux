@@ -162,7 +162,10 @@ provider latency cannot freeze dashboard refresh, typing, or Esc recovery. Esc
 requests cancellation immediately and terminates the transient provider process;
 the monitor itself remains open.
 
-Federation adds no daemon and no listener. Passive discovery reads existing SSH
+Server federation adds no daemon and no listener. The optional laptop
+new-window bridge is a separate client-side process bound only to loopback; it
+is reached from a paired server solely through the user's reverse SSH forward.
+Passive discovery reads existing SSH
 configuration and Tailscale's local status document without probing candidates.
 The monitor's local two-second reconciliation never performs SSH. It keeps at
 most one bounded remote inventory request in flight and replaces a node's cache
@@ -202,6 +205,39 @@ interview only the single exact UUID it just adopted.
 Commissioning finishes with a transcript-free operational reconciliation so
 provider-native renames update tracked rows and pane recovery tags. This name
 sync never opens an expert consultation.
+
+# Client-window launch boundary
+
+Pika may run as a Linux node or as the local Windows client, but it remains one
+package and one command. The server owns conversation truth. The client owns
+only the ability to create a local terminal window.
+
+The optional client bridge is intentionally narrower than fleet federation:
+
+- it listens only on client loopback;
+- a reverse SSH forward supplies transport, so Pika opens no server port;
+- pairing verifies the immutable server node UUID before writing a random
+  per-node secret on both ends;
+- requests contain source node UUID, target node UUID, provider, and exact
+  conversation UUID, never a display name or command string;
+- the client maps the target UUID to its own trusted SSH target and constructs
+  `wt.exe` plus `_fleet-open` arguments locally;
+- spawned attaches clear inherited SSH forwards, leaving the dashboard
+  connection as the sole owner of its reverse bridge port;
+- `_fleet-open` revalidates the target node UUID and tracked conversation;
+- request IDs are deduplicated briefly so a retried receipt cannot create a
+  burst of windows;
+- the long-running client reloads each atomically replaced pairing file before
+  handling a request, so pairing or rotating a node does not require a restart;
+- a confirmed receipt means the local window process was launched, not that the
+  provider completed its later remote attach. The new window prints the normal
+  exact recovery receipt;
+- no live reverse tunnel is ordinary absence and falls back to attaching in the
+  current terminal; a reachable identity rejection fails closed.
+
+This client listener is an explicit exception to Pika's no-daemon server model.
+It cannot read transcripts, mutate the server registry, choose a conversation
+by name, or execute caller-supplied shell text.
 
 # Sources
 

@@ -28,6 +28,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "alerts": "tmux",
     "peek_lines": 200,
     "provider_executables": {},
+    # Paired laptop launchers are explicit, authenticated reverse-SSH routes.
+    # Each entry is written only by the hidden exact-node pairing handshake.
+    "client_bridges": [],
     # Codex app-server clients used as automation harnesses create real UUIDs,
     # but their short-lived workers are not user-facing conversations.  Keep
     # the known harness origins out of Pika while allowing installations to

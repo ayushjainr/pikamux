@@ -11,6 +11,13 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
+from .client_bridge import (
+    ClientBridgeError,
+    ClientBridgeUnavailable,
+    ClientLaunchReceipt,
+    make_launch_request,
+    request_client_launch,
+)
 from .consult import ConsultationPolicy, consultation_for, consultation_policy
 from .experts import (
     ExpertCardState,
@@ -1535,6 +1542,67 @@ class Pika:
         if other_identities and not other_identities.issubset(pane_tree):
             return None
         return pid
+
+    def open_on_client(
+        self, session: Session | FleetSession
+    ) -> ClientLaunchReceipt | None:
+        """Ask a paired SSH client to launch an exact session in a new window.
+
+        An unavailable reverse tunnel is an ordinary absence and lets the
+        monitor retain its current-terminal attach behavior. A reachable bridge
+        that rejects identity is different: fail closed and keep the board open.
+        """
+        if session.session_id.startswith("unbound:"):
+            return None
+        config = load_config()
+        configured = config.get("client_bridges")
+        if not isinstance(configured, list) or not configured:
+            return None
+        # Do not probe a configured client bridge from cron, hooks, or an
+        # unrelated local shell. PIKA_CLIENT_BRIDGE=1 is the explicit escape
+        # hatch for custom transports that preserve the same contract.
+        if not os.environ.get("SSH_CONNECTION") and os.environ.get(
+            "PIKA_CLIENT_BRIDGE"
+        ) != "1":
+            return None
+        source_node_id = self.store.local_node_id()
+        target_node_id = (
+            session.node_id if isinstance(session, FleetSession) else source_node_id
+        )
+        for raw in configured:
+            if not isinstance(raw, dict) or raw.get("enabled", True) is False:
+                continue
+            try:
+                host = str(raw.get("host") or "127.0.0.1")
+                port = int(raw.get("port") or 47654)
+                timeout = float(raw.get("timeout") or 0.35)
+                if host not in {"127.0.0.1", "::1", "localhost"}:
+                    raise ClientBridgeError(
+                        "Client bridge endpoint must stay on server loopback"
+                    )
+                if not 1024 <= port <= 65535:
+                    raise ClientBridgeError("Client bridge port is invalid")
+                request = make_launch_request(
+                    client_id=str(raw.get("client_id") or ""),
+                    token=str(raw.get("token") or ""),
+                    source_node_id=source_node_id,
+                    target_node_id=target_node_id,
+                    provider=session.provider,
+                    session_id=session.session_id,
+                )
+                return request_client_launch(
+                    request,
+                    host=host,
+                    port=port,
+                    timeout=max(0.05, min(timeout, 2.0)),
+                )
+            except ClientBridgeUnavailable:
+                continue
+            except (ClientBridgeError, TypeError, ValueError) as exc:
+                raise PikaError(f"CLIENT WINDOW BLOCKED · {exc}") from exc
+        # No live reverse tunnel: Enter falls through to the proven existing
+        # attach path. Keep transport diagnostics out of normal dashboard UX.
+        return None
 
     def open(self, session: Session | FleetSession, *, attach: bool = True) -> int:
         if isinstance(session, FleetSession):

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import sqlite3
 import sys
 import termios
@@ -13,6 +14,13 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__
+from .client_bridge import (
+    BRIDGE_PROTOCOL,
+    BRIDGE_VERSION,
+    MAX_BRIDGE_MESSAGE_BYTES,
+    ClientBridgeError,
+    validate_pair_request,
+)
 from .consult import (
     Consultation,
     ConsultationError,
@@ -46,7 +54,7 @@ from .setup_hooks import (
     hooks_installed,
     proposed_changes,
 )
-from .store import load_config
+from .store import load_config, write_config
 from .tmux import TmuxError
 from .ui import (
     choose_fleet_candidates,
@@ -85,6 +93,7 @@ INTERNAL_COMMANDS = {
     "_fleet",
     "_fleet-open",
     "_fleet-ask",
+    "_client-pair",
 }
 ADVANCED_COMMANDS = {"open", "new", "adopt"}
 
@@ -332,6 +341,8 @@ def _parser() -> argparse.ArgumentParser:
     fleet_ask.add_argument("--provider", required=True, choices=("codex", "claude"))
     fleet_ask.add_argument("--session-id", required=True)
     fleet_ask.add_argument("--fast", action="store_true")
+    client_pair = sub.add_parser("_client-pair", help=argparse.SUPPRESS)
+    client_pair.add_argument("--stdio", action="store_true", required=True)
     enter_parser = sub.add_parser("_enter", help=argparse.SUPPRESS)
     enter_parser.add_argument("name")
     # argparse otherwise renders hidden implementation commands as
@@ -1457,6 +1468,74 @@ def _database_error_receipt(error: sqlite3.DatabaseError, *, as_json: bool) -> i
     return 1
 
 
+def _pair_client_bridge(pika: Pika) -> int:
+    """Persist one authenticated client route received through SSH stdin."""
+    raw = sys.stdin.readline(MAX_BRIDGE_MESSAGE_BYTES + 1)
+    if not raw or len(raw.encode()) > MAX_BRIDGE_MESSAGE_BYTES:
+        raise PikaError("Invalid client pairing request size")
+    if sys.stdin.readline(1):
+        raise PikaError("Client pairing accepts exactly one JSON line")
+    try:
+        request = validate_pair_request(json.loads(raw))
+    except (ValueError, ClientBridgeError) as exc:
+        raise PikaError(str(exc)) from exc
+    node_id = pika.store.local_node_id()
+    if request["expected_node_id"] != node_id:
+        raise PikaError(
+            "NODE IDENTITY CHANGED: expected "
+            f"{request['expected_node_id'][:8]}, received {node_id[:8]}"
+        )
+
+    config = load_config()
+    existing = config.get("client_bridges")
+    bridges = (
+        [item for item in existing if isinstance(item, dict)]
+        if isinstance(existing, list)
+        else []
+    )
+    bridge = {
+        "client_id": request["client_id"],
+        "label": request["client_label"],
+        "host": "127.0.0.1",
+        "port": request["port"],
+        "token": request["token"],
+        "timeout": 0.35,
+        "enabled": True,
+    }
+    bridges = [
+        item for item in bridges if item.get("client_id") != request["client_id"]
+    ]
+    bridges.append(bridge)
+    config["client_bridges"] = bridges
+
+    target = config_path()
+    if target.exists():
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        backup = target.with_name(f"{target.name}.pika-backup-{stamp}")
+        suffix = 2
+        while backup.exists():
+            backup = target.with_name(
+                f"{target.name}.pika-backup-{stamp}-{suffix}"
+            )
+            suffix += 1
+        shutil.copy2(target, backup)
+    write_config(config)
+    print(
+        json.dumps(
+            {
+                "type": "paired",
+                "protocol": BRIDGE_PROTOCOL,
+                "version": BRIDGE_VERSION,
+                "node_id": node_id,
+                "client_id": request["client_id"],
+                "port": request["port"],
+            },
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
 def run(argv: list[str] | None = None) -> int:
     argv = _normalize_argv(list(sys.argv[1:] if argv is None else argv))
     args = _parser().parse_args(argv)
@@ -1478,6 +1557,8 @@ def run(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             return _database_error_receipt(exc, as_json=args.json)
         raise PikaError(f"Pika state database is unreadable: {exc}") from exc
+    if args.command == "_client-pair":
+        return _pair_client_bridge(pika)
     if args.command == "_fleet":
         return handle_fleet_stdio(pika, sys.stdin, sys.stdout)
     if args.command in {"_fleet-open", "_fleet-ask"}:

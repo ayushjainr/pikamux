@@ -19,9 +19,10 @@ Pika owns that bridge.
   `UNBOUND`, `OPEN TWICE`, and `ERROR` states.
 - It stores metadata only. Ordinary views never index or display transcript
   contents; `peek` explicitly captures the visible tmux pane.
-- It uses hooks plus command-time reconciliation, with no background daemon.
+- Linux nodes use hooks plus command-time reconciliation, with no background
+  daemon. The optional Windows client bridge is described separately below.
 
-## Install
+## Install a Pika node
 
 Pikamux requires Linux, Python 3.10 or newer, and tmux. Codex and/or Claude must
 already be installed.
@@ -85,6 +86,66 @@ Backups are written beside each changed file with a
 `.pika-backup-YYYYMMDDTHHMMSSZ` suffix. Restore one by copying it back over its
 original file; Pika never deletes backups.
 
+## Open a local window from a remote Pika board
+
+Pika uses the same package and `pika` command on the laptop and server. Linux
+nodes own provider processes, exact UUID reconciliation, and tmux homes. The
+Windows client owns only local window creation; a remote process is never given
+permission to execute an arbitrary client-side command.
+
+Install the same release on Windows, then pair each server whose agents may be
+opened locally:
+
+```powershell
+uv tool install "git+ssh://git@github.com/ajainwolfe/pikamux.git@v0.4.0"
+pika setup rstudio-6
+```
+
+Pairing performs two SSH identity receipts, stores a different random secret for
+that exact Pika node on each side, and starts the loopback-only client bridge.
+It prints one line to add to the matching `Host rstudio-6` block in the local
+OpenSSH configuration:
+
+```sshconfig
+RemoteForward 127.0.0.1:47654 127.0.0.1:47653
+```
+
+Reconnect that SSH session after adding the forward. Thereafter, Enter on an
+exact row in the remote `pika` monitor asks the paired client to launch:
+
+```text
+wt.exe -w new ... ssh.exe -tt -o ClearAllForwardings=yes rstudio-6 pika _fleet-open \
+  --expected-node-id NODE_UUID --provider codex --session-id CONVERSATION_UUID
+```
+
+The request contains only a client ID, source node UUID, target node UUID,
+provider, conversation UUID, one-time request ID, and pairing secret. The
+Windows side chooses the SSH target from its own trusted mapping and constructs
+the argument vector itself. Names and shell command strings never cross this
+boundary. The remote `_fleet-open` endpoint revalidates the target node and
+tracked conversation before attaching. The launched attach disables inherited
+SSH forwards so it cannot compete with the dashboard connection for the reverse
+bridge port.
+
+The monitor stays open after a confirmed `WINDOW LAUNCHED` receipt. If the
+reverse forward or client bridge is absent, Enter preserves the original
+behavior and attaches in the current terminal. A reachable bridge that rejects
+identity fails closed and leaves the monitor open with the exact reason.
+
+Useful client commands:
+
+```text
+pika setup SSH_HOST       pair one exact Pika node and start the bridge
+pika                      show paired client nodes
+pika bridge status        show paired client nodes
+pika bridge start         start the loopback bridge in the background
+pika bridge serve         run it in the foreground for diagnosis
+```
+
+Pair every target machine you want a fleet board to open directly. A board on
+one paired server may then request a window for another paired node using only
+that target's immutable node UUID. The bridge cannot route to an unpaired node.
+
 ## Multiple machines
 
 Any Pika installation can be a **coordinator** for other Pika machines. The
@@ -96,7 +157,7 @@ sanitized last-good metadata snapshot. It never copies transcript content.
 
 Pika uses the SSH access you already have. It does not copy private keys, edit
 `known_hosts`, weaken host-key checking, change Tailscale ACLs, scan subnets, or
-open a Pika network port. A hidden versioned JSONL protocol runs over an
+open a Pika server network port. A hidden versioned JSONL protocol runs over an
 ordinary non-interactive SSH process; human attaches use an SSH PTY. Network
 visibility is not treated as authorization.
 

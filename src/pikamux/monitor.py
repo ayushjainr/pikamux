@@ -159,6 +159,8 @@ class MonitorPika(Protocol):
 
     def open(self, session: Session | FleetSession, *, attach: bool = True) -> int: ...
 
+    def open_on_client(self, session: Session | FleetSession): ...
+
     def open_pending(self, session: PendingLaunch, *, attach: bool = True) -> int: ...
 
     def enter(self, query: str, *, attach: bool = True) -> int: ...
@@ -771,6 +773,7 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
                 f"{counts['errors']} errors · {counts['unbound']} unbound"
             ),
             "Pika never guesses identity. Enter acts on the selected provider + UUID.",
+            "A paired SSH client gets a new window; otherwise Enter attaches here.",
             "Operations update every 2s; visible usage updates every 30s.",
         ]
     return [_fit(value, width) for value in items[:slots]]
@@ -2927,6 +2930,25 @@ def run_monitor(
                             selected_to_enter = None
                             break
                         if action == "open":
+                            if session is not None and not isinstance(
+                                session, PendingLaunch
+                            ):
+                                client_opener = getattr(pika, "open_on_client", None)
+                                if callable(client_opener):
+                                    try:
+                                        receipt = client_opener(session)
+                                    except Exception as exc:  # noqa: BLE001 - keep TUI safe
+                                        state.notify(str(exc))
+                                        continue
+                                    if receipt is not None:
+                                        detail = getattr(receipt, "detail", None)
+                                        state.notify(
+                                            terminal_text(
+                                                detail
+                                                or "CLIENT WINDOW LAUNCHED · exact UUID"
+                                            )
+                                        )
+                                        continue
                             selected_to_open = session
                             future = None
                             break
