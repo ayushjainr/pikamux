@@ -558,9 +558,12 @@ class AdversarialTests(unittest.TestCase):
             StaticTmux([pane()]),
             {"codex": FakeProvider(active=[999])},
         )
-        with patch("pikamux.core.provider_process", return_value=999), self.assertRaises(
-            PikaError
-        ) as raised:
+        with (
+            patch("pikamux.core.provider_process", return_value=999),
+            patch("pikamux.core.process_start_time", side_effect=lambda pid:
+                  None if pid == 999 else process_start_time(pid)),
+            self.assertRaises(PikaError) as raised,
+        ):
             pika.open(session, attach=False)
         message = str(raised.exception)
         self.assertIn("already running outside", message)
@@ -735,6 +738,8 @@ class AdversarialTests(unittest.TestCase):
 
         with (
             patch("pikamux.core.provider_process", side_effect=provider_at_root),
+            patch("pikamux.core.process_start_time", side_effect=lambda pid:
+                  None if pid == 999 else process_start_time(pid)),
             self.assertRaisesRegex(PikaError, "already running outside"),
         ):
             pika.open(session, attach=False)

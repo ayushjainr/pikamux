@@ -118,11 +118,12 @@ def _terminal():
 
 def _read_until(fd, needle, timeout=1.0):
     data = b""
+    needles = (needle,) if isinstance(needle, bytes) else needle
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if select.select([fd], [], [], max(0, deadline - time.monotonic()))[0]:
             data += os.read(fd, 65536)
-            if needle in data:
+            if all(value in data for value in needles):
                 return data
     raise AssertionError(f"Missing {needle!r} in terminal output {data[-1000:]!r}")
 
@@ -161,7 +162,9 @@ def test_cached_board_is_usable_while_local_and_remote_scans_are_blocked():
     try:
         started = time.monotonic()
         thread.start()
-        output = _read_until(master, b"cached-agent", timeout=.5)
+        # A PTY read may stop halfway through a frame; the footer is not
+        # necessarily in the same chunk as the row near the top.
+        output = _read_until(master, (b"cached-agent", b"LAST KNOWN"), timeout=.5)
         assert time.monotonic() - started < .5
         assert b"LAST KNOWN" in output
         os.write(master, b"\r")
