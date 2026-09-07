@@ -14,6 +14,7 @@ from pikamux import __version__
 from pikamux.core import OPEN_TWICE_ERROR, OutsideLiveConflict, Pika, PikaError
 from pikamux.doctor import repair_stale_state, run_doctor
 from pikamux.models import Candidate, Pane, Session, Status
+from pikamux.processes import process_start_time
 from pikamux.providers import ClaudeProvider, CodexProvider
 from pikamux.setup_hooks import hook_spec_fingerprint
 from pikamux.store import Store
@@ -890,11 +891,14 @@ class AdversarialTests(unittest.TestCase):
                 side_effect=lambda pid, provider: provider == "codex" and pid == 777,
             ),
             patch.object(pika, "_outside_processes", side_effect=staged_outside),
-            self.assertRaisesRegex(PikaError, "already running outside"),
+            patch("pikamux.core.process_start_time", side_effect=lambda pid:
+                  4242 if pid == 888 else process_start_time(pid)),
+            self.assertRaises(OutsideLiveConflict) as conflict,
         ):
             pika.recover_after_closed_confirmation(session, attach=False)
 
         self.assertEqual(tmux.panes, [])
+        self.assertEqual(conflict.exception.process_identities, ((888, 4242),))
 
     def test_confirmed_recovery_reports_late_genuine_duplicate_as_open_twice(
         self,
