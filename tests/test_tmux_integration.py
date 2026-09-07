@@ -272,7 +272,6 @@ os.write(1, b"GOT=" + data.hex().encode() + b"\\n")
 time.sleep(2)
 """
         self.tmux.run("new-session", "-d", "-s", "seed", "sleep 20")
-        self.assertTrue(self.tmux.ensure_pika_terminal_reply_guard())
 
         def observed_input(
             session_name: str, *, pika_tagged: bool, through_pika: bool
@@ -341,6 +340,16 @@ time.sleep(2)
                         process.wait(timeout=1)
                 os.close(master_fd)
 
+        # Newer tmux handles DA2 replies itself. Preserve the user's native
+        # behavior on this version rather than assuming it forwards the reply.
+        baseline = observed_input(
+            "user-before-guard", pika_tagged=False, through_pika=False
+        )
+        self.assertIn(baseline, (
+            b"beforeafter",
+            b"before" + WINDOWS_TERMINAL_DA2_RESPONSE.encode() + b"after",
+        ))
+        self.assertTrue(self.tmux.ensure_pika_terminal_reply_guard())
         self.assertEqual(
             observed_input(
                 "pika-c-terminal-reply", pika_tagged=True, through_pika=True
@@ -351,7 +360,7 @@ time.sleep(2)
             observed_input(
                 "user-terminal-reply", pika_tagged=False, through_pika=False
             ),
-            b"before" + WINDOWS_TERMINAL_DA2_RESPONSE.encode() + b"after",
+            baseline,
         )
 
     def test_exact_pane_target_selects_its_window_in_multi_window_home(self) -> None:

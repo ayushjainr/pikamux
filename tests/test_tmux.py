@@ -9,6 +9,37 @@ from pikamux.tmux import Tmux, TmuxError, WINDOWS_TERMINAL_DA2_RESPONSE
 
 
 class TmuxTests(unittest.TestCase):
+    def test_escaped_tmux_inventory_preserves_exact_tags_and_backslashes(self) -> None:
+        fields = ["home", "%7", "123", r"/tmp/back\slash", "bash",
+                  "1", "1", "1", "0", "", "10", "5", "codex", "uuid", "name", "token"]
+        for separator in ("\x1f", r"\037"):
+            with self.subTest(separator=repr(separator)):
+                output = separator.join(fields) + "\n"
+                result = subprocess.CompletedProcess([], 0, output, "")
+                with patch.object(Tmux, "run", return_value=result):
+                    panes = Tmux("test").list_panes()
+                self.assertEqual(len(panes), 1)
+                self.assertEqual(panes[0].pane_id, "%7")
+                self.assertEqual(panes[0].cwd, r"/tmp/back\slash")
+                self.assertEqual(panes[0].pika_session_id, "uuid")
+                self.assertEqual(panes[0].pika_launch_token, "token")
+
+    def test_ambiguous_escaped_inventory_cannot_assign_an_exact_identity(self) -> None:
+        fields = ["home", "%7", "123", "/tmp", "bash", "0", "1", "1",
+                  "0", "", "10", "5", "codex", "uuid", r"name\037extra", "token"]
+        result = subprocess.CompletedProcess([], 0, r"\037".join(fields) + "\n", "")
+        with patch.object(Tmux, "run", return_value=result):
+            self.assertEqual(Tmux("test").list_panes(), [])
+
+    def test_modern_tmux_client_inventory_routes_receipt_to_exact_client(self) -> None:
+        def run(_self, *args, **_kwargs):
+            output = r"client-one\037123" + "\n" if args[0] == "list-clients" else ""
+            return subprocess.CompletedProcess([], 0, output, "")
+        with patch.object(Tmux, "run", autospec=True, side_effect=run) as called:
+            Tmux("test")._display_to_client(123, "exact receipt")
+        self.assertTrue(any(call.args[1:4] == ("display-message", "-c", "client-one")
+                            for call in called.call_args_list))
+
     def test_all_provider_homes_are_recognized_as_pika_sessions(self) -> None:
         self.assertTrue(Tmux.is_pika_session("pika-c-codex"))
         self.assertTrue(Tmux.is_pika_session("pika-a-claude"))
@@ -155,14 +186,15 @@ class TmuxTests(unittest.TestCase):
                 "-v",
                 "user-keys[199]",
             ):
-                stdout = WINDOWS_TERMINAL_DA2_RESPONSE + "\n"
+                stdout = reply + "\n"
             return subprocess.CompletedProcess(["tmux"], 0, stdout, "")
 
-        with patch.object(Tmux, "run", new=run):
-            self.assertTrue(Tmux("test").ensure_pika_terminal_reply_guard())
-
-        self.assertFalse(any(call and call[0] == "set-option" for call in calls))
-        self.assertTrue(any(call and call[0] == "bind-key" for call in calls))
+        for reply in (WINDOWS_TERMINAL_DA2_RESPONSE, r"\033[>0;10;1c"):
+            calls.clear()
+            with self.subTest(reply=repr(reply)), patch.object(Tmux, "run", new=run):
+                self.assertTrue(Tmux("test").ensure_pika_terminal_reply_guard())
+            self.assertFalse(any(call and call[0] == "set-option" for call in calls))
+            self.assertTrue(any(call and call[0] == "bind-key" for call in calls))
 
     def test_agent_wrapper_preserves_explicit_interactive_no_color(self) -> None:
         with patch.dict(

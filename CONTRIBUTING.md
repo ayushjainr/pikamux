@@ -6,7 +6,8 @@ trust boundaries. Bugs with a small reproduction are as useful as pull requests.
 
 ## One development setup
 
-Use Linux, Python 3.10 or newer, tmux, and uv. No provider login, SSH account,
+Use Linux, Python 3.10 or newer, tmux, uv, and Node.js 22 for the OpenCode
+plugin execution fixture. No provider login, SSH account,
 API key, or paid model is required for the automated suite.
 
 ```bash

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import time
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -99,6 +100,28 @@ class PeekPika:
 
 
 class CliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # CLI orchestration tests start from a deterministic, commissioned
+        # fixture, never the developer's installed providers or real config.
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        config = Path(temporary.name) / "config.json"
+        config.write_text('{}\n')
+        for target, kwargs in (
+            ("pikamux.cli.config_path", {"return_value": config}),
+            ("pikamux.cli.suggest_local_machine_alias", {"return_value": "testbox"}),
+            ("pikamux.cli.setup_executables", {"return_value": {
+                "codex": "/test/codex", "claude": "/test/claude",
+                "opencode": "/test/opencode",
+            }}),
+            ("pikamux.cli.setup_runtime_path", {"return_value": "/test"}),
+            ("pikamux.cli.executable_available", {"return_value": True}),
+            ("pikamux.cli.executable_version", {"return_value": "1.18.21"}),
+        ):
+            replacement = patch(target, **kwargs)
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
     def test_activity_is_transcript_free_and_reconciles_first(self) -> None:
         pika = Mock()
         pika.store.list_activity_events.return_value = [

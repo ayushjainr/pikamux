@@ -26,6 +26,13 @@ _PIKA_TERMINAL_REPLY_KEY_OPTION = "@pika_terminal_reply_key"
 _PIKA_TERMINAL_REPLY_KEY_CANDIDATES = tuple(range(199, 191, -1))
 
 
+def _inventory_fields(value: str) -> list[str]:
+    # tmux 3.4 prints control bytes as octal escapes; 3.2 prints them raw.
+    # Split framing only, never unescape arbitrary paths, names or UUIDs.
+    separator = "\x1f" if "\x1f" in value else r"\037"
+    return value.split(separator)
+
+
 @dataclass(slots=True)
 class Tmux:
     socket_name: str | None = None
@@ -115,7 +122,7 @@ class Tmux:
             raise TmuxError(message or "tmux pane inventory failed")
         panes: list[Pane] = []
         for line in proc.stdout.splitlines():
-            parts = line.split(separator)
+            parts = _inventory_fields(line)
             if len(parts) != 16:
                 continue
             try:
@@ -305,7 +312,10 @@ class Tmux:
             if (
                 index == claimed
                 and current.returncode == 0
-                and current.stdout.rstrip("\r\n") == WINDOWS_TERMINAL_DA2_RESPONSE
+                and current.stdout.rstrip("\r\n") in {
+                    WINDOWS_TERMINAL_DA2_RESPONSE,
+                    WINDOWS_TERMINAL_DA2_RESPONSE.replace("\x1b", r"\033"),
+                }
             ):
                 selected = index
                 break
@@ -635,7 +645,7 @@ class Tmux:
             check=False,
         )
         for line in proc.stdout.splitlines():
-            parts = line.split(separator, 1)
+            parts = _inventory_fields(line)
             if len(parts) != 2 or parts[1] != str(client_pid):
                 continue
             self.run(
@@ -706,7 +716,7 @@ class Tmux:
             check=False,
         )
         for value in proc.stdout.splitlines():
-            parts = value.split(separator, 1)
+            parts = _inventory_fields(value)
             if len(parts) != 2:
                 continue
             client, tty = parts

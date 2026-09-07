@@ -26,6 +26,10 @@ class SetupTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        # Configuration merge tests do not invoke a developer's actual CLI.
+        executable = patch("pikamux.setup_hooks.configured_executable", return_value=None)
+        executable.start()
+        self.addCleanup(executable.stop)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -184,8 +188,16 @@ class SetupTests(unittest.TestCase):
         codex = self.root / "codex"
         codex.mkdir()
         (codex / "config.toml").write_text('model = "unterminated\n')
-        with self.assertRaisesRegex(ValueError, "invalid Codex config"):
+        with (
+            patch("pikamux.setup_hooks.configured_executable", return_value="/test/codex"),
+            patch("pikamux.setup_hooks.executable_available", return_value=True),
+            patch("pikamux.setup_hooks.subprocess.run", return_value=subprocess.CompletedProcess(
+                [], 1, "", "invalid TOML: unterminated string"
+            )) as validate,
+            self.assertRaisesRegex(ValueError, "invalid Codex config"),
+        ):
             codex_config_change(codex)
+        self.assertEqual(validate.call_args.args[0], ["/test/codex", "features", "list"])
 
     def test_setup_explicitly_reenables_disabled_claude_hooks(self) -> None:
         claude = self.root / "claude"
