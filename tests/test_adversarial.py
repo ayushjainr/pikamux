@@ -8,7 +8,7 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from pikamux import __version__
 from pikamux.core import OPEN_TWICE_ERROR, OutsideLiveConflict, Pika, PikaError
@@ -604,8 +604,8 @@ class AdversarialTests(unittest.TestCase):
             patch.object(pika, "uuid_identity_pids", side_effect=[{999}, set()]),
             patch("pikamux.core.process_start_time", return_value=4242),
             patch("pikamux.core.shared_provider_process", return_value=False),
-            patch("pikamux.core.os.pidfd_open", return_value=55) as pidfd_open,
-            patch("pikamux.core.signal.pidfd_send_signal") as send_signal,
+            patch("pikamux.core.os.pidfd_open", return_value=55, create=True) as pidfd_open,
+            patch("pikamux.core.signal.pidfd_send_signal", create=True) as send_signal,
             patch("pikamux.core.select.select", return_value=([55], [], [])),
             patch("pikamux.core.os.close") as close,
             patch.object(
@@ -629,7 +629,7 @@ class AdversarialTests(unittest.TestCase):
             patch.object(pika, "refresh", return_value=[session]),
             patch.object(pika, "uuid_identity_pids", return_value={999}),
             patch("pikamux.core.process_start_time", return_value=4343),
-            patch("pikamux.core.os.pidfd_open") as pidfd_open,
+            patch("pikamux.core.os.pidfd_open", create=True) as pidfd_open,
             self.assertRaisesRegex(PikaError, "PID generation changed"),
         ):
             pika.clean_and_attach(conflict, attach=False)
@@ -645,7 +645,7 @@ class AdversarialTests(unittest.TestCase):
             patch.object(pika, "uuid_identity_pids", return_value={999}),
             patch("pikamux.core.process_start_time", return_value=4242),
             patch("pikamux.core.shared_provider_process", return_value=True),
-            patch("pikamux.core.os.pidfd_open") as pidfd_open,
+            patch("pikamux.core.os.pidfd_open", create=True) as pidfd_open,
             self.assertRaisesRegex(PikaError, "shared provider infrastructure"),
         ):
             pika.clean_and_attach(conflict, attach=False)
@@ -663,11 +663,36 @@ class AdversarialTests(unittest.TestCase):
             patch("pikamux.core.process_start_time", return_value=4242),
             patch("pikamux.core.shared_provider_process", return_value=False),
             patch("pikamux.core.process_tree", return_value=[123, 999]),
-            patch("pikamux.core.os.pidfd_open") as pidfd_open,
+            patch("pikamux.core.os.pidfd_open", create=True) as pidfd_open,
             self.assertRaisesRegex(PikaError, "now inside tmux"),
         ):
             pika.clean_and_attach(conflict, attach=False)
         pidfd_open.assert_not_called()
+
+    def test_clean_and_attach_without_pidfd_support_never_signals_or_recovers(self) -> None:
+        session = Session("claude", "uuid", name="busy")
+        conflict = OutsideLiveConflict("outside", session, ((999, 4242),))
+        pika = Pika(self.store, StaticTmux(), {"claude": FakeProvider("claude")})
+        for missing in ("open", "signal"):
+            open_fd = Mock()
+            send_signal = Mock()
+            with (
+                self.subTest(missing=missing),
+                patch.object(pika, "refresh", return_value=[session]),
+                patch.object(pika, "uuid_identity_pids", return_value={999}),
+                patch("pikamux.core.process_start_time", return_value=4242),
+                patch("pikamux.core.os.pidfd_open", None if missing == "open" else open_fd, create=True),
+                patch("pikamux.core.signal.pidfd_send_signal", None if missing == "signal" else send_signal, create=True),
+                patch("pikamux.core.os.kill") as kill,
+                patch.object(pika, "recover_after_closed_confirmation") as recover,
+            ):
+                # The production getattr defaults to None when the API is absent.
+                with self.assertRaisesRegex(PikaError, "No signal was sent"):
+                    pika.clean_and_attach(conflict, attach=False)
+                open_fd.assert_not_called()
+                send_signal.assert_not_called()
+                kill.assert_not_called()
+                recover.assert_not_called()
 
     def test_clean_and_attach_never_escalates_after_graceful_timeout(self) -> None:
         session = Session("claude", "uuid", name="busy")
@@ -679,8 +704,8 @@ class AdversarialTests(unittest.TestCase):
             patch.object(pika, "uuid_identity_pids", return_value={999}),
             patch("pikamux.core.process_start_time", return_value=4242),
             patch("pikamux.core.shared_provider_process", return_value=False),
-            patch("pikamux.core.os.pidfd_open", return_value=55),
-            patch("pikamux.core.signal.pidfd_send_signal") as send_signal,
+            patch("pikamux.core.os.pidfd_open", return_value=55, create=True),
+            patch("pikamux.core.signal.pidfd_send_signal", create=True) as send_signal,
             patch("pikamux.core.select.select", return_value=([], [], [])),
             patch("pikamux.core.os.close"),
             patch.object(pika, "recover_after_closed_confirmation") as recover,
