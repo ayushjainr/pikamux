@@ -1,17 +1,51 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from pikamux.processes import (
     _canonical_identity_pids,
     _process_kind,
+    opencode_session_processes,
+    process_tty,
     provider_ancestor,
     shared_provider_process,
 )
 
 
 class ProcessTests(unittest.TestCase):
+    def test_opencode_session_processes_batches_one_proc_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = {
+                "101": ["/opt/opencode", "--session", "ses_first123"],
+                "202": ["opencode", "-s", "ses_second123"],
+                "303": ["opencode", "--session=ses_first123"],
+                "404": ["codex", "--session", "ses_ignore123"],
+            }
+            for pid, argv in commands.items():
+                target = root / pid
+                target.mkdir()
+                (target / "cmdline").write_bytes(
+                    b"\0".join(value.encode() for value in argv) + b"\0"
+                )
+            with patch("pikamux.processes.parent_pid", return_value=None):
+                observed = opencode_session_processes(root)
+        self.assertEqual(observed["ses_first123"], [101, 303])
+        self.assertEqual(observed["ses_second123"], [202])
+        self.assertNotIn("ses_ignore123", observed)
+
+    def test_process_tty_reports_only_terminal_devices(self) -> None:
+        with patch(
+            "pikamux.processes.os.readlink",
+            side_effect=[OSError(), "/dev/pts/39"],
+        ):
+            self.assertEqual(process_tty(2997494), "/dev/pts/39")
+        with patch("pikamux.processes.os.readlink", return_value="/tmp/output"):
+            self.assertIsNone(process_tty(2997494))
+
     def test_uuid_process_aliases_collapse_only_within_one_direct_tree(self) -> None:
         parents = {200: 100, 300: 1}
         with patch(
@@ -24,6 +58,10 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(
             _process_kind(["node", "/opt/codex/bin/codex.js", "resume", "id"]),
             "codex",
+        )
+        self.assertEqual(
+            _process_kind(["/home/user/.opencode/bin/opencode", "--session", "ses_x"]),
+            "opencode",
         )
 
     def test_unrelated_paths_do_not_look_like_agent_processes(self) -> None:
@@ -64,6 +102,13 @@ class ProcessTests(unittest.TestCase):
             return_value=["/opt/codex", "resume", "exact-uuid"],
         ):
             self.assertFalse(shared_provider_process(123, "codex"))
+
+    def test_opencode_process_is_a_renewable_multi_root_lease(self) -> None:
+        with patch(
+            "pikamux.processes.cmdline",
+            return_value=["/home/user/.opencode/bin/opencode", "--session", "ses_one"],
+        ):
+            self.assertTrue(shared_provider_process(123, "opencode"))
 
 
 if __name__ == "__main__":

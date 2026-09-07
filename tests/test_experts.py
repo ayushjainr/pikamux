@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +10,13 @@ from unittest.mock import patch
 
 from pikamux.core import Pika, PikaError
 from pikamux.consult import ConsultationError
-from pikamux.experts import card_state, interview_profile, make_profile, rank_experts
+from pikamux.experts import (
+    card_state,
+    interview_profile,
+    make_profile,
+    rank_experts,
+    transcript_fingerprint,
+)
 from pikamux.models import ExpertProfile, Pane, Session, Status
 from pikamux.store import Store
 
@@ -25,6 +32,46 @@ class OnePaneTmux:
 
 
 class ExpertTests(unittest.TestCase):
+    def test_opencode_card_fingerprint_is_session_tree_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "opencode.db"
+            with sqlite3.connect(database) as db:
+                db.execute(
+                    "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, "
+                    "time_updated INTEGER, time_archived INTEGER)"
+                )
+                db.execute(
+                    "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, "
+                    "time_created INTEGER, data TEXT)"
+                )
+                db.execute(
+                    "CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, "
+                    "message_id TEXT, time_created INTEGER, data TEXT)"
+                )
+                db.executemany(
+                    "INSERT INTO session VALUES (?,?,?,NULL)",
+                    (("ses_one", None, 100), ("ses_other", None, 100)),
+                )
+            session = Session("opencode", "ses_one", transcript_path=str(database))
+            before = transcript_fingerprint(session)
+            with sqlite3.connect(database) as db:
+                db.execute("UPDATE session SET time_updated=200 WHERE id='ses_other'")
+                db.execute(
+                    "INSERT INTO message VALUES ('m_other','ses_other',200,'{}')"
+                )
+            self.assertEqual(transcript_fingerprint(session), before)
+            with sqlite3.connect(database) as db:
+                db.execute(
+                    "INSERT INTO session VALUES ('ses_child','ses_one',300,NULL)"
+                )
+                db.execute(
+                    "INSERT INTO message VALUES ('m_child','ses_child',300,'{}')"
+                )
+                db.execute(
+                    "INSERT INTO part VALUES ('p_child','ses_child','m_child',300,'{}')"
+                )
+            self.assertNotEqual(transcript_fingerprint(session), before)
+
     def test_card_freshness_tracks_the_provider_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             transcript = Path(directory) / "thread.jsonl"
@@ -105,7 +152,7 @@ class ExpertTests(unittest.TestCase):
             Session(
                 "codex",
                 "one",
-                name="master_attr",
+                name="reporting",
                 cwd="/work/attribution",
                 status=Status.WORKING.value,
                 live=True,
@@ -139,16 +186,54 @@ class ExpertTests(unittest.TestCase):
             ),
         ]
         matches = rank_experts(profiles, sessions, "factor attribution")
-        self.assertEqual([item.session.session_id for item in matches], ["one", "two"])
+        self.assertEqual([item.session.session_id for item in matches], ["one"])
         self.assertIn("topic", matches[0].matched_on)
         self.assertIn("scope", matches[0].matched_on)
-        self.assertGreater(matches[0].score, matches[1].score)
         current = rank_experts(profiles, sessions, "live mismatch")
         self.assertEqual(current[0].session.session_id, "one")
         self.assertIn("now", current[0].matched_on)
         payload = current[0].to_dict()
         self.assertEqual(payload["scope"], profiles[0].scope)
         self.assertEqual(payload["current_state"], profiles[0].current_state)
+
+    def test_rank_matches_tokens_not_incidental_substrings(self) -> None:
+        sessions = [
+            Session("codex", "ai", name="ai-components"),
+            Session("codex", "daily", name="returns"),
+        ]
+        profiles = [
+            ExpertProfile("codex", "ai", "Built AI component screens.", ("AI",)),
+            ExpertProfile(
+                "codex",
+                "daily",
+                "Operates the daily returns pipeline.",
+                ("daily returns",),
+            ),
+        ]
+
+        self.assertEqual(
+            [
+                match.session.session_id
+                for match in rank_experts(profiles, sessions, "ai")
+            ],
+            ["ai"],
+        )
+        self.assertEqual(rank_experts(profiles, sessions, "the"), [])
+        self.assertEqual(rank_experts(profiles, sessions, "ai unrelated"), [])
+
+    def test_rank_normalizes_hyphens_underscores_and_paths(self) -> None:
+        session = Session("codex", "one", name="factor_weights")
+        profile = ExpertProfile(
+            "codex",
+            "one",
+            "Built the factor-weight publication.",
+            ("publication",),
+            ("reports/factor_weights.parquet",),
+        )
+
+        matches = rank_experts([profile], [session], "factor weights")
+        self.assertEqual([match.session.session_id for match in matches], ["one"])
+        self.assertIn("scope", matches[0].matched_on)
 
     def test_profiles_are_cleaned_but_not_invented(self) -> None:
         profile = make_profile(

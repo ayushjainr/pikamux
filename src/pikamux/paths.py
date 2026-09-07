@@ -39,3 +39,19 @@ def claude_home() -> Path:
     return Path(
         os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")
     ).expanduser()
+
+
+def opencode_data_home() -> Path:
+    override = os.environ.get("OPENCODE_DATA_HOME")
+    if override:
+        return Path(override).expanduser()
+    base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return base / "opencode"
+
+
+def opencode_config_home() -> Path:
+    override = os.environ.get("OPENCODE_CONFIG_DIR")
+    if override:
+        return Path(override).expanduser()
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "opencode"

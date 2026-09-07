@@ -11,8 +11,10 @@ from typing import Any
 from .paths import config_path
 
 
-PROVIDER_NAMES = ("codex", "claude")
+PROVIDER_NAMES = ("codex", "claude", "opencode")
+MINIMUM_PROVIDER_VERSIONS = {"opencode": (1, 18, 21)}
 _PATH_LINE = re.compile(r'^Environment="PATH=(?P<value>.*)"$')
+_SEMANTIC_VERSION = re.compile(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)")
 
 
 def _raw_config() -> dict[str, Any]:
@@ -55,6 +57,28 @@ def executable_version(value: str | None) -> str | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     return (result.stdout or result.stderr).strip() or None
+
+
+def provider_compatibility_error(provider: str, version: str | None) -> str | None:
+    """Explain a provider version Pika has not certified, if any."""
+    minimum = MINIMUM_PROVIDER_VERSIONS.get(provider)
+    if minimum is None:
+        return None
+    match = _SEMANTIC_VERSION.search(version or "")
+    required = ".".join(map(str, minimum))
+    if match is None:
+        return (
+            f"Pika requires {provider} >= {required}; could not verify version "
+            f"from {version!r}"
+        )
+    found = tuple(int(part) for part in match.groups())
+    if found < minimum:
+        return f"Pika requires {provider} >= {required}; found {version}"
+    return None
+
+
+def provider_version_supported(provider: str, version: str | None) -> bool:
+    return version is not None and provider_compatibility_error(provider, version) is None
 
 
 def _service_path() -> str | None:

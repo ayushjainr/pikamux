@@ -19,6 +19,7 @@ from pikamux.monitor import (
     AskMessage,
     HandoffSummary,
     MonitorState,
+    _InlineAskWorker,
     _briefing_lines,
     _capture_preview,
     _handle_key,
@@ -85,7 +86,8 @@ class MonitorTests(unittest.TestCase):
             state, width=140, height=30, now=time.time(), refreshing=True, color=True
         )
         self.assertIn("PIKA // LIVE OPERATIONS", frame.plain)
-        self.assertIn("2 need you", frame.plain)
+        self.assertIn("1 need you", frame.plain)
+        self.assertIn("1 results", frame.plain)
         self.assertIn("NEEDS YOU", frame.plain)
         self.assertIn("WORKING", frame.plain)
         self.assertIn("permission", frame.plain)
@@ -149,7 +151,7 @@ class MonitorTests(unittest.TestCase):
             MonitorState(), width=90, height=20, refreshing=True, color=False
         )
         self.assertIn("INITIAL HANDOFF", initial.plain)
-        self.assertNotIn("NO ATTENTION PENDING", initial.plain)
+        self.assertNotIn("YOU'RE CLEAR", initial.plain)
 
     def test_refresh_error_keeps_last_good_data_visible(self) -> None:
         state = MonitorState(
@@ -175,6 +177,20 @@ class MonitorTests(unittest.TestCase):
             decode_keys(text_buffer, text_mode=True),
             ["a", " ", "q", "u", "i", "c", "k", "?", "newline", "π", "backspace"],
         )
+
+    def test_fragmented_and_alternate_arrow_sequences_are_decoded(self) -> None:
+        fragmented = bytearray(b"\x1b")
+        self.assertEqual(decode_keys(fragmented, flush_escape=False), [])
+        self.assertEqual(fragmented, bytearray(b"\x1b"))
+        fragmented.extend(b"[")
+        self.assertEqual(decode_keys(fragmented, flush_escape=False), [])
+        fragmented.extend(b"A")
+        self.assertEqual(decode_keys(fragmented, flush_escape=False), ["up"])
+        self.assertEqual(fragmented, bytearray())
+
+        self.assertEqual(decode_keys(bytearray(b"\x1bOB")), ["down"])
+        self.assertEqual(decode_keys(bytearray(b"\x1b[1;2A")), ["up"])
+        self.assertEqual(decode_keys(bytearray(b"\x1b[C")), ["right"])
 
     def test_selection_is_stable_and_next_uses_attention_order(self) -> None:
         state = MonitorState(sessions=self.sessions)
@@ -202,6 +218,18 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(action, "enter")
         self.assertEqual(selected, unbound)
 
+        outside = replace(
+            unbound,
+            name="sample plugin",
+            root_pid=2997494,
+            home_state="outside-live",
+        )
+        state = MonitorState(sessions=[outside])
+        action, selected = _handle_key("enter", Mock(), state)
+        self.assertEqual((action, selected), ("enter", outside))
+        self.assertIn("RECOVERY OPTIONS", _identity_text(outside))
+        self.assertIn("TERMINAL FOR PID 2997494, /exit", _identity_text(outside))
+
         identity_error = Session(
             "codex",
             "identity-error",
@@ -211,9 +239,10 @@ class MonitorTests(unittest.TestCase):
         )
         state = MonitorState(sessions=[identity_error])
         action, selected = _handle_key("enter", Mock(), state)
-        self.assertEqual(action, "continue")
-        self.assertIsNone(selected)
-        self.assertIn("opening remains blocked", state.toast)
+        self.assertEqual(action, "open")
+        self.assertEqual(selected, identity_error)
+        # Core open revalidates identity; a stale board error must not prevent
+        # recovery, nor can the board itself bypass the authoritative check.
 
     def test_terminal_sequence_stripping_protects_peek_surface(self) -> None:
         value = "safe\x1b[2Jrewritten\x1b]0;title\x07"
@@ -252,7 +281,7 @@ class MonitorTests(unittest.TestCase):
             initialized=True,
             refresh_error=None,
         )
-        self.assertIn("NO ATTENTION PENDING", headline)
+        self.assertIn("YOU'RE CLEAR", headline)
         self.assertIn("1 exact live", headline)
 
         quiet.append(
@@ -265,7 +294,7 @@ class MonitorTests(unittest.TestCase):
             initialized=True,
             refresh_error=None,
         )
-        self.assertNotIn("NO ATTENTION PENDING", headline)
+        self.assertNotIn("YOU'RE CLEAR", headline)
 
         quiet[-1].unread = False
         headline, _ = _briefing_lines(
@@ -275,7 +304,7 @@ class MonitorTests(unittest.TestCase):
             initialized=True,
             refresh_error=None,
         )
-        self.assertIn("NO ATTENTION PENDING", headline)
+        self.assertIn("YOU'RE CLEAR", headline)
 
     def test_identity_copy_never_infers_exactness_from_live_or_tags(self) -> None:
         live = Session(
@@ -295,11 +324,21 @@ class MonitorTests(unittest.TestCase):
             "codex",
             "22222222-rest",
             status=Status.ERROR.value,
+            unread=True,
             attention_reason="identity",
             tmux_pane="%2",
             home_state="identity-error",
         )
         self.assertIn("IDENTITY UNVERIFIED", _identity_text(error))
+        self.assertIn("PROTECTED PAUSE", _identity_text(error))
+        protected = render_monitor(
+            MonitorState(sessions=[error], last_update=time.time()),
+            width=100,
+            height=20,
+            color=False,
+        )
+        self.assertIn("PROTECTED", protected.plain)
+        self.assertNotIn(" ERROR ", protected.plain)
 
         states = {
             "unbound": "UNBOUND PROCESS",
@@ -414,7 +453,8 @@ class MonitorTests(unittest.TestCase):
 
         wide = render_monitor(state, width=140, height=30, color=False)
         self.assertIn("STOP WATCHING", wide.plain)
-        self.assertIn("The agent keeps running", wide.plain)
+        self.assertIn("running agent stays running", wide.plain)
+        self.assertIn("expert lookup", wide.plain)
         self.assertIn("not archived", wide.plain)
         self.assertIn("x / Enter", wide.plain)
 
@@ -730,6 +770,67 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(questions, ["first", "second"])
         self.assertTrue(consultation.closed.wait(1.0))
 
+    def test_runtime_does_not_quit_on_fragmented_arrow_key(self) -> None:
+        sessions = [
+            Session("codex", "first", name="first", status=Status.WORKING.value),
+            Session("codex", "second", name="second", status=Status.PARKED.value),
+        ]
+
+        class FakeStore:
+            def claim_monitor_handoff(self, _timestamp):
+                return None, {}
+
+        class FakePika:
+            store = FakeStore()
+            discovery_errors: list[str] = []
+
+            def refresh(self, *, usage=False):
+                return sessions
+
+            def next_attention(self, _sessions=None):
+                return None
+
+            def open(self, _session, *, attach=True):
+                return 0
+
+        master, slave = pty.openpty()
+        fcntl.ioctl(
+            slave,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", 24, 100, 0, 0),
+        )
+        result: list[int] = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                run_monitor(
+                    FakePika(),
+                    input_fd=slave,
+                    output_fd=slave,
+                    refresh_seconds=0.02,
+                )
+            )
+        )
+        try:
+            with patch("pikamux.monitor.KEY_SEQUENCE_TIMEOUT_SECONDS", 0.2):
+                thread.start()
+                time.sleep(0.08)
+                os.write(master, b"\x1b")
+                time.sleep(0.05)
+                self.assertTrue(thread.is_alive())
+                os.write(master, b"[B")
+                time.sleep(0.08)
+                self.assertTrue(thread.is_alive())
+                os.write(master, b"q")
+                thread.join(1.0)
+        finally:
+            if thread.is_alive():
+                os.write(master, b"q")
+                thread.join(1.0)
+            os.close(master)
+            os.close(slave)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [0])
+
     def test_runtime_client_window_receipt_keeps_monitor_open(self) -> None:
         session_id = "99999999-9999-4999-8999-999999999999"
         session = Session(
@@ -763,7 +864,7 @@ class MonitorTests(unittest.TestCase):
                     "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
                     "codex",
                     session_id,
-                    "WINDOW LAUNCHED · rstudio-6 · id 99999999",
+                    "WINDOW LAUNCHED · devbox · id 99999999",
                 )
 
             def open(self, _session, *, attach=True):
@@ -835,11 +936,12 @@ class MonitorTests(unittest.TestCase):
             expert_cards_updated_at=time.time(),
         )
         frame = render_monitor(state, width=140, height=30, color=False)
-        self.assertIn("1 expert", frame.plain.splitlines()[0])
-        self.assertIn("EXPERT CARD", frame.plain)
-        self.assertIn("+NEW CONTEXT", frame.plain)
+        self.assertIn("1 expert thread", frame.plain.splitlines()[0])
+        self.assertIn("THREAD EXPERTISE", frame.plain)
+        self.assertIn("INTERVIEWED", frame.plain)
+        self.assertIn("PROFILE STALE", frame.plain)
         self.assertIn("trade reconciliation", frame.plain)
-        self.assertIn("scope", frame.plain)
+        self.assertIn("worked on", frame.plain)
         self.assertIn("Reconciling three late source", frame.plain)
         self.assertIn("[a] ask here", frame.plain)
 
@@ -883,13 +985,15 @@ class MonitorTests(unittest.TestCase):
     def test_live_tail_is_read_only_and_preserves_unread(self) -> None:
         session = self.sessions[0]
         pika = Mock()
-        pika.tmux.capture.return_value = "old\n\x1b[31mnew result\x1b[0m"
+        pika.capture.return_value = "old\n\x1b[31mnew result\x1b[0m"
         key, lines, error = _capture_preview(pika, session)
         self.assertEqual(key, session.key)
         self.assertEqual(lines[-1], "new result")
         self.assertIsNone(error)
         self.assertTrue(session.unread)
         pika.acknowledge.assert_not_called()
+        pika.capture.assert_called_once_with(session, 12)
+        pika.tmux.capture.assert_not_called()
 
     def test_inline_ask_editor_preserves_input_and_has_explicit_recovery(self) -> None:
         session = self.sessions[0]
@@ -913,6 +1017,17 @@ class MonitorTests(unittest.TestCase):
         action, _ = _handle_key("escape", Mock(), state)
         self.assertEqual(action, "ask-close")
         self.assertEqual(state.mode, "sessions")
+
+    def test_inline_side_cleanup_failure_is_reported_not_lost_in_thread(self) -> None:
+        consultation = Mock()
+        consultation.close.side_effect = RuntimeError("provider delete failed")
+        worker = _InlineAskWorker(self.sessions[0], Mock())
+        worker._consultation = consultation
+        worker._close_consultation()
+        self.assertEqual(
+            worker.poll(),
+            [("error", "side cleanup failed: provider delete failed")],
+        )
 
 
 if __name__ == "__main__":

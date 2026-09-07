@@ -98,7 +98,7 @@ class FailingTagTmux(LaunchTmux):
 
 class LifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(dir="/mnt/ebs1/ajain")
+        self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.store = Store(self.root / "pika.db")
         self.token = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -272,6 +272,65 @@ class LifecycleTests(unittest.TestCase):
         with proofs[0], proofs[1], proofs[2], proofs[3], proofs[4]:
             self.assertEqual(pika.reconcile_pending_launches(), 0)
         self.assertIsNotNone(self.store.get_pending(self.token))
+        self.assertEqual(tmux.tags, [])
+
+    def test_opencode_launch_never_binds_from_time_and_cwd_inference(self) -> None:
+        token = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        session_id = "ses_concurrent123"
+        pane = Pane(
+            "pika-o-bbbbbbbbbb",
+            "%2",
+            124,
+            str(self.root),
+            "opencode",
+            False,
+            False,
+            None,
+            self.started,
+            self.started,
+            pika_launch_token=token,
+            pika_name="oc-safe",
+        )
+        self.assertTrue(
+            self.store.add_pending(
+                token,
+                "opencode",
+                "oc-safe",
+                str(self.root),
+                pane.session_name,
+                pane.pane_id,
+                preexisting_session_ids=[],
+            )
+        )
+        self.store.finalize_pending_pane(
+            token, pane.session_name, pane.pane_id, 778, 100
+        )
+        candidate = Candidate(
+            "opencode",
+            session_id,
+            "concurrent",
+            cwd=str(self.root),
+            created_at=self.started,
+            updated_at=self.started,
+        )
+        provider = LaunchProvider([candidate], [778])
+        provider.name = "opencode"
+        tmux = LaunchTmux(pane)
+        pika = Pika(self.store, tmux, {"opencode": provider})
+        with (
+            patch("pikamux.core.provider_process", return_value=778),
+            patch(
+                "pikamux.core.process_environment",
+                return_value={
+                    "PIKA_LAUNCH_TOKEN": token,
+                    "PIKA_PROVIDER": "opencode",
+                },
+            ),
+            patch("pikamux.core.process_start_time", return_value=100),
+        ):
+            self.assertEqual(pika.reconcile_pending_launches(), 0)
+        self.assertIsNotNone(self.store.get_pending(token))
+        self.assertIsNone(self.store.get_session("opencode", session_id))
         self.assertEqual(tmux.tags, [])
 
     def test_pending_attach_requires_launch_environment_proof(self) -> None:
@@ -483,6 +542,39 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(pika.enter("qis_dash"), 17)
         opened.assert_called_once_with(session, attach=True)
         broad_discovery.assert_not_called()
+
+    def test_provider_confirmed_deleted_opencode_row_leaves_board(self) -> None:
+        provider = LaunchProvider([])
+        provider.name = "opencode"
+        provider.durable_state = Mock(return_value="deleted")
+        session = Session(
+            "opencode",
+            "ses_deleted123",
+            name="deleted-open-code",
+            cwd=str(self.root),
+            status=Status.READY.value,
+            unread=True,
+        )
+        self.store.upsert_session(session)
+        tmux = Mock()
+        tmux.list_panes.return_value = []
+        pika = Pika(self.store, tmux, {"opencode": provider})
+        self.assertEqual(pika.refresh(), [])
+        self.assertIsNone(self.store.get_session(*session.key))
+
+    def test_unknown_opencode_store_state_never_deletes_row(self) -> None:
+        provider = LaunchProvider([])
+        provider.name = "opencode"
+        provider.durable_state = Mock(return_value="unknown")
+        session = Session(
+            "opencode", "ses_unknown123", name="keep-me", cwd=str(self.root)
+        )
+        self.store.upsert_session(session)
+        tmux = Mock()
+        tmux.list_panes.return_value = []
+        pika = Pika(self.store, tmux, {"opencode": provider})
+        pika.refresh()
+        self.assertIsNotNone(self.store.get_session(*session.key))
 
     def test_universal_entry_tags_live_untagged_codex_pane(self) -> None:
         self.pane.pika_launch_token = None

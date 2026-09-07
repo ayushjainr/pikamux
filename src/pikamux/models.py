@@ -79,7 +79,6 @@ class Session:
             self.unread
             and self.status
             in {
-                Status.READY.value,
                 Status.ERROR.value,
                 Status.OPEN_TWICE.value,
             }
@@ -160,6 +159,11 @@ class FleetSession:
     seen_at: float = 0.0
     card_status: str | None = None
     card_detail: str | None = None
+    watched: bool = True
+    availability: str | None = None
+    scope_updated_at: float | None = None
+    current_state_updated_at: float | None = None
+    current_state_status: str | None = None
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -207,6 +211,11 @@ class FleetSession:
             "seen_at": self.seen_at,
             "card_status": self.card_status,
             "card_detail": self.card_detail,
+            "watched": self.watched,
+            "availability": self.availability,
+            "scope_updated_at": self.scope_updated_at,
+            "current_state_updated_at": self.current_state_updated_at,
+            "current_state_status": self.current_state_status,
             "session": self.session.to_dict(),
         }
 
@@ -231,6 +240,25 @@ class Candidate:
     @property
     def display_name(self) -> str:
         return self.name or f"{self.provider}-{self.session_id[:8]}"
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityEvent:
+    event_id: int
+    provider: str
+    session_id: str
+    name: str | None
+    status: str
+    attention_reason: str | None
+    error: str | None
+    event_at: float
+
+    @property
+    def display_name(self) -> str:
+        return self.name or f"{self.provider}-{self.session_id[:8]}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -357,6 +385,10 @@ class ExpertProfile:
     transcript_mtime_ns: int | None = None
     transcript_size: int | None = None
     current_state: str = ""
+    scope_updated_at: float = 0.0
+    current_state_updated_at: float = 0.0
+    current_state_mtime_ns: int | None = None
+    current_state_size: int | None = None
 
     @property
     def key(self) -> tuple[str, str]:

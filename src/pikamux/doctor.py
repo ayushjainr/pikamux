@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import stat
 import time
 import uuid
@@ -9,11 +10,17 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import __version__
 from .core import Pika
-from .executables import configured_executable
+from .executables import configured_executable, provider_compatibility_error
 from .models import Status
 from .paths import config_path, database_path
-from .processes import process_start_time, provider_process, shared_provider_process
+from .processes import (
+    opencode_session_processes,
+    process_start_time,
+    provider_process,
+    shared_provider_process,
+)
 from .setup_hooks import codex_hooks_enabled, hook_spec_fingerprint, hooks_installed
 from .store import LIVE_OWNER_LEASE_SECONDS, load_config
 
@@ -114,16 +121,26 @@ def run_doctor(
         version = provider.version()
         executable = configured_executable(name, config=config)
         required = name in required_providers
+        compatibility_error = provider_compatibility_error(name, version)
+        if required:
+            provider_level = "error" if not version or compatibility_error else "ok"
+            provider_message = (
+                compatibility_error
+                or (f"{version} · {executable}" if version else None)
+                or f"{name} is not on PATH"
+            )
+        else:
+            provider_level = "ok"
+            provider_message = (
+                f"{version} · {executable} · not currently required"
+                if version and not compatibility_error
+                else f"{name} is optional and not currently required"
+            )
         checks.append(
             Check(
                 name,
-                "ok" if version or not required else "error",
-                (f"{version} · {executable}" if version else None)
-                or (
-                    f"{name} is not on PATH"
-                    if required
-                    else f"{name} is not installed (not currently required)"
-                ),
+                provider_level,
+                provider_message,
             )
         )
         installed = hooks_installed(name)
@@ -197,6 +214,11 @@ def run_doctor(
     duplicate_ids: list[str] = []
     seen: set[tuple[str, str]] = set()
     panes = pika.tmux.list_panes()
+    opencode_processes = (
+        opencode_session_processes()
+        if any(session.provider == "opencode" for session in sessions)
+        else {}
+    )
     for session in sessions:
         if pika.store.get_meta(
             f"native_name_error:{session.provider}:{session.session_id}"
@@ -210,20 +232,21 @@ def run_doctor(
         ):
             unbound += 1
         else:
-            valid_id = True
-            try:
-                parsed_id = uuid.UUID(session.session_id)
-                if str(parsed_id) != session.session_id.lower():
-                    raise ValueError
-            except (ValueError, AttributeError):
-                valid_id = False
+            provider = pika.providers.get(session.provider)
+            validator = getattr(provider, "valid_session_id", None)
+            valid_id = bool(validator and validator(session.session_id))
+            if not valid_id:
                 invalid_session_ids.append(f"{session.provider}:{session.session_id}")
             exact_live_pane = any(
                 (pane.pika_provider, pane.pika_session_id) == session.key
-                and pika.exact_pane_pid(session, pane)
+                and pika.exact_pane_pid(
+                    session,
+                    pane,
+                    panes=panes,
+                    opencode_processes=opencode_processes,
+                )
                 for pane in panes
             )
-            provider = pika.providers.get(session.provider)
             resumable = bool(exact_live_pane)
             if provider and not resumable and valid_id:
                 try:
@@ -261,16 +284,21 @@ def run_doctor(
     ]
     mismatched_panes: list[str] = []
     for pane in panes:
-        if pane.pika_provider not in {"codex", "claude"} or not pane.pika_session_id:
+        if pane.pika_provider not in pika.providers or not pane.pika_session_id:
             continue
         expected = provider_process(pane.pane_pid, pane.pika_provider)
-        other_provider = "claude" if pane.pika_provider == "codex" else "codex"
-        other = provider_process(pane.pane_pid, other_provider)
-        if not expected and other:
-            mismatched_panes.append(
-                f"{pane.session_name}:{pane.pane_id} is tagged {pane.pika_provider} "
-                f"but contains {other_provider} PID {other}"
-            )
+        if expected:
+            continue
+        for other_provider in pika.providers:
+            if other_provider == pane.pika_provider:
+                continue
+            other = provider_process(pane.pane_pid, other_provider)
+            if other:
+                mismatched_panes.append(
+                    f"{pane.session_name}:{pane.pane_id} is tagged {pane.pika_provider} "
+                    f"but contains {other_provider} PID {other}"
+                )
+                break
     duplicate_processes: list[str] = []
     outside_tracked_processes: list[str] = []
     for session in sessions:
@@ -293,7 +321,7 @@ def run_doctor(
                         mismatched_panes.append(
                             f"{pane.session_name}:{pane.pane_id} is tagged "
                             f"{session.provider}:{session.session_id} but PID {pid} "
-                            "has no independent exact-UUID evidence"
+                            "has no independent exact-identity evidence"
                         )
         outside = active - pane_active
         if outside:
@@ -353,7 +381,7 @@ def run_doctor(
         if mismatched_panes:
             messages.append("mismatched tmux homes: " + "; ".join(mismatched_panes))
         if invalid_session_ids:
-            messages.append("invalid provider UUIDs: " + ", ".join(invalid_session_ids))
+            messages.append("invalid provider identities: " + ", ".join(invalid_session_ids))
         if non_resumable:
             messages.append(
                 "missing durable provider history: " + ", ".join(non_resumable)
@@ -401,7 +429,7 @@ def run_doctor(
     else:
         checks.append(
             Check(
-                "identity", "ok", "all tracked conversations have exact provider UUIDs"
+                "identity", "ok", "all tracked conversations have exact provider identities"
             )
         )
     if missing_cwd:
@@ -426,6 +454,25 @@ def run_doctor(
             )
         )
     safe = not any(check.level != "ok" for check in checks)
+    ambiguity_count = sum(
+        len(values)
+        for values in (
+            identity_duplicates,
+            mismatched_panes,
+            hidden_live_owners,
+            outside_tracked_processes,
+        )
+    )
+    verified_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    passport = {
+        "status": "PIKA VERIFIED" if safe else "PIKA NOT VERIFIED",
+        "providers": len(required_providers),
+        "recoverable": recoverable,
+        "ambiguous": ambiguity_count,
+        "platform": platform.system() or "Unknown",
+        "pikamux_version": __version__,
+        "verified_at": verified_at,
+    }
     if as_json:
         print(
             json.dumps(
@@ -433,6 +480,7 @@ def run_doctor(
                     "safe_to_disconnect": safe,
                     "recoverable_sessions": recoverable,
                     "tracked_sessions": len(sessions),
+                    "recovery_passport": passport,
                     "repairs": repairs or [],
                     "checks": [asdict(check) for check in checks],
                 },
@@ -452,7 +500,6 @@ def run_doctor(
             session.status == Status.NEEDS_YOU.value for session in sessions
         )
         parked = sum(session.status == Status.PARKED.value for session in sessions)
-        verified_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         if sessions:
             print(
                 f"Recovery verified · {recoverable}/{len(sessions)} exact "
@@ -467,6 +514,15 @@ def run_doctor(
         print("Safe to disconnect this terminal. Keep the tmux server running.")
         if os.environ.get("TMUX"):
             print("Detach with Ctrl-b d.")
+        provider_word = "provider" if len(required_providers) == 1 else "providers"
+        print("\nCopy-safe recovery passport")
+        print(
+            f"PIKA VERIFIED · {len(required_providers)} {provider_word} · "
+            f"{recoverable} recoverable · 0 ambiguous"
+        )
+        print(
+            f"{passport['platform']} · pikamux {__version__} · {verified_at}"
+        )
     else:
         print(
             "Pika found recovery risks above. Resolve them before relying on terminal disconnects."

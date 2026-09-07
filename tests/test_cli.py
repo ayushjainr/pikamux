@@ -9,18 +9,24 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from pikamux.cli import (
+    _activity,
     _bare,
+    _confirm_outside_live,
     _confirm_shared_lease,
+    _expert,
     _normalize_argv,
     _parser,
     _peek,
     _peek_popup,
+    _offer_recovery_rehearsal,
     _setup,
+    _setup_coverage,
     _wait,
     run,
 )
-from pikamux.core import PikaError, SharedLeaseConflict
-from pikamux.models import Candidate, Pane, Session, Status
+from pikamux.core import OutsideLiveConflict, PikaError, SharedLeaseConflict
+from pikamux.experts import ExpertCardState
+from pikamux.models import ActivityEvent, Candidate, Pane, Session, Status
 from pikamux.setup_hooks import hook_spec_fingerprint
 from pikamux.tmux import TmuxError
 
@@ -93,6 +99,45 @@ class PeekPika:
 
 
 class CliTests(unittest.TestCase):
+    def test_activity_is_transcript_free_and_reconciles_first(self) -> None:
+        pika = Mock()
+        pika.store.list_activity_events.return_value = [
+            ActivityEvent(
+                1,
+                "codex",
+                "thread-id",
+                "returns_tracker",
+                Status.READY.value,
+                "completed",
+                None,
+                100.0,
+            )
+        ]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(_activity(pika, limit=5, as_json=False), 0)
+        pika.refresh.assert_called_once_with(usage=False)
+        pika.store.list_activity_events.assert_called_once_with(limit=5)
+        self.assertIn("returns_tracker", output.getvalue())
+        self.assertIn("transcript-free", output.getvalue())
+
+    def test_expert_status_renders_a_populated_opencode_inventory(self) -> None:
+        pika = Mock()
+        pika.expert_card_states.return_value = [
+            ExpertCardState(
+                Session("opencode", "ses_exact123", name="oc-review"),
+                None,
+                "MISSING",
+                "not interviewed",
+            )
+        ]
+        args = argparse.Namespace(expert_command="status", json=False)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(_expert(pika, args), 0)
+        self.assertIn("MISSING  · OpenCode", output.getvalue())
+        self.assertIn("oc-review", output.getvalue())
+
     def test_ask_fast_selects_the_benchmarked_fast_profile(self) -> None:
         args = _parser().parse_args(["ask", "expert", "why", "--fast"])
         self.assertTrue(args.fast)
@@ -143,6 +188,62 @@ class CliTests(unittest.TestCase):
         self.assertIn("may still be open in another Codex client", error.getvalue())
         self.assertNotIn("run exactly", error.getvalue())
 
+    def test_outside_live_choice_offers_safe_default_and_exact_location(self) -> None:
+        session = Session("claude", "uuid", name="sample plugin")
+        conflict = OutsideLiveConflict(
+            "outside live", session, ((2997494, 4242),)
+        )
+        pika = Mock()
+        fake_stdin = Mock()
+        fake_stdin.isatty.return_value = True
+        with (
+            patch("pikamux.cli.sys.stdin", fake_stdin),
+            patch("pikamux.cli.process_tty", return_value="/dev/pts/39"),
+            patch("builtins.input", return_value=""),
+            redirect_stderr(io.StringIO()) as error,
+        ):
+            self.assertEqual(_confirm_outside_live(pika, conflict), 1)
+        rendered = error.getvalue()
+        self.assertIn("PID 2997494", rendered)
+        self.assertIn("/dev/pts/39", rendered)
+        self.assertIn("Keep it there (recommended)", rendered)
+        self.assertIn("Clean and attach here", rendered)
+        self.assertIn("`pika 'sample plugin'`", rendered)
+        pika.clean_and_attach.assert_not_called()
+
+    def test_outside_live_clean_choice_stops_then_attaches_in_one_flow(self) -> None:
+        session = Session("claude", "uuid", name="sample_plugin")
+        conflict = OutsideLiveConflict(
+            "outside live", session, ((2997494, 4242),)
+        )
+        pika = Mock()
+        pika.clean_and_attach.return_value = 23
+        fake_stdin = Mock()
+        fake_stdin.isatty.return_value = True
+        with (
+            patch("pikamux.cli.sys.stdin", fake_stdin),
+            patch("builtins.input", return_value="2"),
+            redirect_stderr(io.StringIO()) as error,
+        ):
+            self.assertEqual(_confirm_outside_live(pika, conflict), 23)
+        pika.clean_and_attach.assert_called_once_with(conflict)
+        self.assertIn("will not force-kill", error.getvalue())
+
+    def test_outside_live_noninteractive_call_never_sends_a_signal(self) -> None:
+        session = Session("claude", "uuid", name="sample_plugin")
+        conflict = OutsideLiveConflict(
+            "outside live", session, ((2997494, 4242),)
+        )
+        pika = Mock()
+        fake_stdin = Mock()
+        fake_stdin.isatty.return_value = False
+        with (
+            patch("pikamux.cli.sys.stdin", fake_stdin),
+            self.assertRaisesRegex(PikaError, "Interactive choice is required"),
+        ):
+            _confirm_outside_live(pika, conflict)
+        pika.clean_and_attach.assert_not_called()
+
     def test_shared_lease_decline_changes_nothing_and_repeats_same_command(self) -> None:
         session = Session("codex", "uuid", name="master pika")
         conflict = SharedLeaseConflict("shared lease", session)
@@ -159,7 +260,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("`pika 'master pika'`", error.getvalue())
 
     def test_shared_lease_noninteractive_call_stays_fail_closed(self) -> None:
-        session = Session("codex", "uuid", name="master_pika")
+        session = Session("codex", "uuid", name="pika-dev")
         conflict = SharedLeaseConflict("shared lease", session)
         fake_stdin = Mock()
         fake_stdin.isatty.return_value = False
@@ -170,7 +271,7 @@ class CliTests(unittest.TestCase):
             _confirm_shared_lease(Mock(), conflict)
 
     def test_one_name_entry_routes_ambiguous_lease_to_confirmation(self) -> None:
-        session = Session("codex", "uuid", name="master_pika")
+        session = Session("codex", "uuid", name="pika-dev")
         conflict = SharedLeaseConflict("shared lease", session)
         pika = Mock()
         pika.enter.side_effect = conflict
@@ -178,12 +279,27 @@ class CliTests(unittest.TestCase):
             patch("pikamux.cli.Pika", return_value=pika),
             patch("pikamux.cli._confirm_shared_lease", return_value=23) as confirm,
         ):
-            self.assertEqual(run(["master_pika"]), 23)
-        pika.enter.assert_called_once_with("master_pika")
+            self.assertEqual(run(["pika-dev"]), 23)
+        pika.enter.assert_called_once_with("pika-dev")
+        confirm.assert_called_once_with(pika, conflict)
+
+    def test_one_name_entry_routes_outside_live_to_takeover_choice(self) -> None:
+        session = Session("claude", "uuid", name="sample_plugin")
+        conflict = OutsideLiveConflict(
+            "outside live", session, ((2997494, 4242),)
+        )
+        pika = Mock()
+        pika.enter.side_effect = conflict
+        with (
+            patch("pikamux.cli.Pika", return_value=pika),
+            patch("pikamux.cli._confirm_outside_live", return_value=31) as confirm,
+        ):
+            self.assertEqual(run(["sample_plugin"]), 31)
+        pika.enter.assert_called_once_with("sample_plugin")
         confirm.assert_called_once_with(pika, conflict)
 
     def test_remote_exact_open_routes_ambiguous_lease_to_confirmation(self) -> None:
-        session = Session("codex", "uuid", name="master_remote")
+        session = Session("codex", "uuid", name="remote-notes")
         conflict = SharedLeaseConflict("shared lease", session)
         pika = Mock()
         pika.store.local_node_id.return_value = "node-1"
@@ -212,20 +328,20 @@ class CliTests(unittest.TestCase):
         confirm.assert_called_once_with(pika, conflict)
 
     def test_legacy_recovery_receipt_remains_a_hidden_safe_alias(self) -> None:
-        session = Session("codex", "uuid", name="master_pika")
+        session = Session("codex", "uuid", name="pika-dev")
         conflict = SharedLeaseConflict("shared lease", session)
         pika = Mock()
         pika.resolve.return_value = session
         pika.open.side_effect = conflict
         self.assertEqual(
-            _normalize_argv(["recover-closed", "master_pika"]),
-            ["recover-closed", "master_pika"],
+            _normalize_argv(["recover-closed", "pika-dev"]),
+            ["recover-closed", "pika-dev"],
         )
         with (
             patch("pikamux.cli.Pika", return_value=pika),
             patch("pikamux.cli._confirm_shared_lease", return_value=31) as confirm,
         ):
-            self.assertEqual(run(["recover-closed", "master_pika"]), 31)
+            self.assertEqual(run(["recover-closed", "pika-dev"]), 31)
         pika.open.assert_called_once_with(session)
         confirm.assert_called_once_with(pika, conflict)
 
@@ -291,7 +407,8 @@ class CliTests(unittest.TestCase):
 
     def test_peek_popup_sanitizes_name(self) -> None:
         pika = Mock()
-        pika.tmux.capture.return_value = "pane output"
+        pika.capture.return_value = "pane output"
+        pika.store.get_session.return_value = Session("codex", "uuid", tmux_pane="%1")
         args = argparse.Namespace(
             target="%1",
             lines=20,
@@ -310,10 +427,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("peek�[2J�renamed", rendered)
 
     def test_peek_popup_enter_routes_ambiguous_lease_to_confirmation(self) -> None:
-        session = Session("codex", "uuid", name="peeked")
+        session = Session("codex", "uuid", name="peeked", tmux_pane="%1")
         conflict = SharedLeaseConflict("shared lease", session)
         pika = Mock()
-        pika.tmux.capture.return_value = "pane output"
+        pika.capture.return_value = "pane output"
         pika.store.get_session.return_value = session
         pika.open.side_effect = conflict
         args = argparse.Namespace(
@@ -396,9 +513,11 @@ class CliTests(unittest.TestCase):
         self.assertIn("existing settings retained", rendered)
         self.assertIn("Default for new conversations: Codex", rendered)
         self.assertIn("Commissioning status", rendered)
-        self.assertIn("Pika not yet commissioned", rendered)
-        self.assertIn("Codex observation", rendered)
-        self.assertIn("Claude observation", rendered)
+        self.assertIn("One required proof remains", rendered)
+        self.assertIn("Codex", rendered)
+        self.assertIn("observed ○", rendered)
+        self.assertIn("Claude", rendered)
+        self.assertIn("optional", rendered)
 
     def test_setup_never_claims_commissioned_from_stale_observation(self) -> None:
         class MetaStore:
@@ -436,11 +555,11 @@ class CliTests(unittest.TestCase):
         ):
             self.assertEqual(_setup(pika, args), 0)
         rendered = output.getvalue()
-        self.assertIn("Pika not yet commissioned", rendered)
-        self.assertIn("Claude activation", rendered)
+        self.assertIn("One required proof remains", rendered)
+        self.assertIn("Claude", rendered)
         self.assertNotIn("Pika commissioned ·", rendered)
 
-    def test_setup_never_commissions_with_nondefault_provider_missing(self) -> None:
+    def test_setup_commissions_when_only_optional_provider_is_missing(self) -> None:
         class MetaStore:
             @staticmethod
             def list_sessions():
@@ -493,8 +612,59 @@ class CliTests(unittest.TestCase):
         ):
             self.assertEqual(_setup(pika, args), 0)
         rendered = output.getvalue()
-        self.assertIn("Claude executable", rendered)
-        self.assertNotIn("Pika commissioned ·", rendered)
+        self.assertIn("Claude", rendered)
+        self.assertIn("optional", rendered)
+        self.assertIn("Pika commissioned ·", rendered)
+
+    def test_setup_requires_a_provider_with_tracked_conversations(self) -> None:
+        store = Mock()
+        store.list_sessions.return_value = [
+            Session("opencode", "ses_tracked123", name="tracked")
+        ]
+        store.untracked_session_keys.return_value = set()
+        store.list_pending.return_value = []
+        store.get_meta.return_value = None
+        store.get_hook_observation.side_effect = lambda provider: (
+            {
+                "fingerprint": hook_spec_fingerprint(provider),
+                "event_name": "SessionStart",
+                "session_id": f"{provider}-id",
+                "observed_at": time.time(),
+            }
+            if provider == "codex"
+            else None
+        )
+        pika = Mock(store=store)
+        args = argparse.Namespace(
+            no_import=True,
+            dry_run=False,
+            import_all=False,
+            yes=True,
+            default_provider="codex",
+        )
+        output = io.StringIO()
+        with (
+            patch(
+                "pikamux.cli.setup_executables",
+                return_value={"codex": "/bin/codex", "claude": None, "opencode": None},
+            ),
+            patch(
+                "pikamux.cli.executable_available",
+                side_effect=lambda value: value == "/bin/codex",
+            ),
+            patch(
+                "pikamux.cli.executable_version",
+                side_effect=lambda value: "test" if value else None,
+            ),
+            patch("pikamux.cli.proposed_changes", return_value=[]),
+            patch("pikamux.cli.hooks_installed", return_value=True),
+            patch("pikamux.cli.load_config", return_value={}),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_setup(pika, args), 0)
+        rendered = output.getvalue()
+        self.assertIn("OpenCode executable/version proof", rendered)
+        self.assertIn("Pika not yet commissioned", rendered)
 
     def test_setup_reports_overdue_pending_launch_as_degraded(self) -> None:
         class MetaStore:
@@ -581,7 +751,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(_setup(pika, args), 0)
         activate.assert_called_once_with()
 
-    def test_setup_one_proof_copy_requires_claude_fully_commissioned(self) -> None:
+    def test_setup_one_proof_copy_ignores_optional_claude(self) -> None:
         class MetaStore:
             @staticmethod
             def list_sessions():
@@ -616,10 +786,9 @@ class CliTests(unittest.TestCase):
         ):
             self.assertEqual(_setup(pika, args), 0)
         rendered = output.getvalue()
-        self.assertNotIn("One required proof remains", rendered)
-        self.assertIn("Codex observation", rendered)
-        self.assertIn("Claude activation", rendered)
-        self.assertIn("Claude observation", rendered)
+        self.assertIn("One required proof remains", rendered)
+        self.assertNotIn("Claude activation", rendered)
+        self.assertNotIn("Claude observation", rendered)
 
     def test_setup_imports_without_interviewing_tracked_agents(self) -> None:
         candidate = Candidate(
@@ -689,7 +858,7 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("before → after", output.getvalue())
 
     def test_setup_respects_explicitly_untracked_conversations(self) -> None:
-        candidate = Candidate("claude", "ignored-id", "qes_plugin")
+        candidate = Candidate("claude", "ignored-id", "sample_plugin")
         store = Mock()
         store.list_sessions.return_value = []
         store.untracked_session_keys.return_value = {
@@ -717,20 +886,20 @@ class CliTests(unittest.TestCase):
 
         pika.import_candidate.assert_not_called()
         self.assertIn("explicitly untracked", output.getvalue())
-        self.assertIn("qes_plugin", output.getvalue())
+        self.assertIn("sample_plugin", output.getvalue())
 
     def test_setup_does_not_reoffer_active_codex_continuation(self) -> None:
         child_id = "22222222-2222-4222-8222-222222222222"
         tracked = Session(
             "codex",
             "11111111-1111-4111-8111-111111111111",
-            name="master_quant",
+            name="research-notes",
             active_thread_id=child_id,
         )
         candidate = Candidate(
             "codex",
             child_id,
-            "master_quant",
+            "research-notes",
             parent_session_id=tracked.session_id,
         )
         store = Mock()
@@ -756,6 +925,109 @@ class CliTests(unittest.TestCase):
             self.assertEqual(_setup(pika, args), 0)
 
         pika.import_candidate.assert_not_called()
+
+
+    def test_setup_coverage_leads_with_protection_and_explicit_exclusions(
+        self,
+    ) -> None:
+        exact = Session(
+            "codex",
+            "11111111-1111-4111-8111-111111111111",
+            name="research",
+            status=Status.PARKED.value,
+        )
+        unbound = Session(
+            "claude",
+            "unbound:%7",
+            name="outside",
+            status=Status.UNBOUND.value,
+            live=True,
+        )
+        store = Mock()
+        store.list_sessions.return_value = [exact, unbound]
+        store.list_fleet_nodes.return_value = [object()]
+        provider = Mock()
+        provider.hidden_session_ids.return_value = {"archived-a", "archived-b"}
+        pika = Mock(store=store)
+        pika.providers = {"codex": provider}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            sessions = _setup_coverage(
+                pika,
+                untracked_keys={
+                    ("claude", "22222222-2222-4222-8222-222222222222")
+                },
+            )
+        rendered = output.getvalue()
+        self.assertEqual(sessions, [exact, unbound])
+        self.assertIn("YOUR PIKA COVERAGE", rendered)
+        self.assertIn("1 exact conversation under Pika", rendered)
+        self.assertIn("1 conversation needs action now", rendered)
+        self.assertIn("2 machines", rendered)
+        self.assertIn("2 archived", rendered)
+        self.assertIn("1 explicitly untracked", rendered)
+        self.assertIn("automation workers filtered by provenance", rendered)
+
+    def test_setup_recovery_rehearsal_proves_same_uuid_without_prompting(
+        self,
+    ) -> None:
+        session_id = "11111111-1111-4111-8111-111111111111"
+        session = Session(
+            "codex",
+            session_id,
+            name="research",
+            cwd="/tmp",
+            status=Status.PARKED.value,
+        )
+        refreshed = Session(
+            "codex",
+            session_id,
+            name="research",
+            cwd="/tmp",
+            status=Status.WORKING.value,
+            live=True,
+            home_state="exact-live",
+        )
+        home = Pane(
+            "pika-c-111",
+            "%1",
+            123,
+            "/tmp",
+            "codex",
+            False,
+            False,
+            None,
+            time.time(),
+            time.time(),
+            pika_provider="codex",
+            pika_session_id=session_id,
+        )
+        pika = Mock()
+        pika.providers = {"codex": object()}
+        pika.open.return_value = 0
+        pika.refresh.return_value = [refreshed]
+        pika.tmux.list_panes.return_value = [home]
+        pika.exact_pane_pid.return_value = 123
+        output = io.StringIO()
+        with (
+            patch("pikamux.cli.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", return_value="y"),
+            patch.dict("os.environ", {"TMUX": ""}, clear=False),
+            redirect_stdout(output),
+        ):
+            _offer_recovery_rehearsal(
+                pika,
+                [session],
+                commissioned=True,
+                automatic=False,
+            )
+        rendered = output.getvalue()
+        pika.open.assert_called_once_with(session)
+        pika.refresh.assert_called_once_with(usage=False)
+        self.assertIn("without sending a prompt", rendered)
+        self.assertIn("CONTINUITY PROVEN", rendered)
+        self.assertIn("same exact Codex conversation", rendered)
+        self.assertIn("id 11111111", rendered)
 
 
 if __name__ == "__main__":

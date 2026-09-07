@@ -39,8 +39,8 @@ class ClientBridgeTests(unittest.TestCase):
             "client_id": self.client_id,
             "nodes": {
                 self.source_id: {
-                    "alias": "rstudio-6",
-                    "ssh_target": "rstudio-6",
+                    "alias": "devbox",
+                    "ssh_target": "devbox",
                     "token": self.source_token,
                 },
                 self.target_id: {
@@ -65,7 +65,7 @@ class ClientBridgeTests(unittest.TestCase):
         return make_launch_request(**values)
 
     def test_command_uses_only_paired_node_and_exact_identity(self) -> None:
-        node = ClientNode(self.target_id, "gpu-box", "ajain@gpu-box", "cd" * 32)
+        node = ClientNode(self.target_id, "gpu-box", "developer@gpu-box", "cd" * 32)
         command = windows_terminal_command(
             node,
             provider="claude",
@@ -74,12 +74,29 @@ class ClientBridgeTests(unittest.TestCase):
         self.assertEqual(command[:4], ["wt.exe", "-w", "new", "new-tab"])
         self.assertIn("ssh.exe", command)
         self.assertIn("ClearAllForwardings=yes", command)
-        self.assertIn("ajain@gpu-box", command)
+        self.assertIn("developer@gpu-box", command)
         self.assertIn("_fleet-open", command)
         self.assertIn(self.target_id, command)
         self.assertIn(self.session_id, command)
         self.assertNotIn("--continue", command)
         self.assertNotIn("--last", command)
+
+        opencode_id = "ses_fdd613642ffeZLuODNNxjAL3h7"
+        opencode = windows_terminal_command(
+            node,
+            provider="opencode",
+            session_id=opencode_id,
+        )
+        self.assertIn("opencode", opencode)
+        self.assertIn(opencode_id, opencode)
+
+    def test_opencode_native_identity_survives_bridge_validation(self) -> None:
+        session_id = "ses_fdd613642ffeZLuODNNxjAL3h7"
+        request = self.request(provider="opencode", session_id=session_id)
+        self.assertEqual(request["provider"], "opencode")
+        self.assertEqual(request["session_id"], session_id)
+        with self.assertRaisesRegex(ClientBridgeError, "conversation identity"):
+            self.request(provider="opencode", session_id="ses_../../bad")
 
     def test_untrusted_command_text_and_non_uuid_identity_are_rejected(self) -> None:
         with self.assertRaisesRegex(ClientBridgeError, "conversation identity"):
@@ -239,13 +256,13 @@ class ClientBridgeTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         target = Path(temp.name) / "client.json"
         args = argparse.Namespace(
-            ssh_target="rstudio-6",
+            ssh_target="devbox",
             alias=None,
             ssh_executable="ssh.exe",
             remote_port=49000,
             no_start=True,
         )
-        hello = {"node_id": self.source_id, "machine": "rstudio-6"}
+        hello = {"node_id": self.source_id, "machine": "devbox"}
 
         def paired(_target, _arguments, payload, **_kwargs):
             return {
@@ -269,7 +286,7 @@ class ClientBridgeTests(unittest.TestCase):
         ):
             self.assertEqual(_pair(args), 0)
         saved = writer.call_args.args[0]
-        self.assertEqual(saved["nodes"][self.source_id]["ssh_target"], "rstudio-6")
+        self.assertEqual(saved["nodes"][self.source_id]["ssh_target"], "devbox")
         self.assertEqual(len(saved["nodes"][self.source_id]["token"]), 64)
 
 

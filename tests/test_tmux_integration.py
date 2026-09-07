@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import pty
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -15,9 +17,14 @@ from unittest.mock import patch
 from pikamux.core import Pika
 from pikamux.hooks import handle_hook
 from pikamux.models import Candidate, Session
-from pikamux.processes import find_processes_with_session_id, provider_process
+from pikamux.processes import (
+    cmdline,
+    find_processes_with_session_id,
+    process_tree,
+    provider_process,
+)
 from pikamux.store import Store
-from pikamux.tmux import Tmux
+from pikamux.tmux import Tmux, WINDOWS_TERMINAL_DA2_RESPONSE
 
 
 class FakeProvider:
@@ -64,7 +71,7 @@ class TmuxIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.socket = "pika-test-" + uuid.uuid4().hex[:10]
         self.tmux = Tmux(self.socket)
-        self.temp = tempfile.TemporaryDirectory(dir="/mnt/ebs1/ajain")
+        self.temp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.temp.name) / "pika.db")
 
     def tearDown(self) -> None:
@@ -80,6 +87,24 @@ class TmuxIntegrationTests(unittest.TestCase):
                 return pid
             time.sleep(0.05)
         return None
+
+    def wait_for_stably_idle_pane(
+        self, pika: Pika, pane_id: str, *, timeout: float = 15
+    ):
+        """Ignore transient shell-only gaps while a login profile is running."""
+        deadline = time.monotonic() + timeout
+        idle_since = None
+        current = None
+        while time.monotonic() < deadline:
+            current = self.tmux.get_pane(pane_id)
+            if current and pika._pane_is_idle(current):
+                idle_since = idle_since or time.monotonic()
+                if time.monotonic() - idle_since >= 0.5:
+                    return current
+            else:
+                idle_since = None
+            time.sleep(0.05)
+        return current
 
     def test_create_tag_capture_and_detect_process(self) -> None:
         pane = self.tmux.create_agent_session(
@@ -134,7 +159,7 @@ class TmuxIntegrationTests(unittest.TestCase):
             display_name="deep-history",
             launch_token=None,
         )
-        deadline = time.time() + 3
+        deadline = time.time() + 10
         output = ""
         while time.time() < deadline:
             output = self.tmux.capture(pane.pane_id, 100)
@@ -233,6 +258,102 @@ os.write(1, b"PALETTE_REPLIES=" + data.hex().encode() + b"\\n")
             time.sleep(0.05)
         self.assertIn(f"PALETTE_REPLIES={expected}", output)
 
+    def test_windows_terminal_da2_reply_never_becomes_pika_input(self) -> None:
+        child = """
+import os
+import time
+import tty
+
+tty.setraw(0)
+data = b""
+while b"after" not in data:
+    data += os.read(0, 1024)
+os.write(1, b"GOT=" + data.hex().encode() + b"\\n")
+time.sleep(2)
+"""
+        self.tmux.run("new-session", "-d", "-s", "seed", "sleep 20")
+        self.assertTrue(self.tmux.ensure_pika_terminal_reply_guard())
+
+        def observed_input(
+            session_name: str, *, pika_tagged: bool, through_pika: bool
+        ) -> bytes:
+            command = f"{sys.executable} -u -c {shlex.quote(child)}"
+            self.tmux.run("new-session", "-d", "-s", session_name, command)
+            pane = self.tmux.get_pane(session_name)
+            self.assertIsNotNone(pane)
+            assert pane is not None
+            if pika_tagged:
+                self.tmux.tag_pane(
+                    pane.pane_id,
+                    provider="codex",
+                    session_id="terminal-reply-probe",
+                    name="terminal-reply-probe",
+                )
+
+            master_fd, slave_fd = pty.openpty()
+            attach_command = self.tmux.command("attach-session", "-t", session_name)
+            if through_pika:
+                helper = (
+                    "from pikamux.tmux import Tmux; "
+                    f"raise SystemExit(Tmux({self.socket!r}).attach({session_name!r}))"
+                )
+                attach_command = [sys.executable, "-c", helper]
+            process = subprocess.Popen(
+                attach_command,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env={**os.environ, "TERM": "xterm-256color"},
+                close_fds=True,
+            )
+            os.close(slave_fd)
+            try:
+                # Let tmux's own capability-request window expire. The bytes
+                # below must therefore travel through the root key table, just
+                # like a late Windows OpenSSH response that caused the bug.
+                time.sleep(3.5)
+                os.write(master_fd, b"before")
+                response = WINDOWS_TERMINAL_DA2_RESPONSE.encode()
+                os.write(master_fd, response[:3])
+                time.sleep(0.02)
+                os.write(master_fd, response[3:] + b"after")
+
+                deadline = time.time() + 2
+                output = ""
+                while time.time() < deadline:
+                    output = self.tmux.capture(pane.pane_id, 20)
+                    if "GOT=" in output:
+                        break
+                    time.sleep(0.05)
+                got = next(
+                    line.removeprefix("GOT=")
+                    for line in output.splitlines()
+                    if line.startswith("GOT=")
+                )
+                return bytes.fromhex(got)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=1)
+                os.close(master_fd)
+
+        self.assertEqual(
+            observed_input(
+                "pika-c-terminal-reply", pika_tagged=True, through_pika=True
+            ),
+            b"beforeafter",
+        )
+        self.assertEqual(
+            observed_input(
+                "user-terminal-reply", pika_tagged=False, through_pika=False
+            ),
+            b"before" + WINDOWS_TERMINAL_DA2_RESPONSE.encode() + b"after",
+        )
+
     def test_exact_pane_target_selects_its_window_in_multi_window_home(self) -> None:
         exact = self.tmux.create_agent_session(
             tmux_name="pika-c-multi-window",
@@ -315,14 +436,15 @@ os.write(1, b"PALETTE_REPLIES=" + data.hex().encode() + b"\\n")
             time.sleep(0.05)
         self.assertIsNone(provider_process(pane.pane_pid, "codex"))
 
-        deadline = time.time() + 6
-        current = None
-        while time.time() < deadline:
-            current = self.tmux.get_pane(pane.pane_id)
-            if current and pika._pane_is_idle(current):
-                break
-            time.sleep(0.05)
-        self.assertTrue(current and pika._pane_is_idle(current))
+        # Login-shell initialization can be slower under the full suite (for
+        # example while nvm resolves its Node path). Wait for a truly idle pane
+        # instead of weakening Pika's live-job safety classification.
+        current = self.wait_for_stably_idle_pane(pika, pane.pane_id)
+        tree = process_tree(current.pane_pid) if current else []
+        self.assertTrue(
+            current and pika._pane_is_idle(current),
+            f"pane={current!r}; process_tree={[(pid, cmdline(pid)) for pid in tree]!r}",
+        )
 
         self.assertEqual(
             pika.open(self.store.get_session("codex", session_id), attach=False), 0
@@ -362,12 +484,7 @@ os.write(1, b"PALETTE_REPLIES=" + data.hex().encode() + b"\\n")
         assert live_pid is not None
         os.kill(live_pid, signal.SIGTERM)
         pika = Pika(self.store, self.tmux, {"codex": FakeProvider("codex")})
-        deadline = time.time() + 3
-        while time.time() < deadline:
-            current = self.tmux.get_pane(old.pane_id)
-            if current and pika._pane_is_idle(current):
-                break
-            time.sleep(0.05)
+        current = self.wait_for_stably_idle_pane(pika, old.pane_id)
         self.tmux.run("send-keys", "-t", old.pane_id, "sleep 30", "Enter")
         deadline = time.time() + 3
         while time.time() < deadline:

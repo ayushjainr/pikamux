@@ -14,8 +14,10 @@ from pikamux.consult import (
     FAST_CODEX_MODEL,
     ClaudeConsultation,
     CodexConsultation,
+    OpenCodeConsultation,
     ConsultationError,
     ConsultationPolicy,
+    _opencode_ephemeral_environment,
     _version_tuple,
     consultation_for,
     consultation_policy,
@@ -46,9 +48,149 @@ class FakeProcess:
 
 
 class ConsultationTests(unittest.TestCase):
+    def test_opencode_side_agent_denies_every_non_read_tool(self) -> None:
+        config = json.loads(
+            _opencode_ephemeral_environment()["OPENCODE_CONFIG_CONTENT"]
+        )
+        agent = config["agent"]["pika-readonly"]
+        self.assertEqual(agent["mode"], "primary")
+        self.assertEqual(
+            agent["permission"],
+            {
+                "*": "deny",
+                "read": "allow",
+                "glob": "allow",
+                "grep": "allow",
+                "list": "allow",
+            },
+        )
+
     def test_version_parser(self) -> None:
         self.assertEqual(_version_tuple("2.1.228 (Claude Code)"), (2, 1, 228))
         self.assertEqual(_version_tuple("unknown"), ())
+
+    def test_opencode_uses_one_disposable_fork_for_multiple_turns(self) -> None:
+        first = FakeProcess([])
+        second = FakeProcess([])
+        deleted = Mock(returncode=0, stdout="", stderr="")
+        session = Session(
+            "opencode", "ses_parent123", cwd="/tmp",
+            model="opencode/x-preview-f-free[max]",
+        )
+        with (
+            patch("pikamux.consult.configured_executable", return_value="opencode"),
+            patch("pikamux.consult.executable_available", return_value=True),
+            patch("pikamux.consult.executable_version", return_value="1.18.21"),
+            patch("pikamux.consult.subprocess.Popen", side_effect=[first, second]) as popen,
+            patch("pikamux.consult.subprocess.run", return_value=deleted) as run,
+            patch.object(
+                OpenCodeConsultation,
+                "_fork_session",
+                return_value="ses_side123",
+            ) as fork,
+            patch.object(
+                OpenCodeConsultation,
+                "_completed_answer",
+                side_effect=["first", "second"],
+            ),
+            patch.object(OpenCodeConsultation, "_session_exists", return_value=False),
+        ):
+            consultation = OpenCodeConsultation(session)
+            self.assertEqual(consultation.ask("one"), "first")
+            self.assertEqual(consultation.ask("two"), "second")
+            consultation.close()
+        first_argv = popen.call_args_list[0].args[0]
+        second_argv = popen.call_args_list[1].args[0]
+        self.assertNotIn("--fork", first_argv)
+        self.assertIn("--pure", first_argv)
+        self.assertIn("pika-readonly", first_argv)
+        self.assertNotIn("--fork", second_argv)
+        self.assertEqual(first_argv[first_argv.index("--session") + 1], "ses_side123")
+        self.assertEqual(second_argv[second_argv.index("--session") + 1], "ses_side123")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["opencode", "--pure", "session", "delete", "ses_side123"],
+        )
+        fork.assert_called_once_with("opencode")
+
+    def test_opencode_fork_uses_authenticated_loopback_api_identity(self) -> None:
+        server = FakeProcess([])
+        session = Session("opencode", "ses_parent123", cwd="/tmp")
+        consultation = OpenCodeConsultation(session)
+        with (
+            patch.object(
+                OpenCodeConsultation, "_free_loopback_port", return_value=43210
+            ),
+            patch("pikamux.consult.secrets.token_urlsafe", return_value="secret"),
+            patch("pikamux.consult.subprocess.Popen", return_value=server) as popen,
+            patch.object(
+                OpenCodeConsultation,
+                "_api_json",
+                side_effect=[
+                    {"healthy": True},
+                    {
+                        "id": "ses_side123",
+                        "directory": "/tmp",
+                    },
+                ],
+            ) as api,
+        ):
+            self.assertEqual(
+                consultation._fork_session("opencode"), "ses_side123"
+            )
+        argv = popen.call_args.args[0]
+        self.assertEqual(
+            argv,
+            [
+                "opencode", "--pure", "serve", "--hostname", "127.0.0.1",
+                "--port", "43210",
+            ],
+        )
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(environment["OPENCODE_SERVER_USERNAME"], "opencode")
+        self.assertEqual(environment["OPENCODE_SERVER_PASSWORD"], "secret")
+        self.assertEqual(api.call_args_list[0].args[0], "http://127.0.0.1:43210/global/health")
+        fork_call = api.call_args_list[1]
+        self.assertEqual(
+            fork_call.args[0],
+            "http://127.0.0.1:43210/session/ses_parent123/fork?directory=%2Ftmp",
+        )
+        self.assertEqual(fork_call.kwargs["method"], "POST")
+        self.assertEqual(fork_call.kwargs["payload"], {})
+        self.assertTrue(server.terminated)
+
+    def test_opencode_consultation_refuses_uncertified_version_before_fork(self) -> None:
+        session = Session("opencode", "ses_parent123", cwd="/tmp")
+        consultation = OpenCodeConsultation(session)
+        with (
+            patch("pikamux.consult.configured_executable", return_value="opencode"),
+            patch("pikamux.consult.executable_available", return_value=True),
+            patch("pikamux.consult.executable_version", return_value="1.18.20"),
+            patch.object(OpenCodeConsultation, "_fork_session") as fork,
+            self.assertRaisesRegex(ConsultationError, "requires opencode >= 1.18.21"),
+        ):
+            consultation.ask("question")
+        fork.assert_not_called()
+
+    def test_opencode_fork_failure_never_guesses_or_deletes_identity(self) -> None:
+        session = Session("opencode", "ses_parent123", cwd="/tmp")
+        consultation = OpenCodeConsultation(session)
+        with (
+            patch("pikamux.consult.configured_executable", return_value="opencode"),
+            patch("pikamux.consult.executable_available", return_value=True),
+            patch("pikamux.consult.executable_version", return_value="1.18.21"),
+            patch.object(
+                OpenCodeConsultation,
+                "_fork_session",
+                side_effect=ConsultationError("fork API failed"),
+            ),
+            patch("pikamux.consult.subprocess.run") as delete,
+            self.assertRaisesRegex(ConsultationError, "fork API failed"),
+        ):
+            consultation.ask("question")
+        self.assertIsNone(consultation.thread_id)
+        consultation.close()
+        delete.assert_not_called()
 
     def test_codex_uses_one_ephemeral_fork_for_multiple_turns(self) -> None:
         messages = [
@@ -358,6 +500,9 @@ class ConsultationTests(unittest.TestCase):
         ):
             self.assertEqual(_ask(pika, "parent", [], jsonl=True, fast=True), 0)
         messages = [json.loads(line) for line in output.getvalue().splitlines()]
+        progress = [item for item in messages if item["type"] == "progress"]
+        self.assertTrue(progress)
+        messages = [item for item in messages if item["type"] != "progress"]
         self.assertEqual(
             [item["type"] for item in messages],
             ["opened", "answer", "answer", "closed"],

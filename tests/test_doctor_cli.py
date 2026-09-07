@@ -17,7 +17,7 @@ class DoctorCliTests(unittest.TestCase):
     def test_corrupt_database_still_returns_machine_readable_unsafe_receipt(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory(dir="/mnt/ebs1/ajain") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "pika.db"
             database.write_text("not a sqlite database")
             output = io.StringIO()
@@ -32,7 +32,7 @@ class DoctorCliTests(unittest.TestCase):
         self.assertIn("unreadable", receipt["checks"][0]["message"])
 
     def test_malformed_pika_config_is_an_explicit_doctor_error(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/mnt/ebs1/ajain") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_home = root / "config"
             config_home.mkdir()
@@ -62,7 +62,7 @@ class DoctorCliTests(unittest.TestCase):
         self.assertEqual(matching[0]["level"], "error")
 
     def test_repair_stale_json_is_one_receipt_with_exact_repairs(self) -> None:
-        with tempfile.TemporaryDirectory(dir="/mnt/ebs1/ajain") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state = root / "state"
             store = Store(state / "pika.db")

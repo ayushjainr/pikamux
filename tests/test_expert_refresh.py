@@ -3,10 +3,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from dataclasses import replace
 from unittest.mock import patch
 
-from pikamux.core import Pika
+from pikamux.core import Pika, PikaError
 from pikamux.consult import DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL
+from pikamux.experts import card_state, profile_freshness
 from pikamux.models import ExpertProfile, Session
 from pikamux.quota import QuotaSnapshot
 from pikamux.store import Store
@@ -60,6 +62,115 @@ class ExpertRefreshTests(unittest.TestCase):
             transcript_size=stat.st_size,
             current_state="Exact recovery is verified and currently stable.",
         )
+
+    def test_unwatched_experts_remain_searchable_and_resolve_without_rewatch(self):
+        self.store.put_expert_profile(self._profile())
+        self.store.untrack_session(*self.session.key)
+        with (
+            patch.object(self.pika, "refresh", side_effect=AssertionError("lookup must stay metadata-only")),
+            patch("pikamux.core.interview_profile", side_effect=AssertionError("lookup must not interview")),
+        ):
+            matches = self.pika.expert_matches("session identity")
+            self.assertEqual(len(matches), 1)
+            self.assertFalse(matches[0].to_dict()["watched"])
+            self.assertEqual(matches[0].to_dict()["availability"], "source-available")
+            target = self.pika.resolve_expert_target("identity")
+            self.assertEqual(target.key, self.session.key)
+            self.assertFalse(self.pika.expert_card_states()[0].watched)
+        self.assertTrue(self.store.is_untracked(*self.session.key))
+        self.assertEqual(self.store.list_sessions(), [])
+
+    def test_identical_interview_revalidates_without_republishing_or_repeat_spend(self):
+        original = self.store.put_expert_profile(replace(self._profile(), updated_at=100))
+        self.transcript.write_text("history\nmore work, unchanged mandate and objective\n")
+        self.assertEqual(card_state(self.session, original).status, "STALE")
+        with patch("pikamux.core.interview_profile", return_value=self._profile()) as interview:
+            refreshed = self.pika.refresh_expert(self.session)
+            self.assertEqual(card_state(self.session, refreshed).status, "CURRENT")
+            with patch("pikamux.core.read_provider_quota", side_effect=AssertionError("synced card needs no quota check")):
+                next_cycle = self.pika.refresh_due_experts(now=5000)
+        interview.assert_called_once()
+        self.assertEqual(next_cycle[0].status, "CURRENT")
+        self.assertEqual(refreshed.updated_at, original.updated_at)
+        self.assertEqual(refreshed.scope_updated_at, original.scope_updated_at)
+        self.assertEqual(refreshed.current_state_updated_at, original.current_state_updated_at)
+        self.assertEqual(profile_freshness(self.session, refreshed)["current_state_status"], "CURRENT")
+        self.assertEqual(self.store.get_expert_profile(*self.session.key), refreshed)
+
+    def test_changed_interview_scope_also_revalidates_unchanged_current_work(self):
+        original = self.store.put_expert_profile(replace(self._profile(), updated_at=100))
+        self.transcript.write_text("history\nverified broader ownership, same current objective\n")
+        interview_card = replace(self._profile(), summary="Owns exact identity and multi-machine recovery.", updated_at=200)
+        with patch("pikamux.core.interview_profile", return_value=interview_card):
+            refreshed = self.pika.refresh_expert(self.session)
+        self.assertEqual(refreshed.scope_updated_at, 200)
+        self.assertEqual(refreshed.current_state_updated_at, original.current_state_updated_at)
+        self.assertEqual(card_state(self.session, refreshed).status, "CURRENT")
+        self.assertEqual(profile_freshness(self.session, refreshed)["current_state_status"], "CURRENT")
+
+    def test_identical_self_publication_cannot_revalidate_interviewed_content(self):
+        original = self.store.put_expert_profile(replace(self._profile(), updated_at=100))
+        self.transcript.write_text("history\nnew work\n")
+        repeated = replace(self._profile(), source="self", updated_at=200)
+        self.assertEqual(self.store.put_expert_profile(repeated), original)
+        self.assertEqual(card_state(self.session, original).status, "STALE")
+
+    def test_unavailable_expert_stays_discoverable_but_resolution_does_not_restore(self):
+        self.store.put_expert_profile(self._profile())
+        self.store.untrack_session(*self.session.key)
+        self.transcript.unlink()
+        match = self.pika.expert_matches("identity")[0]
+        self.assertEqual(match.to_dict()["availability"], "source-unavailable")
+        with self.assertRaisesRegex(PikaError, "No question was sent"):
+            self.pika.resolve_expert_target(self.session.session_id)
+        self.assertTrue(self.store.is_untracked(*self.session.key))
+
+    def test_archived_expert_is_excluded_and_never_resurrected(self):
+        self.store.put_expert_profile(self._profile())
+        self.store.untrack_session(*self.session.key)
+        with patch.object(
+            self.pika.providers["codex"], "hidden_session_ids",
+            return_value={self.session.session_id}, create=True,
+        ):
+            self.assertEqual(self.pika.expert_matches(), [])
+            self.assertEqual(self.pika.expert_card_states(), [])
+            with self.assertRaisesRegex(PikaError, "archived"):
+                self.pika.resolve_expert_target("identity")
+        self.assertTrue(self.store.is_untracked(*self.session.key))
+
+    def test_ambiguous_unwatched_name_cannot_silently_choose_a_provider(self):
+        self.store.untrack_session(*self.session.key)
+        other = Session("claude", "second-uuid", name="identity", transcript_path=str(self.transcript))
+        self.store.upsert_session(other)
+        self.store.untrack_session(*other.key)
+        with patch("pikamux.ui.sys.stdin.isatty", return_value=False):
+            with self.assertRaisesRegex(ValueError, "Multiple continuations"):
+                self.pika.resolve_expert_target("identity")
+        self.assertEqual(len(self.store.list_untracked_sessions()), 2)
+
+    def test_current_work_command_uses_exact_calling_identity_and_no_model(self):
+        from pikamux.cli import _expert, _parser
+
+        original = self.store.put_expert_profile(self._profile())
+        args = _parser().parse_args(["expert", "update", "--now", "Awaiting review.", "--json"])
+        with (
+            patch.object(self.pika, "current_exact_session", return_value=self.session) as exact,
+            patch("pikamux.core.interview_profile", side_effect=AssertionError("no interview")),
+            patch("builtins.print") as output,
+        ):
+            self.assertEqual(_expert(self.pika, args), 0)
+        exact.assert_called_once()
+        self.assertIn("Awaiting review.", output.call_args.args[0])
+        changed = self.store.get_expert_profile(*self.session.key)
+        self.assertEqual(changed.scope_updated_at, original.scope_updated_at)
+        self.assertEqual(changed.current_state, "Awaiting review.")
+
+    def test_current_work_cannot_bypass_exact_identity(self):
+        original = self.store.put_expert_profile(self._profile())
+        with patch.object(self.pika, "current_exact_session", side_effect=PikaError("cannot prove identity")):
+            with self.assertRaisesRegex(PikaError, "cannot prove"):
+                self.pika.publish_current_work("Counterfeit update.")
+        self.assertEqual(self.store.get_expert_profile(*self.session.key), original)
 
     def test_due_refresh_uses_expiring_quota_once(self) -> None:
         now = 1_000.0

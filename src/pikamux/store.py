@@ -6,12 +6,14 @@ import os
 import sqlite3
 import time
 import uuid
+from dataclasses import replace
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from .models import (
+    ActivityEvent,
     ExpertProfile,
     ExpertRefreshAttempt,
     FleetNode,
@@ -21,6 +23,7 @@ from .models import (
 )
 from .paths import config_path, database_path
 from .processes import process_start_time
+from .status_projection import StatusObservation
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
@@ -36,6 +39,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # the known harness origins out of Pika while allowing installations to
     # extend the list for their own runners.
     "codex_worker_originators": ["agentic_fund", "quant_agent_autonomy"],
+    # OpenCode does not persist an originator field. Suppress a root automation
+    # run only when a configured title prefix and an isolated opencode-runtime
+    # directory agree; either signal alone remains visible.
+    "opencode_worker_title_prefixes": ["agentic-fund:", "quant-agent:"],
 }
 
 # Hook ownership is corroborating evidence, not durable conversation identity.
@@ -194,6 +201,20 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS session_events_time_idx
                 ON session_events(event_at);
+                CREATE TABLE IF NOT EXISTS session_status_observations (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    unread INTEGER NOT NULL DEFAULT 0,
+                    attention_reason TEXT,
+                    error TEXT,
+                    observed_at REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    PRIMARY KEY (provider, session_id, kind)
+                );
+                CREATE INDEX IF NOT EXISTS session_status_observations_time_idx
+                ON session_status_observations(observed_at);
                 CREATE TABLE IF NOT EXISTS identity_interruptions (
                     provider TEXT NOT NULL,
                     session_id TEXT NOT NULL,
@@ -388,6 +409,21 @@ class Store:
                     "ALTER TABLE expert_profiles "
                     "ADD COLUMN current_state TEXT NOT NULL DEFAULT ''"
                 )
+            for column, declaration in (
+                ("scope_updated_at", "REAL NOT NULL DEFAULT 0"),
+                ("current_state_updated_at", "REAL NOT NULL DEFAULT 0"),
+                ("current_state_mtime_ns", "INTEGER"),
+                ("current_state_size", "INTEGER"),
+            ):
+                if column not in expert_columns:
+                    db.execute(f"ALTER TABLE expert_profiles ADD COLUMN {column} {declaration}")
+            # Existing full cards provide a checkpoint for both kinds of content.
+            db.execute("UPDATE expert_profiles SET scope_updated_at=updated_at WHERE scope_updated_at=0")
+            db.execute(
+                "UPDATE expert_profiles SET current_state_updated_at=updated_at,"
+                "current_state_mtime_ns=transcript_mtime_ns,current_state_size=transcript_size "
+                "WHERE current_state_updated_at=0 AND current_state<>''"
+            )
             event_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(session_events)").fetchall()
@@ -417,6 +453,39 @@ class Store:
                     ON session_events(event_at);
                     """
                 )
+            # Migrate the legacy materialized state only after every older
+            # schema has received the columns referenced by the projection.
+            # Identity interruptions contain lifecycle truth hidden by a
+            # current fail-closed safety observation.
+            db.execute(
+                """
+                INSERT OR IGNORE INTO session_status_observations(
+                    provider,session_id,kind,status,unread,attention_reason,
+                    error,observed_at,source
+                )
+                SELECT provider,session_id,
+                       CASE
+                         WHEN status IN ('ERROR','OPEN TWICE')
+                              AND attention_reason='identity' THEN 'safety'
+                         WHEN status='ERROR' AND attention_reason='exited'
+                              THEN 'runtime'
+                         ELSE 'lifecycle'
+                       END,
+                       status,unread,attention_reason,error,last_event_at,'legacy'
+                FROM sessions
+                """
+            )
+            db.execute(
+                """
+                INSERT OR IGNORE INTO session_status_observations(
+                    provider,session_id,kind,status,unread,attention_reason,
+                    error,observed_at,source
+                )
+                SELECT provider,session_id,'lifecycle',status,unread,
+                       attention_reason,error,last_event_at,'identity-interruption'
+                FROM identity_interruptions
+                """
+            )
             fleet_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(fleet_nodes)").fetchall()
@@ -545,6 +614,31 @@ class Store:
                     activity,
                 ),
             )
+            db.execute(
+                """
+                INSERT OR IGNORE INTO session_status_observations(
+                    provider,session_id,kind,status,unread,attention_reason,
+                    error,observed_at,source
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    session.provider,
+                    session.session_id,
+                    "safety"
+                    if session.status in {Status.ERROR.value, Status.OPEN_TWICE.value}
+                    and session.attention_reason == "identity"
+                    else "runtime"
+                    if session.status == Status.ERROR.value
+                    and session.attention_reason == "exited"
+                    else "lifecycle",
+                    session.status,
+                    int(session.unread),
+                    session.attention_reason,
+                    session.error,
+                    event_at,
+                    "initial",
+                ),
+            )
             if self._became_actionable(
                 existing,
                 status=session.status,
@@ -633,6 +727,7 @@ class Store:
             for table in (
                 "usage_cache",
                 "session_events",
+                "session_status_observations",
                 "identity_interruptions",
                 "expert_refresh_attempts",
                 "live_owners",
@@ -740,19 +835,116 @@ class Store:
                     float(fields.get("last_event_at", now)),
                 )
 
-    def delete_session(self, provider: str, session_id: str) -> None:
+    def record_status_observation(
+        self,
+        provider: str,
+        session_id: str,
+        *,
+        kind: str,
+        status: str,
+        unread: bool,
+        attention_reason: str | None,
+        error: str | None,
+        observed_at: float,
+        source: str,
+    ) -> bool:
+        """Persist the newest fact of one kind without accepting stale replay."""
+        if kind not in {"lifecycle", "runtime", "safety"}:
+            raise ValueError(f"Unsupported status observation kind: {kind}")
         self.initialize()
         with self.connect() as db:
-            for table in (
+            cursor = db.execute(
+                """
+                INSERT INTO session_status_observations(
+                    provider,session_id,kind,status,unread,attention_reason,
+                    error,observed_at,source
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(provider,session_id,kind) DO UPDATE SET
+                    status=excluded.status,
+                    unread=excluded.unread,
+                    attention_reason=excluded.attention_reason,
+                    error=excluded.error,
+                    observed_at=excluded.observed_at,
+                    source=excluded.source
+                WHERE excluded.observed_at >= session_status_observations.observed_at
+                """,
+                (
+                    provider,
+                    session_id,
+                    kind,
+                    status,
+                    int(unread),
+                    attention_reason,
+                    error,
+                    observed_at,
+                    source,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def status_observations(
+        self, provider: str, session_id: str
+    ) -> tuple[StatusObservation, ...]:
+        self.initialize()
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT kind,status,unread,attention_reason,error,observed_at,source
+                FROM session_status_observations
+                WHERE provider=? AND session_id=?
+                """,
+                (provider, session_id),
+            ).fetchall()
+        return tuple(
+            StatusObservation(
+                kind=str(row["kind"]),
+                status=str(row["status"]),
+                unread=bool(row["unread"]),
+                attention_reason=(
+                    str(row["attention_reason"])
+                    if row["attention_reason"] is not None
+                    else None
+                ),
+                error=str(row["error"]) if row["error"] is not None else None,
+                observed_at=float(row["observed_at"]),
+                source=str(row["source"]),
+            )
+            for row in rows
+        )
+
+    def clear_status_observation(
+        self, provider: str, session_id: str, kind: str
+    ) -> None:
+        self.initialize()
+        with self.connect() as db:
+            db.execute(
+                "DELETE FROM session_status_observations "
+                "WHERE provider=? AND session_id=? AND kind=?",
+                (provider, session_id, kind),
+            )
+
+    def delete_session(
+        self,
+        provider: str,
+        session_id: str,
+        *,
+        preserve_live_owners: bool = False,
+    ) -> None:
+        self.initialize()
+        with self.connect() as db:
+            tables = [
                 "usage_cache",
                 "session_events",
+                "session_status_observations",
                 "identity_interruptions",
                 "expert_profiles",
                 "expert_refresh_attempts",
-                "live_owners",
                 "recovery_owners",
                 "launch_reservations",
-            ):
+            ]
+            if not preserve_live_owners:
+                tables.append("live_owners")
+            for table in tables:
                 db.execute(
                     f"DELETE FROM {table} WHERE provider=? AND session_id=?",
                     (provider, session_id),
@@ -770,18 +962,72 @@ class Store:
         self.initialize()
         updated_at = profile.updated_at or time.time()
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             if not db.execute(
                 "SELECT 1 FROM sessions WHERE provider=? AND session_id=?",
                 profile.key,
             ).fetchone():
                 raise ValueError("Expert profile requires a tracked Pika session")
+            row = db.execute(
+                "SELECT * FROM expert_profiles WHERE provider=? AND session_id=?", profile.key
+            ).fetchone()
+            existing = self._row_to_expert_profile(row) if row else None
+            scope_changed = existing is None or (
+                profile.summary, profile.topics, profile.artifacts
+            ) != (existing.summary, existing.topics, existing.artifacts)
+            work_changed = existing is None or profile.current_state != existing.current_state
+            verified_interview = (
+                profile.source == "interview"
+                and profile.transcript_mtime_ns is not None
+                and profile.transcript_size is not None
+            )
+            if existing and not scope_changed and not work_changed:
+                if not verified_interview:
+                    return existing
+                # A paid interview can reaffirm unchanged content against a new
+                # transcript. Refresh the evidence, not the publication clocks.
+                verified = replace(
+                    existing,
+                    transcript_mtime_ns=profile.transcript_mtime_ns,
+                    transcript_size=profile.transcript_size,
+                    current_state_mtime_ns=profile.transcript_mtime_ns,
+                    current_state_size=profile.transcript_size,
+                )
+                if verified != existing:
+                    db.execute(
+                        "UPDATE expert_profiles SET transcript_mtime_ns=?,transcript_size=?,"
+                        "current_state_mtime_ns=?,current_state_size=? "
+                        "WHERE provider=? AND session_id=?",
+                        (
+                            verified.transcript_mtime_ns, verified.transcript_size,
+                            verified.current_state_mtime_ns, verified.current_state_size,
+                            *verified.key,
+                        ),
+                    )
+                return verified
+            profile = replace(
+                profile,
+                updated_at=updated_at,
+                scope_updated_at=updated_at if scope_changed else existing.scope_updated_at,
+                current_state_updated_at=(
+                    updated_at if work_changed and profile.current_state else
+                    existing.current_state_updated_at if existing else 0.0
+                ),
+                current_state_mtime_ns=(
+                    profile.transcript_mtime_ns if work_changed or verified_interview else existing.current_state_mtime_ns
+                ),
+                current_state_size=(
+                    profile.transcript_size if work_changed or verified_interview else existing.current_state_size
+                ),
+            )
             db.execute(
                 """
                 INSERT INTO expert_profiles(
                     provider,session_id,summary,current_state,topics_json,
                     artifacts_json,source,transcript_mtime_ns,transcript_size,
-                    updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    updated_at,scope_updated_at,current_state_updated_at,
+                    current_state_mtime_ns,current_state_size
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(provider,session_id) DO UPDATE SET
                     summary=excluded.summary,
                     current_state=excluded.current_state,
@@ -790,7 +1036,11 @@ class Store:
                     source=excluded.source,
                     transcript_mtime_ns=excluded.transcript_mtime_ns,
                     transcript_size=excluded.transcript_size,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    scope_updated_at=excluded.scope_updated_at,
+                    current_state_updated_at=excluded.current_state_updated_at,
+                    current_state_mtime_ns=excluded.current_state_mtime_ns,
+                    current_state_size=excluded.current_state_size
                 """,
                 (
                     profile.provider,
@@ -803,20 +1053,49 @@ class Store:
                     profile.transcript_mtime_ns,
                     profile.transcript_size,
                     updated_at,
+                    profile.scope_updated_at,
+                    profile.current_state_updated_at,
+                    profile.current_state_mtime_ns,
+                    profile.current_state_size,
                 ),
             )
-        return ExpertProfile(
-            profile.provider,
-            profile.session_id,
-            profile.summary,
-            profile.topics,
-            profile.artifacts,
-            updated_at,
-            profile.source,
-            profile.transcript_mtime_ns,
-            profile.transcript_size,
-            profile.current_state,
-        )
+        return profile
+
+    def put_expert_current_state(
+        self, provider: str, session_id: str, current_state: str, *,
+        transcript_mtime_ns: int | None = None, transcript_size: int | None = None,
+    ) -> ExpertProfile:
+        """Publish a small work update without rewriting durable expertise.
+
+        No provider is contacted and unchanged content does not refresh its age.
+        """
+        from .experts import clean_current_state
+
+        clean = clean_current_state(current_state)
+        self.initialize()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM expert_profiles WHERE provider=? AND session_id=?",
+                (provider, session_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Publish an expert profile before a current-work update")
+            existing = self._row_to_expert_profile(row)
+            if clean == existing.current_state:
+                return existing
+            now = time.time()
+            db.execute(
+                "UPDATE expert_profiles SET current_state=?,current_state_updated_at=?,"
+                "current_state_mtime_ns=?,current_state_size=?,updated_at=? "
+                "WHERE provider=? AND session_id=?",
+                (clean, now, transcript_mtime_ns, transcript_size, now, provider, session_id),
+            )
+            return replace(
+                existing, current_state=clean, current_state_updated_at=now,
+                current_state_mtime_ns=transcript_mtime_ns,
+                current_state_size=transcript_size, updated_at=now,
+            )
 
     def get_expert_profile(
         self, provider: str, session_id: str
@@ -965,6 +1244,42 @@ class Store:
             ).fetchall()
         return {str(row["status"]): int(row["count"]) for row in rows}
 
+    def list_activity_events(self, *, limit: int = 20) -> list[ActivityEvent]:
+        """Return a transcript-free catch-up feed, newest first."""
+        if limit < 1 or limit > 500:
+            raise ValueError("Activity event limit must be between 1 and 500")
+        self.initialize()
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT events.event_id,events.provider,events.session_id,
+                       sessions.name,events.status,events.attention_reason,
+                       events.error,events.event_at
+                FROM session_events AS events
+                LEFT JOIN sessions USING(provider,session_id)
+                ORDER BY events.event_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            ActivityEvent(
+                event_id=int(row["event_id"]),
+                provider=str(row["provider"]),
+                session_id=str(row["session_id"]),
+                name=str(row["name"]) if row["name"] is not None else None,
+                status=str(row["status"]),
+                attention_reason=(
+                    str(row["attention_reason"])
+                    if row["attention_reason"] is not None
+                    else None
+                ),
+                error=str(row["error"]) if row["error"] is not None else None,
+                event_at=float(row["event_at"]),
+            )
+            for row in rows
+        ]
+
     def capture_identity_interruption(self, provider: str, session_id: str) -> None:
         """Remember the lifecycle state hidden by a temporary identity fault."""
         self.initialize()
@@ -977,6 +1292,19 @@ class Store:
                 )
                 SELECT provider,session_id,status,unread,attention_reason,error,
                        last_event_at
+                FROM sessions
+                WHERE provider=? AND session_id=?
+                """,
+                (provider, session_id),
+            )
+            db.execute(
+                """
+                INSERT OR IGNORE INTO session_status_observations(
+                    provider,session_id,kind,status,unread,attention_reason,
+                    error,observed_at,source
+                )
+                SELECT provider,session_id,'lifecycle',status,unread,
+                       attention_reason,error,last_event_at,'identity-interruption'
                 FROM sessions
                 WHERE provider=? AND session_id=?
                 """,
@@ -1010,6 +1338,11 @@ class Store:
                 "DELETE FROM identity_interruptions WHERE provider=? AND session_id=?",
                 (provider, session_id),
             )
+            db.execute(
+                "DELETE FROM session_status_observations "
+                "WHERE provider=? AND session_id=? AND kind='safety'",
+                (provider, session_id),
+            )
 
     def restore_identity_interruption(
         self, provider: str, session_id: str, *, live: bool
@@ -1034,6 +1367,11 @@ class Store:
                 db.execute(
                     "DELETE FROM identity_interruptions "
                     "WHERE provider=? AND session_id=?",
+                    (provider, session_id),
+                )
+                db.execute(
+                    "DELETE FROM session_status_observations "
+                    "WHERE provider=? AND session_id=? AND kind='safety'",
                     (provider, session_id),
                 )
                 return False
@@ -1092,6 +1430,11 @@ class Store:
                 "DELETE FROM identity_interruptions WHERE provider=? AND session_id=?",
                 (provider, session_id),
             )
+            db.execute(
+                "DELETE FROM session_status_observations "
+                "WHERE provider=? AND session_id=? AND kind='safety'",
+                (provider, session_id),
+            )
             return True
 
     def discard_healthy_identity_interruption(
@@ -1105,6 +1448,25 @@ class Store:
                 """
                 DELETE FROM identity_interruptions
                 WHERE provider=? AND session_id=?
+                  AND EXISTS (
+                    SELECT 1 FROM sessions
+                    WHERE provider=? AND session_id=?
+                      AND NOT (status IN (?,?) AND attention_reason='identity')
+                  )
+                """,
+                (
+                    provider,
+                    session_id,
+                    provider,
+                    session_id,
+                    Status.ERROR.value,
+                    Status.OPEN_TWICE.value,
+                ),
+            )
+            db.execute(
+                """
+                DELETE FROM session_status_observations
+                WHERE provider=? AND session_id=? AND kind='safety'
                   AND EXISTS (
                     SELECT 1 FROM sessions
                     WHERE provider=? AND session_id=?
@@ -1253,8 +1615,18 @@ class Store:
             ).fetchone()
             if binding:
                 db.execute(
-                    "DELETE FROM pending_launches WHERE launch_token=?",
-                    (launch_token,),
+                    """
+                    UPDATE pending_launches
+                    SET tmux_session=?, tmux_pane=?, root_pid=?, root_pid_start=?
+                    WHERE launch_token=?
+                    """,
+                    (
+                        tmux_session,
+                        tmux_pane,
+                        root_pid,
+                        root_pid_start,
+                        launch_token,
+                    ),
                 )
                 return str(binding["provider"]), str(binding["session_id"])
             db.execute(
@@ -1297,16 +1669,79 @@ class Store:
                 (launch_token,),
             ).fetchone()
             if existing:
-                return (str(existing["provider"]), str(existing["session_id"])) == (
+                matches = (
+                    str(existing["provider"]),
+                    str(existing["session_id"]),
+                ) == (
                     provider,
                     session_id,
                 )
+                if not matches:
+                    return False
+            else:
+                db.execute(
+                    """
+                    INSERT INTO launch_bindings(
+                        launch_token, provider, session_id, created_at
+                    ) VALUES (?,?,?,?)
+                    """,
+                    (launch_token, provider, session_id, time.time()),
+                )
+        return True
+
+    def certify_launch(
+        self,
+        launch_token: str,
+        provider: str,
+        session_id: str,
+        pid: int,
+        start_time: int,
+    ) -> bool:
+        """Publish exact process ownership only after its pane is tagged.
+
+        Binding a provider UUID and proving its physical Pika home are separate
+        commits.  Keeping this second commit explicit prevents a failed tmux tag
+        from publishing exact identity and handles either hook/finalizer order.
+        """
+        self.initialize()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            binding = db.execute(
+                "SELECT provider,session_id FROM launch_bindings WHERE launch_token=?",
+                (launch_token,),
+            ).fetchone()
+            if binding is None or (
+                str(binding["provider"]), str(binding["session_id"])
+            ) != (provider, session_id):
+                return False
+            pending = db.execute(
+                "SELECT provider,root_pid,root_pid_start FROM pending_launches "
+                "WHERE launch_token=?",
+                (launch_token,),
+            ).fetchone()
+            if pending is not None and (
+                str(pending["provider"]) != provider
+                or pending["root_pid"] is None
+                or pending["root_pid_start"] is None
+                or int(pending["root_pid"]) != pid
+                or int(pending["root_pid_start"]) != start_time
+            ):
+                return False
             db.execute(
                 """
-                INSERT INTO launch_bindings(launch_token, provider, session_id, created_at)
-                VALUES (?,?,?,?)
+                INSERT INTO recovery_owners(
+                    provider,session_id,pid,start_time,launch_token,created_at
+                ) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(provider,session_id) DO UPDATE SET
+                    pid=excluded.pid,
+                    start_time=excluded.start_time,
+                    launch_token=excluded.launch_token,
+                    created_at=excluded.created_at
                 """,
-                (launch_token, provider, session_id, time.time()),
+                (provider, session_id, pid, start_time, launch_token, time.time()),
+            )
+            db.execute(
+                "DELETE FROM pending_launches WHERE launch_token=?", (launch_token,)
             )
         return True
 
@@ -1320,6 +1755,110 @@ class Store:
         if not row:
             return None
         return str(row["provider"]), str(row["session_id"])
+
+    def switch_launch_binding(
+        self,
+        launch_token: str,
+        provider: str,
+        from_session_id: str,
+        to_session_id: str,
+        pid: int,
+    ) -> bool:
+        """Move one certified managed client to the root it now displays."""
+        self.initialize()
+        start_time = process_start_time(pid)
+        if start_time is None:
+            return False
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            binding = db.execute(
+                "SELECT provider,session_id FROM launch_bindings WHERE launch_token=?",
+                (launch_token,),
+            ).fetchone()
+            proof = db.execute(
+                "SELECT pid,start_time,launch_token FROM recovery_owners "
+                "WHERE provider=? AND session_id=?",
+                (provider, from_session_id),
+            ).fetchone()
+            target_proof = db.execute(
+                "SELECT pid,start_time,launch_token FROM recovery_owners "
+                "WHERE provider=? AND session_id=?",
+                (provider, to_session_id),
+            ).fetchone()
+            target_leases = db.execute(
+                "SELECT pid,start_time,last_seen FROM live_owners "
+                "WHERE provider=? AND session_id=?",
+                (provider, to_session_id),
+            ).fetchall()
+            competing_target = bool(
+                target_proof is not None
+                and (
+                    int(target_proof["pid"]),
+                    int(target_proof["start_time"]),
+                    str(target_proof["launch_token"]),
+                )
+                != (pid, start_time, launch_token)
+                and process_start_time(int(target_proof["pid"]))
+                == int(target_proof["start_time"])
+            )
+            competing_target_lease = any(
+                lease["start_time"] is not None
+                and (int(lease["pid"]), int(lease["start_time"]))
+                != (pid, start_time)
+                and process_start_time(int(lease["pid"]))
+                == int(lease["start_time"])
+                and time.time() - float(lease["last_seen"])
+                <= LIVE_OWNER_LEASE_SECONDS
+                for lease in target_leases
+            )
+            if (
+                binding is None
+                or (str(binding["provider"]), str(binding["session_id"]))
+                != (provider, from_session_id)
+                or proof is None
+                or int(proof["pid"]) != pid
+                or int(proof["start_time"]) != start_time
+                or str(proof["launch_token"]) != launch_token
+                or competing_target
+                or competing_target_lease
+            ):
+                return False
+            db.execute(
+                "UPDATE launch_bindings SET session_id=?,created_at=? "
+                "WHERE launch_token=? AND provider=? AND session_id=?",
+                (
+                    to_session_id,
+                    time.time(),
+                    launch_token,
+                    provider,
+                    from_session_id,
+                ),
+            )
+            db.execute(
+                "DELETE FROM recovery_owners WHERE provider=? AND session_id=?",
+                (provider, from_session_id),
+            )
+            db.execute(
+                """
+                INSERT INTO recovery_owners(
+                    provider,session_id,pid,start_time,launch_token,created_at
+                ) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(provider,session_id) DO UPDATE SET
+                    pid=excluded.pid,
+                    start_time=excluded.start_time,
+                    launch_token=excluded.launch_token,
+                    created_at=excluded.created_at
+                """,
+                (
+                    provider,
+                    to_session_id,
+                    pid,
+                    start_time,
+                    launch_token,
+                    time.time(),
+                ),
+            )
+        return True
 
     def delete_launch_binding(self, launch_token: str) -> None:
         self.initialize()
@@ -1493,6 +2032,17 @@ class Store:
                     "AND pid=? AND owner_token=?",
                     (provider, session_id, pid, owner_token),
                 )
+
+    def delete_other_live_owner_sessions(
+        self, provider: str, pid: int, keep_session_id: str
+    ) -> None:
+        """Revoke prior roots when a single-session provider switches identity."""
+        self.initialize()
+        with self.connect() as db:
+            db.execute(
+                "DELETE FROM live_owners WHERE provider=? AND pid=? AND session_id<>?",
+                (provider, pid, keep_session_id),
+            )
 
     def reserve_resume(
         self,
@@ -1908,6 +2458,19 @@ class Store:
             )
             if cursor.rowcount != 1:
                 return None
+            db.execute(
+                """
+                UPDATE session_status_observations
+                SET unread=0
+                WHERE provider=? AND session_id=? AND status=? AND observed_at=?
+                """,
+                (
+                    provider,
+                    session_id,
+                    Status.READY.value,
+                    expected_event_at,
+                ),
+            )
             row = db.execute(
                 "SELECT COUNT(*) AS count FROM sessions WHERE status=? AND unread=1",
                 (Status.READY.value,),
@@ -1973,6 +2536,21 @@ class Store:
                     *statuses,
                 ),
             )
+            if cursor.rowcount == 1:
+                db.execute(
+                    f"""
+                    UPDATE session_status_observations
+                    SET unread=0
+                    WHERE provider=? AND session_id=? AND unread=1
+                      AND observed_at=? AND status IN ({placeholders})
+                    """,
+                    (
+                        provider,
+                        session_id,
+                        expected_event_at,
+                        *statuses,
+                    ),
+                )
             return cursor.rowcount == 1
 
     def previous_attached(self) -> tuple[str, str] | None:
@@ -2118,6 +2696,10 @@ class Store:
                 else None
             ),
             current_state=str(row["current_state"]),
+            scope_updated_at=float(row["scope_updated_at"]),
+            current_state_updated_at=float(row["current_state_updated_at"]),
+            current_state_mtime_ns=row["current_state_mtime_ns"],
+            current_state_size=row["current_state_size"],
         )
 
     @staticmethod

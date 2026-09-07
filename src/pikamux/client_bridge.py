@@ -15,11 +15,11 @@ from typing import Any, Callable
 from .paths import config_home
 
 BRIDGE_PROTOCOL = "pikamux-client-launch"
-BRIDGE_VERSION = 1
+BRIDGE_VERSION = 2
 DEFAULT_LOCAL_PORT = 47653
 DEFAULT_REMOTE_PORT = 47654
 MAX_BRIDGE_MESSAGE_BYTES = 16 * 1024
-_PROVIDERS = {"codex", "claude"}
+_PROVIDERS = {"codex", "claude", "opencode"}
 _ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 _REQUEST_FIELDS = {
     "type",
@@ -90,6 +90,19 @@ def _uuid(value: object, label: str) -> str:
         return str(uuid.UUID(str(value)))
     except (ValueError, TypeError, AttributeError):
         raise ClientBridgeError(f"Invalid {label}") from None
+
+
+def _conversation_identity(provider: str, value: object) -> str:
+    if provider == "opencode":
+        if (
+            not isinstance(value, str)
+            or not value.startswith("ses_")
+            or not 8 <= len(value) <= 128
+            or not value[4:].isalnum()
+        ):
+            raise ClientBridgeError("Invalid conversation identity")
+        return value
+    return _uuid(value, "conversation identity")
 
 
 def _token(value: object) -> str:
@@ -267,7 +280,7 @@ def validate_launch_request(value: object) -> dict[str, Any]:
         "token": _token(value.get("token")),
         "source_node_id": _uuid(value.get("source_node_id"), "source node identity"),
         "target_node_id": _uuid(value.get("target_node_id"), "target node identity"),
-        "session_id": _uuid(value.get("session_id"), "conversation identity"),
+        "session_id": _conversation_identity(provider, value.get("session_id")),
     }
 
 
@@ -281,7 +294,7 @@ def windows_terminal_command(
 ) -> list[str]:
     if provider not in _PROVIDERS:
         raise ClientBridgeError("Invalid provider")
-    exact_session_id = _uuid(session_id, "conversation identity")
+    exact_session_id = _conversation_identity(provider, session_id)
     return [
         terminal_executable,
         "-w",

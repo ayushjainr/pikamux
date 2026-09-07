@@ -6,6 +6,7 @@ import select
 import sqlite3
 import subprocess
 import time
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from datetime import datetime
@@ -17,9 +18,10 @@ from .executables import (
     configured_executable,
     executable_available,
     executable_version,
+    provider_compatibility_error,
 )
 from .models import Candidate, Session, Status, Usage
-from .paths import claude_home, codex_home
+from .paths import claude_home, codex_home, opencode_data_home
 from .pricing import estimate_cost
 from .processes import find_processes_with_session_id, provider_process
 from .store import Store, load_config
@@ -27,6 +29,14 @@ from .store import Store, load_config
 
 class ProviderError(RuntimeError):
     pass
+
+
+def opencode_native_placeholder_title(value: str | None) -> bool:
+    """Return true only for titles OpenCode generates without user intent."""
+    title = str(value or "")
+    return title.startswith("New session - ") or (
+        " (fork #" in title and title.endswith(")")
+    )
 
 
 def codex_transcript_metadata(
@@ -109,18 +119,27 @@ def codex_worker_originator(
     """Return a configured automation origin, otherwise preserve the session."""
     metadata = codex_session_metadata(session_id, transcript_path)
     source = metadata.get("source")
+    reported_originator = str(originator).strip() if originator else None
+    metadata_originator = (
+        str(metadata.get("originator")).strip()
+        if metadata.get("originator")
+        else None
+    )
+    if source == "exec" or any(
+        value and value.casefold() == "codex_exec"
+        for value in (reported_originator, metadata_originator)
+    ):
+        # ``codex exec`` is a non-interactive execution worker. It can be
+        # launched by another managed agent and inherit that parent's Pika
+        # environment, but it is not a resumable user conversation.
+        return "codex-exec"
     if metadata.get("thread_source") == "subagent" or (
         isinstance(source, dict) and "subagent" in source
     ):
         # Native /side, /btw, and delegated worker threads are subordinate to
         # their parent conversation and must never become Pika workstreams.
         return "codex-subagent"
-    value = str(originator).strip() if originator else None
-    value = value or (
-        str(metadata.get("originator")).strip()
-        if metadata.get("originator")
-        else None
-    )
+    value = reported_originator or metadata_originator
     if not value:
         return None
     configured = load_config().get("codex_worker_originators", ())
@@ -165,13 +184,18 @@ class Provider(ABC):
         raise NotImplementedError
 
     def installed(self) -> bool:
-        return executable_available(self.executable())
+        return executable_available(self.executable()) and not self.compatibility_error()
 
     def executable(self) -> str | None:
         return configured_executable(self.name)
 
     def version(self) -> str | None:
         return executable_version(self.executable())
+
+    def compatibility_error(self) -> str | None:
+        if not executable_available(self.executable()):
+            return None
+        return provider_compatibility_error(self.name, self.version())
 
     def import_candidates(self) -> list[Candidate]:
         """Return the broader, potentially slower one-time import surface."""
@@ -209,6 +233,13 @@ class Provider(ABC):
     ) -> str | None:
         """Return non-interactive automation provenance, when proven."""
         return None
+
+    def valid_session_id(self, value: str) -> bool:
+        try:
+            parsed = uuid.UUID(value)
+        except (ValueError, AttributeError):
+            return False
+        return str(parsed) == value.lower()
 
 
 class CodexProvider(Provider):
@@ -677,6 +708,8 @@ class ClaudeProvider(Provider):
             transcript = self._find_transcript(session_id)
             if transcript:
                 candidate.transcript_path = str(transcript)
+                if self.worker_originator(session_id, str(transcript)):
+                    continue
             existing = records.get(session_id)
             if existing:
                 name = candidate.name or existing.name
@@ -729,7 +762,9 @@ class ClaudeProvider(Provider):
         # recoverable even when Claude never assigned a user-facing title.
         if query not in records:
             transcript = self._find_transcript(query)
-            if transcript is not None:
+            if transcript is not None and not self.worker_originator(
+                query, str(transcript)
+            ):
                 records[query] = Candidate(
                     provider=self.name,
                     session_id=query,
@@ -749,6 +784,8 @@ class ClaudeProvider(Provider):
                 else self._find_transcript(session.session_id)
             )
             if path is None:
+                continue
+            if self.worker_originator(session.session_id, str(path)):
                 continue
             title = self._title_from_transcript(path)
             if not title:
@@ -791,7 +828,12 @@ class ClaudeProvider(Provider):
         return sorted(result)
 
     def is_resumable(self, session_id: str) -> bool:
-        return self._find_transcript(session_id) is not None or any(
+        transcript = self._find_transcript(session_id)
+        if transcript is not None and self.worker_originator(
+            session_id, str(transcript)
+        ):
+            return False
+        return transcript is not None or any(
             item.session_id == session_id for item in self.discover()
         )
 
@@ -807,6 +849,8 @@ class ClaudeProvider(Provider):
         result: list[Candidate] = []
         for path in paths:
             session_id = path.stem
+            if self.worker_originator(session_id, str(path)):
+                continue
             title = self._title_from_transcript(path, explicit_only=explicit_only)
             if title:
                 result.append(
@@ -865,6 +909,52 @@ class ClaudeProvider(Provider):
             return None
         title = explicit_title or (None if explicit_only else generated_title)
         return str(title) if title else None
+
+    @staticmethod
+    def _transcript_entrypoint(
+        path: Path, session_id: str, *, record_limit: int = 128
+    ) -> str | None:
+        """Return the first root launch mode authored for this exact UUID."""
+        try:
+            with path.open(errors="replace") as stream:
+                for index, line in enumerate(stream):
+                    if index >= record_limit:
+                        break
+                    if '"entrypoint"' not in line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except ValueError:
+                        continue
+                    if str(data.get("sessionId") or "") != session_id:
+                        continue
+                    if data.get("isSidechain") is not False:
+                        continue
+                    entrypoint = data.get("entrypoint")
+                    if isinstance(entrypoint, str) and entrypoint:
+                        return entrypoint
+        except OSError:
+            return None
+        return None
+
+    def worker_originator(
+        self, session_id: str, transcript_path: str | None
+    ) -> str | None:
+        """Prove non-interactive Claude print/SDK runs from native metadata.
+
+        Claude records ``claude -p`` sessions as top-level (``isSidechain=false``),
+        but their immutable ``entrypoint=sdk-cli`` metadata still distinguishes
+        them from interactive conversations. They are automation runs, not Pika
+        homes, even if an inherited hook accidentally gave them a native title.
+        """
+        path = Path(transcript_path) if transcript_path else self._find_transcript(
+            session_id
+        )
+        if path is None or not path.is_file():
+            return None
+        if self._transcript_entrypoint(path, session_id) == "sdk-cli":
+            return "claude-sdk-cli"
+        return None
 
     def _find_transcript(self, session_id: str) -> Path | None:
         projects = self.home / "projects"
@@ -934,6 +1024,320 @@ class ClaudeProvider(Provider):
         return result
 
 
+class OpenCodeProvider(Provider):
+    """OpenCode's native SQLite session store and opaque ``ses_`` identities."""
+
+    name = "opencode"
+
+    def __init__(self, home: Path | None = None):
+        self.home = home or opencode_data_home()
+        self.database = self.home / "opencode.db"
+
+    def _connect(self) -> sqlite3.Connection:
+        db = sqlite3.connect(
+            f"file:{self.database}?mode=ro", uri=True, timeout=1
+        )
+        db.row_factory = sqlite3.Row
+        return db
+
+    def durable_state(self, session_id: str) -> str:
+        """Return provider-certified presence without conflating I/O failure.
+
+        OpenCode's delete command does not consistently deliver a plugin event,
+        so Pika also verifies the native store during ordinary reconciliation.
+        """
+        if not self.database.is_file():
+            return "unknown"
+        try:
+            with self._connect() as db:
+                columns = {
+                    str(row["name"])
+                    for row in db.execute("PRAGMA table_info(session)").fetchall()
+                }
+                if "id" not in columns:
+                    return "unknown"
+                archived = (
+                    "time_archived" if "time_archived" in columns else "NULL"
+                )
+                row = db.execute(
+                    f"SELECT {archived} AS time_archived FROM session WHERE id=?",
+                    (session_id,),
+                ).fetchone()
+        except (OSError, sqlite3.Error):
+            return "unknown"
+        if row is None:
+            return "deleted"
+        return "archived" if row["time_archived"] is not None else "present"
+
+    def valid_session_id(self, value: str) -> bool:
+        return (
+            value.startswith("ses_")
+            and 8 <= len(value) <= 128
+            and value[4:].isalnum()
+        )
+
+    def active_pids(self, session_id: str) -> list[int]:
+        # A TUI retains its launch-time --session argument after navigating to
+        # another root. Current-root hook leases, not stale argv, are the exact
+        # runtime authority. Pika still treats an unclaimed argv match as an
+        # ambiguous safety hint in _outside_processes.
+        return []
+
+    @staticmethod
+    def _model(value: object) -> str | None:
+        if not value:
+            return None
+        try:
+            parsed = json.loads(str(value))
+        except (TypeError, ValueError):
+            return str(value)
+        if not isinstance(parsed, dict):
+            return str(value)
+        provider = str(parsed.get("providerID") or "").strip()
+        model = str(parsed.get("id") or parsed.get("modelID") or "").strip()
+        variant = str(parsed.get("variant") or "").strip()
+        if not model:
+            return None
+        label = f"{provider}/{model}" if provider else model
+        return f"{label}[{variant}]" if variant else label
+
+    def _tree_ids(self, db: sqlite3.Connection, session_id: str) -> list[str]:
+        rows = db.execute(
+            "WITH RECURSIVE tree(id) AS ("
+            "SELECT id FROM session WHERE id=? AND time_archived IS NULL "
+            "UNION ALL "
+            "SELECT child.id FROM session AS child JOIN tree ON child.parent_id=tree.id "
+            "WHERE child.time_archived IS NULL"
+            ") SELECT id FROM tree",
+            (session_id,),
+        ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def _tree_updated_at(self, db: sqlite3.Connection, session_id: str) -> float:
+        ids = self._tree_ids(db, session_id)
+        if not ids:
+            return 0.0
+        marks = ",".join("?" for _ in ids)
+        row = db.execute(
+            f"SELECT MAX(time_updated) AS value FROM session WHERE id IN ({marks})",
+            ids,
+        ).fetchone()
+        return _timestamp(row["value"]) if row else 0.0
+
+    def _lifecycle(self, db: sqlite3.Connection, session_id: str) -> str | None:
+        # A root may be idle while its delegated child is still running. A
+        # newest incomplete user turn anywhere in the tree keeps it WORKING.
+        ids = self._tree_ids(db, session_id)
+        found_completed = False
+        for child_id in ids:
+            row = db.execute(
+                "SELECT time_created, data FROM message WHERE session_id=? "
+                "ORDER BY time_created DESC, id DESC LIMIT 1",
+                (child_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            try:
+                data = json.loads(str(row["data"]))
+            except ValueError:
+                continue
+            role = str(data.get("role") or "")
+            timing = data.get("time")
+            completed = bool(
+                isinstance(timing, dict) and timing.get("completed")
+            )
+            if role == "user" or (role == "assistant" and not completed):
+                return Status.WORKING.value
+            found_completed = found_completed or (role == "assistant" and completed)
+        if found_completed:
+            return Status.READY.value
+        return None
+
+    def _records(
+        self, *, query: str | None = None, named_only: bool = True
+    ) -> list[Candidate]:
+        if not self.database.is_file():
+            return []
+        try:
+            with self._connect() as db:
+                columns = {
+                    str(row["name"])
+                    for row in db.execute("PRAGMA table_info(session)").fetchall()
+                }
+                if not {"id", "title", "directory", "parent_id"}.issubset(columns):
+                    return []
+                clauses = ["parent_id IS NULL", "time_archived IS NULL"]
+                params: list[str] = []
+                if named_only:
+                    clauses.append("title IS NOT NULL AND trim(title) != ''")
+                if query is not None:
+                    clauses.append("(id=? OR lower(title)=lower(?))")
+                    params.extend((query, query))
+                wanted = (
+                    "id", "title", "directory", "parent_id", "time_created",
+                    "time_updated", "model",
+                )
+                fields = ", ".join(
+                    field if field in columns else f"NULL AS {field}"
+                    for field in wanted
+                )
+                rows = db.execute(
+                    f"SELECT {fields} FROM session WHERE " + " AND ".join(clauses),
+                    params,
+                ).fetchall()
+                result = [
+                    Candidate(
+                        provider=self.name,
+                        session_id=str(row["id"]),
+                        name=str(row["title"]) if row["title"] else None,
+                        cwd=str(row["directory"]) if row["directory"] else None,
+                        transcript_path=str(self.database),
+                        model=self._model(row["model"]),
+                        updated_at=self._tree_updated_at(db, str(row["id"])),
+                        source="opencode-state",
+                        created_at=_timestamp(row["time_created"]),
+                        lifecycle_status=self._lifecycle(db, str(row["id"])),
+                    )
+                    for row in rows
+                ]
+        except (OSError, sqlite3.Error):
+            return []
+        if query is not None:
+            for item in result:
+                active = self.active_pids(item.session_id)
+                item.live = bool(active)
+                item.pid = active[0] if len(active) == 1 else None
+        return sorted(result, key=lambda item: item.updated_at, reverse=True)
+
+    native_placeholder_title = staticmethod(opencode_native_placeholder_title)
+
+    @staticmethod
+    def _automation_title_prefix(title: str | None, directory: str | None) -> str | None:
+        if "opencode-runtime" not in Path(str(directory or "")).parts:
+            return None
+        configured = load_config().get("opencode_worker_title_prefixes", ())
+        if isinstance(configured, str):
+            configured = [configured]
+        if not isinstance(configured, (list, tuple, set, frozenset)):
+            return None
+        folded = str(title or "").casefold()
+        for value in configured:
+            prefix = str(value).strip().casefold()
+            if prefix and folded.startswith(prefix):
+                return prefix
+        return None
+
+    def worker_originator(
+        self, session_id: str, transcript_path: str | None
+    ) -> str | None:
+        if not self.database.is_file():
+            return None
+        try:
+            with self._connect() as db:
+                row = db.execute(
+                    "SELECT title, directory, parent_id FROM session WHERE id=?",
+                    (session_id,),
+                ).fetchone()
+        except (OSError, sqlite3.Error):
+            return None
+        if row is None:
+            return None
+        if row["parent_id"]:
+            return "opencode-subagent"
+        return self._automation_title_prefix(row["title"], row["directory"])
+
+    def hidden_session_ids(self) -> set[str]:
+        return {
+            item.session_id
+            for item in self._records(named_only=False)
+            if self._automation_title_prefix(item.name, item.cwd)
+        }
+
+    def discover(self) -> list[Candidate]:
+        return [
+            item
+            for item in self._records()
+            if not self.native_placeholder_title(item.name)
+            and not self._automation_title_prefix(item.name, item.cwd)
+        ]
+
+    def import_candidates(self) -> list[Candidate]:
+        return self.discover()
+
+    def launch_candidates(self) -> list[Candidate]:
+        return self._records(named_only=False)
+
+    def find_candidates(self, query: str) -> list[Candidate]:
+        return [
+            item
+            for item in self._records(query=query, named_only=False)
+            if not self._automation_title_prefix(item.name, item.cwd)
+        ]
+
+    def tracked_candidates(self, sessions: Iterable[Session]) -> list[Candidate]:
+        wanted = {item.session_id for item in sessions}
+        return [
+            item
+            for item in self._records(named_only=False)
+            if item.session_id in wanted
+            and not self._automation_title_prefix(item.name, item.cwd)
+        ]
+
+    def is_resumable(self, session_id: str) -> bool:
+        return any(item.session_id == session_id for item in self._records(query=session_id, named_only=False))
+
+    def new_argv(self, name: str, session_id: str | None = None) -> list[str]:
+        # OpenCode creates its own opaque ses_ identity. The installed Pika
+        # plugin consumes PIKA_NAME and renames the root session at creation.
+        return [self.executable() or self.name]
+
+    def resume_argv(self, session_id: str) -> list[str]:
+        return [self.executable() or self.name, "--session", session_id]
+
+    def usage(self, session: Session, store: Store) -> Usage | None:
+        if not self.database.is_file():
+            return None
+        try:
+            with self._connect() as db:
+                ids = self._tree_ids(db, session.provider_thread_id)
+                if not ids:
+                    return None
+                marks = ",".join("?" for _ in ids)
+                row = db.execute(
+                    "SELECT MAX(CASE WHEN id=? THEN model END) AS model, "
+                    "SUM(COALESCE(cost,0)) AS cost, "
+                    "SUM(COALESCE(tokens_input,0)) AS tokens_input, "
+                    "SUM(COALESCE(tokens_output,0)) AS tokens_output, "
+                    "SUM(COALESCE(tokens_reasoning,0)) AS tokens_reasoning, "
+                    "SUM(COALESCE(tokens_cache_read,0)) AS tokens_cache_read, "
+                    "SUM(COALESCE(tokens_cache_write,0)) AS tokens_cache_write "
+                    f"FROM session WHERE id IN ({marks}) AND time_archived IS NULL",
+                    [session.provider_thread_id, *ids],
+                ).fetchone()
+        except (OSError, sqlite3.Error):
+            return None
+        if row is None:
+            return None
+        result = Usage(
+            model=self._model(row["model"]) or session.model,
+            input_tokens=int(row["tokens_input"] or 0),
+            output_tokens=int(row["tokens_output"] or 0),
+            cached_input_tokens=int(row["tokens_cache_read"] or 0),
+            cache_write_tokens=int(row["tokens_cache_write"] or 0),
+        )
+        # OpenCode exposes reasoning separately; Pika's existing stable usage
+        # shape does not. Include it only in the exact cumulative total.
+        result.total_tokens = (
+            result.input_tokens
+            + result.output_tokens
+            + int(row["tokens_reasoning"] or 0)
+            + result.cached_input_tokens
+            + result.cache_write_tokens
+        )
+        result.estimated_cost_usd = float(row["cost"] or 0)
+        return result
+
+
 class _null_context:
     def __init__(self, value: Any):
         self.value = value
@@ -966,4 +1370,8 @@ def _reverse_lines(path: Path, *, block_size: int = 65536) -> Iterable[str]:
 
 
 def providers() -> dict[str, Provider]:
-    return {"codex": CodexProvider(), "claude": ClaudeProvider()}
+    return {
+        "codex": CodexProvider(),
+        "claude": ClaudeProvider(),
+        "opencode": OpenCodeProvider(),
+    }

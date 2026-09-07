@@ -38,6 +38,18 @@ def process_environment(pid: int) -> dict[str, str]:
     return result
 
 
+def process_tty(pid: int) -> str | None:
+    """Return the process's terminal device without inspecting its content."""
+    for descriptor in (0, 1, 2):
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{descriptor}")
+        except OSError:
+            continue
+        if target.startswith("/dev/pts/") or target.startswith("/dev/tty"):
+            return target
+    return None
+
+
 def _process_kind(argv: list[str]) -> str | None:
     """Classify agent executables without matching unrelated path fragments."""
     names = {Path(value).name.lower() for value in argv[:4]}
@@ -45,6 +57,8 @@ def _process_kind(argv: list[str]) -> str | None:
         return "claude"
     if names & {"codex", "codex.js"}:
         return "codex"
+    if names & {"opencode", "opencode.js"}:
+        return "opencode"
     return None
 
 
@@ -72,6 +86,19 @@ def parent_pid(pid: int) -> int | None:
     except (OSError, ValueError, IndexError):
         return None
     return value if value > 0 else None
+
+
+def process_state(pid: int) -> str | None:
+    """Return the one-letter Linux process state for race-safe tree checks."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        # comm is parenthesized and may contain spaces. The first field after
+        # the final ')' is stat field 3, the process state.
+        fields = raw[raw.rfind(")") + 2 :].split()
+        state = fields[0]
+    except (OSError, IndexError):
+        return None
+    return state if len(state) == 1 else None
 
 
 def process_start_time(pid: int | None) -> int | None:
@@ -133,14 +160,21 @@ def provider_process(root_pid: int | None, provider: str | None = None) -> int |
 def shared_provider_process(pid: int | None, provider: str) -> bool:
     """Return whether ``pid`` is shared provider infrastructure.
 
-    Codex hooks may execute beneath the long-lived app-server used by multiple
-    clients. That process is useful as a short-lived ownership hint, but its
-    continued existence cannot permanently prove that any one thread is open.
+    Codex hooks may execute beneath a shared app-server, and one OpenCode
+    process may emit events for several roots. These processes are useful as
+    short-lived ownership hints, but their continued existence cannot
+    permanently prove that any one conversation is open.
     """
-    if not pid or provider != "codex":
+    if not pid or provider not in {"codex", "opencode"}:
         return False
     argv = cmdline(pid)
-    return _process_kind(argv) == provider and "app-server" in argv
+    if _process_kind(argv) != provider:
+        return False
+    # One OpenCode process can visit/create several roots. Its hook ancestry is
+    # therefore a renewable routing hint, not permanent ownership of each root.
+    if provider == "opencode":
+        return True
+    return "app-server" in argv
 
 
 def process_stats(root_pid: int | None) -> tuple[float | None, int | None]:
@@ -186,6 +220,48 @@ def find_processes_with_session_id(session_id: str, provider: str) -> list[int]:
         if _process_kind(argv) == provider:
             matches.append(pid)
     return _canonical_identity_pids(matches)
+
+
+def opencode_session_processes(
+    proc_root: Path = Path("/proc"),
+) -> dict[str, list[int]]:
+    """Map every explicit OpenCode ``--session`` argument in one /proc pass."""
+    matches: dict[str, list[int]] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return matches
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        argv = [
+            part.decode(errors="replace")
+            for part in raw.split(b"\0")
+            if part
+        ]
+        if _process_kind(argv) != "opencode":
+            continue
+        session_ids: set[str] = set()
+        for index, value in enumerate(argv):
+            if value in {"--session", "-s"} and index + 1 < len(argv):
+                session_ids.add(argv[index + 1])
+            elif value.startswith("--session="):
+                session_ids.add(value.partition("=")[2])
+        for session_id in session_ids:
+            if (
+                session_id.startswith("ses_")
+                and 8 <= len(session_id) <= 128
+                and session_id[4:].isalnum()
+            ):
+                matches.setdefault(session_id, []).append(int(entry.name))
+    return {
+        session_id: _canonical_identity_pids(pids)
+        for session_id, pids in matches.items()
+    }
 
 
 def _canonical_identity_pids(pids: list[int]) -> list[int]:

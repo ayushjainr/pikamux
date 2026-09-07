@@ -26,7 +26,7 @@ def unit_contents(*, runtime_path: str | None = None) -> dict[Path, str]:
     return {
         directory / SERVICE_NAME: (
             "[Unit]\n"
-            "Description=Refresh one stale Pika expert card per provider\n\n"
+            "Description=Refresh one stale Pika thread profile per provider\n\n"
             "[Service]\n"
             "Type=oneshot\n"
             f'Environment="PATH={service_path}"\n'
@@ -36,7 +36,7 @@ def unit_contents(*, runtime_path: str | None = None) -> dict[Path, str]:
         ),
         directory / TIMER_NAME: (
             "[Unit]\n"
-            "Description=Check whether Pika expert cards are due for refresh\n\n"
+            "Description=Check whether Pika thread profiles are due for refresh\n\n"
             "[Timer]\n"
             "OnBootSec=10min\n"
             "OnUnitActiveSec=10min\n"
@@ -50,7 +50,7 @@ def unit_contents(*, runtime_path: str | None = None) -> dict[Path, str]:
 
 def _service_path() -> str:
     directories: list[str] = []
-    for name in ("codex", "claude", "node", "tmux", "git", "bash"):
+    for name in ("codex", "claude", "opencode", "node", "tmux", "git", "bash"):
         executable = shutil.which(name)
         if executable:
             directories.append(str(Path(executable).resolve().parent))

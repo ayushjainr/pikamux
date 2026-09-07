@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +17,7 @@ from pikamux.setup_hooks import (
     codex_hooks_change,
     codex_hooks_enabled,
     hooks_installed,
+    opencode_plugin_change,
     pika_config_change,
 )
 
@@ -30,8 +33,8 @@ class SetupTests(unittest.TestCase):
     def test_machine_alias_is_persisted_as_deployment_configuration(self) -> None:
         target = self.root / "config.json"
         with patch("pikamux.setup_hooks.config_path", return_value=target):
-            change = pika_config_change("codex", "rstudio-6")
-        self.assertEqual(json.loads(change.after)["machine_alias"], "rstudio-6")
+            change = pika_config_change("codex", "devbox")
+        self.assertEqual(json.loads(change.after)["machine_alias"], "devbox")
 
     def test_provider_executables_and_runtime_path_are_persisted(self) -> None:
         target = self.root / "config.json"
@@ -200,6 +203,88 @@ class SetupTests(unittest.TestCase):
         after = claude_settings_change(claude).after
         self.assertLess(after.index('"zeta"'), after.index('"model"'))
         self.assertLess(after.index('"model"'), after.index('"hooks"'))
+
+    def test_opencode_plugin_is_idempotent_and_maps_attention_events(self) -> None:
+        home = self.root / "opencode"
+        change = opencode_plugin_change(home)
+        self.assertIn('event.type === "question.asked"', change.after)
+        self.assertIn('send("QuestionRequest"', change.after)
+        self.assertIn("client.session.update", change.after)
+        self.assertIn("path: { id }", change.after)
+        self.assertIn("body: { title: desired }", change.after)
+        self.assertIn("p.info.parentID", change.after)
+        self.assertLess(
+            change.after.index('event.type === "session.deleted"'),
+            change.after.index("client.session.get"),
+        )
+        self.assertIn("updated && updated.error", change.after)
+        self.assertIn("observedTitle !== desired", change.after)
+        self.assertIn("deleted: true", change.after)
+        self.assertIn('send("SessionHeartbeat", currentRootId)', change.after)
+        self.assertIn("}, 60000)", change.after)
+        self.assertIn("heartbeat.unref()", change.after)
+        self.assertIn("expectedRootId", change.after)
+        self.assertEqual(
+            change.after.count('send("SessionHeartbeat", currentRootId)'), 2
+        )
+        self.assertIn("process.env.PIKA_SESSION_ID || null", change.after)
+        self.assertIn("let currentRootId = expectedRootId", change.after)
+        self.assertIn("initialNameClaimed", change.after)
+        apply_changes([change])
+        self.assertFalse(opencode_plugin_change(home).changed)
+        with patch("pikamux.setup_hooks.opencode_config_home", return_value=home):
+            self.assertTrue(hooks_installed("opencode"))
+
+    @unittest.skipUnless(shutil.which("node"), "node is required for plugin execution")
+    def test_opencode_plugin_executes_delete_and_name_verification_paths(self) -> None:
+        home = self.root / "plugin-runtime"
+        home.mkdir()
+        (home / "pika.mjs").write_text(opencode_plugin_change(home).after)
+        (home / "run.mjs").write_text(
+            '''import { Pika } from "./pika.mjs";
+const payloads = [];
+let gets = 0;
+globalThis.Bun = { spawn: () => {
+  let value = "";
+  return {
+    stdin: {
+      write: (part) => { value += part; },
+      end: () => { payloads.push(JSON.parse(value)); },
+    },
+    exited: Promise.resolve(0),
+  };
+}};
+const client = { session: {
+  get: async () => { gets += 1; return { data: { id: "ses_created123", parentID: null, title: "default" } }; },
+  update: async () => ({ error: "rename denied" }),
+}};
+const plugin = await Pika({ client, directory: "/repo" });
+await plugin.event({ event: { type: "session.deleted", properties: { info: { id: "ses_deleted123", parentID: null, title: "gone" } } } });
+const getsAfterDelete = gets;
+await plugin.event({ event: { type: "session.created", properties: { info: { id: "ses_created123", parentID: null, title: "default" } } } });
+console.log(JSON.stringify({ payloads, getsAfterDelete, gets }));
+'''
+        )
+        environment = os.environ.copy()
+        environment.pop("PIKA_EPHEMERAL", None)
+        environment["PIKA_NAME"] = "wanted"
+        result = subprocess.run(
+            [shutil.which("node") or "node", "run.mjs"],
+            cwd=home,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        observed = json.loads(result.stdout)
+        self.assertEqual(observed["getsAfterDelete"], 0)
+        self.assertEqual(observed["payloads"][0]["hook_event_name"], "SessionEnd")
+        self.assertTrue(observed["payloads"][0]["deleted"])
+        self.assertEqual(observed["payloads"][1]["hook_event_name"], "SessionStart")
+        self.assertEqual(observed["payloads"][1]["session_title"], "default")
+        self.assertEqual(observed["payloads"][1]["desired_name"], "wanted")
+        self.assertIn("rename denied", observed["payloads"][1]["native_name_error"])
 
 
 if __name__ == "__main__":

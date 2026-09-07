@@ -9,6 +9,7 @@ import selectors
 import shlex
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from collections.abc import Iterable
@@ -17,7 +18,7 @@ from typing import Any
 
 from . import __version__
 from .consult import ConsultationError, ConsultationPolicy
-from .experts import ExpertCardState, ExpertMatch, rank_experts
+from .experts import ExpertCardState, ExpertMatch, rank_experts, profile_freshness, expert_availability
 from .models import (
     Candidate,
     ExpertProfile,
@@ -31,7 +32,7 @@ from .models import (
 from .store import Store, load_config
 from .ui import choose_session, terminal_text
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 PROTOCOL_NAME = "pikamux-fleet"
 CAPABILITIES = (
     "inventory",
@@ -43,6 +44,8 @@ CAPABILITIES = (
     "untrack",
     "experts",
     "ask-jsonl",
+    "provider-opencode",
+    "expert-directory-v1",
 )
 REMOTE_STALE_SECONDS = 45.0
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
@@ -53,7 +56,7 @@ REMOTE_INSTALL_ARGV = (
     "pip",
     "install",
     "--user",
-    f"git+ssh://git@github.com/ajainwolfe/pikamux.git@v{__version__}",
+    f"git+https://github.com/ayushjainr/pikamux.git@v{__version__}",
 )
 
 _ALIAS = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
@@ -123,8 +126,10 @@ _PROFILE_FIELDS = {
     "artifacts",
     "updated_at",
     "source",
+    "scope_updated_at",
+    "current_state_updated_at",
 }
-_CARD_FIELDS = {"provider", "session_id", "status", "detail"}
+_CARD_FIELDS = {"provider", "session_id", "status", "detail", "watched", "availability", "current_state_status"}
 _BOOLEAN_SESSION_FIELDS = {
     "unread",
     "managed",
@@ -426,9 +431,9 @@ def discover_node_candidates(store: Store) -> list[NodeCandidate]:
     return result
 
 
-def session_to_wire(session: Session) -> dict[str, Any]:
+def session_to_wire(session: Session, *, extended: bool = False) -> dict[str, Any]:
     """Export metadata needed for operations, never transcript or process identity."""
-    return {
+    result = {
         "provider": session.provider,
         "session_id": session.session_id,
         "name": session.name,
@@ -457,6 +462,9 @@ def session_to_wire(session: Session) -> dict[str, Any]:
         "cpu_percent": session.cpu_percent,
         "rss_kb": session.rss_kb,
     }
+    if extended:
+        result["active_thread_id"] = session.active_thread_id
+    return result
 
 
 def candidate_to_wire(candidate: Candidate) -> dict[str, Any]:
@@ -473,8 +481,8 @@ def candidate_to_wire(candidate: Candidate) -> dict[str, Any]:
     }
 
 
-def _profile_to_wire(profile: ExpertProfile) -> dict[str, Any]:
-    return {
+def _profile_to_wire(profile: ExpertProfile, *, extended: bool = False) -> dict[str, Any]:
+    result = {
         "provider": profile.provider,
         "session_id": profile.session_id,
         "scope": profile.scope,
@@ -484,12 +492,16 @@ def _profile_to_wire(profile: ExpertProfile) -> dict[str, Any]:
         "updated_at": profile.updated_at,
         "source": profile.source,
     }
+    if extended:
+        result.update(scope_updated_at=profile.scope_updated_at or profile.updated_at,
+                      current_state_updated_at=profile.current_state_updated_at or profile.updated_at)
+    return result
 
 
 def _session_from_wire(value: object) -> Session:
     if not isinstance(value, dict):
         raise FleetError("Remote session record is not an object", kind="incompatible")
-    unknown = set(value) - _SESSION_FIELDS
+    unknown = set(value) - _SESSION_FIELDS - {"active_thread_id"}
     if unknown:
         raise FleetError(
             "Remote session contains unsupported fields: " + ", ".join(sorted(unknown)),
@@ -498,12 +510,15 @@ def _session_from_wire(value: object) -> Session:
     provider = value.get("provider")
     session_id = value.get("session_id")
     status = value.get("status")
-    if provider not in {"codex", "claude"}:
+    if provider not in {"codex", "claude", "opencode"}:
         raise FleetError("Remote session has an invalid provider", kind="incompatible")
     if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
         raise FleetError(
             "Remote session has an invalid conversation identity", kind="incompatible"
         )
+    active_thread_id = value.get("active_thread_id")
+    if active_thread_id is not None and (not isinstance(active_thread_id, str) or not _SESSION_ID.fullmatch(active_thread_id)):
+        raise FleetError("Remote session has an invalid active conversation identity", kind="incompatible")
     if status not in {item.value for item in Status}:
         raise FleetError("Remote session has an invalid state", kind="incompatible")
     identity_kind = value.get(
@@ -575,6 +590,7 @@ def _session_from_wire(value: object) -> Session:
     session = Session(
         provider=provider,
         session_id=session_id,
+        active_thread_id=active_thread_id,
         name=value.get("name"),
         cwd=value.get("cwd"),
         branch=value.get("branch"),
@@ -607,7 +623,7 @@ def _session_from_wire(value: object) -> Session:
 def _expert_identity(value: dict[str, Any], *, label: str) -> tuple[str, str]:
     provider = value.get("provider")
     session_id = value.get("session_id")
-    if provider not in {"codex", "claude"}:
+    if provider not in {"codex", "claude", "opencode"}:
         raise FleetError(f"Remote {label} has an invalid provider", kind="incompatible")
     if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
         raise FleetError(
@@ -653,6 +669,13 @@ def _validate_profiles(values: object) -> list[dict[str, Any]]:
             raise FleetError(
                 "Remote expert profile has an invalid timestamp", kind="incompatible"
             )
+        clocks = {}
+        for field in ("scope_updated_at", "current_state_updated_at"):
+            if field in value:
+                clock = value[field]
+                if isinstance(clock, bool) or not isinstance(clock, (int, float)) or not math.isfinite(clock) or clock < 0:
+                    raise FleetError("Remote expert clock is invalid", kind="incompatible")
+                clocks[field] = float(clock)
         result.append(
             {
                 "provider": provider,
@@ -667,6 +690,7 @@ def _validate_profiles(values: object) -> list[dict[str, Any]]:
                 ),
                 "updated_at": float(updated_at),
                 "source": _expert_text(value.get("source"), label="expert source"),
+                **clocks,
             }
         )
     return result
@@ -674,27 +698,43 @@ def _validate_profiles(values: object) -> list[dict[str, Any]]:
 
 def _validate_cards(values: object) -> list[dict[str, Any]]:
     if not isinstance(values, list):
-        raise FleetError("Remote expert cards are malformed", kind="incompatible")
+        raise FleetError("Remote thread profiles are malformed", kind="incompatible")
     result: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for value in values:
         if not isinstance(value, dict) or set(value) - _CARD_FIELDS:
-            raise FleetError("Remote expert card is malformed", kind="incompatible")
-        provider, session_id = _expert_identity(value, label="expert card")
+            raise FleetError("Remote thread profile is malformed", kind="incompatible")
+        provider, session_id = _expert_identity(value, label="thread profile")
         if (provider, session_id) in seen:
-            raise FleetError("Remote expert card is duplicated", kind="incompatible")
+            raise FleetError("Remote thread profile is duplicated", kind="incompatible")
         seen.add((provider, session_id))
         status = value.get("status")
         if status not in {"CURRENT", "STALE", "MISSING", "UNKNOWN"}:
             raise FleetError(
-                "Remote expert card has an invalid state", kind="incompatible"
+                "Remote thread profile has an invalid state", kind="incompatible"
             )
+        extensions = {}
+        if "watched" in value:
+            if not isinstance(value["watched"], bool):
+                raise FleetError("Remote watched flag is invalid", kind="incompatible")
+            extensions["watched"] = value["watched"]
+        if "availability" in value:
+            if value["availability"] not in {"source-available", "source-unavailable", "archived", "deleted", "provider-unavailable", "excluded-worker", "requires-reconciliation"}:
+                raise FleetError("Remote expert availability is invalid", kind="incompatible")
+            extensions["availability"] = value["availability"]
+        if "current_state_status" in value:
+            if value["current_state_status"] not in {"CURRENT", "STALE", "MISSING", "UNKNOWN"}:
+                raise FleetError("Remote work freshness is invalid", kind="incompatible")
+            extensions["current_state_status"] = value["current_state_status"]
         result.append(
             {
                 "provider": provider,
                 "session_id": session_id,
                 "status": status,
-                "detail": _expert_text(value.get("detail"), label="expert card detail"),
+                "detail": _expert_text(
+                    value.get("detail"), label="thread profile detail"
+                ),
+                **extensions,
             }
         )
     return result
@@ -707,7 +747,7 @@ def validate_snapshot(
         raise FleetError(
             "Remote did not return a complete snapshot", kind="incompatible"
         )
-    if set(value) != _SNAPSHOT_FIELDS:
+    if set(value) - {"expert_sessions"} != _SNAPSHOT_FIELDS:
         raise FleetError("Remote snapshot envelope is malformed", kind="incompatible")
     if (
         value.get("protocol") != PROTOCOL_NAME
@@ -735,18 +775,25 @@ def validate_snapshot(
             "Remote snapshot has no complete session list", kind="incompatible"
         )
     if any(
-        not isinstance(item, dict) or set(item) != _SESSION_FIELDS
+        not isinstance(item, dict) or set(item) - {"active_thread_id"} != _SESSION_FIELDS
         for item in sessions_raw
     ):
         raise FleetError(
             "Remote snapshot has a malformed session envelope", kind="incompatible"
         )
     sessions = [_session_from_wire(item) for item in sessions_raw]
+    expert_raw = value.get("expert_sessions", [])
+    if not isinstance(expert_raw, list) or any(not isinstance(item, dict) or set(item) - {"active_thread_id"} != _SESSION_FIELDS for item in expert_raw):
+        raise FleetError("Remote expert inventory is malformed", kind="incompatible")
+    expert_sessions = [_session_from_wire(item) for item in expert_raw]
     keys = [item.key for item in sessions]
     if len(keys) != len(set(keys)):
         raise FleetError(
             "Remote snapshot repeats a session identity", kind="incompatible"
         )
+    expert_keys = [item.key for item in expert_sessions]
+    if len(expert_keys) != len(set(expert_keys)) or set(expert_keys) & set(keys):
+        raise FleetError("Remote expert inventory repeats an identity", kind="incompatible")
     profiles = _validate_profiles(value.get("profiles"))
     cards = _validate_cards(value.get("cards"))
     captured_at = value.get("captured_at")
@@ -764,17 +811,20 @@ def validate_snapshot(
         raise FleetError(
             "Remote snapshot has an invalid machine name", kind="incompatible"
         )
-    return {
+    result = {
         "type": "snapshot",
         "protocol": PROTOCOL_NAME,
         "version": PROTOCOL_VERSION,
         "node_id": node_id,
         "machine": terminal_text(machine),
         "captured_at": float(captured_at),
-        "sessions": [session_to_wire(item) for item in sessions],
+        "sessions": [session_to_wire(item, extended="active_thread_id" in raw) for item, raw in zip(sessions, sessions_raw)],
         "profiles": profiles,
         "cards": cards,
     }
+    if "expert_sessions" in value:
+        result["expert_sessions"] = [session_to_wire(item, extended="active_thread_id" in raw) for item, raw in zip(expert_sessions, expert_raw)]
+    return result
 
 
 def _validate_mutation_receipt(
@@ -1110,6 +1160,7 @@ class FleetManager:
             node.ssh_target,
             {
                 "op": "snapshot",
+                "expert_directory": True,
                 "protocol": PROTOCOL_NAME,
                 "version": PROTOCOL_VERSION,
                 "expected_node_id": node.node_id,
@@ -1131,6 +1182,7 @@ class FleetManager:
                 node.ssh_target,
                 {
                     "op": "snapshot",
+                    "expert_directory": True,
                     "protocol": PROTOCOL_NAME,
                     "version": PROTOCOL_VERSION,
                     "expected_node_id": node.node_id,
@@ -1188,6 +1240,42 @@ class FleetManager:
                         ),
                     )
                 )
+        return result
+
+    def cached_expert_sessions(self, node_id: str | None = None) -> list[FleetSession]:
+        """Read retained expertise without adding unwatched rows to the board."""
+        result = self.cached_sessions(node_id)
+        now = time.time()
+        for node in self.nodes():
+            if node_id is not None and node.node_id != node_id:
+                continue
+            stored = self.store.get_remote_snapshot(node.node_id)
+            if stored is None:
+                continue
+            try:
+                payload = validate_snapshot(stored[0], expected_node_id=node.node_id)
+            except FleetError:
+                continue
+            fetched_at = stored[1]
+            for raw in payload.get("expert_sessions", []):
+                result.append(FleetSession(
+                    node.node_id, node.alias, _session_from_wire(raw),
+                    stale=node.status != "ready" or now - fetched_at > REMOTE_STALE_SECONDS,
+                    remote_error=node.last_error, seen_at=fetched_at, watched=False,
+                ))
+            cards = {(item["provider"], item["session_id"]): item for item in payload["cards"]}
+            profiles = {(item["provider"], item["session_id"]): item for item in payload["profiles"]}
+            for session in result:
+                if session.node_id != node.node_id:
+                    continue
+                card = cards.get(session.local_key, {})
+                profile = profiles.get(session.local_key, {})
+                session.card_status = card.get("status")
+                session.card_detail = card.get("detail")
+                session.availability = card.get("availability")
+                session.scope_updated_at = profile.get("scope_updated_at")
+                session.current_state_updated_at = profile.get("current_state_updated_at")
+                session.current_state_status = card.get("current_state_status")
         return result
 
     def remote_candidates(self, node: FleetNode) -> list[Candidate]:
@@ -1300,7 +1388,7 @@ class FleetManager:
             pass
         return session
 
-    def resolve(self, query: str, *, fresh: bool = True) -> FleetSession | None:
+    def resolve(self, query: str, *, fresh: bool = True, include_experts: bool = False) -> FleetSession | None:
         if "@" not in query:
             return None
         thread, alias = query.rsplit("@", 1)
@@ -1309,8 +1397,8 @@ class FleetManager:
             return None
         if fresh:
             self.refresh_node(node.node_id)
-        sessions = self.cached_sessions(node.node_id)
-        if any(item.stale for item in sessions):
+        sessions = (self.cached_expert_sessions(node.node_id) if include_experts else self.cached_sessions(node.node_id))
+        if fresh and any(item.stale for item in sessions):
             raise FleetError(
                 f"{alias} is not current; cached metadata was kept but no action was taken",
                 kind="unreachable",
@@ -1330,7 +1418,7 @@ class FleetManager:
             return matches[0]
         selected = choose_session(
             [item.session for item in matches],
-            f"Codex and Claude both have {thread!r} on {alias}",
+            f"Multiple providers have {thread!r} on {alias}",
         )
         return next(item for item in matches if item.local_key == selected.key)
 
@@ -1441,7 +1529,7 @@ class FleetManager:
     def expert_matches(self, query: str = "") -> list[ExpertMatch]:
         matches: list[ExpertMatch] = []
         by_node: dict[str, list[FleetSession]] = {}
-        for session in self.cached_sessions():
+        for session in self.cached_expert_sessions():
             by_node.setdefault(session.node_id, []).append(session)
         for node_id, sessions in by_node.items():
             stored = self.store.get_remote_snapshot(node_id)
@@ -1462,6 +1550,8 @@ class FleetManager:
                             float(raw.get("updated_at") or 0),
                             str(raw.get("source") or "remote"),
                             current_state=str(raw.get("current_state") or ""),
+                            scope_updated_at=raw.get("scope_updated_at"),
+                            current_state_updated_at=raw.get("current_state_updated_at"),
                         )
                     )
                 except (KeyError, TypeError, ValueError):
@@ -1480,6 +1570,7 @@ class FleetManager:
                             wrapper,
                             match.score,
                             match.matched_on,
+                            watched=wrapper.watched,
                         )
                     )
         return sorted(
@@ -1494,7 +1585,7 @@ class FleetManager:
 
     def expert_card_states(self) -> list[ExpertCardState]:
         result: list[ExpertCardState] = []
-        sessions = {item.key: item for item in self.cached_sessions()}
+        sessions = {item.key: item for item in self.cached_expert_sessions()}
         profiles = {item.session.key: item.profile for item in self.expert_matches("")}
         for node in self.nodes():
             stored = self.store.get_remote_snapshot(node.node_id)
@@ -1543,6 +1634,10 @@ class RemoteConsultation:
         self.node = node
         self.session = session
         self.policy = policy
+        self._progress_callback = None
+        self._cleanup_confirmed = False
+        self._transport_aborted = False
+        self._reader_lock = threading.RLock()
         command = [
             *transport.base(node.ssh_target),
             "pika",
@@ -1571,23 +1666,26 @@ class RemoteConsultation:
         self._stdout_buffer = bytearray()
         self._stderr_buffer = bytearray()
         try:
-            opened = self._read_event(12.0)
-        except BaseException:
-            self.close()
+            opened = self._read_event(240.0)
+        except BaseException as exc:
+            self._abort()
+            exc.cleanup = "unknown"
             raise
         if (
             opened.get("type") != "opened"
-            or opened.get("parent_id") != session.session_id
+            or opened.get("parent_id") != session.provider_thread_id
+            or opened.get("workstream_id", opened.get("parent_id")) != session.session_id
             or opened.get("provider") != session.provider
         ):
-            self.close()
+            self._abort()
             raise ConsultationError(
-                "Remote side channel returned the wrong parent identity"
+                "Remote side channel returned a different conversation identity; no question was sent. "
+                f"Refresh expert lookup for {session.session_id}@{session.node_name} before retrying."
             )
         receipt = policy.receipt()
         for key in ("consultation_mode", "model", "effort"):
             if opened.get(key) != receipt.get(key):
-                self.close()
+                self._abort()
                 raise ConsultationError(
                     f"Remote side channel did not honor requested {key.replace('_', ' ')}"
                 )
@@ -1598,11 +1696,38 @@ class RemoteConsultation:
     def __exit__(self, *_args: object) -> None:
         self.close()
 
+    def set_progress_callback(self, callback) -> None:
+        self._progress_callback = callback
+
     def _read_event(self, timeout: float) -> dict[str, Any]:
+        if not hasattr(self, "_reader_lock"):
+            self._reader_lock = threading.RLock()
+        with self._reader_lock:
+            return self._read_event_serial(timeout)
+
+    def _read_event_serial(self, timeout: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
         try:
-            return self._read_event_bounded(timeout)
-        except ConsultationError:
-            self._abort()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ConsultationError("Remote side channel timed out")
+                event = self._read_event_bounded(remaining)
+                if event.get("type") != "progress":
+                    return event
+                stage = event.get("stage")
+                delivery = event.get("delivery")
+                if (
+                    self._progress_callback
+                    and stage in {"prepare", "turn", "response", "cleanup"}
+                    and delivery in {"not_sent", "unknown", "confirmed"}
+                ):
+                    self._progress_callback(stage, delivery)
+        except ConsultationError as exc:
+            # A remote provider error is followed by its cleanup receipt. Keep
+            # the channel alive so close() can collect that evidence.
+            if not isinstance(getattr(exc, "receipt", None), dict):
+                self._abort()
             raise
 
     def _read_event_bounded(self, timeout: float) -> dict[str, Any]:
@@ -1674,12 +1799,20 @@ class RemoteConsultation:
         if not isinstance(event, dict):
             raise ConsultationError("Remote side channel event is not an object")
         if event.get("type") == "error":
-            raise ConsultationError(
+            error = ConsultationError(
                 str(event.get("message") or "remote consultation failed")
             )
+            error.receipt = {
+                key: event[key] for key in (
+                    "stage", "delivery", "cleanup", "answers_received", "turn",
+                    "elapsed_seconds", "stage_elapsed_seconds", "retry_safe",
+                ) if key in event
+            }
+            raise error
         return event
 
     def _abort(self) -> None:
+        self._transport_aborted = True
         process = getattr(self, "process", None)
         if process is None or process.poll() is not None:
             return
@@ -1690,36 +1823,114 @@ class RemoteConsultation:
             process.kill()
 
     def ask(self, question: str) -> str:
+        with self._reader_lock:
+            return self._ask_serial(question)
+
+    def _ask_serial(self, question: str) -> str:
+        if self._progress_callback:
+            self._progress_callback("turn", "not_sent")
         if not question.strip():
             raise ConsultationError("Question cannot be empty")
+        if self._cleanup_confirmed or self._transport_aborted:
+            raise ConsultationError("Remote side channel is closed")
         assert self.process.stdin is not None
+        if self._progress_callback:
+            self._progress_callback("turn", "unknown")
         self.process.stdin.write(
             (json.dumps({"question": question}, ensure_ascii=False) + "\n").encode(
                 "utf-8"
             )
         )
         self.process.stdin.flush()
-        event = self._read_event(300.0)
+        event = self._read_event(1200.0)
         if event.get("type") != "answer" or not isinstance(event.get("text"), str):
             raise ConsultationError("Remote side channel returned an invalid answer")
+        if self._progress_callback:
+            self._progress_callback("response", "confirmed")
         return str(event["text"])
 
     def close(self) -> None:
-        process = getattr(self, "process", None)
-        if process is None or process.poll() is not None:
-            return
-        try:
-            if process.stdin is not None:
-                process.stdin.write(b'{"close":true}\n')
-                process.stdin.flush()
-                process.stdin.close()
-            process.wait(timeout=2)
-        except (OSError, ValueError, subprocess.TimeoutExpired):
+        if not self._reader_lock.acquire(blocking=False):
+            # The board can cancel from another thread. Do not run a second
+            # stdout reader and accidentally consume the answer as a receipt.
+            # SSH teardown alone cannot prove remote provider cleanup.
             self._abort()
+            error = ConsultationError(
+                "Remote side connection closed while an answer was pending; cleanup is unconfirmed. "
+                f"Do not resend the question; inspect the consultation on {self.node.ssh_target}."
+            )
+            error.receipt = {"stage": "cleanup", "cleanup": "unknown"}
+            raise error
+        try:
+            self._close_serial()
+        finally:
+            self._reader_lock.release()
+
+    def _close_serial(self) -> None:
+        if self._cleanup_confirmed:
+            return
+        process = getattr(self, "process", None)
+        if process is None or self._transport_aborted:
+            error = ConsultationError(
+                "Remote cleanup is unconfirmed after the connection closed. "
+                "Do not resend the question; inspect the consultation on "
+                f"{self.node.ssh_target}."
+            )
+            error.receipt = {"stage": "cleanup", "cleanup": "unknown"}
+            raise error
+        deadline = time.monotonic() + 30.0
+        try:
+            if process.stdin is not None and not process.stdin.closed:
+                try:
+                    process.stdin.write(b'{"close":true}\n')
+                    process.stdin.flush()
+                    process.stdin.close()
+                except BrokenPipeError:
+                    # The remote may already have failed and queued a terminal
+                    # cleanup receipt before closing its input.
+                    pass
+            while True:
+                try:
+                    event = self._read_event(max(0.0, deadline - time.monotonic()))
+                except ConsultationError as exc:
+                    if isinstance(getattr(exc, "receipt", None), dict):
+                        continue
+                    raise
+                if event.get("type") != "closed":
+                    raise ConsultationError("Remote cleanup returned an unexpected event")
+                if (
+                    event.get("receipt_version") != 2
+                    or event.get("discarded") is not True
+                    or event.get("cleanup") != "complete"
+                ):
+                    error = ConsultationError(
+                        "Remote side cleanup was not verified. Keep any received answer; "
+                        f"inspect the consultation on {self.node.ssh_target}."
+                    )
+                    error.receipt = {
+                        "stage": "cleanup",
+                        "cleanup": "failed" if event.get("cleanup") == "failed" else "unknown",
+                    }
+                    raise error
+                process.wait(timeout=max(0.1, min(2.0, deadline - time.monotonic())))
+                self._cleanup_confirmed = True
+                return
+        except (OSError, ValueError, subprocess.TimeoutExpired, ConsultationError) as exc:
+            self._abort()
+            if isinstance(exc, ConsultationError):
+                if not isinstance(getattr(exc, "receipt", None), dict):
+                    exc.receipt = {"stage": "cleanup", "cleanup": "unknown"}
+                raise
+            error = ConsultationError(
+                "Remote cleanup could not be confirmed; keep any received answer. "
+                f"Inspect the consultation on {self.node.ssh_target}: {exc}"
+            )
+            error.receipt = {"stage": "cleanup", "cleanup": "unknown"}
+            raise error from exc
 
 
 def _exact_local_session(pika: Any, provider: object, session_id: object) -> Session:
-    if provider not in {"codex", "claude"} or not isinstance(session_id, str):
+    if provider not in {"codex", "claude", "opencode"} or not isinstance(session_id, str):
         raise FleetError("Invalid exact session identity", kind="invalid_request")
     session = pika.store.get_session(provider, session_id)
     if session is None:
@@ -1787,7 +1998,23 @@ def handle_fleet_stdio(pika: Any, stdin: Any, stdout: Any) -> int:
             if op == "snapshot":
                 sessions = pika.refresh(usage=False)
                 profiles = pika.store.list_expert_profiles()
-                cards = pika.expert_card_states(sessions)
+                extended = request.get("expert_directory") is True
+                unwatched = []
+                if extended:
+                    loader = getattr(pika.store, "list_untracked_sessions", None)
+                    unwatched = loader() if callable(loader) else []
+                    hidden = pika.hidden_session_keys(unwatched) if unwatched else set()
+                    profile_keys = {item.key for item in profiles}
+                    unwatched = [item for item in unwatched if item.key not in hidden and item.key in profile_keys]
+                expert_sessions = [*sessions, *unwatched]
+                visible_keys = {item.key for item in expert_sessions}
+                profiles = [item for item in profiles if item.key in visible_keys]
+                cards = pika.expert_card_states(expert_sessions)
+                card_keys = {item.session.key for item in cards}
+                unwatched = [item for item in unwatched if item.key in card_keys]
+                visible_keys = {item.key for item in [*sessions, *unwatched]}
+                profiles = [item for item in profiles if item.key in visible_keys]
+                unwatched_keys = {item.key for item in unwatched}
                 emit(
                     {
                         "type": "snapshot",
@@ -1796,17 +2023,23 @@ def handle_fleet_stdio(pika: Any, stdin: Any, stdout: Any) -> int:
                         "node_id": node_id,
                         "machine": local_machine_name(),
                         "captured_at": time.time(),
-                        "sessions": [session_to_wire(item) for item in sessions],
-                        "profiles": [_profile_to_wire(item) for item in profiles],
+                        "sessions": [session_to_wire(item, extended=extended) for item in sessions],
+                        "profiles": [_profile_to_wire(item, extended=extended) for item in profiles],
                         "cards": [
                             {
                                 "provider": item.session.provider,
                                 "session_id": item.session.session_id,
                                 "status": item.status,
                                 "detail": item.detail,
+                                **({
+                                    "watched": item.session.key not in unwatched_keys,
+                                    "availability": item.availability or expert_availability(item.session),
+                                    "current_state_status": profile_freshness(item.session, item.profile)["current_state_status"],
+                                } if extended else {}),
                             }
                             for item in cards
                         ],
+                        **({"expert_sessions": [session_to_wire(item, extended=True) for item in unwatched]} if extended else {}),
                     }
                 )
                 continue
@@ -1882,7 +2115,7 @@ def handle_fleet_stdio(pika: Any, stdin: Any, stdout: Any) -> int:
                 provider = request.get("provider")
                 session_id = request.get("session_id")
                 if (
-                    provider in {"codex", "claude"}
+                    provider in {"codex", "claude", "opencode"}
                     and isinstance(session_id, str)
                     and pika.store.is_untracked(provider, session_id)
                 ):
@@ -1914,7 +2147,7 @@ def handle_fleet_stdio(pika: Any, stdin: Any, stdout: Any) -> int:
                     {
                         "type": "peek",
                         "node_id": node_id,
-                        "text": pika.tmux.capture(pane.pane_id, lines),
+                        "text": pika.capture(session, lines),
                     }
                 )
             elif op == "acknowledge":

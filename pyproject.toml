@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pikamux"
-version = "0.4.4"
-description = "Persistent Identity Keeper for Codex and Claude sessions in tmux"
+version = "0.5.0a1"
+description = "Find, recover, and consult your existing coding-agent conversations"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "Pikamux contributors" }]
-keywords = ["tmux", "codex", "claude", "cli"]
+authors = [{ name = "Ayush Jain" }]
+keywords = ["tmux", "codex", "claude", "opencode", "cli"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -22,11 +22,29 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Repository = "https://github.com/ayushjainr/pikamux"
+Issues = "https://github.com/ayushjainr/pikamux/issues"
+Documentation = "https://github.com/ayushjainr/pikamux#readme"
+
+[dependency-groups]
+dev = ["pytest>=8.3,<10", "pytest-subtests>=0.14,<1", "pytest-timeout>=2.3,<3"]
+
 [project.scripts]
 pika = "pikamux.entrypoint:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pikamux"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/pikamux", "/tests", "/docs", "/README.md", "/LICENSE",
+  "/DESIGN.md", "/CONTRIBUTING.md", "/SECURITY.md", "/CHANGELOG.md",
+  "/pyproject.toml", "/uv.lock",
+]
+
+[tool.hatch.build]
+exclude = ["**/__pycache__", "**/*.pyc", "**/*.pika-backup*", "**/pika-skill-backup-*", "**/*.local.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

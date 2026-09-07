@@ -27,15 +27,25 @@ from .consult import (
     consultation_for,
     consultation_policy,
 )
-from .core import PENDING_LAUNCH_GRACE_SECONDS, Pika, PikaError, SharedLeaseConflict
+from .core import (
+    PENDING_LAUNCH_GRACE_SECONDS,
+    OutsideLiveConflict,
+    Pika,
+    PikaError,
+    SharedLeaseConflict,
+)
 from .doctor import repair_stale_state, run_doctor
 from .executables import (
+    PROVIDER_NAMES,
     executable_available,
     executable_version,
+    provider_compatibility_error,
+    provider_version_supported,
     setup_executables,
     setup_runtime_path,
 )
 from .expert_schedule import SERVICE_NAME, TIMER_NAME, activate_timer
+from .explain import explain_session
 from .fleet import (
     REMOTE_INSTALL_ARGV,
     FleetError,
@@ -47,7 +57,9 @@ from .fleet import (
 from .hooks import handle_hook, handle_process_exit, hook_stdout
 from .models import Candidate, FleetSession, NodeCandidate, PendingLaunch, Session, Status
 from .monitor import run_monitor
-from .paths import config_path, database_path
+from .paths import config_path, database_path, codex_home
+from .skill_package import install_skill, skill_text
+from .processes import process_tty
 from .setup_hooks import (
     apply_changes,
     hook_spec_fingerprint,
@@ -65,13 +77,17 @@ from .ui import (
     print_node_candidates,
     print_node_discovery_report,
     print_sessions,
+    provider_identity_label,
+    provider_label,
     terminal_text,
 )
 
 PUBLIC_COMMANDS = {
+    "activity",
     "ask",
     "expert",
     "experts",
+    "explain",
     "open",
     "list",
     "next",
@@ -84,6 +100,7 @@ PUBLIC_COMMANDS = {
     "doctor",
     "machines",
     "sync",
+    "skill",
 }
 INTERNAL_COMMANDS = {
     "_enter",
@@ -102,14 +119,17 @@ ADVANCED_COMMANDS = {"open", "new", "adopt"}
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pika",
-        description="Persistent Identity Keeper for Codex and Claude sessions in tmux.",
+        description=(
+            "Bring back the exact Codex, Claude, or OpenCode conversation, even after "
+            "the terminal is gone."
+        ),
         epilog="Use `pika NAME` to find, protect, attach, resume, or create safely.",
     )
     parser.add_argument("--version", action="version", version=f"pikamux {__version__}")
     sub = parser.add_subparsers(
         dest="command",
         metavar=(
-            "{ask,expert,experts,list,next,peek,wait,untrack,setup,doctor,"
+            "{activity,ask,expert,experts,explain,skill,list,next,peek,wait,untrack,setup,doctor,"
             "machines,sync}"
         ),
     )
@@ -143,11 +163,11 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     expert_parser = sub.add_parser(
-        "expert", help="inspect, refresh, publish, or clear expert cards"
+        "expert", help="inspect, refresh, publish, or clear thread profiles"
     )
     expert_sub = expert_parser.add_subparsers(dest="expert_command", required=True)
     publish_parser = expert_sub.add_parser(
-        "publish", help="publish a provenance-bound expert card from this Pika pane"
+        "publish", help="publish this exact conversation's thread profile"
     )
     publish_parser.add_argument(
         "--scope",
@@ -166,38 +186,63 @@ def _parser() -> argparse.ArgumentParser:
         "--topic", action="append", required=True, help="repeat or comma-separate"
     )
     publish_parser.add_argument("--artifact", action="append", default=[])
-    expert_sub.add_parser("clear", help="remove this conversation's expert card")
+    update_parser = expert_sub.add_parser(
+        "update", help="publish a small current-work change from this exact conversation"
+    )
+    update_parser.add_argument("--now", "--current-state", dest="current_state", required=True)
+    update_parser.add_argument("--json", action="store_true")
+    expert_sub.add_parser("clear", help="remove this conversation's thread profile")
     refresh_parser = expert_sub.add_parser(
-        "refresh", help="interview exact conversations and refresh their expert cards"
+        "refresh", help="interview exact conversations and refresh thread profiles"
     )
     refresh_parser.add_argument("name", nargs="?")
     refresh_mode = refresh_parser.add_mutually_exclusive_group()
     refresh_mode.add_argument(
-        "--all", action="store_true", help="refresh all missing or changed cards now"
+        "--all",
+        action="store_true",
+        help="refresh all missing or changed thread profiles now",
     )
     refresh_mode.add_argument(
         "--due",
         action="store_true",
         help="refresh only when weekly quota is near reset with >10%% left",
     )
-    refresh_parser.add_argument("--provider", choices=("codex", "claude"))
+    refresh_parser.add_argument("--provider", choices=PROVIDER_NAMES)
     refresh_parser.add_argument("--json", action="store_true")
     status_parser = expert_sub.add_parser(
-        "status", help="show which expert cards are current, stale, or missing"
+        "status", help="show which thread profiles are current, stale, or missing"
     )
     status_parser.add_argument("--json", action="store_true")
 
     experts_parser = sub.add_parser(
-        "experts", help="find UUID-bound experts by topic, project, or artifact"
+        "experts",
+        help="find exact conversation threads by topic, project, or artifact",
     )
     experts_parser.add_argument("query", nargs="*")
     experts_parser.add_argument("--json", action="store_true")
+
+    explain_parser = sub.add_parser("explain", help="show the evidence behind a conversation's state")
+    explain_parser.add_argument("name")
+    explain_parser.add_argument("--json", action="store_true")
+
+    skill_parser = sub.add_parser("skill", help="show or install the bundled agent-convo skill")
+    skill_sub = skill_parser.add_subparsers(dest="skill_command", required=True)
+    skill_sub.add_parser("show", help="print the bundled skill")
+    skill_install = skill_sub.add_parser("install", help="install with a backup of any previous SKILL.md")
+    skill_install.add_argument("path", nargs="?", help="destination skill directory (default: Codex agent-convo directory)")
+    skill_install.add_argument("--json", action="store_true")
 
     list_parser = sub.add_parser("list", help="list all tracked conversations")
     list_parser.add_argument("--json", action="store_true")
     list_parser.add_argument(
         "--no-usage", action="store_true", help="skip token and cost calculation"
     )
+
+    activity_parser = sub.add_parser(
+        "activity", help="show the transcript-free attention history"
+    )
+    activity_parser.add_argument("--limit", type=int, default=20)
+    activity_parser.add_argument("--json", action="store_true")
     list_parser.add_argument(
         "--all-machines",
         action="store_true",
@@ -232,7 +277,7 @@ def _parser() -> argparse.ArgumentParser:
 
     new_parser = sub.add_parser("new", help=argparse.SUPPRESS)
     new_parser.add_argument("name")
-    new_parser.add_argument("--agent", choices=("codex", "claude"))
+    new_parser.add_argument("--agent", choices=PROVIDER_NAMES)
     new_parser.add_argument("--cwd")
 
     adopt_parser = sub.add_parser("adopt", help=argparse.SUPPRESS)
@@ -246,17 +291,22 @@ def _parser() -> argparse.ArgumentParser:
     untrack_parser.add_argument("name")
 
     setup_parser = sub.add_parser("setup", help="preview and install lifecycle hooks")
-    setup_parser.add_argument("--default-provider", choices=("codex", "claude"))
+    setup_parser.add_argument("--default-provider", choices=PROVIDER_NAMES)
     setup_parser.add_argument("--codex-executable")
     setup_parser.add_argument("--claude-executable")
+    setup_parser.add_argument("--opencode-executable")
     setup_parser.add_argument(
         "--machine-alias",
-        help="human name for this Pika node (for example rstudio-6)",
+        help="human name for this Pika node (for example devbox)",
     )
     setup_parser.add_argument(
         "--yes", action="store_true", help="apply the displayed changes"
     )
     setup_parser.add_argument("--dry-run", action="store_true")
+    setup_parser.add_argument(
+        "--skip-walkthrough", action="store_true",
+        help="skip the first-conversation recovery walkthrough",
+    )
     setup_parser.add_argument("--no-import", action="store_true")
     setup_parser.add_argument("--import-all", action="store_true")
     setup_parser.add_argument(
@@ -319,10 +369,10 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     hook_parser = sub.add_parser("hook", help=argparse.SUPPRESS)
-    hook_parser.add_argument("--provider", required=True, choices=("codex", "claude"))
+    hook_parser.add_argument("--provider", required=True, choices=PROVIDER_NAMES)
 
     exit_parser = sub.add_parser("_process-exit", help=argparse.SUPPRESS)
-    exit_parser.add_argument("--provider", required=True, choices=("codex", "claude"))
+    exit_parser.add_argument("--provider", required=True, choices=PROVIDER_NAMES)
     exit_parser.add_argument("--session-id")
     exit_parser.add_argument("--launch-token")
     exit_parser.add_argument("--owner-token")
@@ -332,7 +382,7 @@ def _parser() -> argparse.ArgumentParser:
     popup_parser.add_argument("--target", required=True)
     popup_parser.add_argument("--lines", required=True, type=int)
     popup_parser.add_argument("--name", required=True)
-    popup_parser.add_argument("--provider", required=True, choices=("codex", "claude"))
+    popup_parser.add_argument("--provider", required=True, choices=PROVIDER_NAMES)
     popup_parser.add_argument("--session-id", required=True)
 
     fleet_parser = sub.add_parser("_fleet", help=argparse.SUPPRESS)
@@ -340,12 +390,12 @@ def _parser() -> argparse.ArgumentParser:
 
     fleet_open = sub.add_parser("_fleet-open", help=argparse.SUPPRESS)
     fleet_open.add_argument("--expected-node-id", required=True)
-    fleet_open.add_argument("--provider", required=True, choices=("codex", "claude"))
+    fleet_open.add_argument("--provider", required=True, choices=PROVIDER_NAMES)
     fleet_open.add_argument("--session-id", required=True)
 
     fleet_ask = sub.add_parser("_fleet-ask", help=argparse.SUPPRESS)
     fleet_ask.add_argument("--expected-node-id", required=True)
-    fleet_ask.add_argument("--provider", required=True, choices=("codex", "claude"))
+    fleet_ask.add_argument("--provider", required=True, choices=PROVIDER_NAMES)
     fleet_ask.add_argument("--session-id", required=True)
     fleet_ask.add_argument("--fast", action="store_true")
     client_pair = sub.add_parser("_client-pair", help=argparse.SUPPRESS)
@@ -392,13 +442,14 @@ def _confirm_shared_lease(pika: Pika, conflict: SharedLeaseConflict) -> int:
         ) from conflict
     print(
         f"pika: {terminal_text(session.display_name)} may still be open in another "
-        f"{session.provider.title()} client. Exit it everywhere before confirming; "
-        "Pika will then resume the exact UUID in its protected home.",
+            f"{provider_label(session.provider)} client. Exit it everywhere before confirming; "
+            "Pika will then resume the exact "
+            f"{provider_identity_label(session.provider)} in its protected home.",
         file=sys.stderr,
     )
     answer = input(
         f"Have you exited {terminal_text(session.display_name)!r} in every "
-        f"{session.provider.title()} client? [y/N] "
+        f"{provider_label(session.provider)} client? [y/N] "
     ).strip().casefold()
     if answer not in {"y", "yes"}:
         print(
@@ -410,11 +461,63 @@ def _confirm_shared_lease(pika: Pika, conflict: SharedLeaseConflict) -> int:
     return pika.recover_after_closed_confirmation(session)
 
 
+def _confirm_outside_live(pika: Pika, conflict: OutsideLiveConflict) -> int:
+    """Offer one explicit, generation-pinned takeover without weakening identity."""
+    session = conflict.session
+    reopen_command = shlex.join(["pika", session.display_name])
+    pid = conflict.process_identities[0][0]
+    tty_name = process_tty(pid)
+    location = f" · terminal {tty_name}" if tty_name else ""
+    terminal_location = f" on terminal {tty_name}" if tty_name else ""
+    if not sys.stdin.isatty():
+        raise PikaError(
+            f"{conflict} Interactive choice is required. In the original "
+            f"{provider_label(session.provider)} client{terminal_location}, run `/exit`, wait for "
+            f"the shell prompt, then run exactly: `{reopen_command}`."
+        ) from conflict
+    print(
+        f"pika: exact {provider_label(session.provider)} conversation "
+        f"{terminal_text(session.display_name)!r} is live outside Pika "
+        f"(PID {pid}{location}).",
+        file=sys.stderr,
+    )
+    print(
+        "  1. Keep it there (recommended) — no process or state changes",
+        file=sys.stderr,
+    )
+    print(
+        "  2. Clean and attach here — request a graceful stop, then resume the "
+        f"same exact {provider_identity_label(session.provider)} in Pika",
+        file=sys.stderr,
+    )
+    print("  3. Cancel — no process or state changes", file=sys.stderr)
+    answer = input("Choose 1-3 [1]: ").strip()
+    if answer == "2":
+        print(
+            f"pika: stopping exact {provider_label(session.provider)} PID {pid}; this may "
+            "interrupt its current turn. Pika will not force-kill it.",
+            file=sys.stderr,
+        )
+        return pika.clean_and_attach(conflict)
+    if answer in {"3", "q", "cancel"}:
+        print("pika: Cancelled. No state changed.", file=sys.stderr)
+        return 1
+    print(
+        f"pika: Keep using the existing {provider_label(session.provider)} client"
+        f"{terminal_location}. To move it later, run `/exit`, wait for the shell prompt, "
+        f"then run exactly: `{reopen_command}`.",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _open_with_shared_lease_confirmation(
     pika: Pika, session: Session | FleetSession
 ) -> int:
     try:
         return pika.open(session)
+    except OutsideLiveConflict as exc:
+        return _confirm_outside_live(pika, exc)
     except SharedLeaseConflict as exc:
         return _confirm_shared_lease(pika, exc)
 
@@ -504,7 +607,11 @@ def _ask(
     jsonl: bool = False,
     fast: bool = False,
 ) -> int:
-    session = _select_named(pika, name)
+    session = (
+        pika.resolve_expert_target(name)
+        if hasattr(type(pika), "resolve_expert_target")
+        else _select_named(pika, name)
+    )
     return _ask_session(pika, session, question_parts, jsonl=jsonl, fast=fast)
 
 
@@ -516,6 +623,8 @@ def _ask_session(
     jsonl: bool = False,
     fast: bool = False,
 ) -> int:
+    from .consult_reporting import ConsultationRun
+
     if not isinstance(session, FleetSession) and not session.transcript_path:
         raise PikaError(
             f"{session.display_name} has no durable provider transcript to consult"
@@ -527,18 +636,25 @@ def _ask_session(
     if not initial and not interactive and not jsonl:
         raise PikaError("Provide a question as arguments or on stdin")
 
+    def progress(payload: dict[str, object]) -> None:
+        if jsonl:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+
     try:
-        consultation = (
-            pika.consultation(session, fast=fast)
-            if hasattr(type(pika), "consultation")
-            else consultation_for(session, fast=fast)
+        consultation = ConsultationRun.open(
+            lambda: (
+                pika.consultation(session, fast=fast)
+                if hasattr(type(pika), "consultation")
+                else consultation_for(session, fast=fast)
+            ),
+            on_event=progress,
         )
+        if jsonl:
+            return _ask_jsonl(consultation, session, initial)
         with consultation:
-            if jsonl:
-                return _ask_jsonl(consultation, session, initial)
             print(
                 f"SIDE · {terminal_text(session.display_name)} · "
-                f"{session.provider.title()} · parent {session.session_id[:8]} · "
+                f"{provider_label(session.provider)} · parent {session.provider_thread_id[:8]} · "
                 f"EPHEMERAL · {consultation.policy.label}"
             )
             pending = initial
@@ -569,7 +685,7 @@ def _ask_session(
                 pending = ""
                 if not interactive:
                     break
-    except ConsultationError as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         if jsonl:
             try:
                 policy = consultation_policy(session, fast=fast)
@@ -582,7 +698,10 @@ def _ask_session(
                 receipt = {}
             print(
                 json.dumps(
-                    {"type": "error", "message": str(exc), **receipt},
+                    {
+                        "type": "error", "message": str(exc) or "Consultation interrupted",
+                        **receipt, **getattr(exc, "receipt", {}),
+                    },
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
@@ -598,60 +717,107 @@ def _ask_session(
 
 
 def _ask_jsonl(consultation: Consultation, session: Session, initial: str) -> int:
+    from .consult_reporting import ConsultationRun
+
     def emit(payload: dict[str, object]) -> None:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
 
-    emit(
-        {
-            "type": "opened",
-            "ephemeral": True,
-            "provider": session.provider,
-            "parent_id": session.session_id,
-            "name": session.display_name,
-            **consultation.policy.receipt(),
-        }
-    )
+    if not isinstance(consultation, ConsultationRun):
+        native = consultation
+        consultation = ConsultationRun.open(lambda: native, on_event=emit)
+
+    opened = {
+        "type": "opened",
+        "ephemeral": True,
+        "provider": session.provider,
+        "workstream_id": session.session_id,
+        "parent_id": session.provider_thread_id,
+        "name": session.display_name,
+        **consultation.receipt(),
+        **consultation.policy.receipt(),
+    }
 
     def handle(question: str) -> None:
+        answer = consultation.ask(question)
         emit(
             {
                 "type": "answer",
-                "text": consultation.ask(question),
+                "text": answer,
+                **consultation.receipt(),
                 **consultation.policy.receipt(),
             }
         )
 
-    if initial:
-        handle(initial)
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            request = json.loads(line)
-        except ValueError as exc:
-            raise ConsultationError(f"Invalid JSONL request: {exc}") from exc
-        if not isinstance(request, dict):
-            raise ConsultationError("Each JSONL request must be an object")
-        if request.get("close") is True:
-            break
-        question = request.get("question")
-        if not isinstance(question, str) or not question.strip():
-            raise ConsultationError(
-                'Each JSONL request needs a non-empty "question" or {"close":true}'
-            )
-        handle(question)
-    emit(
-        {
-            "type": "closed",
-            "discarded": True,
-            "parent_transcript_unchanged": True,
+    result = 0
+    try:
+        emit(opened)
+        if initial:
+            handle(initial)
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            try:
+                request = json.loads(line)
+                if not isinstance(request, dict):
+                    raise ValueError("Each JSONL request must be an object")
+                if request.get("close") is True:
+                    break
+                question = request.get("question")
+                if not isinstance(question, str) or not question.strip():
+                    raise ValueError('Expected a non-empty "question" or {"close":true}')
+            except ValueError as exc:
+                error = ConsultationError(f"Invalid JSONL request: {exc}")
+                error.receipt = {
+                    **consultation.receipt(), "stage": "input",
+                    "delivery": "not_sent", "retry_safe": False,
+                }
+                raise error from exc
+            handle(question)
+    except (Exception, KeyboardInterrupt) as exc:
+        result = 1
+        emit({
+            "type": "error", "message": str(exc) or "Consultation interrupted",
             **consultation.policy.receipt(),
-        }
-    )
-    return 0
+            **getattr(exc, "receipt", consultation.receipt()),
+        })
+    finally:
+        try:
+            consultation.close()
+        except (Exception, KeyboardInterrupt) as exc:
+            result = 1
+            emit({
+                "type": "error", "message": str(exc) or "Cleanup interrupted",
+                **consultation.policy.receipt(),
+                **getattr(exc, "receipt", consultation.receipt()),
+            })
+        emit({
+            "type": "closed",
+            "discarded": consultation.cleanup == "complete",
+            "parent_transcript_unchanged": True,
+            **consultation.receipt(),
+            **consultation.policy.receipt(),
+        })
+    return result
 
 
 def _expert(pika: Pika, args: argparse.Namespace) -> int:
+    if args.expert_command == "update":
+        profile = pika.publish_current_work(args.current_state)
+        payload = {
+            "provider": profile.provider,
+            "session_id": profile.session_id,
+            "current_state": profile.current_state,
+            "current_state_updated_at": profile.current_state_updated_at,
+            "scope_updated_at": profile.scope_updated_at,
+        }
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(
+                f"CURRENT WORK SAVED · {provider_label(profile.provider)} · "
+                f"{profile.session_id[:8]} · unchanged text retains its publication time"
+            )
+        return 0
     if args.expert_command == "publish":
         topics = [
             topic.strip()
@@ -668,16 +834,16 @@ def _expert(pika: Pika, args: argparse.Namespace) -> int:
         session = pika.store.get_session(*profile.key)
         name = session.display_name if session else profile.session_id[:8]
         print(
-            f"EXPERT CARD PUBLISHED · {terminal_text(name)} · "
-            f"{profile.provider.title()} · {profile.session_id[:8]} · "
+            f"THREAD PROFILE PUBLISHED · {terminal_text(name)} · "
+            f"{provider_label(profile.provider)} · {profile.session_id[:8]} · "
             f"{len(profile.topics)} topics"
         )
         return 0
     if args.expert_command == "clear":
         session = pika.clear_current_expert()
         print(
-            f"EXPERT CARD CLEARED · {terminal_text(session.display_name)} · "
-            f"{session.provider.title()} · {session.session_id[:8]}"
+            f"THREAD PROFILE CLEARED · {terminal_text(session.display_name)} · "
+            f"{provider_label(session.provider)} · {session.session_id[:8]}"
         )
         return 0
     if args.expert_command == "status":
@@ -689,13 +855,14 @@ def _expert(pika: Pika, args: argparse.Namespace) -> int:
                 )
             )
         elif not states:
-            print("No resumable Pika conversations are eligible for expert cards.")
+            print("No resumable Pika conversations are eligible for thread profiles.")
         else:
             for item in states:
                 print(
-                    f"{item.status:<8} · {item.session.provider.title():<6} · "
+                    f"{item.status:<8} · {provider_label(item.session.provider):<8} · "
                     f"{terminal_text(item.session.display_name)} · "
-                    f"{item.session.session_id[:8]} · {terminal_text(item.detail)}"
+                    f"{item.session.session_id[:8]} · {terminal_text(item.detail)} · "
+                    f"{terminal_text(item.to_dict()['availability'])}"
                 )
         return 0
     if args.expert_command == "refresh":
@@ -718,7 +885,7 @@ def _expert(pika: Pika, args: argparse.Namespace) -> int:
                 results = []
                 if pending:
                     print(
-                        f"Building {len(pending)} provenance-bound expert card(s) "
+                        f"Building {len(pending)} exact thread profile(s) "
                         "from exact ephemeral interviews."
                     )
                 for index, state in enumerate(pending, 1):
@@ -735,7 +902,7 @@ def _expert(pika: Pika, args: argparse.Namespace) -> int:
             if args.provider:
                 raise PikaError("--provider is only valid with --all or --due")
             session = (
-                _select_named(pika, args.name)
+                pika.resolve_expert_target(args.name)
                 if args.name
                 else pika.current_exact_session()
             )
@@ -743,7 +910,7 @@ def _expert(pika: Pika, args: argparse.Namespace) -> int:
                 node = pika.store.get_fleet_node(session.node_id)
                 target = node.ssh_target if node else session.node_name
                 raise PikaError(
-                    "Expert-card interviews run on the authoritative machine. "
+                    "Thread interviews run on the authoritative machine. "
                     f"Run `ssh {shlex.quote(target)} pika expert refresh "
                     f"{shlex.quote(session.session_id)}`, then `pika sync "
                     f"{shlex.quote(session.node_name)}`."
@@ -761,10 +928,10 @@ def _print_expert_refresh_results(results, *, as_json: bool = False) -> None:
         )
         return
     if not results:
-        print("Expert cards already current.")
+        print("Thread profiles already current.")
         return
     for item in results:
-        subject = terminal_text(item.name or item.provider.title())
+        subject = terminal_text(item.name or provider_label(item.provider))
         quota = (
             f" · {item.remaining_percent:.0f}% left"
             if item.remaining_percent is not None
@@ -778,7 +945,7 @@ def _print_expert_refresh_results(results, *, as_json: bool = False) -> None:
             else ""
         )
         print(
-            f"{item.status} · {subject} · {item.provider.title()}"
+            f"{item.status} · {subject} · {provider_label(item.provider)}"
             f"{quota}{policy} · {terminal_text(item.detail)}"
         )
 
@@ -786,6 +953,55 @@ def _print_expert_refresh_results(results, *, as_json: bool = False) -> None:
 def _experts(pika: Pika, query_parts: list[str], *, as_json: bool) -> int:
     query = " ".join(query_parts).strip()
     print_experts(pika.expert_matches(query), query=query, as_json=as_json)
+    return 0
+
+
+def _explain(pika: Pika, name: str, *, as_json: bool) -> int:
+    # Remote explanations must remain available even when SSH is unavailable.
+    remote = pika.fleet.resolve(name, fresh=False) if "@" in name else None
+    if remote is not None:
+        session = remote
+        facts = ()
+    else:
+        session = _select_named(pika, name, sessions=pika.refresh(usage=False))
+        facts = pika.store.status_observations(*session.key)
+    report = explain_session(session, facts)
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"{terminal_text(session.display_name)} · {report['state']}")
+        print(terminal_text(report["summary"]))
+        freshness = report["freshness"]
+        if freshness["age_seconds"] is not None:
+            print(f"Evidence age: {int(freshness['age_seconds'])}s · {freshness['basis']}")
+        for fact in report["evidence"]:
+            marker = "WINNER" if fact["winner"] else "observed"
+            print(terminal_text(f"  {marker} · {fact['kind']} · {fact['status']} · {fact['source']} · {int(fact['age_seconds'])}s ago"))
+        if report["next_action"]:
+            print("Next: " + terminal_text(report["next_action"]))
+    return 0
+
+
+def _activity(pika: Pika, *, limit: int, as_json: bool) -> int:
+    # Reconciliation may add a newly-derived actionable transition before the
+    # immutable ledger is read. No transcript content enters this surface.
+    pika.refresh(usage=False)
+    events = pika.store.list_activity_events(limit=limit)
+    if as_json:
+        print(json.dumps([item.to_dict() for item in events], indent=2, sort_keys=True))
+        return 0
+    if not events:
+        print("No Pika attention events yet.")
+        return 0
+    print("PIKA ACTIVITY · transcript-free · newest first")
+    for item in events:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(item.event_at))
+        reason = item.error or item.attention_reason or item.status.casefold()
+        print(
+            f"{timestamp} · {item.status:<10} · "
+            f"{provider_label(item.provider):<8} · "
+            f"{terminal_text(item.display_name)} · {terminal_text(reason)}"
+        )
     return 0
 
 
@@ -847,7 +1063,7 @@ def _wait(pika: Pika, args: argparse.Namespace) -> int:
         if session is None:
             raise PikaError("The tracked conversation disappeared while waiting")
         matches = {
-            "any": session.needs_attention,
+            "any": session.needs_attention or (session.status == Status.READY.value and session.unread),
             "needs-you": session.status == Status.NEEDS_YOU.value,
             "ready": session.status == Status.READY.value and session.unread,
             "error": session.status in {Status.ERROR.value, Status.OPEN_TWICE.value}
@@ -1064,8 +1280,219 @@ def _add_setup_machine(pika: Pika, candidate: NodeCandidate):
             return None
 
 
+def _setup_coverage(
+    pika: Pika, *, untracked_keys: set[tuple[str, str]]
+) -> list[Session]:
+    """Lead setup's closing ledger with the protection outcome, not mechanics."""
+    def noun(value: int, singular: str) -> str:
+        return singular if value == 1 else singular + "s"
+
+    sessions = list(pika.store.list_sessions())
+    exact = [item for item in sessions if not item.session_id.startswith("unbound:")]
+    providers = {item.provider for item in exact}
+    needs_action = sum(
+        item.needs_attention or item.status == Status.UNBOUND.value for item in sessions
+    )
+    node_reader = getattr(pika.store, "list_fleet_nodes", None)
+    node_value = node_reader() if callable(node_reader) else []
+    nodes = list(node_value) if isinstance(node_value, (list, tuple)) else []
+
+    archived = 0
+    provider_map = getattr(pika, "providers", {})
+    if isinstance(provider_map, dict):
+        for provider in provider_map.values():
+            hidden = getattr(provider, "hidden_session_ids", None)
+            if not callable(hidden):
+                continue
+            try:
+                archived += len(hidden())
+            except (OSError, RuntimeError, TypeError):
+                continue
+
+    print("\nYOUR PIKA COVERAGE")
+    if exact:
+        print(
+            f"  {len(exact)} exact {noun(len(exact), 'conversation')} under Pika"
+        )
+    else:
+        print("  No exact conversations protected yet · use `pika NAME`")
+    print(
+        f"  {len(providers)} {noun(len(providers), 'provider')} · "
+        f"{1 + len(nodes)} {noun(1 + len(nodes), 'machine')}"
+    )
+    if needs_action:
+        print(
+            f"  {needs_action} {noun(needs_action, 'conversation')} "
+            f"{'needs' if needs_action == 1 else 'need'} action now"
+        )
+    else:
+        print("  No protection decisions pending")
+
+    ignored: list[str] = []
+    if archived:
+        ignored.append(f"{archived} archived")
+    if untracked_keys:
+        ignored.append(f"{len(untracked_keys)} explicitly untracked")
+    if isinstance(provider_map, dict) and "codex" in provider_map:
+        ignored.append("automation workers filtered by provenance")
+    if ignored:
+        print("  Ignored on purpose · " + " · ".join(ignored))
+    return sessions
+
+
+def _offer_recovery_rehearsal(
+    pika: Pika,
+    sessions: list[Session],
+    *,
+    commissioned: bool,
+    automatic: bool,
+) -> None:
+    """Prove continuity independently of the lifecycle commissioning ledger."""
+    if (
+        automatic
+        or os.environ.get("TMUX")
+        or not sys.stdin.isatty()
+    ):
+        return
+    blocked = {
+        Status.NEEDS_YOU.value,
+        Status.READY.value,
+        Status.ERROR.value,
+        Status.OPEN_TWICE.value,
+        Status.UNBOUND.value,
+        Status.STARTING.value,
+    }
+    eligible = [
+        item
+        for item in sessions
+        if item.status not in blocked
+        and item.cwd
+        and Path(item.cwd).is_dir()
+        and item.provider in pika.providers
+    ]
+    if not eligible:
+        return
+    session = sorted(
+        eligible,
+        key=lambda item: (
+            item.status != Status.PARKED.value,
+            -item.last_activity_at,
+        ),
+    )[0]
+    print("\nPROVE CONTINUITY NOW?")
+    if not commissioned:
+        print(
+            "  This checks conversation recovery only. Missing integration "
+            "observations still need proof in `pika doctor`."
+        )
+    print(
+        f"  Pika can open {terminal_text(session.display_name)} without sending "
+        "a prompt."
+    )
+    print(
+        "  Detach with Ctrl-b d; setup will verify the same "
+        f"{provider_identity_label(session.provider)} when you return."
+    )
+    answer = input("Run the recovery rehearsal? [y/N] ").strip().casefold()
+    if answer not in {"y", "yes"}:
+        print(
+            "Try it later: `pika "
+            f"{terminal_text(session.display_name)}` → detach → run the same command."
+        )
+        return
+
+    expected_thread_id = session.provider_thread_id
+    command = shlex.join(["pika", session.session_id])
+    try:
+        result = pika.open(session)
+    except PikaError as exc:
+        print(f"REHEARSAL PAUSED · {terminal_text(exc)}")
+        print(f"Next: {command}")
+        return
+    if result:
+        print(
+            f"REHEARSAL INCOMPLETE · attach exited {result} · "
+            f"retry with: {command}"
+        )
+        return
+
+    try:
+        refreshed = pika.refresh(usage=False)
+        current = next((item for item in refreshed if item.key == session.key), None)
+        panes = pika.tmux.list_panes()
+        exact = bool(
+            current
+            and current.provider_thread_id == expected_thread_id
+            and any(
+                (pane.pika_provider, pane.pika_session_id) == session.key
+                and pika.exact_pane_pid(current, pane)
+                for pane in panes
+            )
+        )
+    except (PikaError, TmuxError, OSError) as exc:
+        print(f"REHEARSAL INCOMPLETE · verification failed: {terminal_text(exc)}")
+        print(f"Next: {command}")
+        return
+    if exact:
+        print(
+            f"CONTINUITY PROVEN · {terminal_text(session.display_name)} · same "
+            f"exact {provider_label(session.provider)} conversation · "
+            f"id {expected_thread_id[:8]}"
+        )
+    else:
+        print(
+            "REHEARSAL INCOMPLETE · exact live identity is not yet proven · "
+            f"next: {command}"
+        )
+
+
+def _first_conversation_recovery(
+    pika: Pika, *, commissioned: bool,
+) -> None:
+    """Use the ordinary name workflow, then demonstrate an exact return."""
+    if not sys.stdin.isatty() or os.environ.get("TMUX"):
+        return
+    print("\nYOUR FIRST CONVERSATION")
+    print("Open an existing conversation by name, or give a new one a name.")
+    print("Detach with Ctrl-b d to return here; the agent keeps running.")
+    print("Pika will not send a prompt. Enter skips this walkthrough.")
+    query = input("Conversation name: ").strip()
+    if not query:
+        print("Skipped · later, run `pika NAME`, detach, then run the same command.")
+        return
+    command = shlex.join(["pika", query])
+    try:
+        result = pika.enter(query)
+    except (PikaError, FleetError) as exc:
+        print(f"FIRST CONVERSATION PAUSED · {terminal_text(exc)}")
+        print(f"When resolved, run exactly: {command}")
+        return
+    if result:
+        print(f"FIRST CONVERSATION INCOMPLETE · exited {result} · retry: {command}")
+        return
+    # A name may collide across providers or be renamed during the visit.
+    # Never certify whichever row happens to be returned first.
+    matches = [
+        item for item in pika.store.list_sessions()
+        if item.session_id == query or item.provider_thread_id == query
+        or item.display_name.casefold() == query.casefold()
+    ]
+    if len(matches) != 1:
+        print(
+            "Recovery proof pending · the visit did not identify one durable "
+            "local conversation. No identity was guessed."
+        )
+        print(f"Next: {command}")
+        return
+    session = matches[0]
+    print(f"\nYou can return any time with: {shlex.join(['pika', session.display_name])}")
+    _offer_recovery_rehearsal(
+        pika, [session], commissioned=commissioned, automatic=False,
+    )
+
+
 def _setup(pika: Pika, args: argparse.Namespace) -> int:
-    print("Pika commissioning · exact recovery for Codex + Claude")
+    print("Pika commissioning · exact recovery for Codex + Claude + OpenCode")
     print("Preview first · existing settings retained · backups before writes\n")
     if not args.dry_run:
         identity_loader = getattr(pika.store, "local_node_id", None)
@@ -1073,67 +1500,15 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
             identity_loader()
     first_setup = not config_path().exists()
     explicit_machine_setup = bool(getattr(args, "machine", []))
-    selected_machine_candidates = (
-        _setup_machine_candidates(pika, args)
-        if first_setup or explicit_machine_setup
-        else []
-    )
+    selected_machine_candidates: list[NodeCandidate] = []
     selected: list[Candidate] = []
     local_candidates: list[Candidate] = []
     original_tracked = [] if args.dry_run else pika.store.list_sessions()
     tracked_names = {session.key: session.display_name for session in original_tracked}
     explicit_import = bool(args.import_all or getattr(args, "remote_import_all", False))
     routine_inventory = first_setup or explicit_import
-    tracked_sessions = (
-        []
-        if args.dry_run
-        else pika.refresh(usage=False)
-        if routine_inventory
-        else original_tracked
-    )
+    tracked_sessions = original_tracked
     untracked_keys = set() if args.dry_run else pika.store.untracked_session_keys()
-    if not args.no_import and not args.dry_run and (first_setup or explicit_import):
-        discovered_local = [
-            item for item in pika.discover_import_candidates() if item.name or item.live
-        ]
-        tracked = {session.key for session in tracked_sessions}
-        tracked.update(
-            (session.provider, session.active_thread_id)
-            for session in tracked_sessions
-            if session.active_thread_id
-        )
-        suppressed = [
-            item
-            for item in discovered_local
-            if (item.provider, item.session_id) in untracked_keys
-        ]
-        if suppressed:
-            print(
-                f"Pika is keeping {len(suppressed)} explicitly untracked "
-                "conversation(s) out of setup choices:"
-            )
-            for item in suppressed[:3]:
-                print(
-                    f"  {item.provider.title():<6} "
-                    f"{terminal_text(item.display_name)} · {item.session_id[:8]}"
-                )
-            if len(suppressed) > 3:
-                print(f"  … and {len(suppressed) - 3} more")
-            print("Restore one explicitly with `pika <conversation-name>`.\n")
-        local_candidates = [
-            item
-            for item in discovered_local
-            if (item.provider, item.session_id) not in tracked
-            and (item.provider, item.session_id) not in untracked_keys
-        ]
-        if args.import_all:
-            selected = local_candidates
-        elif args.yes or not sys.stdin.isatty():
-            if local_candidates:
-                print(
-                    f"Pika found {len(local_candidates)} local import candidate(s); "
-                    "rerun interactively to choose them or use `--import-all`.\n"
-                )
     config = load_config()
     default_provider = args.default_provider
     first_interactive_setup = (
@@ -1144,8 +1519,10 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         and sys.stdin.isatty()
     )
     if first_interactive_setup:
-        answer = input("Default agent: 1 for Codex, 2 for Claude [1]: ").strip()
-        default_provider = "claude" if answer == "2" else "codex"
+        answer = input(
+            "Default agent: 1 for Codex, 2 for Claude, 3 for OpenCode [1]: "
+        ).strip()
+        default_provider = {"2": "claude", "3": "opencode"}.get(answer, "codex")
     default_provider = default_provider or config.get("default_provider") or "codex"
     print(f"Default for new conversations: {str(default_provider).title()}\n")
     configured_alias = config.get("machine_alias")
@@ -1164,17 +1541,24 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         overrides={
             "codex": getattr(args, "codex_executable", None),
             "claude": getattr(args, "claude_executable", None),
+            "opencode": getattr(args, "opencode_executable", None),
         },
     )
     runtime_path = setup_runtime_path(config, selected_executables)
     print("Provider executables")
     provider_versions: dict[str, str | None] = {}
-    for provider in ("codex", "claude"):
+    compatibility_errors: dict[str, str | None] = {}
+    for provider in PROVIDER_NAMES:
         executable = selected_executables.get(provider)
         version = executable_version(executable)
         provider_versions[provider] = version
-        state = version or "MISSING"
-        print(f"  {provider.title():<6} {state} · {executable or 'not found'}")
+        compatibility_errors[provider] = provider_compatibility_error(provider, version)
+        state = (
+            f"UNSUPPORTED · {compatibility_errors[provider]}"
+            if version and compatibility_errors[provider]
+            else version or "MISSING"
+        )
+        print(f"  {provider_label(provider):<8} {state} · {executable or 'not found'}")
     print()
     missing_default = selected_executables.get(str(default_provider))
     if not executable_available(missing_default):
@@ -1182,6 +1566,9 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
             f"Configured {default_provider} executable is unavailable: "
             f"{missing_default or 'not found'}. Supply --{default_provider}-executable."
         )
+    default_compatibility = compatibility_errors.get(str(default_provider))
+    if default_compatibility:
+        raise PikaError(default_compatibility)
     changes = proposed_changes(
         str(default_provider),
         alias,
@@ -1222,12 +1609,12 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         print(f"Expert refresh timer {'active' if active else 'inactive'} · {detail}")
     changed_names = {change.path.name for change in changed}
     hook_configuration_changed = bool(
-        changed_names & {"hooks.json", "settings.json", "config.toml"}
+        changed_names & {"hooks.json", "settings.json", "config.toml", "pika.js"}
     )
     if hook_configuration_changed:
         inactive = [
             provider
-            for provider in ("codex", "claude")
+            for provider in PROVIDER_NAMES
             if not hooks_installed(provider)
         ]
         print("Pika hook definitions installed.")
@@ -1243,15 +1630,20 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
                 "Warning: Claude hooks are not active; run `pika doctor --verbose` "
                 "before relying on attention state."
             )
+        if "opencode" in inactive:
+            print(
+                "Warning: OpenCode plugin is not active; run `pika setup` again "
+                "before relying on attention state."
+            )
     print("\nCommissioning status")
     observed: dict[str, bool] = {}
     active_hooks: dict[str, bool] = {}
     available_executables = {
         provider: bool(
             executable_available(selected_executables.get(provider))
-            and provider_versions.get(provider)
+            and provider_version_supported(provider, provider_versions.get(provider))
         )
-        for provider in ("codex", "claude")
+        for provider in PROVIDER_NAMES
     }
     pending_reader = getattr(pika.store, "list_pending", None)
     pending_value = pending_reader() if callable(pending_reader) else []
@@ -1263,7 +1655,14 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         for row in pending_rows
         if time.time() - float(row["created_at"]) > PENDING_LAUNCH_GRACE_SECONDS
     }
-    for provider in ("codex", "claude"):
+    required_provider_names = {
+        str(default_provider),
+        *(session.provider for session in original_tracked),
+    }
+    commissioned_providers = [
+        provider for provider in PROVIDER_NAMES if provider in required_provider_names
+    ]
+    for provider in PROVIDER_NAMES:
         active = hooks_installed(provider)
         active_hooks[provider] = active
         fingerprint = hook_spec_fingerprint(provider)
@@ -1287,33 +1686,40 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         else:
             proof = "not yet proven"
         launch = "DEGRADED" if provider in overdue else "healthy"
+        scope = "required" if provider in commissioned_providers else "optional"
         print(
-            f"  {provider.title():<6} binary "
+            f"  {provider_label(provider):<8} binary "
             f"{'✓' if available_executables[provider] else '✗'}  "
             f"hooks {'✓' if active else '✗'}  "
             f"observed {'✓' if observed[provider] else '○'} · {proof} · "
-            f"launches {launch}"
+            f"launches {launch} · {scope}"
         )
     commissioned = all(
         available_executables[provider]
         and active_hooks[provider]
         and observed[provider]
         and provider not in overdue
-        for provider in ("codex", "claude")
+        for provider in commissioned_providers
     )
     if commissioned:
         print(
-            "\nPika commissioned · both integrations configured, observed, "
+            "\nPika commissioned · required integrations configured, observed, "
             "and healthy now."
         )
     elif (
-        active_hooks["codex"]
+        "codex" in commissioned_providers
+        and active_hooks["codex"]
         and available_executables["codex"]
         and not observed["codex"]
-        and active_hooks["claude"]
-        and available_executables["claude"]
-        and observed["claude"]
-        and not overdue
+        and all(
+            active_hooks[provider]
+            and available_executables[provider]
+            and observed[provider]
+            and provider not in overdue
+            for provider in commissioned_providers
+            if provider != "codex"
+        )
+        and "codex" not in overdue
     ):
         print(
             "\nOne required proof remains: Codex → `/hooks` → trust Pika → "
@@ -1321,20 +1727,73 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         )
     else:
         incomplete = []
-        for provider in ("codex", "claude"):
+        for provider in commissioned_providers:
             if not available_executables[provider]:
-                incomplete.append(f"{provider.title()} executable/version proof")
+                incomplete.append(f"{provider_label(provider)} executable/version proof")
             if not active_hooks[provider]:
-                incomplete.append(f"{provider.title()} activation")
+                incomplete.append(f"{provider_label(provider)} activation")
             if not observed[provider]:
-                incomplete.append(f"{provider.title()} observation")
+                incomplete.append(f"{provider_label(provider)} observation")
             if provider in overdue:
                 row = overdue[provider]
                 age = int(time.time() - float(row["created_at"]))
                 incomplete.append(
-                    f"{provider.title()} launch {row['name']} identity pending {age}s"
+                    f"{provider_label(provider)} launch {row['name']} identity pending {age}s"
                 )
         print("\nPika not yet commissioned · pending: " + ", ".join(incomplete) + ".")
+    if (
+        first_setup and not args.yes and not getattr(args, "skip_walkthrough", False)
+        and sys.stdin.isatty()
+    ):
+        _first_conversation_recovery(pika, commissioned=commissioned)
+
+    # First establish the local return experience. Broader discovery is an
+    # optional expansion, and explicit automation flags retain their behavior.
+    if first_setup or explicit_machine_setup:
+        if first_setup and not args.yes and sys.stdin.isatty():
+            print("\nOPTIONAL · Add other machines or more conversations; Enter skips each choice.")
+        selected_machine_candidates = _setup_machine_candidates(pika, args)
+    if routine_inventory:
+        tracked_sessions = pika.refresh(usage=False)
+    if not args.no_import and (first_setup or explicit_import):
+        discovered_local = [
+            item for item in pika.discover_import_candidates() if item.name or item.live
+        ]
+        tracked = {session.key for session in tracked_sessions}
+        tracked.update(
+            (session.provider, session.active_thread_id)
+            for session in tracked_sessions if session.active_thread_id
+        )
+        suppressed = [
+            item for item in discovered_local
+            if (item.provider, item.session_id) in untracked_keys
+        ]
+        if suppressed:
+            print(
+                f"Pika is keeping {len(suppressed)} explicitly untracked "
+                "conversation(s) out of setup choices:"
+            )
+            for item in suppressed[:3]:
+                print(
+                    f"  {provider_label(item.provider):<6} "
+                    f"{terminal_text(item.display_name)} · {item.session_id[:8]}"
+                )
+            if len(suppressed) > 3:
+                print(f"  … and {len(suppressed) - 3} more")
+            print("Restore one explicitly with `pika <conversation-name>`.\n")
+        local_candidates = [
+            item for item in discovered_local
+            if (item.provider, item.session_id) not in tracked
+            and (item.provider, item.session_id) not in untracked_keys
+        ]
+        if args.import_all:
+            selected = local_candidates
+        elif args.yes or not sys.stdin.isatty():
+            if local_candidates:
+                print(
+                    f"Pika found {len(local_candidates)} local import candidate(s); "
+                    "rerun interactively to choose them or use `--import-all`.\n"
+                )
     ready_nodes = []
     for candidate in selected_machine_candidates:
         node = _add_setup_machine(pika, candidate)
@@ -1380,7 +1839,7 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
     if selected:
         for candidate in selected:
             print(
-                f"ADDED HERE · {candidate.provider.title()} · "
+                f"ADDED HERE · {provider_label(candidate.provider)} · "
                 f"{terminal_text(candidate.display_name)} · id {candidate.session_id[:8]}"
             )
         print(f"Added {len(selected)} existing conversation(s) to Pika.")
@@ -1394,7 +1853,7 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
             )
             continue
         print(
-                f"ADDED ON {node.alias} · {adopted.provider.title()} · "
+                f"ADDED ON {node.alias} · {provider_label(adopted.provider)} · "
             f"{terminal_text(adopted.display_name)} · id {adopted.session_id[:8]}"
         )
         current_node = pika.store.get_fleet_node(node.node_id)
@@ -1417,7 +1876,7 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         print(f"Refreshed {len(renamed)} provider rename(s):")
         for old_name, new_name, session in renamed:
             print(
-                f"  {session.provider.title():<6} {session.session_id[:8]}  "
+                f"  {provider_label(session.provider):<6} {session.session_id[:8]}  "
                 f"{terminal_text(old_name)} → {terminal_text(new_name)}"
             )
     elif routine_inventory and tracked_sessions:
@@ -1428,14 +1887,21 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
             "Name reconciliation partial · "
             + "; ".join(terminal_text(error) for error in sync_errors)
         )
-    if args.no_import:
-        return 0
-    print("\nExpert cards deferred · setup did not interview any agents.")
-    print(
-        "Missing or stale cards remain visible in `pika expert status`; the "
-        "quota-aware refresher handles them gradually. Use "
-        "`pika expert refresh --all` only when you want to spend quota now."
-    )
+    coverage_sessions = _setup_coverage(pika, untracked_keys=untracked_keys)
+    if not args.no_import:
+        print("\nThread profiles deferred · setup did not interview any agents.")
+        print(
+            "Missing or stale profiles remain visible in `pika expert status`; the "
+            "quota-aware refresher handles them gradually. Use "
+            "`pika expert refresh --all` only when you want to spend quota now."
+        )
+    if not first_setup:
+        _offer_recovery_rehearsal(
+            pika,
+            coverage_sessions,
+            commissioned=commissioned,
+            automatic=bool(args.yes or getattr(args, "skip_walkthrough", False)),
+        )
     return 0
 
 
@@ -1457,7 +1923,12 @@ def _hook(args: argparse.Namespace) -> int:
 
 def _peek_popup(args: argparse.Namespace) -> int:
     pika = Pika()
-    print(pika.tmux.capture(args.target, args.lines))
+    session = pika.store.get_session(args.provider, args.session_id)
+    if session is None:
+        raise PikaError("The selected Pika conversation is no longer tracked")
+    if session.tmux_pane != args.target:
+        raise PikaError("The selected conversation's pane changed; reopen its peek")
+    print(pika.capture(session, args.lines))
     print(
         f"\n[{terminal_text(args.name)}] Enter attaches; Esc or q returns.",
         flush=True,
@@ -1583,6 +2054,18 @@ def _pair_client_bridge(pika: Pika) -> int:
 def run(argv: list[str] | None = None) -> int:
     argv = _normalize_argv(list(sys.argv[1:] if argv is None else argv))
     args = _parser().parse_args(argv)
+    if args.command == "skill":
+        if args.skill_command == "show":
+            print(skill_text(), end="")
+        else:
+            result = install_skill(Path(args.path) if args.path else codex_home() / "skills" / "agent-convo")
+            if args.json:
+                print(json.dumps(result, sort_keys=True))
+            else:
+                print(f"Agent Convo {'installed' if result['changed'] else 'already current'} · {result['path']}")
+                if result["backup"]:
+                    print(f"Backup: {result['backup']}")
+        return 0
     if args.command == "hook":
         return _hook(args)
     if args.command == "_process-exit":
@@ -1613,6 +2096,11 @@ def run(argv: list[str] | None = None) -> int:
                 "NODE IDENTITY CHANGED: expected "
                 f"{args.expected_node_id[:8]}, received {actual_node_id[:8]}"
             )
+        if args.command == "_fleet-ask":
+            current = pika.resolve_expert_target(args.session_id)
+            if current.provider != args.provider or current.session_id != args.session_id:
+                raise PikaError("Exact remote consultation identity mismatch")
+            return _ask_session(pika, current, [], jsonl=True, fast=args.fast)
         saved = pika.store.get_session(args.provider, args.session_id)
         if saved is None:
             raise PikaError("Exact remote session is not tracked on this Pika node")
@@ -1634,11 +2122,15 @@ def run(argv: list[str] | None = None) -> int:
     if args.command is None:
         try:
             return _bare(pika)
+        except OutsideLiveConflict as exc:
+            return _confirm_outside_live(pika, exc)
         except SharedLeaseConflict as exc:
             return _confirm_shared_lease(pika, exc)
     if args.command == "_enter":
         try:
             return pika.enter(args.name)
+        except OutsideLiveConflict as exc:
+            return _confirm_outside_live(pika, exc)
         except SharedLeaseConflict as exc:
             return _confirm_shared_lease(pika, exc)
     if args.command == "open":
@@ -1661,6 +2153,10 @@ def run(argv: list[str] | None = None) -> int:
         return _expert(pika, args)
     if args.command == "experts":
         return _experts(pika, args.query, as_json=args.json)
+    if args.command == "explain":
+        return _explain(pika, args.name, as_json=args.json)
+    if args.command == "activity":
+        return _activity(pika, limit=args.limit, as_json=args.json)
     if args.command == "list":
         local = pika.refresh(usage=not args.no_usage)
         if args.all_machines:
@@ -1698,7 +2194,7 @@ def run(argv: list[str] | None = None) -> int:
             f"({terminal_text(session.provider)}, {terminal_text(session.status)})."
         )
         if session.transcript_path:
-            print("Building its UUID-bound expert card…", flush=True)
+            print("Building its exact thread profile…", flush=True)
         _print_expert_refresh_results(pika.bootstrap_experts([session]))
         return 0
     if args.command == "untrack":

@@ -15,7 +15,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .paths import claude_home, codex_home, config_path
+from .paths import (
+    claude_home,
+    codex_home,
+    config_path,
+    opencode_config_home,
+)
 from .executables import configured_executable, executable_available
 from .expert_schedule import unit_contents
 from .store import DEFAULT_CONFIG
@@ -47,6 +52,126 @@ QUESTION_TOOL_MATCHERS = {
     "codex": "^request_user_input$",
     "claude": "^AskUserQuestion$",
 }
+
+
+def _opencode_plugin_source() -> str:
+    python = json.dumps(sys.executable)
+    return f'''// Managed by Pika. OpenCode loads this local plugin at startup.
+export const Pika = async ({{ client, directory }}) => {{
+  if (process.env.PIKA_EPHEMERAL === "1") return {{}};
+  const expectedRootId = process.env.PIKA_SESSION_ID || null;
+  let currentRootId = expectedRootId;
+  let initialNameClaimed = Boolean(expectedRootId);
+  const command = [{python}, "-m", "pikamux", "hook", "--provider", "opencode"];
+  const send = async (hook_event_name, session_id, extra = {{}}) => {{
+    if (!session_id) return;
+    const payload = JSON.stringify({{
+      session_id,
+      hook_event_name,
+      cwd: directory,
+      source: "opencode-plugin",
+      ...extra,
+    }});
+    const child = Bun.spawn({{
+      cmd: command,
+      stdin: "pipe",
+      stdout: "ignore",
+      stderr: "ignore",
+      env: process.env,
+    }});
+    child.stdin.write(payload);
+    child.stdin.end();
+    await child.exited;
+  }};
+  if (currentRootId) void send("SessionHeartbeat", currentRootId);
+  const heartbeat = setInterval(() => {{
+    if (currentRootId) void send("SessionHeartbeat", currentRootId);
+  }}, 60000);
+  if (heartbeat && typeof heartbeat.unref === "function") heartbeat.unref();
+  return {{
+    event: async ({{ event }}) => {{
+      const p = event.properties || {{}};
+      const id = p.sessionID || (p.info && p.info.id);
+      if (event.type === "session.deleted") {{
+        if (p.info && p.info.parentID) return;
+        if (currentRootId === id) currentRootId = null;
+        await send("SessionEnd", id, {{
+          deleted: true,
+          session_title: p.info && p.info.title,
+        }});
+        return;
+      }}
+      if (id && event.type !== "session.created") {{
+        try {{
+          const found = await client.session.get({{
+            path: {{ id }},
+            query: {{ directory }},
+          }});
+          const info = found.data;
+          if (!info) return;
+          if (info && info.parentID) return;
+          currentRootId = id;
+        }} catch {{ return; }}
+      }}
+      if (event.type === "session.created") {{
+        if (p.info && p.info.parentID) return;
+        currentRootId = id;
+        const desired = process.env.PIKA_NAME;
+        const mayName = Boolean(
+          desired && ((expectedRootId && id === expectedRootId) ||
+          (!expectedRootId && !initialNameClaimed))
+        );
+        if (mayName) initialNameClaimed = true;
+        let observedTitle = p.info && p.info.title;
+        let nativeNameError = null;
+        if (mayName && p.info && p.info.title !== desired) {{
+          try {{
+            const updated = await client.session.update({{
+              path: {{ id }},
+              query: {{ directory }},
+              body: {{ title: desired }},
+            }});
+            if (updated && updated.error)
+              nativeNameError = String(updated.error);
+            const verified = await client.session.get({{
+              path: {{ id }},
+              query: {{ directory }},
+            }});
+            observedTitle = verified && verified.data && verified.data.title;
+            if (observedTitle !== desired && !nativeNameError)
+              nativeNameError = "OpenCode did not retain the requested title";
+          }} catch (error) {{
+            nativeNameError = String(error);
+          }}
+        }}
+        await send("SessionStart", id, {{
+          session_title: observedTitle,
+          desired_name: mayName ? desired : null,
+          native_name_error: nativeNameError,
+          model: p.info && p.info.model,
+        }});
+      }} else if (event.type === "session.status") {{
+        if (p.status && p.status.type === "busy")
+          await send("UserPromptSubmit", id);
+        else if (p.status && p.status.type === "idle")
+          await send("Stop", id);
+      }} else if (event.type === "session.idle") {{
+        await send("Stop", id);
+      }} else if (event.type === "permission.asked") {{
+        await send("PermissionRequest", id);
+      }} else if (event.type === "permission.replied") {{
+        await send("PermissionReply", id);
+      }} else if (event.type === "question.asked") {{
+        await send("QuestionRequest", id);
+      }} else if (event.type === "question.replied" || event.type === "question.rejected") {{
+        await send("QuestionReply", id);
+      }} else if (event.type === "session.error") {{
+        await send("StopFailure", id, {{ error: String(p.error || "OpenCode turn failed") }});
+      }}
+    }},
+  }};
+}};
+'''
 FEATURE_HEADER = re.compile(r"^\s*\[features\]\s*(?:#.*)?$")
 SECTION_HEADER = re.compile(r"^\s*\[[^]]+\]\s*(?:#.*)?$")
 HOOKS_KEY = re.compile(
@@ -179,6 +304,8 @@ def _normalize_legacy_claude_handlers(groups: Any) -> None:
 
 
 def hook_spec_fingerprint(provider: str) -> str:
+    if provider == "opencode":
+        return hashlib.sha256(_opencode_plugin_source().encode()).hexdigest()
     events = CODEX_EVENTS if provider == "codex" else CLAUDE_EVENTS
     definition = [
         {
@@ -335,6 +462,12 @@ def claude_settings_change(home: Path | None = None) -> FileChange:
     return FileChange(target, before, after)
 
 
+def opencode_plugin_change(home: Path | None = None) -> FileChange:
+    target = (home or opencode_config_home()) / "plugins" / "pika.js"
+    before = target.read_text() if target.exists() else ""
+    return FileChange(target, before, _opencode_plugin_source())
+
+
 def pika_config_change(
     default_provider: str,
     machine_alias: str | None = None,
@@ -382,6 +515,7 @@ def proposed_changes(
         codex_hooks_change(),
         codex_config_change(),
         claude_settings_change(),
+        opencode_plugin_change(),
     ]
     changes.extend(
         FileChange(path, path.read_text() if path.exists() else "", content)
@@ -421,6 +555,12 @@ def apply_changes(changes: list[FileChange]) -> list[Path]:
 
 
 def hooks_installed(provider: str) -> bool:
+    if provider == "opencode":
+        target = opencode_config_home() / "plugins" / "pika.js"
+        try:
+            return target.read_text() == _opencode_plugin_source()
+        except OSError:
+            return False
     try:
         if provider == "codex":
             data = _read_json(codex_home() / "hooks.json")

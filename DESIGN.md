@@ -88,6 +88,15 @@ the last good screen and identify the failure. Empty, loading, narrow, overflow,
 unread, working, ready, parked, error, unbound, remote, and cached-offline states
 are first-class.
 
+Public state is a projection, not a stored assertion. Pika persists provider
+lifecycle, identity-safety, and runtime observations as separate latest facts.
+Reconciliation derives the display label with fail-closed precedence: active
+identity safety, unresolved runtime failure, provider lifecycle, then current
+ownership/liveness. The sessions row is only a compatibility cache. This keeps
+a stale process launch from masquerading as `WORKING`, prevents a newer provider
+event from erasing `OPEN TWICE`, and lets an exact recovered process shed an old
+runtime error without manual cleanup.
+
 The side panel explicitly renders opening, ready, thinking, and error states.
 One provider process owns the side for its whole lifetime, so follow-ups retain
 side context. A visible block cursor and persistent control legend make input

@@ -172,6 +172,52 @@ class StoreTests(unittest.TestCase):
         counts = self.store.attention_event_counts(since=50.0, until=250.0)
         self.assertEqual(counts[Status.READY.value], 2)
 
+    def test_status_observations_reject_stale_replay_by_kind(self) -> None:
+        self.store.record_status_observation(
+            "codex",
+            "observed",
+            kind="lifecycle",
+            status=Status.WORKING.value,
+            unread=False,
+            attention_reason=None,
+            error=None,
+            observed_at=200.0,
+            source="hook",
+        )
+        changed = self.store.record_status_observation(
+            "codex",
+            "observed",
+            kind="lifecycle",
+            status=Status.READY.value,
+            unread=True,
+            attention_reason="completed",
+            error=None,
+            observed_at=100.0,
+            source="provider-scan",
+        )
+        self.assertFalse(changed)
+        observation = self.store.status_observations("codex", "observed")[0]
+        self.assertEqual(observation.status, Status.WORKING.value)
+        self.assertEqual(observation.source, "hook")
+
+    def test_activity_feed_is_named_and_transcript_free(self) -> None:
+        self.store.upsert_session(
+            Session(
+                "codex",
+                "activity",
+                name="returns_tracker",
+                transcript_path="/secret/rollout.jsonl",
+                status=Status.READY.value,
+                unread=True,
+                attention_reason="completed",
+                last_event_at=100.0,
+            )
+        )
+        event = self.store.list_activity_events(limit=1)[0]
+        self.assertEqual(event.display_name, "returns_tracker")
+        self.assertEqual(event.status, Status.READY.value)
+        self.assertNotIn("transcript", event.to_dict())
+
     def test_identity_interruption_tracks_new_provider_lifecycle(self) -> None:
         self.store.upsert_session(
             Session("codex", "interrupted", status=Status.WORKING.value)
@@ -276,6 +322,8 @@ class StoreTests(unittest.TestCase):
             self.store.collect_result("codex", "result-0", expected_event_at=100.0),
             1,
         )
+        observation = self.store.status_observations("codex", "result-0")[0]
+        self.assertFalse(observation.unread)
         self.assertIsNone(
             self.store.collect_result("codex", "result-0", expected_event_at=100.0)
         )
@@ -312,12 +360,119 @@ class StoreTests(unittest.TestCase):
             )
         self.assertTrue(self.store.reserve_resume("codex", "abc", "dead-owner"))
 
-    def test_fast_hook_binding_cannot_be_resurrected_as_pending(self) -> None:
+    def test_fast_hook_binding_waits_for_home_certificate(self) -> None:
         self.store.add_pending("launch", "codex", "fast", "/tmp")
         self.store.bind_launch("launch", "codex", "exact-uuid")
-        binding = self.store.finalize_pending_pane("launch", "home", "%1")
+        binding = self.store.finalize_pending_pane(
+            "launch", "home", "%1", root_pid=123, root_pid_start=1001
+        )
         self.assertEqual(binding, ("codex", "exact-uuid"))
+        self.assertIsNotNone(self.store.get_pending("launch"))
+        self.assertIsNone(self.store.get_recovery_owner("codex", "exact-uuid"))
+        self.assertTrue(
+            self.store.certify_launch(
+                "launch", "codex", "exact-uuid", 123, 1001
+            )
+        )
         self.assertIsNone(self.store.get_pending("launch"))
+        self.assertEqual(
+            self.store.get_recovery_owner("codex", "exact-uuid"),
+            (123, 1001, "launch"),
+        )
+
+    def test_launch_binding_certifies_the_pending_provider_pid_generation(self) -> None:
+        self.store.add_pending("launch", "codex", "exact", "/tmp")
+        self.store.finalize_pending_pane(
+            "launch", "home", "%1", root_pid=123, root_pid_start=1001
+        )
+
+        self.assertTrue(self.store.bind_launch("launch", "codex", "exact-uuid"))
+        self.assertTrue(
+            self.store.certify_launch(
+                "launch", "codex", "exact-uuid", 123, 1001
+            )
+        )
+        self.assertEqual(
+            self.store.get_recovery_owner("codex", "exact-uuid"),
+            (123, 1001, "launch"),
+        )
+
+    def test_switch_launch_binding_moves_only_same_live_pid_generation(self) -> None:
+        self.assertTrue(self.store.bind_launch("token", "opencode", "ses_old123"))
+        self.store.set_recovery_owner(
+            "opencode", "ses_old123", 123, 1001, "token"
+        )
+        with patch("pikamux.store.process_start_time", return_value=1001):
+            self.assertTrue(
+                self.store.switch_launch_binding(
+                    "token", "opencode", "ses_old123", "ses_new123", 123
+                )
+            )
+        self.assertEqual(
+            self.store.get_launch_binding("token"), ("opencode", "ses_new123")
+        )
+        self.assertIsNone(self.store.get_recovery_owner("opencode", "ses_old123"))
+        self.assertEqual(
+            self.store.get_recovery_owner("opencode", "ses_new123"),
+            (123, 1001, "token"),
+        )
+
+    def test_switch_launch_binding_rejects_pid_reuse_and_live_target_owner(self) -> None:
+        self.assertTrue(self.store.bind_launch("token", "opencode", "ses_old123"))
+        self.store.set_recovery_owner(
+            "opencode", "ses_old123", 123, 1001, "token"
+        )
+        with patch("pikamux.store.process_start_time", return_value=2002):
+            self.assertFalse(
+                self.store.switch_launch_binding(
+                    "token", "opencode", "ses_old123", "ses_new123", 123
+                )
+            )
+        self.store.set_recovery_owner(
+            "opencode", "ses_new123", 456, 3003, "other-token"
+        )
+        with patch(
+            "pikamux.store.process_start_time",
+            side_effect=lambda pid: {123: 1001, 456: 3003}.get(pid),
+        ):
+            self.assertFalse(
+                self.store.switch_launch_binding(
+                    "token", "opencode", "ses_old123", "ses_new123", 123
+                )
+            )
+        self.assertEqual(
+            self.store.get_launch_binding("token"), ("opencode", "ses_old123")
+        )
+        self.assertEqual(
+            self.store.get_recovery_owner("opencode", "ses_new123"),
+            (456, 3003, "other-token"),
+        )
+
+    def test_switch_launch_binding_rejects_fresh_target_lease_without_certificate(
+        self,
+    ) -> None:
+        self.assertTrue(self.store.bind_launch("token", "opencode", "ses_old123"))
+        self.store.set_recovery_owner(
+            "opencode", "ses_old123", 123, 1001, "token"
+        )
+        with patch(
+            "pikamux.store.process_start_time",
+            side_effect=lambda pid: {123: 1001, 456: 2002}.get(pid),
+        ):
+            self.assertTrue(
+                self.store.set_live_owner("opencode", "ses_new123", 456)
+            )
+            self.assertFalse(
+                self.store.switch_launch_binding(
+                    "token", "opencode", "ses_old123", "ses_new123", 123
+                )
+            )
+        self.assertEqual(
+            self.store.get_launch_binding("token"), ("opencode", "ses_old123")
+        )
+        self.assertEqual(
+            self.store.get_live_owners("opencode", "ses_new123"), [(456, 2002)]
+        )
 
     def test_live_owner_round_trip_and_delete(self) -> None:
         with patch(

@@ -166,7 +166,7 @@ class FleetTests(unittest.TestCase):
         ssh.mkdir()
         (ssh / "config").write_text(
             "Host atlas\n  HostName 10.0.0.1\n"
-            "Host *.internal !blocked\n  User ajain\n"
+            "Host *.internal !blocked\n  User developer\n"
             "Include conf.d/*.conf\n"
         )
         (ssh / "conf.d").mkdir()
@@ -204,14 +204,14 @@ class FleetTests(unittest.TestCase):
             stdout=json.dumps(
                 {
                     "Self": {
-                        "HostName": "ip-172-31-61-171",
-                        "DNSName": "rstudio-6.example.ts.net.",
+                        "HostName": "ip-192-0-2-10",
+                        "DNSName": "devbox.example.ts.net.",
                     }
                 }
             ),
         )
         with patch("pikamux.fleet.subprocess.run", return_value=completed):
-            self.assertEqual(suggest_local_machine_alias(), "rstudio-6")
+            self.assertEqual(suggest_local_machine_alias(), "devbox")
 
     def test_discovery_makes_duplicate_suggested_aliases_unique(self) -> None:
         candidates = [
@@ -549,7 +549,7 @@ class FleetTests(unittest.TestCase):
         with patch.object(
             SSHTransport, "_bounded_run", return_value=response
         ) as runner:
-            SSHTransport().request("ajain@atlas", payload)
+            SSHTransport().request("developer@atlas", payload)
         command = runner.call_args.args[0]
         self.assertEqual(command[-3:], ["pika", "_fleet", "--stdio"])
         self.assertFalse(any("touch" in item or "rm -rf" in item for item in command))
@@ -676,7 +676,10 @@ class FleetTests(unittest.TestCase):
         output = io.StringIO()
         with patch("sys.stdout", output):
             print_experts(matches, query="pricing")
-        self.assertIn("CACHED", output.getvalue())
+        rendered = output.getvalue()
+        self.assertIn("Expert threads for 'pricing'", rendered)
+        self.assertIn("THREAD", rendered)
+        self.assertIn("CACHED", rendered)
 
     def test_remote_rows_never_trigger_automatic_pane_preview(self) -> None:
         session = FleetSession(
@@ -801,6 +804,10 @@ class RemoteConsultationTests(unittest.TestCase):
                 },
                 {"type": "answer", "text": "one"},
                 {"type": "answer", "text": "two"},
+                {
+                    "type": "closed", "receipt_version": 2,
+                    "discarded": True, "cleanup": "complete",
+                },
             ]
         )
         node = FleetNode(node_id, "atlas", "atlas")

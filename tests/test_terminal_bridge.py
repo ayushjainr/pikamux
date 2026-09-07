@@ -9,10 +9,27 @@ import sys
 import time
 import unittest
 
-from pikamux.terminal_bridge import ColorQueryFilter
+from pikamux.terminal_bridge import ColorQueryFilter, ExactInputFilter
 
 
 class TerminalBridgeTests(unittest.TestCase):
+    def test_filters_fragmented_windows_terminal_reply_only(self) -> None:
+        response = b"\x1b[>0;10;1c"
+        bridge = ExactInputFilter([response])
+
+        visible_1 = bridge.feed(b"before\x1b[>")
+        visible_2 = bridge.feed(b"0;10;")
+        visible_3 = bridge.feed(b"1cafter")
+
+        self.assertEqual(visible_1 + visible_2 + visible_3 + bridge.finish(), b"beforeafter")
+
+    def test_input_filter_does_not_delay_or_change_normal_escape_keys(self) -> None:
+        bridge = ExactInputFilter([b"\x1b[>0;10;1c"])
+        values = [b"\x1b", b"\x1b[", b"\x1b[A", b"text", b"\x1b[>other"]
+
+        self.assertEqual(b"".join(bridge.feed(value) for value in values), b"".join(values))
+        self.assertEqual(bridge.finish(), b"")
+
     def test_filters_split_color_queries_and_returns_exact_replies(self) -> None:
         bridge = ColorQueryFilter((221, 204, 187), (34, 33, 51))
 

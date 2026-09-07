@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -8,6 +9,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from .models import Pane
+from .terminal_bridge import run_client_bridge
 from .terminal_palette import BACKGROUND_ENV
 from .terminal_palette import FOREGROUND_ENV
 from .terminal_palette import palette_from_environment
@@ -19,6 +21,9 @@ class TmuxError(RuntimeError):
 
 
 PIKA_HISTORY_LIMIT = 100_000
+WINDOWS_TERMINAL_DA2_RESPONSE = "\x1b[>0;10;1c"
+_PIKA_TERMINAL_REPLY_KEY_OPTION = "@pika_terminal_reply_key"
+_PIKA_TERMINAL_REPLY_KEY_CANDIDATES = tuple(range(199, 191, -1))
 
 
 @dataclass(slots=True)
@@ -183,7 +188,7 @@ class Tmux:
     @staticmethod
     def is_pika_session(name: str) -> bool:
         """Identify tmux homes created by Pika, not user-owned adopted sessions."""
-        return name.startswith(("pika-c-", "pika-a-"))
+        return name.startswith(("pika-c-", "pika-a-", "pika-o-"))
 
     def hide_pika_status(self, session_name: str) -> None:
         """Keep Pika's tmux transport visually transparent to the agent UI."""
@@ -240,6 +245,124 @@ class Tmux:
             "terminal-features",
             "xterm*:RGB",
         )
+
+    def ensure_pika_terminal_reply_guard(self) -> bool:
+        """Keep Windows Terminal's DA2 reply out of Pika agent input.
+
+        Windows Terminal answers tmux's secondary-device-attributes probe with
+        ``ESC [ > 0 ; 10 ; 1 c``.  Older tmux/Windows OpenSSH combinations can
+        misclassify that reply as a key and forward it to the active pane,
+        where a TUI renders the printable tail as ``0;10;1c``.  Registering the
+        exact reply as a user key lets tmux consume it before it reaches Codex
+        or Claude.  The binding is conditional on Pika's pane tag and replays
+        the sequence unchanged in every user-owned pane.
+
+        A high, unused user-key slot is claimed rather than overwriting tmux
+        configuration the user already owns.  Failure is deliberately soft:
+        terminal compatibility protection must not prevent an exact attach.
+        """
+
+        marker = self.run(
+            "show-options",
+            "-s",
+            "-v",
+            _PIKA_TERMINAL_REPLY_KEY_OPTION,
+            check=False,
+        )
+        try:
+            claimed = int(marker.stdout.strip()) if marker.returncode == 0 else None
+        except ValueError:
+            claimed = None
+
+        configured = self.run("show-options", "-s", "user-keys", check=False)
+        configured_keys = (
+            set(re.findall(r"^user-keys\[(\d+)\]", configured.stdout, re.MULTILINE))
+            if configured.returncode == 0
+            else set()
+        )
+        bindings = self.run("list-keys", "-T", "root", check=False)
+        bound_keys = (
+            set(re.findall(r"\bUser(\d+)\b", bindings.stdout))
+            if bindings.returncode == 0
+            else set()
+        )
+
+        candidates: list[int] = []
+        if claimed in _PIKA_TERMINAL_REPLY_KEY_CANDIDATES:
+            candidates.append(claimed)
+        candidates.extend(
+            index
+            for index in _PIKA_TERMINAL_REPLY_KEY_CANDIDATES
+            if index != claimed
+        )
+
+        selected: int | None = None
+        for index in candidates:
+            option = f"user-keys[{index}]"
+            current = self.run(
+                "show-options", "-s", "-v", option, check=False
+            )
+            if (
+                index == claimed
+                and current.returncode == 0
+                and current.stdout.rstrip("\r\n") == WINDOWS_TERMINAL_DA2_RESPONSE
+            ):
+                selected = index
+                break
+            if str(index) not in configured_keys and str(index) not in bound_keys:
+                selected = index
+                break
+        if selected is None:
+            return False
+
+        key_name = f"User{selected}"
+        option = f"user-keys[{selected}]"
+        created = selected != claimed
+        if created:
+            if self.run(
+                "set-option",
+                "-s",
+                option,
+                WINDOWS_TERMINAL_DA2_RESPONSE,
+                check=False,
+            ).returncode:
+                return False
+
+        # An empty true branch consumes the response. Outside a Pika-tagged
+        # pane, literal send-keys reconstructs the exact sequence so this
+        # server-level guard is behavior-preserving for the user's own tmux
+        # sessions.
+        replay = "send-keys -l " + shlex.quote(WINDOWS_TERMINAL_DA2_RESPONSE)
+        bound = self.run(
+            "bind-key",
+            "-T",
+            "root",
+            key_name,
+            "if-shell",
+            "-F",
+            "#{@pika_provider}",
+            "",
+            replay,
+            check=False,
+        )
+        if bound.returncode:
+            if created:
+                self.run("set-option", "-s", "-u", option, check=False)
+            return False
+        if not created:
+            return True
+        marker = self.run(
+            "set-option",
+            "-s",
+            _PIKA_TERMINAL_REPLY_KEY_OPTION,
+            str(selected),
+            check=False,
+        )
+        if marker.returncode:
+            self.run("unbind-key", "-T", "root", key_name, check=False)
+            self.run("set-option", "-s", "-u", option, check=False)
+            return False
+        return True
 
     def create_agent_session(
         self,
@@ -340,12 +463,33 @@ class Tmux:
             "TERM"
         ) not in {None, "", "dumb"}
         env_argv = ["env"]
+        # A long-lived tmux server can also retain the identity of the Codex or
+        # Claude client that originally created it. Never let a new provider
+        # process inherit that unrelated conversation identity.
+        inherited_identity = (
+            "CODEX_THREAD_ID",
+            "CODEX_COMPANION_SESSION_ID",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_BRIDGE_SESSION_ID",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_PID",
+            "PIKA_ACTIVE_THREAD_ID",
+            "PIKA_SESSION_ID",
+            "PIKA_LAUNCH_TOKEN",
+            "PIKA_OWNER_TOKEN",
+            "PIKA_NAME",
+            "PIKA_PROVIDER",
+        )
         if preserve_no_color:
             launch_environment["NO_COLOR"] = caller_no_color
         else:
             # Explicitly remove a stale tmux-server value. Omitting the key is
             # insufficient because `env` otherwise inherits the server state.
             env_argv.extend(["-u", "NO_COLOR"])
+        for key in inherited_identity:
+            env_argv.extend(["-u", key])
         env_argv.extend(
             f"{key}={value}" for key, value in launch_environment.items()
         )
@@ -408,6 +552,9 @@ class Tmux:
         on_attached: Callable[[], None] | None = None,
         receipt: str | Callable[[], str] | None = None,
     ) -> int:
+        # Install the guard before attaching: the response it protects against
+        # is emitted during tmux's initial terminal-capability handshake.
+        self.ensure_pika_terminal_reply_guard()
         # Also repairs Pika sessions created by older releases whose inherited
         # global status/mouse options exposed transport details or blocked
         # wheel scrolling. A live pane keeps its original history allocation;
@@ -444,10 +591,25 @@ class Tmux:
                 self.run(*args, check=False)
             return result
         try:
-            process = subprocess.Popen(
-                self.command(
-                    "attach-session", "-t", target_pane or target_session
+            command = self.command(
+                "attach-session", "-t", target_pane or target_session
+            )
+            if sys.stdin.isatty() and sys.stdout.isatty():
+
+                def attached(client_pid: int) -> None:
+                    if on_attached:
+                        on_attached()
+                    if receipt:
+                        message = receipt() if callable(receipt) else receipt
+                        self._display_to_client(client_pid, message)
+
+                return run_client_bridge(
+                    command,
+                    suppress_input=[WINDOWS_TERMINAL_DA2_RESPONSE.encode()],
+                    on_ready=attached,
                 )
+            process = subprocess.Popen(
+                command
             )
             try:
                 result = process.wait(timeout=0.15)
@@ -563,7 +725,9 @@ class Tmux:
         provider: str, session_id: str | None = None, token: str | None = None
     ) -> str:
         suffix = (session_id or token or "session").replace("-", "")[:10]
-        prefix = "c" if provider == "codex" else "a"
+        prefix = {"codex": "c", "claude": "a", "opencode": "o"}.get(
+            provider, "x"
+        )
         return f"pika-{prefix}-{suffix}"
 
 

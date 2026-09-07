@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +12,10 @@ from typing import Any
 from .consult import ConsultationError, consultation_for
 from .models import ExpertProfile, FleetSession, Session
 
-_TERM = re.compile(r"[\w.-]+", re.UNICODE)
+_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
+_IGNORED_QUERY_TERMS = frozenset(
+    {"a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with"}
+)
 
 
 @dataclass(slots=True)
@@ -19,6 +24,8 @@ class ExpertMatch:
     session: Session
     score: int
     matched_on: tuple[str, ...]
+    watched: bool = True
+    availability: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         remote = isinstance(self.session, FleetSession)
@@ -46,6 +53,13 @@ class ExpertMatch:
             "card_status": freshness,
             "score": self.score,
             "matched_on": list(self.matched_on),
+            "watched": self.watched,
+            "discoverable": True,
+            "availability": (
+                "machine-unreachable" if remote and self.session.stale
+                else self.availability or expert_availability(self.session)
+            ),
+            **profile_freshness(self.session, self.profile),
         }
         if remote:
             result.update(
@@ -63,6 +77,8 @@ class ExpertCardState:
     profile: ExpertProfile | None
     status: str
     detail: str
+    watched: bool = True
+    availability: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -76,6 +92,12 @@ class ExpertCardState:
             "current_state": self.profile.current_state if self.profile else None,
             "profile_updated_at": self.profile.updated_at if self.profile else None,
             "profile_source": self.profile.source if self.profile else None,
+            "watched": self.watched,
+            "availability": (
+                "machine-unreachable" if isinstance(self.session, FleetSession) and self.session.stale
+                else self.availability or expert_availability(self.session)
+            ),
+            **profile_freshness(self.session, self.profile),
         }
         if isinstance(self.session, FleetSession):
             result.update(
@@ -124,6 +146,33 @@ def make_profile(
 def transcript_fingerprint(session: Session) -> tuple[int, int] | None:
     if not session.transcript_path:
         return None
+    if session.provider == "opencode":
+        try:
+            with sqlite3.connect(
+                f"file:{session.transcript_path}?mode=ro", uri=True, timeout=1
+            ) as db:
+                row = db.execute(
+                    "WITH RECURSIVE tree(id) AS ("
+                    " SELECT id FROM session WHERE id=?"
+                    " UNION ALL SELECT s.id FROM session s JOIN tree t"
+                    " ON s.parent_id=t.id WHERE s.time_archived IS NULL"
+                    ") SELECT"
+                    " COALESCE((SELECT MAX(time_updated) FROM session"
+                    " WHERE id IN (SELECT id FROM tree)),0),"
+                    " COALESCE((SELECT COUNT(*) FROM message"
+                    " WHERE session_id IN (SELECT id FROM tree)),0) * 1000000 +"
+                    " COALESCE((SELECT COUNT(*) FROM part"
+                    " WHERE session_id IN (SELECT id FROM tree)),0)",
+                    (session.provider_thread_id,),
+                ).fetchone()
+        except (OSError, sqlite3.Error):
+            return None
+        if row is None or not int(row[0] or 0):
+            return None
+        # ExpertProfile keeps two integer checkpoint fields for compatibility.
+        # For OpenCode they carry exact tree update-ms and message/part counts,
+        # never the unrelated whole-database file metadata.
+        return int(row[0]), int(row[1])
     try:
         stat = Path(session.transcript_path).stat()
     except OSError:
@@ -152,10 +201,89 @@ def card_state(session: Session, profile: ExpertProfile | None) -> ExpertCardSta
     return ExpertCardState(session, profile, "STALE", "conversation changed")
 
 
+def clean_current_state(value: str) -> str:
+    return _clean(value, label="current state", limit=600)
+
+
+def expert_availability(session: Session) -> str:
+    """Source access is distinct from discovery and never promises delivery."""
+    if isinstance(session, FleetSession):
+        return "machine-unreachable" if session.stale else session.availability or "remote-unverified"
+    if session.transcript_path and "archived_sessions" in Path(session.transcript_path).parts:
+        return "archived"
+    if session.transcript_path and "sessions_archived" in Path(session.transcript_path).parts:
+        return "archived"
+    if session.status in {"ERROR", "OPEN TWICE"}:
+        return "requires-reconciliation"
+    if transcript_fingerprint(session) is None:
+        return "source-unavailable"
+    return "source-available"
+
+
+def profile_freshness(
+    session: Session, profile: ExpertProfile | None, *, now: float | None = None
+) -> dict[str, Any]:
+    """Independent publication ages: transcript growth does not erase expertise.
+
+    Work freshness describes whether its checkpoint matches, never whether the
+    agent is working. No transcript content is read and no model is consulted.
+    """
+    now = time.time() if now is None else now
+    scope_at = (profile.scope_updated_at or profile.updated_at) if profile else 0.0
+    work_at = (
+        profile.current_state_updated_at or profile.updated_at
+        if profile and profile.current_state else 0.0
+    )
+    if isinstance(session, FleetSession):
+        scope_at = session.scope_updated_at or scope_at
+        work_at = session.current_state_updated_at or work_at
+    work_status = "MISSING"
+    if profile and profile.current_state:
+        if isinstance(session, FleetSession):
+            work_status = "UNKNOWN" if session.stale else session.current_state_status or "UNKNOWN"
+        else:
+            fingerprint = transcript_fingerprint(session)
+            saved = (
+                (profile.current_state_mtime_ns, profile.current_state_size)
+                if profile.current_state_updated_at else
+                (profile.transcript_mtime_ns, profile.transcript_size)
+            )
+            work_status = "UNKNOWN" if fingerprint is None else (
+                "CURRENT" if fingerprint == saved else "STALE"
+            )
+    return {
+        "scope_updated_at": scope_at or None,
+        "scope_age_seconds": max(0, now - scope_at) if scope_at else None,
+        "scope_status": "PUBLISHED" if profile else "MISSING",
+        "current_state_updated_at": work_at or None,
+        "current_state_age_seconds": max(0, now - work_at) if work_at else None,
+        "current_state_status": work_status,
+    }
+
+
+def profile_source_label(profile: ExpertProfile) -> str:
+    """Describe how a profile was created without implying verified authorship."""
+    if profile.source == "interview":
+        return "INTERVIEWED"
+    if profile.source == "self":
+        return "SELF-PUBLISHED"
+    return "PROFILED"
+
+
+def profile_freshness_label(status: str) -> str:
+    """Name transcript synchronization without implying current expertise."""
+    return {
+        "CURRENT": "SYNCED",
+        "STALE": "STALE",
+        "MISSING": "MISSING",
+        "UNKNOWN": "SOURCE UNKNOWN",
+    }.get(status, status)
+
+
 def interview_profile(
     session: Session, existing: ExpertProfile | None = None
 ) -> ExpertProfile:
-    """Ask the exact provider conversation to describe its firsthand expertise."""
+    """Ask the exact provider conversation to describe its relevant work context."""
     fingerprint = transcript_fingerprint(session)
     if fingerprint is None:
         raise ConsultationError("durable provider transcript unavailable")
@@ -173,7 +301,7 @@ def interview_profile(
         else "null"
     )
     prompt = (
-        "Create your internal expert-directory card from the exact conversation "
+        "Create your internal expert-thread profile from the exact conversation "
         "context you inherited. This is not a recap of the latest work. Synthesize "
         "the entire inherited conversation and give early, recurring, and recent "
         "work appropriate weight. Describe only work you personally completed, "
@@ -231,10 +359,20 @@ def rank_experts(
     profiles: Iterable[ExpertProfile],
     sessions: Iterable[Session],
     query: str = "",
+    *,
+    untracked_keys: Iterable[tuple[str, str]] = (),
 ) -> list[ExpertMatch]:
     session_by_key = {item.key: item for item in sessions}
-    phrase = " ".join(query.casefold().split())
-    terms = tuple(dict.fromkeys(_TERM.findall(phrase)))
+    unwatched = set(untracked_keys)
+    raw_query = " ".join(query.casefold().split())
+    query_tokens = tuple(
+        token
+        for token in _tokens(raw_query)
+        if token not in _IGNORED_QUERY_TERMS
+    )
+    terms = tuple(dict.fromkeys(query_tokens))
+    if raw_query and not terms:
+        return []
     matches: list[ExpertMatch] = []
     for profile in profiles:
         session = session_by_key.get(profile.key)
@@ -250,18 +388,23 @@ def rank_experts(
         )
         score = 0
         matched_on: list[str] = []
+        matched_terms: set[str] = set()
         for label, value, weight in fields:
-            folded = value.casefold()
-            hits = sum(term in folded for term in terms)
+            field_tokens = _tokens(value)
+            field_terms = frozenset(field_tokens)
+            field_matches = {term for term in terms if term in field_terms}
+            hits = len(field_matches)
             if hits:
                 score += hits * weight
                 matched_on.append(label)
-            if phrase and phrase in folded:
+                matched_terms.update(field_matches)
+            if query_tokens and _contains_tokens(field_tokens, query_tokens):
                 score += weight * 2
-        if phrase and not score:
+        if raw_query and matched_terms != set(terms):
             continue
         matches.append(
-            ExpertMatch(profile, session, score, tuple(dict.fromkeys(matched_on)))
+            ExpertMatch(profile, session, score, tuple(dict.fromkeys(matched_on)),
+                        watched=profile.key not in unwatched)
         )
     return sorted(
         matches,
@@ -273,6 +416,21 @@ def rank_experts(
         ),
         reverse=True,
     )
+
+
+def _tokens(value: str) -> tuple[str, ...]:
+    """Return case-folded lexical tokens without substring false positives."""
+    return tuple(token.casefold() for token in _TOKEN.findall(value))
+
+
+def _contains_tokens(haystack: tuple[str, ...], needle: tuple[str, ...]) -> bool:
+    """Return whether a complete token phrase occurs contiguously."""
+    width = len(needle)
+    return bool(width) and any(
+        haystack[index : index + width] == needle
+        for index in range(len(haystack) - width + 1)
+    )
+
 
 
 def project_label(cwd: str | None) -> str:

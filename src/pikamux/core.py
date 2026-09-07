@@ -3,11 +3,14 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import select
 import shlex
+import signal
 import subprocess
 import sys
 import time
 import uuid
+from dataclasses import replace
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -23,11 +26,13 @@ from .experts import (
     ExpertCardState,
     ExpertMatch,
     card_state,
+    expert_availability,
     interview_profile,
     make_profile,
     rank_experts,
     transcript_fingerprint,
 )
+from .executables import PROVIDER_NAMES
 from .fleet import REMOTE_STALE_SECONDS, FleetManager
 from .models import (
     Candidate,
@@ -41,9 +46,12 @@ from .models import (
     Status,
 )
 from .processes import (
+    cmdline,
     find_processes_with_session_id,
     process_alive,
     process_environment,
+    opencode_session_processes,
+    process_state,
     process_start_time,
     process_stats,
     process_tree,
@@ -54,12 +62,19 @@ from .providers import Provider, codex_session_metadata, providers
 from .quota import read_provider_quota
 from .setup_hooks import hooks_installed
 from .store import LIVE_OWNER_LEASE_SECONDS, Store, load_config
+from .status_projection import project_status
 from .tmux import Tmux, TmuxError
-from .ui import choose_session, sorted_attention_sessions, terminal_text
+from .ui import (
+    choose_session,
+    provider_identity_label,
+    provider_label,
+    sorted_attention_sessions,
+    terminal_text,
+)
 
 DUPLICATE_TMUX_ERROR = "duplicate Pika tmux homes"
-UNVERIFIED_PANE_ERROR = "tagged provider PID lacks exact-UUID evidence"
-OPEN_TWICE_ERROR = "exact provider UUID is open in multiple process trees"
+UNVERIFIED_PANE_ERROR = "tagged provider PID lacks exact-identity evidence"
+OPEN_TWICE_ERROR = "exact provider identity is open in multiple process trees"
 CONTINUATION_CONFLICT_ERROR = "multiple active Codex continuation threads"
 CONTINUATION_FRESH_SECONDS = 30 * 60
 EXPERT_REFRESH_WINDOW_SECONDS = 6 * 60 * 60
@@ -67,6 +82,7 @@ EXPERT_QUOTA_RESERVE_PERCENT = 10.0
 PENDING_LAUNCH_WINDOW_SECONDS = 60.0
 PENDING_LAUNCH_GRACE_SECONDS = 90.0
 PENDING_CANDIDATE_STABILITY_SECONDS = 2.0
+LIFECYCLE_SETTLE_SECONDS = 5.0
 # Do not bind a missed-hook Codex launch until the entire candidate creation
 # window has elapsed. This lets late provider state arrive before uniqueness is
 # evaluated instead of allowing an earlier unrelated same-cwd row to win.
@@ -85,6 +101,20 @@ class SharedLeaseConflict(PikaError):
         self.session = session
 
 
+class OutsideLiveConflict(PikaError):
+    """One exact provider client is live outside every tmux pane."""
+
+    def __init__(
+        self,
+        message: str,
+        session: Session,
+        process_identities: tuple[tuple[int, int], ...],
+    ):
+        super().__init__(message)
+        self.session = session
+        self.process_identities = process_identities
+
+
 class Pika:
     def __init__(
         self,
@@ -101,6 +131,16 @@ class Pika:
         self._last_discovered_candidates: list[Candidate] = []
         self.store.initialize()
         self.fleet = fleet or FleetManager(self.store)
+
+    def _foreign_provider_process(
+        self, pane_pid: int, provider_name: str
+    ) -> tuple[str, int] | None:
+        for name in PROVIDER_NAMES:
+            if name == provider_name:
+                continue
+            if pid := provider_process(pane_pid, name):
+                return name, pid
+        return None
 
     def discover_candidates(
         self, tracked_sessions: list[Session] | None = None
@@ -219,6 +259,11 @@ class Pika:
             return []
         created_at = float(row["created_at"])
         expected_id = str(row.get("expected_session_id") or "")
+        if provider_name == "opencode" and not expected_id:
+            # OpenCode emits its opaque ses_ identity from Pika's plugin. Its
+            # bare launch argv contains no identity, so time+CWD inference can
+            # never certify a missed hook without risking a concurrent root.
+            return []
         if (
             provider_name == "codex"
             and not expected_id
@@ -279,8 +324,9 @@ class Pika:
             if pane.pika_launch_token != token:
                 continue
             provider_pid = provider_process(pane.pane_pid, provider_name)
-            other_provider = "claude" if provider_name == "codex" else "codex"
-            if not provider_pid or provider_process(pane.pane_pid, other_provider):
+            if not provider_pid or self._foreign_provider_process(
+                pane.pane_pid, provider_name
+            ):
                 continue
             environment = process_environment(provider_pid)
             if (
@@ -451,7 +497,7 @@ class Pika:
                     error=(
                         "IDENTITY CONFLICT: " + conflict
                         if conflict
-                        else "IDENTITY PENDING: exact provider UUID not yet proven"
+                        else "IDENTITY PENDING: exact provider identity not yet proven"
                         if stale
                         else None
                     ),
@@ -501,7 +547,6 @@ class Pika:
         identity_pids = self._candidate_identity_pids(candidate)
         if len(identity_pids) == 1:
             identity_pid = next(iter(identity_pids))
-            other_provider = "claude" if candidate.provider == "codex" else "codex"
             matching_panes = [
                 pane
                 for pane in self.tmux.list_panes()
@@ -511,7 +556,7 @@ class Pika:
                     == identity_pid
                 )
                 and provider_process(pane.pane_pid, candidate.provider)
-                and not provider_process(pane.pane_pid, other_provider)
+                and not self._foreign_provider_process(pane.pane_pid, candidate.provider)
                 and (
                     not pane.pika_session_id
                     or pane.pika_session_id.startswith("unbound:")
@@ -578,11 +623,130 @@ class Pika:
                 pass
         return {int(pid) for pid in result if pid}
 
+    def _discovered_lifecycle_status(self, session: Session) -> str | None:
+        """Return the provider's latest state for this home's active thread."""
+        thread_ids = [session.provider_thread_id]
+        if session.session_id not in thread_ids:
+            thread_ids.append(session.session_id)
+        for thread_id in thread_ids:
+            matches = [
+                candidate
+                for candidate in self._last_discovered_candidates
+                if candidate.provider == session.provider
+                and candidate.session_id == thread_id
+                and candidate.lifecycle_status
+            ]
+            if matches:
+                return max(matches, key=lambda item: item.updated_at).lifecycle_status
+        return None
+
+    def _import_named_codex_forks(
+        self,
+        tracked_sessions: list[Session],
+        candidates: list[Candidate],
+        panes: list[Pane],
+        excluded_keys: set[tuple[str, str]],
+    ) -> list[Session]:
+        """Track a renamed user fork without stealing its parent's live home."""
+        tracked_keys = {item.key for item in tracked_sessions}
+        tracked_parents = {
+            thread_id: item
+            for item in tracked_sessions
+            if item.provider == "codex"
+            for thread_id in {item.session_id, item.provider_thread_id}
+        }
+        pane_by_key = {
+            (pane.pika_provider, pane.pika_session_id): pane
+            for pane in panes
+            if pane.pika_provider and pane.pika_session_id
+        }
+        imported: list[Session] = []
+        for candidate in sorted(candidates, key=lambda item: item.created_at):
+            key = (candidate.provider, candidate.session_id)
+            parent = tracked_parents.get(candidate.parent_session_id or "")
+            if (
+                candidate.provider != "codex"
+                or parent is None
+                or not candidate.name
+                or not parent.name
+                or candidate.name.casefold() == parent.name.casefold()
+                or key in tracked_keys
+                or key in excluded_keys
+            ):
+                continue
+            if parent.provider_thread_id == candidate.session_id:
+                # A lifecycle hook already proved that this fork is the
+                # active leaf inside the parent's stable Pika home.  Its
+                # native rename changes that row; it does not mint a second
+                # parked row merely because the launch-time process argv still
+                # contains the parent UUID.
+                continue
+            parent_pane = pane_by_key.get(parent.key)
+            if parent_pane:
+                child_pids = self._candidate_identity_pids(candidate)
+                if child_pids & set(process_tree(parent_pane.pane_pid)):
+                    # A same-pane continuation retains the stable Pika home;
+                    # normal reconciliation updates that row to the leaf's
+                    # native name. A fork outside that pane is independent.
+                    continue
+            session = self.import_candidate(candidate)
+            tracked_keys.add(session.key)
+            tracked_sessions.append(session)
+            imported.append(session)
+        return imported
+
+    def _remove_unmanaged_native_placeholders(
+        self,
+        tracked_sessions: list[Session],
+        panes: list[Pane],
+    ) -> list[Session]:
+        """Remove provider-generated inventory rows while retaining live proof."""
+        live_home_keys = {
+            (pane.pika_provider, pane.pika_session_id)
+            for pane in panes
+            if pane.pika_provider and pane.pika_session_id
+        }
+        retained: list[Session] = []
+        for session in tracked_sessions:
+            provider = self.providers.get(session.provider)
+            classifier = getattr(provider, "native_placeholder_title", None)
+            requested_name = self.store.get_meta(
+                f"native_name_error:{session.provider}:{session.session_id}"
+            )
+            if (
+                callable(classifier)
+                and classifier(session.name)
+                and not session.managed
+                and session.key not in live_home_keys
+                and not requested_name
+            ):
+                # The provider process may still be live outside Pika. Its
+                # expiring ownership lease remains necessary to prevent an
+                # unsafe duplicate if the UUID is queried before the next
+                # heartbeat; only the false inventory row is removed.
+                self.store.delete_session(
+                    *session.key,
+                    preserve_live_owners=True,
+                )
+                continue
+            retained.append(session)
+        return retained
+
     def refresh(self, *, usage: bool = False) -> list[Session]:
         panes = self.tmux.list_panes()
         self.reconcile_pending_launches(panes)
         tracked_sessions = self.store.list_sessions()
+        opencode_processes = (
+            opencode_session_processes()
+            if any(item.provider == "opencode" for item in tracked_sessions)
+            or any(item.pika_provider == "opencode" for item in panes)
+            else {}
+        )
         candidates = self.discover_candidates(tracked_sessions)
+        tracked_sessions = self._remove_unmanaged_native_placeholders(
+            tracked_sessions,
+            panes,
+        )
         hidden_keys = self.hidden_session_keys(tracked_sessions)
         # Hidden provider rows stay provider-owned.  Automation workers are
         # also removed from Pika's operational ledger so stale READY/error
@@ -594,8 +758,38 @@ class Pika:
             classifier = getattr(provider, "worker_originator", None)
             if classifier and classifier(session.session_id, session.transcript_path):
                 self.store.delete_session(*session.key)
+        deleted_keys: set[tuple[str, str]] = set()
+        for session in tracked_sessions:
+            provider = self.providers.get(session.provider)
+            durable_state = getattr(provider, "durable_state", None)
+            if not callable(durable_state):
+                continue
+            try:
+                state = durable_state(session.provider_thread_id)
+            except Exception as exc:  # noqa: BLE001 - deletion must be provider-proven
+                self.discovery_errors.append(
+                    f"{session.provider}:{session.session_id} durable state: {exc}"
+                )
+                continue
+            if state not in {"deleted", "archived"}:
+                continue
+            deleted_keys.add(session.key)
+            for pane in panes:
+                if (pane.pika_provider, pane.pika_session_id) != session.key:
+                    continue
+                try:
+                    self.tmux.clear_pika_tags(pane.pane_id)
+                except (AttributeError, OSError, TmuxError):
+                    pass
+            self.store.delete_session(*session.key)
         untracked_keys = self.store.untracked_session_keys()
-        excluded_keys = hidden_keys | untracked_keys
+        excluded_keys = hidden_keys | deleted_keys | untracked_keys
+        self._import_named_codex_forks(
+            tracked_sessions,
+            candidates,
+            panes,
+            excluded_keys,
+        )
         candidates = [
             item
             for item in candidates
@@ -729,22 +923,31 @@ class Pika:
                 session.attention_reason = "identity"
             if candidate:
                 if candidate.name:
-                    fields["name"] = candidate.name
-                    if pane and pane.pika_name != candidate.name:
+                    error_key = (
+                        f"native_name_error:{session.provider}:{session.session_id}"
+                    )
+                    expected_name = self.store.get_meta(error_key)
+                    reconciled_name = (
+                        expected_name
+                        if session.provider == "opencode"
+                        and expected_name
+                        and candidate.name != expected_name
+                        else candidate.name
+                    )
+                    fields["name"] = reconciled_name
+                    if pane and pane.pika_name != reconciled_name:
                         try:
                             self.tmux.tag_pane(
                                 pane.pane_id,
-                                name=candidate.name,
+                                name=reconciled_name,
                             )
                         except (AttributeError, OSError, TmuxError) as exc:
                             self.discovery_errors.append(
                                 f"{session.provider}:{session.session_id} "
                                 f"pane name tag: {exc}"
                             )
-                    if session.provider == "codex":
-                        self.store.delete_meta(
-                            f"native_name_error:codex:{session.session_id}"
-                        )
+                    if expected_name and candidate.name == expected_name:
+                        self.store.delete_meta(error_key)
                 if candidate.cwd:
                     fields["cwd"] = candidate.cwd
                 if candidate.branch:
@@ -756,6 +959,26 @@ class Pika:
                 fields["last_activity_at"] = max(
                     session.last_activity_at, candidate.updated_at
                 )
+                if candidate.lifecycle_status:
+                    candidate_unread = bool(
+                        candidate.lifecycle_status == Status.READY.value
+                        and candidate.updated_at > session.last_event_at
+                        and not (pane and pane.attached)
+                    )
+                    self.store.record_status_observation(
+                        *session.key,
+                        kind="lifecycle",
+                        status=candidate.lifecycle_status,
+                        unread=candidate_unread,
+                        attention_reason=(
+                            "completed"
+                            if candidate.lifecycle_status == Status.READY.value
+                            else None
+                        ),
+                        error=None,
+                        observed_at=candidate.updated_at or session.last_activity_at,
+                        source=candidate.source,
+                    )
                 if (
                     candidate.lifecycle_status
                     and candidate.updated_at > session.last_event_at
@@ -775,12 +998,55 @@ class Pika:
                         ),
                         last_event_at=candidate.updated_at,
                     )
+                elif (
+                    candidate.lifecycle_status == Status.READY.value
+                    and session.status == Status.WORKING.value
+                    and session.last_activity_at > session.last_event_at
+                    and time.time() - session.last_event_at
+                    >= LIFECYCLE_SETTLE_SECONDS
+                    and not continuation_conflicts
+                ):
+                    # Older Pika releases marked a conversation WORKING merely
+                    # because its provider TUI was resumed. If the provider's
+                    # durable lifecycle still says the last turn completed and
+                    # no newer hook arrived after a short settle window, the
+                    # live TUI is idle. Heal that legacy state without creating
+                    # an unread completion event.
+                    fields.update(
+                        status=Status.READY.value,
+                        unread=False,
+                        error=None,
+                        attention_reason=None,
+                    )
+                    # The newer timestamp belongs to Pika's legacy process
+                    # launch guess, not to provider work. Record the provider's
+                    # settled state as the reconciliation fact that supersedes
+                    # that known-bad observation class.
+                    self.store.record_status_observation(
+                        *session.key,
+                        kind="lifecycle",
+                        status=Status.READY.value,
+                        unread=False,
+                        attention_reason=None,
+                        error=None,
+                        observed_at=time.time(),
+                        source="provider-lifecycle-heal",
+                    )
             direct_uuid_pids = self.uuid_identity_pids(session)
+            claimed_pids = self.identity_pids(session)
             live_pid: int | None = None
             raw_pid: int | None = None
             if pane:
                 raw_pid = provider_process(pane.pane_pid, session.provider)
-                live_pid = self.exact_pane_pid(session, pane)
+                pane_has_bound_launch = bool(
+                    raw_pid and self._bound_launch_identity(session, raw_pid)
+                )
+                live_pid = self.exact_pane_pid(
+                    session,
+                    pane,
+                    panes=panes,
+                    opencode_processes=opencode_processes,
+                )
                 fields.update(
                     tmux_session=pane.session_name,
                     tmux_pane=pane.pane_id,
@@ -794,23 +1060,37 @@ class Pika:
                     ):
                         self.store.capture_identity_interruption(*session.key)
                     outside_exact = self._outside_uuid_pids(session, pane)
-                    if len(direct_uuid_pids) > 1:
+                    outside_processes = (
+                        self._outside_processes(
+                            session,
+                            panes,
+                            opencode_processes=opencode_processes,
+                        )
+                        if session.provider == "opencode"
+                        else []
+                    )
+                    if len(claimed_pids) > 1:
                         fields.update(
                             status=Status.OPEN_TWICE.value,
                             unread=True,
                             error=(
                                 f"{OPEN_TWICE_ERROR}: PIDs "
-                                + ", ".join(map(str, sorted(direct_uuid_pids)))
+                                + ", ".join(map(str, sorted(claimed_pids)))
                             ),
                             attention_reason="identity",
                         )
-                    elif outside_exact and raw_pid in direct_uuid_pids:
+                    elif (outside_exact or outside_processes) and (
+                        raw_pid in claimed_pids or pane_has_bound_launch
+                    ):
+                        outside_ids = sorted(
+                            set(outside_exact) | set(outside_processes)
+                        )
                         fields.update(
                             status=Status.OPEN_TWICE.value,
                             unread=True,
                             error=(
                                 f"{OPEN_TWICE_ERROR}: pane PID {raw_pid}; outside "
-                                f"PID {', '.join(map(str, outside_exact))}"
+                                f"PID {', '.join(map(str, outside_ids))}"
                             ),
                             attention_reason="identity",
                         )
@@ -834,11 +1114,23 @@ class Pika:
             elif candidate and candidate.live and process_alive(candidate.pid):
                 live_pid = candidate.pid
                 fields["root_pid"] = live_pid
+            elif not pane and len(claimed_pids) == 1:
+                # Direct argv evidence or a current provider-root lease proves
+                # one live process outside Pika without a bulk /proc scan.
+                live_pid = next(iter(claimed_pids))
+                fields["root_pid"] = live_pid
+                if not session.managed:
+                    fields.update(
+                        status=Status.UNBOUND.value,
+                        unread=False,
+                        error=None,
+                        attention_reason=None,
+                    )
             elif session.root_pid:
                 stored_pid = provider_process(session.root_pid, session.provider)
                 if stored_pid in self.identity_pids(session):
                     live_pid = stored_pid
-            if len(direct_uuid_pids) > 1:
+            if len(claimed_pids) > 1:
                 if not (
                     session.status == Status.OPEN_TWICE.value
                     and session.attention_reason == "identity"
@@ -849,7 +1141,7 @@ class Pika:
                     unread=True,
                     error=(
                         f"{OPEN_TWICE_ERROR}: PIDs "
-                        + ", ".join(map(str, sorted(direct_uuid_pids)))
+                        + ", ".join(map(str, sorted(claimed_pids)))
                     ),
                     attention_reason="identity",
                 )
@@ -878,7 +1170,7 @@ class Pika:
             if (
                 not continuation_conflicts
                 and len(duplicate_panes) <= 1
-                and len(direct_uuid_pids) <= 1
+                and len(claimed_pids) <= 1
                 and session.error
                 and (
                     session.error.startswith(DUPLICATE_TMUX_ERROR)
@@ -889,6 +1181,36 @@ class Pika:
                 and not (raw_pid and not live_pid)
             ):
                 identity_repaired = True
+            observed_status = fields.get("status")
+            observed_reason = fields.get("attention_reason")
+            observed_error = fields.get("error")
+            if observed_reason == "identity" and observed_status in {
+                Status.ERROR.value,
+                Status.OPEN_TWICE.value,
+            }:
+                self.store.record_status_observation(
+                    *session.key,
+                    kind="safety",
+                    status=str(observed_status),
+                    unread=bool(fields.get("unread", True)),
+                    attention_reason="identity",
+                    error=str(observed_error) if observed_error is not None else None,
+                    observed_at=time.time(),
+                    source="identity-reconciliation",
+                )
+            elif observed_reason == "exited" and observed_status == Status.ERROR.value:
+                self.store.record_status_observation(
+                    *session.key,
+                    kind="runtime",
+                    status=Status.ERROR.value,
+                    unread=bool(fields.get("unread", True)),
+                    attention_reason="exited",
+                    error=str(observed_error) if observed_error is not None else None,
+                    observed_at=time.time(),
+                    source="tmux",
+                )
+            if live_pid:
+                self.store.clear_status_observation(*session.key, "runtime")
             if fields:
                 self.store.update_session(
                     session.provider, session.session_id, **fields
@@ -935,7 +1257,16 @@ class Pika:
                 != session.key
             ):
                 pane = None
-            live_pid = self.exact_pane_pid(session, pane) if pane else None
+            live_pid = (
+                self.exact_pane_pid(
+                    session,
+                    pane,
+                    panes=panes,
+                    opencode_processes=opencode_processes,
+                )
+                if pane
+                else None
+            )
             if not pane and not live_pid and session.root_pid:
                 stored_pid = provider_process(session.root_pid, session.provider)
                 if stored_pid in self.identity_pids(session):
@@ -968,6 +1299,44 @@ class Pika:
                 session.cpu_percent, session.rss_kb = process_stats(
                     pane.pane_pid if pane else live_pid
                 )
+            projection = project_status(
+                self.store.status_observations(*session.key),
+                live=session.live,
+                home_state=session.home_state,
+                fallback_status=session.status,
+                fallback_unread=session.unread,
+                fallback_reason=session.attention_reason,
+                fallback_error=session.error,
+                fallback_at=session.last_event_at,
+            )
+            projected_values = (
+                projection.status,
+                projection.unread,
+                projection.attention_reason,
+                projection.error,
+                projection.observed_at,
+            )
+            current_values = (
+                session.status,
+                session.unread,
+                session.attention_reason,
+                session.error,
+                session.last_event_at,
+            )
+            if projected_values != current_values:
+                self.store.update_session(
+                    *session.key,
+                    status=projection.status,
+                    unread=projection.unread,
+                    attention_reason=projection.attention_reason,
+                    error=projection.error,
+                    last_event_at=projection.observed_at,
+                )
+                session.status = projection.status
+                session.unread = projection.unread
+                session.attention_reason = projection.attention_reason
+                session.error = projection.error
+                session.last_event_at = projection.observed_at
         return self.hydrate_usage(sessions) if usage else sessions
 
     @staticmethod
@@ -1126,6 +1495,15 @@ class Pika:
             raise PikaError(
                 f"{session.display_name} has no surviving tmux pane to peek"
             )
+        if (
+            (pane.pika_provider, pane.pika_session_id) != session.key
+            or self.exact_pane_pid(session, pane) is None
+        ):
+            raise PikaError(
+                f"Cannot verify the exact owner of {session.display_name}'s pane. "
+                f"No output was read. Run `pika open {session.session_id}` "
+                "to reconcile the conversation."
+            )
         return self.tmux.capture(pane.pane_id, lines)
 
     def resolve(self, query: str, sessions: list[Session] | None = None) -> Session:
@@ -1237,7 +1615,6 @@ class Pika:
         provider_pid = (
             provider_process(pane.pane_pid, pending.provider) if pane else None
         )
-        other_provider = "claude" if pending.provider == "codex" else "codex"
         environment = process_environment(provider_pid) if provider_pid else {}
         pid_start = process_start_time(provider_pid)
         conflict = self.store.get_meta(
@@ -1252,7 +1629,7 @@ class Pika:
             pane is None
             or pane.pika_launch_token != pending.launch_token
             or not provider_pid
-            or provider_process(pane.pane_pid, other_provider)
+            or self._foreign_provider_process(pane.pane_pid, pending.provider)
             or environment.get("PIKA_LAUNCH_TOKEN") != pending.launch_token
             or environment.get("PIKA_PROVIDER") != pending.provider
             or (pending.root_pid is not None and pending.root_pid != provider_pid)
@@ -1278,7 +1655,7 @@ class Pika:
                 on_attached=attached,
                 receipt=(
                     f"Pika → {terminal_text(pending.display_name)} · "
-                    f"{pending.provider.title()} · ATTACHED · IDENTITY PENDING · "
+                    f"{provider_label(pending.provider)} · ATTACHED · IDENTITY PENDING · "
                     f"launch {pending.launch_token[:8]}"
                 ),
             )
@@ -1397,9 +1774,16 @@ class Pika:
                 "if creating another conversation is intentional."
             )
         compact = query.replace("-", "")
-        if len(compact) >= 8 and all(char in "0123456789abcdefABCDEF" for char in compact):
+        identity_shaped = any(
+            getattr(provider, "valid_session_id", lambda _value: False)(query)
+            for provider in self.providers.values()
+        )
+        if identity_shaped or (
+            len(compact) >= 8
+            and all(char in "0123456789abcdefABCDEF" for char in compact)
+        ):
             raise PikaError(
-                f"No provider conversation has UUID {query!r}; Pika will not turn "
+                f"No provider conversation has identity {query!r}; Pika will not turn "
                 "an identity-shaped value into a new name."
             )
         stale_nodes: list[str] = []
@@ -1425,7 +1809,13 @@ class Pika:
             )
         return self.new(query, attach=attach)
 
-    def _outside_processes(self, session: Session, panes: list) -> list[int]:
+    def _outside_processes(
+        self,
+        session: Session,
+        panes: list,
+        *,
+        opencode_processes: dict[str, list[int]] | None = None,
+    ) -> list[int]:
         owned_pane_pids: set[int] = set()
         for pane in panes:
             if (pane.pika_provider, pane.pika_session_id) == session.key or (
@@ -1437,9 +1827,46 @@ class Pika:
         thread_ids = {session.session_id, session.provider_thread_id}
         candidates: set[int] = set()
         for thread_id in thread_ids:
-            candidates.update(
-                find_processes_with_session_id(thread_id, session.provider)
+            argv_pids = (
+                list(
+                    (
+                        opencode_processes
+                        if opencode_processes is not None
+                        else opencode_session_processes()
+                    ).get(thread_id, [])
+                )
+                if session.provider == "opencode"
+                else find_processes_with_session_id(thread_id, session.provider)
             )
+            if session.provider == "opencode":
+                # OpenCode retains its launch root in argv after an in-TUI
+                # switch. A fresh hook claim for another root supersedes that
+                # stale argument. An unclaimed argument remains an ambiguity
+                # hint and blocks unsafe duplication.
+                current_claims: dict[int, set[str]] = {}
+                now = time.time()
+                for (
+                    owner_provider,
+                    owner_session,
+                    owner_pid,
+                    owner_start,
+                    last_seen,
+                    _owner_token,
+                ) in self.store.list_live_owners():
+                    if (
+                        owner_provider == "opencode"
+                        and owner_start is not None
+                        and process_start_time(owner_pid) == owner_start
+                        and now - last_seen <= LIVE_OWNER_LEASE_SECONDS
+                    ):
+                        current_claims.setdefault(owner_pid, set()).add(owner_session)
+                argv_pids = [
+                    pid
+                    for pid in argv_pids
+                    if not current_claims.get(pid)
+                    or bool(current_claims[pid] & thread_ids)
+                ]
+            candidates.update(argv_pids)
         provider = self.providers.get(session.provider)
         if provider:
             active_pids = getattr(provider, "active_pids", None)
@@ -1513,44 +1940,107 @@ class Pika:
         useful as a short lease only when no direct UUID-bearing client exists.
         """
         uuid_pids = self.uuid_identity_pids(session)
+        recovery_pids = self._recovery_owner_pids(session)
         lease_pids = self._live_owner_pids(session)
-        if uuid_pids:
+        if (uuid_pids or recovery_pids) and session.provider == "codex":
             lease_pids = {
                 pid
                 for pid in lease_pids
                 if not shared_provider_process(pid, session.provider)
             }
-        return uuid_pids | lease_pids | self._recovery_owner_pids(session)
+        return uuid_pids | recovery_pids | lease_pids
+
+    def _bound_launch_identity(self, session: Session, pid: int) -> bool:
+        """Prove one Pika-created process generation from its launch binding.
+
+        New Codex clients choose their UUID after the process starts, so their
+        argv cannot carry it. The launch token is injected before start and is
+        bound to exactly one provider UUID by the validated SessionStart hook.
+        The token is inheritable, so it becomes direct proof only when the PID
+        and /proc start time also match Pika's validated owner certificate.
+        """
+        environment = process_environment(pid)
+        launch_token = environment.get("PIKA_LAUNCH_TOKEN")
+        if (
+            not launch_token
+            or environment.get("PIKA_PROVIDER") != session.provider
+        ):
+            return False
+        if self.store.get_launch_binding(launch_token) != session.key:
+            return False
+        start_time = process_start_time(pid)
+        if start_time is None:
+            return False
+        certificate = self.store.get_recovery_owner(*session.key)
+        if certificate == (pid, start_time, launch_token):
+            return True
+        # Older Pika launches predate recovery certificates. Their validated
+        # direct hook lease still contains the same PID generation, so upgrade
+        # it once in place. A descendant or copied-token process has no such
+        # lease and remains unverified.
+        for owner, owner_start, _last_seen, _owner_token in (
+            self.store.get_live_owner_leases(*session.key)
+        ):
+            if owner == pid and owner_start == start_time:
+                self.store.set_recovery_owner(
+                    *session.key,
+                    pid,
+                    start_time,
+                    launch_token,
+                )
+                return True
+        return False
 
     def _outside_uuid_pids(self, session: Session, pane: Pane) -> list[int]:
         inside = set(process_tree(pane.pane_pid))
         pane_provider_pid = provider_process(pane.pane_pid, session.provider)
         if pane_provider_pid:
             inside.add(pane_provider_pid)
-        return sorted(self.uuid_identity_pids(session) - inside)
+        return sorted(self.identity_pids(session) - inside)
 
-    def exact_pane_pid(self, session: Session, pane: Pane) -> int | None:
+    def exact_pane_pid(
+        self,
+        session: Session,
+        pane: Pane,
+        *,
+        panes: list[Pane] | None = None,
+        opencode_processes: dict[str, list[int]] | None = None,
+    ) -> int | None:
         """Accept one pane only when it contains all live UUID-owned processes."""
         pid = provider_process(pane.pane_pid, session.provider)
         if not pid:
             return None
+        if session.provider == "opencode" and self._outside_processes(
+            session,
+            panes if panes is not None else self.tmux.list_panes(),
+            opencode_processes=opencode_processes,
+        ):
+            # Before its first hook/heartbeat, a second OpenCode client has
+            # only launch argv as evidence. That ambiguity must still defeat an
+            # otherwise exact managed pane instead of allowing a duplicate.
+            return None
         uuid_pids = self.uuid_identity_pids(session)
-        if len(uuid_pids) > 1:
+        direct_pids = set(uuid_pids)
+        if self._bound_launch_identity(session, pid):
+            direct_pids.add(pid)
+        if len(direct_pids) > 1:
             return None
         pane_tree = set(process_tree(pane.pane_pid))
         # provider_process only returns a descendant of pane.pane_pid. Keep
         # that direct proof even when a concurrently exiting process makes a
         # second /proc tree walk incomplete.
         pane_tree.add(pid)
-        identities = self.identity_pids(session)
-        if uuid_pids:
-            return pid if identities.issubset(pane_tree) else None
-        if pid not in identities:
+        lease_pids = self._live_owner_pids(session)
+        if direct_pids and session.provider == "codex":
+            lease_pids = {
+                owner
+                for owner in lease_pids
+                if not shared_provider_process(owner, session.provider)
+            }
+        identities = direct_pids | lease_pids | self._recovery_owner_pids(session)
+        if not direct_pids and pid not in identities:
             return None
-        other_identities = identities - {pid}
-        if other_identities and not other_identities.issubset(pane_tree):
-            return None
-        return pid
+        return pid if identities.issubset(pane_tree) else None
 
     def open_on_client(
         self, session: Session | FleetSession
@@ -1625,6 +2115,9 @@ class Pika:
         sessions = self.refresh()
         current = next((item for item in sessions if item.key == session.key), session)
         panes = self.tmux.list_panes()
+        opencode_processes = (
+            opencode_session_processes() if current.provider == "opencode" else {}
+        )
         matching_panes = [
             pane
             for pane in panes
@@ -1645,15 +2138,24 @@ class Pika:
             raise PikaError(
                 f"RECOVERY REFUSED: {current.display_name}'s Pika pane "
                 f"{pane.session_name}:{pane.pane_id} still runs "
-                f"{current.provider.title()} PID {pid}. Run exactly: "
+                f"{provider_label(current.provider)} PID {pid}. Run exactly: "
                 f"`{shlex.join(['pika', current.display_name])}` to attach it."
             )
-        direct_uuid_pids = self.uuid_identity_pids(current)
-        if direct_uuid_pids:
+        claimed_pids = self.identity_pids(current)
+        strict_claims = {
+            pid
+            for pid in claimed_pids
+            if not (
+                current.provider == "codex"
+                and shared_provider_process(pid, current.provider)
+            )
+        }
+        if strict_claims:
             raise PikaError(
-                f"RECOVERY REFUSED: {current.display_name} still has an exact "
-                f"UUID-bearing {current.provider.title()} client (PID "
-                f"{', '.join(map(str, sorted(direct_uuid_pids)))}). Exit it first, "
+                f"RECOVERY REFUSED: {current.display_name} still has a "
+                f"{provider_label(current.provider)} client bearing the exact "
+                f"{provider_identity_label(current.provider)} (PID "
+                f"{', '.join(map(str, sorted(strict_claims)))}). Exit it first, "
                 f"then run exactly: "
                 f"`{shlex.join(['pika', current.display_name])}`."
             )
@@ -1664,7 +2166,7 @@ class Pika:
         )
         if named_client_pids:
             raise PikaError(
-                f"RECOVERY REFUSED: a live {current.provider.title()} client was "
+                f"RECOVERY REFUSED: a live {provider_label(current.provider)} client was "
                 f"launched with saved name {current.display_name!r} (PID "
                 f"{', '.join(map(str, named_client_pids))}). In that client, run "
                 f"`/exit` and wait for the shell prompt; then run exactly: "
@@ -1674,12 +2176,15 @@ class Pika:
         non_shared = [
             pid
             for pid in outside
-            if not shared_provider_process(pid, current.provider)
+            if not (
+                current.provider == "codex"
+                and shared_provider_process(pid, current.provider)
+            )
         ]
         if non_shared:
             raise PikaError(
                 f"RECOVERY REFUSED: {current.display_name} still has a dedicated "
-                f"{current.provider.title()} process (PID "
+                f"{provider_label(current.provider)} process (PID "
                 f"{', '.join(map(str, non_shared))}). Exit it first, then run "
                 f"exactly: "
                 f"`{shlex.join(['pika', current.display_name])}`."
@@ -1693,7 +2198,11 @@ class Pika:
                 and process_start_time(owner) == owner_start
                 else None
             )
-            if live_owner and shared_provider_process(live_owner, current.provider):
+            if (
+                live_owner
+                and current.provider == "codex"
+                and shared_provider_process(live_owner, current.provider)
+            ):
                 self.store.delete_live_owner(
                     *current.key,
                     pid=owner,
@@ -1707,6 +2216,97 @@ class Pika:
             )
         return self.open(current, attach=attach)
 
+    def clean_and_attach(
+        self,
+        conflict: OutsideLiveConflict,
+        *,
+        attach: bool = True,
+        timeout: float = 8.0,
+    ) -> int:
+        """Gracefully stop one proven outside client, then resume its exact UUID.
+
+        This is deliberately not a force-open or a generic process killer. The
+        target must remain the same single UUID-bearing provider PID generation,
+        must not be shared infrastructure, and must not belong to any tmux pane.
+        A graceful SIGTERM timeout leaves recovery stopped; Pika never escalates
+        to SIGKILL automatically.
+        """
+        if len(conflict.process_identities) != 1:
+            raise PikaError(
+                "CLEAN AND ATTACH REFUSED: expected exactly one outside process"
+            )
+        expected_pid, expected_start = conflict.process_identities[0]
+        sessions = self.refresh()
+        current = next(
+            (item for item in sessions if item.key == conflict.session.key),
+            conflict.session,
+        )
+        claimed = self.identity_pids(current)
+        if claimed != {expected_pid}:
+            detail = ", ".join(map(str, sorted(claimed))) or "none"
+            raise PikaError(
+                "CLEAN AND ATTACH REFUSED: exact provider-identity ownership changed "
+                f"(expected PID {expected_pid}, now {detail}). No signal was sent."
+            )
+        if process_start_time(expected_pid) != expected_start:
+            raise PikaError(
+                "CLEAN AND ATTACH REFUSED: the outside PID generation changed. "
+                "No signal was sent; rerun the original `pika NAME` command."
+            )
+        if current.provider == "codex" and shared_provider_process(
+            expected_pid, current.provider
+        ):
+            raise PikaError(
+                "CLEAN AND ATTACH REFUSED: Pika will never terminate shared "
+                "provider infrastructure."
+            )
+        for pane in self.tmux.list_panes():
+            if expected_pid in process_tree(pane.pane_pid):
+                raise PikaError(
+                    "CLEAN AND ATTACH REFUSED: the exact process is now inside tmux. "
+                    f"Rerun `{shlex.join(['pika', current.display_name])}` to attach it."
+                )
+        pidfd_open = getattr(os, "pidfd_open", None)
+        pidfd_signal = getattr(signal, "pidfd_send_signal", None)
+        if not callable(pidfd_open) or not callable(pidfd_signal):
+            raise PikaError(
+                "CLEAN AND ATTACH REFUSED: this Linux/Python runtime cannot pin the "
+                "exact PID generation safely. No signal was sent."
+            )
+        try:
+            pidfd = pidfd_open(expected_pid, 0)
+        except OSError as exc:
+            raise PikaError(
+                "CLEAN AND ATTACH REFUSED: the outside process changed before it "
+                "could be pinned. No signal was sent."
+            ) from exc
+        try:
+            if process_start_time(expected_pid) != expected_start:
+                raise PikaError(
+                    "CLEAN AND ATTACH REFUSED: the outside PID generation changed. "
+                    "No signal was sent."
+                )
+            pidfd_signal(pidfd, signal.SIGTERM, None, 0)
+            readable, _, _ = select.select([pidfd], [], [], max(0.1, timeout))
+            if not readable:
+                raise PikaError(
+                    f"{provider_label(current.provider)} PID {expected_pid} did not exit after "
+                    f"{timeout:g}s. Pika did not force-kill it and did not start a "
+                    "second client. Use `/exit` in its original terminal."
+                )
+        finally:
+            os.close(pidfd)
+        remaining = self.identity_pids(current)
+        if remaining:
+            status = "OPEN TWICE" if len(remaining) > 1 else "STILL OPEN"
+            raise PikaError(
+                f"{status}: exact {provider_identity_label(current.provider)} "
+                f"{current.provider_thread_id} still has live "
+                f"provider PID {', '.join(map(str, sorted(remaining)))}. Pika did "
+                "not resume another client."
+            )
+        return self.recover_after_closed_confirmation(current, attach=attach)
+
     def open(self, session: Session | FleetSession, *, attach: bool = True) -> int:
         if isinstance(session, FleetSession):
             if not attach:
@@ -1718,6 +2318,14 @@ class Pika:
         current = next((item for item in sessions if item.key == session.key), session)
         collecting_result = current.status == Status.READY.value and current.unread
         panes = self.tmux.list_panes()
+        opencode_processes = (
+            opencode_session_processes() if current.provider == "opencode" else {}
+        )
+        opencode_process_kwargs = (
+            {"opencode_processes": opencode_processes}
+            if current.provider == "opencode"
+            else {}
+        )
         matching_panes = [
             item
             for item in panes
@@ -1741,56 +2349,87 @@ class Pika:
         raw_pane_pid = (
             provider_process(pane.pane_pid, current.provider) if pane else None
         )
-        live_pid = self.exact_pane_pid(current, pane) if pane else None
+        live_pid = (
+            self.exact_pane_pid(
+                current,
+                pane,
+                panes=panes,
+                **opencode_process_kwargs,
+            )
+            if pane
+            else None
+        )
         if raw_pane_pid and not live_pid:
-            direct_uuid_pids = self.uuid_identity_pids(current)
-            if len(direct_uuid_pids) > 1:
+            claimed_pids = self.identity_pids(current)
+            outside_processes = (
+                self._outside_processes(
+                    current,
+                    panes,
+                    **opencode_process_kwargs,
+                )
+                if current.provider == "opencode"
+                else []
+            )
+            if len(claimed_pids) > 1:
                 raise PikaError(
-                    f"OPEN TWICE: {current.display_name} has exact UUID "
+                    f"OPEN TWICE: {current.display_name} has exact "
+                    f"{provider_identity_label(current.provider)} "
                     f"{current.provider_thread_id} in multiple provider clients "
-                    f"(PID {', '.join(map(str, sorted(direct_uuid_pids)))}). "
+                    f"(PID {', '.join(map(str, sorted(claimed_pids)))}). "
                     "Close one copy before attaching."
                 )
             outside_exact = self._outside_uuid_pids(current, pane)
-            if outside_exact and raw_pane_pid in self.uuid_identity_pids(current):
+            if (outside_exact or outside_processes) and (
+                raw_pane_pid in claimed_pids
+                or self._bound_launch_identity(current, raw_pane_pid)
+            ):
+                outside_ids = sorted(set(outside_exact) | set(outside_processes))
                 raise PikaError(
-                    f"OPEN TWICE: {current.display_name} has exact UUID "
+                    f"OPEN TWICE: {current.display_name} has exact "
+                    f"{provider_identity_label(current.provider)} "
                     f"{current.provider_thread_id} in its Pika pane "
                     f"(PID {raw_pane_pid}) "
-                    f"and outside it (PID {', '.join(map(str, outside_exact))}). "
+                    f"and outside it (PID {', '.join(map(str, outside_ids))}). "
                     "Close one copy before attaching."
                 )
             raise PikaError(
                 f"{current.display_name}'s tagged pane contains a running "
-                f"{current.provider} process (PID {raw_pane_pid}) that cannot be tied "
-                f"to exact UUID {current.provider_thread_id}. Pika refuses to "
+                f"{provider_label(current.provider)} process (PID {raw_pane_pid}) that "
+                f"cannot be tied to exact {provider_identity_label(current.provider)} "
+                f"{current.provider_thread_id}. Pika refuses to "
                 "attach or issue an exact-thread receipt."
             )
         outcome = "ATTACHED LIVE" if live_pid else "RESUMED EXACT"
         preserved: str | None = None
         if pane and not live_pid:
-            other_provider = "claude" if current.provider == "codex" else "codex"
-            other_pid = provider_process(pane.pane_pid, other_provider)
-            if other_pid:
+            other = self._foreign_provider_process(pane.pane_pid, current.provider)
+            if other:
+                other_provider, other_pid = other
                 raise PikaError(
                     f"{current.display_name}'s saved tmux pane contains a running "
                     f"{other_provider} process (PID {other_pid}). Pika refuses to replace it."
                 )
         if not live_pid:
-            outside = self._outside_processes(current, panes)
+            outside = self._outside_processes(
+                current,
+                panes,
+                **opencode_process_kwargs,
+            )
             if outside:
                 pid_text = ", ".join(str(pid) for pid in outside)
                 reopen_command = shlex.join(["pika", current.display_name])
                 direct_uuid_pids = self.uuid_identity_pids(current)
-                if len(direct_uuid_pids) > 1:
+                claimed_pids = self.identity_pids(current)
+                if len(claimed_pids) > 1:
                     raise PikaError(
-                        f"OPEN TWICE: {current.display_name} has exact UUID "
+                        f"OPEN TWICE: {current.display_name} has exact "
+                        f"{provider_identity_label(current.provider)} "
                         f"{current.provider_thread_id} in multiple process trees "
                         f"(PID {pid_text}). Required steps: 1) close all but one "
                         f"of those provider clients; 2) run exactly: "
                         f"`{reopen_command}`."
                     )
-                if not direct_uuid_pids and all(
+                if current.provider == "codex" and not direct_uuid_pids and all(
                     shared_provider_process(pid, current.provider) for pid in outside
                 ):
                     leases = self.store.get_live_owner_leases(*current.key)
@@ -1816,7 +2455,8 @@ class Pika:
                         raise PikaError(
                             f"ACTIVE IN {current.provider.upper()} CLI: a live client "
                             f"was launched with saved name {current.display_name!r} "
-                            f"(PID {named_pid_text}) and the exact UUID has a fresh "
+                            f"(PID {named_pid_text}) and the exact "
+                            f"{provider_identity_label(current.provider)} has a fresh "
                             f"shared app-server lease. Required steps: 1) in that client, run "
                             f"`/exit` and wait for the shell prompt; 2) run exactly: "
                             f"`{reopen_command}`. Do not kill app-server PID "
@@ -1824,26 +2464,73 @@ class Pika:
                         )
                     raise SharedLeaseConflict(
                         f"{current.provider.upper()} CLIENT STATE AMBIGUOUS: "
-                        f"{current.display_name}'s exact UUID has a fresh shared lease "
-                        f"through shared app-server PID {pid_text}, but no exact UUID/name "
+                        f"{current.display_name}'s exact "
+                        f"{provider_identity_label(current.provider)} has a fresh shared "
+                        f"lease through shared app-server PID {pid_text}, but no exact "
+                        f"identity/name "
                         "client process is visible. Pika needs one confirmation before "
                         f"recovering. Run exactly: `{reopen_command}` in an interactive "
                         f"terminal, or wait until {retry_time} and run the same command. "
                         f"Do not kill PID {pid_text}; it is shared provider infrastructure.",
                         current,
                     )
+                all_tmux_pids = {
+                    pid
+                    for candidate_pane in panes
+                    for pid in process_tree(candidate_pane.pane_pid)
+                }
+                exact_outside = sorted(
+                    pid
+                    for pid in claimed_pids
+                    if pid in outside
+                    and pid not in all_tmux_pids
+                    and not (
+                        current.provider == "codex"
+                        and shared_provider_process(pid, current.provider)
+                    )
+                )
+                identities = tuple(
+                    (pid, start)
+                    for pid in exact_outside
+                    if (start := process_start_time(pid)) is not None
+                )
+                other_dedicated = [
+                    pid
+                    for pid in outside
+                    if pid not in exact_outside
+                    and not (
+                        current.provider == "codex"
+                        and shared_provider_process(pid, current.provider)
+                    )
+                ]
+                if len(identities) == 1 and not other_dedicated:
+                    raise OutsideLiveConflict(
+                        f"{current.display_name} is running outside its Pika home "
+                        f"as exact {provider_label(current.provider)} PID {identities[0][0]}. "
+                        "Choose whether to keep that client or cleanly stop it and "
+                        f"attach the same {provider_identity_label(current.provider)} in Pika.",
+                        current,
+                        identities,
+                    )
                 raise PikaError(
                     f"{current.display_name} is already running outside its Pika "
                     f"home (PID {pid_text}) and cannot be moved safely while live. "
                     f"Required steps: 1) return to the terminal owning PID {pid_text} "
-                    f"and exit {current.provider.title()} normally; 2) run exactly: "
-                    f"`{reopen_command}`. Pika will resume the exact UUID."
+                    f"and exit {provider_label(current.provider)} normally; 2) run exactly: "
+                    f"`{reopen_command}`. Pika will resume the exact "
+                    f"{provider_identity_label(current.provider)}."
                 )
         if not live_pid:
             provider = self.providers.get(current.provider)
             if provider is None:
                 raise PikaError(f"Unknown provider: {current.provider}")
             if not provider.installed():
+                compatibility = getattr(provider, "compatibility_error", None)
+                compatibility_error = (
+                    compatibility() if callable(compatibility) else None
+                )
+                if compatibility_error:
+                    raise PikaError(compatibility_error)
                 raise PikaError(f"{current.provider} is not installed or not on PATH")
             resumable_check = getattr(provider, "is_resumable", None)
             if resumable_check:
@@ -1880,13 +2567,14 @@ class Pika:
                 panes = self.tmux.list_panes()
                 outside = self._outside_processes(current, panes)
                 if outside:
-                    direct_uuid_pids = self.uuid_identity_pids(current)
-                    if len(direct_uuid_pids) > 1:
+                    claimed_pids = self.identity_pids(current)
+                    if len(claimed_pids) > 1:
                         raise PikaError(
                             f"OPEN TWICE: {current.display_name} acquired multiple "
-                            f"exact UUID-bearing {current.provider.title()} clients "
+                            f"{provider_label(current.provider)} clients bearing the exact "
+                            f"{provider_identity_label(current.provider)} "
                             "while Pika was opening it "
-                            f"(PID {', '.join(map(str, sorted(direct_uuid_pids)))}). "
+                            f"(PID {', '.join(map(str, sorted(claimed_pids)))}). "
                             "Close all but one before attaching."
                         )
                     raise PikaError(
@@ -1920,15 +2608,16 @@ class Pika:
                 if fresh_raw_pid and not fresh_pid:
                     raise PikaError(
                         f"{current.display_name}'s tagged pane acquired an "
-                        f"unverified {current.provider} process (PID {fresh_raw_pid}). "
-                        "Pika refuses to attach it to the saved UUID."
+                        f"unverified {provider_label(current.provider)} process "
+                        f"(PID {fresh_raw_pid}). Pika refuses to attach it to the "
+                        f"saved {provider_identity_label(current.provider)}."
                     )
                 if fresh_pane and not fresh_pid:
-                    other_provider = (
-                        "claude" if current.provider == "codex" else "codex"
+                    other = self._foreign_provider_process(
+                        fresh_pane.pane_pid, current.provider
                     )
-                    other_pid = provider_process(fresh_pane.pane_pid, other_provider)
-                    if other_pid:
+                    if other:
+                        other_provider, other_pid = other
                         raise PikaError(
                             f"{current.display_name}'s saved tmux pane acquired a "
                             f"running {other_provider} process (PID {other_pid}) while "
@@ -1983,12 +2672,28 @@ class Pika:
                     "tmux_pane": pane.pane_id,
                     "root_pid": provider_process(pane.pane_pid, current.provider),
                 }
-                # A real unread result remains collectible after resuming its
-                # exact conversation. Every other old state becomes WORKING;
-                # launching a process must never manufacture a READY event.
-                if not (current.status == Status.READY.value and current.unread):
+                # Process liveness and work liveness are different facts. A
+                # resumed provider TUI is idle until a provider lifecycle event
+                # proves otherwise. Preserve actionable states; otherwise use
+                # the durable provider lifecycle and treat a successful resume
+                # with no evidence of work as READY-but-read.
+                preserve_actionable = current.unread and current.status in {
+                    Status.READY.value,
+                    Status.NEEDS_YOU.value,
+                }
+                if not preserve_actionable:
+                    lifecycle_status = self._discovered_lifecycle_status(current)
+                    if lifecycle_status not in {
+                        Status.READY.value,
+                        Status.WORKING.value,
+                    }:
+                        lifecycle_status = (
+                            Status.WORKING.value
+                            if current.status == Status.WORKING.value
+                            else Status.READY.value
+                        )
                     resumed_fields.update(
-                        status=Status.WORKING.value,
+                        status=lifecycle_status,
                         unread=False,
                         error=None,
                         attention_reason=None,
@@ -2018,9 +2723,29 @@ class Pika:
         receipt_box = [""]
 
         def ordinary_receipt(exact: bool) -> str:
+            if exact:
+                meaning = {
+                    "ATTACHED LIVE": "same live home",
+                    "RESUMED EXACT": "same conversation resumed",
+                    "NEW HOME": "same conversation · NEW HOME · protected",
+                }.get(outcome, open_outcome(exact).lower())
+                parts = [
+                    "CONTINUITY PROVEN",
+                    terminal_text(current.display_name),
+                    meaning,
+                    provider_label(current.provider),
+                    f"exact id {current.provider_thread_id[:8]}",
+                ]
+                if current.active_thread_id:
+                    parts.append(f"home {current.session_id[:8]}")
+                if preserved:
+                    parts.append(terminal_text(preserved))
+                elif current.attention_reason:
+                    parts.append(terminal_text(current.attention_reason))
+                return " · ".join(parts)
             parts = [
                 f"Pika → {terminal_text(current.display_name)}",
-                current.provider.title(),
+                provider_label(current.provider),
                 open_outcome(exact),
                 f"{'exact id' if exact else 'id'} {current.provider_thread_id[:8]}",
             ]
@@ -2058,7 +2783,7 @@ class Pika:
                     [
                         "RESULT COLLECTED",
                         remainder,
-                        {"codex": "C", "claude": "A"}.get(
+                        {"codex": "C", "claude": "A", "opencode": "O"}.get(
                             current.provider, current.provider[:1].upper()
                         ),
                         f"EXACT {current.session_id[:8]}",
@@ -2085,7 +2810,7 @@ class Pika:
             print(
                 f"Left {terminal_text(current.display_name)} running in Pika tmux · "
                 "return with: "
-                f"{shlex.join(['pika', 'open', current.session_id])}"
+                f"{shlex.join(['pika', current.display_name])}"
             )
         return result
 
@@ -2105,6 +2830,10 @@ class Pika:
         if provider is None:
             raise PikaError(f"Unknown provider: {provider_name}")
         if not provider.installed():
+            compatibility = getattr(provider, "compatibility_error", None)
+            compatibility_error = compatibility() if callable(compatibility) else None
+            if compatibility_error:
+                raise PikaError(compatibility_error)
             raise PikaError(f"{provider_name} is not installed or not on PATH")
         if not hooks_installed(provider_name):
             raise PikaError(
@@ -2114,7 +2843,7 @@ class Pika:
         if not Path(cwd).is_dir():
             raise PikaError(f"Working directory does not exist: {cwd}")
         preexisting_session_ids: list[str] | None = None
-        if provider_name == "codex":
+        if provider_name in {"codex", "opencode"}:
             snapshot_at = time.time()
             snapshotter = getattr(provider, "launch_candidates", None)
             try:
@@ -2173,15 +2902,24 @@ class Pika:
         except TmuxError as exc:
             self.store.delete_pending(token)
             raise PikaError(str(exc)) from exc
+        # tmux can return just before the provider replaces its wrapper shell.
+        # Wait briefly so the launch certificate records the actual provider
+        # process generation instead of leaving a fast SessionStart half-bound.
         root_pid = provider_process(pane.pane_pid, provider_name)
+        root_deadline = time.monotonic() + 2.0
+        while root_pid is None and time.monotonic() < root_deadline:
+            time.sleep(0.02)
+            root_pid = provider_process(pane.pane_pid, provider_name)
+        root_start = process_start_time(root_pid)
         binding = self.store.finalize_pending_pane(
             token,
             pane.session_name,
             pane.pane_id,
             root_pid,
-            process_start_time(root_pid),
+            root_start,
         )
         if binding:
+            tagged = False
             try:
                 self.tmux.tag_pane(
                     pane.pane_id,
@@ -2192,6 +2930,25 @@ class Pika:
                 )
             except TmuxError:
                 pass
+            else:
+                tagged = True
+            current_root_start = process_start_time(root_pid)
+            root_environment = process_environment(root_pid) if root_pid else {}
+            if (
+                tagged
+                and root_pid is not None
+                and root_start is not None
+                and current_root_start == root_start
+                and root_environment.get("PIKA_LAUNCH_TOKEN") == token
+                and root_environment.get("PIKA_PROVIDER") == provider_name
+            ):
+                self.store.certify_launch(
+                    token,
+                    binding[0],
+                    binding[1],
+                    root_pid,
+                    root_start,
+                )
         if not attach:
             return 0
 
@@ -2202,18 +2959,19 @@ class Pika:
             elif reserved_id:
                 self.store.record_attach(provider_name, reserved_id)
             else:
-                # Codex chooses its UUID. The SessionStart hook will replace
+                # The provider chooses its identity. Its SessionStart hook will replace
                 # this short-lived token with the exact identity.
                 self.store.set_meta(f"attached_launch:{token}", "1")
 
         if reserved_id:
             receipt = (
-                f"Pika → {terminal_text(name)} · {provider_name.title()} · STARTED · "
+                f"Pika → {terminal_text(name)} · {provider_label(provider_name)} · STARTED · "
                 f"IDENTITY PENDING · id {reserved_id[:8]}"
             )
         else:
             receipt = (
-                f"Pika → {terminal_text(name)} · Codex · STARTED · IDENTITY PENDING"
+                f"Pika → {terminal_text(name)} · {provider_label(provider_name)} · "
+                "STARTED · IDENTITY PENDING"
             )
 
         try:
@@ -2243,9 +3001,25 @@ class Pika:
         shells = {"bash", "dash", "fish", "ksh", "sh", "tcsh", "zsh"}
         if Path(pane.current_command).name not in shells:
             return False
-        # A login shell with any live descendant may be running a foreground
-        # command, build, server, editor, or background job. Preserve it.
-        return process_tree(pane.pane_pid) == [pane.pane_pid]
+        # tmux may retain its pane shell and place Pika's fallback login shell
+        # beneath it. That shell-only chain is the expected idle home after an
+        # agent exits. Any non-shell descendant can still be a build, server,
+        # editor, or background job and must be preserved.
+        tree = process_tree(pane.pane_pid)
+        if not tree:
+            return False
+        for pid in tree:
+            argv = cmdline(pid)
+            if argv:
+                if Path(argv[0]).name not in shells:
+                    return False
+                continue
+            # A reaped command can remain briefly as a zombie descendant of
+            # the fallback shell. It cannot own work and must not prevent exact
+            # home reuse; an unreadable or non-zombie process remains unsafe.
+            if process_state(pid) != "Z":
+                return False
+        return True
 
     def _settle_idle_pane(self, pane: Pane, *, timeout: float = 0.5) -> Pane | None:
         """Absorb short shell-exit races without overwriting durable pane work."""
@@ -2324,7 +3098,7 @@ class Pika:
         target = os.environ.get("TMUX_PANE")
         if not target:
             raise PikaError(
-                "Expert cards can only be changed from inside their exact Pika pane"
+                "Thread profiles can only be changed from inside their exact Pika pane"
             )
         pane = self.tmux.get_pane(target)
         if not pane or not pane.pika_provider or not pane.pika_session_id:
@@ -2332,11 +3106,11 @@ class Pika:
                 "This pane has no exact Pika identity; adopt or open it with Pika first"
             )
         if pane.pika_session_id.startswith("unbound:"):
-            raise PikaError("An unbound pane cannot publish an expert card")
+            raise PikaError("An unbound pane cannot publish a thread profile")
         session = next(
             (
                 item
-                for item in self.refresh()
+                for item in self.refresh(usage=False)
                 if item.key == (pane.pika_provider, pane.pika_session_id)
             ),
             None,
@@ -2348,7 +3122,7 @@ class Pika:
             or not self.exact_pane_pid(session, fresh_pane)
         ):
             raise PikaError(
-                "Pika cannot prove this pane owns that provider UUID; expert card unchanged"
+                "Pika cannot prove this pane owns that provider identity; thread profile unchanged"
             )
         return session
 
@@ -2378,12 +3152,87 @@ class Pika:
         self.store.delete_expert_profile(*session.key)
         return session
 
+    def publish_current_work(self, current_state: str) -> ExpertProfile:
+        session = self.current_exact_session()
+        fingerprint = transcript_fingerprint(session)
+        return self.store.put_expert_current_state(
+            *session.key, current_state,
+            transcript_mtime_ns=fingerprint[0] if fingerprint else None,
+            transcript_size=fingerprint[1] if fingerprint else None,
+        )
+
+    def _expert_source_availability(self, session: Session) -> str:
+        provider = self.providers.get(session.provider)
+        if provider is None:
+            return "provider-unavailable"
+        hidden = getattr(provider, "hidden_session_ids", None)
+        try:
+            if hidden and session.provider_thread_id in hidden():
+                return "archived" if session.provider == "codex" else "excluded-worker"
+            durable = getattr(provider, "durable_state", None)
+            if durable:
+                state = durable(session.provider_thread_id)
+                if state in {"deleted", "archived"}:
+                    return state
+                if state == "unknown":
+                    return "source-unavailable"
+        except Exception:  # Provider read failure cannot authorize consultation.
+            return "source-unavailable"
+        return expert_availability(session)
+
+    def resolve_expert_target(self, query: str) -> Session | FleetSession:
+        """Resolve consultation identity without adopting or restoring its watch."""
+        if "@" in query:
+            _thread, alias = query.rsplit("@", 1)
+            if self.store.get_fleet_node(alias) is not None:
+                remote = self.fleet.resolve(query, fresh=True, include_experts=True)
+                if remote is not None:
+                    if remote.stale or remote.availability in {
+                        "archived", "deleted", "source-unavailable", "provider-unavailable",
+                        "requires-reconciliation", "excluded-worker",
+                    }:
+                        raise PikaError(
+                            f"Cannot consult {query!r}: {expert_availability(remote)}. "
+                            "No question was sent; watching is unchanged."
+                        )
+                    return remote
+        local = [*self.store.list_sessions(), *self.store.list_untracked_sessions()]
+        if query == ".":
+            session = self.current_repo(local)
+        elif query == "-":
+            session = self.previous(local)
+        else:
+            exact_id = [item for item in local if query in {item.session_id, item.provider_thread_id}]
+            names = [item for item in local if item.name and item.name.casefold() == query.casefold()]
+            prefixes = [item for item in local if item.session_id.startswith(query) or item.provider_thread_id.startswith(query)]
+            matches = exact_id or names or prefixes
+            if not matches:
+                raise PikaError(
+                    f"No saved consultation target named {query!r}. "
+                    "Run `pika experts --json` to find exact expert identities."
+                )
+            session = choose_session(matches, "Several consultation targets match; choose an exact identity")
+        availability = self._expert_source_availability(session)
+        if availability != "source-available":
+            raise PikaError(
+                f"Cannot consult {session.display_name!r}: {availability}. "
+                "No question was sent; watching is unchanged."
+            )
+        return session
+
     def expert_matches(self, query: str = "") -> list[ExpertMatch]:
         local = rank_experts(
             self.store.list_expert_profiles(),
-            self.refresh(usage=False),
+            [*self.store.list_sessions(), *self.store.list_untracked_sessions()],
             query,
+            untracked_keys=self.store.untracked_session_keys(),
         )
+        for match in local:
+            match.availability = self._expert_source_availability(match.session)
+        local = [
+            match for match in local
+            if match.availability not in {"archived", "excluded-worker"}
+        ]
         return sorted(
             [*local, *self.fleet.expert_matches(query)],
             key=lambda item: (
@@ -2400,20 +3249,30 @@ class Pika:
         visible = (
             sessions
             if sessions is not None
-            else self.monitor_sessions(self.refresh(usage=False))
+            else [*self.store.list_sessions(), *self.store.list_untracked_sessions()]
         )
         local_visible = [item for item in visible if isinstance(item, Session)]
         profiles = {item.key: item for item in self.store.list_expert_profiles()}
+        untracked = self.store.untracked_session_keys()
         local = [
-            card_state(session, profiles.get(session.key))
+            replace(
+                card_state(session, profiles.get(session.key)),
+                watched=session.key not in untracked,
+                availability=self._expert_source_availability(session),
+            )
             for session in local_visible
             if not session.session_id.startswith("unbound:")
+            and (session.key not in untracked or session.key in profiles)
         ]
         remote_keys = {item.key for item in visible if isinstance(item, FleetSession)}
+        local = [
+            item for item in local
+            if item.availability not in {"archived", "excluded-worker"}
+        ]
         remote = [
             item
             for item in self.fleet.expert_card_states()
-            if item.session.key in remote_keys
+            if sessions is None or item.session.key in remote_keys
         ]
         return [*local, *remote]
 
@@ -2498,7 +3357,7 @@ class Pika:
                         (
                             "one or more cards lack a durable transcript"
                             if unknown
-                            else "no changed expert cards"
+                            else "no changed thread profiles"
                         ),
                     )
                 )
@@ -2690,7 +3549,8 @@ class Pika:
                         f"outside tmux (PID {pid_text}). A live process cannot be "
                         "moved safely into tmux. Exit that agent normally, then run "
                         f"`pika {terminal_text(named_session.display_name)}` to resume "
-                        "the exact UUID inside Pika."
+                        f"the exact {provider_identity_label(named_session.provider)} "
+                        "inside Pika."
                     )
                 else:
                     raise PikaError(
@@ -2702,17 +3562,17 @@ class Pika:
         if not pane:
             raise PikaError(f"No tmux pane matches {target!r}")
         running_agents: list[tuple[str, int]] = []
-        for candidate in ("codex", "claude"):
+        for candidate in self.providers:
             found = provider_process(pane.pane_pid, candidate)
             if found:
                 running_agents.append((candidate, found))
         if not running_agents:
             raise PikaError(
-                "That pane does not contain a running Codex or Claude process"
+                "That pane does not contain a running supported agent process"
             )
         if len(running_agents) > 1:
             raise PikaError(
-                "That pane contains both Codex and Claude processes; Pika cannot "
+                "That pane contains multiple provider processes; Pika cannot "
                 "assign one exact owner. Adopt a pane containing only one agent."
             )
         provider_name, pid = running_agents[0]
@@ -2770,13 +3630,13 @@ class Pika:
         return session
 
     def untrack(self, session: Session | FleetSession) -> int:
-        """Stop showing an exact UUID without stopping or archiving its agent."""
+        """Stop showing an exact provider identity without stopping its agent."""
         if isinstance(session, FleetSession):
             return self.fleet.untrack(session)
         if session.session_id.startswith("unbound:"):
             raise PikaError(
                 "Pika cannot stop watching this placeholder safely because its "
-                "provider UUID is not known yet. Wait for it to bind, or exit the "
+                "provider identity is not known yet. Wait for it to bind, or exit the "
                 "agent normally."
             )
         panes = [

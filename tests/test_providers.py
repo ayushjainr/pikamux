@@ -6,15 +6,17 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from pikamux.models import Session
 from pikamux.providers import (
     ClaudeProvider,
     CodexProvider,
+    OpenCodeProvider,
     _timestamp,
     codex_lifecycle_status,
     codex_worker_originator,
+    opencode_native_placeholder_title,
 )
 
 
@@ -41,7 +43,7 @@ class FakeAppServer:
 
 class ProviderTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(dir="/mnt/ebs1/ajain")
+        self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
 
     def tearDown(self) -> None:
@@ -52,6 +54,15 @@ class ProviderTests(unittest.TestCase):
             _timestamp("2026-08-12T10:30:00Z"),
             1786530600.0,
         )
+
+    def test_opencode_native_placeholder_titles_are_provider_scaffolding(self) -> None:
+        self.assertTrue(
+            opencode_native_placeholder_title(
+                "New session - 2026-08-26T00:00:00Z"
+            )
+        )
+        self.assertTrue(opencode_native_placeholder_title("Research (fork #2)"))
+        self.assertFalse(opencode_native_placeholder_title("oc_research"))
 
     def test_claude_import_excludes_ai_generated_title(self) -> None:
         project = self.root / "projects" / "repo"
@@ -88,6 +99,84 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(candidates[0].name, "chosen name")
         self.assertEqual(candidates[0].source, "claude-history")
 
+    def test_claude_sdk_cli_title_is_automation_not_a_conversation(self) -> None:
+        project = self.root / "projects" / "repo"
+        project.mkdir(parents=True)
+        worker_id = "11111111-1111-4111-8111-111111111111"
+        interactive_id = "22222222-2222-4222-8222-222222222222"
+        worker = project / f"{worker_id}.jsonl"
+        interactive = project / f"{interactive_id}.jsonl"
+        worker.write_text(
+            json.dumps({"type": "custom-title", "customTitle": "sample_plugin"})
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "user",
+                    "sessionId": worker_id,
+                    "entrypoint": "sdk-cli",
+                    "isSidechain": False,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "user",
+                    "sessionId": worker_id,
+                    "entrypoint": "cli",
+                    "isSidechain": False,
+                }
+            )
+            + "\n"
+        )
+        interactive.write_text(
+            json.dumps({"type": "custom-title", "customTitle": "sample_plugin"})
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "user",
+                    "sessionId": interactive_id,
+                    "entrypoint": "cli",
+                    "isSidechain": False,
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "user",
+                    "sessionId": interactive_id,
+                    "entrypoint": "sdk-cli",
+                    "isSidechain": False,
+                }
+            )
+            + "\n"
+        )
+        sessions = self.root / "sessions"
+        sessions.mkdir()
+        (sessions / f"{worker_id}.json").write_text(
+            json.dumps(
+                {
+                    "sessionId": worker_id,
+                    "kind": "interactive",
+                    "name": "sample_plugin",
+                    "nameSource": "custom",
+                    "cwd": "/tmp/automation",
+                }
+            )
+        )
+        provider = ClaudeProvider(self.root)
+
+        self.assertEqual(
+            provider.worker_originator(worker_id, str(worker)), "claude-sdk-cli"
+        )
+        self.assertIsNone(provider.worker_originator(interactive_id, str(interactive)))
+        self.assertEqual(
+            [item.session_id for item in provider.import_candidates()],
+            [interactive_id],
+        )
+        self.assertEqual(provider.find_candidates(worker_id), [])
+        self.assertFalse(provider.is_resumable(worker_id))
+        self.assertTrue(provider.is_resumable(interactive_id))
+
     def test_claude_tracked_parked_rename_refreshes_from_transcript(self) -> None:
         project = self.root / "projects" / "repo"
         project.mkdir(parents=True)
@@ -120,14 +209,14 @@ class ProviderTests(unittest.TestCase):
             )
         )
         (project / f"{session_id}.jsonl").write_text(
-            json.dumps({"type": "custom-title", "customTitle": "qes_plugin"})
+            json.dumps({"type": "custom-title", "customTitle": "sample_plugin"})
             + "\n"
             + json.dumps({"type": "ai-title", "aiTitle": "generated-old-name"})
             + "\n"
         )
 
         candidate = ClaudeProvider(self.root).import_candidates()[0]
-        self.assertEqual(candidate.name, "qes_plugin")
+        self.assertEqual(candidate.name, "sample_plugin")
         self.assertEqual(candidate.source, "claude-live+explicit-history")
 
     def test_codex_candidate_exposes_lineage_and_structured_lifecycle(self) -> None:
@@ -159,7 +248,7 @@ class ProviderTests(unittest.TestCase):
             )
             db.execute(
                 "INSERT INTO threads VALUES (?,?,?,?,?,?,0)",
-                (child, "master_quant", "/repo", str(rollout), 10, 20),
+                (child, "research-notes", "/repo", str(rollout), 10, 20),
             )
 
         candidate = CodexProvider(self.root).discover()[0]
@@ -261,9 +350,9 @@ class ProviderTests(unittest.TestCase):
                 ),
             )
         (self.root / "session_index.jsonl").write_text(
-            json.dumps({"id": active_id, "thread_name": "master_quant"})
+            json.dumps({"id": active_id, "thread_name": "research-notes"})
             + "\n"
-            + json.dumps({"id": archived_id, "thread_name": "master_quant"})
+            + json.dumps({"id": archived_id, "thread_name": "research-notes"})
             + "\n"
         )
 
@@ -372,13 +461,55 @@ class ProviderTests(unittest.TestCase):
                     "type": "session_meta",
                     "payload": {
                         "id": "different-uuid",
-                        "originator": "agentic_fund",
+                        "originator": "codex_exec",
+                        "source": "exec",
                     },
                 }
             )
             + "\n"
         )
         self.assertIsNone(codex_worker_originator("wanted-uuid", transcript))
+
+    def test_codex_exec_is_hidden_as_native_headless_worker(self) -> None:
+        worker_id = "33333333-3333-4333-8333-333333333333"
+        transcript = self.root / "exec.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": worker_id,
+                        "originator": "codex_exec",
+                        "source": "exec",
+                        "thread_source": "user",
+                    },
+                }
+            )
+            + "\n"
+        )
+        with sqlite3.connect(self.root / "state_current.sqlite") as db:
+            db.execute(
+                "CREATE TABLE threads "
+                "(id TEXT PRIMARY KEY, name TEXT, rollout_path TEXT, archived INTEGER)"
+            )
+            db.execute(
+                "INSERT INTO threads(id,name,rollout_path,archived) VALUES (?,?,?,0)",
+                (worker_id, "oc_qes_style", str(transcript)),
+            )
+
+        provider = CodexProvider(self.root)
+        self.assertEqual(
+            codex_worker_originator(worker_id, transcript), "codex-exec"
+        )
+        self.assertEqual(
+            codex_worker_originator(
+                worker_id, None, originator="codex_exec"
+            ),
+            "codex-exec",
+        )
+        self.assertEqual(provider.discover(), [])
+        self.assertEqual(provider.import_candidates(), [])
+        self.assertFalse(provider.is_resumable(worker_id))
 
     def test_codex_native_name_uses_official_thread_rpc(self) -> None:
         process = FakeAppServer()
@@ -410,6 +541,126 @@ class ProviderTests(unittest.TestCase):
         (self.root / "sessions" / "bad.json").write_text("{")
         self.assertEqual(CodexProvider(self.root).discover(), [])
         self.assertEqual(ClaudeProvider(self.root).discover(), [])
+
+    def test_opencode_discovers_only_root_sessions_and_tracks_child_work(self) -> None:
+        database = self.root / "opencode.db"
+        with sqlite3.connect(database) as db:
+            db.execute(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, "
+                "title TEXT, directory TEXT, time_created INTEGER, "
+                "time_updated INTEGER, time_archived INTEGER, model TEXT, "
+                "cost REAL, tokens_input INTEGER, tokens_output INTEGER, "
+                "tokens_reasoning INTEGER, tokens_cache_read INTEGER, "
+                "tokens_cache_write INTEGER)"
+            )
+            db.execute(
+                "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, "
+                "time_created INTEGER, data TEXT)"
+            )
+            model = json.dumps(
+                {"providerID": "opencode", "id": "x-preview-f-free", "variant": "max"}
+            )
+            db.execute(
+                "INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("ses_root123", None, "oc_qes_style", "/repo", 1000, 2000, None,
+                 model, 0, 10, 2, 1, 20, 0),
+            )
+            db.execute(
+                "INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("ses_child456", "ses_root123", "worker", "/repo", 1500, 3000,
+                 None, model, 0, 1, 1, 0, 0, 0),
+            )
+            db.execute(
+                "INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("ses_blank789", None, "New session - 2026-08-21T00:00:00Z", "/repo",
+                 1200, 1200, None, model, 0, 0, 0, 0, 0, 0),
+            )
+            db.execute(
+                "INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("ses_worker999", None, "agentic-fund:calibration",
+                 "/runs/opencode-runtime/worker", 1300, 1300, None, model,
+                 0, 0, 0, 0, 0, 0),
+            )
+            db.execute(
+                "INSERT INTO message VALUES (?,?,?,?)",
+                ("msg_root", "ses_root123", 2000, json.dumps({
+                    "role": "assistant", "time": {"created": 1900, "completed": 2000}
+                })),
+            )
+            db.execute(
+                "INSERT INTO message VALUES (?,?,?,?)",
+                ("msg_child", "ses_child456", 3000, json.dumps({
+                    "role": "user", "time": {"created": 3000}
+                })),
+            )
+        provider = OpenCodeProvider(self.root)
+        self.assertEqual(provider.durable_state("ses_root123"), "present")
+        self.assertEqual(provider.durable_state("ses_missing123"), "deleted")
+        candidates = provider.discover()
+        self.assertEqual([item.session_id for item in candidates], ["ses_root123"])
+        self.assertEqual(candidates[0].lifecycle_status, "WORKING")
+        self.assertEqual(candidates[0].updated_at, 3000)
+        self.assertEqual(candidates[0].model, "opencode/x-preview-f-free[max]")
+        self.assertTrue(provider.valid_session_id("ses_root123"))
+        with patch("pikamux.providers.find_processes_with_session_id", return_value=[99]):
+            self.assertEqual(provider.active_pids("ses_root123"), [])
+        self.assertEqual(provider.resume_argv("ses_root123")[-2:], ["--session", "ses_root123"])
+        self.assertEqual(
+            [item.session_id for item in provider.find_candidates("ses_blank789")],
+            ["ses_blank789"],
+        )
+        self.assertIn("ses_worker999", provider.hidden_session_ids())
+        usage = provider.usage(Session("opencode", "ses_root123"), Mock())
+        self.assertIsNotNone(usage)
+        assert usage is not None
+        self.assertEqual(usage.total_tokens, 35)
+        self.assertEqual(usage.estimated_cost_usd, 0)
+
+        with sqlite3.connect(database) as db:
+            db.execute(
+                "UPDATE session SET time_updated=4000 WHERE id='ses_child456'"
+            )
+            db.execute(
+                "UPDATE message SET data=? WHERE id='msg_child'",
+                (json.dumps({
+                    "role": "assistant",
+                    "time": {"created": 3000, "completed": 4000},
+                }),),
+            )
+        completed = provider.discover()[0]
+        self.assertEqual(completed.lifecycle_status, "READY")
+        self.assertEqual(completed.updated_at, 4000)
+
+        with sqlite3.connect(database) as db:
+            db.execute(
+                "UPDATE session SET time_archived=5000 WHERE id='ses_root123'"
+            )
+        self.assertEqual(provider.durable_state("ses_root123"), "archived")
+        with sqlite3.connect(database) as db:
+            db.execute("DELETE FROM session WHERE id='ses_root123'")
+        self.assertEqual(provider.durable_state("ses_root123"), "deleted")
+
+    def test_opencode_missing_store_is_unknown_not_deleted(self) -> None:
+        self.assertEqual(
+            OpenCodeProvider(self.root / "missing").durable_state("ses_root123"),
+            "unknown",
+        )
+
+    def test_opencode_runtime_refuses_uncertified_binary_version(self) -> None:
+        provider = OpenCodeProvider(self.root)
+        with (
+            patch.object(provider, "executable", return_value="/bin/opencode"),
+            patch("pikamux.providers.executable_available", return_value=True),
+            patch.object(provider, "version", return_value="1.18.20"),
+        ):
+            self.assertFalse(provider.installed())
+            self.assertIn("requires opencode >= 1.18.21", provider.compatibility_error())
+        with (
+            patch.object(provider, "executable", return_value="/bin/opencode"),
+            patch("pikamux.providers.executable_available", return_value=True),
+            patch.object(provider, "version", return_value="1.18.21"),
+        ):
+            self.assertTrue(provider.installed())
 
 
 if __name__ == "__main__":

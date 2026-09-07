@@ -11,7 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .experts import ExpertMatch, card_state, project_label
+from .experts import (
+    ExpertMatch,
+    card_state,
+    profile_freshness_label,
+    profile_source_label,
+    project_label,
+)
 from .models import (
     ATTENTION_ORDER,
     Candidate,
@@ -23,7 +29,15 @@ from .models import (
 )
 from .pricing import PRICING_AS_OF
 
-PROVIDER_MARK = {"codex": "C", "claude": "A"}
+PROVIDER_MARK = {"codex": "C", "claude": "A", "opencode": "O"}
+
+
+def provider_label(provider: str) -> str:
+    return "OpenCode" if provider == "opencode" else provider.title()
+
+
+def provider_identity_label(provider: str) -> str:
+    return "session ID" if provider == "opencode" else "UUID"
 
 
 class SelectionCancelled(ValueError):
@@ -210,7 +224,7 @@ def print_sessions(sessions: list[Session], *, as_json: bool = False) -> None:
                 else "not yet managed in a Pika tmux home"
             )
             print(
-                f"  {terminal_text(item.display_name)} ({item.provider.title()}): "
+                f"  {terminal_text(item.display_name)} ({provider_label(item.provider)}): "
                 f"{terminal_text(detail)}"
             )
     legend = "C=Codex  A=Claude  NEW=unread  VIEW=tracked pane visible"
@@ -458,18 +472,18 @@ def print_experts(
         return
     if not matches:
         suffix = f" matching {query!r}" if query else ""
-        print(f"No Pika experts{suffix}.")
-        print("Build cards with `pika expert refresh --all`.")
+        print(f"No expert threads{suffix}.")
+        print("Check profile coverage with `pika expert status`.")
         return
-    title = f"Pika experts for {query!r}" if query else "Pika expert directory"
+    title = f"Expert threads for {query!r}" if query else "Expert threads"
     print(title)
     print()
     columns = [
         ("AG", 2),
-        ("EXPERT", 22),
+        ("THREAD", 22),
         ("PROJECT", 20),
         ("STATE", 10),
-        ("CARD", 8),
+        ("PROFILE", 22),
         ("CACHE", 12),
         ("TOPICS", 32),
         ("WHY", 15),
@@ -483,10 +497,13 @@ def print_experts(
             match.session.display_name,
             project_label(match.session.cwd),
             match.session.status,
-            (
-                match.session.card_status or "UNKNOWN"
-                if isinstance(match.session, FleetSession)
-                else card_state(match.session, match.profile).status
+            f"{profile_source_label(match.profile)} · "
+            + profile_freshness_label(
+                (
+                    match.session.card_status or "UNKNOWN"
+                    if isinstance(match.session, FleetSession)
+                    else card_state(match.session, match.profile).status
+                )
             ),
             (
                 f"CACHED {_fleet_age(match.session.seen_at, time.time())}"
@@ -507,8 +524,8 @@ def print_experts(
             cells.append(value.ljust(size))
         print("  ".join(cells).rstrip())
     print(
-        "\nCards come from exact UUID-bound interviews; durable scope and current "
-        "state remain evidence to inspect."
+        "\nProfiles are bound to exact provider identities. INTERVIEWED is "
+        "conversation-reported; SELF-PUBLISHED is explicit pane input."
     )
 
 
@@ -524,13 +541,21 @@ def choose_session(
         names = ", ".join(f"{item.provider}:{item.session_id[:8]}" for item in sessions)
         raise ValueError(
             "Multiple continuations match; run interactively or use a "
-            f"session UUID: {names}"
+            f"provider-native session ID: {names}"
         )
     providers = {item.provider for item in sessions}
     names = {item.display_name.casefold() for item in sessions}
-    if providers == {"codex", "claude"} and len(names) == 1:
+    if len(providers) > 1 and len(names) == 1:
         name = terminal_text(sessions[0].display_name)
-        print(f'Both Codex and Claude have "{name}". Which continuation do you mean?')
+        labels = [
+            "OpenCode" if value == "opencode" else value.title()
+            for value in sorted(providers)
+        ]
+        if labels == ["Claude", "Codex"]:
+            owners = "Both Codex and Claude"
+        else:
+            owners = ", ".join(labels[:-1]) + f", and {labels[-1]}"
+        print(f'{owners} have "{name}". Which continuation do you mean?')
     else:
         print(f"{prompt}; Pika will not guess:")
     ordered = (
@@ -542,7 +567,7 @@ def choose_session(
         location = short_path(item.cwd, 36)
         branch = f" [{terminal_text(item.branch)}]" if item.branch else ""
         print(
-            f"  {index}. {item.provider.title():<6} "
+            f"  {index}. {provider_label(item.provider):<8} "
             f"{terminal_text(item.display_name)} "
             f"· id {item.session_id[:8]} · {location}{branch}, "
             f"{human_age(item.last_activity_at)} ago, {item.status}"

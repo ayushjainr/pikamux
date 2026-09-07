@@ -6,6 +6,7 @@ import os
 import queue
 import re
 import select
+import shlex
 import sys
 import termios
 import threading
@@ -24,7 +25,10 @@ from .consult import (
     consultation_for,
     consultation_policy,
 )
-from .experts import ExpertCardState
+from .consult_reporting import ConsultationRun
+from .experts import ExpertCardState, profile_source_label, profile_freshness
+from .explain import explain_session
+from .fleet import REMOTE_STALE_SECONDS
 from .models import ExpertProfile, FleetNode, FleetSession, PendingLaunch, Session, Status
 from .pricing import PRICING_AS_OF
 from .ui import (
@@ -32,6 +36,8 @@ from .ui import (
     format_bytes,
     format_cost,
     format_tokens,
+    provider_identity_label,
+    provider_label,
     short_path,
     sorted_attention_sessions,
     sorted_sessions,
@@ -46,6 +52,7 @@ PLAYBOOK_ROTATION_SECONDS = 300
 MORNING_GAP_SECONDS = 6 * 60 * 60
 HANDOFF_DISPLAY_SECONDS = 15.0
 SLOW_REFRESH_SECONDS = 1.0
+KEY_SEQUENCE_TIMEOUT_SECONDS = 0.05
 MIN_WIDTH = 58
 MIN_HEIGHT = 15
 SPLIT_MIN_WIDTH = 104
@@ -54,8 +61,8 @@ SPINNER = ("◐", "◓", "◑", "◒")
 PLAYBOOK_TIPS = (
     (
         "experts",
-        ("pika experts QUERY finds UUID-bound firsthand expertise across projects."),
-        "pika experts QUERY finds the agent who did the work.",
+        ("pika experts QUERY finds exact conversation threads by work context."),
+        "pika experts QUERY finds the thread that worked on it.",
     ),
     (
         "ask",
@@ -83,6 +90,12 @@ PLAYBOOK_TIPS = (
         "pika next opens the oldest needed work.",
     ),
     (
+        "activity",
+        "pika activity catches up on completed, blocked, and failed transitions "
+        "without reading transcripts.",
+        "pika activity is a transcript-free catch-up feed.",
+    ),
+    (
         "peek",
         "pika peek NAME inspects without switching; "
         "redirected peeks keep unread state.",
@@ -101,8 +114,8 @@ PLAYBOOK_TIPS = (
     ),
     (
         "collision",
-        "Codex and Claude may share a name; Pika asks for provider + UUID.",
-        "Same name? Pika asks provider + UUID.",
+        "Providers may share a name; Pika asks for provider + exact identity.",
+        "Same name? Pika asks provider + exact ID.",
     ),
     (
         "doctor",
@@ -148,6 +161,8 @@ _ANSI_ESCAPE = re.compile(
     re.DOTALL,
 )
 _MOUSE = re.compile(rb"^\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+_CSI_KEY = re.compile(rb"^\x1b\[[0-?]*[ -/]*[@-~]")
+_SS3_KEY = re.compile(rb"^\x1bO[@-~]")
 
 
 class MonitorPika(Protocol):
@@ -227,9 +242,9 @@ class _InlineAskWorker:
         self.policy = policy
         self._opener = opener or (lambda: consultation_for(session, policy=policy))
         self._requests: queue.Queue[tuple[str, str]] = queue.Queue()
-        self._events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._closing = threading.Event()
-        self._consultation: Consultation | None = None
+        self._consultation: ConsultationRun | None = None
         self._consultation_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run,
@@ -248,8 +263,8 @@ class _InlineAskWorker:
         if not self._closing.is_set():
             self._requests.put(("ask", question))
 
-    def poll(self) -> list[tuple[str, str]]:
-        events: list[tuple[str, str]] = []
+    def poll(self) -> list[tuple[str, object]]:
+        events: list[tuple[str, object]] = []
         while True:
             try:
                 events.append(self._events.get_nowait())
@@ -272,11 +287,17 @@ class _InlineAskWorker:
             consultation = self._consultation
             self._consultation = None
         if consultation is not None:
-            consultation.close()
+            try:
+                consultation.close()
+            except Exception as exc:  # noqa: BLE001 - cleanup proof belongs in the TUI
+                self._events.put(("error", f"side cleanup failed: {exc}"))
 
     def _run(self) -> None:
         try:
-            consultation = self._opener()
+            consultation = ConsultationRun.open(
+                self._opener,
+                on_event=lambda event: self._events.put(("progress", event)),
+            )
             with self._consultation_lock:
                 if self._closing.is_set():
                     should_close = True
@@ -326,6 +347,7 @@ class MonitorState:
     handoff_until: float = 0.0
     expert_cards: dict[tuple[str, ...], ExpertCardState] = field(default_factory=dict)
     expert_cards_updated_at: float = 0.0
+    expert_freshness: dict[tuple[str, ...], dict] = field(default_factory=dict)
     preview_key: tuple[str, ...] | None = None
     preview_lines: list[str] = field(default_factory=list)
     preview_error: str | None = None
@@ -340,11 +362,42 @@ class MonitorState:
     ask_error: str | None = None
     ask_pending: bool = False
     ask_scroll: int = 0
+    ask_progress: dict = field(default_factory=dict)
     untrack_target: Session | FleetSession | None = None
     machines: list[FleetNode] = field(default_factory=list)
+    filter_text: str = ""
+    order_keys: list[tuple[str, ...]] = field(default_factory=list)
+    left_offset: int = 0
+    left_anchor_key: tuple[str, ...] | None = None
+    left_anchor_row: int = 0
+    table_offset: int = 0
+    cached_initial: bool = False
+    explanations: dict[tuple[str, ...], dict] = field(default_factory=dict)
+    action_error: str | None = None
+    action_error_offset: int = 0
+    action_error_target: Session | FleetSession | PendingLaunch | None = None
 
     def ordered(self) -> list[Session | FleetSession]:
-        return sorted_sessions(self.sessions)
+        # Once visible, workstreams retain their relative position until the
+        # user requests a regroup. Status updates must not move the next key's
+        # target while somebody is navigating.
+        by_key = {item.key: item for item in self.sessions}
+        self.order_keys = [key for key in self.order_keys if key in by_key]
+        known = set(self.order_keys)
+        self.order_keys.extend(
+            item.key
+            for _label, members in _split_groups(self.sessions)
+            for item in members
+            if item.key not in known
+        )
+        query = self.filter_text.casefold()
+        return [
+            by_key[key] for key in self.order_keys
+            if not query or query in " ".join((
+                by_key[key].display_name, by_key[key].provider,
+                by_key[key].cwd or "", by_key[key].session_id,
+            )).casefold()
+        ]
 
     def selected(self) -> Session | FleetSession | None:
         ordered = self.ordered()
@@ -377,6 +430,20 @@ class MonitorState:
         self.toast = terminal_text(message)
         self.toast_until = (now or time.monotonic()) + 3.0
 
+    def fail_action(
+        self, message: str,
+        target: Session | FleetSession | PendingLaunch | None = None,
+    ) -> None:
+        self.action_error = _safe_chat_text(message)
+        self.action_error_offset = 0
+        target = target if target is not None else self.selected()
+        self.action_error_target = (
+            replace(target, session=replace(target.session))
+            if isinstance(target, FleetSession)
+            else replace(target) if target is not None else None
+        )
+        self.mode = "action-error"
+
     def expert_card(self, session: Session | None) -> ExpertCardState | None:
         return self.expert_cards.get(session.key) if session is not None else None
 
@@ -394,6 +461,7 @@ class MonitorState:
         self.ask_error = None
         self.ask_pending = False
         self.ask_scroll = 0
+        self.ask_progress = {}
 
     def close_ask(self) -> None:
         self.mode = "sessions"
@@ -431,6 +499,7 @@ def _paint(value: str, code: str, enabled: bool) -> str:
 
 def _status_code(status: str) -> str:
     return {
+        "PROTECTED": FG_MAGENTA,
         Status.NEEDS_YOU.value: FG_YELLOW,
         Status.OPEN_TWICE.value: FG_RED,
         Status.ERROR.value: FG_RED,
@@ -440,6 +509,15 @@ def _status_code(status: str) -> str:
         Status.PARKED.value: FG_BRIGHT_BLACK,
         Status.UNBOUND.value: FG_MAGENTA,
     }.get(status, "")
+
+
+def _public_status(session: Session | FleetSession | PendingLaunch) -> str:
+    """Translate identity safety stops without weakening their internal state."""
+    if isinstance(session, PendingLaunch):
+        return Status.STARTING.value
+    if session.home_state == "identity-error":
+        return "PROTECTED"
+    return session.status
 
 
 def _line(left: str, right: str, width: int) -> str:
@@ -464,7 +542,17 @@ def _session_counts(sessions: list[Session | FleetSession]) -> dict[str, int]:
         "starting": sum(item.status == Status.STARTING.value for item in current),
         "parked": sum(item.status == Status.PARKED.value for item in current),
         "errors": sum(
-            item.status in {Status.ERROR.value, Status.OPEN_TWICE.value} and item.unread
+            item.status == Status.ERROR.value
+            and item.home_state != "identity-error"
+            and item.unread
+            for item in current
+        ),
+        "protected_pauses": sum(
+            (
+                item.home_state in {"identity-error", "open-twice"}
+                or item.status == Status.OPEN_TWICE.value
+            )
+            and item.unread
             for item in current
         ),
         "unbound": sum(item.status == Status.UNBOUND.value for item in current),
@@ -500,14 +588,14 @@ def _handoff_text(handoff: HandoffSummary) -> str:
     if handoff.first:
         return (
             f"FIRST HANDOFF // CURRENT STATE · {handoff.finished} results · "
-            f"{handoff.decisions} decisions · {handoff.errors} errors"
+            f"{handoff.decisions} decisions · {handoff.errors} exceptions"
         )
     if not handoff.changed:
         return "SINCE YOUR LAST VISIT · no new handoffs"
     return (
         f"SINCE YOUR LAST VISIT · {handoff.finished} finished · "
         f"{handoff.decisions} {_noun(handoff.decisions, 'decision')} · "
-        f"{handoff.errors} {_noun(handoff.errors, 'error')}"
+        f"{handoff.errors} {_noun(handoff.errors, 'exception')}"
     )
 
 
@@ -525,9 +613,19 @@ def _briefing_lines(
             _fit("No state is shown until the first reconciliation completes", width),
         )
     counts = _session_counts(sessions)
-    interventions = counts["decisions"] + counts["errors"] + counts["unbound"]
-    if not interventions and not counts["results"]:
-        prefix = "LAST KNOWN" if refresh_error else "NO ATTENTION PENDING"
+    interventions = (
+        counts["decisions"]
+        + counts["errors"]
+        + counts["protected_pauses"]
+    )
+    if not interventions:
+        prefix = (
+            "LAST KNOWN · no decisions waiting"
+            if refresh_error
+            else "No decisions waiting on current observations"
+            if counts["cached"]
+            else "YOU'RE CLEAR · no decisions waiting"
+        )
         headline = (
             f"{prefix} · {counts['working']} working · "
             f"{counts['starting']} starting · {counts['parked']} parked · "
@@ -535,17 +633,13 @@ def _briefing_lines(
         )
         if counts["cached"]:
             headline += f" · {counts['cached']} cached"
-    elif not interventions:
-        headline = (
-            f"{counts['results']} {_noun(counts['results'], 'RESULT')} "
-            "READY TO COLLECT · "
-            f"{counts['working']} STILL WORKING · "
-            f"{counts['starting']} STARTING"
-        )
+        if counts["results"]:
+            headline += f" · {counts['results']} results available"
     elif width < 80:
         headline = (
             f"NEED {counts['decisions']} · RESULTS {counts['results']} · "
-            f"FAILED {counts['errors']} · UNBOUND {counts['unbound']}"
+            f"PROTECTED {counts['protected_pauses']} · FAILED {counts['errors']} · "
+            f"UNBOUND {counts['unbound']}"
         )
     else:
         headline = (
@@ -558,6 +652,8 @@ def _briefing_lines(
         )
         if counts["errors"]:
             headline += f" · {counts['errors']} FAILED"
+        if counts["protected_pauses"]:
+            headline += f" · {counts['protected_pauses']} PROTECTED"
         if counts["unbound"]:
             headline += f" · {counts['unbound']} UNBOUND"
 
@@ -684,7 +780,7 @@ def _field(session: Session, field: str, width: int, now: float) -> str:
     values = {
         "provider": PROVIDER_MARK.get(session.provider, "?"),
         "name": session.display_name,
-        "status": session.status,
+        "status": _public_status(session),
         "why": session.attention_reason or "—",
         "view": "yes" if session.attached else ("no" if session.tmux_session else "—"),
         "repo": short_path(session.cwd, width),
@@ -721,7 +817,7 @@ def _table_row(
     rendered = list(plain_cells)
     status_index = next(i for i, item in enumerate(columns) if item.field == "status")
     rendered[status_index] = _paint(
-        rendered[status_index], _status_code(session.status), color
+        rendered[status_index], _status_code(_public_status(session)), color
     )
     if session.unread:
         marker = " " + _paint("◆", FG_MAGENTA, color)
@@ -742,6 +838,37 @@ def _visible_rows(
     return ordered[start : start + slots], start
 
 
+def _viewport_offset(start: int, selected: int, count: int, slots: int) -> int:
+    """Scroll only when selection leaves the viewport, including after resize."""
+    start = max(0, min(start, max(0, count - slots)))
+    if selected < start:
+        return selected
+    if selected >= start + slots:
+        return max(0, selected - slots + 1)
+    return start
+
+
+def _observation_scope(state: MonitorState, now: float) -> str:
+    if state.cached_initial:
+        return "LAST KNOWN · checking current state"
+    if state.refresh_error or state.refresh_warning:
+        return "PARTIAL OBSERVATIONS · some current state is unavailable"
+    unavailable = [
+        f"{node.alias} (last seen {_human_age_at(node.last_seen, now)} ago)"
+        for node in state.machines
+        if node.status != "ready" or not node.last_seen
+        or now - node.last_seen > REMOTE_STALE_SECONDS
+    ]
+    cached = _session_counts(state.sessions)["cached"]
+    if unavailable:
+        return "UNAVAILABLE · " + ", ".join(unavailable) + " · other observations only"
+    if cached:
+        return f"PARTIAL · {cached} cached remote rows · current observations only"
+    if not state.last_update:
+        return "Checking current state"
+    return f"Observed {_human_age_at(state.last_update, now)} ago"
+
+
 def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
     counts = _session_counts(state.sessions)
     if width < 80:
@@ -752,6 +879,7 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
             (
                 f"Need {counts['decisions']} · results {counts['results']} · "
                 f"starting {counts['starting']} · failed {counts['errors']} · "
+                f"protected {counts['protected_pauses']} · "
                 f"unbound {counts['unbound']}"
             ),
         ]
@@ -770,9 +898,10 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
                 f"{counts['results']} results · "
                 f"{counts['working']} working · {counts['starting']} starting · "
                 f"{counts['parked']} parked · "
+                f"{counts['protected_pauses']} protected · "
                 f"{counts['errors']} errors · {counts['unbound']} unbound"
             ),
-            "Pika never guesses identity. Enter acts on the selected provider + UUID.",
+            "Pika never guesses identity. Enter acts on the selected provider + exact ID.",
             "A paired SSH client gets a new window; otherwise Enter attaches here.",
             "Operations update every 2s; visible usage updates every 30s.",
         ]
@@ -814,7 +943,7 @@ def _playbook_options(
     names: dict[str, set[str]] = {}
     for item in sessions:
         names.setdefault(item.display_name.casefold(), set()).add(item.provider)
-    if any(providers == {"codex", "claude"} for providers in names.values()):
+    if any(len(providers) > 1 for providers in names.values()):
         categories.insert(0, "collision")
     ordered: list[tuple[str, str, str]] = []
     for category in dict.fromkeys(categories):
@@ -853,31 +982,40 @@ def _identity_text(session: Session | FleetSession) -> str:
         age = _human_age_at(session.seen_at, time.time())
         if session.stale:
             return (
-                f"CACHED ON {session.node_name.upper()} · {session.provider.title()} · "
+                f"CACHED ON {session.node_name.upper()} · {provider_label(session.provider)} · "
                 f"id {session.session_id[:8]} · last sync {age} ago"
             )
         proof = "REMOTE EXACT" if session.exact_home else "REMOTE TRACKED"
         return (
-            f"{proof} · {session.node_name} · {session.provider.title()} · "
+            f"{proof} · {session.node_name} · {provider_label(session.provider)} · "
             f"id {session.session_id[:8]}"
         )
     if isinstance(session, PendingLaunch):
         return (
-            f"IDENTITY PENDING · {session.provider.title()} · "
+            f"IDENTITY PENDING · {provider_label(session.provider)} · "
             f"launch {session.launch_token[:8]} · PIKA HOME LIVE"
         )
-    provider = session.provider.title()
+    provider = provider_label(session.provider)
     fingerprint = session.session_id[:8]
     if session.home_state == "exact-live":
         return f"EXACT HOME · {provider} · id {fingerprint} · PROTECTED LIVE"
     if session.home_state == "identity-error":
-        return f"IDENTITY UNVERIFIED · {provider} · id {fingerprint} · OPEN BLOCKED"
+        return (
+            f"PROTECTED PAUSE · {provider} · id {fingerprint} · "
+            "IDENTITY UNVERIFIED"
+        )
     if session.home_state == "open-twice":
         return f"OPEN TWICE · {provider} · id {fingerprint} · CLOSE ONE COPY"
     if session.home_state == "unbound":
         return f"UNBOUND PROCESS · {provider} · id {fingerprint} · EXIT + PIKA NAME"
     if session.home_state == "outside-live":
-        return f"LIVE OUTSIDE PIKA · {provider} · id {fingerprint} · NOT PROTECTED"
+        command = shlex.join(["pika", session.display_name])
+        owner = f"PID {session.root_pid}" if session.root_pid else "THIS SESSION"
+        return (
+            f"LIVE OUTSIDE PIKA · {provider} · id {fingerprint} · NOT PROTECTED · "
+            f"ENTER: RECOVERY OPTIONS · MANUAL: IN {provider.upper()} TERMINAL FOR "
+            f"{owner}, /exit; WAIT FOR SHELL; THEN {command}"
+        )
     if session.home_state == "saved-idle":
         return f"SAVED HOME · {provider} · id {fingerprint} · NOT LIVE"
     if session.home_state == "no-live-home":
@@ -890,6 +1028,8 @@ def _age_phrase(session: Session | FleetSession, now: float) -> str:
         return f"cached {_human_age_at(session.seen_at, now)} ago"
     event_age = _human_age_at(session.last_event_at, now)
     activity_age = _human_age_at(session.last_activity_at, now)
+    if session.home_state == "identity-error":
+        return f"protected pause for {event_age}"
     return {
         Status.NEEDS_YOU.value: f"waiting on you for {event_age}",
         Status.READY.value: f"result ready for {event_age}",
@@ -905,11 +1045,7 @@ def _age_phrase(session: Session | FleetSession, now: float) -> str:
 def _needs_you_group(session: Session | FleetSession) -> bool:
     if isinstance(session, FleetSession) and session.stale:
         return False
-    return session.status in {
-        Status.NEEDS_YOU.value,
-        Status.ERROR.value,
-        Status.OPEN_TWICE.value,
-    } or (session.status == Status.READY.value and session.unread)
+    return session.status == Status.NEEDS_YOU.value
 
 
 def _split_groups(
@@ -918,13 +1054,13 @@ def _split_groups(
     ordered = sorted_sessions(sessions)
     definitions = (
         ("NEEDS YOU", _needs_you_group),
+        ("EXCEPTIONS", lambda item: item.status in {
+            Status.ERROR.value, Status.OPEN_TWICE.value,
+        }),
+        ("RESULTS", lambda item: item.status == Status.READY.value),
         ("STARTING", lambda item: item.status == Status.STARTING.value),
         ("WORKING", lambda item: item.status == Status.WORKING.value),
         ("UNBOUND", lambda item: item.status == Status.UNBOUND.value),
-        (
-            "READY",
-            lambda item: item.status == Status.READY.value and not item.unread,
-        ),
         ("PARKED", lambda item: item.status == Status.PARKED.value),
     )
     assigned: set[tuple[str, ...]] = set()
@@ -949,6 +1085,8 @@ def _split_groups(
 def _group_color(label: str) -> str:
     return {
         "NEEDS YOU": FG_RED,
+        "EXCEPTIONS": FG_RED,
+        "RESULTS": FG_GREEN,
         "WORKING": FG_CYAN,
         "STARTING": FG_YELLOW,
         "UNBOUND": FG_MAGENTA,
@@ -968,11 +1106,18 @@ def _split_left_pane(
 ) -> tuple[list[str], list[str]]:
     selected = state.selected()
     entries: list[tuple[str, Session | None]] = []
-    for index, (label, members) in enumerate(_split_groups(state.sessions)):
-        if index:
-            entries.append(("", None))
-        entries.append((label, None))
-        entries.extend(("", item) for item in members)
+    labels = {
+        item.key: label
+        for label, members in _split_groups(state.sessions)
+        for item in members
+    }
+    previous_label = None
+    for item in state.ordered():
+        label = labels[item.key]
+        if label != previous_label:
+            entries.append((label, None))
+        entries.append(("", item))
+        previous_label = label
 
     selected_index = next(
         (
@@ -982,9 +1127,14 @@ def _split_left_pane(
         ),
         0,
     )
-    if len(entries) > height:
-        start = max(0, min(len(entries) - height, selected_index - height // 2))
-        entries = entries[start : start + height]
+    if selected is not None and selected.key == state.left_anchor_key:
+        state.left_offset = selected_index - state.left_anchor_row
+    state.left_offset = _viewport_offset(
+        state.left_offset, selected_index, len(entries), height
+    )
+    state.left_anchor_key = selected.key if selected is not None else None
+    state.left_anchor_row = selected_index - state.left_offset
+    entries = entries[state.left_offset : state.left_offset + height]
 
     plain_lines: list[str] = []
     ansi_lines: list[str] = []
@@ -995,7 +1145,7 @@ def _split_left_pane(
         else:
             is_selected = selected is not None and item.key == selected.key
             marker = "›" if is_selected else " "
-            signal = "◆" if _needs_you_group(item) else "□" if item.live else "·"
+            signal = "◆" if item.unread or _needs_you_group(item) else "□" if item.live else "·"
             provider = PROVIDER_MARK.get(item.provider, "?")
             age = (
                 "resolve"
@@ -1019,7 +1169,7 @@ def _split_left_pane(
             if is_selected:
                 ansi = _paint(plain, REVERSE + BOLD, color)
             else:
-                ansi = _paint(plain, _status_code(item.status), color)
+                ansi = _paint(plain, _status_code(_public_status(item)), color)
         plain_lines.append(plain)
         ansi_lines.append(ansi)
 
@@ -1064,9 +1214,9 @@ def _card_display_status(card: ExpertCardState | None) -> str:
     if card.status == "STALE" and not (card.profile and card.profile.current_state):
         return "NEEDS REFRESH"
     return {
-        "CURRENT": "CURRENT",
-        "STALE": "+NEW CONTEXT",
-        "MISSING": "NOT INTERVIEWED",
+        "CURRENT": "PROFILE SYNCED",
+        "STALE": "PROFILE STALE",
+        "MISSING": "NO PROFILE",
         "UNKNOWN": "SOURCE UNAVAILABLE",
     }.get(card.status, card.status)
 
@@ -1080,7 +1230,7 @@ def _safe_chat_text(value: object) -> str:
 
 
 def _chat_message_lines(message: AskMessage, width: int) -> list[str]:
-    label = "YOU" if message.role == "user" else "EXPERT"
+    label = "YOU" if message.role == "user" else "AGENT"
     prefix = f"{label} // "
     continuation = " " * len(prefix)
     result: list[str] = []
@@ -1113,7 +1263,7 @@ def _ask_history_lines(
     if state.ask_pending:
         if entries:
             entries.append(("blank", " " * width))
-        entries.append(("status", _fit("EXPERT // thinking…", width)))
+        entries.append(("status", _fit("AGENT // thinking…", width)))
     elif state.ask_error:
         if entries:
             entries.append(("blank", " " * width))
@@ -1125,7 +1275,7 @@ def _ask_history_lines(
         empty = (
             "Opening an ephemeral side context… You can type while it connects."
             if state.ask_status == "opening"
-            else "Ask from this agent's firsthand context. Follow-ups stay in this side."
+            else "Ask from this exact thread's context. Follow-ups stay in this side."
         )
         entries.extend(("status", line) for line in _wrapped_detail(empty, width=width))
 
@@ -1150,7 +1300,12 @@ def _ask_history_lines(
 
 def _ask_input_lines(state: MonitorState, *, width: int, rows: int) -> list[str]:
     if state.ask_pending:
-        return [_fit("› waiting for this answer…", width)] + [" " * width] * max(
+        progress = state.ask_progress
+        stage = progress.get("stage", "prepare")
+        elapsed = float(progress.get("elapsed_seconds", 0))
+        updated = float(progress.get("received_at", time.monotonic()))
+        elapsed += max(0, time.monotonic() - updated)
+        return [_fit(f"› {stage} · {elapsed:.0f}s · delivery {progress.get('delivery', 'not_sent')}", width)] + [" " * width] * max(
             0, rows - 1
         )
     cursor = "█"
@@ -1201,6 +1356,12 @@ def _ask_panel_lines(
         "error": "! ERROR",
         "closed": "○ CLOSED",
     }.get(state.ask_status, state.ask_status.upper())
+    if state.ask_progress and state.ask_status in {"opening", "asking", "error"}:
+        elapsed = float(state.ask_progress.get("elapsed_seconds", 0))
+        if state.ask_status != "error":
+            elapsed += max(0, time.monotonic() - float(state.ask_progress.get("received_at", time.monotonic())))
+        stage = str(state.ask_progress.get("stage", "prepare")).upper()
+        status = f"{'! ' if state.ask_status == 'error' else ''}{stage} · {elapsed:.0f}s"
     title = _line(target.display_name, status, width)
     policy = state.ask_policy or consultation_policy(target)
     if state.ask_confirmed:
@@ -1218,13 +1379,13 @@ def _ask_panel_lines(
     if card and card.profile:
         now_line = _detail_value(
             "now",
-            card.profile.current_state or "not captured — refresh this card",
+            card.profile.current_state or "not captured — refresh this profile",
             width,
         )
-        knows = _detail_value("knows", " · ".join(card.profile.topics[:3]), width)
+        knows = _detail_value("topics", " · ".join(card.profile.topics[:3]), width)
     else:
-        now_line = _detail_value("now", "expert card unavailable", width)
-        knows = _detail_value("knows", "expert card unavailable", width)
+        now_line = _detail_value("now", "thread profile unavailable", width)
+        knows = _detail_value("topics", "thread profile unavailable", width)
     heading = _line(
         "CONVERSATION",
         f"{len(state.ask_messages)} messages · ↑↓ scroll",
@@ -1292,7 +1453,7 @@ def _untrack_panel_lines(
         )
     title = _line("STOP WATCHING", "CONFIRM", width)
     identity = _detail_value(
-        "target", f"{target.provider.title()} · {target.session_id[:8]}", width
+        "target", f"{provider_label(target.provider)} · {target.session_id[:8]}", width
     )
     name = _detail_value("name", target.display_name, width)
     lines = [
@@ -1302,8 +1463,9 @@ def _untrack_panel_lines(
         identity,
         " " * width,
         _fit("Pika will remove this workstream from Live Operations.", width),
-        _fit("The agent keeps running. The conversation is not archived.", width),
-        _fit("Its expert card is retained until pika NAME watches it again.", width),
+        _fit("Any running agent stays running. The conversation is not archived.", width),
+        _fit("Retained expertise remains discoverable through expert lookup.", width),
+        _fit("Consultation availability is checked separately.", width),
         " " * width,
         _fit("Use pika NAME to watch it again.", width),
         " " * width,
@@ -1318,10 +1480,11 @@ def _untrack_panel_lines(
         lines[5],
         _paint(lines[6], FG_GREEN, color),
         _paint(lines[7], FG_BLUE, color),
+        _paint(lines[8], DIM, color),
         " " * width,
-        _paint(lines[9], DIM, color),
+        _paint(lines[10], DIM, color),
         " " * width,
-        _paint(lines[11], REVERSE, color),
+        _paint(lines[12], REVERSE, color),
     ]
     padding = [" " * width] * max(0, height - len(lines))
     return (lines + padding)[:height], (ansi + padding)[:height]
@@ -1369,6 +1532,26 @@ def _render_compact_untrack(
     )
 
 
+def _action_error_lines(state: MonitorState, width: int, height: int) -> list[str]:
+    lines = []
+    target = state.action_error_target
+    if target is not None:
+        lines.extend(wrap(
+            f"Target: {target.display_name} · {target.provider} · {target.session_id}",
+            max(1, width), break_long_words=True,
+        ))
+        lines.append("")
+    for paragraph in (state.action_error or "No action error recorded").splitlines():
+        lines.extend(wrap(paragraph, max(1, width), break_long_words=True) or [""])
+    slots = max(1, height - 3)
+    state.action_error_offset = min(state.action_error_offset, max(0, len(lines) - slots))
+    visible = lines[state.action_error_offset : state.action_error_offset + slots]
+    result = ["OPENING PAUSED · exact recovery steps", "", *visible]
+    result.extend([""] * max(0, height - 1 - len(result)))
+    result.append("↑↓ scroll · Enter recheck · Esc return to board")
+    return [_fit(line, width) for line in result[:height]]
+
+
 def _split_right_pane(
     state: MonitorState,
     *,
@@ -1377,6 +1560,9 @@ def _split_right_pane(
     now: float,
     color: bool,
 ) -> tuple[list[str], list[str]]:
+    if state.mode == "action-error":
+        plain = _action_error_lines(state, width, height)
+        return plain, [_paint(line, FG_YELLOW, color) for line in plain]
     if state.mode == "ask":
         return _ask_panel_lines(state, width=width, height=height, now=now, color=color)
     if state.mode == "untrack":
@@ -1385,7 +1571,7 @@ def _split_right_pane(
     if selected is None:
         plain = [
             _fit("NO WORKSTREAM SELECTED", width),
-            _fit("Choose a workstream on the left.", width),
+            _fit(_observation_scope(state, now), width),
         ]
         return (
             (plain + [" " * width] * height)[:height],
@@ -1401,8 +1587,17 @@ def _split_right_pane(
         if isinstance(selected, FleetSession) and selected.remote_error
         else selected.error or selected.attention_reason or "no exception reported"
     )
+    explanation = state.explanations.get(selected.key)
+    if explanation is None and not isinstance(selected, PendingLaunch):
+        explanation = explain_session(selected, now=now)
+    why = str(explanation["summary"]) if explanation else signal
     status_mark = "◆" if _needs_you_group(selected) else "□"
-    title = _line(selected.display_name, f"{status_mark} {selected.status}", width)
+    public_status = (
+        "PROTECTED PAUSE"
+        if selected.home_state == "identity-error"
+        else _public_status(selected)
+    )
+    title = _line(selected.display_name, f"{status_mark} {public_status}", width)
     active_handoff = (
         state.handoff
         if state.handoff and time.monotonic() < state.handoff_until
@@ -1425,11 +1620,15 @@ def _split_right_pane(
         plain.append(notice)
         ansi.append(_paint(notice, FG_MAGENTA, color))
 
+    scope = _fit(_observation_scope(state, now), width)
+    plain.append(scope)
+    ansi.append(_paint(scope, DIM, color))
+
     metadata = [
-        _detail_value("signal", f"{signal} · {_age_phrase(selected, now)}", width),
+        _detail_value("WHY", why, width),
         _detail_value(
             "agent",
-            f"{selected.provider.title()} · id {selected.session_id[:8]}",
+            f"{provider_label(selected.provider)} · id {selected.session_id[:8]}",
             width,
         ),
         _detail_value("path", selected.cwd or "—", width),
@@ -1454,11 +1653,23 @@ def _split_right_pane(
         ]
     )
 
+    if explanation:
+        winning = next((item for item in explanation["evidence"] if item["winner"]), None)
+        proof = (
+            f"{winning['source']} · {_human_age_at(winning['observed_at'], now)} ago"
+            if winning else f"{signal} · {_age_phrase(selected, now)}"
+        )
+        proof_line = _detail_value("evidence", proof, width)
+        plain.append(proof_line)
+        ansi.append(_paint(proof_line, DIM, color))
+
     plain.append(" " * width)
     ansi.append(" " * width)
+    provenance = profile_source_label(profile) if profile is not None else ""
+    card_state_text = _card_display_status(card)
     card_heading = _line(
-        "EXPERT CARD",
-        _card_display_status(card),
+        "THREAD EXPERTISE",
+        f"{provenance} · {card_state_text}" if provenance else card_state_text,
         width,
     )
     plain.append(card_heading)
@@ -1472,14 +1683,20 @@ def _split_right_pane(
     ansi.append(_paint(card_heading, BOLD + card_color, color))
 
     if profile is not None:
+        freshness = state.expert_freshness.get(selected.key, {})
+        work_at = profile.current_state_updated_at or profile.updated_at
+        work_label = (
+            f"work published {_human_age_at(work_at, now)} ago · "
+            f"{freshness.get('current_state_status', 'UNKNOWN')}"
+        )
         scope_lines = _wrapped_detail(
             profile.scope,
             width=width,
-            first_prefix="scope    ",
-            continuation="         ",
+            first_prefix="worked on  ",
+            continuation="           ",
         )
         now_lines = _wrapped_detail(
-            profile.current_state or "not captured — refresh this card",
+            profile.current_state or "not captured — refresh this profile",
             width=width,
             first_prefix="now      ",
             continuation="         ",
@@ -1487,12 +1704,13 @@ def _split_right_pane(
         topic_lines = _wrapped_detail(
             " · ".join(profile.topics),
             width=width,
-            first_prefix="knows    ",
-            continuation="         ",
+            first_prefix="topics     ",
+            continuation="           ",
         )
-        card_plain = [*scope_lines[:2], *now_lines[:2], *topic_lines[:2]]
+        card_plain = [*scope_lines[:2], _fit(work_label, width), *now_lines[:2], *topic_lines[:2]]
         card_ansi = [
             *scope_lines[:2],
+            _paint(_fit(work_label, width), DIM, color),
             *[_paint(line, FG_MAGENTA, color) for line in now_lines[:2]],
             *[_paint(line, FG_BLUE, color) for line in topic_lines[:2]],
         ]
@@ -1507,7 +1725,7 @@ def _split_right_pane(
         plain.append(message)
         ansi.append(_paint(message, DIM, color))
     else:
-        message = _fit("Loading the UUID-bound expert card…", width)
+        message = _fit("Loading this exact thread's expertise profile…", width)
         plain.append(message)
         ansi.append(_paint(message, DIM, color))
 
@@ -1542,15 +1760,21 @@ def _split_right_pane(
         )
     elif isinstance(selected, PendingLaunch):
         actions = "[Enter] open Pika home · identity reconciliation continues"
-        reassurance = "The conversation is visible; Pika has not guessed its UUID."
+        reassurance = "The conversation is visible; Pika has not guessed its identity."
     elif selected.status == Status.UNBOUND.value and selected.live:
-        actions = "Enter blocked · exit the external agent, then run pika NAME"
-        reassurance = "Pika will not guess ownership for a live external process."
-    elif selected.home_state in {"identity-error", "open-twice"}:
+        actions = "[Enter] inspect recovery options"
+        reassurance = "Pika rechecks the exact conversation before offering a handoff."
+    elif selected.home_state == "identity-error":
         ask = " · [a] ask here" if can_ask else ""
-        actions = f"[Enter] blocked{ask} · run pika doctor --verbose"
+        actions = f"[Enter] recheck exact identity{ask}"
         reassurance = (
-            "The saved conversation remains visible; pane identity is fail-closed."
+            "Pika stopped here to protect the original conversation; it did not guess."
+        )
+    elif selected.home_state == "open-twice":
+        ask = " · [a] ask here" if can_ask else ""
+        actions = f"[Enter] recheck duplicate owners{ask}"
+        reassurance = (
+            "Pika caught the duplicate before another copy could be opened."
         )
     else:
         open_label = (
@@ -1649,21 +1873,30 @@ def _render_split_monitor(
     clock = datetime.fromtimestamp(now).strftime("%H:%M:%S")
     summary = [
         f"{need_count} need you",
+        f"{counts['results']} results",
         f"{counts['working']} working",
     ]
+    if counts['errors'] or counts['protected_pauses']:
+        summary.append(f"{counts['errors'] + counts['protected_pauses']} exceptions")
     if counts["starting"]:
         summary.append(f"{counts['starting']} starting")
     summary.append(f"{counts['unbound']} unbound")
     if counts["cached"]:
         summary.append(f"{counts['cached']} cached")
     if state.machines:
-        unavailable = sum(node.status != "ready" for node in state.machines)
+        unavailable = sum(
+            node.status != "ready" or not node.last_seen
+            or now - node.last_seen > REMOTE_STALE_SECONDS
+            for node in state.machines
+        )
         summary.append(
             f"{len(state.machines) + 1} machines"
             + (f"/{unavailable} offline" if unavailable else "")
         )
     if state.expert_cards_updated_at:
-        summary.append(f"{expert_count} {_noun(expert_count, 'expert')}")
+        summary.append(
+            f"{expert_count} expert thread{'' if expert_count == 1 else 's'}"
+        )
     status_clock = (
         f"{sync} {clock}"
         if sync == "●" or any(sync.startswith(frame) for frame in SPINNER)
@@ -1680,7 +1913,10 @@ def _render_split_monitor(
         else ""
     )
     header_plain = _line(
-        f"PIKA // LIVE OPERATIONS{view}",
+        f"PIKA // LIVE OPERATIONS{view}" + (
+            f" / {state.filter_text}_" if state.mode == "filter"
+            else f" / {state.filter_text}" if state.filter_text else ""
+        ),
         " · ".join(summary),
         width,
     )
@@ -1747,7 +1983,7 @@ def _render_split_monitor(
         )
         playbook_ansi = _paint(playbook_plain, FG_BLUE, color)
         footer_plain = _fit(
-            "↑↓/jk move  Enter open  a ask here  n next needed  p peek  x stop watching  "
+            "↑↓/jk move  / filter  Enter open  a ask here  n next needed  p peek  x stop watching  "
             f"u {'operations' if state.show_usage else 'usage'}  r refresh  ? keys  q quit",
             width,
         )
@@ -1774,6 +2010,9 @@ def render_monitor(
     width = max(1, width)
     height = max(1, height)
     selected = state.selected()
+    if state.mode == "action-error" and (width < SPLIT_MIN_WIDTH or height < SPLIT_MIN_HEIGHT):
+        plain = _action_error_lines(state, width, height)
+        return MonitorFrame("\n".join(plain), "\n".join(plain), state.selected_key)
 
     if width < MIN_WIDTH or height < MIN_HEIGHT:
         if state.mode in {"ask", "untrack"}:
@@ -1863,7 +2102,10 @@ def render_monitor(
     if state.show_usage and state.usage_warning:
         view_label += " · USAGE PARTIAL"
     header_plain = _line(
-        f"PIKA // LIVE OPERATIONS{view_label}  {len(state.sessions)} WORKSTREAMS",
+        f"PIKA // LIVE OPERATIONS{view_label}  " + (
+            f"FILTER /{state.filter_text}" if state.filter_text or state.mode == "filter"
+            else f"{len(state.sessions)} WORKSTREAMS"
+        ),
         f"{freshness}  {clock}",
         width,
     )
@@ -1878,9 +2120,16 @@ def render_monitor(
         state.sessions,
         width=width,
         handoff=active_handoff,
-        initialized=bool(state.last_update),
-        refresh_error=state.refresh_error,
+        initialized=bool(state.last_update or state.sessions),
+        refresh_error=state.refresh_error or ("Checking cache" if state.cached_initial else None),
     )
+    if state.cached_initial or state.refresh_warning or any(
+        node.status != "ready" or not node.last_seen
+        or now - node.last_seen > REMOTE_STALE_SECONDS
+        for node in state.machines
+    ):
+        headline = briefing_plain[0].replace("YOU'RE CLEAR", "CURRENT OBSERVATIONS")
+        briefing_plain = (_fit(headline, width), _fit(_observation_scope(state, now), width))
     counts = _session_counts(state.sessions)
     has_attention = bool(
         counts["decisions"]
@@ -1911,7 +2160,15 @@ def render_monitor(
 
     row_slots = max(1, height - 11)
     ordered = state.ordered()
-    rows, start = _visible_rows(ordered, selected, row_slots)
+    selected_index = next(
+        (index for index, item in enumerate(ordered)
+         if selected is not None and item.key == selected.key), 0
+    )
+    state.table_offset = _viewport_offset(
+        state.table_offset, selected_index, len(ordered), row_slots
+    )
+    start = state.table_offset
+    rows = ordered[start : start + row_slots]
     table_plain: list[str] = []
     table_ansi: list[str] = []
 
@@ -1971,7 +2228,7 @@ def render_monitor(
         selection = _line(
             (
                 f"SELECTED // {selected.display_name}  "
-                f"{selected.provider.title()} · {selected.status}"
+                f"{provider_label(selected.provider)} · {_public_status(selected)}"
             ),
             (
                 f"{index + 1}/{len(ordered)}  "
@@ -1981,7 +2238,12 @@ def render_monitor(
             width,
         )
         identity = _identity_text(selected)
-        signal = selected.error or selected.attention_reason or "No exception reported"
+        explanation = state.explanations.get(selected.key)
+        if explanation is None and not isinstance(selected, PendingLaunch):
+            explanation = explain_session(selected, now=now)
+        signal = str(explanation["summary"]) if explanation else (
+            selected.error or selected.attention_reason or "No exception reported"
+        )
         if state.show_usage:
             resources = (
                 f"CPU {selected.cpu_percent:.1f}%"
@@ -1997,7 +2259,7 @@ def render_monitor(
         detail_plain = [
             _fit(selection, width),
             _fit(identity, width),
-            _line(f"SIGNAL // {signal}", resources, width),
+            _line(f"WHY // {signal}", resources, width),
         ]
     else:
         detail_plain = [
@@ -2096,7 +2358,12 @@ def _pop_utf8_character(buffer: bytearray) -> str | None:
         return "�"
 
 
-def decode_keys(buffer: bytearray, *, text_mode: bool = False) -> list[str]:
+def decode_keys(
+    buffer: bytearray,
+    *,
+    text_mode: bool = False,
+    flush_escape: bool = True,
+) -> list[str]:
     keys: list[str] = []
     while buffer:
         mouse = _MOUSE.match(buffer)
@@ -2105,31 +2372,45 @@ def decode_keys(buffer: bytearray, *, text_mode: bool = False) -> list[str]:
             keys.append("up" if button == 64 else "down" if button == 65 else "mouse")
             del buffer[: mouse.end()]
             continue
-        sequences = {
-            b"\x1b[A": "up",
-            b"\x1b[B": "down",
-            b"\x1b[5~": "pageup",
-            b"\x1b[6~": "pagedown",
-        }
-        matched = next(
-            (
-                (sequence, key)
-                for sequence, key in sequences.items()
-                if buffer.startswith(sequence)
-            ),
-            None,
-        )
-        if matched:
-            sequence, key = matched
-            keys.append(key)
-            del buffer[: len(sequence)]
-            continue
         if buffer[0] == 0x1B:
-            if len(buffer) == 1:
-                keys.append("escape")
-                buffer.clear()
+            csi = _CSI_KEY.match(buffer)
+            if csi:
+                sequence = bytes(buffer[: csi.end()])
+                key = {
+                    b"\x1b[5~": "pageup",
+                    b"\x1b[6~": "pagedown",
+                }.get(sequence) or {
+                    ord("A"): "up",
+                    ord("B"): "down",
+                    ord("C"): "right",
+                    ord("D"): "left",
+                    ord("H"): "first",
+                    ord("F"): "last",
+                }.get(sequence[-1])
+                if key:
+                    keys.append(key)
+                del buffer[: csi.end()]
                 continue
-            if buffer.startswith(b"\x1b[") and len(buffer) < 6:
+            ss3 = _SS3_KEY.match(buffer)
+            if ss3:
+                sequence = bytes(buffer[: ss3.end()])
+                key = {
+                    ord("A"): "up",
+                    ord("B"): "down",
+                    ord("C"): "right",
+                    ord("D"): "left",
+                    ord("H"): "first",
+                    ord("F"): "last",
+                }.get(sequence[-1])
+                if key:
+                    keys.append(key)
+                del buffer[: ss3.end()]
+                continue
+            if not flush_escape and (
+                len(buffer) == 1
+                or buffer.startswith(b"\x1b[")
+                or (buffer.startswith(b"\x1bO") and len(buffer) < 3)
+            ):
                 break
             keys.append("escape")
             del buffer[0]
@@ -2192,6 +2473,14 @@ class _Terminal:
 
     def draw(self, frame: str) -> None:
         os.write(self.output_fd, ("\x1b[H" + frame).encode(errors="replace"))
+
+    def run_external(self, callback: Callable[[], int]) -> int:
+        """Give the native provider its terminal, restoring this board on detach."""
+        self.__exit__(None, None, None)
+        try:
+            return callback()
+        finally:
+            self.__enter__()
 
     def __exit__(self, _type, _value, _traceback) -> None:
         os.write(
@@ -2267,7 +2556,9 @@ def _capture_preview(
     if not target:
         return session.key, [], None
     try:
-        captured = pika.tmux.capture(target, 12)
+        # Preview uses the same fresh ownership check as explicit peek; a saved
+        # pane number alone is not identity, particularly on the initial cache.
+        captured = pika.capture(session, 12)
     except Exception as exc:  # noqa: BLE001 - preview is optional and read-only
         return session.key, [], terminal_text(exc)
     lines = [strip_terminal_sequences(line) for line in captured.splitlines()]
@@ -2318,6 +2609,58 @@ def _handle_key(
     pika: MonitorPika,
     state: MonitorState,
 ) -> tuple[str, Session | FleetSession | None]:
+    if state.mode not in {"ask", "filter"}:
+        key = {
+            "j": "down", "k": "up", "g": "first", "G": "last",
+            "q": "quit", "?": "help", "p": "peek", "a": "ask",
+            "A": "ask-fast", "n": "next", "u": "usage", "r": "refresh",
+            "x": "untrack", "\x0c": "refresh", "newline": "enter",
+        }.get(key, key)
+    if state.mode == "action-error":
+        if key in {"escape", "quit"}:
+            state.action_error = None
+            state.action_error_target = None
+            state.mode = "sessions"
+        elif key == "enter":
+            target = state.action_error_target
+            current = next(
+                (item for item in state.sessions if target is not None and item.key == target.key),
+                None,
+            )
+            if current is None:
+                state.action_error = (
+                    "The original conversation is no longer in current inventory. "
+                    "Return to the board and refresh before choosing a conversation."
+                )
+                state.action_error_offset = 0
+                return "continue", None
+            if not isinstance(target, PendingLaunch) and (
+                isinstance(current, PendingLaunch)
+                or current.provider_thread_id != target.provider_thread_id
+            ):
+                state.action_error = (
+                    "The original conversation's active provider identity changed. "
+                    "Return to the board and explicitly select the intended thread."
+                )
+                state.action_error_offset = 0
+                return "continue", None
+            return "open", target
+        elif key in {"up", "pageup"}:
+            state.action_error_offset = max(0, state.action_error_offset - (8 if key == "pageup" else 1))
+        elif key in {"down", "pagedown"}:
+            state.action_error_offset += 8 if key == "pagedown" else 1
+        return "continue", None
+    if state.mode == "filter":
+        if key in {"enter", "escape"}:
+            state.mode = "sessions"
+        elif key == "backspace":
+            state.filter_text = state.filter_text[:-1]
+        elif key == "clear-input":
+            state.filter_text = ""
+        elif len(key) == 1 and key.isprintable():
+            state.filter_text += key
+        state.selected()
+        return "continue", None
     if state.mode == "ask":
         target = state.ask_target
         if key == "escape":
@@ -2404,9 +2747,14 @@ def _handle_key(
             return "open", state.selected()
         return "continue", None
 
+    if key == "escape" and state.filter_text:
+        state.filter_text = ""
+        return "continue", None
     if key == "quit" or key == "escape":
         return "quit", None
-    if key == "up":
+    if key == "/":
+        state.mode = "filter"
+    elif key == "up":
         state.move(-1)
     elif key == "down":
         state.move(1)
@@ -2435,16 +2783,16 @@ def _handle_key(
         session = state.selected()
         if isinstance(session, FleetSession) and session.stale:
             state.notify("Cached remote row — press r to retry its machine first")
+        elif session and session.home_state == "outside-live":
+            return "enter", session
         elif session and session.status == Status.UNBOUND.value and session.live:
             return "enter", session
-        elif session and session.home_state in {"identity-error", "open-twice"}:
-            state.notify("Exact pane identity is unverified — opening remains blocked")
         elif session:
             return "open", session
     elif key in {"ask", "ask-fast"}:
         session = state.selected()
         if isinstance(session, PendingLaunch):
-            state.notify("Identity is still pending — side asks require an exact UUID")
+            state.notify("Identity is still pending — side asks require an exact provider ID")
         elif isinstance(session, FleetSession) and session.stale:
             state.notify("Cached remote row — press r to retry its machine first")
         elif session and session.status == Status.UNBOUND.value and session.live:
@@ -2469,7 +2817,10 @@ def _handle_key(
         elif isinstance(session, FleetSession) and session.stale:
             state.notify("Cached remote row — press r to retry its machine first")
         elif session and session.session_id.startswith("unbound:"):
-            state.notify("Cannot stop watching until this process has an exact UUID")
+            state.notify(
+                "Cannot stop watching until this process has an exact "
+                f"{provider_identity_label(session.provider)}"
+            )
         elif session:
             state.begin_untrack(session)
     elif key == "next":
@@ -2479,6 +2830,7 @@ def _handle_key(
         else:
             return "open", session
     elif key == "refresh":
+        state.order_keys.clear()
         return "refresh", None
     elif key != "mouse":
         state.notify("Unknown key · press ? for controls")
@@ -2554,6 +2906,33 @@ class _DaemonExecutor:
         return future
 
 
+def _load_expert_cards(loader, sessions) -> tuple[list, dict]:
+    cards = loader(sessions)
+    return cards, {
+        item.session.key: profile_freshness(item.session, item.profile)
+        for item in cards
+    }
+
+
+def _refresh_inventory(pika: MonitorPika) -> tuple[list[Session], list, dict, float]:
+    """All potentially slow discovery and evidence reads run off the UI thread."""
+    local = pika.refresh(usage=False)
+    aggregator = getattr(pika, "monitor_sessions", None)
+    sessions = aggregator(local) if callable(aggregator) else local
+    evidence_loader = getattr(pika.store, "status_observations", None)
+    explanations = {}
+    for item in sessions:
+        if isinstance(item, PendingLaunch):
+            continue
+        facts = (
+            evidence_loader(item.provider, item.session_id)
+            if callable(evidence_loader) and not isinstance(item, FleetSession)
+            else ()
+        )
+        explanations[item.key] = explain_session(item, facts)
+    return local, sessions, explanations, time.time()
+
+
 def run_monitor(
     pika: MonitorPika,
     *,
@@ -2564,8 +2943,27 @@ def run_monitor(
     input_fd = sys.stdin.fileno() if input_fd is None else input_fd
     output_fd = sys.stdout.fileno() if output_fd is None else output_fd
     state = MonitorState()
+    # Only local persisted metadata belongs on the first-frame path. Provider
+    # scans, tmux enumeration and SSH handshakes happen after drawing the cache.
+    initial_local: list[Session] = []
+    try:
+        loader = getattr(pika.store, "list_sessions", None)
+        if callable(loader):
+            initial_local = list(loader())
+        fleet = getattr(pika, "fleet", None)
+        cache_loader = getattr(fleet, "cached_sessions", None)
+        remote_cached = list(cache_loader()) if callable(cache_loader) else []
+        state.sessions = [*initial_local, *remote_cached]
+        node_loader = getattr(fleet, "nodes", None)
+        state.machines = list(node_loader()) if callable(node_loader) else []
+        state.cached_initial = bool(state.sessions)
+    except Exception as exc:  # noqa: BLE001 - fresh reconciliation can recover
+        state.sessions = initial_local
+        state.cached_initial = bool(initial_local)
+        state.refresh_warning = f"Initial cache unavailable: {terminal_text(exc)}"
     usage_cache: dict[tuple[str, ...], dict[str, object]] = {}
     input_buffer = bytearray()
+    escape_started_at: float | None = None
     future: concurrent.futures.Future[list[Session]] | None = None
     usage_future: concurrent.futures.Future[list[Session | FleetSession]] | None = None
     expert_future: concurrent.futures.Future[list[ExpertCardState]] | None = None
@@ -2595,16 +2993,25 @@ def run_monitor(
     last_frame: str | None = None
     color = "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
     first_scan = True
-    local_sessions: list[Session] = []
+    local_sessions: list[Session] = initial_local
 
     try:
         with _DaemonExecutor() as executor:
             with _Terminal(input_fd, output_fd) as terminal:
+                size = os.get_terminal_size(output_fd)
+                frame = render_monitor(
+                    state, width=size.columns, height=size.lines,
+                    refreshing=True, color=color,
+                )
+                terminal.draw(frame.ansi)
+                last_frame = frame.ansi
                 while True:
                     monotonic = time.monotonic()
                     if inline_ask is not None:
                         for event, value in inline_ask.poll():
-                            if event == "opened":
+                            if event == "progress":
+                                state.ask_progress = {**value, "received_at": time.monotonic()}
+                            elif event == "opened":
                                 state.ask_confirmed = True
                                 state.ask_status = (
                                     "asking" if state.ask_pending else "ready"
@@ -2617,12 +3024,14 @@ def run_monitor(
                                 state.ask_status = "ready"
                                 state.ask_error = None
                                 state.ask_scroll = 0
-                            elif event == "error" and state.mode == "ask":
-                                state.ask_pending = False
-                                state.ask_status = "error"
-                                state.ask_error = _safe_chat_text(value).replace(
-                                    "\n", " "
-                                )
+                            elif event == "error":
+                                detail = _safe_chat_text(value).replace("\n", " ")
+                                if state.mode == "ask":
+                                    state.ask_pending = False
+                                    state.ask_status = "error"
+                                    state.ask_error = detail
+                                else:
+                                    state.notify(detail)
                             elif event == "closed":
                                 if state.mode == "ask" and state.ask_status != "error":
                                     state.ask_pending = False
@@ -2632,20 +3041,19 @@ def run_monitor(
                             inline_ask = None
                     if future is not None and future.done():
                         try:
-                            sessions = future.result()
+                            sessions, inventory, explanations, observed_at = future.result()
                         except Exception as exc:  # noqa: BLE001
                             state.refresh_error = terminal_text(exc)
                         else:
                             _carry_usage(sessions, usage_cache)
                             local_sessions = sessions
-                            aggregator = getattr(pika, "monitor_sessions", None)
-                            state.sessions = (
-                                aggregator(sessions)
-                                if callable(aggregator)
-                                else sessions
-                            )
+                            state.sessions = inventory
+                            state.explanations = explanations
                             state.selected()
-                            state.last_update = time.time()
+                            # The worker may have completed long before a native
+                            # attach returns; applying its result is not a new scan.
+                            state.last_update = observed_at
+                            state.cached_initial = False
                             state.refresh_error = None
                             discovery_errors = getattr(pika, "discovery_errors", [])
                             state.refresh_warning = (
@@ -2668,7 +3076,10 @@ def run_monitor(
                         state.emphasize_refresh = False
                         next_refresh = (
                             0.0
-                            if manual_refresh_pending
+                            if manual_refresh_pending or (
+                                not state.refresh_error
+                                and time.time() - state.last_update >= refresh_seconds
+                            )
                             else monotonic + refresh_seconds
                         )
 
@@ -2677,11 +3088,14 @@ def run_monitor(
                             fleet_future.result()
                         except Exception:  # noqa: BLE001 - cache remains last-good
                             pass
-                        aggregator = getattr(pika, "monitor_sessions", None)
-                        if callable(aggregator):
-                            state.sessions = aggregator(local_sessions)
+                        cache_loader = getattr(getattr(pika, "fleet", None), "cached_sessions", None)
+                        if callable(cache_loader):
+                            state.sessions = [
+                                *local_sessions,
+                                *(item for item in state.sessions if isinstance(item, PendingLaunch)),
+                                *cache_loader(),
+                            ]
                             state.selected()
-                            state.last_update = time.time()
                         fleet_future = None
                         # Per-node last_attempt_at enforces each node's cadence.
                         # Do not idle while another node is already due.
@@ -2706,13 +3120,14 @@ def run_monitor(
 
                     if expert_future is not None and expert_future.done():
                         try:
-                            cards = expert_future.result()
+                            cards, freshness = expert_future.result()
                         except Exception:  # noqa: BLE001 - cards never block operations
                             pass
                         else:
                             state.expert_cards = {
                                 item.session.key: item for item in cards
                             }
+                            state.expert_freshness = freshness
                             state.expert_cards_updated_at = time.time()
                         expert_future = None
                         next_expert = monotonic + EXPERT_CARD_REFRESH_SECONDS
@@ -2818,7 +3233,7 @@ def run_monitor(
                             state.last_update
                         )
                         manual_refresh_pending = False
-                        future = executor.submit(pika.refresh, usage=False)
+                        future = executor.submit(_refresh_inventory, pika)
 
                     fleet = getattr(pika, "fleet", None)
                     node_loader = getattr(fleet, "nodes", None)
@@ -2868,7 +3283,7 @@ def run_monitor(
                         and monotonic >= next_expert
                     ):
                         expert_future = executor.submit(
-                            expert_loader,
+                            _load_expert_cards, expert_loader,
                             [replace(item) for item in state.sessions],
                         )
 
@@ -2915,14 +3330,48 @@ def run_monitor(
                         last_frame = frame.ansi
 
                     poll_seconds = min(0.12, max(0.01, refresh_seconds / 2))
+                    key_now = time.monotonic()
+                    if input_buffer and input_buffer[0] == 0x1B:
+                        if escape_started_at is None:
+                            escape_started_at = key_now
+                        poll_seconds = min(
+                            poll_seconds,
+                            max(
+                                0.0,
+                                KEY_SEQUENCE_TIMEOUT_SECONDS
+                                - (key_now - escape_started_at),
+                            ),
+                        )
                     readable, _, _ = select.select([input_fd], [], [], poll_seconds)
-                    if not readable:
+                    flush_escape = False
+                    if readable:
+                        data = os.read(input_fd, 256)
+                        if not data:
+                            break
+                        input_buffer.extend(data)
+                    elif (
+                        input_buffer
+                        and input_buffer[0] == 0x1B
+                        and escape_started_at is not None
+                        and time.monotonic() - escape_started_at
+                        >= KEY_SEQUENCE_TIMEOUT_SECONDS
+                    ):
+                        flush_escape = True
+                    else:
                         continue
-                    data = os.read(input_fd, 256)
-                    if not data:
-                        break
-                    input_buffer.extend(data)
-                    for key in decode_keys(input_buffer, text_mode=state.mode == "ask"):
+                    keys = decode_keys(
+                        input_buffer,
+                        # Interpret printable keys after each preceding key has
+                        # changed mode (e.g. a pasted /filter or inline ask).
+                        text_mode=True,
+                        flush_escape=flush_escape,
+                    )
+                    if input_buffer and input_buffer[0] == 0x1B:
+                        if escape_started_at is None:
+                            escape_started_at = time.monotonic()
+                    else:
+                        escape_started_at = None
+                    for key in keys:
                         action, session = _handle_key(key, pika, state)
                         if action == "quit":
                             future = None
@@ -2938,24 +3387,50 @@ def run_monitor(
                                     try:
                                         receipt = client_opener(session)
                                     except Exception as exc:  # noqa: BLE001 - keep TUI safe
-                                        state.notify(str(exc))
+                                        state.fail_action(str(exc), session)
                                         continue
                                     if receipt is not None:
                                         detail = getattr(receipt, "detail", None)
                                         state.notify(
                                             terminal_text(
                                                 detail
-                                                or "CLIENT WINDOW LAUNCHED · exact UUID"
+                                                or "CLIENT WINDOW LAUNCHED · exact identity"
                                             )
                                         )
+                                        state.mode = "sessions"
+                                        state.action_error = None
+                                        state.action_error_target = None
                                         continue
-                            selected_to_open = session
-                            future = None
-                            break
+                            if session is not None:
+                                try:
+                                    terminal.run_external(
+                                        lambda: pika.open_pending(session)
+                                        if isinstance(session, PendingLaunch)
+                                        else pika.open(session)
+                                    )
+                                except Exception as exc:  # noqa: BLE001 - return to board
+                                    state.fail_action(str(exc), session)
+                                else:
+                                    state.mode = "sessions"
+                                    state.action_error = None
+                                    state.action_error_target = None
+                                next_refresh = 0.0
+                                input_buffer.clear()
+                                last_frame = None
+                            continue
                         if action == "enter" and session is not None:
-                            selected_to_enter = session.display_name
-                            future = None
-                            break
+                            try:
+                                terminal.run_external(lambda: pika.enter(session.display_name))
+                            except Exception as exc:  # noqa: BLE001
+                                state.fail_action(str(exc), session)
+                            else:
+                                state.mode = "sessions"
+                                state.action_error = None
+                                state.action_error_target = None
+                            next_refresh = 0.0
+                            input_buffer.clear()
+                            last_frame = None
+                            continue
                         if action == "ask-open" and session is not None:
                             if inline_ask is not None:
                                 inline_ask.close()
@@ -3057,9 +3532,9 @@ def _demo_sessions(now: float) -> list[Session]:
             "codex",
             "11111111-1111-4111-8111-111111111111",
             name="factor-history",
-            cwd="/work/quant/SMART",
+            cwd="/work/sample-project",
             branch="main",
-            transcript_path="/work/quant/SMART/.codex/factor-history.jsonl",
+            transcript_path="/work/sample-project/.codex/factor-history.jsonl",
             tmux_pane="%12",
             status=Status.NEEDS_YOU.value,
             unread=True,
@@ -3077,8 +3552,8 @@ def _demo_sessions(now: float) -> list[Session]:
             "claude",
             "22222222-2222-4222-8222-222222222222",
             name="plugin-cleanup-with-a-deliberately-long-name",
-            cwd="/work/qes/plugin",
-            transcript_path="/work/qes/plugin/.claude/plugin-cleanup.jsonl",
+            cwd="/work/sample-plugin",
+            transcript_path="/work/sample-plugin/.claude/plugin-cleanup.jsonl",
             status=Status.WORKING.value,
             last_event_at=now - 8,
             last_activity_at=now - 8,
@@ -3127,9 +3602,9 @@ def main() -> None:
     profile = ExpertProfile(
         selected.provider,
         selected.session_id,
-        "Built and verified the SMART factor-history publication workflow.",
-        ("monthly factor weights", "S3 publication", "idempotent reruns"),
-        ("SMART/qis/SMART_factor_weights_history.parquet",),
+        "Built and verified a sample snapshot publication workflow.",
+        ("data snapshots", "publication", "idempotent reruns"),
+        ("artifacts/snapshot-history.parquet",),
         now - 300,
         "interview",
         current_state=(
@@ -3148,7 +3623,7 @@ def main() -> None:
         refresh_started_at=now,
         preview_key=selected.key,
         preview_lines=[
-            "17:13:02  reading monthly factor weights",
+            "17:13:02  reading sample snapshot inputs",
             "17:13:44  verified 38 tests",
             "17:14:11  unchanged rerun wrote nothing",
             "17:14:47  done · history publication is idempotent",

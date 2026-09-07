@@ -5,10 +5,16 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from pikamux.tmux import Tmux, TmuxError
+from pikamux.tmux import Tmux, TmuxError, WINDOWS_TERMINAL_DA2_RESPONSE
 
 
 class TmuxTests(unittest.TestCase):
+    def test_all_provider_homes_are_recognized_as_pika_sessions(self) -> None:
+        self.assertTrue(Tmux.is_pika_session("pika-c-codex"))
+        self.assertTrue(Tmux.is_pika_session("pika-a-claude"))
+        self.assertTrue(Tmux.is_pika_session("pika-o-opencode"))
+        self.assertFalse(Tmux.is_pika_session("my-pika-o-opencode"))
+
     def test_pane_inventory_distinguishes_no_server_from_query_failure(self) -> None:
         tmux = Tmux("test")
         no_server = subprocess.CompletedProcess(
@@ -29,7 +35,12 @@ class TmuxTests(unittest.TestCase):
     def test_agent_wrapper_restores_interactive_tui_environment(self) -> None:
         with patch.dict(
             os.environ,
-            {"PATH": "/caller/bin", "TERM": "dumb", "NO_COLOR": "1"},
+            {
+                "PATH": "/caller/bin",
+                "TERM": "dumb",
+                "NO_COLOR": "1",
+                "CODEX_THREAD_ID": "unrelated-parent",
+            },
             clear=True,
         ):
             wrapper = Tmux("test")._agent_wrapper(
@@ -40,6 +51,8 @@ class TmuxTests(unittest.TestCase):
                 None,
             )
         self.assertIn("env -u NO_COLOR", wrapper)
+        self.assertIn("-u CODEX_THREAD_ID", wrapper)
+        self.assertNotIn("CODEX_THREAD_ID=unrelated-parent", wrapper)
         self.assertIn("PATH=/caller/bin", wrapper)
         self.assertIn("TERM=tmux-direct", wrapper)
         self.assertIn("codex resume uuid", wrapper)
@@ -75,6 +88,81 @@ class TmuxTests(unittest.TestCase):
         with patch.object(Tmux, "run", new=already_rgb):
             Tmux("test").ensure_pika_rgb()
         self.assertFalse(any(call and call[0] == "set-option" for call in calls))
+
+    def test_terminal_reply_guard_uses_only_an_unowned_user_key(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def run(_self, *args, **_kwargs):
+            calls.append(args)
+            stdout = ""
+            if args == ("show-options", "-s", "user-keys"):
+                stdout = "user-keys[199] custom-sequence\n"
+            elif args == ("list-keys", "-T", "root"):
+                stdout = "bind-key -T root User198 display-message user-owned\n"
+            elif args == (
+                "show-options",
+                "-s",
+                "-v",
+                "user-keys[199]",
+            ):
+                stdout = "custom-sequence\n"
+            return subprocess.CompletedProcess(["tmux"], 0, stdout, "")
+
+        with patch.object(Tmux, "run", new=run):
+            self.assertTrue(Tmux("test").ensure_pika_terminal_reply_guard())
+
+        self.assertIn(
+            (
+                "set-option",
+                "-s",
+                "user-keys[197]",
+                WINDOWS_TERMINAL_DA2_RESPONSE,
+            ),
+            calls,
+        )
+        self.assertIn(
+            ("set-option", "-s", "@pika_terminal_reply_key", "197"), calls
+        )
+        binding = next(call for call in calls if call[:3] == ("bind-key", "-T", "root"))
+        self.assertEqual(binding[3:8], ("User197", "if-shell", "-F", "#{@pika_provider}", ""))
+        self.assertIn(WINDOWS_TERMINAL_DA2_RESPONSE, binding[8])
+        self.assertFalse(
+            any(
+                call[:3] == ("set-option", "-s", "user-keys[199]")
+                or call[:3] == ("set-option", "-s", "user-keys[198]")
+                for call in calls
+            )
+        )
+
+    def test_terminal_reply_guard_reuses_its_claim_idempotently(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def run(_self, *args, **_kwargs):
+            calls.append(args)
+            stdout = ""
+            if args == (
+                "show-options",
+                "-s",
+                "-v",
+                "@pika_terminal_reply_key",
+            ):
+                stdout = "199\n"
+            elif args == ("show-options", "-s", "user-keys"):
+                stdout = "user-keys[199] existing-pika-value\n"
+            elif args == (
+                "show-options",
+                "-s",
+                "-v",
+                "user-keys[199]",
+            ):
+                stdout = WINDOWS_TERMINAL_DA2_RESPONSE + "\n"
+            return subprocess.CompletedProcess(["tmux"], 0, stdout, "")
+
+        with patch.object(Tmux, "run", new=run):
+            self.assertTrue(Tmux("test").ensure_pika_terminal_reply_guard())
+
+        self.assertFalse(any(call and call[0] == "set-option" for call in calls))
+        self.assertTrue(any(call and call[0] == "bind-key" for call in calls))
 
     def test_agent_wrapper_preserves_explicit_interactive_no_color(self) -> None:
         with patch.dict(
@@ -251,6 +339,7 @@ class TmuxTests(unittest.TestCase):
 
         with (
             patch.object(Tmux, "run", new=run),
+            patch.object(Tmux, "ensure_pika_terminal_reply_guard", return_value=True),
             patch.dict(os.environ, {"TMUX": "socket,1,0"}, clear=False),
         ):
             self.assertEqual(Tmux("test").attach("my-existing-session"), 0)

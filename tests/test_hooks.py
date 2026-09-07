@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import ClassVar
 from unittest.mock import patch
 
-from pikamux.hooks import handle_hook, handle_process_exit, hook_stdout
+from pikamux.hooks import _event_state, handle_hook, handle_process_exit, hook_stdout
 from pikamux.models import Candidate, Pane, Session, Status
 from pikamux.providers import CodexProvider
 from pikamux.store import Store
@@ -56,6 +56,335 @@ class FailingTagTmux(FakeTmux):
 
 
 class HookTests(unittest.TestCase):
+    def test_opencode_attention_events_map_without_transcript_text(self) -> None:
+        self.assertEqual(
+            _event_state("opencode", {"hook_event_name": "QuestionRequest"}),
+            (Status.NEEDS_YOU.value, True, None, "question"),
+        )
+        self.assertEqual(
+            _event_state("opencode", {"hook_event_name": "PermissionRequest"}),
+            (Status.NEEDS_YOU.value, True, None, "permission"),
+        )
+        self.assertEqual(
+            _event_state("opencode", {"hook_event_name": "QuestionReply"}),
+            (Status.WORKING.value, False, None, None),
+        )
+
+    @patch("pikamux.hooks.OpenCodeProvider")
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_opencode_deleted_event_removes_exact_inventory_and_ownership(
+        self, provider_class
+    ) -> None:
+        self.store.delete_pending("launch")
+        session_id = "ses_deleted123"
+        self.store.upsert_session(
+            Session("opencode", session_id, name="deleted", cwd="/tmp")
+        )
+        with patch("pikamux.store.process_start_time", return_value=10):
+            self.assertTrue(self.store.set_live_owner("opencode", session_id, 4321))
+        provider_class.return_value.worker_originator.return_value = None
+        FakeTmux.pika_provider = "opencode"
+        FakeTmux.pika_session_id = session_id
+        with patch.dict(
+            os.environ, {"PIKA_LAUNCH_TOKEN": "", "TMUX_PANE": "%9"}, clear=False
+        ):
+            handle_hook(
+                "opencode",
+                {
+                    "session_id": session_id,
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionEnd",
+                    "deleted": True,
+                },
+                self.store,
+            )
+        self.assertIsNone(self.store.get_session("opencode", session_id))
+        self.assertEqual(self.store.get_live_owners("opencode", session_id), [])
+        self.assertEqual(FakeTmux.cleared, ["%9"])
+
+    @patch("pikamux.hooks.OpenCodeProvider")
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_opencode_native_name_requires_verified_readback(self, provider_class) -> None:
+        self.store.delete_pending("launch")
+        provider_class.return_value.worker_originator.return_value = None
+        session_id = "ses_name123"
+        key = f"native_name_error:opencode:{session_id}"
+        with patch.dict(
+            os.environ,
+            {"PIKA_NAME": "wanted", "PIKA_LAUNCH_TOKEN": "", "TMUX_PANE": ""},
+            clear=False,
+        ):
+            handle_hook(
+                "opencode",
+                {
+                    "session_id": session_id,
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionStart",
+                    "session_title": "New session - now",
+                    "desired_name": "wanted",
+                    "native_name_error": "update failed",
+                },
+                self.store,
+            )
+            self.assertEqual(self.store.get_meta(key), "wanted")
+            self.assertEqual(
+                self.store.get_session("opencode", session_id).name,
+                "wanted",
+            )
+            handle_hook(
+                "opencode",
+                {
+                    "session_id": session_id,
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionStart",
+                    "session_title": "wanted",
+                    "desired_name": "wanted",
+                    "native_name_error": None,
+                },
+                self.store,
+            )
+        self.assertIsNone(self.store.get_meta(key))
+
+    @patch("pikamux.hooks.provider_ancestor", return_value=4321)
+    @patch("pikamux.hooks.OpenCodeProvider")
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_unmanaged_opencode_placeholder_keeps_lease_without_inventory(
+        self, provider_class, _owner
+    ) -> None:
+        self.store.delete_pending("launch")
+        provider_class.return_value.worker_originator.return_value = None
+        session_id = "ses_placeholder123"
+        with (
+            patch.dict(
+                os.environ,
+                {"PIKA_LAUNCH_TOKEN": "", "PIKA_NAME": "", "TMUX_PANE": ""},
+                clear=False,
+            ),
+            patch("pikamux.store.process_start_time", return_value=12345),
+        ):
+            handle_hook(
+                "opencode",
+                {
+                    "session_id": session_id,
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionStart",
+                    "session_title": "New session - 2026-08-26T00:00:00Z",
+                    "desired_name": None,
+                },
+                self.store,
+            )
+
+        self.assertIsNone(self.store.get_session("opencode", session_id))
+        self.assertEqual(
+            self.store.get_live_owners("opencode", session_id),
+            [(4321, 12345)],
+        )
+
+    @patch("pikamux.hooks.OpenCodeProvider")
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_renamed_external_opencode_root_enters_inventory(
+        self, provider_class
+    ) -> None:
+        self.store.delete_pending("launch")
+        provider_class.return_value.worker_originator.return_value = None
+        session_id = "ses_renamed123"
+        with patch.dict(
+            os.environ,
+            {"PIKA_LAUNCH_TOKEN": "", "PIKA_NAME": "", "TMUX_PANE": ""},
+            clear=False,
+        ):
+            handle_hook(
+                "opencode",
+                {
+                    "session_id": session_id,
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionStart",
+                    "session_title": "oc_research",
+                    "desired_name": None,
+                },
+                self.store,
+            )
+
+        current = self.store.get_session("opencode", session_id)
+        self.assertEqual(current.name if current else None, "oc_research")
+
+    @patch("pikamux.hooks.provider_ancestor", return_value=4321)
+    @patch("pikamux.hooks.OpenCodeProvider")
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_opencode_heartbeat_renews_only_current_root_without_state_change(
+        self, provider_class, _owner
+    ) -> None:
+        self.store.delete_pending("launch")
+        current = "ses_current123"
+        previous = "ses_previous123"
+        self.store.upsert_session(
+            Session(
+                "opencode",
+                current,
+                name="current",
+                status=Status.READY.value,
+                unread=True,
+                updated_at=20,
+                last_event_at=10,
+                last_activity_at=15,
+            )
+        )
+        with patch("pikamux.store.process_start_time", return_value=10):
+            self.store.set_live_owner("opencode", current, 4321)
+            self.store.set_live_owner("opencode", previous, 4321)
+        with self.store.connect() as db:
+            db.execute(
+                "UPDATE live_owners SET last_seen=1 WHERE provider='opencode'"
+            )
+        before = self.store.get_session("opencode", current)
+        provider_class.return_value.worker_originator.return_value = None
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "PIKA_LAUNCH_TOKEN": "",
+                    "PIKA_OWNER_TOKEN": "",
+                    "PIKA_NAME": "",
+                    "TMUX_PANE": "",
+                },
+                clear=False,
+            ),
+            patch("pikamux.store.process_start_time", return_value=10),
+        ):
+            handle_hook(
+                "opencode",
+                {
+                    "session_id": current,
+                    "cwd": "/tmp",
+                    "hook_event_name": "SessionHeartbeat",
+                },
+                self.store,
+            )
+
+        after = self.store.get_session("opencode", current)
+        self.assertEqual(after.status, Status.READY.value)
+        self.assertTrue(after.unread)
+        self.assertEqual(after.updated_at, before.updated_at)
+        self.assertEqual(after.last_event_at, before.last_event_at)
+        self.assertEqual(after.last_activity_at, before.last_activity_at)
+        self.assertEqual(self.store.get_live_owners("opencode", previous), [])
+        leases = self.store.get_live_owner_leases("opencode", current)
+        self.assertEqual([(pid, start) for pid, start, *_ in leases], [(4321, 10)])
+        self.assertGreater(leases[0][2], 1)
+
+    @patch("pikamux.hooks.provider_ancestor", return_value=4321)
+    @patch("pikamux.hooks.OpenCodeProvider")
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_managed_opencode_root_switch_moves_exact_home_atomically(
+        self, provider_class, _owner
+    ) -> None:
+        self.store.delete_pending("launch")
+        old = "ses_oldroot123"
+        new = "ses_newroot123"
+        token = "opencode-launch"
+        self.store.upsert_session(
+            Session("opencode", old, name="old", managed=True, tmux_pane="%9")
+        )
+        self.store.upsert_session(Session("opencode", new, name="new"))
+        self.assertTrue(self.store.bind_launch(token, "opencode", old))
+        self.store.set_recovery_owner("opencode", old, 4321, 10, token)
+        with patch("pikamux.store.process_start_time", return_value=10):
+            self.store.set_live_owner("opencode", old, 4321)
+        provider_class.return_value.worker_originator.return_value = None
+        FakeTmux.pika_provider = "opencode"
+        FakeTmux.pika_session_id = old
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "PIKA_LAUNCH_TOKEN": token,
+                    "PIKA_OWNER_TOKEN": "owner",
+                    "PIKA_NAME": "old",
+                    "TMUX_PANE": "%9",
+                },
+                clear=False,
+            ),
+            patch("pikamux.store.process_start_time", return_value=10),
+            patch("pikamux.hooks.provider_process", return_value=4321),
+        ):
+            handle_hook(
+                "opencode",
+                {
+                    "session_id": new,
+                    "cwd": "/tmp",
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_title": "new",
+                },
+                self.store,
+            )
+
+        self.assertEqual(self.store.get_launch_binding(token), ("opencode", new))
+        self.assertIsNone(self.store.get_recovery_owner("opencode", old))
+        self.assertEqual(
+            self.store.get_recovery_owner("opencode", new),
+            (4321, 10, token),
+        )
+        self.assertEqual(self.store.get_live_owners("opencode", old), [])
+        self.assertEqual(self.store.get_live_owners("opencode", new), [(4321, 10)])
+        self.assertTrue(self.store.get_session("opencode", new).managed)
+        self.assertEqual(self.store.get_session("opencode", new).name, "new")
+        self.assertEqual(FakeTmux.tags[-1][1]["session_id"], new)
+
+    @patch("pikamux.hooks.OpenCodeProvider")
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_opencode_automation_root_never_enters_attention(self, provider_class) -> None:
+        self.store.delete_pending("launch")
+        provider_class.return_value.worker_originator.return_value = "agentic-fund:"
+        with patch.dict(
+            os.environ, {"PIKA_LAUNCH_TOKEN": "", "TMUX_PANE": ""}, clear=False
+        ):
+            handle_hook(
+                "opencode",
+                {
+                    "session_id": "ses_worker123",
+                    "cwd": "/runs/opencode-runtime/worker",
+                    "hook_event_name": "Stop",
+                    "session_title": "agentic-fund:calibration",
+                },
+                self.store,
+            )
+        self.assertIsNone(self.store.get_session("opencode", "ses_worker123"))
+        self.assertEqual(
+            self.store.get_live_owners("opencode", "ses_worker123"), []
+        )
+
+    @patch("pikamux.hooks.provider_ancestor", return_value=4321)
+    @patch("pikamux.hooks.OpenCodeProvider")
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_opencode_root_switch_revokes_same_process_old_root(
+        self, provider_class, _owner
+    ) -> None:
+        self.store.delete_pending("launch")
+        first = "ses_first123"
+        second = "ses_second123"
+        self.store.upsert_session(Session("opencode", first, name="first"))
+        self.store.upsert_session(Session("opencode", second, name="second"))
+        with patch("pikamux.store.process_start_time", return_value=10):
+            self.store.set_live_owner("opencode", first, 4321)
+        provider_class.return_value.worker_originator.return_value = None
+        with (
+            patch.dict(
+                os.environ, {"PIKA_LAUNCH_TOKEN": "", "TMUX_PANE": ""}, clear=False
+            ),
+            patch("pikamux.store.process_start_time", return_value=10),
+        ):
+            handle_hook(
+                "opencode",
+                {
+                    "session_id": second,
+                    "cwd": "/tmp",
+                    "hook_event_name": "UserPromptSubmit",
+                },
+                self.store,
+            )
+        self.assertEqual(self.store.get_live_owners("opencode", first), [])
+        self.assertEqual(self.store.get_live_owners("opencode", second), [(4321, 10)])
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.temp.name) / "pika.db")
@@ -99,7 +428,13 @@ class HookTests(unittest.TestCase):
         self.assertIsNone(result)
         session = self.store.get_session("codex", "uuid-1")
         self.assertEqual(session.name if session else None, "thread-name")
-        self.assertIsNone(self.store.get_pending("launch"))
+        # A fast SessionStart may bind before the launcher captures the exact
+        # provider PID generation. Keep the pending row until that second proof
+        # is available instead of publishing an unverified home.
+        self.assertIsNotNone(self.store.get_pending("launch"))
+        self.assertEqual(
+            self.store.get_launch_binding("launch"), ("codex", "uuid-1")
+        )
         observation = self.store.get_hook_observation("codex")
         self.assertEqual(observation["event_name"], "SessionStart")
         self.assertEqual(observation["session_id"], "uuid-1")
@@ -119,7 +454,21 @@ class HookTests(unittest.TestCase):
         )
         self.assertIsNotNone(self.store.get_session("codex", "uuid-tag-retry"))
         self.assertIsNotNone(self.store.get_pending("launch"))
-        with patch("pikamux.hooks.Tmux", FakeTmux):
+        self.store.finalize_pending_pane(
+            "launch", "pika-c-token", "%9", root_pid=777, root_pid_start=99
+        )
+        with (
+            patch("pikamux.hooks.Tmux", FakeTmux),
+            patch("pikamux.hooks.provider_process", return_value=777),
+            patch("pikamux.hooks.process_start_time", return_value=99),
+            patch(
+                "pikamux.hooks.process_environment",
+                return_value={
+                    "PIKA_PROVIDER": "codex",
+                    "PIKA_LAUNCH_TOKEN": "launch",
+                },
+            ),
+        ):
             handle_hook("codex", event, self.store)
         self.assertEqual(
             self.store.get_launch_binding("launch"),
@@ -415,7 +764,11 @@ class HookTests(unittest.TestCase):
         self.store.delete_pending("launch")
         with patch.dict(
             os.environ,
-            {"PIKA_NAME": "native-title", "PIKA_LAUNCH_TOKEN": ""},
+            {
+                "PIKA_NAME": "native-title",
+                "PIKA_SESSION_ID": "uuid-c",
+                "PIKA_LAUNCH_TOKEN": "",
+            },
             clear=False,
         ):
             result = handle_hook(
@@ -428,6 +781,225 @@ class HookTests(unittest.TestCase):
                 self.store,
             )
         self.assertEqual(result["hookSpecificOutput"]["sessionTitle"], "native-title")
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_claude_child_uuid_cannot_inherit_parent_pika_identity(self) -> None:
+        self.store.delete_pending("launch")
+        parent_id = "11111111-1111-4111-8111-111111111111"
+        child_id = "22222222-2222-4222-8222-222222222222"
+        self.store.upsert_session(
+            Session(
+                "claude",
+                parent_id,
+                name="sample_plugin",
+                tmux_session="pika-a-parent",
+                tmux_pane="%9",
+                status=Status.WORKING.value,
+            )
+        )
+        FakeTmux.pika_provider = "claude"
+        FakeTmux.pika_session_id = parent_id
+        self.assertTrue(self.store.bind_launch("parent-launch", "claude", parent_id))
+        with patch("pikamux.store.process_start_time", return_value=10):
+            self.assertTrue(
+                self.store.set_live_owner(
+                    "claude", parent_id, 4321, owner_token="parent-owner"
+                )
+            )
+        with patch.dict(
+            os.environ,
+            {
+                "PIKA_NAME": "sample_plugin",
+                "PIKA_SESSION_ID": parent_id,
+                "PIKA_LAUNCH_TOKEN": "parent-launch",
+                "PIKA_OWNER_TOKEN": "parent-owner",
+                "TMUX_PANE": "%9",
+            },
+            clear=True,
+        ):
+            result = handle_hook(
+                "claude",
+                {
+                    "session_id": child_id,
+                    "cwd": "/tmp/automation",
+                    "hook_event_name": "SessionStart",
+                },
+                self.store,
+            )
+
+        self.assertIsNone(result)
+        self.assertIsNone(self.store.get_session("claude", child_id))
+        parent = self.store.get_session("claude", parent_id)
+        self.assertEqual(parent.status if parent else None, Status.WORKING.value)
+        self.assertFalse(parent.unread if parent else True)
+        self.assertEqual(
+            self.store.get_launch_binding("parent-launch"), ("claude", parent_id)
+        )
+        self.assertIsNone(
+            self.store.get_meta("launch_binding_error:parent-launch")
+        )
+        self.assertEqual(
+            self.store.get_live_owners("claude", parent_id), [(4321, 10)]
+        )
+        self.assertIsNone(self.store.get_hook_observation("claude"))
+        self.assertEqual(FakeTmux.tags, [])
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_cross_provider_child_cannot_inherit_parent_pika_identity(self) -> None:
+        self.store.delete_pending("launch")
+        parent_id = "ses_parent123"
+        child_id = "33333333-3333-4333-8333-333333333333"
+        self.store.upsert_session(
+            Session(
+                "opencode",
+                parent_id,
+                name="oc_qes_style",
+                tmux_session="pika-o-parent",
+                tmux_pane="%9",
+                status=Status.WORKING.value,
+            )
+        )
+        FakeTmux.pika_provider = "opencode"
+        FakeTmux.pika_session_id = parent_id
+        self.assertTrue(
+            self.store.bind_launch("parent-launch", "opencode", parent_id)
+        )
+        with patch("pikamux.store.process_start_time", return_value=10):
+            self.assertTrue(
+                self.store.set_live_owner(
+                    "opencode", parent_id, 4321, owner_token="parent-owner"
+                )
+            )
+
+        with patch.dict(
+            os.environ,
+            {
+                "PIKA_PROVIDER": "opencode",
+                "PIKA_NAME": "oc_qes_style",
+                "PIKA_SESSION_ID": parent_id,
+                "PIKA_LAUNCH_TOKEN": "parent-launch",
+                "PIKA_OWNER_TOKEN": "parent-owner",
+                "TMUX_PANE": "%9",
+            },
+            clear=True,
+        ):
+            result = handle_hook(
+                "codex",
+                {
+                    "session_id": child_id,
+                    "cwd": "/tmp/automation",
+                    "hook_event_name": "SessionStart",
+                },
+                self.store,
+            )
+
+        self.assertIsNone(result)
+        self.assertIsNone(self.store.get_session("codex", child_id))
+        parent = self.store.get_session("opencode", parent_id)
+        self.assertEqual(parent.status if parent else None, Status.WORKING.value)
+        self.assertFalse(parent.unread if parent else True)
+        self.assertEqual(
+            self.store.get_launch_binding("parent-launch"),
+            ("opencode", parent_id),
+        )
+        self.assertIsNone(
+            self.store.get_meta("launch_binding_error:parent-launch")
+        )
+        self.assertEqual(
+            self.store.get_live_owners("opencode", parent_id), [(4321, 10)]
+        )
+        self.assertIsNone(self.store.get_hook_observation("codex"))
+        self.assertEqual(FakeTmux.tags, [])
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_claude_sdk_cli_hook_removes_only_false_inventory_row(self) -> None:
+        self.store.delete_pending("launch")
+        worker_id = "33333333-3333-4333-8333-333333333333"
+        transcript = Path(self.temp.name) / f"{worker_id}.jsonl"
+        content = (
+            json.dumps({"type": "custom-title", "customTitle": "sample_plugin"})
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "user",
+                    "sessionId": worker_id,
+                    "entrypoint": "sdk-cli",
+                    "isSidechain": False,
+                }
+            )
+            + "\n"
+        )
+        transcript.write_text(content)
+        self.store.upsert_session(
+            Session(
+                "claude",
+                worker_id,
+                name="sample_plugin",
+                transcript_path=str(transcript),
+                status=Status.READY.value,
+                unread=True,
+            )
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            result = handle_hook(
+                "claude",
+                {
+                    "session_id": worker_id,
+                    "transcript_path": str(transcript),
+                    "hook_event_name": "Stop",
+                },
+                self.store,
+            )
+
+        self.assertIsNone(result)
+        self.assertIsNone(self.store.get_session("claude", worker_id))
+        self.assertEqual(transcript.read_text(), content)
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_codex_exec_hook_removes_only_false_inventory_row(self) -> None:
+        self.store.delete_pending("launch")
+        worker_id = "44444444-4444-4444-8444-444444444444"
+        transcript = Path(self.temp.name) / f"{worker_id}.jsonl"
+        content = (
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": worker_id,
+                        "originator": "codex_exec",
+                        "source": "exec",
+                    },
+                }
+            )
+            + "\n"
+        )
+        transcript.write_text(content)
+        self.store.upsert_session(
+            Session(
+                "codex",
+                worker_id,
+                name="oc_qes_style",
+                transcript_path=str(transcript),
+                status=Status.READY.value,
+                unread=True,
+            )
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            result = handle_hook(
+                "codex",
+                {
+                    "session_id": worker_id,
+                    "transcript_path": str(transcript),
+                    "hook_event_name": "Stop",
+                },
+                self.store,
+            )
+
+        self.assertIsNone(result)
+        self.assertIsNone(self.store.get_session("codex", worker_id))
+        self.assertEqual(transcript.read_text(), content)
 
     @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_hook_replaces_unbound_adoption_without_losing_name(self) -> None:
@@ -599,7 +1171,7 @@ class HookTests(unittest.TestCase):
             Session(
                 "codex",
                 parent_id,
-                name="master_quant",
+                name="research-notes",
                 cwd="/tmp",
                 tmux_pane="%9",
                 status=Status.WORKING.value,
@@ -667,17 +1239,17 @@ class HookTests(unittest.TestCase):
             Session(
                 "codex",
                 parent_id,
-                name="master_quant",
+                name="research-notes",
                 cwd="/tmp",
                 tmux_session="pika-parent",
-                tmux_pane="%1",
+                tmux_pane="%9",
                 status=Status.READY.value,
             )
         )
         candidate = Candidate(
             "codex",
             child_id,
-            "master_quant",
+            "research-notes",
             cwd="/tmp",
             transcript_path=str(transcript),
             parent_session_id=parent_id,
@@ -705,6 +1277,117 @@ class HookTests(unittest.TestCase):
         self.assertIsNone(self.store.get_session("codex", child_id))
 
     @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_renamed_codex_fork_transfers_same_pane_home_and_name(self) -> None:
+        parent_id = "11111111-1111-4111-8111-111111111111"
+        child_id = "22222222-2222-4222-8222-222222222222"
+        transcript = Path(self.temp.name) / f"{child_id}.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": child_id, "forked_from_id": parent_id},
+                }
+            )
+            + "\n"
+        )
+        self.store.upsert_session(
+            Session(
+                "codex",
+                parent_id,
+                name="returns_tracker",
+                cwd="/tmp",
+                tmux_session="pika-parent",
+                tmux_pane="%9",
+                status=Status.READY.value,
+            )
+        )
+        candidate = Candidate(
+            "codex",
+            child_id,
+            "cf_perf",
+            cwd="/tmp",
+            transcript_path=str(transcript),
+            parent_session_id=parent_id,
+            lifecycle_status=Status.WORKING.value,
+        )
+        self.store.bind_launch("launch", "codex", parent_id)
+        self.store.delete_pending("launch")
+
+        with patch.object(CodexProvider, "thread_candidate", return_value=candidate):
+            handle_hook(
+                "codex",
+                {
+                    "session_id": parent_id,
+                    "cwd": "/tmp",
+                    "hook_event_name": "UserPromptSubmit",
+                    "transcript_path": str(transcript),
+                },
+                self.store,
+            )
+
+        current = self.store.get_session("codex", parent_id)
+        self.assertEqual(current.active_thread_id if current else None, child_id)
+        self.assertEqual(current.name if current else None, "cf_perf")
+        self.assertEqual(current.status if current else None, Status.WORKING.value)
+        self.assertIsNone(self.store.get_session("codex", child_id))
+        self.assertTrue(
+            any(values.get("name") == "cf_perf" for _, values in FakeTmux.tags)
+        )
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
+    def test_renamed_codex_fork_in_other_pane_stays_independent(self) -> None:
+        parent_id = "11111111-1111-4111-8111-111111111111"
+        child_id = "22222222-2222-4222-8222-222222222222"
+        transcript = Path(self.temp.name) / f"{child_id}.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": child_id, "forked_from_id": parent_id},
+                }
+            )
+            + "\n"
+        )
+        self.store.delete_pending("launch")
+        self.store.upsert_session(
+            Session(
+                "codex",
+                parent_id,
+                name="returns_tracker",
+                cwd="/tmp",
+                tmux_pane="%1",
+                status=Status.READY.value,
+            )
+        )
+        candidate = Candidate(
+            "codex",
+            child_id,
+            "cf_perf",
+            cwd="/tmp",
+            transcript_path=str(transcript),
+            parent_session_id=parent_id,
+            lifecycle_status=Status.WORKING.value,
+        )
+
+        with patch.object(CodexProvider, "thread_candidate", return_value=candidate):
+            handle_hook(
+                "codex",
+                {
+                    "session_id": child_id,
+                    "cwd": "/tmp",
+                    "hook_event_name": "UserPromptSubmit",
+                    "transcript_path": str(transcript),
+                },
+                self.store,
+            )
+
+        parent = self.store.get_session("codex", parent_id)
+        child = self.store.get_session("codex", child_id)
+        self.assertIsNone(parent.active_thread_id if parent else None)
+        self.assertEqual(child.name if child else None, "cf_perf")
+        self.assertEqual(child.tmux_pane if child else None, "%9")
+
+    @patch("pikamux.hooks.Tmux", FakeTmux)
     def test_concurrent_codex_child_hook_keeps_one_fail_closed_home(self) -> None:
         parent_id = "11111111-1111-4111-8111-111111111111"
         child_id = "22222222-2222-4222-8222-222222222222"
@@ -722,17 +1405,17 @@ class HookTests(unittest.TestCase):
             Session(
                 "codex",
                 parent_id,
-                name="master_quant",
+                name="research-notes",
                 cwd="/tmp",
                 tmux_session="pika-parent",
-                tmux_pane="%1",
+                tmux_pane="%9",
                 status=Status.WORKING.value,
             )
         )
         candidate = Candidate(
             "codex",
             child_id,
-            "master_quant",
+            "research-notes",
             cwd="/tmp",
             parent_session_id=parent_id,
             lifecycle_status=Status.WORKING.value,
@@ -870,12 +1553,74 @@ class HookTests(unittest.TestCase):
             },
             self.store,
         )
+        self.store.delete_pending("launch")
         self.assertIsNone(self.store.get_pending("launch"))
         handle_process_exit("codex", 7, launch_token="launch", store=self.store)
         session = self.store.get_session("codex", "uuid-exit")
         self.assertEqual(session.status if session else None, Status.ERROR.value)
         self.assertIn("status 7", session.error if session else "")
         self.assertEqual(session.attention_reason if session else None, "exited")
+
+    def test_opencode_exit_after_root_switch_targets_current_binding(self) -> None:
+        for code in (0, 9):
+            with self.subTest(code=code):
+                old = f"ses_oldexit{code}"
+                current = f"ses_currentexit{code}"
+                token = f"switch-token-{code}"
+                owner_token = f"owner-{code}"
+                self.store.upsert_session(
+                    Session("opencode", old, name="old", status=Status.WORKING.value)
+                )
+                self.store.upsert_session(
+                    Session(
+                        "opencode",
+                        current,
+                        name="current",
+                        status=Status.WORKING.value,
+                    )
+                )
+                self.assertTrue(self.store.bind_launch(token, "opencode", current))
+                self.store.set_recovery_owner(
+                    "opencode", current, 4321, 10, token
+                )
+                with patch("pikamux.store.process_start_time", return_value=10):
+                    self.assertTrue(
+                        self.store.set_live_owner(
+                            "opencode",
+                            current,
+                            4321,
+                            owner_token=owner_token,
+                        )
+                    )
+
+                handle_process_exit(
+                    "opencode",
+                    code,
+                    session_id=old,
+                    launch_token=token,
+                    owner_token=owner_token,
+                    store=self.store,
+                )
+
+                old_after = self.store.get_session("opencode", old)
+                current_after = self.store.get_session("opencode", current)
+                self.assertEqual(old_after.status, Status.WORKING.value)
+                self.assertEqual(
+                    current_after.status,
+                    Status.PARKED.value if code == 0 else Status.ERROR.value,
+                )
+                self.assertEqual(current_after.unread, code != 0)
+                self.assertEqual(
+                    current_after.attention_reason,
+                    None if code == 0 else "exited",
+                )
+                self.assertEqual(
+                    self.store.get_live_owner_leases("opencode", current), []
+                )
+                self.assertIsNone(
+                    self.store.get_recovery_owner("opencode", current)
+                )
+                self.assertIsNone(self.store.get_launch_binding(token))
 
     def test_ctrl_c_exit_revokes_only_its_owner_lease_and_parks(self) -> None:
         self.store.upsert_session(

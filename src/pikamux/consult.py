@@ -1,19 +1,33 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
+import secrets
 import select
+import selectors
+import socket
+import sqlite3
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import __version__
-from .executables import configured_executable, executable_available
+from .executables import (
+    configured_executable,
+    executable_available,
+    executable_version,
+    provider_compatibility_error,
+)
 from .models import Session
+from .paths import opencode_data_home
 
 
 class ConsultationError(RuntimeError):
@@ -60,6 +74,13 @@ def consultation_policy(session: Session, *, fast: bool = False) -> Consultation
                 "omit --fast to use its provider-native model"
             )
         return ConsultationPolicy("provider-native", None, None)
+    if session.provider == "opencode":
+        if fast:
+            raise ConsultationError(
+                "Fast consultations are not benchmarked for OpenCode; "
+                "omit --fast to use the session's provider-native model"
+            )
+        return ConsultationPolicy("provider-native", None, None)
     raise ConsultationError(f"Unsupported provider: {session.provider}")
 
 
@@ -86,6 +107,22 @@ class Consultation(ABC):
     def __init__(self, session: Session, policy: ConsultationPolicy):
         self.session = session
         self.policy = policy
+        self._progress_callback: Callable[[str, str], None] | None = None
+
+    def set_progress_callback(self, callback: Callable[[str, str], None]) -> None:
+        self._progress_callback = callback
+
+    def _progress(self, stage: str, delivery: str) -> None:
+        if self._progress_callback:
+            self._progress_callback(stage, delivery)
+
+    def _cleanup_failed_start(self, error: BaseException) -> None:
+        try:
+            self.close()
+            error.cleanup = "complete"
+        except (Exception, KeyboardInterrupt) as cleanup_error:
+            error.cleanup = "failed"
+            error.cleanup_error = str(cleanup_error)
 
     @abstractmethod
     def ask(self, question: str) -> str:
@@ -98,14 +135,46 @@ class Consultation(ABC):
     def __enter__(self) -> Consultation:
         return self
 
-    def __exit__(self, *_args: object) -> None:
-        self.close()
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        try:
+            self.close()
+        except (Exception, KeyboardInterrupt) as cleanup_error:
+            if exc is None:
+                raise
+            exc.cleanup = "failed"
+            exc.cleanup_error = str(cleanup_error)
 
 
 def _ephemeral_environment() -> dict[str, str]:
     environment = os.environ.copy()
     # Pika's own hooks must not inventory the provider's transient fork.
     environment["PIKA_EPHEMERAL"] = "1"
+    return environment
+
+
+def _opencode_ephemeral_environment() -> dict[str, str]:
+    environment = _ephemeral_environment()
+    # Inline config has runtime precedence over user/project agent settings.
+    # The catch-all deny also covers custom and MCP tools; only transcript-free
+    # local reads are enabled for Pika's private inherited consultation.
+    environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+        {
+            "agent": {
+                "pika-readonly": {
+                    "description": "Pika read-only inherited consultation",
+                    "mode": "primary",
+                    "permission": {
+                        "*": "deny",
+                        "read": "allow",
+                        "glob": "allow",
+                        "grep": "allow",
+                        "list": "allow",
+                    },
+                }
+            }
+        },
+        separators=(",", ":"),
+    )
     return environment
 
 
@@ -121,6 +190,81 @@ def _terminate(process: subprocess.Popen[str] | None) -> None:
 
 
 def _read_json_line(
+    process: subprocess.Popen[str], *, deadline: float
+) -> dict[str, Any]:
+    """Read provider frames without TextIOWrapper read-ahead hiding ready data."""
+    assert process.stdout is not None
+    try:
+        stdout_fd = process.stdout.fileno()
+    except (AttributeError, OSError, ValueError):
+        # In-memory streams are useful provider fixtures; actual child pipes
+        # always take the byte-buffer path below.
+        return _read_json_line_text(process, deadline=deadline)
+
+    buffered = getattr(process, "_pika_stdout_buffer", None)
+    if not isinstance(buffered, bytearray):
+        buffered = bytearray()
+        process._pika_stdout_buffer = buffered
+    stderr_buffer = getattr(process, "_pika_stderr_buffer", None)
+    if not isinstance(stderr_buffer, bytearray):
+        stderr_buffer = bytearray()
+        process._pika_stderr_buffer = stderr_buffer
+    selector = selectors.DefaultSelector()
+    selector.register(stdout_fd, selectors.EVENT_READ, "stdout")
+    if process.stderr is not None:
+        selector.register(process.stderr.fileno(), selectors.EVENT_READ, "stderr")
+    eof = False
+    try:
+        while time.monotonic() < deadline:
+            newline = buffered.find(b"\n")
+            if newline >= 0 or (eof and buffered):
+                size = newline if newline >= 0 else len(buffered)
+                if size > 16 * 1024 * 1024:
+                    raise ConsultationError("Provider side response exceeded the 16 MiB frame limit")
+                line = bytes(buffered[:size])
+                del buffered[:size + (1 if newline >= 0 else 0)]
+                try:
+                    message = json.loads(line)
+                except (UnicodeDecodeError, ValueError):
+                    continue
+                if isinstance(message, dict):
+                    return message
+                continue
+            if len(buffered) > 16 * 1024 * 1024:
+                raise ConsultationError("Provider side response exceeded the 16 MiB frame limit")
+            if eof:
+                break
+            ready = selector.select(max(0.0, deadline - time.monotonic()))
+            if not ready:
+                break
+            for key, _mask in ready:
+                try:
+                    chunk = os.read(key.fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fd)
+                    if key.data == "stdout":
+                        eof = True
+                    continue
+                if key.data == "stdout":
+                    buffered.extend(chunk)
+                else:
+                    stderr_buffer.extend(chunk)
+                    if len(stderr_buffer) > 65536:
+                        del stderr_buffer[:-65536]
+    finally:
+        selector.close()
+    if not eof and process.poll() is None:
+        raise ConsultationError("provider side consultation timed out")
+    detail = bytes(stderr_buffer).decode("utf-8", errors="replace").strip()
+    suffix = f": {detail[-500:]}" if detail else ""
+    raise ConsultationError(
+        f"provider side consultation exited with status {process.poll()}{suffix}"
+    )
+
+
+def _read_json_line_text(
     process: subprocess.Popen[str], *, deadline: float
 ) -> dict[str, Any]:
     assert process.stdout is not None
@@ -176,68 +320,67 @@ class CodexConsultation(Consultation):
         self.thread_id: str | None = None
         self._request_id = 0
         self._notifications: list[dict[str, Any]] = []
-        self._start()
+        try:
+            self._start()
+        except (Exception, KeyboardInterrupt) as exc:
+            self._cleanup_failed_start(exc)
+            raise
 
     def _start(self) -> None:
         executable = configured_executable("codex")
         if not executable_available(executable):
             raise ConsultationError("Configured Codex executable is unavailable")
-        try:
-            self.process = subprocess.Popen(
-                [str(executable), "app-server", "--stdio"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd=self.session.cwd if _valid_cwd(self.session.cwd) else None,
-                env=_ephemeral_environment(),
-            )
-            self._request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "pikamux",
-                        "title": "Pika side consultation",
-                        "version": __version__,
-                    },
-                    "capabilities": {"experimentalApi": True},
+        self.process = subprocess.Popen(
+            [str(executable), "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            cwd=self.session.cwd if _valid_cwd(self.session.cwd) else None,
+            env=_ephemeral_environment(),
+        )
+        self._request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "pikamux",
+                    "title": "Pika side consultation",
+                    "version": __version__,
                 },
-                timeout=15.0,
-            )
-            self._send({"method": "initialized"})
-            fork_params: dict[str, Any] = {
-                "threadId": self.session.session_id,
-                "ephemeral": True,
-                "approvalPolicy": "never",
-                "sandbox": "read-only",
-                "developerInstructions": (
-                    "This is an ephemeral side consultation. Answer from the "
-                    "inherited conversation context without modifying files or "
-                    "external state. If tools would be required, explain what "
-                    "needs checking instead. Keep dated or named historical "
-                    "work separate from later current state; state the chronology "
-                    "when both are relevant."
-                ),
+                "capabilities": {"experimentalApi": True},
+            },
+            timeout=15.0,
+        )
+        self._send({"method": "initialized"})
+        fork_params: dict[str, Any] = {
+            "threadId": self.session.provider_thread_id,
+            "ephemeral": True,
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+            "developerInstructions": (
+                "This is an ephemeral side consultation. Answer from the "
+                "inherited conversation context without modifying files or "
+                "external state. If tools would be required, explain what "
+                "needs checking instead. Keep dated or named historical "
+                "work separate from later current state; state the chronology "
+                "when both are relevant."
+            ),
+        }
+        if self.policy.model:
+            fork_params["model"] = self.policy.model
+        if self.policy.effort:
+            fork_params["config"] = {
+                "model_reasoning_effort": self.policy.effort
             }
-            if self.policy.model:
-                fork_params["model"] = self.policy.model
-            if self.policy.effort:
-                fork_params["config"] = {
-                    "model_reasoning_effort": self.policy.effort
-                }
-            result = self._request(
-                "thread/fork",
-                fork_params,
-                timeout=self.FORK_TIMEOUT_SECONDS,
-            )
-        except (OSError, BrokenPipeError, ValueError, ConsultationError):
-            self.close()
-            raise
+        result = self._request(
+            "thread/fork",
+            fork_params,
+            timeout=self.FORK_TIMEOUT_SECONDS,
+        )
         thread = result.get("thread") if isinstance(result, dict) else None
         thread_id = thread.get("id") if isinstance(thread, dict) else None
         if not thread_id or not thread.get("ephemeral"):
-            self.close()
             raise ConsultationError(
                 "Codex did not confirm an ephemeral fork; refusing to continue"
             )
@@ -247,7 +390,6 @@ class CodexConsultation(Consultation):
             observed_model != self.policy.model
             or observed_effort != self.policy.effort
         ):
-            self.close()
             raise ConsultationError(
                 "Codex did not confirm the requested consultation profile; "
                 f"requested {self.policy.label}, observed "
@@ -295,6 +437,7 @@ class CodexConsultation(Consultation):
                 self._notifications.append(message)
 
     def ask(self, question: str) -> str:
+        self._progress("turn", "not_sent")
         question = question.strip()
         if not question:
             raise ConsultationError("Question cannot be empty")
@@ -309,6 +452,7 @@ class CodexConsultation(Consultation):
             params["model"] = self.policy.model
         if self.policy.effort:
             params["effort"] = self.policy.effort
+        self._progress("turn", "unknown")
         result = self._request(
             "turn/start", params, timeout=self.TURN_START_TIMEOUT_SECONDS
         )
@@ -316,6 +460,7 @@ class CodexConsultation(Consultation):
         turn_id = turn.get("id") if isinstance(turn, dict) else None
         if not turn_id:
             raise ConsultationError("Codex did not start the side turn")
+        self._progress("turn", "confirmed")
         final_text = ""
         deltas: list[str] = []
         deadline = time.monotonic() + self.timeout
@@ -399,8 +544,12 @@ class ClaudeConsultation(Consultation):
         super().__init__(session, _validated_policy(session, policy))
         self.timeout = timeout
         self.process: subprocess.Popen[str] | None = None
-        self._check_capability()
-        self._start()
+        try:
+            self._check_capability()
+            self._start()
+        except (Exception, KeyboardInterrupt) as exc:
+            self._cleanup_failed_start(exc)
+            raise
 
     def _check_capability(self) -> None:
         executable = configured_executable("claude")
@@ -437,7 +586,7 @@ class ClaudeConsultation(Consultation):
                     str(executable),
                     "-p",
                     "--resume",
-                    self.session.session_id,
+                    self.session.provider_thread_id,
                     "--fork-session",
                     "--no-session-persistence",
                     "--tools",
@@ -462,6 +611,7 @@ class ClaudeConsultation(Consultation):
             ) from exc
 
     def ask(self, question: str) -> str:
+        self._progress("turn", "not_sent")
         question = question.strip()
         if not question:
             raise ConsultationError("Question cannot be empty")
@@ -474,6 +624,7 @@ class ClaudeConsultation(Consultation):
         }
         if self.process is None or self.process.stdin is None:
             raise ConsultationError("Claude side consultation is closed")
+        self._progress("turn", "unknown")
         try:
             self.process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
             self.process.stdin.flush()
@@ -484,6 +635,7 @@ class ClaudeConsultation(Consultation):
         while True:
             message = _read_json_line(self.process, deadline=deadline)
             if message.get("type") == "assistant":
+                self._progress("turn", "confirmed")
                 body = message.get("message")
                 content = body.get("content") if isinstance(body, dict) else None
                 if isinstance(content, list):
@@ -496,6 +648,7 @@ class ClaudeConsultation(Consultation):
                 continue
             if message.get("type") != "result":
                 continue
+            self._progress("turn", "confirmed")
             if message.get("subtype") != "success" or message.get("is_error"):
                 raise ConsultationError(
                     f"Claude side turn failed: {message.get('result') or message}"
@@ -510,6 +663,388 @@ class ClaudeConsultation(Consultation):
         self.process = None
 
 
+class OpenCodeConsultation(Consultation):
+    """A disposable OpenCode fork reused for a private multi-turn dialogue."""
+
+    def __init__(
+        self,
+        session: Session,
+        *,
+        timeout: float = 900.0,
+        policy: ConsultationPolicy | None = None,
+    ):
+        if session.provider != "opencode":
+            raise ConsultationError(
+                f"OpenCode consultation cannot open a {session.provider} session"
+            )
+        super().__init__(session, _validated_policy(session, policy))
+        self.timeout = timeout
+        self.thread_id: str | None = None
+        self.closed = False
+        self.process: subprocess.Popen[str] | None = None
+        self.database = opencode_data_home() / "opencode.db"
+        self._fork_uncertain = False
+        self._fork_server: subprocess.Popen[str] | None = None
+
+    @staticmethod
+    def _free_loopback_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            return int(listener.getsockname()[1])
+
+    @staticmethod
+    def _api_json(
+        url: str,
+        *,
+        username: str,
+        password: str,
+        method: str = "GET",
+        payload: dict[str, Any] | None = None,
+        timeout: float = 2.0,
+    ) -> dict[str, Any]:
+        token = base64.b64encode(
+            f"{username}:{password}".encode("utf-8")
+        ).decode("ascii")
+        body = None
+        headers = {"Authorization": f"Basic {token}"}
+        if payload is not None:
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            url, data=body, headers=headers, method=method
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace").strip()
+            except OSError:
+                detail = ""
+            raise ConsultationError(
+                f"OpenCode API returned HTTP {exc.code}"
+                + (f": {detail[-500:]}" if detail else "")
+            ) from exc
+        except (OSError, urllib.error.URLError) as exc:
+            raise ConsultationError(f"OpenCode API request failed: {exc}") from exc
+        try:
+            result = json.loads(raw)
+        except ValueError as exc:
+            raise ConsultationError("OpenCode API returned invalid JSON") from exc
+        if not isinstance(result, dict):
+            raise ConsultationError("OpenCode API returned an invalid response")
+        return result
+
+    def _fork_session(self, executable: Path | str) -> str:
+        """Create one exact provider-issued fork before any side prompt runs."""
+        port = self._free_loopback_port()
+        username = "opencode"
+        password = secrets.token_urlsafe(32)
+        base_url = f"http://127.0.0.1:{port}"
+        environment = _opencode_ephemeral_environment()
+        environment["OPENCODE_SERVER_USERNAME"] = username
+        environment["OPENCODE_SERVER_PASSWORD"] = password
+        server: subprocess.Popen[str] | None = None
+        try:
+            server = subprocess.Popen(
+                [
+                    str(executable),
+                    "--pure",
+                    "serve",
+                    "--hostname",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                ],
+                cwd=self.session.cwd if _valid_cwd(self.session.cwd) else None,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self._fork_server = server
+            deadline = time.monotonic() + 15.0
+            while True:
+                if server.poll() is not None:
+                    detail = server.stdout.read().strip() if server.stdout else ""
+                    raise ConsultationError(
+                        "OpenCode side-session server exited before becoming ready"
+                        + (f": {detail[-500:]}" if detail else "")
+                    )
+                try:
+                    self._api_json(
+                        f"{base_url}/global/health",
+                        username=username,
+                        password=password,
+                        timeout=0.5,
+                    )
+                    break
+                except ConsultationError:
+                    if time.monotonic() >= deadline:
+                        raise ConsultationError(
+                            "OpenCode side-session server did not become ready"
+                        )
+                    time.sleep(0.05)
+            query: dict[str, str] = {}
+            if _valid_cwd(self.session.cwd):
+                query["directory"] = str(self.session.cwd)
+            suffix = f"?{urllib.parse.urlencode(query)}" if query else ""
+            parent = urllib.parse.quote(self.session.provider_thread_id, safe="")
+            self._fork_uncertain = True
+            result = self._api_json(
+                f"{base_url}/session/{parent}/fork{suffix}",
+                username=username,
+                password=password,
+                method="POST",
+                payload={},
+                timeout=30.0,
+            )
+            # Retain the provider-issued child before server teardown: a failed
+            # terminate must not lose the exact identity needed for cleanup.
+            session_id = str(result.get("id") or "")
+            if self._valid_session_id(session_id) and session_id not in {
+                self.session.session_id, self.session.provider_thread_id,
+            }:
+                self.thread_id = session_id
+                self._fork_uncertain = False
+        except OSError as exc:
+            raise ConsultationError(
+                f"OpenCode side-session server failed: {exc}"
+            ) from exc
+        finally:
+            _terminate(server)
+            self._fork_server = None
+
+        session_id = str(result.get("id") or "")
+        if not self._valid_session_id(session_id):
+            raise ConsultationError(
+                "OpenCode did not return a valid provider-issued fork identity"
+            )
+        if session_id in {self.session.session_id, self.session.provider_thread_id}:
+            raise ConsultationError("OpenCode did not fork the parent consultation")
+        self.thread_id = session_id
+        observed_cwd = str(result.get("directory") or "")
+        if _valid_cwd(self.session.cwd) and observed_cwd != str(self.session.cwd):
+            raise ConsultationError(
+                "OpenCode forked the parent in an unexpected working directory"
+            )
+        return session_id
+
+    def _model_argv(self) -> list[str]:
+        value = str(self.session.model or "").strip()
+        if not value:
+            return []
+        variant: str | None = None
+        if value.endswith("]") and "[" in value:
+            value, variant = value[:-1].rsplit("[", 1)
+        result = ["--model", value]
+        if variant:
+            result.extend(("--variant", variant))
+        return result
+
+    def ask(self, question: str) -> str:
+        self._progress("prepare" if self.thread_id is None else "turn", "not_sent")
+        question = question.strip()
+        if not question:
+            raise ConsultationError("Question cannot be empty")
+        if self.closed:
+            raise ConsultationError("OpenCode side consultation is closed")
+        executable = configured_executable("opencode")
+        if not executable_available(executable):
+            raise ConsultationError("Configured OpenCode executable is unavailable")
+        compatibility_error = provider_compatibility_error(
+            "opencode", executable_version(executable)
+        )
+        if compatibility_error:
+            raise ConsultationError(compatibility_error)
+        if self.thread_id is None:
+            self.thread_id = self._fork_session(executable)
+        assert self.thread_id is not None
+        target = self.thread_id
+        argv = [
+            str(executable),
+            "--pure",
+            "run",
+            "--session",
+            target,
+        ]
+        argv.extend(("--format", "json", "--agent", "pika-readonly"))
+        argv.extend(self._model_argv())
+        prompt = (
+            "This is an ephemeral, read-only Pika side consultation inherited "
+            "from the parent conversation. Do not modify files or external "
+            "state. Answer the question from context; if a mutating tool would "
+            "be required, explain what needs checking instead.\n\n" + question
+        )
+        argv.append(prompt)
+        checkpoint = self._latest_message_time(self.thread_id)
+        try:
+            self.process = subprocess.Popen(
+                argv,
+                cwd=self.session.cwd if _valid_cwd(self.session.cwd) else None,
+                env=_opencode_ephemeral_environment(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            raise ConsultationError(f"OpenCode side turn failed: {exc}") from exc
+        self._progress("turn", "unknown")
+        answer: str | None = None
+        try:
+            deadline = time.monotonic() + self.timeout
+            while time.monotonic() < deadline:
+                answer = self._completed_answer(self.thread_id, checkpoint)
+                if answer:
+                    return answer
+                assert self.process is not None
+                if self.process.poll() is not None:
+                    answer = self._completed_answer(self.thread_id, checkpoint)
+                    if answer:
+                        return answer
+                    detail = ""
+                    if self.process.stderr is not None:
+                        detail = self.process.stderr.read().strip()
+                    suffix = f": {detail[-500:]}" if detail else ""
+                    raise ConsultationError(
+                        "OpenCode side turn exited before a completed answer"
+                        + suffix
+                    )
+                time.sleep(0.1)
+            raise ConsultationError("OpenCode side consultation timed out")
+        finally:
+            try:
+                _terminate(self.process)
+            except (OSError, subprocess.TimeoutExpired):
+                # The completed answer remains usable. close() must retry
+                # termination and certify deletion, or report cleanup failure.
+                if not answer:
+                    raise
+            else:
+                self.process = None
+
+    def _connect(self) -> sqlite3.Connection:
+        db = sqlite3.connect(f"file:{self.database}?mode=ro", uri=True, timeout=1)
+        db.row_factory = sqlite3.Row
+        return db
+
+    @staticmethod
+    def _valid_session_id(value: str) -> bool:
+        return (
+            value.startswith("ses_")
+            and 8 <= len(value) <= 128
+            and value[4:].isalnum()
+        )
+
+    def _latest_message_time(self, session_id: str) -> int:
+        try:
+            with self._connect() as db:
+                row = db.execute(
+                    "SELECT COALESCE(MAX(time_created),0) AS value FROM message "
+                    "WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()
+        except (OSError, sqlite3.Error):
+            return 0
+        return int(row["value"] or 0) if row else 0
+
+    def _completed_answer(self, session_id: str, after: int) -> str | None:
+        try:
+            with self._connect() as db:
+                user = db.execute(
+                    "SELECT id FROM message WHERE session_id=? AND time_created>? "
+                    "AND json_extract(data,'$.role')='user' "
+                    "ORDER BY time_created DESC, id DESC LIMIT 1",
+                    (session_id, after),
+                ).fetchone()
+                if user is None:
+                    return None
+                self._progress("turn", "confirmed")
+                assistant = db.execute(
+                    "SELECT id FROM message WHERE session_id=? "
+                    "AND json_extract(data,'$.role')='assistant' "
+                    "AND json_extract(data,'$.parentID')=? "
+                    "AND json_extract(data,'$.time.completed') IS NOT NULL "
+                    "AND json_extract(data,'$.finish')='stop' "
+                    "ORDER BY time_created DESC, id DESC LIMIT 1",
+                    (session_id, str(user["id"])),
+                ).fetchone()
+                if assistant is None:
+                    return None
+                parts = db.execute(
+                    "SELECT json_extract(data,'$.text') AS text FROM part "
+                    "WHERE session_id=? AND message_id=? "
+                    "AND json_extract(data,'$.type')='text' "
+                    "ORDER BY time_created, id",
+                    (session_id, str(assistant["id"])),
+                ).fetchall()
+        except (OSError, sqlite3.Error):
+            return None
+        text = "".join(str(row["text"] or "") for row in parts).strip()
+        return text or None
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        _terminate(self._fork_server)
+        self._fork_server = None
+        _terminate(self.process)
+        self.process = None
+        if self.thread_id is None:
+            if self._fork_uncertain:
+                raise ConsultationError(
+                    "OpenCode fork response was lost; temporary session identity is unknown. "
+                    "Inspect OpenCode sessions before retrying; Pika will not guess which session to delete."
+                )
+            self.closed = True
+            return
+        executable = configured_executable("opencode")
+        if not executable_available(executable):
+            raise ConsultationError(
+                f"OpenCode side {self.thread_id} was not deleted: executable unavailable"
+            )
+        try:
+            result = subprocess.run(
+                [str(executable), "--pure", "session", "delete", self.thread_id],
+                cwd=self.session.cwd if _valid_cwd(self.session.cwd) else None,
+                env=_opencode_ephemeral_environment(),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ConsultationError(
+                f"OpenCode side {self.thread_id} cleanup failed: {exc}"
+            ) from exc
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            raise ConsultationError(
+                f"OpenCode side {self.thread_id} cleanup failed"
+                + (f": {detail[-500:]}" if detail else "")
+            )
+        if self._session_exists(self.thread_id):
+            raise ConsultationError(
+                f"OpenCode side {self.thread_id} still exists after cleanup"
+            )
+        self.thread_id = None
+        self.closed = True
+
+    def _session_exists(self, session_id: str) -> bool:
+        try:
+            with self._connect() as db:
+                row = db.execute(
+                    "SELECT 1 FROM session WHERE id=?", (session_id,)
+                ).fetchone()
+        except (OSError, sqlite3.Error):
+            # Cleanup cannot be certified when the provider store is unreadable.
+            return True
+        return row is not None
+
+
 def consultation_for(
     session: Session,
     *,
@@ -521,6 +1056,8 @@ def consultation_for(
         return CodexConsultation(session, policy=policy)
     if session.provider == "claude":
         return ClaudeConsultation(session, policy=policy)
+    if session.provider == "opencode":
+        return OpenCodeConsultation(session, policy=policy)
     raise ConsultationError(f"Unsupported provider: {session.provider}")
 
 
