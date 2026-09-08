@@ -19,6 +19,8 @@ below. Do not overwrite those tags to publish this candidate.
 - Preserve expert discoverability after unwatching; track durable expertise and
   current work separately.
 - Report consultation stage, delivery certainty, and verified cleanup.
+- Distinguish consultation isolation from measured transcript preservation:
+  unmeasured parent-byte equality is `null`, never an automatic success claim.
 - Package the agent-convo skill and introduce first-conversation onboarding.
 - Prepare public documentation, synthetic examples, portable tests, locked
   development dependencies, and build verification.

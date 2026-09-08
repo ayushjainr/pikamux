@@ -520,6 +520,16 @@ if cleanup fails; only a terminal `closed` receipt with `discarded: true` confir
 successful cleanup. EOF or an answer alone does not prove disposal. Unknown
 delivery must never trigger a blind retry.
 
+Parent isolation and byte-for-byte verification are different claims. Ordinary
+consultations do not fingerprint the parent transcript: the closing receipt reports
+`parent_transcript_unchanged: null` and
+`parent_transcript_verification: "not_performed"`. This is independent of
+`discarded` and `cleanup`. Earlier development builds emitted an unconditional
+`true`; consumers must not treat that legacy value as measured evidence. The
+original agent can legitimately keep writing while a side is open. An explicitly
+authorized live audit can compare fingerprints separately, but even equality
+alone does not certify every aspect of provider isolation.
+
 `pika skill install` installs the bundled, version-matched `agent-convo` skill in
 the Codex skill directory and backs up an existing `SKILL.md`. Pass an explicit
 skill directory to install for another harness; unrelated resources are preserved.

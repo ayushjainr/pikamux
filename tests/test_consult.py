@@ -473,7 +473,9 @@ class ConsultationTests(unittest.TestCase):
         self.assertIn("EPHEMERAL", output.getvalue())
         self.assertIn(DEFAULT_CODEX_MODEL, output.getvalue())
         self.assertIn(DEFAULT_CODEX_EFFORT, output.getvalue())
-        self.assertIn("parent transcript unchanged", output.getvalue())
+        self.assertIn("parent isolation enabled", output.getvalue())
+        self.assertIn("transcript comparison not performed", output.getvalue())
+        self.assertNotIn("parent transcript unchanged", output.getvalue())
 
     def test_jsonl_ask_keeps_one_consultation_for_multiple_turns(self) -> None:
         session = Session(
@@ -519,7 +521,8 @@ class ConsultationTests(unittest.TestCase):
         self.assertEqual(messages[-1]["model"], FAST_CODEX_MODEL)
         self.assertEqual(messages[-1]["effort"], FAST_CODEX_EFFORT)
         factory.assert_called_once_with(session, fast=True)
-        self.assertTrue(messages[-1]["parent_transcript_unchanged"])
+        self.assertIsNone(messages[-1]["parent_transcript_unchanged"])
+        self.assertEqual(messages[-1]["parent_transcript_verification"], "not_performed")
 
     def test_ask_is_a_public_command(self) -> None:
         self.assertEqual(_normalize_argv(["ask", "name", "why"])[0], "ask")

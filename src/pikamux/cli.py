@@ -730,7 +730,8 @@ def _ask_session(
             return 1
         raise PikaError(str(exc)) from exc
     print(
-        "SIDE CLOSED · discarded · parent transcript unchanged · "
+        "SIDE CLOSED · discarded · parent isolation enabled · "
+        "transcript comparison not performed · "
         f"{consultation.policy.label}"
     )
     return 0
@@ -813,7 +814,10 @@ def _ask_jsonl(consultation: Consultation, session: Session, initial: str) -> in
         emit({
             "type": "closed",
             "discarded": consultation.cleanup == "complete",
-            "parent_transcript_unchanged": True,
+            # Isolation is the consultation policy, not a measured file result.
+            # The parent may legitimately keep writing while a side is open.
+            "parent_transcript_unchanged": None,
+            "parent_transcript_verification": "not_performed",
             **consultation.receipt(),
             **consultation.policy.receipt(),
         })

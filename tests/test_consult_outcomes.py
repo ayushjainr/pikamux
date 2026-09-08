@@ -83,6 +83,8 @@ def test_answer_is_emitted_before_cleanup_and_discard_is_after_verification():
     assert terminal["discarded"] is True
     assert terminal["cleanup"] == "complete"
     assert terminal["receipt_version"] == 2
+    assert terminal["parent_transcript_unchanged"] is None
+    assert terminal["parent_transcript_verification"] == "not_performed"
     assert side.close_calls == 1
 
 
@@ -98,7 +100,31 @@ def test_answer_survives_cleanup_failure_without_false_discard():
     assert error["retry_safe"] is False
     assert events[-1]["discarded"] is False
     assert events[-1]["cleanup"] == "failed"
+    assert events[-1]["parent_transcript_unchanged"] is None
+    assert events[-1]["parent_transcript_verification"] == "not_performed"
     assert side.questions == ["question"]
+
+
+def test_cleanup_does_not_certify_parent_bytes_when_the_parent_changes(tmp_path):
+    parent = tmp_path / "parent.jsonl"
+    parent.write_text("before\n")
+    side = Side()
+    original_ask = side.ask
+
+    def ask(question):
+        # This could be the original agent continuing its own work, or an
+        # isolation defect. Teardown alone cannot tell which, or prove equality.
+        parent.write_text("before\nnew parent turn\n")
+        return original_ask(question)
+
+    side.ask = ask
+    with patch.object(SESSION, "transcript_path", str(parent)):
+        result, events = cli(side, initial=["question"])
+    assert result == 0
+    assert parent.read_text() == "before\nnew parent turn\n"
+    assert events[-1]["discarded"] is True
+    assert events[-1]["parent_transcript_unchanged"] is None
+    assert events[-1]["parent_transcript_verification"] == "not_performed"
 
 
 @pytest.mark.parametrize("delivery", ["not_sent", "unknown", "confirmed"])
