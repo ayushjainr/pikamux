@@ -6,6 +6,13 @@ Use its explicit tag below. There is no stable release yet: GitHub's
 channel-aware updater discovers alpha releases too; older versions need the
 tagged installer below once to gain this behavior.
 
+Installing Pika also offers the bundled agent workflow: your current agent can
+discover expert cards and privately consult a relevant earlier conversation.
+After installation, follow [one useful consultation](first-consultation.md),
+not a fleet-wide setup. Setup itself does not interview agents or create missing
+cards. Note the [a3 Codex compatibility gap](first-consultation.md#release-compatibility)
+before using a newer paginated Codex conversation as your first expert.
+
 ## Fresh Mac or Linux machine
 
 For a private release bundle supplied by the maintainer:
@@ -132,6 +139,35 @@ convenient. If release notes require hook/skill configuration changes, `pika set
 previews them; `pika skill install` backs up the installed skill. Database changes
 on subsequently opening a new release are a separate compatibility concern and
 must be tested per release. Development checkouts are not self-updated.
+
+## Source preview
+
+For contributors testing an existing source checkout, use the
+[development setup](../CONTRIBUTING.md#one-development-setup):
+
+```bash
+uv sync --locked --group dev
+uv run pika --help
+```
+
+The checkout must include commit `6b8af0f` to test the newer paginated Codex
+parent fix. Check that locally with `git merge-base --is-ancestor 6b8af0f HEAD`
+(exit status 0 means it is included). These instructions do not imply that an
+unpublished commit is obtainable from a public release or remote branch.
+
+For approved live testing, `uv run pika setup` previews configuration from this
+checkout. The consulting agent must also resolve this checkout's Pika, not an
+older installed launcher. In a dedicated test shell inside the checkout, activate
+its environment with `source .venv/bin/activate`, verify `command -v pika`, then
+start the caller's provider CLI from that shell. Recheck command resolution from
+the caller before a consultation; desktop-launched agents may use a different PATH.
+Use `deactivate` when finished. Do not overwrite an installer-managed launcher or
+assume `pika --version` alone proves a source-only fix is present.
+
+Source preview is not a release upgrade. It can share your existing Pika state;
+setup is a real, previewed configuration change and consultations use real
+provider quota. Run the automated development tests before live trials, and
+keep the public installer pinned to a published, verified release.
 
 ## Other machines, including private releases
 

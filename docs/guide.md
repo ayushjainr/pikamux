@@ -2,20 +2,28 @@
 
 [Start here](../README.md) · [Security and privacy](../SECURITY.md) · [Contributing](../CONTRIBUTING.md)
 
-**Close the terminal. Pika will bring back the exact conversation—not merely
-the latest one.**
+**Your agent can find and consult the conversation that already did the work.**
 
-Pikamux provides the `pika` command: a local-first continuity and attention
-router for Codex, Claude, and OpenCode conversations running in tmux. Pika does not do the
-agent's work. It makes that work safe to leave alone, remembers exactly where
-it lives, and brings the same conversation back when called.
+Pikamux provides `pika`: expert-card discovery and private side consultations for
+your existing Codex, Claude, and OpenCode conversations, plus a human board for
+attention and exact return. Its bundled agent-convo skill lets your current agent
+use prior expertise without you carrying the conversation between agents.
+Pika does not replace the provider or do the agent's work itself.
+
+For the expert workflow, start with [one useful consultation](first-consultation.md).
+It covers the missing-card step, quota, evidence checking, and the public-release
+compatibility gap. The terminal recovery rehearsal below is a separate capability.
 
 ## Why Pika
 
-Agent conversations already persist, and tmux sessions already persist. The
-missing piece is a trustworthy bridge between a human name, the provider's
-immutable conversation identity, and the pane where that conversation is running.
-Pika owns that bridge.
+Existing conversations can hold useful context without being easy for another
+agent to discover. Pika connects relevant expertise to an exact conversation and
+a bounded consultation. For your own terminal use, it also connects a human name,
+provider identity and live pane so return and attention do not depend on guessing.
+
+- Expert cards expose scope, current work, topics and artifacts. Discovery uses
+  metadata; an explicit interview or consultation uses provider quota. The agent
+  checks the answer's evidence before treating it as a constraint on new work.
 
 - It resumes exact provider identities. It never falls back to `--last` or
   `--continue`. Codex and Claude use UUIDs; OpenCode uses native opaque
@@ -60,13 +68,14 @@ No tmux session name is part of the daily workflow.
 Press Enter at the name prompt to skip, or use `pika setup --skip-walkthrough`.
 `--yes`, non-interactive setup, and dry runs do not launch the walkthrough.
 
-After one recovery makes the contract tangible, use `pika` for the whole live
-briefing. Later, `pika experts QUERY` finds the exact conversation threads that
-worked on a topic and shows whether they can answer privately now.
+After one recovery makes that contract tangible, use `pika` for the live briefing.
+`pika experts QUERY` is a separate entry into existing expertise; it reports
+metadata matches and source availability, not a guarantee the next ask succeeds.
 
 ## The moments Pika is for
 
-Pika's value appears when ordinary process persistence stops being enough:
+The expert workflow helps when your current agent needs relevant prior context.
+Its continuity and attention layer also handles moments like these:
 
 ```text
 The terminal disappears        → recover the exact provider-native ID
@@ -77,7 +86,7 @@ A remote inventory is stale   → preserve last-known metadata; pause actions
 Identity cannot be proven     → show a PROTECTED PAUSE and one exact next step
 ```
 
-That is the product boundary: tmux keeps a process alive; Pika proves which
+That is the continuity boundary: tmux keeps a process alive; Pika proves which
 conversation the process belongs to and whether it is safe to enter.
 
 ## Install a Pika node

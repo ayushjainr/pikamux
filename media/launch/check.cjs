@@ -20,12 +20,14 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright-core');
    if(t===8){
     assert.equal(await page.locator('#hook-reply').evaluate(e=>getComputedStyle(e).opacity),'1');
     assert.equal(await page.locator('#hook-payoff').evaluate(e=>getComputedStyle(e).opacity),'1');
-    assert.match(await page.locator('#hook-reply').innerText(),/billing owns mutations/);
+    assert.match(await page.locator('#hook-reply').innerText(),/2 refunds.*1 with the original ID/);
    }
    if(t===22){
-    assert.match(await page.locator('.expert-card').innerText(),/Matched on scope \+ name/);
+    assert.match(await page.locator('.expert-card').innerText(),/Matched on topic \+ scope \+ name/);
     assert.match(await page.locator('.expert-card').innerText(),/DESIGN.md/);
    }
+   if(t===53)assert.match(await page.locator('#scene').innerText(),/2 refunds[\s\S]*1 refund/);
+   if(t===68)assert.match(await page.locator('.closing').innerText(),/not yet in public v0.5.0a3/);
    if(t===34){
     assert.equal(await page.locator('.question').innerText(),await page.evaluate(()=>PIKA_CONSULTATION.question));
     assert.equal(await page.locator('.answer').innerText(),await page.evaluate(()=>'“'+PIKA_CONSULTATION.answer+'”'));
@@ -36,7 +38,7 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright-core');
   assert.equal(await page.locator('#scene').innerHTML(),before,'Seeking must be deterministic');
   assert.deepEqual(errors,[]);
   const source=['board.js','consultation.js','discovery.js','index.html'].map(file=>fs.readFileSync(path.join(__dirname,file),'utf8')).join('\n');
-  assert(!/\/Users\/|\/mnt\/|master_|@rs6|019ff5b2|366df21d|01a07f02/.test(source),'No real inventory identifiers');
+  assert(!/\/Users\/|\/mnt\/|master_|@rs6|019ff5b2|366df21d|01a07f02|01a07f24/.test(source),'No real inventory identifiers');
   assert.match(source,/synthetic inventory/);
   const proof=await page.evaluate(()=>PIKA_CONSULTATION.proof);
   assert.equal(proof.parentTranscriptUnchanged,true);

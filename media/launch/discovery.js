@@ -1,21 +1,22 @@
-// Actual Pika metadata search after an expert interview of the synthetic builder.
-// Scope is an exact excerpt; topics are selected; artifact paths use basenames.
-// No fabricated ranking/confidence score. Display design is not the actual TUI.
+// Actual selected metadata from Pika's synthetic refund expert interview and search.
+// Display is designed; full capture/protocol details are in STORYBOARD.md.
 window.PIKA_DISCOVERY = {
-  "query": "orders",
-  "name": "demo-orders",
+  "query": "refund",
+  "name": "refund-retries",
   "provider": "codex",
-  "scopeExcerpt": "support-dashboard backend for inspecting synthetic orders",
+  "scopeExcerpt": "synthetic experiment for refund retries, post-commit response loss, operation-ID deduplication",
   "topics": [
-    "HTTP read-only method policy",
-    "Billing mutation and audit ownership boundaries"
+    "refund retry idempotency",
+    "post-commit response loss",
+    "operation-ID deduplication"
   ],
   "artifacts": [
-    "dashboard.py",
-    "test_dashboard.py",
+    "experiment.py",
+    "test_experiment.py",
     "DESIGN.md"
   ],
   "matchedOn": [
+    "topic",
     "scope",
     "name"
   ],

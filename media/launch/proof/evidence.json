@@ -1,0 +1,39 @@
+{
+  "scope": "Designed deterministic synthetic experiment, not a real payment incident or an AI-quality benchmark.",
+  "scenario": {
+    "intendedRefunds": 1,
+    "lostResponsesAfterCommit": 1,
+    "retries": 1
+  },
+  "observed": {
+    "freshRetryIdRefunds": 2,
+    "originalRetryIdRefunds": 1,
+    "testsPassed": 4
+  },
+  "sourceSha256": {
+    "experiment.py": "ef5cd57bd30e3f38702ef86a1bf17bbc8726429d8eb294e1fe1cbe1765b96d6b",
+    "test_experiment.py": "22f7faf7af9c8a1a04e5027b35cc7816d466c65957893dc359050f35df44b7a1",
+    "DESIGN.md": "7c9a1c3023a5d531a54b12c9ff7b99b6f0b99fca28d1a48c98eca686ab6fe2b6"
+  },
+  "discovery": {
+    "query": "refund",
+    "matchedOn": [
+      "topic",
+      "scope",
+      "name"
+    ],
+    "candidates": 1,
+    "source": "Pika expert interview"
+  },
+  "consultation": {
+    "question": "I'm adding a refund retry button. What did your earlier experiment find that should constrain my implementation?",
+    "answer": "The synthetic experiment measured 2 refunds with a fresh retry ID versus 1 with the original ID. Assign one operation ID per intended refund and reuse it after timeouts; a timeout may follow a successful commit. See DESIGN.md.",
+    "turns": 1,
+    "route": "local",
+    "parentState": "parked",
+    "cleanupConfirmed": true,
+    "parentTranscriptUnchangedMeasuredExternally": true,
+    "projectFilesUnchangedMeasuredExternally": true
+  },
+  "build": "Development preview; requires local 6b8af0f fix not in public v0.5.0a3."
+}

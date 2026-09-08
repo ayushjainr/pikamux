@@ -1,9 +1,8 @@
-// Real Pika consultation selected using the recorded discovery result.
-// Words preserved; the DESIGN.md Markdown link's private path is removed.
-// Displayed question omits only citation, brevity and no-tools instructions.
+// Actual answer words; only the private DESIGN.md Markdown link target is removed.
+// Display is designed; full capture/protocol details are in STORYBOARD.md.
 window.PIKA_CONSULTATION = {
-  "question": "I'm planning to let support staff edit orders in this dashboard. Which earlier decision should constrain my approach?",
-  "answer": "The dashboard was deliberately read-only because billing owns mutations and their audit trail. Any edit must delegate to billing with authorization, validation, and defined failure and retry behavior; merely enabling POST or changing local data violates that boundary. See DESIGN.md.",
+  "question": "I'm adding a refund retry button. What did your earlier experiment find that should constrain my implementation?",
+  "answer": "The synthetic experiment measured 2 refunds with a fresh retry ID versus 1 with the original ID. Assign one operation ID per intended refund and reuse it after timeouts; a timeout may follow a successful commit. See DESIGN.md.",
   "provider": "Codex",
   "route": "local",
   "parentState": "parked",
@@ -11,6 +10,6 @@ window.PIKA_CONSULTATION = {
     "parentTranscriptUnchanged": true,
     "projectFilesUnchanged": true,
     "cleanupConfirmed": true,
-    "scope": "One recorded consultation; external before/after measurements, not a universal guarantee."
+    "scope": "One synthetic local capture, externally measured. Not a universal guarantee."
   }
 };

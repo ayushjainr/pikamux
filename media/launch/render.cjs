@@ -8,7 +8,7 @@ const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core');
 const outArg=process.argv.indexOf('--out');
 const out=path.resolve(outArg<0?path.join(__dirname,'../../dist/launch-film'):process.argv[outArg+1]);
 const stills=process.argv.includes('--stills');
-const movie=path.join(out,'pika-expert-network.mp4');
+const movie=path.join(out,'pika-promise-and-proof.mp4');
 if(!stills&&fs.existsSync(movie))throw Error('Output already exists; choose a new --out directory.');
 fs.mkdirSync(out,{recursive:true});
 (async()=>{
