@@ -1,6 +1,6 @@
 # Installation and updates
 
-The first public release is **0.5.0a1 (alpha)**, distributed through GitHub Releases.
+The current public release is **0.5.0a2 (alpha)**, distributed through GitHub Releases.
 Use its explicit tag below. There is no stable release yet: GitHub's
 `releases/latest` endpoint and the default online `pika update` channel select
 stable releases, not alphas.
@@ -22,7 +22,7 @@ curl -fsSL https://github.com/ayushjainr/pikamux/releases/latest/download/instal
 For the current alpha, use its exact tag:
 
 ```bash
-curl -fsSL https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a1/install.sh | bash -s -- --version v0.5.0a1
+curl -fsSL https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a2/install.sh | bash -s -- --version v0.5.0a2
 ```
 
 Read the script before running it if you prefer. Piping a downloaded script to
@@ -62,9 +62,9 @@ is never silently replaced. Keep that installation method, or explicitly remove
 it through its original installer before switching. Re-running the same release
 is idempotent; reusing a version number for different package bytes is refused.
 
-### Skill setup in the next release
+### Skill setup
 
-The development version includes `agent-convo` in the same setup preview and
+Version 0.5.0a2 includes `agent-convo` in the same setup preview and
 approval as provider hooks. Accepting setup installs it for each installed
 provider: Codex's `skills/agent-convo` under its configured home, Claude's
 `skills/agent-convo` under its configured home, and OpenCode's
@@ -73,9 +73,8 @@ instructions are diffed and backed up; supporting files are preserved. A
 symlink-managed skill is left to its existing manager with an explicit notice.
 Missing providers do not receive skill directories. No model call is made.
 
-In the published **0.5.0a1**, run `pika skill install` separately (Codex default;
-other hosts accept an explicit skill-directory argument). The change above is
-not yet part of that immutable release. `--no-setup` skips skill installation
+In the older **0.5.0a1**, skill installation was a separate command. Its immutable
+release assets have not been changed. `--no-setup` skips skill installation
 as well as other configuration changes. Updating the package alone still does
 not overwrite installed instructions; rerun setup to review newer bundled skills.
 

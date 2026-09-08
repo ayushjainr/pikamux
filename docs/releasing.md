@@ -35,7 +35,7 @@ fixture, sample size, environment, limits, and evidence—not an agent review sc
 
 ## Before publication
 
-- The prepared candidate is `0.5.0a1`. Keep `src/pikamux/__init__.py`,
+- The prepared candidate is `0.5.0a2`. Keep `src/pikamux/__init__.py`,
   `pyproject.toml`, `uv.lock`, and the changelog consistent. Never reuse an old tag or overwrite
   an existing distribution to represent different code.
 - Verify issue links and the first hosted CI run after the owner authorizes a

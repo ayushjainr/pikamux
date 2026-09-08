@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0a2 — skill included in setup
 
 - Include the bundled agent-convo skill in setup for installed Codex, Claude,
   and OpenCode providers, using the existing preview and approval step. Back up
