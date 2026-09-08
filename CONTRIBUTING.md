@@ -43,9 +43,9 @@ and remain supported boundaries, not speculative abstractions. Runtime
 dependencies, new daemons, new commands, and provider fallbacks need a concrete
 consumer and a simpler-alternative analysis.
 
-Discuss large changes before implementation. AI-assisted contributions are
-welcome; describe your own decisions and verification, and take responsibility
-for the submitted code. Contributions are under the project's MIT license;
+Discuss large changes before implementation. Describe your decisions and
+verification, and take responsibility for the submitted code. Contributions are
+under the project's MIT license;
 retain applicable third-party notices and only contribute material you may share.
 
 ## Report safely

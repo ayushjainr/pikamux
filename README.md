@@ -2,6 +2,11 @@
 
 **Let your agent find and consult the conversation that already did the work.**
 
+[![Watch Pika: a dashboard agent finds relevant experience in a separate reporting project](media/demo/pika.gif)](media/demo/pika.mp4)
+
+[Watch or download the 60-second video](media/demo/pika.mp4) · Illustrative demo ·
+[Story and build notes](media/launch/CROSS_PROJECT_FILM.md)
+
 You should not have to remember which conversation knows the answer, find it,
 and carry its explanation back. Pika turns your existing Codex, Claude Code,
 and OpenCode conversations into a discoverable expert network. The bundled
@@ -19,17 +24,11 @@ and OpenCode conversations into a discoverable expert network. The bundled
   native agent interface with `pika NAME`. Cards enrich the board; provider
   evidence, not a card's prose, determines attention state.
 
-For example, before changing an endpoint, your agent can find the conversation
-that built it and ask which earlier constraint still matters. The useful result
-is a better-informed change—not merely another generated answer.
-
-[Inspect and reproduce the synthetic example](media/launch/proof/DESIGN.md):
-Pika discovered a refund expert card and a side consultation recalled its cited
-experiment—after a lost response, a fresh retry ID produced two refunds; retaining
-the original ID produced one. The source and four tests are included. This is a
-designed demonstration, not a production incident or a claim of model superiority;
-the [recorded evidence](media/launch/proof/evidence.json) identifies its
-development-preview build.
+For example, an agent building a dashboard encounters a service integration it
+hasn't used before. A separate reporting project has already connected to that
+service. Pika helps the dashboard agent find that experience, ask a focused
+question, and continue its own work. Consultation is available when context is
+missing—not a required step before every task.
 
 The current release is **0.5.0a3 (alpha)**. Pika is an independent project, not affiliated with OpenAI,
 Anthropic, or OpenCode. It is not an agent runtime or a hosted service.
@@ -70,9 +69,9 @@ Choose one existing conversation. **Setup does not interview agents or create
 missing expert cards.** Follow [your first useful consultation](docs/first-consultation.md)
 to make that conversation discoverable, then give your current agent a real task:
 
-> Use the agent-convo skill. Before making this change, find one relevant prior
-> conversation through Pika and consult it about constraints I might otherwise
-> need to explain. Check its cited evidence and tell me what changed in your plan.
+> Use the agent-convo skill when relevant prior work would help. If you encounter
+> a gap, look for an expert through Pika and consult it if the card alone isn't
+> enough. Check the answer against evidence and continue the task.
 
 You do not need a fleet of servers or an expert panel. Start with one project and
 one useful consultation. Discovery makes no model calls; building a missing card
@@ -161,8 +160,8 @@ recording of a real consultation.
 - [Security and privacy](SECURITY.md): data boundaries and safe issue reporting.
 - [Release checklist](docs/releasing.md): verification before any public release.
 
-Built and maintained by [Ayush Jain](https://github.com/ayushjainr), with
-AI-assisted development. Contributions are welcome; please include a small
-reproduction and tests for the behavior you change.
+Built and maintained by [Ayush Jain](https://ayushjainr.com).
+Contributions are welcome; please include a small reproduction and tests for the
+behavior you change.
 
 Licensed under [MIT](LICENSE).

@@ -1,5 +1,17 @@
 # Pika: promise, proof, first useful consultation
 
+**Narrative revision pending:** the user rejected the refund example below and
+the task-to-immediate-consultation framing. Use the new
+[cross-project script draft](../media/launch/SCRIPT.md) for the next narrative
+review. The old example, openings, and launch copy here are retained for reference,
+not approved for promotion. No new cross-project capture is claimed.
+
+**Current film:** the user approved an illustrative cross-project story instead
+of further live capture. The [60-second film](../media/launch/CROSS_PROJECT_FILM.md)
+and its inline README animation now show task progress, a relevant obstacle,
+expert discovery, one private consultation, and a return to the task. The dialogue
+is fictional and labelled accordingly. The older draft copy below remains archived.
+
 Local launch preparation, not a publication announcement. No outreach, telemetry,
 advertising spend, or claims of measured audience lift are authorized by this file.
 

@@ -9,4 +9,4 @@ What user outcome does this change? What simpler alternative did you consider?
 - [ ] Included no credentials, personal transcripts, or internal project data.
 - [ ] Preserved exact identity, unread state, and truthful delivery/cleanup claims.
 
-Describe limitations and any AI assistance relevant to reviewing the change.
+Describe known limitations and anything reviewers should verify independently.

@@ -1,4 +1,26 @@
-# Pika launch film — promise-and-proof preview
+# Pika launch films
+
+## Current: cross-project illustrative demo
+
+[Watch the 60-second MP4](../demo/pika.mp4). The repository README embeds the
+[animated version](../demo/pika.gif) directly. The user approved a synthetic
+story: a dashboard project discovers and consults a separate reporting project
+that uses the same service. Dialogue and interfaces are illustrative, not live
+agent output. See [story and build notes](CROSS_PROJECT_FILM.md).
+
+```sh
+CHROME_PATH='/path/to/chrome' node media/launch/check_cross_project.cjs
+CHROME_PATH='/path/to/chrome' FFMPEG_PATH='/path/to/ffmpeg' \
+  node media/launch/render.cjs --page cross-project.html --out dist/new-cross-project-cut
+```
+
+No live agent calls are needed. The earlier [capture attempts](CROSS_PROJECT_CAPTURE.md)
+are separate evidence, not a source of invented successful exchanges.
+
+## Archived: refund promise-and-proof preview
+
+The remaining instructions describe the older `index.html` cut. It is preserved
+for provenance, not the current README demonstration.
 
 Code-rendered, captions-only, 1920×1080 at 30 fps. No generated video, stock
 footage, provider logos, external fonts, or music. Nothing is uploaded by these

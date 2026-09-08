@@ -1,5 +1,11 @@
 # Promise-and-proof cut: an expert network for your agents
 
+**Superseded narrative — retained as provenance for the existing render.**
+The user rejected the refund example and the implication that a task should
+immediately trigger consultation. [SCRIPT.md](SCRIPT.md) is the next-cut draft:
+independent projects, a concrete overlap encountered during work, one useful
+consultation, and a return to the original task. It is not yet a recorded demo.
+
 72 seconds. Captions only. HTML/CSS/browser rendering, no video model.
 Development preview: local Codex compatibility fix 6b8af0f is not in public a3.
 The main promise is agent-discovered expertise and agent-to-agent consultation;
