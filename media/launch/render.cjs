@@ -8,7 +8,7 @@ const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright-core');
 const outArg=process.argv.indexOf('--out');
 const out=path.resolve(outArg<0?path.join(__dirname,'../../dist/launch-film'):process.argv[outArg+1]);
 const stills=process.argv.includes('--stills');
-const movie=path.join(out,'pika-alchemy-cut.mp4');
+const movie=path.join(out,'pika-expert-network.mp4');
 if(!stills&&fs.existsSync(movie))throw Error('Output already exists; choose a new --out directory.');
 fs.mkdirSync(out,{recursive:true});
 (async()=>{
@@ -19,7 +19,7 @@ fs.mkdirSync(out,{recursive:true});
   const errors=[];page.on('pageerror',e=>errors.push(String(e)));
   await page.goto(pathToFileURL(path.join(__dirname,'index.html')).href+'?render=1');
   await page.evaluate(()=>document.fonts.ready);
-  for(const t of [4,12,24,35,42,47,51,57,66]){
+  for(const t of [1,4,8,13,22,34,44,53,59,62,68]){
    await page.evaluate(t=>window.renderFrame(t),t);
    await page.screenshot({path:path.join(out,`scene-${t}.png`)});
   }

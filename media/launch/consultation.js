@@ -1,16 +1,16 @@
-// Verbatim answer from a real Pika side consultation, not authored film dialogue.
-// Synthetic project only. Identifiers and raw transcripts remain outside public assets.
-// The displayed question omits only brevity/no-tools instructions; see STORYBOARD.md.
+// Real Pika consultation selected using the recorded discovery result.
+// Words preserved; the DESIGN.md Markdown link's private path is removed.
+// Displayed question omits only citation, brevity and no-tools instructions.
 window.PIKA_CONSULTATION = {
-  question: "Why did we make this endpoint read-only?",
-  answer: "Support staff only need to inspect sample orders. The separate billing service owns all order changes and their audit trail, so allowing dashboard mutations would duplicate responsibility and risk bypassing billing’s controls. The endpoint therefore permits only GET, HEAD, and OPTIONS.",
-  provider: "Codex",
-  route: "local",
-  parentState: "parked",
-  proof: {
-    parentTranscriptUnchanged: true,
-    projectFilesUnchanged: true,
-    cleanupConfirmed: true,
-    scope: "One recorded consultation; external before/after measurements, not a universal guarantee."
+  "question": "I'm planning to let support staff edit orders in this dashboard. Which earlier decision should constrain my approach?",
+  "answer": "The dashboard was deliberately read-only because billing owns mutations and their audit trail. Any edit must delegate to billing with authorization, validation, and defined failure and retry behavior; merely enabling POST or changing local data violates that boundary. See DESIGN.md.",
+  "provider": "Codex",
+  "route": "local",
+  "parentState": "parked",
+  "proof": {
+    "parentTranscriptUnchanged": true,
+    "projectFilesUnchanged": true,
+    "cleanupConfirmed": true,
+    "scope": "One recorded consultation; external before/after measurements, not a universal guarantee."
   }
 };

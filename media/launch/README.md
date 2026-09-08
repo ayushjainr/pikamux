@@ -1,4 +1,4 @@
-# Pika launch film — Alchemy cut
+# Pika launch film — expert-network cut
 
 Code-rendered, captions-only, 1920×1080 at 30 fps. No generated video, stock
 footage, provider logos, external fonts, or music. Nothing is uploaded by these
@@ -7,9 +7,13 @@ scripts. Review the MP4 before sharing.
 The board frames come from Pika's actual `render_monitor` function with synthetic
 sessions. They are labelled **Real renderer · synthetic projects**. This is a
 product walkthrough, not a continuous live screen recording. The consultation
-segment uses a complete, verbatim answer from the Codex conversation that built
+segment preserves the answer's words from the Codex conversation that built
 and tested a tiny synthetic support-dashboard endpoint. The answer was obtained
-through `pika ask`, not scripted. It is a **local** example; the later cross-server
+through `pika ask`, not scripted; the private DESIGN.md link path is removed.
+The target came from a real `pika experts orders --json` result following an
+explicit expert interview. The card shows actual selected metadata in a designed
+view, not a new TUI component. The user task is illustrated; the film-making agent
+performed the recorded discovery and consultation. It is a **local** example; the cross-server
 claim is backed by separate recorded Codex and Claude tests. The accompanying
 results are scoped to those tests, not blanket guarantees. No real names, UUIDs,
 server identifiers, credentials, transcript files, or private project paths are
@@ -36,10 +40,11 @@ Browser and encoder dependencies are production tools only, not Pika dependencie
 Rendered MP4/PNG files stay under ignored `dist/`. The source is self-contained
 and can be revised without re-recording a desktop or changing Pika itself.
 
-The new render is named `pika-alchemy-cut.mp4`; the original first-cut MP4 is
-retained separately. The narrative brings the bundled skill forward, makes a
-familiar decision the consultation example, and ends with one conversation
-rather than a fleet or a wall of installation commands.
+The new render is named `pika-expert-network.mp4`; both earlier cuts are retained
+separately. The first ten seconds show task → expert card → expert reply. The
+main story is agent discovery and consultation, with the board as a short human
+view into the same network. The endpoint-change proposal is checked against the
+expert's design note but not implemented. See STORYBOARD.md for claim boundaries.
 
 ## Installation text for the description
 
