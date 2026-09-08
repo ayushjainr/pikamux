@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0a3 — approved updates from the board
+
+- Add cached, background update notices for installer-managed boards. Press `U`
+  to review the exact release and Enter to approve; installation runs separately
+  without stopping agents. No automatic installation or remote upgrades.
+- Make online `pika update` channel-aware: alpha/beta/RC installations can find
+  newer prereleases or stable versions; stable installations stay stable. Support
+  `--release VERSION` for an explicit, version-pinned update.
+
 ## 0.5.0a2 — skill included in setup
 
 - Include the bundled agent-convo skill in setup for installed Codex, Claude,

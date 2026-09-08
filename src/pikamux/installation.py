@@ -14,13 +14,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import uuid
 import zipfile
 
 from . import __version__
 
-RELEASE_URL = "https://github.com/ayushjainr/pikamux/releases/latest/download"
+RELEASE_API = "https://api.github.com/repos/ayushjainr/pikamux/releases?per_page=100"
+UPDATE_CHECK_SECONDS = 6 * 60 * 60
 ROOT_MARKER = "pikamux-installer-v1\n"
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:(?:a|b|rc)[0-9]+)?\Z")
 
@@ -111,7 +113,7 @@ def _validate_root(root: Path) -> None:
     if root in {Path('/'), Path.home().resolve(), Path.cwd().resolve()}:
         raise InstallError("Choose a dedicated Pika installation directory, not a home or workspace root.")
     marker = root / '.pika-install-root'
-    for entry in (marker, root / 'tools', root / 'releases', root / '.install.lock'):
+    for entry in (marker, root / 'tools', root / 'releases', root / '.install.lock', root / '.update-check.lock'):
         if entry.is_symlink():
             raise InstallError(f'Unexpected symlink in managed installation: {entry}. Nothing overwritten.')
     if root.exists() and any(root.iterdir()):
@@ -120,9 +122,9 @@ def _validate_root(root: Path) -> None:
 
 
 @contextlib.contextmanager
-def _lock(root: Path):
+def _lock(root: Path, *, name: str = '.install.lock'):
     import fcntl
-    with (root / '.install.lock').open('a') as stream:
+    with (root / name).open('a') as stream:
         try:
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
@@ -237,9 +239,9 @@ def managed_receipt() -> dict:
                            "Update it with its original installation method; editable checkouts are left untouched.") from exc
 
 
-def _download(url: str, target: Path, *, limit: int) -> None:
+def _download(url: str, target: Path, *, limit: int, timeout: float = 30) -> None:
     try:
-        with urllib.request.urlopen(url, timeout=30) as response, target.open('wb') as output:
+        with urllib.request.urlopen(url, timeout=timeout) as response, target.open('wb') as output:
             if not response.url.startswith('https://'):
                 raise InstallError('Release download redirected away from HTTPS.')
             size = 0
@@ -261,13 +263,103 @@ def _version_key(version: str) -> tuple:
     return (int(major), int(minor), int(patch), {'a': 0, 'b': 1, 'rc': 2, None: 3}[phase], int(number or 0))
 
 
-def update(*, bundle: Path | None = None, check: bool = False) -> None:
+def latest_release(current: str) -> str | None:
+    """Bounded public metadata lookup; never send local inventory or credentials."""
+    preview = _version_key(current)[3] != 3
+    with tempfile.TemporaryDirectory(prefix='pika-release-check-') as directory:
+        path = Path(directory) / 'releases.json'
+        _download(RELEASE_API, path, limit=2 * 1024 * 1024, timeout=5)
+        try:
+            rows = json.loads(path.read_text())
+            if not isinstance(rows, list):
+                raise ValueError('expected release list')
+        except (OSError, ValueError) as exc:
+            raise InstallError('Cannot read the release listing. Nothing changed.') from exc
+    versions = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get('draft') is not False:
+            continue
+        tag = row.get('tag_name')
+        if not isinstance(tag, str) or not tag.startswith('v') or not VERSION.fullmatch(tag[1:]):
+            continue
+        version = tag[1:]
+        if not preview and (row.get('prerelease') is not False or _version_key(version)[3] != 3):
+            continue
+        assets = row.get('assets')
+        if not isinstance(assets, list):
+            continue
+        names = {asset.get('name') for asset in assets if isinstance(asset, dict)
+                 and isinstance(asset.get('name'), str)}
+        if {'pika-release.json', f'pikamux-{version}-py3-none-any.whl'} <= names:
+            versions.append(version)
+    return max(versions, key=_version_key) if versions else None
+
+
+def update_notice() -> str | None:
+    """Best-effort, cached board check. Unmanaged installs never use the network."""
+    if os.environ.get('PIKA_UPDATE_CHECK', '').lower() in {'0', 'false', 'off'}:
+        return None
+    try:
+        receipt = managed_receipt()
+        root, current = Path(receipt['root']), receipt['version']
+        cache = root / '.update-check.json'
+        # Concurrent boards share a check lock without blocking real installers.
+        with _lock(root, name='.update-check.lock'):
+            now = time.time()
+            saved = {}
+            try:
+                if not cache.is_symlink() and cache.stat().st_size <= 4096:
+                    saved = json.loads(cache.read_text())
+                if not isinstance(saved, dict):
+                    saved = {}
+                age = now - float(saved.get('checked_at', 0))
+                valid = saved.get('current') == current and 0 <= age < (
+                    3600 if saved.get('failed') else UPDATE_CHECK_SECONDS
+                )
+            except (OSError, ValueError, TypeError):
+                valid = False
+            if not valid:
+                try:
+                    version = latest_release(current)
+                    saved = {'current': current, 'checked_at': now, 'latest': version}
+                except (InstallError, OSError):
+                    saved = {'current': current, 'checked_at': now, 'latest': None, 'failed': True}
+                fd, temporary = tempfile.mkstemp(prefix='.update-check-', dir=root)
+                try:
+                    with os.fdopen(fd, 'w') as stream:
+                        json.dump(saved, stream)
+                    os.replace(temporary, cache)
+                finally:
+                    Path(temporary).unlink(missing_ok=True)
+            version = saved.get('latest')
+            if isinstance(version, str) and VERSION.fullmatch(version):
+                if _version_key(version) > _version_key(current) and (
+                    _version_key(current)[3] != 3 or _version_key(version)[3] == 3
+                ):
+                    return version
+    except (InstallError, OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def update(*, bundle: Path | None = None, check: bool = False, release: str | None = None) -> None:
     receipt = managed_receipt()
+    if release is not None and (bundle is not None or not VERSION.fullmatch(release)):
+        raise InstallError('Use a valid --release VERSION or --bundle, not both.')
+    if release is not None and _version_key(release) < _version_key(receipt['version']):
+        raise InstallError('Refusing a release downgrade. Nothing changed.')
     with tempfile.TemporaryDirectory(prefix='pika-update-') as directory:
         local = bundle.resolve() if bundle else Path(directory)
         if not bundle:
-            _download(RELEASE_URL + '/pika-release.json', local / 'pika-release.json', limit=65536)
+            release = release or latest_release(receipt['version'])
+            if release is None or _version_key(release) < _version_key(receipt['version']):
+                print(f"Pika {receipt['version']} is already current for its release channel.")
+                return
+            base = f'https://github.com/ayushjainr/pikamux/releases/download/v{release}'
+            _download(base + '/pika-release.json', local / 'pika-release.json', limit=65536)
         manifest = read_manifest(local / 'pika-release.json')
+        if release is not None and manifest['version'] != release:
+            raise InstallError('Release tag and manifest version differ. Nothing activated.')
         if _version_key(manifest['version']) < _version_key(receipt['version']):
             raise InstallError('Refusing a release downgrade. Nothing changed.')
         if manifest['version'] == receipt['version']:
@@ -277,16 +369,35 @@ def update(*, bundle: Path | None = None, check: bool = False) -> None:
             return
         print(f"Pika {receipt['version']} → {manifest['version']}")
         if check:
-            command = ['pika', 'update'] + (['--bundle', str(bundle.resolve())] if bundle else [])
+            command = ['pika', 'update'] + (['--bundle', str(bundle.resolve())] if bundle else ['--release', release])
             print(f'Update available. Run `{shlex.join(command)}` to install it.')
             return
         wheel = local / manifest['wheel']
         if not bundle:
-            _download(RELEASE_URL + '/' + manifest['wheel'], wheel, limit=64 * 1024 * 1024)
+            _download(base + '/' + manifest['wheel'], wheel, limit=64 * 1024 * 1024)
         install(wheel, manifest['sha256'], Path(receipt['root']) / 'tools/uv',
                 root=Path(receipt['root']), bin_dir=Path(receipt['bin_dir']))
         print('Reopen the Pika board when convenient. Existing agent processes were not restarted. '
               'Hook/skill configuration is unchanged; `pika setup` previews any integration changes.')
+
+
+def board_update(release: str) -> str:
+    """Run only after explicit board approval; never redirect global TUI stdout."""
+    managed_receipt()
+    if not VERSION.fullmatch(release):
+        raise InstallError('Invalid release version.')
+    # File-backed output lets the child finish safely even if the board exits.
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run(
+            [sys.executable, '-m', 'pikamux', 'update', '--release', release],
+            env=_environment(), stdin=subprocess.DEVNULL, stdout=output,
+            stderr=subprocess.STDOUT, timeout=3600, start_new_session=True,
+        )
+        output.seek(max(0, output.tell() - 4000))
+        detail = output.read().decode(errors='replace').strip()
+    if result.returncode:
+        raise InstallError(detail or 'Update failed. Run `pika update` for diagnostics.')
+    return f'Updated to {release} · reopen pika when convenient; agents left running. Run pika setup to review skill changes.'
 
 
 def onboarding(launcher: Path) -> None:

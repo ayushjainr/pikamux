@@ -28,6 +28,7 @@ from .consult import (
 from .consult_reporting import ConsultationRun
 from .experts import ExpertCardState, profile_source_label, profile_freshness
 from .explain import explain_session
+from . import installation
 from .fleet import REMOTE_STALE_SECONDS
 from .models import ExpertProfile, FleetNode, FleetSession, PendingLaunch, Session, Status
 from .pricing import PRICING_AS_OF
@@ -376,6 +377,9 @@ class MonitorState:
     action_error: str | None = None
     action_error_offset: int = 0
     action_error_target: Session | FleetSession | PendingLaunch | None = None
+    update_version: str | None = None
+    update_status: str = "available"
+    update_detail: str | None = None
 
     def ordered(self) -> list[Session | FleetSession]:
         # Once visible, workstreams retain their relative position until the
@@ -875,7 +879,7 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
         items = [
             "↑↓/jk move · Enter open · n next",
             "a ask · A fast ask · p peek · x stop watching",
-            "u usage · r refresh · ? keys · q/Esc close",
+            "u usage · r refresh · U update · ? keys · q/Esc close",
             (
                 f"Need {counts['decisions']} · results {counts['results']} · "
                 f"starting {counts['starting']} · failed {counts['errors']} · "
@@ -888,7 +892,8 @@ def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
             "↑/k  previous workstream        ↓/j  next workstream",
             "Enter open selected             n    open oldest attention",
             "a/A   ask here / faster Codex     p    peek recent pane output",
-            "u     operations / usage view    r    reconcile now",
+            "u     operations / usage view    U    review Pika update",
+            "r     reconcile now",
             "x     stop watching selected     Esc  cancel confirmation",
             "g/G   first / last               ?    close this help",
             "q/Esc close this help",
@@ -1840,6 +1845,42 @@ def _split_right_pane(
     return plain[:height], ansi[:height]
 
 
+def _update_banner(state: MonitorState) -> str | None:
+    if not state.update_version:
+        return None
+    if state.update_status == "installing":
+        return f"Updating Pika to {state.update_version} · board and agents stay available"
+    if state.update_status == "done":
+        return f"Pika {state.update_version} installed · reopen pika · pika setup reviews skill changes"
+    if state.update_status == "error":
+        return "Pika update failed · U details / retry · agents left running"
+    return f"Update available: {state.update_version} · U review / install"
+
+
+def _render_update(state: MonitorState, width: int, height: int) -> MonitorFrame:
+    lines = [f"PIKA // UPDATE {state.update_version}", ""]
+    if state.update_status == "available":
+        lines += [
+            "Install this release on this machine only?",
+            "The package is verified and staged before activation.",
+            "Agents stay running; other machines and skills are not changed.",
+            "Reopen pika afterward; pika setup reviews skill changes.",
+            "", "Enter / y install    Esc / n cancel",
+        ]
+    elif state.update_status == "installing":
+        lines += ["Installing in the background. Agents stay running.",
+                  "Esc returns to the board; the update continues."]
+    else:
+        lines += [state.update_detail or "Update failed.", "",
+                  "Enter / y retry · Esc back" if state.update_status == "error" else "Esc / Enter back"]
+    controls = lines.pop()
+    wrapped = [part for line in lines for part in (wrap(terminal_text(line), width=max(1, width)) or [""])]
+    # Long installer diagnostics must never push cancellation/retry off-screen.
+    visible = (wrapped + [""] * height)[:max(0, height - 1)] + [controls]
+    plain = "\n".join(_fit(line, width) for line in visible)
+    return MonitorFrame(plain, plain, state.selected_key)
+
+
 def _render_split_monitor(
     state: MonitorState,
     *,
@@ -1987,6 +2028,8 @@ def _render_split_monitor(
             f"u {'operations' if state.show_usage else 'usage'}  r refresh  ? keys  q quit",
             width,
         )
+    if state.mode == "sessions" and (notice := _update_banner(state)):
+        footer_plain = _fit(notice + " | ↑↓ move  Enter open  ? keys  q quit", width)
     footer_ansi = _paint(footer_plain, REVERSE, color)
     plain_lines = [header_plain, *body_plain, playbook_plain, footer_plain]
     ansi_lines = [header_ansi, *body_ansi, playbook_ansi, footer_ansi]
@@ -2010,6 +2053,8 @@ def render_monitor(
     width = max(1, width)
     height = max(1, height)
     selected = state.selected()
+    if state.mode == "update":
+        return _render_update(state, width, height)
     if state.mode == "action-error" and (width < SPLIT_MIN_WIDTH or height < SPLIT_MIN_HEIGHT):
         plain = _action_error_lines(state, width, height)
         return MonitorFrame("\n".join(plain), "\n".join(plain), state.selected_key)
@@ -2290,6 +2335,8 @@ def render_monitor(
             f"? keys  {exit_copy}"
         )
     )
+    if state.mode == "sessions" and (notice := _update_banner(state)):
+        footer_text = notice + " | ↑↓ move  Enter open  ? keys  q quit"
     footer_plain = _fit(footer_text, width)
     footer_ansi = _paint(footer_plain, REVERSE, color)
     tip_index, tip_total, tip = playbook_tip(
@@ -2609,6 +2656,22 @@ def _handle_key(
     pika: MonitorPika,
     state: MonitorState,
 ) -> tuple[str, Session | FleetSession | None]:
+    if state.mode == "update":
+        if key in {"escape", "q", "n"} or (
+            state.update_status == "done" and key in {"enter", "newline"}
+        ):
+            state.mode = "sessions"
+        elif key in {"enter", "newline", "y"} and state.update_status in {"available", "error"}:
+            state.update_status = "installing"
+            state.update_detail = None
+            return "update", None
+        return "continue", None
+    if key == "U" and state.mode in {"sessions", "help"}:
+        if state.update_version:
+            state.mode = "update"
+        else:
+            state.notify("No update available. Installer-managed copies check automatically; pika update --check checks now.")
+        return "continue", None
     if state.mode not in {"ask", "filter"}:
         key = {
             "j": "down", "k": "up", "g": "first", "G": "last",
@@ -2994,6 +3057,9 @@ def run_monitor(
     color = "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
     first_scan = True
     local_sessions: list[Session] = initial_local
+    update_check_future = None
+    update_future = None
+    next_update_check = 0.0
 
     try:
         with _DaemonExecutor() as executor:
@@ -3007,6 +3073,26 @@ def run_monitor(
                 last_frame = frame.ansi
                 while True:
                     monotonic = time.monotonic()
+                    if update_check_future is not None and update_check_future.done():
+                        try:
+                            version = update_check_future.result()
+                            # Never change the release currently being approved.
+                            if state.mode != "update" and state.update_status == "available":
+                                state.update_version = version
+                        except Exception:
+                            pass  # Optional offline checks never become agent errors.
+                        update_check_future = None
+                    if update_future is not None and update_future.done():
+                        try:
+                            state.update_detail = update_future.result()
+                            state.update_status = "done"
+                        except Exception as exc:
+                            state.update_detail = terminal_text(exc)
+                            state.update_status = "error"
+                        update_future = None
+                    if monotonic >= next_update_check and update_check_future is None and state.update_status == "available":
+                        update_check_future = executor.submit(installation.update_notice)
+                        next_update_check = monotonic + 3600
                     if inline_ask is not None:
                         for event, value in inline_ask.poll():
                             if event == "progress":
@@ -3373,6 +3459,9 @@ def run_monitor(
                         escape_started_at = None
                     for key in keys:
                         action, session = _handle_key(key, pika, state)
+                        if action == "update" and update_future is None and state.update_version:
+                            update_future = executor.submit(installation.board_update, state.update_version)
+                            continue
                         if action == "quit":
                             future = None
                             selected_to_open = None

@@ -15,7 +15,7 @@ use one board to see what needs your attention.
   consultation without appending to the parent conversation's transcript.
   A bundled skill lets other agents use the same workflow.
 
-The current release is **0.5.0a2 (alpha)**. Pika is an independent project, not affiliated with OpenAI,
+The current release is **0.5.0a3 (alpha)**. Pika is an independent project, not affiliated with OpenAI,
 Anthropic, or OpenCode. It is not an agent runtime or a hosted service.
 
 ## Start with one conversation
@@ -30,7 +30,7 @@ is new in this alpha; see [compatibility and limitations](docs/guide.md#install-
 Install the alpha on Mac or Linux; no Python/uv installation is needed:
 
 ```bash
-curl -fsSL https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a2/install.sh | bash -s -- --version v0.5.0a2
+curl -fsSL https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a3/install.sh | bash -s -- --version v0.5.0a3
 ```
 
 It installs Pika user-locally, offers a backed-up shell PATH change and onboarding,
@@ -65,6 +65,11 @@ On the board, use arrows or `j`/`k` to select, Enter to open, `/` to filter,
 and `q` to leave. Detaching returns to the board. If a live agent is outside
 Pika's home, Pika explains the safe handover rather than moving it forcibly.
 Codex users must review and trust the installed hooks through `/hooks`.
+
+Installer-managed boards check for updates in the background. When an update is
+available, press `U` to review it, then Enter to approve installation. Agents stay
+running. `pika update` also works from the shell, including for alpha releases.
+For 0.5.0a2 or earlier, run the installer above once to gain this update flow.
 
 Pika is distributed through [GitHub Releases](https://github.com/ayushjainr/pikamux/releases),
 not PyPI. Older Git tags do not include this alpha's changes.

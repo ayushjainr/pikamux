@@ -1,9 +1,10 @@
 # Installation and updates
 
-The current public release is **0.5.0a2 (alpha)**, distributed through GitHub Releases.
+The current public release is **0.5.0a3 (alpha)**, distributed through GitHub Releases.
 Use its explicit tag below. There is no stable release yet: GitHub's
-`releases/latest` endpoint and the default online `pika update` channel select
-stable releases, not alphas.
+`releases/latest` endpoint selects stable releases, not alphas. Pika 0.5.0a3's
+channel-aware updater discovers alpha releases too; older versions need the
+tagged installer below once to gain this behavior.
 
 ## Fresh Mac or Linux machine
 
@@ -22,7 +23,7 @@ curl -fsSL https://github.com/ayushjainr/pikamux/releases/latest/download/instal
 For the current alpha, use its exact tag:
 
 ```bash
-curl -fsSL https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a2/install.sh | bash -s -- --version v0.5.0a2
+curl -fsSL https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a3/install.sh | bash -s -- --version v0.5.0a3
 ```
 
 Read the script before running it if you prefer. Piping a downloaded script to
@@ -64,7 +65,7 @@ is idempotent; reusing a version number for different package bytes is refused.
 
 ### Skill setup
 
-Version 0.5.0a2 includes `agent-convo` in the same setup preview and
+Since version 0.5.0a2, Pika includes `agent-convo` in the same setup preview and
 approval as provider hooks. Accepting setup installs it for each installed
 provider: Codex's `skills/agent-convo` under its configured home, Claude's
 `skills/agent-convo` under its configured home, and OpenCode's
@@ -80,16 +81,39 @@ not overwrite installed instructions; rerun setup to review newer bundled skills
 
 ## Updates
 
-Once a stable release is published, installer-managed copies can check for and
-install it with:
+Version 0.5.0a3 adds background update notices to installer-managed
+boards. Checks run after the first frame, read only public GitHub release
+metadata, and cache results for six hours (one hour after a failed check).
+Concurrent boards share the cache and lock. Offline checks never become agent
+errors or delay navigation. No prompts, transcripts, or machine inventory are
+sent; GitHub receives the normal release request and source IP. No model calls
+are made. Set `PIKA_UPDATE_CHECK=0` to disable automatic checks.
+
+An available version appears in the footer; the rotating usage tips remain.
+Press `U` to review the exact release, then Enter or `y` to install it. Esc or
+`n` cancels before installation. Once approved, installation continues in the
+background even if you return to or leave the board. Success asks you to reopen
+`pika`; the old board and live agents are not restarted. This affects only the
+local managed installation, not remote machines or editable development copies.
+
+Installer-managed copies can also check and update
+explicitly with:
 
 ```bash
 pika update --check
 pika update
 ```
 
-Until then, download the next alpha's assets from its GitHub release into one
-directory and update from that bundle. Private installations use the same flow:
+Alpha/beta/RC copies include newer prereleases and stable releases; stable copies
+exclude prereleases. Selection uses numeric versions, not publication order, from
+the newest 100 public GitHub release records with package assets. Once a stable
+version is installed, future automatic checks stay on stable releases. Use
+`pika update --release 0.5.0a3` to pin a specific release explicitly (downgrades
+are refused). Each download uses the selected tag, not a moving `latest` URL.
+
+For 0.5.0a2 and earlier, rerun the newer release's tagged installer
+to upgrade. Alternatively download its assets into one directory and update
+from that bundle. Private/offline-metadata installations use the same flow:
 
 ```bash
 pika update --check --bundle /path/to/new-release

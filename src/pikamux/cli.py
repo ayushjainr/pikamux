@@ -142,6 +142,7 @@ def _parser() -> argparse.ArgumentParser:
     update_parser = sub.add_parser("update", help="safely update an installer-managed Pika")
     update_parser.add_argument("--check", action="store_true", help="check without installing")
     update_parser.add_argument("--bundle", type=Path, help="use a locally supplied release bundle")
+    update_parser.add_argument("--release", help="install an exact release version (including alphas)")
     open_parser.add_argument("name")
 
     # v0.4.3 printed this exact command in recovery receipts. Keep a hidden,
@@ -2143,7 +2144,7 @@ def run(argv: list[str] | None = None) -> int:
     if args.command == "update":
         from .installation import InstallError, update
         try:
-            update(bundle=args.bundle, check=args.check)
+            update(bundle=args.bundle, check=args.check, release=args.release)
         except (InstallError, OSError, ValueError) as exc:
             raise PikaError(str(exc)) from exc
         return 0
