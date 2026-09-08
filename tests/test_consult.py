@@ -258,6 +258,8 @@ class ConsultationTests(unittest.TestCase):
         forks = [item for item in sent if item.get("method") == "thread/fork"]
         self.assertEqual(len(forks), 1)
         self.assertTrue(forks[0]["params"]["ephemeral"])
+        # Required for ephemeral forks of native paginated parent threads.
+        self.assertIs(forks[0]["params"]["excludeTurns"], True)
         self.assertEqual(forks[0]["params"]["model"], DEFAULT_CODEX_MODEL)
         self.assertEqual(
             forks[0]["params"]["config"]["model_reasoning_effort"],
@@ -316,6 +318,7 @@ class ConsultationTests(unittest.TestCase):
                 self.assertEqual(consultation.ask("question"), "fast")
         sent = [json.loads(line) for line in process.stdin.getvalue().splitlines()]
         fork = next(item for item in sent if item.get("method") == "thread/fork")
+        self.assertIs(fork["params"]["excludeTurns"], True)
         self.assertEqual(fork["params"]["model"], FAST_CODEX_MODEL)
         self.assertEqual(
             fork["params"]["config"]["model_reasoning_effort"],

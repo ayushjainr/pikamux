@@ -356,6 +356,9 @@ class CodexConsultation(Consultation):
         fork_params: dict[str, Any] = {
             "threadId": self.session.provider_thread_id,
             "ephemeral": True,
+            # Paginated Codex parents require metadata-only fork responses.
+            # This omits response turns, not the side's inherited context.
+            "excludeTurns": True,
             "approvalPolicy": "never",
             "sandbox": "read-only",
             "developerInstructions": (
