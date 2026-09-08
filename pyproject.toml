@@ -9,7 +9,7 @@ description = "Find, recover, and consult your existing coding-agent conversatio
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "Ayush Jain" }]
+authors = [{ name = "Ayush Jain", email = "24372573+ayushjainr@users.noreply.github.com" }]
 keywords = ["tmux", "codex", "claude", "opencode", "cli"]
 classifiers = [
   "Development Status :: 3 - Alpha",

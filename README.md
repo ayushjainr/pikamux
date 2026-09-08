@@ -15,8 +15,7 @@ use one board to see what needs your attention.
   consultation without appending to the parent conversation's transcript.
   A bundled skill lets other agents use the same workflow.
 
-The current checkout is the **0.5.0a1 alpha candidate**, not yet a published
-release. Pika is an independent project, not affiliated with OpenAI,
+The current release is **0.5.0a1 (alpha)**. Pika is an independent project, not affiliated with OpenAI,
 Anthropic, or OpenCode. It is not an agent runtime or a hosted service.
 
 ## Start with one conversation
@@ -26,19 +25,20 @@ supported provider CLI**, already installed and authenticated. Pika's installer
 handles its own Python runtime. Windows has an
 experimental optional client bridge, not local agent hosting; real Windows
 Terminal pairing and attachment are not yet release-verified. Native macOS hosting
-is new in this candidate; see [compatibility and limitations](docs/guide.md#install-a-pika-node).
+is new in this alpha; see [compatibility and limitations](docs/guide.md#install-a-pika-node).
 
-The one-command installer is implemented, but this candidate has **not been
-published**. For a supplied private release bundle, no Python/uv installation is needed:
+Install the alpha on Mac or Linux; no Python/uv installation is needed:
 
 ```bash
-bash /path/to/pika-release/install.sh --bundle /path/to/pika-release
+curl -fsSL https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a1/install.sh | bash -s -- --version v0.5.0a1
 ```
 
 It installs Pika user-locally, offers a backed-up shell PATH change and onboarding,
 and gives OS-specific tmux instructions if it is missing. It never runs sudo for
-you. See [installation and updates](docs/installing.md) for the future public
-one-liner, private SSH installation, and update guarantees.
+you. Read the script first if you prefer; it executes code from this publisher.
+See [installation and updates](docs/installing.md) for release bundles, private
+SSH installation, and update guarantees. This is a prerelease: do not substitute
+GitHub's `latest` URL, which selects stable releases only.
 
 Contributors can instead use a checkout (requires Python 3.10+ and uv):
 
@@ -63,8 +63,8 @@ and `q` to leave. Detaching returns to the board. If a live agent is outside
 Pika's home, Pika explains the safe handover rather than moving it forcibly.
 Codex users must review and trust the installed hooks through `/hooks`.
 
-No PyPI release is assumed by these instructions. Use the checkout you intend
-to test; older Git tags do not include unreleased changes.
+Pika is distributed through [GitHub Releases](https://github.com/ayushjainr/pikamux/releases),
+not PyPI. Older Git tags do not include this alpha's changes.
 
 ## Reuse expertise
 

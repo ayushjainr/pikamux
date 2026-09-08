@@ -1,8 +1,9 @@
 # Installation and updates
 
-The installer and updater are implemented and locally tested. Public download
-URLs are **not live until the owner publishes the corresponding GitHub release**.
-Do not present the examples below as an available public release before then.
+The first public release is **0.5.0a1 (alpha)**, distributed through GitHub Releases.
+Use its explicit tag below. There is no stable release yet: GitHub's
+`releases/latest` endpoint and the default online `pika update` channel select
+stable releases, not alphas.
 
 ## Fresh Mac or Linux machine
 
@@ -12,14 +13,13 @@ For a private release bundle supplied by the maintainer:
 bash /path/to/pika-release/install.sh --bundle /path/to/pika-release
 ```
 
-After publication, the latest stable public release can be installed with:
+Once a stable release exists, it can be installed with:
 
 ```bash
 curl -fsSL https://github.com/ayushjainr/pikamux/releases/latest/download/install.sh | bash
 ```
 
-For a published prerelease, use its exact tag; GitHub's latest-stable URL does not
-select alpha releases. For example, only after publishing `v0.5.0a1`:
+For the current alpha, use its exact tag:
 
 ```bash
 curl -fsSL https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a1/install.sh | bash -s -- --version v0.5.0a1
@@ -64,14 +64,16 @@ is idempotent; reusing a version number for different package bytes is refused.
 
 ## Updates
 
-Installer-managed copies use:
+Once a stable release is published, installer-managed copies can check for and
+install it with:
 
 ```bash
 pika update --check
 pika update
 ```
 
-Private/prerelease installations can use another supplied bundle:
+Until then, download the next alpha's assets from its GitHub release into one
+directory and update from that bundle. Private installations use the same flow:
 
 ```bash
 pika update --check --bundle /path/to/new-release

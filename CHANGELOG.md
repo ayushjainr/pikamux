@@ -1,10 +1,9 @@
 # Changelog
 
-## 0.5.0a1 — unreleased alpha candidate
+## 0.5.0a1 — first public alpha
 
-This section describes the working development line, not an already published
-GitHub or PyPI release. Historical 0.4.4 tags do not contain everything listed
-below. Do not overwrite those tags to publish this candidate.
+Distributed through GitHub Releases, not PyPI. Historical 0.4.4 tags do not
+contain everything listed below; their artifacts have not been overwritten.
 
 - Add an inspectable fresh-host installer, isolated runtime, staged `pika update`,
   private release bundle builder, and approved verified-package transfer over SSH.
