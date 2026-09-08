@@ -217,7 +217,7 @@ sync never opens an expert consultation.
 
 # Client-window launch boundary
 
-Pika may run as a Linux node or as the local Windows client, but it remains one
+Pika may run as a Linux/macOS node or as the local Windows client, but it remains one
 package and one command. The server owns conversation truth. The client owns
 only the ability to create a local terminal window.
 

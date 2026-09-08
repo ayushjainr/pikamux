@@ -220,6 +220,7 @@ class CliTests(unittest.TestCase):
         fake_stdin = Mock()
         fake_stdin.isatty.return_value = True
         with (
+            patch("pikamux.cli.can_signal_exact_process", return_value=True),
             patch("pikamux.cli.sys.stdin", fake_stdin),
             patch("pikamux.cli.process_tty", return_value="/dev/pts/39"),
             patch("builtins.input", return_value=""),
@@ -244,6 +245,7 @@ class CliTests(unittest.TestCase):
         fake_stdin = Mock()
         fake_stdin.isatty.return_value = True
         with (
+            patch("pikamux.cli.can_signal_exact_process", return_value=True),
             patch("pikamux.cli.sys.stdin", fake_stdin),
             patch("builtins.input", return_value="2"),
             redirect_stderr(io.StringIO()) as error,
@@ -261,10 +263,27 @@ class CliTests(unittest.TestCase):
         fake_stdin = Mock()
         fake_stdin.isatty.return_value = False
         with (
+            patch("pikamux.cli.can_signal_exact_process", return_value=True),
             patch("pikamux.cli.sys.stdin", fake_stdin),
             self.assertRaisesRegex(PikaError, "Interactive choice is required"),
         ):
             _confirm_outside_live(pika, conflict)
+        pika.clean_and_attach.assert_not_called()
+
+    def test_without_generation_pinned_signals_offers_exact_manual_steps(self) -> None:
+        session = Session("claude", "uuid", name="sample plugin")
+        conflict = OutsideLiveConflict("outside live", session, ((123, 4242),))
+        pika = Mock()
+        with (
+            patch("pikamux.cli.can_signal_exact_process", return_value=False),
+            patch("pikamux.cli.process_tty", return_value="/dev/ttys004"),
+            patch("builtins.input") as prompt,
+            self.assertRaisesRegex(PikaError, "pika 'sample plugin'") as caught,
+        ):
+            _confirm_outside_live(pika, conflict)
+        self.assertIn("/dev/ttys004", str(caught.exception))
+        self.assertIn("/exit", str(caught.exception))
+        prompt.assert_not_called()
         pika.clean_and_attach.assert_not_called()
 
     def test_shared_lease_decline_changes_nothing_and_repeats_same_command(self) -> None:

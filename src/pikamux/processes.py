@@ -1,8 +1,21 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
+import sys
 from pathlib import Path
+
+_MACOS = sys.platform == "darwin"
+if _MACOS:
+    from . import processes_macos as _mac
+
+
+def can_signal_exact_process() -> bool:
+    """Whether the runtime can signal a pinned generation, not a reusable PID."""
+    return callable(getattr(os, "pidfd_open", None)) and callable(
+        getattr(signal, "pidfd_send_signal", None)
+    )
 
 
 def process_alive(pid: int | None) -> bool:
@@ -16,6 +29,8 @@ def process_alive(pid: int | None) -> bool:
 
 
 def cmdline(pid: int) -> list[str]:
+    if _MACOS:
+        return _mac.read(pid, "cmdline", [])
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
@@ -25,6 +40,8 @@ def cmdline(pid: int) -> list[str]:
 
 def process_environment(pid: int) -> dict[str, str]:
     """Read one same-user process environment without invoking a shell."""
+    if _MACOS:
+        return _mac.read(pid, "environ", {})
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
@@ -40,6 +57,8 @@ def process_environment(pid: int) -> dict[str, str]:
 
 def process_tty(pid: int) -> str | None:
     """Return the process's terminal device without inspecting its content."""
+    if _MACOS:
+        return _mac.read(pid, "terminal")
     for descriptor in (0, 1, 2):
         try:
             target = os.readlink(f"/proc/{pid}/fd/{descriptor}")
@@ -63,6 +82,8 @@ def _process_kind(argv: list[str]) -> str | None:
 
 
 def child_pids(pid: int) -> list[int]:
+    if _MACOS:
+        return _mac.children(pid)
     try:
         raw = Path(f"/proc/{pid}/task/{pid}/children").read_text()
     except OSError:
@@ -77,6 +98,9 @@ def child_pids(pid: int) -> list[int]:
 
 
 def parent_pid(pid: int) -> int | None:
+    if _MACOS:
+        value = _mac.read(pid, "ppid")
+        return value if value and value > 0 else None
     try:
         raw = Path(f"/proc/{pid}/stat").read_text()
         # comm is parenthesized and may itself contain spaces. Fields after the
@@ -89,7 +113,9 @@ def parent_pid(pid: int) -> int | None:
 
 
 def process_state(pid: int) -> str | None:
-    """Return the one-letter Linux process state for race-safe tree checks."""
+    """Return a normalized one-letter process state for tree checks."""
+    if _MACOS:
+        return _mac.state(pid)
     try:
         raw = Path(f"/proc/{pid}/stat").read_text()
         # comm is parenthesized and may contain spaces. The first field after
@@ -102,9 +128,11 @@ def process_state(pid: int) -> str | None:
 
 
 def process_start_time(pid: int | None) -> int | None:
-    """Return Linux /proc start ticks, which disambiguate reused PIDs."""
+    """Return a platform-native integer birth stamp to disambiguate PID reuse."""
     if not pid or pid <= 0:
         return None
+    if _MACOS:
+        return _mac.start_time(pid)
     try:
         raw = Path(f"/proc/{pid}/stat").read_text()
         fields = raw[raw.rfind(")") + 2 :].split()
@@ -209,11 +237,7 @@ def process_stats(root_pid: int | None) -> tuple[float | None, int | None]:
 
 def find_processes_with_session_id(session_id: str, provider: str) -> list[int]:
     matches: list[int] = []
-    proc_root = Path("/proc")
-    for entry in proc_root.iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
+    for pid in _process_ids():
         argv = cmdline(pid)
         if not argv or session_id not in argv:
             continue
@@ -222,27 +246,29 @@ def find_processes_with_session_id(session_id: str, provider: str) -> list[int]:
     return _canonical_identity_pids(matches)
 
 
+def _process_ids(proc_root: Path = Path("/proc")) -> list[int]:
+    if _MACOS and proc_root == Path("/proc"):
+        return _mac.pids()
+    try:
+        return [int(entry.name) for entry in proc_root.iterdir() if entry.name.isdigit()]
+    except OSError:
+        return []
+
+
 def opencode_session_processes(
     proc_root: Path = Path("/proc"),
 ) -> dict[str, list[int]]:
-    """Map every explicit OpenCode ``--session`` argument in one /proc pass."""
+    """Map every explicit OpenCode ``--session`` argument in one process pass."""
     matches: dict[str, list[int]] = {}
-    try:
-        entries = list(proc_root.iterdir())
-    except OSError:
-        return matches
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        try:
-            raw = (entry / "cmdline").read_bytes()
-        except OSError:
-            continue
-        argv = [
-            part.decode(errors="replace")
-            for part in raw.split(b"\0")
-            if part
-        ]
+    for pid in _process_ids(proc_root):
+        if proc_root == Path("/proc"):
+            argv = cmdline(pid)
+        else:
+            try:
+                raw = (proc_root / str(pid) / "cmdline").read_bytes()
+            except OSError:
+                continue
+            argv = [part.decode(errors="replace") for part in raw.split(b"\0") if part]
         if _process_kind(argv) != "opencode":
             continue
         session_ids: set[str] = set()
@@ -257,7 +283,7 @@ def opencode_session_processes(
                 and 8 <= len(session_id) <= 128
                 and session_id[4:].isalnum()
             ):
-                matches.setdefault(session_id, []).append(int(entry.name))
+                matches.setdefault(session_id, []).append(pid)
     return {
         session_id: _canonical_identity_pids(pids)
         for session_id, pids in matches.items()

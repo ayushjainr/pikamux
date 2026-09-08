@@ -44,10 +44,12 @@ from .executables import (
     setup_executables,
     setup_runtime_path,
 )
-from .expert_schedule import SERVICE_NAME, TIMER_NAME, activate_timer
+from .expert_schedule import LAUNCHD_NAME, SERVICE_NAME, TIMER_NAME, activate_timer
+from .processes import can_signal_exact_process
 from .explain import explain_session
 from .fleet import (
     REMOTE_INSTALL_ARGV,
+    bundled_release,
     FleetError,
     handle_fleet_stdio,
     machine_alias,
@@ -99,8 +101,10 @@ PUBLIC_COMMANDS = {
     "setup",
     "doctor",
     "machines",
+    "machine",
     "sync",
     "skill",
+    "update",
 }
 INTERNAL_COMMANDS = {
     "_enter",
@@ -130,11 +134,14 @@ def _parser() -> argparse.ArgumentParser:
         dest="command",
         metavar=(
             "{activity,ask,expert,experts,explain,skill,list,next,peek,wait,untrack,setup,doctor,"
-            "machines,sync}"
+            "machines,sync,update}"
         ),
     )
 
     open_parser = sub.add_parser("open", help=argparse.SUPPRESS)
+    update_parser = sub.add_parser("update", help="safely update an installer-managed Pika")
+    update_parser.add_argument("--check", action="store_true", help="check without installing")
+    update_parser.add_argument("--bundle", type=Path, help="use a locally supplied release bundle")
     open_parser.add_argument("name")
 
     # v0.4.3 printed this exact command in recovery receipts. Keep a hidden,
@@ -308,7 +315,12 @@ def _parser() -> argparse.ArgumentParser:
         help="skip the first-conversation recovery walkthrough",
     )
     setup_parser.add_argument("--no-import", action="store_true")
+    setup_parser.add_argument("--install-bundle", type=Path, help="verified local release bundle for approved remote installs")
     setup_parser.add_argument("--import-all", action="store_true")
+    setup_parser.add_argument(
+        "--browse-all", action="store_true",
+        help="include generated or unconfirmed titles in setup choices; does not adopt them automatically",
+    )
     setup_parser.add_argument(
         "--no-machines", action="store_true", help="skip passive machine discovery"
     )
@@ -326,7 +338,7 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     machines_parser = sub.add_parser(
-        "machines", help="discover and manage trusted remote Pika nodes"
+        "machines", aliases=["machine"], help="discover and manage trusted remote Pika nodes"
     )
     machine_sub = machines_parser.add_subparsers(dest="machines_command")
     machine_list = machine_sub.add_parser("list", help="list trusted machines")
@@ -346,6 +358,7 @@ def _parser() -> argparse.ArgumentParser:
         "upgrade", help="install this coordinator's pinned Pika release remotely"
     )
     machine_upgrade.add_argument("machine")
+    machine_upgrade.add_argument("--bundle", type=Path, help="transfer a verified local release bundle over SSH")
     machine_upgrade.add_argument(
         "--yes", action="store_true", help="run the displayed pinned install command"
     )
@@ -469,6 +482,13 @@ def _confirm_outside_live(pika: Pika, conflict: OutsideLiveConflict) -> int:
     tty_name = process_tty(pid)
     location = f" · terminal {tty_name}" if tty_name else ""
     terminal_location = f" on terminal {tty_name}" if tty_name else ""
+    if not can_signal_exact_process():
+        raise PikaError(
+            f"{provider_label(session.provider)} is already running{terminal_location} "
+            f"(PID {pid}). This platform cannot safely stop a pinned PID generation. "
+            "No process was stopped. In that client, run `/exit`, wait for the "
+            f"shell prompt, then run exactly: `{reopen_command}`."
+        ) from conflict
     if not sys.stdin.isatty():
         raise PikaError(
             f"{conflict} Interactive choice is required. In the original "
@@ -1161,7 +1181,11 @@ def _machines(pika: Pika, args: argparse.Namespace) -> int:
         node = pika.store.get_fleet_node(args.machine)
         if node is None:
             raise PikaError(f"Unknown Pika machine {args.machine!r}")
-        preview = shlex.join(REMOTE_INSTALL_ARGV)
+        bundle = getattr(args, 'bundle', None) or bundled_release()
+        preview = (
+            f"Transfer verified release from {bundle}; install user-locally without running setup"
+            if bundle else shlex.join(REMOTE_INSTALL_ARGV)
+        )
         print(f"PINNED REMOTE UPGRADE · {node.alias}")
         print(f"Exact command: {preview}")
         approved = args.yes
@@ -1175,9 +1199,16 @@ def _machines(pika: Pika, args: argparse.Namespace) -> int:
         if not approved:
             print("Nothing installed.")
             return 0
-        code, detail = pika.fleet.transport.install(node.ssh_target)
+        # Do not mutate whichever machine an SSH alias happens to resolve to.
+        # New optional capabilities must not prevent identifying an older node.
+        pika.fleet.verify_node_identity(node)
+        code, detail = (
+            pika.fleet.transport.install(node.ssh_target, bundle=bundle)
+            if bundle else pika.fleet.transport.install(node.ssh_target)
+        )
         if code:
             raise PikaError(f"Remote upgrade failed on {node.alias}: {detail}")
+        pika.fleet.verify_node_identity(node)
         refreshed = pika.fleet.add(
             NodeCandidate(node.alias, node.ssh_target, node.sources), alias=node.alias
         )
@@ -1246,7 +1277,7 @@ def _setup_machine_candidates(
     return choose_node_candidates(list(report.candidates), report=report)
 
 
-def _add_setup_machine(pika: Pika, candidate: NodeCandidate):
+def _add_setup_machine(pika: Pika, candidate: NodeCandidate, *, bundle: Path | None = None):
     try:
         return pika.fleet.add(candidate)
     except FleetError as exc:
@@ -1256,7 +1287,9 @@ def _add_setup_machine(pika: Pika, candidate: NodeCandidate):
                 file=sys.stderr,
             )
             return None
-        preview = shlex.join(REMOTE_INSTALL_ARGV)
+        bundle = bundle or bundled_release()
+        preview = (f'Transfer verified release from {bundle}; install without running setup'
+                   if bundle else shlex.join(REMOTE_INSTALL_ARGV))
         print(f"PIKA MISSING · {candidate.alias}")
         print(f"Exact remote install preview: {preview}")
         if not sys.stdin.isatty():
@@ -1266,7 +1299,8 @@ def _add_setup_machine(pika: Pika, candidate: NodeCandidate):
         if answer not in {"y", "yes"}:
             print("Nothing installed.")
             return None
-        code, detail = pika.fleet.transport.install(candidate.ssh_target)
+        code, detail = (pika.fleet.transport.install(candidate.ssh_target, bundle=bundle)
+                        if bundle else pika.fleet.transport.install(candidate.ssh_target))
         if code:
             print(f"INSTALL FAILED · {candidate.alias} · {detail}", file=sys.stderr)
             return None
@@ -1505,7 +1539,8 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
     local_candidates: list[Candidate] = []
     original_tracked = [] if args.dry_run else pika.store.list_sessions()
     tracked_names = {session.key: session.display_name for session in original_tracked}
-    explicit_import = bool(args.import_all or getattr(args, "remote_import_all", False))
+    browse_all = getattr(args, "browse_all", False)
+    explicit_import = bool(args.import_all or getattr(args, "remote_import_all", False) or browse_all)
     routine_inventory = first_setup or explicit_import
     tracked_sessions = original_tracked
     untracked_keys = set() if args.dry_run else pika.store.untracked_session_keys()
@@ -1602,7 +1637,7 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
     for backup in backups:
         print(f"Backup: {backup}")
     schedule_in_scope = any(
-        change.path.name in {SERVICE_NAME, TIMER_NAME} for change in changed
+        change.path.name in {SERVICE_NAME, TIMER_NAME, LAUNCHD_NAME} for change in changes
     )
     if schedule_in_scope:
         active, detail = activate_timer()
@@ -1757,7 +1792,10 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         tracked_sessions = pika.refresh(usage=False)
     if not args.no_import and (first_setup or explicit_import):
         discovered_local = [
-            item for item in pika.discover_import_candidates() if item.name or item.live
+            item for item in (
+                pika.discover_import_candidates(include_unconfirmed=True)
+                if browse_all else pika.discover_import_candidates()
+            ) if browse_all or item.name or item.live
         ]
         tracked = {session.key for session in tracked_sessions}
         tracked.update(
@@ -1796,7 +1834,9 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
                 )
     ready_nodes = []
     for candidate in selected_machine_candidates:
-        node = _add_setup_machine(pika, candidate)
+        install_bundle = getattr(args, 'install_bundle', None)
+        node = (_add_setup_machine(pika, candidate, bundle=install_bundle)
+                if install_bundle else _add_setup_machine(pika, candidate))
         if node is not None:
             ready_nodes.append(node)
             print(
@@ -1808,7 +1848,10 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
     if not args.no_import:
         for node in ready_nodes:
             try:
-                values = pika.fleet.remote_candidates(node)
+                values = (
+                    pika.fleet.remote_candidates(node, include_unconfirmed=True)
+                    if browse_all else pika.fleet.remote_candidates(node)
+                )
             except FleetError as exc:
                 print(
                     f"REMOTE INVENTORY UNAVAILABLE · {node.alias} · {exc}",
@@ -1825,9 +1868,36 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         and not args.yes
         and not args.import_all
         and not getattr(args, "remote_import_all", False)
+        and (first_setup or explicit_import or ready_nodes)
     ):
-        chosen = choose_fleet_candidates(
-            [(None, item) for item in local_candidates] + remote_candidates
+        def browse_titles():
+            watched = {
+                (item.provider, thread_id)
+                for item in pika.store.list_sessions()
+                for thread_id in (item.session_id, item.active_thread_id)
+                if thread_id
+            }
+            ignored = pika.store.untracked_session_keys()
+            values = [
+                (None, item)
+                for item in pika.discover_import_candidates(include_unconfirmed=True)
+                if (item.provider, item.session_id) not in watched | ignored
+            ]
+            for node in ready_nodes:
+                try:
+                    values.extend(
+                        (node, item) for item in pika.fleet.remote_candidates(
+                            node, include_unconfirmed=True,
+                        )
+                    )
+                except FleetError as exc:
+                    print(f"REMOTE INVENTORY UNAVAILABLE · {node.alias} · {exc}", file=sys.stderr)
+            return values
+
+        values = [(None, item) for item in local_candidates] + remote_candidates
+        chosen = (
+            choose_fleet_candidates(values) if browse_all
+            else choose_fleet_candidates(values, browse=browse_titles)
         )
         selected = [item for node, item in chosen if node is None]
         selected_remote = [(node, item) for node, item in chosen if node is not None]
@@ -2054,6 +2124,15 @@ def _pair_client_bridge(pika: Pika) -> int:
 def run(argv: list[str] | None = None) -> int:
     argv = _normalize_argv(list(sys.argv[1:] if argv is None else argv))
     args = _parser().parse_args(argv)
+    if args.command == 'machine':
+        args.command = 'machines'
+    if args.command == "update":
+        from .installation import InstallError, update
+        try:
+            update(bundle=args.bundle, check=args.check)
+        except (InstallError, OSError, ValueError) as exc:
+            raise PikaError(str(exc)) from exc
+        return 0
     if args.command == "skill":
         if args.skill_command == "show":
             print(skill_text(), end="")

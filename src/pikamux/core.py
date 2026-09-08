@@ -203,13 +203,19 @@ class Pika:
         self._last_discovered_candidates = discovered
         return discovered
 
-    def discover_import_candidates(self) -> list[Candidate]:
+    def discover_import_candidates(
+        self, *, include_unconfirmed: bool = False,
+    ) -> list[Candidate]:
         """Run the slower one-time discovery used only by `pika setup`."""
         self.discovery_errors = []
         result: list[Candidate] = []
         for provider in self.providers.values():
             try:
-                for item in provider.import_candidates():
+                discover = (
+                    getattr(provider, "browse_candidates", provider.import_candidates)
+                    if include_unconfirmed else provider.import_candidates
+                )
+                for item in discover():
                     if item.live or provider.is_resumable(item.session_id):
                         result.append(item)
             except Exception as exc:  # noqa: BLE001 - imports are best-effort
@@ -1506,6 +1512,98 @@ class Pika:
             )
         return self.tmux.capture(pane.pane_id, lines)
 
+    def _name_choices(
+        self, query: str, choices: list[Session | FleetSession | PendingLaunch]
+    ) -> list[Session | FleetSession | PendingLaunch]:
+        """Reduce only proven equivalent local names; never merge identities.
+
+        This is selection, not inventory cleanup. Unknown provider/storage state
+        stays visible, and explicit UUIDs always take precedence over names.
+        """
+        exact_ids = [item for item in choices if item.session_id == query
+                     or (isinstance(item, Session) and item.provider_thread_id == query)]
+        if exact_ids:
+            choices = exact_ids
+        deduped: list[Session | FleetSession | PendingLaunch] = []
+        native: dict[tuple[str, str], Session] = {}
+        for item in choices:
+            if not isinstance(item, Session):
+                deduped.append(item)
+                continue
+            key = (item.provider, item.provider_thread_id)
+            previous = native.get(key)
+            if previous is None:
+                native[key] = item
+                deduped.append(item)
+            elif (item.exact_home and not previous.exact_home) or (
+                item.exact_home == previous.exact_home
+                and item.active_thread_id and not previous.active_thread_id
+            ):
+                deduped[deduped.index(previous)] = item
+                native[key] = item
+        if exact_ids:
+            return deduped
+
+        evidence: dict[tuple[str, str], tuple[str, Candidate | None]] = {}
+        kept: list[Session | FleetSession | PendingLaunch] = []
+        for item in deduped:
+            if not isinstance(item, Session):
+                kept.append(item)
+                continue
+            provider = self.providers.get(item.provider)
+            probe = getattr(provider, "selection_evidence", None)
+            try:
+                proof = probe(item.provider_thread_id, item.transcript_path) if callable(probe) else ("unknown", None)
+            except (OSError, RuntimeError):
+                proof = ("unknown", None)
+            evidence[item.key] = proof
+            # Live process evidence wins over missing disk metadata, but an
+            # explicitly archived conversation is not a daily name target.
+            if proof[0] == "archived" or (proof[0] == "missing" and not item.live):
+                continue
+            kept.append(item)
+        if not kept and deduped:
+            raise PikaError(
+                f"Saved conversations named {query!r} are archived or confirmed missing. "
+                "No new conversation was created and no saved entry was removed. "
+                "Use an exact UUID to inspect a specific conversation."
+            )
+        if len(kept) < 2 or not all(isinstance(item, Session) for item in kept):
+            return kept
+        local = [item for item in kept if isinstance(item, Session)]
+        if len({(item.provider, (item.name or "").casefold()) for item in local}) != 1:
+            return kept
+        # Resolve strict existing directories. Empty, relative, missing, or
+        # inaccessible paths never become a guessed common project.
+        paths = []
+        try:
+            for item in local:
+                detail = evidence[item.key][1]
+                cwd = detail.cwd if detail and detail.cwd else item.cwd
+                if not cwd or not Path(cwd).is_absolute():
+                    return kept
+                path = Path(cwd).resolve(strict=True)
+                if not path.is_dir():
+                    return kept
+                paths.append(path)
+        except (OSError, RuntimeError):
+            return kept
+        if len(set(paths)) != 1:
+            return kept
+        live = [item for item in local if item.live or item.exact_home
+                or item.status == Status.OPEN_TWICE.value]
+        if len(live) > 1 or any(item.status == Status.OPEN_TWICE.value for item in live):
+            return kept
+        if len(live) == 1:
+            return live if live[0].exact_home else kept
+        # Provider timestamps only: Pika.updated_at is a reconciliation clock.
+        if any(evidence[item.key][0] != "available" or evidence[item.key][1] is None
+               or evidence[item.key][1].updated_at <= 0 for item in local):
+            return kept
+        newest = max(evidence[item.key][1].updated_at for item in local)
+        winners = [item for item in local if evidence[item.key][1].updated_at == newest]
+        return winners if len(winners) == 1 else kept
+
     def resolve(self, query: str, sessions: list[Session] | None = None) -> Session:
         supplied_sessions = sessions is not None
         sessions = sessions or self.refresh()
@@ -1517,14 +1615,14 @@ class Pika:
             if item.session_id == query or item.provider_thread_id == query
         ]
         if uuid_matches:
-            return choose_session(uuid_matches)
+            return choose_session(self._name_choices(query, uuid_matches))
         exact = [
             item
             for item in sessions
             if item.name and item.name.casefold() == query_folded
         ]
         if exact:
-            return choose_session(exact, "Two continuations share that name")
+            return choose_session(self._name_choices(query, exact), "Two continuations share that name")
         prefix = [
             item
             for item in sessions
@@ -1549,7 +1647,7 @@ class Pika:
                 hidden_matches = hidden_prefix
             if hidden_matches:
                 restored = choose_session(
-                    hidden_matches,
+                    self._name_choices(query, hidden_matches),
                     "Two untracked conversations share that name",
                 )
                 self.store.restore_tracking(*restored.key)
@@ -1569,10 +1667,14 @@ class Pika:
                 if item.name and item.name.casefold() == query_folded
             ]
             if discovered_matches:
-                imported = [self.import_candidate(item) for item in discovered_matches]
-                return choose_session(
-                    imported, "Two native conversations share that name"
+                views = [self._candidate_session(item) for item in discovered_matches]
+                chosen = choose_session(
+                    self._name_choices(query, views), "Two native conversations share that name"
                 )
+                return self.import_candidate(next(
+                    item for item in discovered_matches
+                    if (item.provider, item.session_id) == chosen.key
+                ))
         suggestion_pool = [*sessions, *discovered]
         suggestions = list(
             dict.fromkeys(
@@ -1740,7 +1842,7 @@ class Pika:
             ]
         if choices:
             chosen = choose_session(
-                choices, "Several conversations share that name"
+                self._name_choices(query, choices), "Several conversations share that name"
             )
             if isinstance(chosen, PendingLaunch):
                 return self.open_pending(chosen, attach=attach)
@@ -2270,8 +2372,10 @@ class Pika:
         pidfd_signal = getattr(signal, "pidfd_send_signal", None)
         if not callable(pidfd_open) or not callable(pidfd_signal):
             raise PikaError(
-                "CLEAN AND ATTACH REFUSED: this Linux/Python runtime cannot pin the "
-                "exact PID generation safely. No signal was sent."
+                "CLEAN AND ATTACH REFUSED: this runtime cannot pin the exact "
+                "PID generation safely. No signal was sent. Exit the agent "
+                "normally in its original terminal, then run exactly: "
+                f"`{shlex.join(['pika', current.display_name])}`."
             )
         try:
             pidfd = pidfd_open(expected_pid, 0)

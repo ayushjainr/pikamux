@@ -17,7 +17,7 @@ it is not assumed active by this document.
 
 ## What is stored and where
 
-On Linux, defaults are `~/.config/pika` for configuration and
+On Linux and macOS, defaults are `~/.config/pika` for configuration and
 `~/.local/state/pika/pika.db` for state (XDG and PIKA overrides are supported).
 Provider transcripts remain owned by the provider. Pika metadata includes names,
 paths, identities, lifecycle events, usage counters, machine mappings, and expert

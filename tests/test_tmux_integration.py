@@ -53,7 +53,7 @@ class FakeProvider:
             "bash",
             "-lc",
             (
-                f"exec -a {shlex.quote(self.name)} python3 -c "
+                f"exec -a {shlex.quote(self.name)} {shlex.quote(sys.executable)} -c "
                 f"{shlex.quote('import time; time.sleep(30)')} "
                 f"{shlex.quote(identity)}"
             ),

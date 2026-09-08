@@ -38,6 +38,9 @@ class ProcessTests(unittest.TestCase):
         self.assertNotIn("ses_ignore123", observed)
 
     def test_process_tty_reports_only_terminal_devices(self) -> None:
+        linux = patch("pikamux.processes._MACOS", False)
+        linux.start()
+        self.addCleanup(linux.stop)
         with patch(
             "pikamux.processes.os.readlink",
             side_effect=[OSError(), "/dev/pts/39"],

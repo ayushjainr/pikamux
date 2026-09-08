@@ -8,17 +8,31 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 
-from pikamux.models import Candidate, Session, Status
+from pikamux.models import Candidate, NodeCandidate, Session, Status
 from pikamux.ui import (
     SelectionCancelled,
     choose_candidates,
     choose_session,
     format_tokens,
     print_sessions,
+    print_node_candidates,
 )
 
 
 class UiTests(unittest.TestCase):
+    def test_machine_groups_keep_one_continuous_selection_numbering(self):
+        candidates = [
+            NodeCandidate("z-work", "z-work", ("ssh-config",)),
+            NodeCandidate("a-server", "a-server.ts.net", ("tailscale",)),
+        ]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            print_node_candidates(candidates)
+        text = output.getvalue()
+        self.assertLess(text.index("SSH CONFIG"), text.index("TAILSCALE"))
+        self.assertIn("1. z-work", text)
+        self.assertIn("2. a-server", text)
+
     def setUp(self) -> None:
         now = time.time()
         self.sessions = [

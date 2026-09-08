@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +84,15 @@ def provider_version_supported(provider: str, version: str | None) -> bool:
 
 
 def _service_path() -> str | None:
+    if sys.platform == "darwin":
+        from .expert_schedule import LAUNCHD_NAME, unit_directory
+
+        try:
+            value = plistlib.loads((unit_directory() / LAUNCHD_NAME).read_bytes())
+            path = value.get("EnvironmentVariables", {}).get("PATH")
+            return path if isinstance(path, str) else None
+        except (OSError, ValueError, plistlib.InvalidFileException, AttributeError):
+            return None
     base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     target = base / "systemd" / "user" / "pika-expert-refresh.service"
     try:
@@ -133,7 +144,7 @@ def setup_executables(
 def setup_runtime_path(
     config: dict[str, Any], executables: dict[str, str]
 ) -> str:
-    """Pin the PATH needed by provider wrappers used by the systemd timer."""
+    """Pin the PATH needed by provider wrappers used by scheduled refresh."""
     saved = config.get("provider_runtime_path")
     directories: list[str] = []
     for executable in executables.values():

@@ -123,7 +123,7 @@ class NodeDiscoveryReport:
     ssh_config_files: int = 0
     tailscale_total: int = 0
     tailscale_compatible: int = 0
-    excluded_non_linux: int = 0
+    excluded_non_linux: int = 0  # Legacy field name: now counts unsupported host OSes.
     excluded_no_target: int = 0
     tailscale_error: str | None = None
 

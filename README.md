@@ -21,18 +21,33 @@ Anthropic, or OpenCode. It is not an agent runtime or a hosted service.
 
 ## Start with one conversation
 
-The agent-hosting node requires **Linux, Python 3.10+, tmux, and at least one
-supported provider CLI**, already installed and authenticated. Windows has an
+The agent-hosting node requires **Linux or macOS, tmux, and at least one
+supported provider CLI**, already installed and authenticated. Pika's installer
+handles its own Python runtime. Windows has an
 experimental optional client bridge, not local agent hosting; real Windows
-Terminal pairing and attachment are not yet release-verified. macOS hosting is not yet
-supported. See [compatibility and limitations](docs/guide.md#install-a-pika-node).
+Terminal pairing and attachment are not yet release-verified. Native macOS hosting
+is new in this candidate; see [compatibility and limitations](docs/guide.md#install-a-pika-node).
 
-From a checkout of this repository:
+The one-command installer is implemented, but this candidate has **not been
+published**. For a supplied private release bundle, no Python/uv installation is needed:
+
+```bash
+bash /path/to/pika-release/install.sh --bundle /path/to/pika-release
+```
+
+It installs Pika user-locally, offers a backed-up shell PATH change and onboarding,
+and gives OS-specific tmux instructions if it is missing. It never runs sudo for
+you. See [installation and updates](docs/installing.md) for the future public
+one-liner, private SSH installation, and update guarantees.
+
+Contributors can instead use a checkout (requires Python 3.10+ and uv):
 
 ```bash
 uv tool install .
 pika setup
 ```
+
+On a Mac, `brew install uv tmux` supplies the prerequisites; no Linux VM is needed.
 
 During setup, review the proposed changes to provider hooks and configuration.
 Choose one conversation, then detach with **Ctrl-b d**. The agent keeps running.

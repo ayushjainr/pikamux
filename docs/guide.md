@@ -27,7 +27,7 @@ Pika owns that bridge.
   full transcript index. Explicit peeks and selected-pane previews can display
   terminal output. Profiles and diagnostics can contain sensitive content;
   see [security and privacy](../SECURITY.md).
-- Linux nodes use hooks plus command-time reconciliation, with no background
+- Linux and macOS nodes use hooks plus command-time reconciliation, with no background
   daemon. The optional Windows client bridge is described separately below.
 
 ## The first 90 seconds
@@ -82,10 +82,28 @@ conversation the process belongs to and whether it is safe to enter.
 
 ## Install a Pika node
 
-Pikamux requires Linux, Python 3.10 or newer, and tmux. Codex, Claude, and/or
+Pikamux requires Linux or macOS, Python 3.10 or newer, and tmux. Codex, Claude, and/or
 OpenCode must already be installed. Pika requires OpenCode 1.18.21
 or newer; setup and doctor reject an older or unparseable version. This lower
 bound is not certification of every future provider release.
+
+Native macOS hosting is new in this alpha candidate. Install prerequisites with
+`brew install uv tmux`, then use the same commands below. On macOS only, Pika
+installs psutil (BSD-3-Clause) for native process arguments, ancestry and birth
+timestamps. Linux retains its `/proc` implementation with no Python runtime
+dependencies. Native process and tmux tests do not certify every provider's TUI.
+
+Expert refresh uses a user LaunchAgent on macOS and a user systemd timer on Linux.
+The Mac job checks eligibility every ten minutes while logged in and awake; missed
+sleep intervals are not replayed. Loading it does not trigger an interview. The
+existing quota policy still decides whether any model call is allowed. Setup
+preserves a loaded job rather than terminating an ongoing consultation; updated
+schedule definitions take effect at the next desktop login.
+
+macOS cannot use Linux's PID-pinned graceful-stop operation. A live agent outside
+tmux must be exited normally before `pika NAME` can resume it safely; Pika gives
+the terminal location when available and the exact command. It does not offer a
+takeover button that cannot work, or replace this safety gate with plain PID kills.
 
 ```bash
 uv tool install --editable /path/to/pikamux
@@ -98,16 +116,32 @@ existing files, preserves existing JSON key order, and merges lifecycle hooks
 into Codex and Claude user settings and installs a local OpenCode event plugin.
 On first setup it asks for the default provider, previews configuration, and
 offers one conversation recovery walkthrough. Optional machine discovery and
-broader imports follow that experience. Import choices include existing
-resumable conversations with explicit names plus conversations currently live.
+broader imports follow that experience. Default import suggestions require
+explicit naming provenance, not merely a display title or a live process.
+Claude custom-title records and its custom-name registry qualify. The Codex and
+OpenCode metadata currently read by Pika does not reliably distinguish an
+automatic title from a manual rename. Setup therefore uses two separate chooser
+steps: **Personally named** first, followed by **Recent** conversations without a
+confirmed personal name. Recent shows up to ten conversations updated within the
+last fourteen days, newest first, including automatic titles and untitled sessions.
+This also includes genuine renames whose authorship cannot be established; they
+are not classified as workers or deleted. Selections from the first step carry
+forward; Enter skips selection in either step, and `q` finishes without scanning
+the next step. Older titles and unknown activity dates remain under **Browse all**
+(`b`), which does not repeat already selected conversations. `all` selects only
+the current view, never the hidden inventory.
+Existing watched/Pika-created homes remain untouched. `pika NAME` or an exact
+UUID still resolves independently of this setup suggestion filter.
 Later setup runs configure
 and verify the integration without rescanning conversation inventory or machines;
-use `--import-all`, `--machine`, or the daily `pika NAME` entry point when that
-work is intentional. Archived sessions, missing histories, and
-AI-generated Claude summaries stay out of this commissioning choice. For Codex,
-setup uses the effective saved name exposed by Codex: names created with
-`/rename` are eligible even when the internal SQLite `threads.name` column is
-empty. Subordinate Codex threads (`thread_source=subagent`, including native
+use `--browse-all`, `--import-all`, `--machine`, or the daily `pika NAME` entry point
+when that work is intentional. `--browse-all` includes generated and unconfirmed
+titles but does not adopt them automatically; `--import-all` adds only the
+currently eligible suggestion set unless combined with `--browse-all`.
+Updated remote nodes apply the same rule. Older nodes must be updated before
+their suggestions can be called confirmed; their broader title inventory remains
+available through explicit Browse all. Archived sessions, missing histories, and
+subordinate Codex threads (`thread_source=subagent`, including native
 side work) and short-lived workers from known automation harness origins are
 also excluded. Pika reads only immutable `session_meta` provenance and requires
 its UUID to match the candidate; it never guesses from a generated name. The
@@ -158,7 +192,7 @@ original file; Pika never deletes backups.
 The Windows bridge is experimental: CLI smoke checks do not verify real Windows
 Terminal pairing or attachment. Use the same candidate on both ends.
 
-Pika uses the same package and `pika` command on the laptop and server. Linux
+Pika uses the same package and `pika` command on the laptop and server. Linux/macOS
 nodes own provider processes, exact identity reconciliation, and tmux homes. The
 Windows client owns only local window creation; a remote process is never given
 permission to execute an arbitrary client-side command.
@@ -640,7 +674,7 @@ reconciliation, including `pika`, `pika NAME`, or `pika list`, updates the
 tracked display name and the pane's recovery metadata when the provider exposes
 the new name.
 
-Live hook ownership is bound to both a PID and its Linux process start time, so
+Live hook ownership is bound to both a PID and its native process birth stamp, so
 a recycled PID cannot counterfeit exact identity. A shared Codex app-server is
 only a five-minute, hook-renewed lease when no direct client identity is
 visible. OpenCode is different: its launch-time `--session` argument can become
@@ -745,7 +779,8 @@ non-sensitive. See [security and privacy](../SECURITY.md).
 
 ## Development
 
-The package uses only the Python standard library at runtime.
+Linux and Windows use only the Python standard library at runtime. macOS adds
+psutil for native, argument-preserving process inspection.
 
 ```bash
 uv sync --locked --group dev

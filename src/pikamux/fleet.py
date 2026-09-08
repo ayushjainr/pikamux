@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import io
 import json
 import math
 import os
@@ -9,9 +10,12 @@ import selectors
 import shlex
 import socket
 import subprocess
+import tarfile
 import threading
 import time
 import uuid
+import zipfile
+import sys
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -34,6 +38,7 @@ from .ui import choose_session, terminal_text
 
 PROTOCOL_VERSION = 2
 PROTOCOL_NAME = "pikamux-fleet"
+SUPPORTED_HOST_OS = {"linux", "macos", "darwin"}
 CAPABILITIES = (
     "inventory",
     "candidates",
@@ -46,18 +51,32 @@ CAPABILITIES = (
     "ask-jsonl",
     "provider-opencode",
     "expert-directory-v1",
+    "setup-explicit-names-v1",
 )
 REMOTE_STALE_SECONDS = 45.0
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 MAX_STDERR_BYTES = 64 * 1024
 REMOTE_INSTALL_ARGV = (
-    "python3",
-    "-m",
-    "pip",
-    "install",
-    "--user",
-    f"git+https://github.com/ayushjainr/pikamux.git@v{__version__}",
+    "bash", "-o", "pipefail", "-c",
+    shlex.quote(
+        "curl --disable -fsSL --proto '=https' --proto-redir '=https' "
+        f"https://github.com/ayushjainr/pikamux/releases/download/v{__version__}/install.sh "
+        f"| bash -s -- --version v{__version__} --no-setup"
+    ),
 )
+
+
+def remote_pika_argv(*arguments: str) -> list[str]:
+    """SSH non-login shells may not have ~/.local/bin on PATH yet."""
+    return ["sh", "-c", shlex.quote(
+        'if command -v pika >/dev/null 2>&1; then exec pika "$@"; '
+        'else exec "$HOME/.local/bin/pika" "$@"; fi'
+    ), "pika", *(shlex.quote(value) for value in arguments)]
+
+
+def bundled_release() -> Path | None:
+    path = Path(sys.prefix) / 'bundle'
+    return path if (Path(sys.prefix) / '.pika-install.json').is_file() and (path / 'pika-release.json').is_file() else None
 
 _ALIAS = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 _SESSION_ID = re.compile(r"^[A-Za-z0-9:._%+-]{1,128}$")
@@ -306,10 +325,8 @@ def discover_tailscale_candidates(
         dns = str(record.get("DNSName") or "").rstrip(".")
         hostname = str(record.get("HostName") or "").strip()
         os_name = str(record.get("OS") or "").casefold()
-        # Pika's exact PID/process-tree contract is Linux-specific. Other
-        # tailnet devices remain explicitly addable by SSH target, but should
-        # not flood the automatic setup picker.
-        if os_name and os_name != "linux":
+        # Only native agent-hosting platforms belong in the automatic picker.
+        if os_name and os_name not in SUPPORTED_HOST_OS:
             continue
         ips = record.get("TailscaleIPs")
         ip = str(ips[0]) if isinstance(ips, list) and ips else ""
@@ -370,7 +387,7 @@ def tailscale_discovery_summary(
             continue
         total += 1
         os_name = str(record.get("OS") or "").casefold()
-        if os_name and os_name != "linux":
+        if os_name and os_name not in SUPPORTED_HOST_OS:
             non_linux += 1
             continue
         ips = record.get("TailscaleIPs")
@@ -409,7 +426,12 @@ def discover_node_candidates(store: Store) -> list[NodeCandidate]:
     result: list[NodeCandidate] = []
     used: set[str] = set()
     for item in sorted(
-        merged.values(), key=lambda value: (value.alias, value.ssh_target)
+        merged.values(),
+        key=lambda value: (
+            "ssh-config" not in value.sources,
+            value.alias.casefold(),
+            value.ssh_target.casefold(),
+        ),
     ):
         alias = item.alias
         suffix = 2
@@ -964,7 +986,7 @@ class SSHTransport:
             )
         try:
             result = self._bounded_run(
-                [*self.base(target), "pika", "_fleet", "--stdio"],
+                [*self.base(target), *remote_pika_argv("_fleet", "--stdio")],
                 line.encode("utf-8"),
             )
         except FileNotFoundError:
@@ -1027,12 +1049,15 @@ class SSHTransport:
 
     def run_exact(self, node: FleetNode, arguments: list[str], *, tty: bool) -> int:
         result = subprocess.run(
-            [*self.base(node.ssh_target, tty=tty), "pika", *arguments],
+            [*self.base(node.ssh_target, tty=tty), *remote_pika_argv(*arguments)],
             check=False,
         )
         return result.returncode
 
-    def install(self, target: str) -> tuple[int, str]:
+    def install(self, target: str, *, bundle: Path | None = None) -> tuple[int, str]:
+        bundle = bundle or bundled_release()
+        if bundle is not None:
+            return self._install_bundle(target, bundle)
         try:
             result = subprocess.run(
                 [*self.base(target), *REMOTE_INSTALL_ARGV],
@@ -1041,13 +1066,70 @@ class SSHTransport:
                 timeout=180,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except subprocess.TimeoutExpired:
+            return 1, 'Remote install outcome unknown after SSH timeout. Reconnect and verify the installed version before retrying.'
+        except OSError as exc:
             return 1, terminal_text(exc)
-        detail = (result.stdout or result.stderr).strip()
+        # pip often prints progress to stdout and the actual failure to stderr.
+        # Keep the error last so truncation cannot discard it behind progress.
+        detail = "\n".join(
+            part.strip() for part in (result.stdout, result.stderr) if part.strip()
+        )
         return result.returncode, terminal_text(detail)[-1000:]
+
+    def _install_bundle(self, target: str, bundle: Path) -> tuple[int, str]:
+        from .installation import InstallError, read_manifest, wheel_version
+        try:
+            manifest = read_manifest(bundle / 'pika-release.json')
+            wheel = bundle / manifest['wheel']
+            version = wheel_version(wheel, manifest['sha256'])
+            if version != __version__:
+                raise InstallError('Remote bundle must match this coordinator version.')
+            with zipfile.ZipFile(wheel) as archive:
+                installer = archive.read('pikamux/install.sh')
+            data = io.BytesIO()
+            with tarfile.open(fileobj=data, mode='w') as archive:
+                for name, content in (
+                    (wheel.name, wheel.read_bytes()),
+                    ('pika-release.json', json.dumps(manifest).encode()),
+                    ('install.sh', installer),
+                ):
+                    info = tarfile.TarInfo(name)
+                    info.size = len(content)
+                    info.mode = 0o600
+                    archive.addfile(info, io.BytesIO(content))
+            script = (
+                'set -eu; pika_stage=$(mktemp -d /tmp/pika-remote.XXXXXXXX); '
+                'trap \'rm -rf -- "$pika_stage"\' EXIT; '
+                'tar -xf - -C "$pika_stage"; '
+                'bash "$pika_stage/install.sh" --bundle "$pika_stage" --no-setup'
+            )
+            result = subprocess.run(
+                [*self.base(target), 'sh', '-c', shlex.quote(script)],
+                input=data.getvalue(), capture_output=True, timeout=900, check=False,
+            )
+            detail = (result.stdout + b'\n' + result.stderr).decode(errors='replace').strip()
+            return result.returncode, terminal_text(detail)[-2000:]
+        except subprocess.TimeoutExpired:
+            return 1, 'Remote install outcome unknown after SSH timeout. Reconnect and verify the installed version before retrying.'
+        except (InstallError, OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
+            return 1, terminal_text(exc)
 
 
 class FleetManager:
+    def verify_node_identity(self, node: FleetNode) -> None:
+        """Read-only upgrade pre/postflight, independent of new optional features."""
+        response = self.transport.request(node.ssh_target, {
+            'op': 'hello', 'protocol': PROTOCOL_NAME, 'version': PROTOCOL_VERSION,
+            'expected_node_id': node.node_id,
+        })
+        if (response.get('type') != 'hello' or response.get('protocol') != PROTOCOL_NAME
+                or response.get('version') != PROTOCOL_VERSION):
+            raise FleetError('Cannot verify the target Pika node. Nothing further installed.', kind='incompatible')
+        if response.get('node_id') != node.node_id:
+            raise FleetError('NODE IDENTITY CHANGED: refusing to operate on the machine now behind this SSH alias.',
+                             kind='quarantined')
+
     def __init__(self, store: Store, transport: SSHTransport | None = None) -> None:
         self.store = store
         self.transport = transport or SSHTransport()
@@ -1123,7 +1205,7 @@ class FleetManager:
             not isinstance(capabilities, list)
             or not all(isinstance(item, str) for item in capabilities)
             or len(capabilities) != len(set(capabilities))
-            or not set(CAPABILITIES).issubset(capabilities)
+            or not (set(CAPABILITIES) - {"setup-explicit-names-v1"}).issubset(capabilities)
         ):
             raise FleetError(
                 "Remote Pika lacks required fleet capabilities", kind="incompatible"
@@ -1278,11 +1360,21 @@ class FleetManager:
                 session.current_state_status = card.get("current_state_status")
         return result
 
-    def remote_candidates(self, node: FleetNode) -> list[Candidate]:
+    def remote_candidates(
+        self, node: FleetNode, *, include_unconfirmed: bool = False,
+    ) -> list[Candidate]:
+        if not include_unconfirmed and "setup-explicit-names-v1" not in node.capabilities:
+            raise FleetError(
+                f"{node.alias} needs an updated Pika for explicit-name setup filtering. "
+                "Its existing conversations remain accessible; use Browse all "
+                "to inspect its unfiltered titles explicitly.",
+                kind="incompatible",
+            )
         response = self.transport.request(
             node.ssh_target,
             {
                 "op": "candidates",
+                "include_unconfirmed": include_unconfirmed,
                 "protocol": PROTOCOL_NAME,
                 "version": PROTOCOL_VERSION,
                 "expected_node_id": node.node_id,
@@ -1638,9 +1730,7 @@ class RemoteConsultation:
         self._cleanup_confirmed = False
         self._transport_aborted = False
         self._reader_lock = threading.RLock()
-        command = [
-            *transport.base(node.ssh_target),
-            "pika",
+        arguments = [
             "_fleet-ask",
             "--expected-node-id",
             node.node_id,
@@ -1650,7 +1740,8 @@ class RemoteConsultation:
             session.session_id,
         ]
         if policy.mode == "fast":
-            command.append("--fast")
+            arguments.append("--fast")
+        command = [*transport.base(node.ssh_target), *remote_pika_argv(*arguments)]
         try:
             self.process = subprocess.Popen(
                 command,
@@ -2044,12 +2135,23 @@ def handle_fleet_stdio(pika: Any, stdin: Any, stdout: Any) -> int:
                 )
                 continue
             if op == "candidates":
-                tracked = {item.key for item in pika.store.list_sessions()}
+                include_unconfirmed = request.get("include_unconfirmed", False)
+                if not isinstance(include_unconfirmed, bool):
+                    raise FleetError("include_unconfirmed must be a boolean", kind="invalid_request")
+                tracked = {
+                    (item.provider, thread_id)
+                    for item in pika.store.list_sessions()
+                    for thread_id in (item.session_id, item.active_thread_id)
+                    if thread_id
+                }
                 untracked = pika.store.untracked_session_keys()
                 candidates = [
                     item
-                    for item in pika.discover_import_candidates()
-                    if item.name or item.live
+                    for item in (
+                        pika.discover_import_candidates(include_unconfirmed=True)
+                        if include_unconfirmed else pika.discover_import_candidates()
+                    )
+                    if include_unconfirmed or item.name or item.live
                     if (item.provider, item.session_id) not in tracked
                     and (item.provider, item.session_id) not in untracked
                 ]
@@ -2080,7 +2182,7 @@ def handle_fleet_stdio(pika: Any, stdin: Any, stdout: Any) -> int:
                 if session is None:
                     matches = [
                         item
-                        for item in pika.discover_import_candidates()
+                        for item in pika.discover_import_candidates(include_unconfirmed=True)
                         if (item.provider, item.session_id) == (provider, session_id)
                     ]
                     if len(matches) != 1:

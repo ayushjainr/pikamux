@@ -176,7 +176,7 @@ class FleetTests(unittest.TestCase):
         self.assertEqual([item.alias for item in values], ["atlas", "gpu-box"])
         runner.assert_not_called()
 
-    def test_tailscale_discovery_offers_only_linux_compatible_peers(self) -> None:
+    def test_tailscale_discovery_offers_linux_and_mac_but_not_phones(self) -> None:
         payload = {
             "Peer": {
                 "a": {
@@ -191,12 +191,18 @@ class FleetTests(unittest.TestCase):
                     "OS": "iOS",
                     "Online": True,
                 },
+                "c": {
+                    "HostName": "macbook",
+                    "DNSName": "macbook.ts.net.",
+                    "OS": "macOS",
+                    "Online": True,
+                },
             }
         }
         completed = Mock(returncode=0, stdout=json.dumps(payload))
         with patch("pikamux.fleet.subprocess.run", return_value=completed):
             values = discover_tailscale_candidates()
-        self.assertEqual([item.alias for item in values], ["linux-box"])
+        self.assertEqual([item.alias for item in values], ["linux-box", "macbook"])
 
     def test_local_alias_prefers_tailscale_dns_over_kernel_hostname(self) -> None:
         completed = Mock(
@@ -227,6 +233,34 @@ class FleetTests(unittest.TestCase):
         ):
             values = discover_node_candidates(self.store)
         self.assertEqual([item.alias for item in values], ["worker", "worker-2"])
+
+    def test_configured_ssh_connections_precede_alphabetically_earlier_tailnet(self):
+        ssh = [
+            NodeCandidate("z-work", "z-work", ("ssh-config",)),
+            NodeCandidate("b-laptop", "b-laptop", ("ssh-config",)),
+        ]
+        tailnet = [
+            NodeCandidate("a-server", "a-server.ts.net", ("tailscale",), online=True),
+            NodeCandidate("z-work", "z-work", ("tailscale",), online=True),
+        ]
+        with (
+            patch("pikamux.fleet.discover_ssh_candidates", return_value=ssh),
+            patch("pikamux.fleet.discover_tailscale_candidates", return_value=tailnet),
+            patch("pikamux.fleet.subprocess.run") as network,
+        ):
+            values = discover_node_candidates(self.store)
+        self.assertEqual([item.alias for item in values], ["b-laptop", "z-work", "a-server"])
+        self.assertEqual(values[1].sources, ("ssh-config", "tailscale"))
+        self.assertTrue(values[1].online)
+        network.assert_not_called()
+
+    def test_remote_install_keeps_error_when_progress_was_written_to_stdout(self):
+        result = subprocess.CompletedProcess([], 1, "progress " * 300, "ERROR: package unavailable")
+        with patch("pikamux.fleet.subprocess.run", return_value=result):
+            code, detail = SSHTransport().install("test-host")
+        self.assertEqual(code, 1)
+        self.assertTrue(detail.endswith("ERROR: package unavailable"))
+        self.assertLessEqual(len(detail), 1000)
 
     def test_failed_initial_snapshot_adopts_nothing(self) -> None:
         remote_id = str(uuid.uuid4())

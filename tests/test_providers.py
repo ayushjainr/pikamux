@@ -364,7 +364,7 @@ class ProviderTests(unittest.TestCase):
         self.assertTrue(provider.is_resumable(active_id))
         self.assertFalse(provider.is_resumable(archived_id))
 
-    def test_codex_setup_includes_effective_renamed_thread(self) -> None:
+    def test_codex_index_title_is_lookup_evidence_not_setup_rename_proof(self) -> None:
         session_id = "11111111-1111-4111-8111-111111111111"
         rollout = self.root / "rollout.jsonl"
         rollout.write_text("{}\n")
@@ -385,9 +385,11 @@ class ProviderTests(unittest.TestCase):
         provider = CodexProvider(self.root)
         self.assertEqual(provider.discover()[0].name, "generated-looking title")
         candidates = provider.import_candidates()
-        self.assertEqual([item.name for item in candidates], ["generated-looking title"])
+        self.assertEqual(candidates, [])
+        self.assertEqual([item.name for item in provider.browse_candidates()], ["generated-looking title"])
+        self.assertEqual(provider.find_candidates("generated-looking title")[0].session_id, session_id)
 
-    def test_codex_setup_includes_current_native_name(self) -> None:
+    def test_codex_native_name_alone_does_not_prove_rename_intent(self) -> None:
         session_id = "11111111-1111-4111-8111-111111111111"
         rollout = self.root / "rollout.jsonl"
         rollout.write_text("{}\n")
@@ -401,8 +403,9 @@ class ProviderTests(unittest.TestCase):
                 (session_id, "chosen name", str(rollout), 0),
             )
 
-        candidates = CodexProvider(self.root).import_candidates()
-        self.assertEqual([item.name for item in candidates], ["chosen name"])
+        provider = CodexProvider(self.root)
+        self.assertEqual(provider.import_candidates(), [])
+        self.assertEqual([item.name for item in provider.browse_candidates()], ["chosen name"])
 
     def test_codex_automation_origin_is_hidden_without_name_heuristics(self) -> None:
         worker_id = "11111111-1111-4111-8111-111111111111"

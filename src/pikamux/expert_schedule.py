@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import plistlib
 import shlex
 import shutil
 import subprocess
@@ -10,15 +11,32 @@ from pathlib import Path
 
 SERVICE_NAME = "pika-expert-refresh.service"
 TIMER_NAME = "pika-expert-refresh.timer"
+LAUNCHD_LABEL = "io.pikamux.expert-refresh"
+LAUNCHD_NAME = LAUNCHD_LABEL + ".plist"
+_MACOS = sys.platform == "darwin"
 
 
 def unit_directory() -> Path:
+    if _MACOS:
+        return Path.home() / "Library" / "LaunchAgents"
     base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return base / "systemd" / "user"
 
 
 def unit_contents(*, runtime_path: str | None = None) -> dict[Path, str]:
     directory = unit_directory()
+    if _MACOS:
+        return {
+            directory / LAUNCHD_NAME: plistlib.dumps({
+                "Label": LAUNCHD_LABEL,
+                "ProgramArguments": [
+                    sys.executable, "-m", "pikamux", "expert", "refresh", "--due", "--json"
+                ],
+                "EnvironmentVariables": {"PATH": runtime_path or _service_path()},
+                "StartInterval": 600,
+                "ProcessType": "Background",
+            }).decode()
+        }
     command = shlex.join(
         [sys.executable, "-m", "pikamux", "expert", "refresh", "--due", "--json"]
     )
@@ -64,6 +82,8 @@ def _systemd_escape(value: str) -> str:
 
 
 def activate_timer() -> tuple[bool, str]:
+    if _MACOS:
+        return _activate_launch_agent()
     executable = shutil.which("systemctl")
     if executable is None:
         return False, "systemctl unavailable; run `pika expert refresh --due` manually"
@@ -81,3 +101,44 @@ def activate_timer() -> tuple[bool, str]:
             detail = (result.stderr or result.stdout).strip()
             return False, detail or "systemd user timer activation failed"
     return True, "10-minute quota-aware expert refresh timer active"
+
+
+def _activate_launch_agent() -> tuple[bool, str]:
+    executable = shutil.which("launchctl")
+    if executable is None:
+        return False, "launchctl unavailable; run `pika expert refresh --due` manually"
+    domain = f"gui/{os.getuid()}"
+    target = f"{domain}/{LAUNCHD_LABEL}"
+
+    def run(*arguments: str):
+        return subprocess.run(
+            [executable, *arguments], capture_output=True, text=True,
+            timeout=15, check=False,
+        )
+
+    try:
+        loaded = run("print", target)
+        if loaded.returncode == 0:
+            # bootout would terminate an in-flight expert consultation. Keep
+            # it running; launchd reads the updated plist on the next login.
+            return True, (
+                "existing expert refresh LaunchAgent left running; "
+                "saved schedule changes take effect at your next desktop login"
+            )
+        commands = [
+            ("enable", target),
+            ("bootstrap", domain, str(unit_directory() / LAUNCHD_NAME)),
+            ("print", target),
+        ]
+        for arguments in commands:
+            result = run(*arguments)
+            if result.returncode:
+                detail = (result.stderr or result.stdout).strip()
+                return False, (
+                    f"launchd {arguments[0]} failed: {detail}. "
+                    "Log in to the Mac desktop and rerun `pika setup`; "
+                    "or run `pika expert refresh --due` manually."
+                )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"could not activate expert refresh LaunchAgent: {exc}"
+    return True, "10-minute quota-aware expert refresh LaunchAgent active"

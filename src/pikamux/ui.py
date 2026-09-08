@@ -5,7 +5,7 @@ import os
 import shutil
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -374,7 +374,18 @@ def print_node_candidates(candidates: list[NodeCandidate]) -> None:
         print("No new SSH or Tailscale machine candidates found.")
         return
     print("Pika found these machine candidates without connecting:")
+    previous_group = None
     for index, item in enumerate(candidates, 1):
+        group = (
+            "SSH CONFIG · your configured connections"
+            if "ssh-config" in item.sources
+            else "TAILSCALE · other discovered machines"
+            if "tailscale" in item.sources
+            else "OTHER CANDIDATES"
+        )
+        if group != previous_group:
+            print(f"\n{group}")
+            previous_group = group
         presence = (
             "online"
             if item.online is True
@@ -399,12 +410,12 @@ def print_node_discovery_report(report: NodeDiscoveryReport) -> None:
         excluded = report.excluded_non_linux + report.excluded_no_target
         print(
             f"Tailscale: {report.tailscale_total} peer(s) · "
-            f"{report.tailscale_compatible} compatible Linux host(s) · "
+            f"{report.tailscale_compatible} compatible Linux/macOS host(s) · "
             f"{excluded} excluded"
         )
         if excluded:
             print(
-                f"  excluded: {report.excluded_non_linux} non-Linux · "
+                f"  excluded: {report.excluded_non_linux} unsupported OS · "
                 f"{report.excluded_no_target} without an address"
             )
     print_node_candidates(list(report.candidates))
@@ -425,25 +436,74 @@ def choose_node_candidates(
 
 def choose_fleet_candidates(
     values: list[tuple[FleetNode | None, Candidate]],
+    *,
+    browse: Callable[[], list[tuple[FleetNode | None, Candidate]]] | None = None,
 ) -> list[tuple[FleetNode | None, Candidate]]:
-    if not values:
+    if not values and browse is None:
         return []
     print("\nPika conversations · 2/2 ADD")
     print(
         "Selecting a remote item updates only Pika on that machine; no transcript is copied."
     )
-    for index, (node, item) in enumerate(values, 1):
-        machine = node.alias if node else "here"
-        live = " live" if item.live else ""
-        label = item.name or f"<unnamed live · {item.session_id[:8]}>"
-        print(
-            f"  {index:>2}. {item.provider:<6} {terminal_text(label):<28} "
-            f"@{machine:<16} {short_path(item.cwd, 28)}{live}"
-        )
-    if not sys.stdin.isatty():
-        return []
-    raw = input("Add numbers, `all`, or press Enter for none: ").strip().lower()
-    return _choose_numbered(values, raw)
+    def identity(value):
+        node, item = value
+        return (node.node_id if node else None, item.provider, item.session_id)
+
+    values = sorted(values, key=lambda value: value[1].updated_at, reverse=True)
+    named_ids = {identity(value) for value in values}
+    selected = []
+    broader = None
+    stage = "named" if browse is not None else "all"
+    while True:
+        if stage == "named":
+            print("\n1/2 · PERSONALLY NAMED · confirmed naming evidence")
+            print("Next: recent conversations without a confirmed personal name.")
+        elif stage == "recent":
+            print("\n2/2 · RECENT · no confirmed personal name")
+            print("Up to 10 from the last 14 days, newest first. Titles may be automatic.")
+            print("Codex/OpenCode renames with unknown authorship also appear here.")
+        else:
+            print("\nBROWSE ALL · includes generated and unconfirmed titles; nothing added yet.")
+        if not values:
+            print("No additional conversations in this view.")
+        for index, (node, item) in enumerate(values, 1):
+            machine = node.alias if node else "here"
+            live = " live" if item.live else ""
+            label = item.name or f"<unnamed · {item.session_id[:8]}>"
+            print(
+                f"  {index:>2}. {item.provider:<6} {terminal_text(label):<28} "
+                f"@{terminal_text(machine):<16} {short_path(item.cwd, 28)}{live}"
+                f" · {human_age(item.updated_at)} · …{terminal_text(item.session_id[-8:])}"
+            )
+        if not sys.stdin.isatty():
+            return []
+        more = "`b` to Browse all, " if stage != "all" else ""
+        enter = "continue to recent" if stage == "named" else "skip"
+        raw = input(
+            f"Add numbers, `all` in this view, {more}`q` to finish, or Enter to {enter}: "
+        ).strip().lower()
+        if raw in {"q", "quit"}:
+            return selected
+        if stage != "all" and raw in {"b", "browse"}:
+            broader = broader if broader is not None else browse()
+            chosen_ids = {identity(value) for value in selected}
+            values = sorted(
+                (value for value in broader if identity(value) not in chosen_ids),
+                key=lambda value: value[1].updated_at, reverse=True,
+            )
+            stage = "all"
+            continue
+        selected.extend(_choose_numbered(values, raw))
+        if stage != "named":
+            return selected
+        broader = browse()
+        cutoff = time.time() - 14 * 86400
+        values = sorted(
+            (value for value in broader
+             if identity(value) not in named_ids and value[1].updated_at >= cutoff),
+            key=lambda value: value[1].updated_at, reverse=True,
+        )[:10]
+        stage = "recent"
 
 
 def _choose_numbered(values: list[Any], raw: str) -> list[Any]:

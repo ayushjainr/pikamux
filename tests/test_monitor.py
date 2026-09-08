@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pty_reader import PtyReader
+
 import fcntl
 import os
 import pty
@@ -633,6 +635,7 @@ class MonitorTests(unittest.TestCase):
             )
         )
         calls_after_hiding = 0
+        reader = PtyReader(master)
         try:
             with patch("pikamux.monitor.USAGE_REFRESH_SECONDS", 0.03):
                 thread.start()
@@ -654,6 +657,7 @@ class MonitorTests(unittest.TestCase):
             if thread.is_alive():
                 os.write(master, b"q")
                 thread.join(2.0)
+            reader.close()
             os.close(master)
             os.close(slave)
         self.assertFalse(thread.is_alive())
@@ -794,6 +798,7 @@ class MonitorTests(unittest.TestCase):
                 return 0
 
         master, slave = pty.openpty()
+        reader = PtyReader(master)
         fcntl.ioctl(
             slave,
             termios.TIOCSWINSZ,
@@ -826,6 +831,7 @@ class MonitorTests(unittest.TestCase):
             if thread.is_alive():
                 os.write(master, b"q")
                 thread.join(1.0)
+            reader.close()
             os.close(master)
             os.close(slave)
         self.assertFalse(thread.is_alive())
@@ -872,6 +878,7 @@ class MonitorTests(unittest.TestCase):
 
         pika = FakePika()
         master, slave = pty.openpty()
+        reader = PtyReader(master)
         fcntl.ioctl(
             slave,
             termios.TIOCSWINSZ,
@@ -901,6 +908,7 @@ class MonitorTests(unittest.TestCase):
             if thread.is_alive():
                 os.write(master, b"q")
                 thread.join(1.0)
+            reader.close()
             os.close(master)
             os.close(slave)
         self.assertEqual(result, [0])

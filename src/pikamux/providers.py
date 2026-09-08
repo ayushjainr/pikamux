@@ -198,19 +198,23 @@ class Provider(ABC):
         return provider_compatibility_error(self.name, self.version())
 
     def import_candidates(self) -> list[Candidate]:
-        """Return the broader, potentially slower one-time import surface."""
+        """Return setup suggestions backed by explicit naming evidence."""
+        return self.discover()
+
+    def browse_candidates(self) -> list[Candidate]:
+        """Explicit opt-in to titles whose naming intent is not established."""
         return self.discover()
 
     def launch_candidates(self) -> list[Candidate]:
         """Return launch-time identities, including unnamed provider records."""
-        return self.import_candidates()
+        return self.browse_candidates()
 
     def find_candidates(self, query: str) -> list[Candidate]:
         """Return exact name/UUID matches without a bulk resumability pass."""
         folded = query.casefold()
         return [
             item
-            for item in self.import_candidates()
+            for item in self.browse_candidates()
             if item.session_id == query
             or (item.name and item.name.casefold() == folded)
         ]
@@ -220,6 +224,18 @@ class Provider(ABC):
 
     def is_resumable(self, session_id: str) -> bool:
         return any(item.session_id == session_id for item in self.discover())
+
+    def selection_evidence(
+        self, session_id: str, transcript_path: str | None = None
+    ) -> tuple[str, Candidate | None]:
+        """Fresh provider activity for name selection; absence is not deletion."""
+        matches = [item for item in self.find_candidates(session_id)
+                   if item.session_id == session_id]
+        if not matches:
+            return "unknown", None
+        item = max(matches, key=lambda value: value.updated_at)
+        return ("available" if item.live or self.is_resumable(session_id)
+                else "unknown"), item
 
     def tracked_candidates(self, sessions: Iterable[Session]) -> list[Candidate]:
         return []
@@ -296,14 +312,64 @@ class CodexProvider(Provider):
         ]
 
     def import_candidates(self) -> list[Candidate]:
-        """Offer Codex's effective saved names during commissioning.
+        """Do not infer naming intent from either native or index titles.
 
-        `/rename` persists names in the append-only session index, and Codex
-        hydrates its user-facing `thread.name` from that effective name. Setup
-        therefore uses the same reconciled view as normal discovery; the core
-        commissioning pass separately rejects archived and unresumable rows.
+        Neither current threads.name nor session_index.thread_name records the
+        author of a name. Both can be populated by a client, not just /rename.
+        Previously chosen Pika homes remain tracked. Other named threads stay
+        available through exact lookup and explicit Browse all, including older
+        clients' genuine index-only renames. This is not a worker classifier.
         """
-        return self.discover()
+        return []
+
+    def selection_evidence(
+        self, session_id: str, transcript_path: str | None = None
+    ) -> tuple[str, Candidate | None]:
+        """Distinguish a missing thread from an unavailable provider store.
+
+        Do not fall back to an older database after the newest one fails. An
+        index entry is a name hint, not proof of durable conversation existence.
+        Conversely, absent DB rows alone do not invalidate legacy rollouts.
+        """
+        try:
+            databases = sorted(self.home.glob("state_*.sqlite"),
+                               key=lambda path: path.stat().st_mtime, reverse=True)
+            if not databases:
+                return "unknown", None
+            database = databases[0]
+            archived = self._query_archived_ids(database)
+            records = self._query_database(database, named_only=False,
+                                           session_ids=[session_id])
+            if archived is None or records is None:
+                return "unknown", None
+            if session_id in archived:
+                return "archived", None
+            if records:
+                item = records[0]
+                if item.transcript_path and Path(item.transcript_path).is_file():
+                    return "available", item
+                return "unknown", item
+            if transcript_path:
+                try:
+                    Path(transcript_path).stat()
+                    return "unknown", None
+                except FileNotFoundError:
+                    pass
+            root = self.home / "sessions"
+            # An absent/unmounted sessions tree is not proof of deletion.
+            if not root.is_dir():
+                return "unknown", None
+            def unreadable(error: OSError) -> None:
+                raise error
+            for _directory, directories, files in os.walk(root, onerror=unreadable):
+                # Do not infer absence across links to unavailable storage.
+                if any((Path(_directory) / name).is_symlink() for name in directories):
+                    return "unknown", None
+                if any(session_id in name for name in files):
+                    return "unknown", None
+            return "missing", None
+        except (OSError, sqlite3.Error):
+            return "unknown", None
 
     def find_candidates(self, query: str) -> list[Candidate]:
         folded = query.casefold()
@@ -378,6 +444,11 @@ class CodexProvider(Provider):
             if item.session_id not in archived_ids
             and not self.worker_originator(item.session_id, item.transcript_path)
         ]
+
+    def browse_candidates(self) -> list[Candidate]:
+        records = {item.session_id: item for item in self._all_database_records()}
+        records.update((item.session_id, item) for item in self.discover())
+        return sorted(records.values(), key=lambda item: item.updated_at, reverse=True)
 
     def launch_candidates(self) -> list[Candidate]:
         return self._all_database_records()
@@ -703,7 +774,7 @@ class ClaudeProvider(Provider):
                 created_at=_timestamp(data.get("startedAt")),
                 live=bool(pid),
                 pid=pid,
-                source="claude-live",
+                source="claude-live-custom" if name_source == "custom" else "claude-live",
             )
             transcript = self._find_transcript(session_id)
             if transcript:
@@ -721,21 +792,41 @@ class ClaudeProvider(Provider):
         return sorted(records.values(), key=lambda item: item.updated_at, reverse=True)
 
     def import_candidates(self) -> list[Candidate]:
+        return self._import_titles(explicit_only=True)
+
+    def browse_candidates(self) -> list[Candidate]:
+        return self._import_titles(explicit_only=False)
+
+    def _import_titles(self, *, explicit_only: bool) -> list[Candidate]:
         records = {item.session_id: item for item in self.discover()}
-        for item in self._historical_titles(explicit_only=True):
+        for item in self._historical_titles(
+            explicit_only=explicit_only, include_unnamed=not explicit_only,
+        ):
             existing = records.get(item.session_id)
             if existing:
                 # A user-authored title is authoritative even when Claude's
                 # live registry still carries an older generated title.
-                existing.name = item.name
-                existing.source = "claude-live+explicit-history"
+                existing.name = item.name or existing.name
+                existing.source = (
+                    "claude-live+explicit-history" if explicit_only else "claude-live+history"
+                )
                 existing.transcript_path = (
                     existing.transcript_path or item.transcript_path
                 )
                 existing.updated_at = max(existing.updated_at, item.updated_at)
             else:
                 records[item.session_id] = item
-        return sorted(records.values(), key=lambda item: item.updated_at, reverse=True)
+        return sorted(
+            (
+                item for item in records.values()
+                if not explicit_only or (
+                    item.name and item.name.strip() and item.source in {
+                        "claude-live-custom", "claude-live+explicit-history", "claude-history"
+                    }
+                )
+            ),
+            key=lambda item: item.updated_at, reverse=True,
+        )
 
     def find_candidates(self, query: str) -> list[Candidate]:
         folded = query.casefold()
@@ -838,7 +929,8 @@ class ClaudeProvider(Provider):
         )
 
     def _historical_titles(
-        self, limit: int = 1000, *, explicit_only: bool = False
+        self, limit: int = 1000, *, explicit_only: bool = False,
+        include_unnamed: bool = False,
     ) -> list[Candidate]:
         projects = self.home / "projects"
         if not projects.exists():
@@ -852,12 +944,12 @@ class ClaudeProvider(Provider):
             if self.worker_originator(session_id, str(path)):
                 continue
             title = self._title_from_transcript(path, explicit_only=explicit_only)
-            if title:
+            if title or include_unnamed:
                 result.append(
                     Candidate(
                         provider=self.name,
                         session_id=session_id,
-                        name=str(title),
+                        name=str(title) if title else None,
                         transcript_path=str(path),
                         updated_at=path.stat().st_mtime,
                         source="claude-history",
@@ -1262,7 +1354,16 @@ class OpenCodeProvider(Provider):
         ]
 
     def import_candidates(self) -> list[Candidate]:
-        return self.discover()
+        # The current native schema exposes a title but not whether it was
+        # generated or explicitly renamed. Existing Pika homes stay tracked;
+        # other titles remain accessible through browse and exact lookup.
+        return []
+
+    def browse_candidates(self) -> list[Candidate]:
+        return [
+            item for item in self._records(named_only=False)
+            if not self._automation_title_prefix(item.name, item.cwd)
+        ]
 
     def launch_candidates(self) -> list[Candidate]:
         return self._records(named_only=False)

@@ -11,9 +11,9 @@ upload a package, or change GitHub visibility. Those are separate owner actions.
    Keep machine-local audit notes, real consultation results, and backups out of
    Git and both distribution formats. Pattern scans do not prove absence of secrets.
 2. Run `uv sync --locked --group dev`, then
-   `uv run pytest -q --timeout=90`. Use a clean Linux environment with tmux as
+   `uv run pytest -q --timeout=90`. Use clean Linux and macOS environments with tmux as
    well as the maintainer's host. CI should run without provider credentials.
-3. Run `uv build --out-dir dist/candidate` into an empty candidate directory.
+3. Run `uv run python scripts/build_release.py --output dist/candidate` into a nonexistent candidate directory.
    Keep older distributions separate. Inspect wheel and sdist contents: the skill and MIT license
    must be present; databases, transcripts, credentials, backup files, and local
    audit notes must be absent. Build a wheel from the unpacked sdist too.
@@ -21,6 +21,11 @@ upload a package, or change GitHub visibility. Those are separate owner actions.
    `pika --version`, `pika skill show`, and skill installation into a temporary
    directory. Run the synthetic monitor demo. Do not run `pika setup` against a
    real home during package verification.
+5. Run `PIKA_INSTALL_BUNDLE=dist/candidate PIKA_BOOTSTRAP_BUNDLE=dist/candidate uv run pytest -q tests/test_installation.py tests/test_bootstrap.py --timeout=300`.
+   These opt-in tests use temporary homes and real package/runtime downloads,
+   exercise the fresh-host bootstrap and a synthetic next-version update, and
+   must not access provider credentials or transcripts. Synthetic versions are
+   test fixtures, never release candidates.
 
 Performance fixtures and `tests/live_consult_probe.py` are opt-in. The latter
 uses real provider quota and reads parent histories to verify unchanged bytes;
@@ -38,11 +43,12 @@ fixture, sample size, environment, limits, and evidence—not an agent review sc
 - Public visibility is a separate owner decision. At the approved public
   cutover, enable GitHub private vulnerability reporting and verify the reporting
   link and notifications; GitHub does not offer it for private repositories.
-- Create the matching version tag only after candidate checks pass. Verify an
-  anonymous HTTPS installation from that tag after public cutover. Remote
-  bootstrap uses that exact HTTPS tag; while the repository is private or the tag
-  absent, install a matching authorized checkout or wheel on the remote node
-  manually. Do not claim anonymous installation works before verifying it.
+- Create the matching version tag only after candidate checks pass. Upload the
+  exact bundle assets (including installer, manifest, checksums, wheel and sdist)
+  without rebuilding different bytes under the same version. Verify anonymous
+  HTTPS installation from that tag after public cutover. Until then, use local
+  bundles or approved SSH bundle transfer. Do not claim anonymous installation
+  works before verifying it; GitHub's latest-stable endpoint excludes alpha tags.
 - Validate provider versions on an authorized disposable workspace and record
   results. Unit tests, Linux tmux tests, and a Windows client smoke test do not
   establish universal native TUI fidelity or live-provider compatibility.
@@ -54,7 +60,7 @@ There is one development command (`uv run pytest`) and one packaging command
 short entry point; detailed operating contracts live in the guide. Local audit
 history is retained privately rather than repackaged as user documentation.
 
-Provider-native subprocesses, Windows/Linux dispatch, immutable identity leases,
+Provider-native subprocesses, platform dispatch, immutable identity leases,
 and fleet caching remain because they enforce current user contracts. This pass
 does not add a release daemon, generic plugin framework, new command family,
 telemetry service, or a second state store.

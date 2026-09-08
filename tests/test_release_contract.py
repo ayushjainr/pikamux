@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import tarfile
 import zipfile
@@ -19,8 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_remote_bootstrap_uses_matching_public_tag_without_github_ssh_credentials():
-    url = f"git+https://github.com/ayushjainr/pikamux.git@v{__version__}"
-    assert REMOTE_INSTALL_ARGV[-1] == url
+    url = f"https://github.com/ayushjainr/pikamux/releases/download/v{__version__}/install.sh"
+    assert REMOTE_INSTALL_ARGV[:4] == ('bash', '-o', 'pipefail', '-c')
+    assert url in shlex.split(REMOTE_INSTALL_ARGV[-1])[0]
+    assert f'--version v{__version__} --no-setup' in shlex.split(REMOTE_INSTALL_ARGV[-1])[0]
     with patch("pikamux.fleet.subprocess.run") as run:
         run.return_value = subprocess.CompletedProcess([], 0, "installed", "")
         assert SSHTransport().install("buildbox") == (0, "installed")

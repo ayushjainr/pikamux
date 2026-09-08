@@ -16,11 +16,12 @@ classifiers = [
   "Environment :: Console",
   "License :: OSI Approved :: MIT License",
   "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS :: MacOS X",
   "Operating System :: Microsoft :: Windows",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
 ]
-dependencies = []
+dependencies = ["psutil>=7.2,<8; sys_platform == 'darwin'"]
 
 [project.urls]
 Repository = "https://github.com/ayushjainr/pikamux"
@@ -36,11 +37,15 @@ pika = "pikamux.entrypoint:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/pikamux"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"install.sh" = "pikamux/install.sh"
+
 [tool.hatch.build.targets.sdist]
 include = [
   "/src/pikamux", "/tests", "/docs", "/README.md", "/LICENSE",
   "/DESIGN.md", "/CONTRIBUTING.md", "/SECURITY.md", "/CHANGELOG.md",
   "/pyproject.toml", "/uv.lock",
+  "/install.sh", "/scripts",
 ]
 
 [tool.hatch.build]

@@ -4,12 +4,12 @@ from __future__ import annotations
 import fcntl
 import os
 import pty
-import select
 import struct
 import termios
 import threading
 import time
 from dataclasses import replace
+from pty_reader import PtyReader
 
 from pikamux.models import FleetNode, Session, Status
 from pikamux.monitor import (
@@ -116,16 +116,12 @@ def _terminal():
     return master, slave
 
 
-def _read_until(fd, needle, timeout=1.0):
-    data = b""
-    needles = (needle,) if isinstance(needle, bytes) else needle
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if select.select([fd], [], [], max(0, deadline - time.monotonic()))[0]:
-            data += os.read(fd, 65536)
-            if all(value in data for value in needles):
-                return data
-    raise AssertionError(f"Missing {needle!r} in terminal output {data[-1000:]!r}")
+def _terminal_attributes(fd):
+    attributes = termios.tcgetattr(fd)
+    # Darwin sets PENDIN when canonical input must be reprocessed. It is a
+    # kernel queue flag, not a user terminal preference changed by the board.
+    attributes[3] &= ~getattr(termios, "PENDIN", 0)
+    return attributes
 
 
 def test_cached_board_is_usable_while_local_and_remote_scans_are_blocked():
@@ -158,18 +154,19 @@ def test_cached_board_is_usable_while_local_and_remote_scans_are_blocked():
             return 0
 
     master, slave = _terminal()
+    reader = PtyReader(master)
     thread = threading.Thread(target=lambda: run_monitor(Pika(), input_fd=slave, output_fd=slave))
     try:
         started = time.monotonic()
         thread.start()
         # A PTY read may stop halfway through a frame; the footer is not
         # necessarily in the same chunk as the row near the top.
-        output = _read_until(master, (b"cached-agent", b"LAST KNOWN"), timeout=.5)
+        output = reader.until((b"cached-agent", b"LAST KNOWN"), timeout=.5)
         assert time.monotonic() - started < .5
         assert b"LAST KNOWN" in output
         os.write(master, b"\r")
         assert opened.wait(.5), "Cached row must be actionable before scans finish"
-        _read_until(master, b"cached-agent")
+        reader.until(b"cached-agent")
         os.write(master, b"q")
         thread.join(.5)
         assert not thread.is_alive(), "Offline node cannot block exit either"
@@ -178,6 +175,7 @@ def test_cached_board_is_usable_while_local_and_remote_scans_are_blocked():
         if thread.is_alive():
             os.write(master, b"q")
             thread.join(1)
+        reader.close()
         os.close(master)
         os.close(slave)
 
@@ -185,8 +183,11 @@ def test_cached_board_is_usable_while_local_and_remote_scans_are_blocked():
 def test_attach_detach_returns_to_filtered_selection_with_native_terminal():
     items = [Session("codex", name, name=name, status="PARKED") for name in ["alpha", "beta"]]
     opened = []
+    restored = []
+    open_event = threading.Event()
     master, slave = _terminal()
-    original = termios.tcgetattr(slave)
+    reader = PtyReader(master)
+    original = _terminal_attributes(slave)
 
     class Pika:
         store = _CacheStore(items)
@@ -195,27 +196,33 @@ def test_attach_detach_returns_to_filtered_selection_with_native_terminal():
             return list(reversed(items))
 
         def open(self, selected, attach=True):
-            assert termios.tcgetattr(slave) == original
+            restored.append(_terminal_attributes(slave))
             opened.append(selected.session_id)
+            open_event.set()
             return 0
 
     thread = threading.Thread(target=lambda: run_monitor(Pika(), input_fd=slave, output_fd=slave))
     try:
         thread.start()
-        _read_until(master, b"alpha")
+        reader.until(b"alpha")
         os.write(master, b"/beta\r\r")
-        _read_until(master, b"/ beta")
+        assert open_event.wait(1)
+        reader.until(b"/ beta")
         assert opened == ["beta"]
+        assert restored == [original]
+        open_event.clear()
         os.write(master, b"\r")
-        _read_until(master, b"/ beta")
+        assert open_event.wait(1)
+        reader.until(b"/ beta")
         assert opened == ["beta", "beta"]
         os.write(master, b"q")
         thread.join(1)
         assert not thread.is_alive()
-        assert termios.tcgetattr(slave) == original
+        assert _terminal_attributes(slave) == original
     finally:
         if thread.is_alive():
             os.write(master, b"q")
             thread.join(1)
+        reader.close()
         os.close(master)
         os.close(slave)
