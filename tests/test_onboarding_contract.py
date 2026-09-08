@@ -84,6 +84,27 @@ def test_explicit_bulk_import_survives_walkthrough_skip(setup_context):
     pika.import_candidate.assert_called_once_with(candidate)
 
 
+@pytest.mark.parametrize("decision", ["approve", "decline", "dry-run"])
+def test_setup_skill_uses_the_same_approval_boundary(setup_context, monkeypatch, tmp_path, capsys, decision):
+    from pikamux.setup_hooks import FileChange, apply_changes
+    from pikamux.skill_package import skill_text
+
+    pika, args, _ = setup_context
+    target = tmp_path / "skills/agent-convo/SKILL.md"
+    monkeypatch.setattr(cli, "proposed_changes", lambda *_, **__: [FileChange(target, "", skill_text())])
+    monkeypatch.setattr(cli, "apply_changes", apply_changes)
+    monkeypatch.setattr("builtins.input", lambda _: "y" if decision == "approve" else "n")
+    args.dry_run = decision == "dry-run"
+    assert cli._setup(pika, args) == 0
+    output = capsys.readouterr().out
+    assert "Install bundled agent-convo skill" in output
+    assert target.exists() is (decision == "approve")
+    if decision == "approve":
+        assert target.read_text() == skill_text()
+        assert "Agent-convo skill installed" in output
+    pika.consultation.assert_not_called()
+
+
 def test_browse_all_is_explicit_but_does_not_automatically_add(setup_context):
     pika, args, _ = setup_context
     args.browse_all = True

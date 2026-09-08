@@ -23,6 +23,7 @@ from .paths import (
 )
 from .executables import configured_executable, executable_available
 from .expert_schedule import unit_contents
+from .skill_package import skill_text
 from .store import DEFAULT_CONFIG
 
 CODEX_EVENTS = (
@@ -184,6 +185,7 @@ class FileChange:
     path: Path
     before: str
     after: str
+    notice: str | None = None
 
     @property
     def changed(self) -> bool:
@@ -498,6 +500,30 @@ def pika_config_change(
     return FileChange(target, before, after)
 
 
+def _linked_skill_path(path: Path) -> bool:
+    return any(item.is_symlink() for item in (path, path.parent, path.parent.parent))
+
+
+def skill_setup_changes(provider_executables: dict[str, str]) -> list[FileChange]:
+    """Include the bundled skill in the existing setup preview/approval batch."""
+    roots = {"codex": codex_home(), "claude": claude_home(), "opencode": opencode_config_home()}
+    content = skill_text()
+    changes = []
+    for provider, root in roots.items():
+        if not executable_available(provider_executables.get(provider)):
+            continue
+        target = root / "skills" / "agent-convo" / "SKILL.md"
+        if _linked_skill_path(target):
+            changes.append(FileChange(target, "", "", notice=(
+                f"{provider} agent-convo: externally managed symlink kept at {target}. "
+                "Update it through its existing skill manager; Pika has not replaced it."
+            )))
+            continue
+        before = target.read_text(encoding="utf-8") if target.exists() else ""
+        changes.append(FileChange(target, before, content))
+    return changes
+
+
 def proposed_changes(
     default_provider: str,
     machine_alias: str | None = None,
@@ -521,10 +547,20 @@ def proposed_changes(
         FileChange(path, path.read_text() if path.exists() else "", content)
         for path, content in unit_contents(runtime_path=provider_runtime_path).items()
     )
+    changes.extend(skill_setup_changes(provider_executables or {}))
     return changes
 
 
 def apply_changes(changes: list[FileChange]) -> list[Path]:
+    # A skill may be managed by another tool between preview and approval.
+    # Revalidate the whole skill batch before writing any configuration files.
+    for change in changes:
+        if change.changed and change.path.name == "SKILL.md":
+            if _linked_skill_path(change.path):
+                raise ValueError(f"Skill path became a symlink: {change.path}. Re-run pika setup.")
+            current = change.path.read_text(encoding="utf-8") if change.path.exists() else ""
+            if current != change.before:
+                raise ValueError(f"Skill changed since preview: {change.path}. Re-run pika setup.")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backups: list[Path] = []
     for change in changes:

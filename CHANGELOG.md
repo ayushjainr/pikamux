@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Include the bundled agent-convo skill in setup for installed Codex, Claude,
+  and OpenCode providers, using the existing preview and approval step. Back up
+  replaced instructions, preserve other resources, and leave externally managed
+  symlinks alone with a notice. No separate skill-install command is required
+  when accepting setup. `--no-setup` and dry runs remain non-mutating.
+
 ## 0.5.0a1 — first public alpha
 
 Distributed through GitHub Releases, not PyPI. Historical 0.4.4 tags do not

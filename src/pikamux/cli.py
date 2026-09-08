@@ -1615,12 +1615,19 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
         provider_runtime_path=runtime_path,
     )
     changed = [item for item in changes if item.changed]
+    for change in changes:
+        if getattr(change, "notice", None):
+            print(f"Skill notice · {change.notice}")
     if changed:
         print("Pika proposes these configuration changes:\n")
         for change in changed:
-            print(change.diff())
+            if change.path.name == "SKILL.md" and not change.before:
+                print(f"Install bundled agent-convo skill → {change.path}\n"
+                      "  Preview its instructions with `pika skill show`.\n")
+            else:
+                print(change.diff())
     else:
-        print("Pika hooks and configuration are already installed.")
+        print("Pika hooks, skills and configuration are already current where managed by Pika.")
     if args.dry_run:
         print("Dry run only · no files changed.")
         return 0
@@ -1640,6 +1647,9 @@ def _setup(pika: Pika, args: argparse.Namespace) -> int:
     backups = apply_changes(changes) if changed else []
     for backup in backups:
         print(f"Backup: {backup}")
+    for change in changes:
+        if change.path.name == "SKILL.md" and not getattr(change, "notice", None):
+            print(f"Agent-convo skill {'installed' if change.changed else 'current'} · {change.path}")
     schedule_in_scope = any(
         change.path.name in {SERVICE_NAME, TIMER_NAME, LAUNCHD_NAME} for change in changes
     )
