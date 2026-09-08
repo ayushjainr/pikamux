@@ -667,10 +667,15 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(pika.usage_calls, calls_after_hiding)
 
     def test_runtime_keeps_multi_turn_ephemeral_ask_inside_monitor(self) -> None:
+        for delayed in (False, True):
+            with self.subTest(delayed_inventory_and_answers=delayed):
+                self._check_runtime_inline_ask(delayed=delayed)
+
+    def _check_runtime_inline_ask(self, *, delayed: bool) -> None:
         session = Session(
             "codex",
             "ask-parent",
-            name="expert",
+            name="inline-ask-test-expert",
             transcript_path="/tmp/expert.jsonl",
             status=Status.PARKED.value,
         )
@@ -683,7 +688,16 @@ class MonitorTests(unittest.TestCase):
             store = FakeStore()
             discovery_errors: list[str] = []
 
+            def __init__(self):
+                self.initial_refresh = True
+
             def refresh(self, *, usage=False):
+                if self.initial_refresh:
+                    self.initial_refresh = False
+                    if delayed:
+                        # Deliberately exceed the former 80ms startup guess.
+                        # Readiness must follow the rendered row, not elapsed time.
+                        time.sleep(0.2)
                 return [session]
 
             def next_attention(self, _sessions=None):
@@ -703,6 +717,9 @@ class MonitorTests(unittest.TestCase):
             def ask(self, question):
                 questions.append(question)
                 (first_seen if len(questions) == 1 else second_seen).set()
+                if delayed:
+                    # Receipt alone does not mean the next turn is writable.
+                    time.sleep(0.2)
                 return f"answer to {question}"
 
             def close(self):
@@ -710,25 +727,12 @@ class MonitorTests(unittest.TestCase):
 
         consultation = FakeConsultation()
         master, slave = pty.openpty()
-        os.set_blocking(master, False)
         fcntl.ioctl(
             slave,
             termios.TIOCSWINSZ,
             struct.pack("HHHH", 24, 120, 0, 0),
         )
-        stop_drain = threading.Event()
-
-        def drain_output():
-            while not stop_drain.is_set():
-                try:
-                    os.read(master, 65_536)
-                except BlockingIOError:
-                    time.sleep(0.01)
-                except OSError:
-                    return
-
-        drainer = threading.Thread(target=drain_output, daemon=True)
-        drainer.start()
+        reader = PtyReader(master)
         result: list[int] = []
         thread = threading.Thread(
             target=lambda: result.append(
@@ -745,34 +749,38 @@ class MonitorTests(unittest.TestCase):
                 "pikamux.monitor.consultation_for", return_value=consultation
             ):
                 thread.start()
-                time.sleep(0.08)
+                # The first frame can precede asynchronous inventory loading.
+                # Sending `a` after a fixed sleep can therefore find no target
+                # on a busy CI runner. Wait for the actual selectable row.
+                reader.until(b"inline-ask-test-expert", timeout=5.0)
                 os.write(master, b"a")
-                time.sleep(0.08)
+                reader.until(b"SIDE RECEIPT // EPHEMERAL", timeout=5.0)
                 self.assertTrue(thread.is_alive())
                 os.write(master, b"first\r")
-                self.assertTrue(first_seen.wait(1.0))
-                time.sleep(0.08)
+                self.assertTrue(first_seen.wait(5.0))
+                # The worker receiving a question is not the same as the UI
+                # applying its answer and accepting the next turn's input.
+                reader.until(b"AGENT // answer to first", timeout=5.0)
                 os.write(master, b"second\r")
-                self.assertTrue(second_seen.wait(1.0))
-                time.sleep(0.08)
+                self.assertTrue(second_seen.wait(5.0))
+                reader.until(b"AGENT // answer to second", timeout=5.0)
                 self.assertTrue(thread.is_alive())
                 os.write(master, b"\x1b")
-                time.sleep(0.08)
+                reader.until(b"Enter open", timeout=5.0)
                 self.assertTrue(thread.is_alive())
                 os.write(master, b"q")
-                thread.join(1.0)
+                thread.join(5.0)
         finally:
             if thread.is_alive():
                 os.write(master, b"\x1bq")
-                thread.join(1.0)
-            stop_drain.set()
-            drainer.join(0.2)
+                thread.join(5.0)
+            reader.close()
             os.close(master)
             os.close(slave)
         self.assertFalse(thread.is_alive())
         self.assertEqual(result, [0])
         self.assertEqual(questions, ["first", "second"])
-        self.assertTrue(consultation.closed.wait(1.0))
+        self.assertTrue(consultation.closed.wait(5.0))
 
     def test_runtime_does_not_quit_on_fragmented_arrow_key(self) -> None:
         sessions = [

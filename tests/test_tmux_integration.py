@@ -28,9 +28,13 @@ from pikamux.tmux import Tmux, WINDOWS_TERMINAL_DA2_RESPONSE
 
 
 class FakeProvider:
-    def __init__(self, name: str, candidates: list[Candidate] | None = None):
+    def __init__(self, name: str, script_dir: Path, candidates: list[Candidate] | None = None):
         self.name = name
         self.candidates = candidates or []
+        # A named script remains visible after macOS framework Python re-execs;
+        # exec -a only worked with the local standalone Python distribution.
+        self.script = script_dir / name
+        self.script.write_text("import time; time.sleep(30)\n")
 
     def discover(self) -> list[Candidate]:
         return self.candidates
@@ -49,15 +53,7 @@ class FakeProvider:
 
     def new_argv(self, _name: str, _session_id: str | None = None) -> list[str]:
         identity = _session_id or "pending"
-        return [
-            "bash",
-            "-lc",
-            (
-                f"exec -a {shlex.quote(self.name)} {shlex.quote(sys.executable)} -c "
-                f"{shlex.quote('import time; time.sleep(30)')} "
-                f"{shlex.quote(identity)}"
-            ),
-        ]
+        return [sys.executable, str(self.script), identity]
 
     def resume_argv(self, _session_id: str) -> list[str]:
         return self.new_argv("resume", _session_id)
@@ -430,7 +426,7 @@ time.sleep(2)
         assert initial_pid is not None
         # Simulate the lifecycle hook's independent UUID-to-PID proof.
         self.store.set_live_owner("codex", session_id, initial_pid)
-        pika = Pika(self.store, self.tmux, {"codex": FakeProvider("codex")})
+        pika = Pika(self.store, self.tmux, {"codex": FakeProvider("codex", Path(self.temp.name))})
         self.assertEqual(
             pika.open(self.store.get_session("codex", session_id), attach=False),
             0,
@@ -492,7 +488,7 @@ time.sleep(2)
         self.assertIsNotNone(live_pid)
         assert live_pid is not None
         os.kill(live_pid, signal.SIGTERM)
-        pika = Pika(self.store, self.tmux, {"codex": FakeProvider("codex")})
+        pika = Pika(self.store, self.tmux, {"codex": FakeProvider("codex", Path(self.temp.name))})
         current = self.wait_for_stably_idle_pane(pika, old.pane_id)
         self.tmux.run("send-keys", "-t", old.pane_id, "sleep 30", "Enter")
         deadline = time.time() + 3
@@ -518,7 +514,7 @@ time.sleep(2)
         self.assertIsNotNone(self.wait_for_provider(replacement.pane_pid, "codex"))
 
     def test_new_binds_provider_uuid_and_adopt_finds_exact_identity(self) -> None:
-        provider = FakeProvider("claude")
+        provider = FakeProvider("claude", Path(self.temp.name))
         pika = Pika(self.store, self.tmux, {"claude": provider})
         with patch("pikamux.core.hooks_installed", return_value=True):
             self.assertEqual(pika.new("new-thread", "claude", "/tmp", attach=False), 0)

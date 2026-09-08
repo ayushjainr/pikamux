@@ -23,13 +23,20 @@ def test_native_birth_stamp_and_parent_are_fresh():
     assert not processes.can_signal_exact_process()
 
 
-def test_native_exact_argv_tree_duplicates_and_exit():
+@pytest.mark.parametrize("interpreter", [sys.executable, "/usr/bin/python3"])
+def test_native_exact_argv_tree_duplicates_and_exit(tmp_path, interpreter):
     identity = str(uuid.uuid4())
-    # Use the actual standalone test interpreter. Apple's system Python
-    # launcher re-execs a framework binary, intentionally losing exec -a.
-    command = ["codex", "-c", "import time; time.sleep(30)", identity, "two words"]
-    children = [subprocess.Popen(command, executable=sys.executable) for _ in range(2)]
+    if not os.path.isfile(interpreter):
+        pytest.skip("optional Apple framework interpreter is unavailable")
+    # Script identity survives framework Python's argv[0] rewrite. Exercise
+    # both the test runtime and Apple's launcher without forging argv[0].
+    script = tmp_path / "codex"
+    script.write_text("import time; time.sleep(30)\n")
+    command = [interpreter, str(script), identity, "two words"]
+    children = []
     try:
+        for _ in range(2):
+            children.append(subprocess.Popen(command))
         deadline = time.monotonic() + 3
         expected = {p.pid for p in children}
         while time.monotonic() < deadline:
