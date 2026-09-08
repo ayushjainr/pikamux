@@ -1,0 +1,7 @@
+{
+  "name": "pika-launch-film",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Deterministic HTML/CSS launch film; not a Pika runtime dependency",
+  "devDependencies": {"playwright-core": "1.50.1"}
+}
