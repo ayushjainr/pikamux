@@ -1,117 +1,124 @@
 # Pika
 
-**A terminal home for your coding agents—and a way for them to consult each other.**
+**One home for your coding agents. A way for their work to connect.**
 
-Pika connects your existing **Codex, Claude Code and OpenCode** conversations.
-Your agents can find relevant experience from earlier work and ask focused
-questions in a separate consultation. You get one board to see who needs you,
-check results and return to a conversation.
+Bring your **Codex, Claude Code, and OpenCode** conversations into one terminal
+board. See what needs you, return to work by name, and let agents consult relevant
+experience from your other projects.
 
-[![Pika in 60 seconds: agents consult prior expertise while the original keeps working; one board for conversations across machines](media/demo/pika.gif)](media/demo/pika.mp4)
+https://github.com/user-attachments/assets/91c07810-e304-4ab5-a533-e2b05351a73e
 
-[Watch the 60-second video with sound](media/demo/pika.mp4) · Illustrative demo
+*Pika in 60 seconds · Illustrative demo*
 
-## Borrow the experience. Keep the work moving.
+- **Know where you're needed.** Distinguish requests for your input from work in
+  progress and completed results.
+- **Pick up where you left off.** Open a conversation by name or from the board,
+  in its original agent interface.
+- **Connect relevant work.** Let your agent find a project expert and consult its
+  existing context while the original conversation keeps working.
 
-An agent adding CSV downloads to a support inbox needs export rules. A reporting
-project already worked them out. Through Pika, the support agent finds that
-project's expert card, consults its existing context and checks the referenced
-file. Meanwhile, the original reporting agent keeps working on its own task.
-The consultation's questions and answers do not enter its main conversation.
+## Get started
 
-- **Find expertise.** Expert cards summarize a conversation's scope, topics and
-  relevant artifacts. Your agent searches these cards, not every old transcript.
-- **Consult without interrupting.** The included `agent-convo` skill lets your
-  agent open a separate side consultation when prior work would help.
-- **See what needs you.** The live board distinguishes working agents, results
-  and requests for your input. Peek at a result or stop watching without deleting
-  the conversation's history.
-- **Return by name.** Run `pika NAME`, or select a conversation on the board, to
-  reopen it in its native agent interface. Pika manages the tmux home and checks
-  the conversation's identity before attaching.
-- **Connect your machines.** Discover and select trusted SSH/Tailscale machines
-  during setup. Monitor and consult across them with Pika installed on each.
-  One laptop is enough to start.
+Pika runs on **macOS and Linux**. You need **tmux** and at least one agent CLI
+installed and signed in: Codex, Claude Code, or OpenCode (1.18.21+).
+One machine is enough.
 
-## Install
-
-Requires **macOS or Linux**, **tmux**, and at least one supported agent CLI,
-already installed and signed in. Pika's installer handles its own Python runtime
-and gives platform-specific instructions if tmux is missing.
+Install the current alpha, **v0.5.0a3**:
 
 ```bash
 curl -fsSL https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a3/install.sh | bash -s -- --version v0.5.0a3
 ```
 
-You can [read the installer](https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a3/install.sh)
-before running it. Pika installs to your user account and asks before changing
-shell or agent settings. Existing configuration is backed up.
+The [installer](https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a3/install.sh)
+handles Python and offers setup. It asks before changing shell or agent settings
+and backs up existing configuration. See the [installation guide](docs/installing.md)
+for prerequisites and troubleshooting.
 
-**Current release: v0.5.0a3 (alpha).** Consultations with some newer Codex
-conversations require the source-preview version; see
-[compatibility and setup](docs/first-consultation.md#release-compatibility).
-Native Windows agent hosting is not supported; the optional Windows client
-bridge is experimental. See [platform support](docs/guide.md#install-a-pika-node).
-
-## Start with one conversation
-
-1. **Approve setup.** The installer offers onboarding; run `pika setup` if you
-   skipped it. Review the proposed integrations and included `agent-convo` skill,
-   then choose an existing conversation. In Codex, review and trust hooks through
-   `/hooks`.
-2. **Make it discoverable.** Follow the [first-consultation guide](docs/first-consultation.md)
-   to publish or generate its expert card. Skip this if it already has a useful
-   card. Setup does not create missing cards or interview agents automatically.
-3. **Give your current agent a task**, and tell it:
-
-   > Use agent-convo when relevant prior work would help. Look for an expert,
-   > consult it if needed, check the evidence and continue the task.
-
-Your agent handles discovery and consultation; you do not need to choose the
-expert or relay its answer. Creating a card by interview and consulting an
-expert use provider quota. Card searches and ordinary board views do not.
+1. **Choose your conversations.** Review setup and select an existing conversation.
+   Run `pika setup` if you skipped onboarding. In Codex, review and trust the
+   integration through `/hooks`.
+2. **Open the board.** Run `pika`, select a conversation, and press **Enter**.
+   Use **Ctrl-b**, then **d**, to detach and return to Pika while the agent keeps
+   running.
 
 ## Everyday use
 
 ```bash
-pika                 # Open the live board
-pika support-inbox   # Open a conversation by name
-pika setup           # Review integrations, conversations and machines
-pika update          # Check for and install an update with approval
+pika          # Open the board
+pika NAME     # Open or create a named conversation
+pika setup    # Review hooks and agent integrations
+pika update   # Review and install an available update
 ```
 
-On the board, use **↑↓** or **j/k** to choose, **Enter** to open, **/** to filter,
-**p** to peek and **x** to stop watching. Press **q** to leave the board.
-Detach from an agent with **Ctrl-b d** to return to Pika while it keeps running.
+Replace `NAME` with your conversation's name. Pika opens it if it exists, asks
+you to choose when the match is ambiguous, or creates a conversation for a new
+name. If an agent is already running elsewhere, Pika explains the safe handover
+steps instead of opening a duplicate.
 
-If an agent is already running outside its Pika home, Pika gives you the safe
-handover steps instead of opening a duplicate conversation.
+| On the board | Action |
+| --- | --- |
+| **↑↓** or **j/k**, then **Enter** | Select and open a conversation |
+| **/** | Filter conversations |
+| **p** | Peek at a result |
+| **x** | Stop watching; keep the agent running and its history |
+| **q** | Leave the board |
 
-Installer-managed boards check for updates in the background. Press **U** when
-an update is available to review and approve it; your agents stay running.
+Installer-managed copies show update notices on the board. Press **U** to review
+an update; installation requires your approval and leaves running agents alone.
 See [installation and updates](docs/installing.md) for other install methods.
 
-## Privacy and compatibility
+## Let your agents consult prior work
 
-Pika stores operational metadata and expert cards locally. “Private consultation”
-means separate from the original conversation—not offline: your model provider
-still processes the consultation. Only machines you approve are connected.
+The included **agent-convo** skill gives your agents access to relevant project
+experience. Expert cards describe each conversation's scope, topics, and artifacts
+so an agent can find the right context without searching every transcript.
 
-Consultation capabilities and side-session cleanup vary by provider and version.
-Exact recovery depends on the original host and provider history remaining
-available. Read the [security and privacy notes](SECURITY.md) before using
-sensitive work, and the [operating guide](docs/guide.md) for provider-specific
-behavior and troubleshooting.
+For example, a dashboard agent deciding how to display missing data can consult
+the pipeline project about why it preserved gaps instead of filling them. The
+dashboard agent checks the referenced test, then applies the decision to its chart.
+The exchange happens in a separate consultation; its questions and answers do not
+enter the original conversation.
 
-Pika is an independent open-source project, not affiliated with OpenAI,
-Anthropic or OpenCode. It works with your agent tools rather than replacing them.
+When you're ready, follow the [first-consultation guide](docs/first-consultation.md)
+to prepare one expert card. Then give your agent a task and tell it:
 
-## More
+> Use agent-convo when relevant prior work would help. Check the evidence and
+> continue the task.
 
-- [First consultation](docs/first-consultation.md)
+Card searches and ordinary board views make no model calls. Card interviews and
+consultations use your provider quota.
+
+**Compatibility:** v0.5.0a3 cannot consult some newer Codex conversations.
+Claude consultations require CLI 2.1.228+. Check the
+[consultation compatibility notes](docs/first-consultation.md#release-compatibility)
+before your first consultation.
+
+## Across your machines
+
+Add trusted SSH or Tailscale machines to monitor and consult their conversations
+from the same board. Pika must be installed on each machine; you choose which
+machines to connect. Start locally and add others when you need them.
+
+See the [machine setup guide](docs/guide.md#multiple-machines).
+Native Windows agent hosting is not supported; the Windows client bridge is
+experimental.
+
+## Privacy
+
+Pika stores operational metadata and expert cards locally. Consultations are
+separate from the original conversation, but your model provider still processes
+them. Side-session storage and cleanup vary by provider and version. Returning to
+a conversation requires its original host and provider history to remain available.
+See [security and privacy](SECURITY.md) for the boundaries.
+
+## Documentation
+
 - [Operating guide](docs/guide.md)
+- [First consultation](docs/first-consultation.md)
 - [Installation and updates](docs/installing.md)
-- [Architecture](DESIGN.md)
-- [Contributing](CONTRIBUTING.md)
+- [Architecture](DESIGN.md) · [Contributing](CONTRIBUTING.md)
 
-Maintained by [Ayush Jain](https://ayushjainr.com). Licensed under [MIT](LICENSE).
+Pika is an independent open-source project, not affiliated with OpenAI, Anthropic,
+or OpenCode.
+
+Maintained by [Ayush Jain](https://ayushjainr.com). [MIT license](LICENSE).
