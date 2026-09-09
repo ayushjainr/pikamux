@@ -9,7 +9,7 @@ check results and return to a conversation.
 
 [![Pika in 60 seconds: agents consult prior expertise while the original keeps working; one board for conversations across machines](media/demo/pika.gif)](media/demo/pika.mp4)
 
-[Watch the 60-second video](media/demo/pika.mp4) · Illustrative demo
+[Watch the 60-second video with sound](media/demo/pika.mp4) · Illustrative demo
 
 ## Borrow the experience. Keep the work moving.
 

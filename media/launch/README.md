@@ -1,7 +1,8 @@
 # Pika video
 
 [Watch the 60-second tour](../demo/pika.mp4). The repository README embeds its
-[animated preview](../demo/pika.gif).
+[animated preview](../demo/pika.gif). The MP4 includes music; the animated preview
+is silent.
 
 The film shows an agent discovering prior expertise and consulting it while the
 original agent keeps working, followed by the board, conversation recovery,
