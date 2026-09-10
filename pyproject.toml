@@ -49,7 +49,10 @@ include = [
 ]
 
 [tool.hatch.build]
-exclude = ["**/__pycache__", "**/*.pyc", "**/*.pika-backup*", "**/pika-skill-backup-*", "**/*.local.md"]
+exclude = [
+  "**/__pycache__", "**/*.pyc", "**/*.pika-backup*", "**/pika-skill-backup-*", "**/*.local.md",
+  "/docs/launch-playbook.md", "/docs/campaign-*.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

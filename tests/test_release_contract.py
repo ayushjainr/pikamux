@@ -44,13 +44,34 @@ def test_package_and_runtime_versions_match():
 
 
 def test_documentation_links_resolve():
-    documents = [ROOT / name for name in ("README.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md")]
-    documents.extend((ROOT / "docs").glob("*.md"))
+    if (ROOT / ".git").exists():
+        tracked = subprocess.run(["git", "ls-files", "-z", "*.md"], cwd=ROOT,
+                                 capture_output=True, text=True, check=True).stdout
+        documents = [ROOT / name for name in tracked.split("\0") if name]
+        published = set(subprocess.run(["git", "ls-files", "-z"], cwd=ROOT,
+                                      capture_output=True, text=True, check=True).stdout.split("\0"))
+    else:
+        documents = [*ROOT.glob("*.md"), *(ROOT / "docs").glob("*.md")]
+        published = None
     for document in documents:
         for target in re.findall(r"\]\(([^)]+)\)", document.read_text()):
             if "://" in target or target.startswith("#"):
                 continue
-            assert (document.parent / target.split("#", 1)[0]).exists(), (document.name, target)
+            path = (document.parent / target.split("#", 1)[0]).resolve()
+            assert path.exists(), (document.name, target)
+            if published is not None and path.is_file():
+                assert path.relative_to(ROOT).as_posix() in published, (document.name, target)
+
+
+def test_user_documentation_has_no_editorial_handoff_notes():
+    documents = [ROOT / name for name in ("README.md", "SECURITY.md", "CONTRIBUTING.md",
+                 "docs/first-consultation.md", "docs/installing.md", "docs/releasing.md")]
+    forbidden = ("the user rejected", "the user approved", "narrative revision pending",
+                 "rory-inspired", "hopkins-inspired", "agent review score",
+                 "public installer is pinned", "prepared candidate is")
+    for document in documents:
+        text = document.read_text().lower()
+        assert not any(phrase in text for phrase in forbidden), document.name
 
 
 def test_no_maintainer_home_dependency_in_tests():
@@ -62,7 +83,11 @@ def test_no_maintainer_home_dependency_in_tests():
 @pytest.mark.skipif(not (ROOT / ".git").exists(), reason="gitignore checks need a checkout")
 def test_local_state_and_credentials_are_ignored():
     paths = [".env", "auth.json", "pika.db", "pika.db-wal", "session.jsonl",
-             "private.pem", "id_ed25519", "IMPLEMENTATION_STATUS.md", "audit.local.md"]
+             "private.pem", "id_ed25519", "IMPLEMENTATION_STATUS.md", "audit.local.md",
+             "docs/launch-playbook.md", "docs/campaign-brief.md", "docs/campaign-posts.md",
+             "docs/campaign-rollout.md", "media/launch/SCRIPT.md", "media/launch/STORYBOARD.md",
+             "media/launch/CROSS_PROJECT_CAPTURE.md", "media/launch/CROSS_PROJECT_FILM.md",
+             "media/launch/CAMPAIGN_VIDEO.md", "media/launch/CAMPAIGN_OVERVIEW_STORYBOARD.md"]
     result = subprocess.run(
         ["git", "check-ignore", "--no-index", "--stdin"], input="\n".join(paths),
         cwd=ROOT, text=True, capture_output=True, check=True,
@@ -89,3 +114,5 @@ def test_distributions_contain_only_public_artifacts():
             assert not any(part in {".git", ".env", "__pycache__", "release-audit"} for part in Path(name).parts), name
             assert not name.endswith((".pyc", ".db", ".sqlite", ".jsonl", ".pem", ".key", ".local.md")), name
             assert "IMPLEMENTATION_STATUS" not in name and "pika-backup" not in name and "pika-skill-backup" not in name, name
+            assert Path(name).name != "launch-playbook.md", name
+            assert not (Path(name).name.startswith("campaign-") and name.endswith(".md")), name

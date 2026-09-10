@@ -140,12 +140,11 @@ uv sync --locked --group dev
 uv run pika --help
 ```
 
-The checkout must include commit `6b8af0f` to test the newer paginated Codex
-parent fix. Check that locally with `git merge-base --is-ancestor 6b8af0f HEAD`
-(exit status 0 means it is included). These instructions do not imply that an
-unpublished commit is obtainable from a public release or remote branch.
+For the newer paginated Codex history fix, the checkout must include commit
+`6b8af0f`. Verify with `git merge-base --is-ancestor 6b8af0f HEAD`;
+exit status 0 means it is included.
 
-For approved live testing, `uv run pika setup` previews configuration from this
+For live testing, `uv run pika setup` previews configuration from this
 checkout. The consulting agent must also resolve this checkout's Pika, not an
 older installed launcher. In a dedicated test shell inside the checkout, activate
 its environment with `source .venv/bin/activate`, verify `command -v pika`, then
@@ -156,8 +155,7 @@ assume `pika --version` alone proves a source-only fix is present.
 
 Source preview is not a release upgrade. It can share your existing Pika state;
 setup is a real, previewed configuration change and consultations use real
-provider quota. Run the automated development tests before live trials, and
-keep the public installer pinned to a published, verified release.
+provider quota. Run the automated development tests before live trials.
 
 ## Other machines, including private releases
 
@@ -169,8 +167,7 @@ of asking each machine for GitHub credentials:
 pika machine upgrade devbox
 ```
 
-`machines` remains an alias-compatible existing spelling. From a development
-checkout or when explicitly choosing a matching bundle:
+From a development checkout or when choosing a matching bundle:
 
 ```bash
 pika machine upgrade devbox --bundle /path/to/pika-release
@@ -188,7 +185,7 @@ so a repointed SSH alias does not silently authorize changing a different node.
 Confirmation is required before remote installation, except an
 explicit `machine upgrade --yes`. No machines are updated automatically.
 
-## Maintainer: prepare a private bundle
+## Build a release bundle
 
 ```bash
 uv run python scripts/build_release.py --output dist/new-candidate
@@ -197,4 +194,4 @@ uv run python scripts/build_release.py --output dist/new-candidate
 The output must not exist. It contains wheel, sdist, `install.sh`,
 `pika-release.json`, and `SHA256SUMS`. This builds local files; it neither uploads
 nor changes GitHub visibility. Follow the [release checklist](releasing.md)
-before publishing any artifact or advertising a public install command.
+before publishing.

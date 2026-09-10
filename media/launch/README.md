@@ -1,17 +1,16 @@
 # Pika video
 
-[Watch the 60-second tour](../demo/pika.mp4). The repository README embeds its
-[animated preview](../demo/pika.gif). The MP4 includes music; the animated preview
-is silent.
+[Watch Pika in action](../../README.md#pika).
 
-The film shows an agent discovering prior expertise and consulting it while the
-original agent keeps working, followed by the board, conversation recovery,
-trusted machines and first-time setup. The projects and interfaces are
+The film starts with the board and returning to a conversation by name, then
+shows an agent discovering prior expertise and consulting it while the original
+agent keeps working. It closes with trusted machines and setup: use the board
+first, then add expert cards for consultations. The projects and interfaces are
 illustrative. No live conversations or credentials are used to render it.
 
-## Build
+## Build the earlier experience tour
 
-The current source is [experience-tour.html](experience-tour.html) and
+The earlier tour uses [experience-tour.html](experience-tour.html) and
 [experience-tour.js](experience-tour.js). It uses local HTML/CSS and deterministic
 animation. Rendering requires Node.js, Chrome, Playwright and FFmpeg:
 
@@ -31,3 +30,7 @@ Open the HTML file for an interactive preview: Space pauses, arrow keys seek,
 and `?t=19` starts at a specific time. Earlier film sources remain available in
 this directory. Browser and encoder packages are video-development dependencies,
 not Pika runtime requirements.
+
+The `proof/` directory contains a separate synthetic retry fixture used in an
+earlier demo. Run `python3 media/launch/check_evidence.py` from the repository
+root to verify it. Its results describe that fixture, not production performance.

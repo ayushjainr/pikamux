@@ -1,5 +1,5 @@
 // Actual selected metadata from Pika's synthetic refund expert interview and search.
-// Display is designed; full capture/protocol details are in STORYBOARD.md.
+// Designed display; the synthetic fixture's evidence is in proof/evidence.json.
 window.PIKA_DISCOVERY = {
   "query": "refund",
   "name": "refund-retries",

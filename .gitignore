@@ -43,3 +43,13 @@ htmlcov/
 .DS_Store
 .wheel-check/
 .sdist-check/
+
+# Local campaign planning and historical capture notes.
+/docs/launch-playbook.md
+/docs/campaign-*.md
+/media/launch/SCRIPT.md
+/media/launch/STORYBOARD.md
+/media/launch/CROSS_PROJECT_CAPTURE.md
+/media/launch/CROSS_PROJECT_FILM.md
+/media/launch/CAMPAIGN_VIDEO.md
+/media/launch/CAMPAIGN_OVERVIEW_STORYBOARD.md

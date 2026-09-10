@@ -1,12 +1,8 @@
-# Your first useful consultation
+# Your first consultation
 
-The test is not “can two agents exchange messages?” It is: **can your current
-agent find earlier expertise and use it to make a better-informed decision,
-without you carrying the context between conversations?**
-
-Quick path: check compatibility → install the skill through setup → make one
-existing conversation's card available → give your current agent a real task →
-verify the cited answer and side cleanup.
+Give your current agent access to relevant experience from another conversation.
+This guide covers setup, preparing one expert card, and checking the resulting
+consultation.
 
 Start with one local project, an existing conversation that did relevant work,
 and a small next task. No second server is required. Use a project you are allowed
@@ -14,18 +10,15 @@ to share with the selected model provider; avoid sensitive work for a first tria
 
 ## Release compatibility
 
-The public installer is pinned to **0.5.0a3 (alpha)**. That release can fail when
-opening a side from a newer Codex paginated parent. Source commit `6b8af0f` adds
-the required metadata-only fork response option; it is **not included in a3**.
-The option changes the fork response, not the side's inherited conversation
-context. Do not treat a source-preview demo as proof the published package has
-that fix.
+**Pika 0.5.0a3:** consultations can fail with newer Codex conversations that use
+paginated history. The fix is available in source commit `6b8af0f`, but is not
+included in that release. It changes the provider's fork response format, not
+the context inherited by the consultation.
 
 If affected, stop that consultation and use the [source-preview path](installing.md#source-preview)
 only if you are comfortable testing a checkout, or wait for a release containing
 the fix. Do not bypass Pika, force-resume the parent, or disable identity checks.
-An ordinary receipt does not certify compatibility with every later provider
-version. Claude consultation requires CLI 2.1.228 or newer; OpenCode has temporary
+Claude consultation requires CLI 2.1.228 or newer; OpenCode has temporary
 persisted-side cleanup limits. Read [consultation boundaries](../SECURITY.md#consultation-boundaries).
 
 ## 1. Install the agent workflow

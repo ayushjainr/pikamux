@@ -8,12 +8,10 @@ provider failures.
 ## Reporting a vulnerability
 
 Do not post credentials, raw transcripts, database files, or an exploitable
-reproduction containing private information in a public issue. Use GitHub's
-private vulnerability reporting on this repository **if enabled**. If that
-option is unavailable, open an issue asking for a private contact without
-including vulnerability details. Private reporting must be verified by the
-maintainer at public launch (GitHub offers it for public repositories only);
-it is not assumed active by this document.
+reproduction containing private information in a public issue.
+[Report a vulnerability privately](https://github.com/ayushjainr/pikamux/security/advisories/new)
+through GitHub. Include the affected Pika and provider versions, reproduction
+steps, and expected impact, with credentials and personal data removed.
 
 ## What is stored and where
 
