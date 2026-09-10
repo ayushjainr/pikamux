@@ -9,7 +9,7 @@ usage() {
         '                       [--root DIRECTORY] [--bin-dir DIRECTORY]' \
         '' 'Installs Pika for your user on macOS/Linux. No sudo; profile edits require approval.' \
         '--bundle uses a private local release bundle; runtime/dependency downloads may still occur.' \
-        '--version selects a published GitHub release; otherwise the latest stable release is used.'
+        '--version selects a published GitHub release; otherwise the newest published version is used.'
 }
 
 pika_version=''
@@ -93,17 +93,21 @@ download() {
         fail 'Download failed. Check network access and the release tag. Private/unpublished releases require --bundle DIRECTORY.'
 }
 
-pika_base=https://github.com/ayushjainr/pikamux/releases/latest/download
+pika_base=''
 if [ -n "$pika_version" ]; then
     pika_base="https://github.com/ayushjainr/pikamux/releases/download/$pika_version"
 fi
 if [ -n "$pika_bundle" ]; then
     cp "$pika_bundle/pika-release.json" "$pika_tmp/pika-release.json"
-else
+elif [ -n "$pika_version" ]; then
     download "$pika_base/pika-release.json" "$pika_tmp/pika-release.json" 65536
+else
+    download 'https://api.github.com/repos/ayushjainr/pikamux/releases?per_page=100' "$pika_tmp/releases.json" 2097152
 fi
-pika_manifest_size=$(wc -c < "$pika_tmp/pika-release.json")
-[ "$pika_manifest_size" -le 65536 ] || fail 'Release manifest exceeds the 64 KiB limit. Nothing activated.'
+if [ -f "$pika_tmp/pika-release.json" ]; then
+    pika_manifest_size=$(wc -c < "$pika_tmp/pika-release.json")
+    [ "$pika_manifest_size" -le 65536 ] || fail 'Release manifest exceeds the 64 KiB limit. Nothing activated.'
+fi
 printf '%s\n' 'Preparing a private Pika runtime (no system Python changes)...'
 download "https://github.com/astral-sh/uv/releases/download/0.8.15/uv-$pika_uv_target.tar.gz" "$pika_tmp/uv.tar.gz"
 [ "$(digest "$pika_tmp/uv.tar.gz")" = "$pika_uv_sha" ] || fail 'uv checksum mismatch. Downloaded code was not executed.'
@@ -112,6 +116,45 @@ pika_uv="$pika_tmp/uv-$pika_uv_target/uv"
 "$pika_uv" --no-config python install --no-bin 3.13
 pika_python=$("$pika_uv" --no-config python find --no-project --managed-python 3.13)
 [ -x "$pika_python" ] || fail 'The managed Python runtime is unavailable.'
+
+# Resolve once, then pin both downloads to that release. GitHub's /latest
+# endpoint excludes prereleases; a fresh install must also work during alpha.
+if [ -z "$pika_bundle" ] && [ -z "$pika_version" ]; then
+    pika_version=$("$pika_python" -I - "$pika_tmp/releases.json" <<'PY'
+import json, re, sys
+from pathlib import Path
+try:
+    path = Path(sys.argv[1])
+    assert path.stat().st_size <= 2097152
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(rows, list)
+    candidates = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("draft") is not False:
+            continue
+        tag = row.get("tag_name")
+        match = re.fullmatch(r"v([0-9]+)\.([0-9]+)\.([0-9]+)(?:(a|b|rc)([0-9]+))?", tag) if isinstance(tag, str) else None
+        if not match or not isinstance(row.get("assets"), list):
+            continue
+        names = {asset.get("name") for asset in row["assets"]
+                 if isinstance(asset, dict) and asset.get("state") == "uploaded"
+                 and isinstance(asset.get("name"), str)}
+        if not {"pika-release.json", f"pikamux-{tag[1:]}-py3-none-any.whl"} <= names:
+            continue
+        major, minor, patch, phase, number = match.groups()
+        key = (int(major), int(minor), int(patch), {"a": 0, "b": 1, "rc": 2, None: 3}[phase], int(number or 0))
+        candidates.append((key, tag))
+    assert candidates
+    print(max(candidates)[1])
+except (OSError, ValueError, TypeError, AssertionError):
+    sys.exit("Pika installer: Cannot select a complete published release. Nothing activated. Retry later or use --version TAG.")
+PY
+    )
+    pika_base="https://github.com/ayushjainr/pikamux/releases/download/$pika_version"
+    download "$pika_base/pika-release.json" "$pika_tmp/pika-release.json" 65536
+    pika_manifest_size=$(wc -c < "$pika_tmp/pika-release.json")
+    [ "$pika_manifest_size" -le 65536 ] || fail 'Release manifest exceeds the 64 KiB limit. Nothing activated.'
+fi
 
 # Parse JSON with Python, not eval or shell regexes. Never follow a URL/path from the manifest.
 "$pika_python" -I - "$pika_tmp/pika-release.json" "$pika_version" > "$pika_tmp/validated" <<'PY'

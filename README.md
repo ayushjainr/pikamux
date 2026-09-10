@@ -23,13 +23,13 @@ Pika runs on **macOS and Linux**. You need **tmux** and at least one agent CLI
 installed and signed in: Codex, Claude Code, or OpenCode (1.18.21+).
 One machine is enough.
 
-Install the current alpha, **v0.5.0a3**:
+Install:
 
 ```bash
-curl -fsSL https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a3/install.sh | bash -s -- --version v0.5.0a3
+curl -fsSL https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.sh | bash
 ```
 
-The [installer](https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a3/install.sh)
+The [installer](install.sh)
 handles Python and offers setup. It asks before changing shell or agent settings
 and backs up existing configuration. See the [installation guide](docs/installing.md)
 for prerequisites and troubleshooting.

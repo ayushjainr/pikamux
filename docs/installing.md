@@ -1,10 +1,6 @@
 # Installation and updates
 
-The current public release is **0.5.0a3 (alpha)**, distributed through GitHub Releases.
-Use its explicit tag below. There is no stable release yet: GitHub's
-`releases/latest` endpoint selects stable releases, not alphas. Pika 0.5.0a3's
-channel-aware updater discovers alpha releases too; older versions need the
-tagged installer below once to gain this behavior.
+Pika is distributed through GitHub Releases.
 
 Installing Pika also offers the bundled agent workflow: your current agent can
 discover expert cards and privately consult a relevant earlier conversation.
@@ -15,22 +11,16 @@ before using a newer paginated Codex conversation as your first expert.
 
 ## Fresh Mac or Linux machine
 
+Install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.sh | bash
+```
+
 For a private release bundle supplied by the maintainer:
 
 ```bash
 bash /path/to/pika-release/install.sh --bundle /path/to/pika-release
-```
-
-Once a stable release exists, it can be installed with:
-
-```bash
-curl -fsSL https://github.com/ayushjainr/pikamux/releases/latest/download/install.sh | bash
-```
-
-For the current alpha, use its exact tag:
-
-```bash
-curl -fsSL https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a3/install.sh | bash -s -- --version v0.5.0a3
 ```
 
 Read the script before running it if you prefer. Piping a downloaded script to

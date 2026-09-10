@@ -16,6 +16,13 @@ import pytest
 
 INSTALLER = Path(__file__).resolve().parents[1] / "install.sh"
 UV_SHA = "d0fec58f3124e05e0a1af0f6541abfce4333253cdaf23c7b6bb2e6128bf138ea"
+RELEASE_API = "https://api.github.com/repos/ayushjainr/pikamux/releases?per_page=100"
+
+
+def release_row(version, **overrides):
+    return {"tag_name": f"v{version}", "draft": False, "prerelease": True,
+            "assets": [{"name": name, "state": "uploaded"} for name in
+                       ("pika-release.json", f"pikamux-{version}-py3-none-any.whl")], **overrides}
 
 
 def executable(path: Path, contents: str) -> None:
@@ -37,6 +44,7 @@ def bootstrap(tmp_path):
         archive.writestr("pikamux/installation.py", "import json,os,sys\nfrom pathlib import Path\nPath(os.environ['PIKA_TEST_TRACE']).write_text(json.dumps(sys.argv[1:]))\n")
     manifest = {"schema": 1, "version": "0.5.0a1", "wheel": wheel.name, "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()}
     (bundle / "pika-release.json").write_text(json.dumps(manifest))
+    (bundle / "releases.json").write_text(json.dumps([release_row("0.5.0a1")]))
     trace = tmp_path / "invoked.json"
     network = tmp_path / "network.log"
     uv_archive = tmp_path / "fake-uv.tar.gz"
@@ -61,7 +69,7 @@ from pathlib import Path
 args=sys.argv[1:]; url=args[-1]; output=args[args.index('--output')+1]
 with open(os.environ['PIKA_TEST_NETWORK'],'a') as stream: stream.write(url+'\\n')
 if os.environ.get('PIKA_TEST_NETWORK_FAIL'): sys.exit(22)
-source=Path(os.environ['PIKA_TEST_UV_ARCHIVE']) if '/astral-sh/uv/' in url else Path(os.environ['PIKA_TEST_BUNDLE'])/url.rsplit('/',1)[-1]
+source=Path(os.environ['PIKA_TEST_UV_ARCHIVE']) if '/astral-sh/uv/' in url else Path(os.environ['PIKA_TEST_BUNDLE'])/('releases.json' if url == {RELEASE_API!r} else url.rsplit('/',1)[-1])
 shutil.copyfile(source, output)
 ''')
     executable(fake / "sha256sum", f'''#!{sys.executable}
@@ -116,7 +124,65 @@ def test_default_install_works_with_empty_optional_arguments(bootstrap):
     result = run()
     assert result.returncode == 0, result.stderr
     assert trace.exists(), (result.stdout, result.stderr)
-    assert network.read_text().splitlines()[0] == "https://github.com/ayushjainr/pikamux/releases/latest/download/pika-release.json"
+    urls = network.read_text().splitlines()
+    assert urls[0] == RELEASE_API
+    assert urls[-2:] == [
+        "https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a1/pika-release.json",
+        "https://github.com/ayushjainr/pikamux/releases/download/v0.5.0a1/pikamux-0.5.0a1-py3-none-any.whl",
+    ]
+
+
+@pytest.mark.parametrize("versions, expected", [
+    (["0.5.0a9", "0.5.0a10", "0.5.0a2"], "0.5.0a10"),
+    (["0.5.0rc1", "0.5.0", "0.5.0b9"], "0.5.0"),
+    (["0.9.0", "0.10.0a1", "0.8.0"], "0.10.0a1"),
+])
+def test_default_selects_numeric_newest_not_listing_order(bootstrap, versions, expected):
+    run, bundle, trace, network, _ = bootstrap
+    original = bundle / "pikamux-0.5.0a1-py3-none-any.whl"
+    manifest = json.loads((bundle / "pika-release.json").read_text())
+    wheel = f"pikamux-{expected}-py3-none-any.whl"
+    (bundle / wheel).write_bytes(original.read_bytes())
+    (bundle / "pika-release.json").write_text(json.dumps({**manifest, "version": expected, "wheel": wheel}))
+    (bundle / "releases.json").write_text(json.dumps([release_row(v) for v in versions]))
+    result = run()
+    assert result.returncode == 0, result.stderr
+    assert trace.exists()
+    assert f"/download/v{expected}/{wheel}" in network.read_text()
+
+
+def test_default_ignores_drafts_incomplete_and_unsafe_releases(bootstrap):
+    run, bundle, trace, network, _ = bootstrap
+    rows = [release_row("99.0.0", draft=True), release_row("98.0.0", assets=[]),
+            release_row("97.0.0", assets=[{"name": "pika-release.json", "state": "uploaded"},
+                                          {"name": "pikamux-97.0.0-py3-none-any.whl", "state": "new"}]),
+            release_row("0.5.0a1"), release_row("../../unsafe"), None]
+    (bundle / "releases.json").write_text(json.dumps(rows))
+    result = run()
+    assert result.returncode == 0, result.stderr
+    assert trace.exists()
+    assert "/download/v0.5.0a1/" in network.read_text()
+    assert "unsafe" not in network.read_text()
+
+
+@pytest.mark.parametrize("listing", ["[]", "{}", "not json", '[{"draft": false}]'])
+def test_default_bad_listing_never_activates(bootstrap, listing):
+    run, bundle, trace, network, temporary = bootstrap
+    (bundle / "releases.json").write_text(listing)
+    result = run()
+    assert result.returncode != 0
+    assert "Cannot select a complete published release" in result.stderr
+    assert not trace.exists() and not list(temporary.iterdir())
+    assert not any("/pikamux/releases/download/" in url for url in network.read_text().splitlines())
+
+
+def test_default_pins_manifest_to_selected_release(bootstrap):
+    run, bundle, trace, _, _ = bootstrap
+    (bundle / "releases.json").write_text(json.dumps([release_row("0.5.0a2")]))
+    result = run()
+    assert result.returncode != 0
+    assert "requested-version mismatch" in result.stderr
+    assert not trace.exists()
 
 
 @pytest.mark.parametrize("change", [{"wheel": "../../payload.whl"}, {"wheel": "https://evil.example/payload.whl"}, {"version": "../x"}, {"schema": True}, {"sha256": "x" * 64}])
@@ -215,19 +281,26 @@ def test_oversized_manifest_fails_before_runtime_download(bootstrap):
 
 
 @pytest.mark.timeout(300)
-def test_real_fresh_machine_bootstrap_when_bundle_is_supplied(tmp_path):
+@pytest.mark.parametrize("source", ["bundle", "published"])
+def test_real_fresh_machine_bootstrap_when_bundle_is_supplied(tmp_path, source):
     """Opt-in network test: no installed uv/Python on PATH and no real-home writes.
 
-    PIKA_BOOTSTRAP_BUNDLE must point to a freshly built, trusted local bundle.
+    PIKA_BOOTSTRAP_BUNDLE points to a freshly built, trusted local bundle.
+    PIKA_BOOTSTRAP_PUBLIC_VERSION enables the no-version public install and
+    specifies the expected result for the assertion, not an installer argument.
     uv, its managed Python, and package dependencies download into this test's
     isolated home. The normal test suite never downloads anything here.
     """
-    supplied = os.environ.get("PIKA_BOOTSTRAP_BUNDLE")
+    supplied = os.environ.get("PIKA_BOOTSTRAP_BUNDLE" if source == "bundle" else "PIKA_BOOTSTRAP_PUBLIC_VERSION")
     if not supplied:
-        pytest.skip("Set PIKA_BOOTSTRAP_BUNDLE to exercise real isolated bootstrap downloads")
-    bundle = Path(supplied).resolve()
-    assert bundle.is_dir() and (bundle / "pika-release.json").is_file()
-    manifest = json.loads((bundle / "pika-release.json").read_text())
+        pytest.skip("Set PIKA_BOOTSTRAP_BUNDLE or PIKA_BOOTSTRAP_PUBLIC_VERSION for isolated network tests")
+    source_args = []
+    expected_version = supplied
+    if source == "bundle":
+        bundle = Path(supplied).resolve()
+        assert bundle.is_dir() and (bundle / "pika-release.json").is_file()
+        expected_version = json.loads((bundle / "pika-release.json").read_text())["version"]
+        source_args = ["--bundle", str(bundle)]
     isolated_home = tmp_path / "home"
     isolated_home.mkdir()
     temporary = tmp_path / "temp"
@@ -237,14 +310,14 @@ def test_real_fresh_machine_bootstrap_when_bundle_is_supplied(tmp_path):
     for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE"):
         if name in os.environ:
             env[name] = os.environ[name]
-    result = subprocess.run(["/bin/bash", str(INSTALLER), "--bundle", str(bundle), "--root", str(root), "--bin-dir", str(bin_dir), "--no-setup"], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=240)
+    result = subprocess.run(["/bin/bash", str(INSTALLER), *source_args, "--root", str(root), "--bin-dir", str(bin_dir), "--no-setup"], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=240)
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert (root / "tools/uv").is_file()
     command = bin_dir / "pika"
     assert command.is_file()
     version = subprocess.run([str(command), "--version"], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=20)
     assert version.returncode == 0, version.stderr
-    assert manifest["version"] in version.stdout
+    assert expected_version in version.stdout
     managed_python = root / "current/bin/python"
     assert managed_python.exists()
     # The venv's base Python is persistent but belongs to the temporary home,

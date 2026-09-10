@@ -19,6 +19,13 @@ from pikamux.fleet import REMOTE_INSTALL_ARGV, SSHTransport
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_readme_install_command_needs_no_version_selection():
+    readme = (ROOT / "README.md").read_text()
+    commands = [line for line in readme.splitlines() if line.startswith("curl ")]
+    assert commands == ["curl -fsSL https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.sh | bash"]
+    assert "Install the current alpha," not in readme
+
+
 def test_remote_bootstrap_uses_matching_public_tag_without_github_ssh_credentials():
     url = f"https://github.com/ayushjainr/pikamux/releases/download/v{__version__}/install.sh"
     assert REMOTE_INSTALL_ARGV[:4] == ('bash', '-o', 'pipefail', '-c')
