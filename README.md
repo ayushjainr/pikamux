@@ -6,9 +6,9 @@ Bring your **Codex, Claude Code, and OpenCode** conversations into one terminal
 board. See what needs you, return to work by name, and let agents consult relevant
 experience from your other projects.
 
-https://github.com/user-attachments/assets/91c07810-e304-4ab5-a533-e2b05351a73e
+https://github.com/user-attachments/assets/cfd1cce1-dea7-4cea-ba06-0ebf404a7f28
 
-*Pika in 60 seconds · Illustrative demo*
+*Pika in under a minute · Illustrative demo*
 
 - **Know where you're needed.** Distinguish requests for your input from work in
   progress and completed results.
