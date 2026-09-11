@@ -6,7 +6,7 @@ Bring your **Codex, Claude Code, and OpenCode** conversations into one terminal
 board. See what needs you, return to work by name, and let agents consult relevant
 experience from your other projects.
 
-https://github.com/user-attachments/assets/1544d6b6-548f-4bb8-ba43-89f02d48dd55
+https://github.com/user-attachments/assets/048abf56-d9d3-4a6a-9128-317ec9330d04
 
 *Meet Pika · Illustrative demo*
 
