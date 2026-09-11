@@ -89,7 +89,7 @@ class MonitorTests(unittest.TestCase):
         )
         self.assertIn("PIKA // LIVE OPERATIONS", frame.plain)
         self.assertIn("1 need you", frame.plain)
-        self.assertIn("1 results", frame.plain)
+        self.assertIn("1 ready", frame.plain)
         self.assertIn("NEEDS YOU", frame.plain)
         self.assertIn("WORKING", frame.plain)
         self.assertIn("permission", frame.plain)

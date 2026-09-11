@@ -1,27 +1,18 @@
----
-name: Pika Live Operations
----
+# Pika architecture and interaction design
 
-# Overview
+Pika connects existing Codex, Claude Code, and OpenCode conversations. The board
+shows where attention is needed and opens the exact selected conversation;
+expert cards let agents discover and consult relevant project experience.
+Provider harnesses remain responsible for their conversations and history.
 
-Pika is a dense terminal control surface for developers delegating durable work
-to Codex and Claude. The primary outcome is to see where human attention is
-needed, understand why, and enter the exact conversation without inspecting
-processes or transcripts. The trust posture is fail-closed around identity and
-honest about missing usage data.
+## Design principles
 
-The reference world is a night-shift railway signal board crossed with btop:
-compact, continuously current, operationally calm, and organized around
-exceptions. Borrow the signal board's attention hierarchy and btop's keyboard-
-first density, not their surface ornament.
+Keep identity, attention, and freshness visible. Use keyboard-first navigation
+and stable selection so background refreshes do not change the target of an
+action. Do not present inferred usage as precise measurement or hide an identity
+failure behind a successful-looking attachment.
 
-Anti-references: no Pikachu interaction gimmicks, neon-everywhere hacker
-aesthetics, fabricated precision, decorative charts, or animation that competes
-with state changes.
-
-Signature decisions:
-
-- A commander's brief says where intervention is required, how many results are
+- The board summary says where intervention is required, how many results are
   waiting, and what to open next; its underlying categories remain disjoint.
 - On wide terminals, a grouped workstream rail keeps the delegation portfolio
   visible while a persistent inspector explains the selected exact identity,

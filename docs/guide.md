@@ -342,7 +342,7 @@ fleet past the 45-second freshness budget is honestly marked `CACHED`; it never
 blocks typing, local state, or quitting. Remote
 pane tails are fetched only after explicit `p`, and remote side questions keep
 one ephemeral SSH/JSONL process for all follow-ups. Stale rows move to a
-`CACHED` group, lose actionable attention status, retain their last-success age,
+`PARKED` section with a `cached` label, lose actionable attention status, retain their last-success age,
 and never disappear merely because a machine is offline.
 
 Remote errors remain distinct: `UNREACHABLE`, `SSH TRUST OR AUTH FAILED`,
@@ -562,9 +562,12 @@ to at most one meaningful change per active turn; Pika does not run status inter
 
 The interactive `pika` monitor refreshes operational state every two seconds.
 It first renders saved inventory as `LAST KNOWN`, then reconciles progressively.
-An unavailable remote does not hold up the first usable board. `NEEDS YOU` holds
-questions and permissions; results remain unread under `RESULTS`, and failures have
-their own actionable group. A quiet board distinguishes checked machines from
+An unavailable remote does not hold up the first usable board. The sections are
+`NEEDS YOU`, `WORKING`, `READY`, and `PARKED`; empty sections are hidden.
+Questions, permissions, and recovery problems appear under `NEEDS YOU`, with the
+reason on the affected row. Completed results remain unread under `READY`.
+Starting and cached states use row labels rather than additional sections.
+A quiet board distinguishes checked machines from
 stale or unavailable ones, so completion does not create an inbox-clearing chore.
 On wide terminals it uses a grouped workstream rail and a selected-workstream
 inspector inspired by a live operations board: exact identity, signal, thread

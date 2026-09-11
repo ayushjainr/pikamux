@@ -517,6 +517,8 @@ def _status_code(status: str) -> str:
 
 def _public_status(session: Session | FleetSession | PendingLaunch) -> str:
     """Translate identity safety stops without weakening their internal state."""
+    if isinstance(session, FleetSession) and session.stale:
+        return "CACHED"
     if isinstance(session, PendingLaunch):
         return Status.STARTING.value
     if session.home_state == "identity-error":
@@ -1057,47 +1059,29 @@ def _split_groups(
     sessions: list[Session | FleetSession],
 ) -> list[tuple[str, list[Session | FleetSession]]]:
     ordered = sorted_sessions(sessions)
-    definitions = (
-        ("NEEDS YOU", _needs_you_group),
-        ("EXCEPTIONS", lambda item: item.status in {
-            Status.ERROR.value, Status.OPEN_TWICE.value,
-        }),
-        ("RESULTS", lambda item: item.status == Status.READY.value),
-        ("STARTING", lambda item: item.status == Status.STARTING.value),
-        ("WORKING", lambda item: item.status == Status.WORKING.value),
-        ("UNBOUND", lambda item: item.status == Status.UNBOUND.value),
-        ("PARKED", lambda item: item.status == Status.PARKED.value),
-    )
-    assigned: set[tuple[str, ...]] = set()
-    groups: list[tuple[str, list[Session | FleetSession]]] = []
-    cached = [item for item in ordered if isinstance(item, FleetSession) and item.stale]
-    assigned.update(item.key for item in cached)
-    for label, predicate in definitions:
-        members = [
-            item for item in ordered if predicate(item) and item.key not in assigned
-        ]
-        if members:
-            assigned.update(item.key for item in members)
-            groups.append((label, members))
-    other = [item for item in ordered if item.key not in assigned]
-    if other:
-        groups.append(("OTHER", other))
-    if cached:
-        groups.append(("CACHED", cached))
-    return groups
+    groups = {label: [] for label in ("NEEDS YOU", "WORKING", "READY", "PARKED")}
+    for item in ordered:
+        if isinstance(item, FleetSession) and item.stale:
+            label = "PARKED"
+        elif item.status in {Status.NEEDS_YOU.value, Status.ERROR.value,
+                             Status.OPEN_TWICE.value, Status.UNBOUND.value}:
+            label = "NEEDS YOU"
+        elif item.status in {Status.WORKING.value, Status.STARTING.value}:
+            label = "WORKING"
+        elif item.status == Status.READY.value:
+            label = "READY"
+        else:
+            label = "PARKED"
+        groups[label].append(item)
+    return [(label, members) for label, members in groups.items() if members]
 
 
 def _group_color(label: str) -> str:
     return {
         "NEEDS YOU": FG_RED,
-        "EXCEPTIONS": FG_RED,
-        "RESULTS": FG_GREEN,
         "WORKING": FG_CYAN,
-        "STARTING": FG_YELLOW,
-        "UNBOUND": FG_MAGENTA,
         "READY": FG_GREEN,
         "PARKED": FG_BRIGHT_BLACK,
-        "CACHED": FG_BRIGHT_BLACK,
     }.get(label, FG_BLUE)
 
 
@@ -1168,6 +1152,16 @@ def _split_left_pane(
                     now,
                 )
             )
+            # Transitional states and recovery problems belong on the row, not
+            # in another section. Cached state must never look current.
+            age = {
+                "CACHED": "cached",
+                "PROTECTED": "check identity",
+                Status.ERROR.value: "open blocked",
+                Status.OPEN_TWICE.value: "open twice",
+                Status.STARTING.value: "starting",
+                Status.UNBOUND.value: "outside Pika",
+            }.get(_public_status(item), age)
             prefix = f"{marker}{signal} {provider} "
             name_width = max(4, width - len(prefix) - len(age) - 1)
             plain = _fit(f"{prefix}{_fit(item.display_name, name_width)} {age}", width)
@@ -1891,7 +1885,7 @@ def _render_split_monitor(
     color: bool,
 ) -> MonitorFrame:
     counts = _session_counts(state.sessions)
-    need_count = sum(_needs_you_group(item) for item in state.sessions)
+    groups = dict(_split_groups(state.sessions))
     expert_count = sum(card.profile is not None for card in state.expert_cards.values())
     refresh_age = max(0.0, now - state.refresh_started_at)
     show_refresh = refreshing and (
@@ -1913,15 +1907,11 @@ def _render_split_monitor(
         sync = "●"
     clock = datetime.fromtimestamp(now).strftime("%H:%M:%S")
     summary = [
-        f"{need_count} need you",
-        f"{counts['results']} results",
-        f"{counts['working']} working",
+        f"{len(groups.get('NEEDS YOU', []))} need you",
+        f"{len(groups.get('WORKING', []))} working",
+        f"{len(groups.get('READY', []))} ready",
+        f"{len(groups.get('PARKED', []))} parked",
     ]
-    if counts['errors'] or counts['protected_pauses']:
-        summary.append(f"{counts['errors'] + counts['protected_pauses']} exceptions")
-    if counts["starting"]:
-        summary.append(f"{counts['starting']} starting")
-    summary.append(f"{counts['unbound']} unbound")
     if counts["cached"]:
         summary.append(f"{counts['cached']} cached")
     if state.machines:
@@ -2107,8 +2097,8 @@ def render_monitor(
     if (
         width >= SPLIT_MIN_WIDTH
         and height >= SPLIT_MIN_HEIGHT
-        and state.mode in {"sessions", "ask", "untrack"}
-        and (state.sessions or state.mode in {"ask", "untrack"})
+        and state.mode in {"sessions", "ask", "untrack", "action-error"}
+        and (state.sessions or state.mode in {"ask", "untrack", "action-error"})
     ):
         return _render_split_monitor(
             state,
@@ -2536,6 +2526,26 @@ class _Terminal:
         )
         if self.previous is not None:
             termios.tcsetattr(self.input_fd, termios.TCSADRAIN, self.previous)
+
+
+def _open_in_terminal(
+    terminal: _Terminal, callback: Callable[[], int],
+    session: Session | FleetSession | PendingLaunch,
+) -> None:
+    result = terminal.run_external(callback)
+    if result != 0:
+        query = session.session_id
+        if isinstance(session, FleetSession):
+            query += f"@{session.node_name}"
+        elif isinstance(session, PendingLaunch) or query.startswith("unbound:"):
+            query = session.display_name
+        command = shlex.join(["pika", query])
+        raise RuntimeError(
+            f"Opening {session.display_name} failed (exit code {result}). "
+            "Successful attachment was not confirmed. "
+            "Press Esc to return to the board. To see terminal diagnostics, "
+            f"quit the board and run exactly: {command}"
+        )
 
 
 def _carry_usage(
@@ -3492,10 +3502,12 @@ def run_monitor(
                                         continue
                             if session is not None:
                                 try:
-                                    terminal.run_external(
+                                    _open_in_terminal(
+                                        terminal,
                                         lambda: pika.open_pending(session)
                                         if isinstance(session, PendingLaunch)
-                                        else pika.open(session)
+                                        else pika.open(session),
+                                        session,
                                     )
                                 except Exception as exc:  # noqa: BLE001 - return to board
                                     state.fail_action(str(exc), session)
@@ -3509,7 +3521,9 @@ def run_monitor(
                             continue
                         if action == "enter" and session is not None:
                             try:
-                                terminal.run_external(lambda: pika.enter(session.display_name))
+                                _open_in_terminal(
+                                    terminal, lambda: pika.enter(session.display_name), session,
+                                )
                             except Exception as exc:  # noqa: BLE001
                                 state.fail_action(str(exc), session)
                             else:

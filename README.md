@@ -6,9 +6,9 @@ Bring your **Codex, Claude Code, and OpenCode** conversations into one terminal
 board. See what needs you, return to work by name, and let agents consult relevant
 experience from your other projects.
 
-https://github.com/user-attachments/assets/cfd1cce1-dea7-4cea-ba06-0ebf404a7f28
+https://github.com/user-attachments/assets/1544d6b6-548f-4bb8-ba43-89f02d48dd55
 
-*Pika in under a minute · Illustrative demo*
+*Meet Pika · Illustrative demo*
 
 - **Know where you're needed.** Distinguish requests for your input from work in
   progress and completed results.
@@ -46,7 +46,7 @@ for prerequisites and troubleshooting.
 ```bash
 pika          # Open the board
 pika NAME     # Open or create a named conversation
-pika setup    # Review hooks and agent integrations
+pika setup    # Review conversations and integrations
 pika update   # Review and install an available update
 ```
 
@@ -61,7 +61,7 @@ steps instead of opening a duplicate.
 | **/** | Filter conversations |
 | **p** | Peek at a result |
 | **x** | Stop watching; keep the agent running and its history |
-| **q** | Leave the board |
+| **q** | Leave the board; keep agents running |
 
 Installer-managed copies show update notices on the board. Press **U** to review
 an update; installation requires your approval and leaves running agents alone.
@@ -76,8 +76,9 @@ so an agent can find the right context without searching every transcript.
 For example, a dashboard agent deciding how to display missing data can consult
 the pipeline project about why it preserved gaps instead of filling them. The
 dashboard agent checks the referenced test, then applies the decision to its chart.
-The exchange happens in a separate consultation; its questions and answers do not
-enter the original conversation.
+Your agent receives the answer and uses it in its task. The expert is consulted
+through a separate side session, leaving its original conversation untouched and
+free to keep working.
 
 When you're ready, follow the [first-consultation guide](docs/first-consultation.md)
 to prepare one expert card. Then give your agent a task and tell it:

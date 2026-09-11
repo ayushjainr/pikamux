@@ -16,7 +16,7 @@ vulnerability reporting.
 - Pika version:
 - OS and terminal:
 - Provider CLI and version:
-- tmux version (Linux nodes):
+- tmux version (macOS/Linux):
 - Local or remote workflow:
 
 ## Sanitized error and recovery tried

@@ -69,9 +69,9 @@ def test_attention_is_not_an_unread_inbox():
         Session("codex", "busy", status=Status.WORKING.value, live=True),
     ]
     groups = {label: [item.session_id for item in members] for label, members in _split_groups(items)}
-    assert groups["NEEDS YOU"] == ["question"]
-    assert groups["RESULTS"] == ["done"]
-    assert set(groups["EXCEPTIONS"]) == {"failed", "duplicate"}
+    assert set(groups["NEEDS YOU"]) == {"question", "failed", "duplicate"}
+    assert groups["READY"] == ["done"]
+    assert list(groups) == ["NEEDS YOU", "WORKING", "READY"]
     assert items[1].unread  # Classification is not acknowledgement.
 
 
@@ -87,7 +87,7 @@ def test_status_updates_preserve_navigation_and_real_labels():
     state.move(1)
     assert state.selected().key == items[16].key
     frame = render_monitor(state, width=150, height=35, color=False)
-    assert "RESULTS" in frame.plain
+    assert "READY" in frame.plain
     assert "WORKING" not in frame.plain.split("THREAD EXPERTISE")[0]
 
 

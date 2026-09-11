@@ -2,12 +2,10 @@
 
 Pika is distributed through GitHub Releases.
 
-Installing Pika also offers the bundled agent workflow: your current agent can
-discover expert cards and privately consult a relevant earlier conversation.
-After installation, follow [one useful consultation](first-consultation.md),
-not a fleet-wide setup. Setup itself does not interview agents or create missing
-cards. Note the [a3 Codex compatibility gap](first-consultation.md#release-compatibility)
-before using a newer paginated Codex conversation as your first expert.
+Start with one conversation on one machine. Install Pika, review setup, then run
+`pika` to open the board. When you want your agents to consult prior work, follow
+[your first consultation](first-consultation.md). The bundled `agent-convo` skill
+is included in setup; expert cards are a separate step.
 
 ## Fresh Mac or Linux machine
 

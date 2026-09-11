@@ -26,6 +26,16 @@ def test_readme_install_command_needs_no_version_selection():
     assert "Install the current alpha," not in readme
 
 
+def test_readme_uses_one_inline_video_without_production_labels():
+    readme = (ROOT / "README.md").read_text()
+    assert len(re.findall(
+        r"^https://github\.com/user-attachments/assets/[0-9a-f-]+$", readme, re.M,
+    )) == 1
+    assert "Illustrative demo" in readme
+    for phrase in ("with music", "with sound", "campaign-overview-v", "pika-with-music"):
+        assert phrase not in readme.lower()
+
+
 def test_remote_bootstrap_uses_matching_public_tag_without_github_ssh_credentials():
     url = f"https://github.com/ayushjainr/pikamux/releases/download/v{__version__}/install.sh"
     assert REMOTE_INSTALL_ARGV[:4] == ('bash', '-o', 'pipefail', '-c')
@@ -64,7 +74,8 @@ def test_documentation_links_resolve():
 
 
 def test_user_documentation_has_no_editorial_handoff_notes():
-    documents = [ROOT / name for name in ("README.md", "SECURITY.md", "CONTRIBUTING.md",
+    documents = [ROOT / name for name in ("README.md", "SECURITY.md", "CONTRIBUTING.md", "DESIGN.md",
+                 "docs/guide.md",
                  "docs/first-consultation.md", "docs/installing.md", "docs/releasing.md")]
     forbidden = ("the user rejected", "the user approved", "narrative revision pending",
                  "rory-inspired", "hopkins-inspired", "agent review score",
