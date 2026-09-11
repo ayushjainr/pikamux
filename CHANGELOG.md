@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0a4 — reliable returns and consultations
+
+- Support private consultations from newer Codex conversations with paginated
+  history, without changing the expert conversation's context.
+- Keep failed board attachments visible with an exact recovery command, including
+  on wide terminals, instead of silently returning to the board.
+- Simplify the board to Needs You, Working, Ready, and Parked. Show recovery
+  reasons and cached state on individual rows without losing exact identities.
+- Make the default installer select the newest complete published release,
+  including alpha releases, without requiring a version argument.
+- Refine first-use documentation and update the illustrative walkthrough.
+
 ## 0.5.0a3 — approved updates from the board
 
 - Add cached, background update notices for installer-managed boards. Press `U`

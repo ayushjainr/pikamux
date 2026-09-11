@@ -10,14 +10,8 @@ to share with the selected model provider; avoid sensitive work for a first tria
 
 ## Release compatibility
 
-**Pika 0.5.0a3:** consultations can fail with newer Codex conversations that use
-paginated history. The fix is available in source commit `6b8af0f`, but is not
-included in that release. It changes the provider's fork response format, not
-the context inherited by the consultation.
-
-If affected, stop that consultation and use the [source-preview path](installing.md#source-preview)
-only if you are comfortable testing a checkout, or wait for a release containing
-the fix. Do not bypass Pika, force-resume the parent, or disable identity checks.
+Use Pika 0.5.0a4 or newer for Codex conversations with paginated history. If you
+installed an earlier release, run `pika update` before consulting those conversations.
 Claude consultation requires CLI 2.1.228 or newer; OpenCode has temporary
 persisted-side cleanup limits. Read [consultation boundaries](../SECURITY.md#consultation-boundaries).
 

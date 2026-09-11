@@ -52,7 +52,7 @@ wheels = [
 
 [[package]]
 name = "pikamux"
-version = "0.5.0a3"
+version = "0.5.0a4"
 source = { editable = "." }
 dependencies = [
     { name = "psutil", marker = "sys_platform == 'darwin'" },

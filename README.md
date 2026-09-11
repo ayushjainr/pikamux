@@ -89,7 +89,6 @@ to prepare one expert card. Then give your agent a task and tell it:
 Card searches and ordinary board views make no model calls. Card interviews and
 consultations use your provider quota.
 
-**Compatibility:** v0.5.0a3 cannot consult some newer Codex conversations.
 Claude consultations require CLI 2.1.228+. Check the
 [consultation compatibility notes](docs/first-consultation.md#release-compatibility)
 before your first consultation.
