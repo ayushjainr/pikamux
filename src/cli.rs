@@ -614,22 +614,47 @@ fn bare(pika: &Pika) -> Result<i32> {
     let local_sender = sender.clone();
     let (local_done_sender, local_done_receiver) = mpsc::sync_channel(1);
     let local_refresh = thread::spawn(move || {
+        let mut store_changes = worker.store.change_watcher().ok();
+        let mut next_reconcile = Instant::now();
         while !worker_stop.load(Ordering::Relaxed) {
-            if let Ok(mut inventory) = worker.reconcile_local() {
-                let _ =
-                    usage::hydrate_sessions(&worker.paths, &worker.store, &mut inventory.sessions);
-                if let Ok(items) = board_items_from_inventory(&worker, inventory)
-                    && local_sender.send(items).is_err()
-                {
-                    break;
+            if Instant::now() >= next_reconcile {
+                if let Ok(mut inventory) = worker.reconcile_local() {
+                    let _ = usage::hydrate_sessions(
+                        &worker.paths,
+                        &worker.store,
+                        &mut inventory.sessions,
+                    );
+                    if let Ok(items) = board_items_from_inventory(&worker, inventory) {
+                        match local_sender.try_send(items) {
+                            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                            Err(mpsc::TrySendError::Disconnected(_)) => break,
+                        }
+                    }
                 }
+                // Consume commits made by reconciliation itself. Subsequent
+                // changes are hook/provider publications from other writers.
+                if let Some(watcher) = &mut store_changes {
+                    let _ = watcher.changed();
+                }
+                next_reconcile = Instant::now() + Duration::from_secs(10);
             }
-            // Hooks persist important state immediately; this pass reconciles
-            // provider/process evidence. Ten seconds keeps the fallback fresh
-            // without continuously rescanning a large watched inventory;
-            // lifecycle hooks still publish attention immediately.
-            match refresh_receiver.recv_timeout(Duration::from_secs(10)) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            let wait = next_reconcile
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(250));
+            match refresh_receiver.recv_timeout(wait) {
+                Ok(()) => next_reconcile = Instant::now(),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let changed = store_changes
+                        .as_mut()
+                        .and_then(|watcher| watcher.changed().ok())
+                        .unwrap_or(false);
+                    if changed && let Ok(items) = board_items(&worker) {
+                        match local_sender.try_send(items) {
+                            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                            Err(mpsc::TrySendError::Disconnected(_)) => break,
+                        }
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -3759,7 +3784,7 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
-    *'"method":"thread/fork"'*) printf '{{"id":%s,"result":{{"thread":{{"id":"side-id","ephemeral":true}},"model":"gpt-5.6-sol","reasoningEffort":"medium"}}}}\n' "$id" ;;
+    *'"method":"thread/fork"'*) printf '{{"id":%s,"result":{{"thread":{{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","ephemeral":true}},"model":"gpt-5.6-sol","reasoningEffort":"medium"}}}}\n' "$id" ;;
     *'"method":"turn/start"'*)
       printf '{{"id":%s,"result":{{"turn":{{"id":"turn-1"}}}}}}\n' "$id"
       sleep 30 &

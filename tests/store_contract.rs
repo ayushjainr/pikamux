@@ -120,6 +120,20 @@ fn initialization_is_current_wal_and_private() {
 }
 
 #[test]
+fn change_watcher_reports_external_commits_without_scanning_rows() {
+    let (_temp, store) = store_fixture();
+    store.initialize().unwrap();
+    let mut watcher = store.change_watcher().unwrap();
+    assert!(!watcher.changed().unwrap());
+
+    store
+        .upsert_session(&session("changed", Status::Working, false, 2.0), false)
+        .unwrap();
+    assert!(watcher.changed().unwrap());
+    assert!(!watcher.changed().unwrap());
+}
+
+#[test]
 fn incompatible_existing_schema_is_rejected_without_repair() {
     let (_temp, store) = store_fixture();
     std::fs::create_dir_all(store.path().parent().unwrap()).unwrap();

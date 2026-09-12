@@ -381,6 +381,25 @@ pub struct Store {
     validated: Arc<AtomicBool>,
 }
 
+/// A cheap, connection-local SQLite commit cursor for dynamic views. SQLite's
+/// `data_version` advances only when another connection commits, so polling it
+/// does not scan conversations or provider history.
+pub struct StoreChangeWatcher {
+    db: Connection,
+    version: i64,
+}
+
+impl StoreChangeWatcher {
+    pub fn changed(&mut self) -> Result<bool> {
+        let version = self
+            .db
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        let changed = version != self.version;
+        self.version = version;
+        Ok(changed)
+    }
+}
+
 /// One short, writer-serialized view shared by reconciliation and hook ingestion.
 /// Identity checks, authoritative observations, projections and session writes
 /// must use this same transaction so overlapping writers cannot publish stale
@@ -410,6 +429,12 @@ impl Store {
 
     pub fn exists(&self) -> bool {
         self.path.is_file()
+    }
+
+    pub fn change_watcher(&self) -> Result<StoreChangeWatcher> {
+        let db = self.open_read()?;
+        let version = db.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        Ok(StoreChangeWatcher { db, version })
     }
 
     /// Create only the frozen current schema. Existing partial or legacy schemas are rejected.
