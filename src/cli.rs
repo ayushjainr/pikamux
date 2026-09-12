@@ -937,18 +937,19 @@ fn board_items_from_inventory(
     }));
     append_cached_fleet(
         &mut items,
-        FleetManager::new(&pika.store, SshTransport::default()).cached_sessions(None, false),
+        FleetManager::new(&pika.store, SshTransport::default())
+            .cached_sessions_with_notices(None, false),
     );
     Ok(items)
 }
 
 fn append_cached_fleet(
     items: &mut Vec<BoardItem>,
-    cached: std::result::Result<Vec<fleet::FleetSession>, fleet::FleetError>,
+    cached: std::result::Result<fleet::CachedFleetSessions, fleet::FleetError>,
 ) {
     match cached {
-        Ok(remotes) => {
-            for remote in remotes {
+        Ok(cached) => {
+            for remote in cached.sessions {
                 items.push(BoardItem {
                     session: remote.session,
                     node_id: Some(remote.node_id),
@@ -963,6 +964,7 @@ fn append_cached_fleet(
                     }),
                 });
             }
+            items.extend(cached.notices.iter().map(fleet_cache_truncation_notice));
         }
         Err(error) => items.push(fleet_cache_notice(&error)),
     }
@@ -988,6 +990,43 @@ fn fleet_cache_notice(error: &fleet::FleetError) -> BoardItem {
         managed: false,
         error: Some(error.message.clone()),
         attention_reason: Some("cached fleet exceeded a safety limit".into()),
+        created_at: now(),
+        updated_at: now(),
+        last_event_at: now(),
+        last_activity_at: now(),
+        live: false,
+        attached: false,
+        home_state: "unavailable".into(),
+        cpu_percent: None,
+        rss_kb: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        cache_write_tokens: None,
+        total_tokens: None,
+        estimated_cost_usd: None,
+        active_thread_id: None,
+    })
+}
+
+fn fleet_cache_truncation_notice(notice: &fleet::FleetCacheNotice) -> BoardItem {
+    BoardItem::local(Session {
+        provider: Provider::Codex,
+        session_id: format!("fleet-cache-truncated:{}", notice.node_id),
+        name: Some(format!("{} cache limited", notice.node_name)),
+        cwd: None,
+        branch: None,
+        transcript_path: None,
+        tmux_session: None,
+        tmux_pane: None,
+        root_pid: None,
+        status: Status::Parked,
+        unread: false,
+        model: None,
+        source: FLEET_CACHE_NOTICE_SOURCE.into(),
+        managed: false,
+        error: Some(notice.message.clone()),
+        attention_reason: None,
         created_at: now(),
         updated_at: now(),
         last_event_at: now(),
@@ -5104,6 +5143,35 @@ done
                 .unwrap()
                 .contains("safety limit")
         );
+        assert!(reject_fleet_cache_notice(&items[1]).is_err());
+    }
+
+    #[test]
+    fn scoped_fleet_truncation_notice_is_parked_and_non_actionable() {
+        let root = tempfile::tempdir().unwrap();
+        let local = BoardItem::local(fixture_session(root.path()));
+        let mut items = vec![local.clone()];
+        append_cached_fleet(
+            &mut items,
+            Ok(fleet::CachedFleetSessions {
+                sessions: Vec::new(),
+                notices: vec![fleet::FleetCacheNotice {
+                    node_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+                    node_name: "atlas".into(),
+                    omitted_rows: 3,
+                    message: "3 cached conversations on atlas not shown".into(),
+                }],
+            }),
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], local);
+        assert_eq!(
+            items[1].session.name.as_deref(),
+            Some("atlas cache limited")
+        );
+        assert_eq!(items[1].session.status, Status::Parked);
+        assert!(!items[1].session.unread);
+        assert_eq!(items[1].session.source, FLEET_CACHE_NOTICE_SOURCE);
         assert!(reject_fleet_cache_notice(&items[1]).is_err());
     }
 

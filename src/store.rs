@@ -1868,6 +1868,42 @@ impl Store {
         Ok(generation)
     }
 
+    /// Reserve the same monotonic generation used by refresh without trusting
+    /// a new machine yet. The node and its first snapshot become visible only
+    /// together in `commit_fleet_onboarding_if_current`.
+    pub fn claim_fleet_onboarding(&self, node_id: &str) -> Result<u64> {
+        Uuid::parse_str(node_id).context("fleet node_id is not a UUID")?;
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let key = fleet_refresh_generation_key(node_id);
+        let current = tx
+            .query_row("SELECT value FROM meta WHERE key=?", [&key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .context("stored fleet refresh generation is invalid")
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let generation = current
+            .checked_add(1)
+            .context("fleet refresh generation exhausted")?;
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, generation.to_string()],
+        )?;
+        let timestamp = now();
+        tx.execute(
+            "UPDATE fleet_nodes SET last_attempt_at=?,updated_at=? WHERE node_id=?",
+            params![timestamp, timestamp, node_id],
+        )?;
+        tx.commit()?;
+        Ok(generation)
+    }
+
     pub fn current_fleet_refresh_generation(&self, node_id: &str) -> Result<u64> {
         if !self.exists() {
             return Ok(0);
@@ -1954,6 +1990,86 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically make an onboarded node and its validated first snapshot
+    /// visible, but only if no newer add/refresh/delete operation superseded
+    /// the pre-I/O generation claim.
+    pub fn commit_fleet_onboarding_if_current(
+        &self,
+        node: &FleetNode,
+        payload: &Value,
+        captured_at: f64,
+        generation: u64,
+    ) -> Result<bool> {
+        Uuid::parse_str(&node.node_id).context("fleet node_id is not a UUID")?;
+        if !payload.is_object() {
+            bail!("remote snapshot must be a JSON object");
+        }
+        let encoded = serde_json::to_string(payload)?;
+        if encoded.len() > MAX_REMOTE_SNAPSHOT_BYTES {
+            bail!("remote snapshot exceeds the 4 MiB safety limit");
+        }
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !fleet_refresh_is_current(&tx, &node.node_id, generation)? {
+            tx.commit()?;
+            return Ok(false);
+        }
+        if let Some(collision) = tx
+            .query_row(
+                "SELECT node_id FROM fleet_nodes WHERE alias=? COLLATE NOCASE",
+                [&node.alias],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            && collision != node.node_id
+        {
+            bail!(
+                "machine alias {:?} already belongs to another node",
+                node.alias
+            );
+        }
+        let existing: Option<(f64, f64, f64)> = tx
+            .query_row(
+                "SELECT last_seen,last_attempt_at,created_at FROM fleet_nodes WHERE node_id=?",
+                [&node.node_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let timestamp = now();
+        let created_at = nonzero_or(
+            node.created_at,
+            existing.map_or(timestamp, |(_, _, created)| created),
+        );
+        let updated_at = nonzero_or(node.updated_at, timestamp);
+        let last_seen = nonzero_or(node.last_seen, existing.map_or(0.0, |old| old.0));
+        let last_attempt_at = nonzero_or(
+            node.last_attempt_at,
+            existing.map_or(updated_at, |old| old.1),
+        );
+        let sources = serde_json::to_string(&node.sources)?;
+        let capabilities = serde_json::to_string(&node.capabilities)?;
+        tx.execute(
+            r#"INSERT INTO fleet_nodes(node_id,alias,ssh_target,sources_json,status,protocol_version,package_version,capabilities_json,last_seen,last_attempt_at,last_error,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET
+            alias=excluded.alias,ssh_target=excluded.ssh_target,sources_json=excluded.sources_json,
+            status=excluded.status,protocol_version=excluded.protocol_version,
+            package_version=excluded.package_version,capabilities_json=excluded.capabilities_json,
+            last_seen=excluded.last_seen,last_attempt_at=excluded.last_attempt_at,
+            last_error=excluded.last_error,updated_at=excluded.updated_at"#,
+            params![node.node_id, node.alias, node.ssh_target, sources, node.status, node.protocol_version, node.package_version, capabilities, last_seen, last_attempt_at, node.last_error, created_at, updated_at],
+        )?;
+        tx.execute(
+            "INSERT INTO remote_snapshots(node_id,payload_json,captured_at) VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET payload_json=excluded.payload_json,captured_at=excluded.captured_at",
+            params![node.node_id, encoded, captured_at],
+        )?;
+        tx.execute(
+            "UPDATE fleet_nodes SET status='ready',last_seen=?,last_error=NULL,last_attempt_at=?,updated_at=? WHERE node_id=?",
+            params![captured_at, captured_at, timestamp, node.node_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Commit a remote snapshot only while its pre-I/O refresh claim is still
     /// current. A later-started request therefore wins even if an older SSH
     /// response arrives last.
@@ -1976,6 +2092,17 @@ impl Store {
         if !fleet_refresh_is_current(&tx, node_id, generation)? {
             tx.commit()?;
             return Ok(false);
+        }
+        let trusted = tx
+            .query_row(
+                "SELECT 1 FROM fleet_nodes WHERE node_id=?",
+                [node_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !trusted {
+            bail!("remote snapshot requires an adopted fleet node");
         }
         tx.execute(
             "INSERT INTO remote_snapshots(node_id,payload_json,captured_at) VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET payload_json=excluded.payload_json,captured_at=excluded.captured_at",

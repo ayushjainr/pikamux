@@ -538,6 +538,116 @@ fn fleet_refresh_generation_makes_last_started_request_win() {
 }
 
 #[test]
+fn fleet_onboarding_generation_makes_newer_add_snapshot_win_atomically() {
+    let (_temp, store) = store_fixture();
+    let node = FleetNode {
+        node_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        alias: "atlas".into(),
+        ssh_target: "atlas".into(),
+        sources: vec!["fixture".into()],
+        status: "ready".into(),
+        protocol_version: Some(2),
+        package_version: Some("0.6".into()),
+        capabilities: vec!["snapshot".into()],
+        last_seen: 0.0,
+        last_attempt_at: 0.0,
+        last_error: None,
+        created_at: 1.0,
+        updated_at: 1.0,
+    };
+
+    let older_add = store.claim_fleet_onboarding(&node.node_id).unwrap();
+    assert!(store.list_nodes().unwrap().is_empty());
+    assert!(store.get_remote_snapshot(&node.node_id).unwrap().is_none());
+    let newer_add = store.claim_fleet_onboarding(&node.node_id).unwrap();
+    assert!(newer_add > older_add);
+    assert!(
+        store
+            .commit_fleet_onboarding_if_current(
+                &node,
+                &json!({"generation":"newer-add"}),
+                20.0,
+                newer_add,
+            )
+            .unwrap()
+    );
+    assert!(
+        !store
+            .commit_fleet_onboarding_if_current(
+                &node,
+                &json!({"generation":"older-add"}),
+                30.0,
+                older_add,
+            )
+            .unwrap()
+    );
+    let adopted = store.list_nodes().unwrap();
+    assert_eq!(adopted.len(), 1);
+    assert_eq!(adopted[0].node_id, node.node_id);
+    assert_eq!(adopted[0].alias, node.alias);
+    assert_eq!(adopted[0].status, "ready");
+    assert_eq!(
+        store
+            .get_remote_snapshot(&node.node_id)
+            .unwrap()
+            .unwrap()
+            .payload["generation"],
+        "newer-add"
+    );
+}
+
+#[test]
+fn newer_refresh_suppresses_an_older_readd_snapshot() {
+    let (_temp, store) = store_fixture();
+    let node = FleetNode {
+        node_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        alias: "atlas".into(),
+        ssh_target: "atlas".into(),
+        sources: vec!["fixture".into()],
+        status: "ready".into(),
+        protocol_version: Some(2),
+        package_version: Some("0.6".into()),
+        capabilities: vec!["snapshot".into()],
+        last_seen: 0.0,
+        last_attempt_at: 0.0,
+        last_error: None,
+        created_at: 1.0,
+        updated_at: 1.0,
+    };
+    store.upsert_fleet_node(&node).unwrap();
+    let older_add = store.claim_fleet_onboarding(&node.node_id).unwrap();
+    let newer_refresh = store.claim_fleet_refresh(&node.node_id).unwrap();
+    assert!(
+        store
+            .put_remote_snapshot_if_current(
+                &node.node_id,
+                &json!({"generation":"newer-refresh"}),
+                20.0,
+                newer_refresh,
+            )
+            .unwrap()
+    );
+    assert!(
+        !store
+            .commit_fleet_onboarding_if_current(
+                &node,
+                &json!({"generation":"older-add"}),
+                30.0,
+                older_add,
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .get_remote_snapshot(&node.node_id)
+            .unwrap()
+            .unwrap()
+            .payload["generation"],
+        "newer-refresh"
+    );
+}
+
+#[test]
 fn remote_snapshot_storage_rejects_oversized_payload_before_json_parse() {
     let (_temp, store) = store_fixture();
     let node = FleetNode {

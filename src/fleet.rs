@@ -260,6 +260,23 @@ pub struct FleetSession {
     pub current_state_updated_at: Option<f64>,
     pub current_state_status: Option<String>,
 }
+
+/// A machine-scoped explanation for cached rows omitted from an aggregate
+/// view. Exact-machine reads are never truncated by the aggregate budget.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FleetCacheNotice {
+    pub node_id: String,
+    pub node_name: String,
+    pub omitted_rows: usize,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CachedFleetSessions {
+    pub sessions: Vec<FleetSession>,
+    pub notices: Vec<FleetCacheNotice>,
+}
+
 impl FleetSession {
     pub fn key(&self) -> (&str, Provider, &str) {
         (
@@ -1611,12 +1628,22 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
         alias: Option<&str>,
     ) -> Result<FleetNode, FleetError> {
         let node = self.handshake(candidate, alias)?;
+        // Joining the same generation stream as refresh makes onboarding
+        // last-started-wins without trusting a node before its first complete
+        // snapshot has passed validation.
+        let generation = self.store.claim_fleet_onboarding(&node.node_id)?;
         let snapshot = validate_snapshot(&self.snapshot_request(&node)?, Some(&node.node_id))?;
-        self.store.upsert_fleet_node(&node)?;
         // Scheduling and cache age belong to the receiving machine's clock.
         // Keep the remote capture timestamp only inside the source payload.
-        self.store
-            .put_remote_snapshot(&node.node_id, &snapshot, now())?;
+        if !self
+            .store
+            .commit_fleet_onboarding_if_current(&node, &snapshot, now(), generation)?
+        {
+            return Err(FleetError::new(
+                FleetErrorKind::Error,
+                "Machine adoption was superseded by a newer request; retry from the current cache",
+            ));
+        }
         self.store.get_fleet_node(&node.node_id)?.ok_or_else(|| {
             FleetError::new(
                 FleetErrorKind::Error,
@@ -1647,6 +1674,12 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                // Board shutdown is an intentional observer lifecycle event,
+                // not evidence that the remote machine became unreachable.
+                // The generation claim still invalidates older in-flight work.
+                if cancellation.is_cancelled() {
+                    return Err(error);
+                }
                 let status = match error.kind {
                     FleetErrorKind::Unreachable => "unreachable",
                     FleetErrorKind::Authentication => "auth",
@@ -1682,8 +1715,25 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
         node_id: Option<&str>,
         include_experts: bool,
     ) -> Result<Vec<FleetSession>, FleetError> {
+        Ok(self
+            .cached_sessions_with_notices(node_id, include_experts)?
+            .sessions)
+    }
+
+    /// Read the retained fleet cache without remote I/O.
+    ///
+    /// Aggregate views receive an equal deterministic row and byte slice per
+    /// selected machine. One noisy machine therefore cannot evict every other
+    /// machine from the board. Exact-machine reads retain their full validated
+    /// snapshot and are not subject to aggregate slicing.
+    pub fn cached_sessions_with_notices(
+        &self,
+        node_id: Option<&str>,
+        include_experts: bool,
+    ) -> Result<CachedFleetSessions, FleetError> {
         let timestamp = now();
         let mut result = Vec::new();
+        let mut notices = Vec::new();
         let nodes = self.nodes()?;
         let selected_nodes = nodes
             .iter()
@@ -1695,7 +1745,17 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 format!("Cached fleet exceeds the {MAX_CACHED_FLEET_NODES}-machine safety limit"),
             ));
         }
-        let mut cached_bytes = 0_usize;
+        let aggregate = node_id.is_none();
+        let row_slice = if aggregate && selected_nodes > 0 {
+            MAX_CACHED_FLEET_ROWS / selected_nodes
+        } else {
+            MAX_CACHED_FLEET_ROWS
+        };
+        let byte_slice = if aggregate && selected_nodes > 0 {
+            MAX_CACHED_FLEET_BYTES / selected_nodes
+        } else {
+            MAX_CACHED_FLEET_BYTES
+        };
         for node in nodes {
             if node_id.is_some_and(|expected| expected != node.node_id) {
                 continue;
@@ -1703,23 +1763,6 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
             let Some(stored) = self.store.get_remote_snapshot(&node.node_id)? else {
                 continue;
             };
-            cached_bytes = cached_bytes
-                .checked_add(stored.encoded_bytes)
-                .ok_or_else(|| {
-                    FleetError::new(
-                        FleetErrorKind::Incompatible,
-                        "Cached fleet size overflowed its safety counter",
-                    )
-                })?;
-            if cached_bytes > MAX_CACHED_FLEET_BYTES {
-                return Err(FleetError::new(
-                    FleetErrorKind::Incompatible,
-                    format!(
-                        "Cached fleet exceeds the {} MiB board safety limit",
-                        MAX_CACHED_FLEET_BYTES / (1024 * 1024)
-                    ),
-                ));
-            }
             let Ok(snapshot) = validate_snapshot(&stored.payload, Some(&node.node_id)) else {
                 continue;
             };
@@ -1732,26 +1775,6 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 || timestamp - stored.captured_at > REMOTE_STALE_SECONDS;
             let cards = keyed_values(snapshot.get("cards"));
             let profiles = keyed_values(snapshot.get("profiles"));
-            let session_count = snapshot
-                .get("sessions")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len)
-                + if include_experts {
-                    snapshot
-                        .get("expert_sessions")
-                        .and_then(Value::as_array)
-                        .map_or(0, Vec::len)
-                } else {
-                    0
-                };
-            if result.len().saturating_add(session_count) > MAX_CACHED_FLEET_ROWS {
-                return Err(FleetError::new(
-                    FleetErrorKind::Incompatible,
-                    format!(
-                        "Cached fleet exceeds the {MAX_CACHED_FLEET_ROWS}-row board safety limit"
-                    ),
-                ));
-            }
             let mut all = snapshot
                 .get("sessions")
                 .and_then(Value::as_array)
@@ -1766,14 +1789,56 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                         .unwrap_or_default(),
                 );
             }
+            let available_rows = all.len();
+            let mut retained_rows = 0_usize;
+            let mut retained_bytes = 0_usize;
+            let node_wire = json!({
+                "node_id": node.node_id,
+                "node_name": node.alias,
+                "remote_error": node.last_error,
+            });
             for raw in all {
+                if aggregate && retained_rows >= row_slice {
+                    break;
+                }
                 let session = session_from_wire(&raw)?;
                 let key = (
                     session.provider.as_str().to_owned(),
                     session.session_id.clone(),
                 );
-                let card = cards.get(&key).and_then(Value::as_object);
-                let profile = profiles.get(&key).and_then(Value::as_object);
+                let card_value = cards.get(&key);
+                let profile_value = profiles.get(&key);
+                let card = card_value.and_then(Value::as_object);
+                let profile = profile_value.and_then(Value::as_object);
+                // Count each retained row together with the annotations it can
+                // carry. Using the complete wire values deliberately
+                // overestimates the smaller FleetSession projection.
+                let encoded_bytes = [
+                    &raw,
+                    card_value.unwrap_or(&Value::Null),
+                    profile_value.unwrap_or(&Value::Null),
+                    &node_wire,
+                ]
+                .into_iter()
+                .try_fold(0_usize, |total, value| {
+                    serde_json::to_vec(value)
+                        .map_err(|error| FleetError::new(FleetErrorKind::Error, error.to_string()))?
+                        .len()
+                        .checked_add(total)
+                        .ok_or_else(|| {
+                            FleetError::new(
+                                FleetErrorKind::Incompatible,
+                                "Cached fleet row size overflowed its safety counter",
+                            )
+                        })
+                })?;
+                if aggregate
+                    && retained_bytes
+                        .checked_add(encoded_bytes)
+                        .is_none_or(|bytes| bytes > byte_slice)
+                {
+                    break;
+                }
                 result.push(FleetSession {
                     node_id: node.node_id.clone(),
                     node_name: node.alias.clone(),
@@ -1814,9 +1879,27 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                         .and_then(Value::as_str)
                         .map(str::to_owned),
                 });
+                retained_rows += 1;
+                retained_bytes += encoded_bytes;
+            }
+            let omitted_rows = available_rows.saturating_sub(retained_rows);
+            if omitted_rows > 0 {
+                notices.push(FleetCacheNotice {
+                    node_id: node.node_id.clone(),
+                    node_name: node.alias.clone(),
+                    omitted_rows,
+                    message: format!(
+                        "{omitted_rows} cached conversation(s) on {} not shown · fair aggregate limit is {row_slice} rows and {} KiB for this machine",
+                        node.alias,
+                        byte_slice / 1024,
+                    ),
+                });
             }
         }
-        Ok(result)
+        Ok(CachedFleetSessions {
+            sessions: result,
+            notices,
+        })
     }
 
     /// Merge retained remote expert cards without contacting any machine.

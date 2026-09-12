@@ -155,6 +155,44 @@ impl FleetTransport for &FakeTransport {
     }
 }
 
+struct SupersedingAddTransport {
+    store: Store,
+    node_id: String,
+}
+
+impl FleetTransport for &SupersedingAddTransport {
+    fn request(
+        &self,
+        _target: &str,
+        payload: &Value,
+        _mutating: bool,
+    ) -> Result<Value, FleetError> {
+        match payload.get("op").and_then(Value::as_str) {
+            Some("hello") => Ok(json!({
+                "type":"hello", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+                "node_id":self.node_id, "machine":"atlas", "package_version":"0.6.0",
+                "capabilities":CAPABILITIES,
+            })),
+            Some("snapshot") => {
+                // Simulate a second add beginning while the first add waits on
+                // its snapshot. The first response must not become trusted.
+                self.store.claim_fleet_onboarding(&self.node_id).unwrap();
+                Ok(snapshot(&self.node_id, CODEX_THREAD_ID))
+            }
+            operation => panic!("unexpected fake fleet operation: {operation:?}"),
+        }
+    }
+
+    fn run_exact(
+        &self,
+        _node: &FleetNode,
+        _arguments: &[String],
+        _tty: bool,
+    ) -> Result<i32, FleetError> {
+        unreachable!("add does not run an exact command")
+    }
+}
+
 fn initialized_store(temp: &TempDir, name: &str) -> Store {
     let store = Store::at(temp.path().join(name));
     store.initialize().unwrap();
@@ -272,7 +310,7 @@ fn strict_snapshot_rejects_more_than_two_thousand_sessions() {
 }
 
 #[test]
-fn cached_fleet_accepts_twenty_small_nodes_but_rejects_aggregate_row_amplification() {
+fn cached_fleet_accepts_twenty_small_nodes_and_fairly_slices_aggregate_rows() {
     let temp = TempDir::new().unwrap();
     let store = initialized_store(&temp, "state.db");
     for index in 0..20 {
@@ -295,8 +333,10 @@ fn cached_fleet_accepts_twenty_small_nodes_but_rejects_aggregate_row_amplificati
     let temp = TempDir::new().unwrap();
     let store = initialized_store(&temp, "amplified.db");
     let rows_per_node = (MAX_CACHED_FLEET_ROWS / 5) + 1;
+    let mut node_ids = Vec::new();
     for node_index in 0..5 {
         let node_id = Uuid::new_v4().to_string();
+        node_ids.push(node_id.clone());
         store
             .upsert_fleet_node(&node(&node_id, &format!("large-{node_index}")))
             .unwrap();
@@ -319,11 +359,37 @@ fn cached_fleet_accepts_twenty_small_nodes_but_rejects_aggregate_row_amplificati
             .put_remote_snapshot(&node_id, &payload, now())
             .unwrap();
     }
-    let error = FleetManager::new(&store, &FakeTransport::default())
-        .cached_sessions(None, false)
-        .unwrap_err();
-    assert_eq!(error.kind, FleetErrorKind::Incompatible);
-    assert!(error.message.contains("row board safety limit"));
+    let fake = FakeTransport::default();
+    let manager = FleetManager::new(&store, &fake);
+    let cached = manager.cached_sessions_with_notices(None, false).unwrap();
+    assert_eq!(cached.sessions.len(), MAX_CACHED_FLEET_ROWS);
+    assert_eq!(cached.notices.len(), 5);
+    for node_index in 0..5 {
+        let alias = format!("large-{node_index}");
+        assert_eq!(
+            cached
+                .sessions
+                .iter()
+                .filter(|session| session.node_name == alias)
+                .count(),
+            MAX_CACHED_FLEET_ROWS / 5
+        );
+        let notice = cached
+            .notices
+            .iter()
+            .find(|notice| notice.node_name == alias)
+            .unwrap();
+        assert_eq!(notice.omitted_rows, 1);
+        assert!(notice.message.contains("1 cached conversation"));
+    }
+    assert_eq!(
+        manager
+            .cached_sessions(Some(&node_ids[0]), false)
+            .unwrap()
+            .len(),
+        rows_per_node,
+        "exact-machine reads must not inherit the aggregate slice"
+    );
 }
 
 #[test]
@@ -354,6 +420,57 @@ fn failed_initial_snapshot_trusts_nothing() {
     };
     assert!(manager.add(&candidate, None).is_err());
     assert!(store.list_nodes().unwrap().is_empty());
+}
+
+#[test]
+fn stale_add_response_cannot_trust_a_node_after_a_newer_add_claim() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "state.db");
+    let remote = Uuid::new_v4().to_string();
+    let transport = SupersedingAddTransport {
+        store: store.clone(),
+        node_id: remote,
+    };
+    let candidate = NodeCandidate {
+        alias: "atlas".into(),
+        ssh_target: "atlas".into(),
+        sources: vec!["explicit".into()],
+        hostname: None,
+        online: None,
+        os_name: None,
+    };
+    let error = FleetManager::new(&store, &transport)
+        .add(&candidate, None)
+        .unwrap_err();
+    assert!(error.message.contains("superseded"));
+    assert!(store.list_nodes().unwrap().is_empty());
+}
+
+#[test]
+fn intentional_refresh_cancellation_preserves_ready_node_and_cached_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "state.db");
+    let remote = Uuid::new_v4().to_string();
+    store.upsert_fleet_node(&node(&remote, "atlas")).unwrap();
+    let original = snapshot(&remote, CODEX_THREAD_ID);
+    store
+        .put_remote_snapshot(&remote, &original, now())
+        .unwrap();
+
+    let cancellation = CancellationToken::default();
+    cancellation.cancel();
+    let error = FleetManager::new(&store, &FakeTransport::default())
+        .refresh_node_cancellable(&remote, &cancellation)
+        .unwrap_err();
+    assert_eq!(error.kind, FleetErrorKind::Unreachable);
+
+    let retained = store.get_fleet_node(&remote).unwrap().unwrap();
+    assert_eq!(retained.status, "ready");
+    assert_eq!(retained.last_error, None);
+    assert_eq!(
+        store.get_remote_snapshot(&remote).unwrap().unwrap().payload,
+        original
+    );
 }
 
 #[test]
