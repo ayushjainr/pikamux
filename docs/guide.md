@@ -196,23 +196,23 @@ original file; Pika never deletes backups.
 ## Open a local window from a remote Pika board
 
 The Windows bridge is experimental: CLI smoke checks do not verify real Windows
-Terminal pairing or attachment. Use the same candidate on both ends.
+Terminal pairing or attachment. Keep the client and host updated together.
 
 Pika uses the same package and `pika` command on the laptop and server. Linux/macOS
 nodes own provider processes, exact identity reconciliation, and tmux homes. The
 Windows client owns only local window creation; a remote process is never given
 permission to execute an arbitrary client-side command.
 
-Install the same release on Windows, then pair each server whose agents may be
+Install the Windows client, then pair each server whose agents may be
 opened locally:
 
 ```powershell
-Expand-Archive .\pikamux-VERSION-x86_64-pc-windows-msvc.zip -DestinationPath .\pika
-Set-Location .\pika
-./pika.exe setup devbox
+irm https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.ps1 | iex
+pika setup devbox
 ```
 
-Download the Windows client ZIP from the same release as the host.
+Run these commands in local PowerShell, outside SSH. Replace `devbox` with the
+SSH host name you already use. Installation needs no administrator access.
 
 Pairing performs two SSH identity receipts, stores a different random secret for
 that exact Pika node on each side, and starts the loopback-only client bridge.

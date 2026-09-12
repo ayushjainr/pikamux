@@ -41,6 +41,19 @@ for prerequisites and troubleshooting.
    Use **Ctrl-b**, then **d**, to detach and return to Pika while the agent keeps
    running.
 
+### Windows
+
+Use the Windows client to open agents running on a Mac or Linux host. In PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.ps1 | iex
+pika setup YOUR_SSH_HOST
+```
+
+Replace `YOUR_SSH_HOST` with a host you already connect to over SSH.
+The native client is experimental; local agent hosting requires WSL.
+See [Windows setup](docs/installing.md#windows).
+
 ## Everyday use
 
 ```bash

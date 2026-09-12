@@ -100,8 +100,29 @@ Source installations are updated through Cargo, not `pika update`.
 
 Windows can host Pika inside a supported WSL Linux environment. The native
 Windows download is an experimental client for opening conversations on a
-macOS or Linux host; it does not host agents or tmux itself. See
-[client pairing](guide.md#open-a-local-window-from-a-remote-pika-board).
+macOS or Linux host; it does not host agents or tmux itself.
+
+Run in a local PowerShell window, not inside SSH:
+
+```powershell
+irm https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.ps1 | iex
+pika setup YOUR_SSH_HOST
+```
+
+Replace `YOUR_SSH_HOST` with your existing SSH host name. Pika must already be
+installed on that host. Pairing prints the reverse-forward setting needed to
+open exact conversations in Windows Terminal.
+
+The installer requires 64-bit Windows and PowerShell 5.1 or newer. It verifies
+the release manifest, checksum and ZIP contents before running the client,
+installs under `%LOCALAPPDATA%\Pika\Client`, and adds the command to your user
+PATH and current PowerShell session. No administrator access is needed. It does
+not change SSH configuration, pair machines, or start a bridge during installation.
+
+Run the same install command to update. Previous releases remain on disk; an
+already running bridge is left alone. Windows `pika update` is not available.
+Offline installation accepts `install.ps1 -Bundle C:\path\to\release`; `-NoPath`
+leaves PATH unchanged. See [client pairing](guide.md#open-a-local-window-from-a-remote-pika-board).
 
 ## Troubleshooting
 

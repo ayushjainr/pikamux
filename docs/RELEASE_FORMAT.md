@@ -157,5 +157,15 @@ provenance attestations. See [releasing](releasing.md).
 - Setup migration and long-lived callback rewrites remain previewed operations.
 - Remote upgrades remain explicit, version-pinned and per machine.
 - Automatic pruning, delta updates and OS package managers are deferred.
-- Native Windows hosting, PowerShell installation and Windows self-update are a
-  future client features.
+- Native Windows hosting and in-client self-update remain separate future work.
+
+## Windows bootstrap
+
+The root `install.ps1` installs the Windows client from the stable release
+manifest and matching checksum sidecar. It pins download paths to that version,
+bounds downloads and extraction, allows only the three declared archive files,
+and probes the verified executable before activation. Versioned directories under
+`%LOCALAPPDATA%\Pika\Client\releases` avoid replacing an executable used by a
+running bridge. The per-user PATH selects the installed version. Re-running the
+installer updates it; downgrades and changed bytes for an installed version are
+refused. Pairing and SSH configuration remain separate, explicit steps.
