@@ -111,8 +111,13 @@ def seed(root: Path, project: Path) -> tuple[Path, dict[str, str]]:
     }
 
 
-def measure(program: Path, environment: dict[str, str], seconds: int) -> dict[str, float | int]:
-    pid, fd, first_frame = spawn_board(program, environment)
+def measure(
+    program: Path,
+    environment: dict[str, str],
+    seconds: int,
+    complete_marker: bytes,
+) -> dict[str, float | int]:
+    pid, fd, first_frame = spawn_board(program, environment, complete_marker)
     rss: list[float] = []
     cpu: list[float] = []
     output_bytes = 0
@@ -171,7 +176,10 @@ def main() -> None:
         root = Path(temporary)
         for index, (label, program) in enumerate(programs.items()):
             _, environment = seed(root / f"{index}-{label}", project)
-            results[label] = measure(program, environment, args.seconds)
+            complete_marker = b"q quit" if label == "python" else b"q leave"
+            results[label] = measure(
+                program, environment, args.seconds, complete_marker
+            )
     print(json.dumps(results, indent=2, sort_keys=True))
 
 
