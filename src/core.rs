@@ -541,6 +541,12 @@ impl Pika {
             candidates: mut metadata,
         } = self.reconcile_local_with_candidates()?;
         let mut sessions = inventory.sessions;
+        // An explicit daily-name or UUID lookup is also the recovery path for
+        // a conversation the user previously stopped watching. Keep the
+        // tombstone in place while resolving so read-only lookups and
+        // ambiguous choices have no side effect; `open_session` removes only
+        // the exact selected tombstone immediately before the open action.
+        sessions.extend(self.store.list_untracked_sessions()?);
         let mut known: BTreeSet<(Provider, String)> = sessions
             .iter()
             .map(|item| (item.provider, item.session_id.clone()))
@@ -551,7 +557,17 @@ impl Pika {
                 continue;
             }
             for candidate in providers.find(provider, raw_query) {
-                if known.insert((candidate.provider, candidate.session_id.clone())) {
+                if let Some(existing) = sessions.iter_mut().find(|session| {
+                    session.provider == candidate.provider
+                        && (session.session_id == candidate.session_id
+                            || session.active_thread_id.as_deref()
+                                == Some(candidate.session_id.as_str()))
+                }) {
+                    // Keep an untracked row's stable Pika identity while using
+                    // current provider metadata for explicit lookup (including
+                    // a native rename made while it was unwatched).
+                    merge_session_candidate(existing, &candidate);
+                } else if known.insert((candidate.provider, candidate.session_id.clone())) {
                     sessions.push(session_from_candidate(&candidate));
                 }
                 metadata.insert(
@@ -771,6 +787,16 @@ impl Pika {
     }
 
     pub fn open_session(&self, mut session: Session, attach: bool) -> Result<OpenReceipt> {
+        // Selection is complete by the time this boundary is entered. Match
+        // the frozen daily-command contract: explicitly opening an unwatched
+        // conversation resumes watching that exact provider UUID, even when a
+        // later provider/tmux check prevents the actual attach or resume.
+        if self
+            .store
+            .restore_tracking(session.provider, &session.session_id)?
+        {
+            self.store.upsert_session(&session, false)?;
+        }
         let inventory = self.reconcile_local()?;
         if let Some(current) = inventory.sessions.into_iter().find(|candidate| {
             candidate.provider == session.provider && candidate.session_id == session.session_id
@@ -1906,6 +1932,109 @@ mod tests {
             pika_session_id: Some(identity.into()),
             pika_name: Some("portfolio_review".into()),
             pika_launch_token: None,
+        }
+    }
+
+    #[test]
+    fn daily_name_and_uuid_restore_only_the_exact_selected_tombstone() {
+        for query_by_name in [true, false] {
+            let (root, pika) = test_pika();
+            let identity = if query_by_name {
+                "11111111-1111-4111-8111-111111111111"
+            } else {
+                "22222222-2222-4222-8222-222222222222"
+            };
+            let mut session = test_session(identity);
+            if query_by_name {
+                session.name = Some("old_provider_name".into());
+                std::fs::create_dir_all(&pika.paths.codex_home).unwrap();
+                let transcript = root.path().join("renamed.jsonl");
+                std::fs::write(&transcript, "{}\n").unwrap();
+                let db =
+                    rusqlite::Connection::open(pika.paths.codex_home.join("state_renamed.sqlite"))
+                        .unwrap();
+                db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,name TEXT,cwd TEXT,rollout_path TEXT,updated_at INTEGER,archived INTEGER)").unwrap();
+                db.execute(
+                    "INSERT INTO threads VALUES(?1,'restored_name','/tmp',?2,10,0)",
+                    rusqlite::params![identity, transcript.display().to_string()],
+                )
+                .unwrap();
+            }
+            session.live = false;
+            session.root_pid = None;
+            session.status = Status::Parked;
+            pika.store.upsert_session(&session, false).unwrap();
+            pika.store
+                .untrack_session(session.provider, &session.session_id)
+                .unwrap();
+
+            let query = if query_by_name {
+                "restored_name".to_owned()
+            } else {
+                session.session_id.clone()
+            };
+            let matches = pika.resolve_local(&query).unwrap();
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].session_id, session.session_id);
+            assert!(
+                pika.store
+                    .is_untracked(session.provider, &session.session_id)
+                    .unwrap(),
+                "resolution alone must preserve the tombstone"
+            );
+
+            // The isolated fixture cannot complete a real provider/tmux open.
+            // Frozen Pika semantics still restore watching immediately after
+            // the exact daily-command selection.
+            assert!(pika.open_name(&query, false, false).is_err());
+            assert!(
+                !pika
+                    .store
+                    .is_untracked(session.provider, &session.session_id)
+                    .unwrap()
+            );
+            assert!(
+                pika.cached_inventory()
+                    .unwrap()
+                    .sessions
+                    .iter()
+                    .any(|item| {
+                        item.provider == session.provider && item.session_id == session.session_id
+                    })
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_daily_name_does_not_restore_any_tombstone() {
+        let (root, pika) = test_pika();
+        let first_dir = root.path().join("first");
+        let second_dir = root.path().join("second");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let mut identities = Vec::new();
+        for (identity, cwd) in [
+            ("11111111-1111-4111-8111-111111111111", first_dir),
+            ("22222222-2222-4222-8222-222222222222", second_dir),
+        ] {
+            let mut session = test_session(identity);
+            session.cwd = Some(cwd.to_string_lossy().into_owned());
+            session.live = false;
+            session.root_pid = None;
+            session.status = Status::Parked;
+            pika.store.upsert_session(&session, false).unwrap();
+            pika.store
+                .untrack_session(session.provider, &session.session_id)
+                .unwrap();
+            identities.push(session.session_id);
+        }
+
+        let error = pika
+            .open_name("portfolio_review", false, false)
+            .unwrap_err();
+        assert!(error.downcast_ref::<OpenError>().is_some());
+        for identity in identities {
+            assert!(pika.store.is_untracked(Provider::Codex, &identity).unwrap());
         }
     }
 
