@@ -259,8 +259,7 @@ fn pane_replacement_between_readback_and_respawn_never_starts_provider() {
     executable(
         &wrapper,
         &format!(
-            "#!/bin/sh\ncase \"$*\" in *if-shell*respawn-pane*) pane=$(tmux -L '{}' list-panes -a -F '#{{pane_id}}' | head -n 1); tmux -L '{}' respawn-pane -k -t \"$pane\" 'sleep 30';; esac\nexec tmux \"$@\"\n",
-            socket, socket
+            "#!/bin/sh\ncase \"$*\" in *if-shell*respawn-pane*) pane=$(tmux -L '{socket}' list-panes -a -F '#{{pane_id}}' | head -n 1); tmux -L '{socket}' respawn-pane -k -t \"$pane\" 'sleep 30';; esac\nexec tmux \"$@\"\n"
         ),
     );
     let pika = launch_fixture(&temp, &socket, wrapper);

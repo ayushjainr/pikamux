@@ -576,6 +576,25 @@ pub fn local_source_availability(
     LocalSourceIndex::read(paths, config, std::slice::from_ref(session)).availability(session)
 }
 
+/// Fail closed at the shared boundary used by every local consultation path.
+/// This must run immediately before provider startup because archive/delete
+/// state can change after discovery, ranking, or quota selection.
+pub fn require_local_source_available(
+    paths: &Paths,
+    config: &Config,
+    session: &Session,
+) -> Result<()> {
+    let availability = local_source_availability(paths, config, session);
+    if !availability.permits_consultation() {
+        bail!(
+            "Cannot consult {}: {}. No question was sent; watching is unchanged.",
+            session.display_name(),
+            availability.as_str(),
+        )
+    }
+    Ok(())
+}
+
 pub fn remote_source_availability(stale: bool, availability: Option<&str>) -> &str {
     if stale {
         "machine-unreachable"

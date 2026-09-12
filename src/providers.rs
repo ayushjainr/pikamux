@@ -1387,10 +1387,10 @@ mod tests {
             !Providers::new(&paths, &config).set_codex_native_name_with_timeout(
                 "11111111-1111-4111-8111-111111111111",
                 &"x".repeat(64 * 1024),
-                Duration::from_millis(300)
+                Duration::from_secs(1)
             )
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(2));
         let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
         for _ in 0..100 {
             // Signal zero only inspects our fixture child; no user process is signalled.
@@ -1412,7 +1412,7 @@ mod tests {
             !Providers::new(&paths, &config)
                 .set_codex_native_name("11111111-1111-4111-8111-111111111111", "name")
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(unix)]

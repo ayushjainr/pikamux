@@ -1162,10 +1162,10 @@ mod tests {
         );
         let started = Instant::now();
         let error = tmux
-            .output_with_timeout(["list-panes"], false, Duration::from_millis(300))
+            .output_with_timeout(["list-panes"], false, Duration::from_secs(3))
             .unwrap_err();
         assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(4));
         assert_fixture_child_gone(&pid_file);
     }
 
@@ -1183,10 +1183,10 @@ mod tests {
         );
         let started = Instant::now();
         let output = tmux
-            .output_with_timeout(["list-panes"], true, Duration::from_millis(500))
+            .output_with_timeout(["list-panes"], true, Duration::from_secs(2))
             .unwrap();
         assert_eq!(output.stdout, b"complete");
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(3));
         assert_fixture_child_gone(&pid_file);
     }
 

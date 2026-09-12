@@ -612,7 +612,8 @@ fn bare(pika: &Pika) -> Result<i32> {
     let worker_stop = Arc::clone(&stop);
     let worker = pika.clone();
     let local_sender = sender.clone();
-    let _local_refresh = thread::spawn(move || {
+    let (local_done_sender, local_done_receiver) = mpsc::sync_channel(1);
+    let local_refresh = thread::spawn(move || {
         while !worker_stop.load(Ordering::Relaxed) {
             if let Ok(mut inventory) = worker.reconcile_local() {
                 let _ =
@@ -629,9 +630,10 @@ fn bare(pika: &Pika) -> Result<i32> {
             // lifecycle hooks still publish attention immediately.
             match refresh_receiver.recv_timeout(Duration::from_secs(10)) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        let _ = local_done_sender.send(());
     });
     let remote_stop = Arc::clone(&stop);
     let remote_worker = pika.clone();
@@ -673,12 +675,7 @@ fn bare(pika: &Pika) -> Result<i32> {
         update_receiver,
         refresh_sender.clone(),
     );
-    stop.store(true, Ordering::Relaxed);
-    // Wake and join the bounded local observer. Remote/update work has its own
-    // deadline and never owns row-action correctness; joining it here would
-    // delay Enter behind SSH, which the board explicitly forbids.
-    let _ = refresh_sender.try_send(());
-    let _ = _local_refresh.join();
+    finish_board_observer(&stop, &refresh_sender, &local_done_receiver, local_refresh);
     // Do not delay Enter/quit behind provider metadata or a bounded SSH
     // timeout. Exact actions revalidate independently before mutating state.
     match action? {
@@ -693,6 +690,23 @@ fn bare(pika: &Pika) -> Result<i32> {
             release: version,
         }),
         BoardAction::Quit => Ok(0),
+    }
+}
+
+fn finish_board_observer(
+    stop: &AtomicBool,
+    refresh: &mpsc::SyncSender<()>,
+    done: &mpsc::Receiver<()>,
+    worker: thread::JoinHandle<()>,
+) {
+    stop.store(true, Ordering::Relaxed);
+    // Wake the local observer, but never hold Enter/quit behind an in-flight
+    // provider or tmux read. Exact row actions revalidate independently. A
+    // completed observer is joined; a slow one retains its own Pika clone and
+    // exits after its now-bounded reconciliation call observes `stop`.
+    let _ = refresh.try_send(());
+    if done.recv_timeout(Duration::from_millis(50)).is_ok() {
+        let _ = worker.join();
     }
 }
 
@@ -1665,7 +1679,9 @@ fn expert(pika: &Pika, a: ExpertArgs) -> Result<i32> {
                 };
                 refresh.refresh_one(&session)?
             };
-            let failed = results.iter().any(|result| result.status == "FAILED");
+            let failed = results
+                .iter()
+                .any(|result| matches!(result.status.as_str(), "FAILED" | "UNAVAILABLE"));
             if json {
                 println!("{}", serde_json::to_string(&results)?)
             } else if results.is_empty() {
@@ -2105,7 +2121,7 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
                             ))?
                         {
                             transport
-                                .install_bundle(&candidate.ssh_target, &prepared)
+                                .install_bundle(&candidate.ssh_target, &prepared, None)
                                 .map_err(anyhow::Error::from)?;
                             let node = manager
                                 .add(&candidate, Some(&candidate.alias))
@@ -3157,15 +3173,7 @@ fn open_local_consultation(
     session: &Session,
     options: crate::consult::ConsultationOptions,
 ) -> Result<crate::consult::Consultation> {
-    let availability =
-        crate::experts::local_source_availability(&pika.paths, &pika.config, session);
-    if !availability.permits_consultation() {
-        bail!(
-            "Cannot consult {}: {}. No question was sent; watching is unchanged.",
-            session.display_name(),
-            availability.as_str(),
-        )
-    }
+    crate::experts::require_local_source_available(&pika.paths, &pika.config, session)?;
     crate::consult::Consultation::open(session, options).map_err(consultation_error)
 }
 
@@ -3715,6 +3723,28 @@ mod fleet_consultation_tests {
             estimated_cost_usd: None,
             active_thread_id: Some("parent-thread".into()),
         }
+    }
+
+    #[test]
+    fn board_exit_does_not_join_a_stalled_local_observer() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (refresh_sender, _refresh_receiver) = mpsc::sync_channel(1);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _ = release_receiver.recv();
+            let _ = done_sender.send(());
+        });
+
+        let started = Instant::now();
+        finish_board_observer(&stop, &refresh_sender, &done_receiver, worker);
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert!(stop.load(Ordering::Relaxed));
+
+        release_sender.send(()).unwrap();
+        done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached observer exits safely after its bounded work returns");
     }
 
     fn assert_disconnect_cancels_exact_child(explicit_close: bool) {

@@ -7,7 +7,10 @@
 
 use crate::config::Config;
 use crate::consult::{Consultation, ConsultationOptions, ConsultationPolicy, consultation_policy};
-use crate::experts::{CardStatus, PublishInput, card_state, make_profile, transcript_fingerprint};
+use crate::experts::{
+    CardStatus, PublishInput, card_state, make_profile, require_local_source_available,
+    transcript_fingerprint,
+};
 use crate::model::{Provider, Session};
 use crate::paths::Paths;
 use crate::store::{ExpertRefreshAttempt, Store, StoredExpertProfile};
@@ -188,6 +191,12 @@ impl QuotaSource for SystemQuotaSource {
 }
 
 pub trait InterviewRunner {
+    /// Proves that the provider still exposes the exact parent source without
+    /// starting a model. Test runners may accept their synthetic sessions.
+    fn require_available(&mut self, _session: &Session) -> Result<()> {
+        Ok(())
+    }
+
     /// Runs exactly one private side interview with the supplied immutable policy.
     fn interview(
         &mut self,
@@ -200,16 +209,20 @@ pub trait InterviewRunner {
 #[derive(Clone, Debug)]
 pub struct NativeInterviewRunner {
     executables: BTreeMap<Provider, PathBuf>,
+    config: Config,
+    paths: Paths,
     timeout: Duration,
 }
 
 impl NativeInterviewRunner {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, paths: &Paths) -> Self {
         Self {
             executables: Provider::ALL
                 .into_iter()
                 .map(|provider| (provider, PathBuf::from(config.executable(provider))))
                 .collect(),
+            config: config.clone(),
+            paths: paths.clone(),
             timeout: Duration::from_secs(900),
         }
     }
@@ -221,6 +234,10 @@ impl NativeInterviewRunner {
 }
 
 impl InterviewRunner for NativeInterviewRunner {
+    fn require_available(&mut self, session: &Session) -> Result<()> {
+        require_local_source_available(&self.paths, &self.config, session)
+    }
+
     fn interview(
         &mut self,
         session: &Session,
@@ -231,6 +248,7 @@ impl InterviewRunner for NativeInterviewRunner {
         if *policy != expected {
             bail!("expert refresh attempted an unapproved consultation policy");
         }
+        self.require_available(session)?;
         let executable = self
             .executables
             .get(&session.provider)
@@ -318,7 +336,7 @@ impl<'a> NativeExpertRefresh<'a> {
         Self::new(
             store,
             SystemQuotaSource::new(config, paths),
-            NativeInterviewRunner::new(config),
+            NativeInterviewRunner::new(config, paths),
         )
     }
 }
@@ -371,14 +389,28 @@ impl<'a, Q: QuotaSource, I: InterviewRunner> ExpertRefresh<'a, Q, I> {
                     .get_stored_expert_profile(provider, &session.session_id)?;
                 states.push((session, card_state(session, profile.as_ref())));
             }
-            let mut pending = states
-                .iter()
-                .filter(|(_, state)| {
-                    matches!(state.status, CardStatus::Missing | CardStatus::Stale)
-                })
-                .map(|(session, state)| (*session, state.status))
-                .collect::<Vec<_>>();
+            let mut pending = Vec::new();
+            let mut unavailable = false;
+            for (session, state) in &states {
+                if !matches!(state.status, CardStatus::Missing | CardStatus::Stale) {
+                    continue;
+                }
+                match self.interviews.require_available(session) {
+                    Ok(()) => pending.push((*session, state.status)),
+                    Err(error) => {
+                        unavailable = true;
+                        output.push(ExpertRefreshResult::session(
+                            session,
+                            "UNAVAILABLE",
+                            error.to_string(),
+                        ));
+                    }
+                }
+            }
             if pending.is_empty() {
+                if unavailable {
+                    continue;
+                }
                 let unknown = states
                     .iter()
                     .any(|(_, state)| state.status == CardStatus::Unknown);
@@ -559,20 +591,27 @@ impl<'a, Q: QuotaSource, I: InterviewRunner> ExpertRefresh<'a, Q, I> {
                     state.detail,
                 )),
                 CardStatus::Missing | CardStatus::Stale => {
-                    match self.interview_and_store(session) {
-                        Ok(policy) => output.push(
-                            ExpertRefreshResult::session(
-                                session,
-                                "REFRESHED",
-                                "exact ephemeral interview",
-                            )
-                            .with_policy(&policy),
-                        ),
+                    match self.interviews.require_available(session) {
                         Err(error) => output.push(ExpertRefreshResult::session(
                             session,
-                            "FAILED",
+                            "UNAVAILABLE",
                             error.to_string(),
                         )),
+                        Ok(()) => match self.interview_and_store(session) {
+                            Ok(policy) => output.push(
+                                ExpertRefreshResult::session(
+                                    session,
+                                    "REFRESHED",
+                                    "exact ephemeral interview",
+                                )
+                                .with_policy(&policy),
+                            ),
+                            Err(error) => output.push(ExpertRefreshResult::session(
+                                session,
+                                "FAILED",
+                                error.to_string(),
+                            )),
+                        },
                     }
                 }
             }
@@ -839,6 +878,7 @@ mod tests {
 
     struct FakeInterview {
         answer: Result<String, String>,
+        availability: Result<(), String>,
         calls: Vec<String>,
         active: Cell<usize>,
         max_active: Cell<usize>,
@@ -854,6 +894,7 @@ mod tests {
                     "artifacts":["src/core.rs"]
                 })
                 .to_string()),
+                availability: Ok(()),
                 calls: Vec::new(),
                 active: Cell::new(0),
                 max_active: Cell::new(0),
@@ -862,6 +903,10 @@ mod tests {
     }
 
     impl InterviewRunner for FakeInterview {
+        fn require_available(&mut self, _session: &Session) -> Result<()> {
+            self.availability.clone().map_err(anyhow::Error::msg)
+        }
+
         fn interview(
             &mut self,
             session: &Session,
@@ -1290,6 +1335,109 @@ mod tests {
         );
         assert_eq!(refresh.quota.calls, 0);
         assert_eq!(refresh.interviews.calls, ["exact-0"]);
+    }
+
+    #[test]
+    fn every_refresh_mode_skips_unavailable_sources_before_quota_or_interview() {
+        let fixture = Fixture::new(&[Provider::Codex, Provider::Codex]);
+        let unavailable = || FakeInterview {
+            availability: Err("source deleted".into()),
+            ..FakeInterview::valid()
+        };
+
+        let mut one = ExpertRefresh::new(
+            &fixture.store,
+            FakeQuota {
+                values: BTreeMap::new(),
+                calls: 0,
+            },
+            unavailable(),
+        );
+        let result = one.refresh_one(&fixture.sessions[0]).unwrap();
+        assert_eq!(result[0].status, "UNAVAILABLE");
+        assert!(one.interviews.calls.is_empty());
+
+        let mut all = ExpertRefresh::new(
+            &fixture.store,
+            FakeQuota {
+                values: BTreeMap::new(),
+                calls: 0,
+            },
+            unavailable(),
+        );
+        let result = all.refresh_all(&fixture.sessions, None).unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|item| item.status == "UNAVAILABLE"));
+        assert!(all.interviews.calls.is_empty());
+
+        let mut due = ExpertRefresh::new(
+            &fixture.store,
+            FakeQuota {
+                values: BTreeMap::from([(
+                    Provider::Codex,
+                    Some(QuotaSnapshot {
+                        provider: Provider::Codex,
+                        used_percent: 20.0,
+                        reset_at: 2_000,
+                        observed_at: 1_000.0,
+                        source: "test".into(),
+                    }),
+                )]),
+                calls: 0,
+            },
+            unavailable(),
+        );
+        let result = due
+            .refresh_due(&fixture.sessions, Some(Provider::Codex), 1_000.0)
+            .unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|item| item.status == "UNAVAILABLE"));
+        assert_eq!(due.quota.calls, 0);
+        assert!(due.interviews.calls.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_refresh_refuses_archived_source_before_provider_start() {
+        let root = tempfile::tempdir().unwrap();
+        let archived = root.path().join("archived_sessions/exact.jsonl");
+        fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        fs::write(&archived, "retained history\n").unwrap();
+        let marker = root.path().join("provider-started");
+        let executable = root.path().join("codex");
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\n: > {}\nexit 99\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = Paths {
+            config_dir: root.path().join("config"),
+            state_dir: root.path().join("state"),
+            config: root.path().join("config/config.json"),
+            database: root.path().join("state/pika.db"),
+            codex_home: root.path().join("codex-home"),
+            claude_home: root.path().join("claude-home"),
+            opencode_data_home: root.path().join("opencode-data"),
+            opencode_config_home: root.path().join("opencode-config"),
+        };
+        let mut config = Config::default();
+        config.provider_executables.insert(
+            Provider::Codex.as_str().to_owned(),
+            executable.display().to_string(),
+        );
+        let mut session = Fixture::new(&[Provider::Codex]).sessions.remove(0);
+        session.transcript_path = Some(archived.display().to_string());
+        let policy = consultation_policy(Provider::Codex, false).unwrap();
+        let error = NativeInterviewRunner::new(&config, &paths)
+            .interview(&session, "profile", &policy)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("archived"));
+        assert!(
+            !marker.exists(),
+            "provider was started for an archived source"
+        );
     }
 
     #[test]

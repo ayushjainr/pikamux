@@ -569,30 +569,35 @@ impl Pika {
         if let Some(provider) = provider_filter {
             sessions.retain(|session| session.provider == provider);
         }
+        let source_index =
+            crate::experts::LocalSourceIndex::read(&self.paths, &self.config, &sessions);
         let choices: Vec<NameCandidate> = sessions
             .iter()
-            .map(|session| NameCandidate {
-                provider: session.provider,
-                session_id: session.session_id.clone(),
-                active_thread_id: session.active_thread_id.clone(),
-                name: session.name.clone(),
-                live: session.live,
-                exact_home: session.has_exact_home(),
-                status: session.status,
-                local: true,
-                evidence: SelectionEvidence {
-                    state: if session
-                        .transcript_path
-                        .as_deref()
-                        .is_some_and(|path| !path.is_empty() && !Path::new(path).exists())
-                    {
-                        EvidenceState::Missing
-                    } else {
-                        EvidenceState::Available
+            .map(|session| {
+                let state = match source_index.availability(session) {
+                    crate::experts::SourceAvailability::SourceAvailable => EvidenceState::Available,
+                    crate::experts::SourceAvailability::Archived => EvidenceState::Archived,
+                    crate::experts::SourceAvailability::Deleted => EvidenceState::Missing,
+                    crate::experts::SourceAvailability::SourceUnavailable
+                    | crate::experts::SourceAvailability::RequiresReconciliation => {
+                        EvidenceState::Unknown
+                    }
+                };
+                NameCandidate {
+                    provider: session.provider,
+                    session_id: session.session_id.clone(),
+                    active_thread_id: session.active_thread_id.clone(),
+                    name: session.name.clone(),
+                    live: session.live,
+                    exact_home: session.has_exact_home(),
+                    status: session.status,
+                    local: true,
+                    evidence: SelectionEvidence {
+                        state,
+                        canonical_cwd: canonical_directory(session.cwd.as_deref()),
+                        provider_updated_at: Some(session.last_activity_at),
                     },
-                    canonical_cwd: canonical_directory(session.cwd.as_deref()),
-                    provider_updated_at: Some(session.last_activity_at),
-                },
+                }
             })
             .collect();
         match resolve_name(raw_query, &choices) {
@@ -772,15 +777,22 @@ impl Pika {
         if session.has_exact_home() {
             let binding = self.exact_pane_binding(&session, session.tmux_pane.as_deref())?;
             let event = session.last_event_at;
+            let mut handoff_started = false;
             let code = if attach {
                 self.tmux.attach_exact_with_started(&binding.pane, || {
                     self.confirm_exact_handoff(&session, &binding)?;
-                    open_history::record_session(&self.store, session.provider, &session.session_id)
+                    open_history::record_session(
+                        &self.store,
+                        session.provider,
+                        &session.session_id,
+                    )?;
+                    handoff_started = true;
+                    Ok(())
                 })?
             } else {
                 0
             };
-            if attach {
+            if handoff_started {
                 self.store.acknowledge_attention(
                     session.provider,
                     &session.session_id,
@@ -850,6 +862,25 @@ impl Pika {
                 shell_words::quote(&display_name)
             ))
             .into());
+        }
+        let availability =
+            crate::experts::local_source_availability(&self.paths, &self.config, &session);
+        if !availability.permits_consultation() {
+            let display_name = session.display_name();
+            let quoted_name = shell_words::quote(&display_name);
+            if availability == crate::experts::SourceAvailability::Archived
+                && session.provider == Provider::Codex
+            {
+                bail!(
+                    "{display_name} is archived. Required steps: 1) run exactly: `codex unarchive {}`; 2) run exactly: `pika {quoted_name}`. Pika did not start a provider.",
+                    shell_words::quote(session.provider_thread_id()),
+                )
+            }
+            bail!(
+                "Cannot resume {display_name}: {}. Pika did not start a provider. Restore the exact conversation in {}, then run exactly: `pika {quoted_name}`.",
+                availability.as_str(),
+                session.provider,
+            )
         }
         self.resume_session(session, attach)
     }
@@ -2082,5 +2113,117 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!error.contains("process identity could not be observed"));
+    }
+
+    #[test]
+    fn archived_saved_source_is_not_a_daily_target_or_resumed_by_exact_id() {
+        let (root, mut pika) = test_pika();
+        pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
+        let identity = "88888888-8888-4888-8888-888888888888";
+        let archived = root.path().join("archived_sessions/thread.jsonl");
+        std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        std::fs::write(&archived, "retained history\n").unwrap();
+        let mut session = test_session(identity);
+        session.name = Some("archived_work".into());
+        session.live = false;
+        session.status = Status::Parked;
+        session.root_pid = None;
+        session.transcript_path = Some(archived.display().to_string());
+        pika.store.upsert_session(&session, false).unwrap();
+
+        let error = pika.resolve_local("archived_work").unwrap_err().to_string();
+        assert!(error.contains("archived"));
+        let exact = pika.resolve_local(identity).unwrap();
+        assert_eq!(exact.len(), 1, "exact identity remains diagnosable");
+        let error = pika
+            .open_session(exact[0].clone(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("codex unarchive"));
+        assert!(pika.store.list_pending().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_exact_attach_preserves_unread_attention() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, mut pika) = test_pika();
+        let identity = "99999999-9999-4999-8999-999999999999";
+        let pid = i64::from(std::process::id());
+        let start_time = process::process_start_time(pid).expect("test process has a generation");
+        let separator = '\u{1f}'.to_string();
+        let row = [
+            "pika-c-portfolio".to_owned(),
+            "%1".to_owned(),
+            pid.to_string(),
+            "/tmp".to_owned(),
+            "codex".to_owned(),
+            "0".to_owned(),
+            "1".to_owned(),
+            "1".to_owned(),
+            "0".to_owned(),
+            String::new(),
+            "1".to_owned(),
+            "1".to_owned(),
+            "codex".to_owned(),
+            identity.to_owned(),
+            "portfolio_review".to_owned(),
+            String::new(),
+        ]
+        .join(&separator);
+        let executable = root.path().join("tmux-fixture");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *list-panes*) printf '%s\\n' '{row}' ;;\n  *if-shell*attach-session*) exit 75 ;;\n  *) exit 0 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        pika.tmux = Tmux::with_executable(executable.to_string_lossy(), None);
+        pika.process_observer = Arc::new(move || {
+            ProcessObservation::complete(BTreeMap::from([(
+                pid,
+                record(pid, None, start_time, &["codex", "resume", identity]),
+            )]))
+        });
+
+        let mut session = test_session(identity);
+        session.tmux_session = Some("pika-c-portfolio".into());
+        session.tmux_pane = Some("%1".into());
+        session.root_pid = Some(pid);
+        session.status = Status::Ready;
+        session.unread = true;
+        session.last_event_at = 42.0;
+        pika.store.upsert_session(&session, false).unwrap();
+        pika.store
+            .record_status_observation(
+                Provider::Codex,
+                identity,
+                &crate::model::StatusObservation {
+                    kind: ObservationKind::Lifecycle,
+                    status: Status::Ready,
+                    unread: true,
+                    attention_reason: Some("result ready".into()),
+                    error: None,
+                    observed_at: 42.0,
+                    source: "test".into(),
+                },
+            )
+            .unwrap();
+
+        let receipt = pika.open_session(session, true).unwrap();
+        assert_eq!(receipt.exit_code, 75);
+        let stored = pika
+            .store
+            .get_session(Provider::Codex, identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, Status::Ready);
+        assert!(
+            stored.unread,
+            "a rejected handoff must not acknowledge attention"
+        );
     }
 }
