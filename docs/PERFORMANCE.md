@@ -13,20 +13,20 @@ Python v0.5.0a4 reference recorded in `REFERENCE.md`.
 
 | Contract | Samples | Native Rust | Python v0.5.0a4 | Gate |
 | --- | ---: | ---: | ---: | ---: |
-| CLI startup p95 | 100 each | 6.29 ms | 154.94 ms | ≤30 ms |
-| Cached board first-frame p95 | 30 each | 12.61 ms | 490.47 ms | ≤200 ms |
-| Board input redraw p95 / p99 | 1,000 each | 0.118 / 0.146 ms | 8.58 / 8.74 ms | ≤50 / 100 ms |
-| Hook fast-path p95 | 100 each | 25.04 ms | 515.52 ms | ≤75 ms |
-| Full 200-row local reconciliation p95 | 30 each | 68.63 ms | 2,785.48 ms | ≤500 ms |
-| Warm board RSS p95 | 300 s native / 60 s Python | 7.03 MiB | 36.42 MiB | ≤40 MiB |
-| Native idle board CPU mean | 300 s | 0.635% of one core | — | ≤1% |
-| Executable / gzip | one release build | 4.61 / 2.15 MB | interpreter environment required | ≤50 / 20 MiB |
+| CLI startup p95 | 100 each | 4.15 ms | 139.44 ms | ≤30 ms |
+| Cached board first-frame p95 | 30 each | 9.91 ms | 473.50 ms | ≤200 ms |
+| Board input redraw p95 / p99 | 1,000 each | 0.128 / 0.133 ms | 8.36 / 8.64 ms | ≤50 / 100 ms |
+| Hook fast-path p95 | 100 each | 13.89 ms | 511.07 ms | ≤75 ms |
+| Full 200-row local reconciliation p95 | 30 each | 69.42 ms | 2,441.08 ms | ≤500 ms |
+| Warm board RSS p95 | 300 s native / 60 s Python | 6.92 MiB | 36.42 MiB | ≤40 MiB |
+| Native idle board CPU mean | 300 s | 0.630% of one core | — | ≤1% |
+| Executable / gzip | one release build | 4.27 / 2.20 MB | interpreter environment required | ≤50 / 20 MiB |
 
-The 100-launch native startup run had a 4.38 ms p50 and 9.83 ms maximum. The
-dedicated board run had a 16.36 ms maximum. The five-minute CPU run repainted the clock once per
+The 100-launch native startup run had a 3.79 ms p50 and 4.28 ms maximum. The
+dedicated board run had an 11.68 ms maximum. The five-minute CPU run repainted the clock once per
 second and performed the fallback provider/process reconciliation every ten
 seconds; lifecycle hooks remain immediate. Its process-tree RSS maximum was
-7.69 MiB, RSS p95 was 7.03 MiB, and its second-half CPU mean was 0.610%.
+6.94 MiB, RSS p95 was 6.92 MiB, and its second-half CPU mean was 0.684%.
 
 `measure_reconcile.py` invokes the public `pika list --no-usage` boundary, so its
 numbers include process startup, process enumeration, provider metadata reads,

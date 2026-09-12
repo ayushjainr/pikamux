@@ -20,7 +20,7 @@ jobs:
         os: [ubuntu-24.04, macos-14]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
@@ -59,7 +59,7 @@ jobs:
     name: Windows x86_64 client/bridge only
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: |
