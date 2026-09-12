@@ -9,6 +9,7 @@ use pikamux::fleet::{
 };
 use pikamux::model::{Candidate, FleetNode, Provider, Session, Status};
 use pikamux::store::Store;
+use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fs;
@@ -670,7 +671,7 @@ fn sixty_four_dense_nodes_each_contribute_with_bounded_board_and_expert_input() 
             .unwrap()
             .unwrap();
         let expert = store
-            .get_remote_expert_projection(node_id, per_node_bytes, per_node_rows)
+            .get_remote_expert_projection(node_id, "needle", per_node_bytes, per_node_rows)
             .unwrap()
             .unwrap();
         assert!(!board.rows.is_empty());
@@ -697,6 +698,125 @@ fn sixty_four_dense_nodes_each_contribute_with_bounded_board_and_expert_input() 
                 .any(|row| row.machine.as_deref() == Some(alias.as_str()))
         );
     }
+}
+
+#[test]
+fn expert_search_finds_the_only_match_after_a_sixty_four_node_fair_slice() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "late-expert.db");
+    let captured_at = now();
+    let target_node = Uuid::new_v4().to_string();
+    store
+        .upsert_fleet_node(&node(&target_node, "dense-target"))
+        .unwrap();
+    for index in 1..MAX_CACHED_FLEET_NODES {
+        let node_id = Uuid::new_v4().to_string();
+        store
+            .upsert_fleet_node(&node(&node_id, &format!("empty-{index}")))
+            .unwrap();
+    }
+
+    let mut sessions = Vec::with_capacity(MAX_SNAPSHOT_SESSIONS);
+    let mut profiles = Vec::with_capacity(MAX_SNAPSHOT_SESSIONS);
+    let mut expected = String::new();
+    for index in 0..MAX_SNAPSHOT_SESSIONS {
+        let session_id = format!("10000000-0000-4000-8000-{index:012x}");
+        let is_late_match = index == MAX_SNAPSHOT_SESSIONS - 1;
+        if is_late_match {
+            expected = session_id.clone();
+        }
+        sessions.push(session_to_wire(
+            &session(Provider::Codex, &session_id, "dense-worker"),
+            false,
+        ));
+        profiles.push(json!({
+            "provider":"codex", "session_id":session_id,
+            "scope":if is_late_match { "singular quasar expertise" } else { "ordinary expertise" },
+            "current_state":"working", "topics":[], "artifacts":[],
+            "updated_at":captured_at, "source":"fixture",
+            "scope_updated_at":captured_at, "current_state_updated_at":captured_at
+        }));
+    }
+    let mut payload = json!({
+        "type":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+        "node_id":target_node, "machine":"dense-target", "captured_at":captured_at,
+        "sessions":sessions, "profiles":profiles, "cards":[]
+    });
+    store
+        .put_remote_snapshot(&target_node, &payload, captured_at)
+        .unwrap();
+    let first_revision = store
+        .get_meta(&format!("fleet:cache-revision:{target_node}"))
+        .unwrap()
+        .unwrap();
+    payload["captured_at"] = json!(captured_at + 1.0);
+    store
+        .put_remote_snapshot(&target_node, &payload, captured_at + 1.0)
+        .unwrap();
+    let current_revision = store
+        .get_meta(&format!("fleet:cache-revision:{target_node}"))
+        .unwrap()
+        .unwrap();
+    assert_ne!(first_revision, current_revision);
+    let cache_path = store.path().parent().unwrap().join(format!(
+        ".{}.fleet-cache.sqlite3",
+        store.path().file_name().unwrap().to_string_lossy()
+    ));
+    let cache = Connection::open(cache_path).unwrap();
+    let old_rows: i64 = cache
+        .query_row(
+            "SELECT COUNT(*) FROM expert_rows WHERE node_id=? AND revision=?",
+            params![target_node, first_revision],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let current_rows: i64 = cache
+        .query_row(
+            "SELECT COUNT(*) FROM expert_rows WHERE node_id=? AND revision=?",
+            params![target_node, current_revision],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let search_rows: i64 = cache
+        .query_row("SELECT COUNT(*) FROM expert_search_fts_v2", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(old_rows, 0);
+    assert_eq!(current_rows, MAX_SNAPSHOT_SESSIONS as i64);
+    assert_eq!(search_rows, MAX_SNAPSHOT_SESSIONS as i64);
+
+    let per_node_rows = MAX_CACHED_FLEET_ROWS / MAX_CACHED_FLEET_NODES;
+    assert!(MAX_SNAPSHOT_SESSIONS > per_node_rows);
+    let directory = FleetManager::new(&store, &FakeTransport::default())
+        .expert_directory("quasar")
+        .unwrap();
+    assert_eq!(directory.matches.len(), 1);
+    assert_eq!(directory.matches[0].session_id, expected);
+    assert_eq!(
+        directory.matches[0].machine.as_deref(),
+        Some("dense-target")
+    );
+    assert!(
+        directory
+            .notices
+            .iter()
+            .all(|notice| notice.node_name != "dense-target")
+    );
+
+    // A frozen-Python snapshot has no revision-bound search index. Its dense
+    // payload cannot fit this node's fair 256-KiB input slice, so Pika must say
+    // that discovery is incomplete instead of searching an arbitrary prefix.
+    store
+        .delete_meta(&format!("fleet:cache-revision:{target_node}"))
+        .unwrap();
+    let legacy = FleetManager::new(&store, &FakeTransport::default())
+        .expert_directory("quasar")
+        .unwrap();
+    assert!(legacy.matches.is_empty());
+    assert!(legacy.notices.iter().any(|notice| {
+        notice.node_name == "dense-target" && notice.kind == "expert-input-limited"
+    }));
 }
 
 #[test]

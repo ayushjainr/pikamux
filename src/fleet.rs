@@ -2370,18 +2370,20 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
             MAX_CACHED_FLEET_BYTES / nodes.len()
         };
         for node in nodes {
-            let (rows, source_experts, captured_at, remote_captured_at, directory_notices) =
-                match self
-                    .store
-                    .get_remote_expert_projection(&node.node_id, byte_slice, row_slice)
-                {
+            let (rows, indexed_matches, captured_at, remote_captured_at, directory_notices) =
+                match self.store.get_remote_expert_projection(
+                    &node.node_id,
+                    query,
+                    byte_slice,
+                    row_slice,
+                ) {
                     Ok(Some(projection))
                         if projection.protocol == PROTOCOL_NAME
                             && projection.version == PROTOCOL_VERSION =>
                     {
                         (
                             projection.rows,
-                            projection.source_experts,
+                            Some(projection.matching_experts),
                             projection.source_captured_at,
                             projection.remote_captured_at,
                             projection.directory_notices,
@@ -2449,7 +2451,6 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                                 "card":cards.get(&key).map(|value| (*value).clone()).unwrap_or(Value::Null),
                             }));
                         }
-                        let source_experts = rows.len();
                         let remote_captured_at = snapshot
                             .get("captured_at")
                             .and_then(Value::as_f64)
@@ -2461,7 +2462,7 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                             .unwrap_or_default();
                         (
                             rows,
-                            source_experts,
+                            None,
                             stored.captured_at,
                             remote_captured_at,
                             directory_notices,
@@ -2526,7 +2527,7 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 })
                 .collect::<BTreeMap<_, _>>();
             let ranked = rank_experts(&profiles, &local_sessions, query, &BTreeSet::new());
-            let available_matches = ranked.len();
+            let available_matches = indexed_matches.unwrap_or(ranked.len());
             let mut retained_matches = 0_usize;
             let mut retained_bytes = 0_usize;
             for mut found in ranked {
@@ -2575,9 +2576,7 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 retained_matches += 1;
                 retained_bytes += encoded_bytes;
             }
-            let omitted_rows = available_matches
-                .saturating_sub(retained_matches)
-                .saturating_add(source_experts.saturating_sub(profiles.len()));
+            let omitted_rows = available_matches.saturating_sub(retained_matches);
             if omitted_rows > 0 {
                 notices.push(FleetCacheNotice {
                     node_id: node.node_id.clone(),

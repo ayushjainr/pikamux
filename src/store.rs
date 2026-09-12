@@ -1,3 +1,4 @@
+use crate::expert_search::{ExpertQuery, token_sequence};
 use crate::model::{
     ExpertProfile, FleetNode, ObservationKind, Provider, Session, Status, StatusObservation,
 };
@@ -28,13 +29,14 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 const BUSY_TIMEOUT: Duration = Duration::from_millis(500);
 pub const MAX_REMOTE_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const REMOTE_BOARD_CACHE_SCHEMA: u32 = 1;
-const REMOTE_EXPERT_CACHE_SCHEMA: u32 = 1;
+const REMOTE_EXPERT_CACHE_SCHEMA: u32 = 2;
 // The aggregate budget is divided fairly across as many as 64 machines. A
 // 64-KiB page leaves room for the per-node manifest inside its 256-KiB slice,
 // so every valid dense node can contribute at least one row.
 const REMOTE_CACHE_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_REMOTE_CACHE_HEADER_BYTES: usize = 64 * 1024;
 const MAX_REMOTE_BOARD_CACHE_BYTES: usize = MAX_REMOTE_SNAPSHOT_BYTES + 512 * 1024;
+const MAX_REMOTE_EXPERT_INDEX_BYTES: usize = 2 * MAX_REMOTE_SNAPSHOT_BYTES + 512 * 1024;
 const MAX_REMOTE_CACHE_CHUNKS: usize = 128;
 
 const SCHEMA: &str = r#"
@@ -381,14 +383,16 @@ pub struct RemoteBoardProjection {
     pub directory_notices: Vec<Value>,
 }
 
-/// Bounded expert-only rows for aggregate expert search. The board inventory
-/// and unrelated session payload never enter an expert query's input budget.
+/// Query-ranked expert rows selected from a revision-bound SQLite search index.
+/// SQLite considers the complete per-node expert set; only this fair result
+/// slice crosses into the caller's aggregate input budget.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoteExpertProjection {
     pub rows: Vec<Value>,
     pub protocol: String,
     pub version: i64,
     pub source_experts: usize,
+    pub matching_experts: usize,
     pub source_captured_at: f64,
     pub remote_captured_at: f64,
     pub source_encoded_bytes: usize,
@@ -431,7 +435,7 @@ struct RemoteExpertCacheHeader {
     remote_captured_at: f64,
     source_encoded_bytes: usize,
     source_experts: usize,
-    chunks: Vec<RemoteBoardCacheChunk>,
+    indexed_bytes: usize,
     directory_notices: Vec<Value>,
 }
 
@@ -447,12 +451,31 @@ struct PreparedRemoteSnapshot {
     node_id: String,
     encoded: String,
     board_cache: Option<PreparedRemoteBoardCache>,
-    expert_cache: Option<PreparedRemoteBoardCache>,
+    expert_cache: Option<PreparedRemoteExpertCache>,
 }
 
 struct PreparedRemoteBoardCache {
     header: String,
     chunks: Vec<String>,
+}
+
+struct PreparedRemoteExpertCache {
+    header: String,
+    rows: Vec<PreparedRemoteExpertRow>,
+}
+
+struct PreparedRemoteExpertRow {
+    ordinal: usize,
+    row_json: String,
+    live: bool,
+    profile_updated_at: f64,
+    session_id: String,
+    topic_tokens: String,
+    scope_tokens: String,
+    current_tokens: String,
+    name_tokens: String,
+    project_tokens: String,
+    artifact_tokens: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -692,7 +715,30 @@ impl Store {
              CREATE TABLE IF NOT EXISTS projection_chunks(
                node_id TEXT NOT NULL, revision TEXT NOT NULL, kind TEXT NOT NULL,
                chunk_index INTEGER NOT NULL, value TEXT NOT NULL,
-               PRIMARY KEY(node_id,revision,kind,chunk_index));",
+               PRIMARY KEY(node_id,revision,kind,chunk_index));
+             CREATE TABLE IF NOT EXISTS expert_rows(
+               node_id TEXT NOT NULL,
+               revision TEXT NOT NULL,
+               ordinal INTEGER NOT NULL CHECK(ordinal >= 0 AND ordinal < 2000),
+               row_json TEXT NOT NULL,
+               row_bytes INTEGER NOT NULL CHECK(row_bytes > 0 AND row_bytes <= 4194304),
+               live INTEGER NOT NULL CHECK(live IN (0,1)),
+               profile_updated_at REAL NOT NULL,
+               session_id TEXT NOT NULL,
+               PRIMARY KEY(node_id,revision,ordinal)
+             ) WITHOUT ROWID;
+             CREATE VIRTUAL TABLE IF NOT EXISTS expert_search_fts_v2 USING fts5(
+               node_id,
+               revision,
+               ordinal UNINDEXED,
+               topic_tokens,
+               scope_tokens,
+               current_tokens,
+               name_tokens,
+               project_tokens,
+               artifact_tokens,
+               tokenize='unicode61 remove_diacritics 0'
+             );",
         )?;
         set_mode(&path, 0o600)?;
         Ok(db)
@@ -701,20 +747,55 @@ impl Store {
     fn stage_remote_cache(&self, prepared: &PreparedRemoteSnapshot) -> Result<()> {
         let mut db = self.open_fleet_cache()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (kind, cache) in [
-            ("board", prepared.board_cache.as_ref()),
-            ("expert", prepared.expert_cache.as_ref()),
-        ] {
-            let Some(cache) = cache else { continue };
+        if let Some(cache) = prepared.board_cache.as_ref() {
             tx.execute(
                 "INSERT INTO projections(node_id,revision,kind,header) VALUES (?,?,?,?)",
-                params![prepared.node_id, prepared.revision, kind, cache.header],
+                params![prepared.node_id, prepared.revision, "board", cache.header],
             )?;
             for (index, chunk) in cache.chunks.iter().enumerate() {
                 tx.execute(
                     "INSERT INTO projection_chunks(node_id,revision,kind,chunk_index,value) VALUES (?,?,?,?,?)",
-                    params![prepared.node_id, prepared.revision, kind, index, chunk],
+                    params![prepared.node_id, prepared.revision, "board", index, chunk],
                 )?;
+            }
+        }
+        if let Some(cache) = prepared.expert_cache.as_ref() {
+            tx.execute(
+                "INSERT INTO projections(node_id,revision,kind,header) VALUES (?,?,?,?)",
+                params![prepared.node_id, prepared.revision, "expert", cache.header],
+            )?;
+            let indexed_node = fts_identity("n", &prepared.node_id);
+            let indexed_revision = fts_identity("r", &prepared.revision);
+            {
+                let mut rich = tx.prepare(
+                    "INSERT INTO expert_rows(node_id,revision,ordinal,row_json,row_bytes,live,profile_updated_at,session_id) VALUES (?,?,?,?,?,?,?,?)",
+                )?;
+                let mut search = tx.prepare(
+                    "INSERT INTO expert_search_fts_v2(node_id,revision,ordinal,topic_tokens,scope_tokens,current_tokens,name_tokens,project_tokens,artifact_tokens) VALUES (?,?,?,?,?,?,?,?,?)",
+                )?;
+                for row in &cache.rows {
+                    rich.execute(params![
+                        prepared.node_id,
+                        prepared.revision,
+                        row.ordinal,
+                        row.row_json,
+                        row.row_json.len(),
+                        row.live,
+                        row.profile_updated_at,
+                        row.session_id,
+                    ])?;
+                    search.execute(params![
+                        indexed_node,
+                        indexed_revision,
+                        row.ordinal,
+                        row.topic_tokens,
+                        row.scope_tokens,
+                        row.current_tokens,
+                        row.name_tokens,
+                        row.project_tokens,
+                        row.artifact_tokens,
+                    ])?;
+                }
             }
         }
         tx.commit()?;
@@ -730,6 +811,14 @@ impl Store {
         };
         let _ = tx.execute(
             "DELETE FROM projection_chunks WHERE node_id=? AND revision=?",
+            params![node_id, revision],
+        );
+        let _ = tx.execute(
+            "DELETE FROM expert_search_fts_v2 WHERE node_id=? AND revision=?",
+            params![fts_identity("n", node_id), fts_identity("r", revision)],
+        );
+        let _ = tx.execute(
+            "DELETE FROM expert_rows WHERE node_id=? AND revision=?",
             params![node_id, revision],
         );
         let _ = tx.execute(
@@ -2017,6 +2106,11 @@ impl Store {
         if deleted {
             if let Ok(cache) = self.open_fleet_cache() {
                 let _ = cache.execute("DELETE FROM projection_chunks WHERE node_id=?", [node_id]);
+                let _ = cache.execute(
+                    "DELETE FROM expert_search_fts_v2 WHERE node_id=?",
+                    [fts_identity("n", node_id)],
+                );
+                let _ = cache.execute("DELETE FROM expert_rows WHERE node_id=?", [node_id]);
                 let _ = cache.execute("DELETE FROM projections WHERE node_id=?", [node_id]);
             }
         }
@@ -2636,12 +2730,13 @@ impl Store {
         }))
     }
 
-    /// Load only persisted expert-bearing pages within this machine's fair
-    /// aggregate slice. A fleet expert query never parses the full remote
-    /// board snapshot or unrelated conversations.
+    /// Rank the complete persisted expert set for one machine, then materialize
+    /// only the fair result slice. Full remote snapshots and nonmatching rich
+    /// rows never enter the caller's aggregate input budget.
     pub fn get_remote_expert_projection(
         &self,
         node_id: &str,
+        query: &str,
         max_bytes: usize,
         max_rows: usize,
     ) -> Result<Option<RemoteExpertProjection>> {
@@ -2670,92 +2765,27 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        if let Some(revision) = revision {
-            tx.commit()?;
-            let cache = self.open_fleet_cache()?;
-            let encoded_header = cache
-                .query_row(
-                    "SELECT CASE WHEN length(CAST(header AS BLOB))<=? THEN header ELSE NULL END FROM projections WHERE node_id=? AND revision=? AND kind='expert'",
-                    params![MAX_REMOTE_CACHE_HEADER_BYTES as i64, node_id, revision],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten();
-            let Some(encoded_header) = encoded_header else {
-                return Ok(None);
-            };
-            let header_bytes = encoded_header.len();
-            if header_bytes > max_bytes {
-                bail!("stored remote expert cache header exceeds its per-node input budget");
-            }
-            let header: RemoteExpertCacheHeader = serde_json::from_str(&encoded_header)
-                .context("stored remote expert cache header is malformed")?;
-            if header.schema != REMOTE_EXPERT_CACHE_SCHEMA
-                || header.node_id != node_id
-                || header.source_captured_at != source_captured_at
-                || header.source_encoded_bytes != source_encoded_bytes
-                || header.chunks.len() > MAX_REMOTE_CACHE_CHUNKS
-                || header.source_experts > 2_000
-            {
-                bail!("stored remote expert cache does not match its source snapshot");
-            }
-            let mut input_bytes = header_bytes;
-            let mut rows = Vec::new();
-            for (index, chunk) in header.chunks.iter().enumerate() {
-                if chunk.bytes == 0
-                    || chunk.bytes > MAX_REMOTE_BOARD_CACHE_BYTES
-                    || chunk.rows == 0
-                    || chunk.rows > 2_000
-                {
-                    bail!("stored remote expert cache chunk metadata is invalid");
-                }
-                if rows.len() >= max_rows || chunk.bytes > max_bytes.saturating_sub(input_bytes) {
-                    break;
-                }
-                let encoded = cache
-                    .query_row(
-                        "SELECT CASE WHEN length(CAST(value AS BLOB))=? THEN value ELSE NULL END FROM projection_chunks WHERE node_id=? AND revision=? AND kind='expert' AND chunk_index=?",
-                        params![i64::try_from(chunk.bytes)?, node_id, revision, index],
-                        |row| row.get::<_, Option<String>>(0),
-                    )
-                    .optional()?
-                    .flatten()
-                    .context("stored remote expert cache chunk is missing or changed")?;
-                let mut values: Vec<Value> = serde_json::from_str(&encoded)
-                    .context("stored remote expert cache chunk is malformed")?;
-                if values.len() != chunk.rows {
-                    bail!("stored remote expert cache chunk row count changed");
-                }
-                input_bytes += chunk.bytes;
-                values.truncate(max_rows.saturating_sub(rows.len()));
-                rows.extend(values);
-            }
-            return Ok(Some(RemoteExpertProjection {
-                rows,
-                protocol: header.protocol,
-                version: header.version,
-                source_experts: header.source_experts,
-                source_captured_at,
-                remote_captured_at: header.remote_captured_at,
-                source_encoded_bytes,
-                input_bytes,
-                directory_notices: header.directory_notices,
-            }));
-        }
-        let header_key = remote_expert_cache_header_key(node_id);
-        let header = tx
-            .query_row(
-                "SELECT CASE WHEN length(CAST(value AS BLOB))<=? THEN value ELSE NULL END,length(CAST(value AS BLOB)) FROM meta WHERE key=?",
-                params![MAX_REMOTE_CACHE_HEADER_BYTES as i64, header_key],
-                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .optional()?;
-        let Some((Some(encoded_header), header_bytes)) = header else {
-            tx.commit()?;
+        tx.commit()?;
+        let Some(revision) = revision else {
+            // Frozen Python and pre-index Rust snapshots have no revision-bound
+            // searchable projection. The caller may size-gate and search the
+            // complete legacy snapshot, but must never treat a prefix cache as
+            // a complete expert directory.
             return Ok(None);
         };
-        let header_bytes = usize::try_from(header_bytes)
-            .context("stored remote expert cache header has a negative size")?;
+        let cache = self.open_fleet_cache()?;
+        let encoded_header = cache
+            .query_row(
+                "SELECT CASE WHEN length(CAST(header AS BLOB))<=? THEN header ELSE NULL END FROM projections WHERE node_id=? AND revision=? AND kind='expert'",
+                params![MAX_REMOTE_CACHE_HEADER_BYTES as i64, node_id, revision],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(encoded_header) = encoded_header else {
+            return Ok(None);
+        };
+        let header_bytes = encoded_header.len();
         if header_bytes > max_bytes {
             bail!("stored remote expert cache header exceeds its per-node input budget");
         }
@@ -2765,50 +2795,163 @@ impl Store {
             || header.node_id != node_id
             || header.source_captured_at != source_captured_at
             || header.source_encoded_bytes != source_encoded_bytes
-            || header.chunks.len() > MAX_REMOTE_CACHE_CHUNKS
             || header.source_experts > 2_000
+            || header.indexed_bytes > MAX_REMOTE_EXPERT_INDEX_BYTES
         {
             bail!("stored remote expert cache does not match its source snapshot");
         }
-        let mut input_bytes = header_bytes;
-        let mut rows = Vec::new();
-        for (index, chunk) in header.chunks.iter().enumerate() {
-            if chunk.bytes == 0
-                || chunk.bytes > MAX_REMOTE_BOARD_CACHE_BYTES
-                || chunk.rows == 0
-                || chunk.rows > 2_000
-            {
-                bail!("stored remote expert cache chunk metadata is invalid");
-            }
-            if rows.len() >= max_rows || chunk.bytes > max_bytes.saturating_sub(input_bytes) {
-                break;
-            }
-            let key = remote_expert_cache_chunk_key(node_id, index);
-            let encoded = tx
-                .query_row(
-                    "SELECT CASE WHEN length(CAST(value AS BLOB))=? THEN value ELSE NULL END FROM meta WHERE key=?",
-                    params![i64::try_from(chunk.bytes)?, key],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten()
-                .context("stored remote expert cache chunk is missing or changed")?;
-            let mut values: Vec<Value> = serde_json::from_str(&encoded)
-                .context("stored remote expert cache chunk is malformed")?;
-            if values.len() != chunk.rows {
-                bail!("stored remote expert cache chunk row count changed");
-            }
-            input_bytes += chunk.bytes;
-            let remaining_rows = max_rows.saturating_sub(rows.len());
-            values.truncate(remaining_rows);
-            rows.extend(values);
+        let indexed_node = fts_identity("n", node_id);
+        let indexed_revision = fts_identity("r", &revision);
+        let identity_query =
+            format!("node_id : \"{indexed_node}\" AND revision : \"{indexed_revision}\"");
+
+        let (row_count, search_count): (i64, i64) = cache.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM expert_rows WHERE node_id=?1 AND revision=?2),
+               (SELECT COUNT(*) FROM expert_search_fts_v2 WHERE expert_search_fts_v2 MATCH ?3)",
+            params![node_id, revision, identity_query],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if usize::try_from(row_count).ok() != Some(header.source_experts)
+            || row_count != search_count
+        {
+            bail!("stored remote expert search index is incomplete or changed");
         }
-        tx.commit()?;
+
+        let parsed = ExpertQuery::parse(query);
+        if parsed.raw_nonempty && parsed.terms.is_empty() {
+            return Ok(Some(RemoteExpertProjection {
+                rows: Vec::new(),
+                protocol: header.protocol,
+                version: header.version,
+                source_experts: header.source_experts,
+                matching_experts: 0,
+                source_captured_at,
+                remote_captured_at: header.remote_captured_at,
+                source_encoded_bytes,
+                input_bytes: header_bytes,
+                directory_notices: header.directory_notices,
+            }));
+        }
+        let terms_json = serde_json::to_string(&parsed.terms)?;
+        let phrase = parsed.phrase();
+        let expert_terms = parsed
+            .terms
+            .iter()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let fts_query = if expert_terms.is_empty() {
+            format!("node_id : \"{indexed_node}\" AND revision : \"{indexed_revision}\"")
+        } else {
+            format!(
+                "node_id : \"{indexed_node}\" AND revision : \"{indexed_revision}\" AND \
+                 {{topic_tokens scope_tokens current_tokens name_tokens project_tokens artifact_tokens}} : ({expert_terms})"
+            )
+        };
+        let available_bytes = max_bytes.saturating_sub(header_bytes);
+        let score = "COALESCE((
+            SELECT SUM(
+              CASE WHEN instr(s.topic_tokens, ' ' || CAST(term.value AS TEXT) || ' ')>0 THEN 10 ELSE 0 END +
+              CASE WHEN instr(s.scope_tokens, ' ' || CAST(term.value AS TEXT) || ' ')>0 THEN 6 ELSE 0 END +
+              CASE WHEN instr(s.current_tokens, ' ' || CAST(term.value AS TEXT) || ' ')>0 THEN 5 ELSE 0 END +
+              CASE WHEN instr(s.name_tokens, ' ' || CAST(term.value AS TEXT) || ' ')>0 THEN 4 ELSE 0 END +
+              CASE WHEN instr(s.project_tokens, ' ' || CAST(term.value AS TEXT) || ' ')>0 THEN 3 ELSE 0 END +
+              CASE WHEN instr(s.artifact_tokens, ' ' || CAST(term.value AS TEXT) || ' ')>0 THEN 2 ELSE 0 END
+            ) FROM json_each(?1) term
+          ),0) +
+          CASE WHEN ?5=1 AND instr(s.topic_tokens, ?6)>0 THEN 20 ELSE 0 END +
+          CASE WHEN ?5=1 AND instr(s.scope_tokens, ?6)>0 THEN 12 ELSE 0 END +
+          CASE WHEN ?5=1 AND instr(s.current_tokens, ?6)>0 THEN 10 ELSE 0 END +
+          CASE WHEN ?5=1 AND instr(s.name_tokens, ?6)>0 THEN 8 ELSE 0 END +
+          CASE WHEN ?5=1 AND instr(s.project_tokens, ?6)>0 THEN 6 ELSE 0 END +
+          CASE WHEN ?5=1 AND instr(s.artifact_tokens, ?6)>0 THEN 4 ELSE 0 END";
+        let rows_sql = format!(
+            "WITH scored AS (
+               SELECT r.ordinal,r.row_bytes,r.live,r.profile_updated_at,r.session_id,{score} AS score
+               FROM expert_rows r JOIN expert_search_fts_v2 s ON s.ordinal=r.ordinal
+               WHERE r.node_id=?3 AND r.revision=?4
+                 AND expert_search_fts_v2 MATCH ?2
+             ), eligible AS (
+               SELECT * FROM scored WHERE row_bytes<=?7
+             ), ranked AS (
+               SELECT *,
+                 ROW_NUMBER() OVER (
+                   ORDER BY score DESC,live DESC,profile_updated_at DESC,session_id DESC
+                 ) AS result_rank,
+                 SUM(row_bytes) OVER (
+                   ORDER BY score DESC,live DESC,profile_updated_at DESC,session_id DESC
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                 ) AS cumulative_bytes
+               FROM eligible
+             ), totals AS (
+               SELECT COUNT(*) AS matching_experts FROM scored
+             )
+             SELECT CASE
+                      WHEN ranked.ordinal IS NULL THEN NULL
+                      WHEN length(CAST(r.row_json AS BLOB))=ranked.row_bytes THEN r.row_json
+                      ELSE NULL
+                    END,
+                    ranked.row_bytes,
+                    totals.matching_experts
+             FROM totals
+             LEFT JOIN ranked
+               ON ranked.result_rank<=?8 AND ranked.cumulative_bytes<=?7
+             LEFT JOIN expert_rows r
+               ON r.node_id=?3 AND r.revision=?4 AND r.ordinal=ranked.ordinal
+             ORDER BY ranked.result_rank"
+        );
+        let mut statement = cache.prepare(&rows_sql)?;
+        let selected = statement
+            .query_map(
+                params![
+                    terms_json,
+                    fts_query,
+                    node_id,
+                    revision,
+                    !parsed.tokens.is_empty(),
+                    phrase,
+                    i64::try_from(available_bytes)?,
+                    i64::try_from(max_rows)?,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut input_bytes = header_bytes;
+        let mut rows = Vec::with_capacity(selected.len());
+        let matching_experts = selected
+            .first()
+            .and_then(|(_, _, count)| usize::try_from(*count).ok())
+            .context("stored remote expert match count is invalid")?;
+        for (encoded, row_bytes, _) in selected {
+            let Some(row_bytes) = row_bytes else {
+                continue;
+            };
+            let encoded = encoded.context("stored remote expert row is missing or changed")?;
+            let row_bytes = usize::try_from(row_bytes)
+                .context("stored remote expert row has an invalid size")?;
+            input_bytes = input_bytes
+                .checked_add(row_bytes)
+                .context("remote expert projection input size overflowed")?;
+            if input_bytes > max_bytes {
+                bail!("stored remote expert projection exceeded its input budget");
+            }
+            rows.push(
+                serde_json::from_str(&encoded).context("stored remote expert row is malformed")?,
+            );
+        }
         Ok(Some(RemoteExpertProjection {
             rows,
             protocol: header.protocol,
             version: header.version,
             source_experts: header.source_experts,
+            matching_experts,
             source_captured_at,
             remote_captured_at: header.remote_captured_at,
             source_encoded_bytes,
@@ -3906,16 +4049,12 @@ fn remote_expert_cache_pattern(node_id: &str) -> String {
     format!("{}%", remote_expert_cache_prefix(node_id))
 }
 
-fn remote_expert_cache_header_key(node_id: &str) -> String {
-    format!("{}header", remote_expert_cache_prefix(node_id))
-}
-
-fn remote_expert_cache_chunk_key(node_id: &str, index: usize) -> String {
-    format!("{}chunk:{index:04}", remote_expert_cache_prefix(node_id))
-}
-
 fn remote_cache_revision_key(node_id: &str) -> String {
     format!("fleet:cache-revision:{node_id}")
+}
+
+fn fts_identity(prefix: &str, value: &str) -> String {
+    format!("{prefix}{}", value.replace('-', ""))
 }
 
 fn prepare_remote_snapshot(
@@ -4042,7 +4181,7 @@ fn prepare_remote_expert_cache(
     object: &serde_json::Map<String, Value>,
     captured_at: f64,
     source_encoded_bytes: usize,
-) -> Result<Option<PreparedRemoteBoardCache>> {
+) -> Result<Option<PreparedRemoteExpertCache>> {
     let Some(source_node_id) = object.get("node_id").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -4079,7 +4218,8 @@ fn prepare_remote_expert_cache(
     let profiles = keyed("profiles");
     let cards = keyed("cards");
     let mut seen = BTreeSet::new();
-    let mut encoded_rows = Vec::new();
+    let mut rows = Vec::new();
+    let mut indexed_bytes = 0_usize;
     for session in object
         .get("expert_sessions")
         .and_then(Value::as_array)
@@ -4110,22 +4250,85 @@ fn prepare_remote_expert_cache(
         if !seen.insert(key.clone()) {
             continue;
         }
-        encoded_rows.push(serde_json::to_string(&serde_json::json!({
+        let Some(profile) = profile.as_object() else {
+            return Ok(None);
+        };
+        let Some(session_id) = row.get("session_id").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(topics) = joined_search_items(profile.get("topics")) else {
+            return Ok(None);
+        };
+        let Some(artifacts) = joined_search_items(profile.get("artifacts")) else {
+            return Ok(None);
+        };
+        let Some(scope) = profile.get("scope").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(current) = profile.get("current_state").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(name) = optional_search_text(row.get("name")) else {
+            return Ok(None);
+        };
+        let Some(cwd) = optional_search_text(row.get("cwd")) else {
+            return Ok(None);
+        };
+        let Some(branch) = optional_search_text(row.get("branch")) else {
+            return Ok(None);
+        };
+        let live = match row.get("live") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            _ => return Ok(None),
+        };
+        let Some(profile_updated_at) = profile
+            .get("updated_at")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+        else {
+            return Ok(None);
+        };
+        let row_json = serde_json::to_string(&serde_json::json!({
             "session": session,
-            "profile": (*profile).clone(),
+            "profile": Value::Object(profile.clone()),
             "card": cards.get(&key).map(|value| (*value).clone()).unwrap_or(Value::Null),
-        }))?);
+        }))?;
+        let search_row = PreparedRemoteExpertRow {
+            ordinal: rows.len(),
+            row_json,
+            live,
+            profile_updated_at,
+            session_id: session_id.to_owned(),
+            topic_tokens: token_sequence(&topics),
+            scope_tokens: token_sequence(scope),
+            current_tokens: token_sequence(current),
+            name_tokens: token_sequence(name),
+            project_tokens: token_sequence(&[cwd, branch].join(" ")),
+            artifact_tokens: token_sequence(&artifacts),
+        };
+        indexed_bytes = [
+            search_row.row_json.len(),
+            search_row.session_id.len(),
+            search_row.topic_tokens.len(),
+            search_row.scope_tokens.len(),
+            search_row.current_tokens.len(),
+            search_row.name_tokens.len(),
+            search_row.project_tokens.len(),
+            search_row.artifact_tokens.len(),
+        ]
+        .into_iter()
+        .try_fold(indexed_bytes, |total, bytes| total.checked_add(bytes))
+        .context("remote expert search index size overflowed")?;
+        if indexed_bytes > MAX_REMOTE_EXPERT_INDEX_BYTES {
+            return Ok(None);
+        }
+        rows.push(search_row);
     }
-    if encoded_rows.len() > 2_000 {
+    if rows.len() > 2_000 {
         return Ok(None);
     }
-    let source_experts = encoded_rows.len();
-    let (chunks, chunk_metadata) = chunk_cache_rows(encoded_rows)?;
-    if chunk_metadata.len() > MAX_REMOTE_CACHE_CHUNKS
-        || chunks.iter().map(String::len).sum::<usize>() > MAX_REMOTE_BOARD_CACHE_BYTES
-    {
-        return Ok(None);
-    }
+    let source_experts = rows.len();
     let directory_notices = object
         .get("directory_notices")
         .and_then(Value::as_array)
@@ -4140,16 +4343,30 @@ fn prepare_remote_expert_cache(
         remote_captured_at,
         source_encoded_bytes,
         source_experts,
-        chunks: chunk_metadata,
+        indexed_bytes,
         directory_notices,
     })?;
-    if header.len() > MAX_REMOTE_CACHE_HEADER_BYTES
-        || header.len() + chunks.iter().map(String::len).sum::<usize>()
-            > MAX_REMOTE_BOARD_CACHE_BYTES
-    {
+    if header.len() > MAX_REMOTE_CACHE_HEADER_BYTES {
         return Ok(None);
     }
-    Ok(Some(PreparedRemoteBoardCache { header, chunks }))
+    Ok(Some(PreparedRemoteExpertCache { header, rows }))
+}
+
+fn joined_search_items(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_array)?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .map(|items| items.join(" "))
+}
+
+fn optional_search_text(value: Option<&Value>) -> Option<&str> {
+    match value {
+        None | Some(Value::Null) => Some(""),
+        Some(Value::String(value)) => Some(value),
+        _ => None,
+    }
 }
 
 fn chunk_cache_rows(

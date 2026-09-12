@@ -5,18 +5,17 @@
 //! work still matches the provider source.
 
 use crate::config::Config;
+use crate::expert_search::{ExpertQuery, field_contains_tokens, field_terms};
 use crate::model::{ExpertProfile, Provider, Session, Status};
 use crate::paths::Paths;
 use crate::providers::{ProviderSourceState, Providers};
 use crate::store::{Store, StoredExpertProfile};
 use anyhow::{Context, Result, bail};
-use regex::Regex;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path};
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_SCOPE: usize = 600;
@@ -295,17 +294,9 @@ pub fn rank_experts(
         .iter()
         .map(|session| ((session.provider, session.session_id.clone()), session))
         .collect();
-    let raw_query = query
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    let query_tokens = tokens(&raw_query)
-        .into_iter()
-        .filter(|token| !ignored_terms().contains(token.as_str()))
-        .collect::<Vec<_>>();
-    let terms = query_tokens.iter().cloned().collect::<BTreeSet<_>>();
-    if !raw_query.is_empty() && terms.is_empty() {
+    let query = ExpertQuery::parse(query);
+    let terms = query.terms.iter().cloned().collect::<BTreeSet<_>>();
+    if query.raw_nonempty && terms.is_empty() {
         return Vec::new();
     }
 
@@ -335,10 +326,9 @@ pub fn rank_experts(
         let mut matched_on = Vec::new();
         let mut matched_terms = BTreeSet::new();
         for (label, value, weight) in fields {
-            let field_tokens = tokens(&value);
-            let field_terms = field_tokens.iter().cloned().collect::<BTreeSet<_>>();
+            let value_terms = field_terms(&value);
             let field_matches = terms
-                .intersection(&field_terms)
+                .intersection(&value_terms)
                 .cloned()
                 .collect::<Vec<_>>();
             if !field_matches.is_empty() {
@@ -346,11 +336,11 @@ pub fn rank_experts(
                 matched_on.push(label.to_owned());
                 matched_terms.extend(field_matches);
             }
-            if !query_tokens.is_empty() && contains_tokens(&field_tokens, &query_tokens) {
+            if field_contains_tokens(&value, &query.tokens) {
                 score += weight * 2;
             }
         }
-        if !raw_query.is_empty() && matched_terms != terms {
+        if query.raw_nonempty && matched_terms != terms {
             continue;
         }
         let fingerprint = transcript_fingerprint(session).ok().flatten();
@@ -654,33 +644,6 @@ fn clean_many(
         bail!("publish at most {maximum} expert {label}s");
     }
     Ok(result)
-}
-
-fn tokens(value: &str) -> Vec<String> {
-    static TOKEN: OnceLock<Regex> = OnceLock::new();
-    TOKEN
-        .get_or_init(|| Regex::new(r"[^\W_]+").expect("static token regex"))
-        .find_iter(value)
-        .map(|item| item.as_str().to_lowercase())
-        .collect()
-}
-
-fn ignored_terms() -> &'static BTreeSet<&'static str> {
-    static TERMS: OnceLock<BTreeSet<&'static str>> = OnceLock::new();
-    TERMS.get_or_init(|| {
-        [
-            "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with",
-        ]
-        .into_iter()
-        .collect()
-    })
-}
-
-fn contains_tokens(haystack: &[String], needle: &[String]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
 }
 
 fn nonzero(value: f64) -> Option<f64> {

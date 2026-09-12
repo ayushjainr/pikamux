@@ -9,6 +9,7 @@ pub mod consult;
 pub mod core;
 pub mod doctor;
 pub mod expert_refresh;
+mod expert_search;
 pub mod experts;
 pub mod fleet;
 pub mod hooks;
