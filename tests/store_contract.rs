@@ -2,7 +2,8 @@ use pikamux::model::{
     ExpertProfile, FleetNode, ObservationKind, Provider, Session, Status, StatusObservation,
 };
 use pikamux::store::{
-    HookObservation, LiveOwner, PendingLaunch, Store, StoredExpertProfile, UsageCacheRecord,
+    HookObservation, LaunchPhase, LiveOwner, PendingLaunch, Store, StoredExpertProfile,
+    UsageCacheRecord,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -452,4 +453,68 @@ fn verified_exit_explicitly_clears_a_coalesced_runtime_pid() {
         .unwrap()
         .unwrap();
     assert_eq!(cleared.root_pid, None);
+}
+
+#[test]
+fn launch_phase_and_provider_generation_advance_atomically_with_pending_state() {
+    let (_temp, store) = store_fixture();
+    let pending = PendingLaunch {
+        launch_token: "phased-launch".into(),
+        provider: Provider::Claude,
+        name: "phased".into(),
+        cwd: "/tmp".into(),
+        tmux_session: None,
+        tmux_pane: None,
+        expected_session_id: Some("thread".into()),
+        root_pid: None,
+        root_pid_start: None,
+        preexisting_session_ids: None,
+        candidate_session_id: None,
+        candidate_observed_at: None,
+        created_at: 1.0,
+    };
+    assert!(store.add_pending(&pending).unwrap());
+    assert_eq!(
+        store.get_launch_phase(&pending.launch_token).unwrap(),
+        Some(LaunchPhase::Reserved)
+    );
+    store
+        .finalize_pending_pane(
+            &pending.launch_token,
+            "pika-a-thread",
+            "%7",
+            Some(70),
+            Some(700),
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_launch_phase(&pending.launch_token).unwrap(),
+        Some(LaunchPhase::PaneAllocated)
+    );
+    assert!(
+        store
+            .set_launch_phase(&pending.launch_token, LaunchPhase::PanePrepared)
+            .unwrap()
+    );
+    assert!(
+        store
+            .set_launch_phase(&pending.launch_token, LaunchPhase::ProviderStarting)
+            .unwrap()
+    );
+    assert!(
+        store
+            .observe_launched_generation(&pending.launch_token, 71, 701)
+            .unwrap()
+    );
+    let observed = store.get_pending(&pending.launch_token).unwrap().unwrap();
+    assert_eq!(
+        (observed.root_pid, observed.root_pid_start),
+        (Some(71), Some(701))
+    );
+    assert_eq!(
+        store.get_launch_phase(&pending.launch_token).unwrap(),
+        Some(LaunchPhase::ProviderObserved)
+    );
+    store.delete_pending(&pending.launch_token).unwrap();
+    assert_eq!(store.get_launch_phase(&pending.launch_token).unwrap(), None);
 }

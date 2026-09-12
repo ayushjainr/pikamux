@@ -5,6 +5,97 @@ use std::path::Path;
 use std::time::Duration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObservationState {
+    Complete,
+    Partial(Vec<String>),
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessObservation {
+    pub processes: BTreeMap<i64, ProcessRecord>,
+    pub state: ObservationState,
+}
+
+impl ProcessObservation {
+    pub fn complete(processes: BTreeMap<i64, ProcessRecord>) -> Self {
+        Self {
+            processes,
+            state: ObservationState::Complete,
+        }
+    }
+
+    pub fn partial(processes: BTreeMap<i64, ProcessRecord>, issues: Vec<String>) -> Self {
+        Self {
+            processes,
+            state: ObservationState::Partial(issues),
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            processes: BTreeMap::new(),
+            state: ObservationState::Error(message.into()),
+        }
+    }
+
+    pub fn require_complete(
+        &self,
+        operation: &str,
+    ) -> Result<&BTreeMap<i64, ProcessRecord>, String> {
+        match &self.state {
+            ObservationState::Complete => Ok(&self.processes),
+            ObservationState::Partial(issues) => Err(format!(
+                "Pika refused to {operation}: process identity observation was partial ({}). No provider was launched and no stored ownership was cleared.",
+                issues.join("; ")
+            )),
+            ObservationState::Error(error) => Err(format!(
+                "Pika refused to {operation}: process identity could not be observed ({error}). No provider was launched and no stored ownership was cleared."
+            )),
+        }
+    }
+}
+
+impl std::ops::Deref for ProcessObservation {
+    type Target = BTreeMap<i64, ProcessRecord>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.processes
+    }
+}
+
+fn collect_observation(
+    pids: Result<Vec<i64>, String>,
+    mut read: impl FnMut(i64) -> Result<Option<ProcessRecord>, String>,
+) -> ProcessObservation {
+    let pids = match pids {
+        Ok(pids) => pids,
+        Err(error) => return ProcessObservation::error(error),
+    };
+    let mut processes = BTreeMap::new();
+    let mut issues = Vec::new();
+    for pid in pids {
+        match read(pid) {
+            Ok(Some(record)) => {
+                processes.insert(pid, record);
+            }
+            Ok(None) => {}
+            Err(error) => issues.push(format!("PID {pid}: {error}")),
+        }
+    }
+    if issues.is_empty() {
+        ProcessObservation::complete(processes)
+    } else {
+        ProcessObservation::partial(processes, issues)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn relevant_process_owner(owner_uid: u32, current_uid: u32) -> bool {
+    owner_uid == current_uid
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessRecord {
     pub pid: i64,
     pub parent_pid: Option<i64>,
@@ -34,8 +125,15 @@ pub fn process_kind(argv: &[String]) -> Option<Provider> {
     })
 }
 
-pub fn snapshot() -> BTreeMap<i64, ProcessRecord> {
+pub fn observe() -> ProcessObservation {
     platform::snapshot()
+}
+
+/// Compatibility view for read-only callers that do not make ownership
+/// decisions. Identity-changing paths must use `observe` and require complete
+/// evidence instead of treating observation failure as an empty machine.
+pub fn snapshot() -> BTreeMap<i64, ProcessRecord> {
+    observe().processes
 }
 
 pub fn process_start_time(pid: i64) -> Option<u64> {
@@ -225,95 +323,221 @@ pub fn shared_provider_process(record: &ProcessRecord, provider: Provider) -> bo
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::ProcessRecord;
-    use std::{collections::BTreeMap, fs, path::Path};
+    use super::{ProcessObservation, ProcessRecord};
+    use std::{fs, io::ErrorKind, os::unix::fs::MetadataExt, path::Path};
 
-    pub fn snapshot() -> BTreeMap<i64, ProcessRecord> {
-        let Ok(entries) = fs::read_dir("/proc") else {
-            return BTreeMap::new();
+    pub fn snapshot() -> ProcessObservation {
+        let entries = match fs::read_dir("/proc") {
+            Ok(entries) => entries,
+            Err(error) => {
+                return ProcessObservation::error(format!("cannot enumerate /proc: {error}"));
+            }
         };
-        entries
-            .flatten()
-            .filter_map(|entry| entry.file_name().to_str()?.parse::<i64>().ok())
-            .filter_map(|pid| read(pid).map(|record| (pid, record)))
-            .collect()
+        let mut pids = Vec::new();
+        let mut entry_issues = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    entry_issues.push(format!("cannot read /proc entry: {error}"));
+                    continue;
+                }
+            };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|value| value.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => {
+                    entry_issues.push(format!("PID {pid}: cannot identify owner: {error}"));
+                    continue;
+                }
+            };
+            // `/proc` lists the whole host. Foreign cmdlines are irrelevant to
+            // this user's conversations and are commonly unreadable under
+            // hidepid; only an unreadable same-user entry is uncertainty.
+            if !super::relevant_process_owner(metadata.uid(), unsafe { libc::getuid() }) {
+                continue;
+            }
+            pids.push(pid);
+        }
+        let mut observed = super::collect_observation(Ok(pids), read_result);
+        if !entry_issues.is_empty() {
+            if let super::ObservationState::Partial(issues) = &mut observed.state {
+                issues.extend(entry_issues);
+            } else {
+                observed.state = super::ObservationState::Partial(entry_issues);
+            }
+        }
+        observed
     }
 
     pub fn read(pid: i64) -> Option<ProcessRecord> {
+        read_result(pid).ok().flatten()
+    }
+
+    fn read_result(pid: i64) -> Result<Option<ProcessRecord>, String> {
         if pid <= 0 {
-            return None;
+            return Ok(None);
         }
         let root = Path::new("/proc").join(pid.to_string());
-        let stat = fs::read_to_string(root.join("stat")).ok()?;
-        let tail = stat.get(stat.rfind(')')? + 2..)?;
+        let stat = match fs::read_to_string(root.join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot read stat: {error}")),
+        };
+        let tail = stat
+            .get(stat.rfind(')').ok_or("malformed stat")? + 2..)
+            .ok_or("malformed stat")?;
         let fields: Vec<_> = tail.split_whitespace().collect();
-        let parent_pid = fields
-            .get(1)?
+        let parsed_parent = fields
+            .get(1)
+            .ok_or("stat has no parent PID")?
             .parse::<i64>()
-            .ok()
-            .filter(|value| *value > 0);
-        let start_time = fields.get(19)?.parse().ok()?;
-        let raw = fs::read(root.join("cmdline")).ok()?;
+            .map_err(|_| "invalid parent PID")?;
+        let parent_pid = (parsed_parent > 0).then_some(parsed_parent);
+        let start_time = fields
+            .get(19)
+            .ok_or("stat has no start time")?
+            .parse()
+            .map_err(|_| "invalid start time")?;
+        let raw = match fs::read(root.join("cmdline")) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot read command line: {error}")),
+        };
         let argv = raw
             .split(|byte| *byte == 0)
             .filter(|value| !value.is_empty())
             .map(|value| String::from_utf8_lossy(value).into_owned())
             .collect();
-        Some(ProcessRecord {
+        // Re-read the generation after argv so PID exit/reuse during the
+        // observation cannot turn two different processes into one record.
+        let verified = match fs::read_to_string(root.join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot verify stat: {error}")),
+        };
+        let verified_tail = verified
+            .get(verified.rfind(')').ok_or("malformed verified stat")? + 2..)
+            .ok_or("malformed verified stat")?;
+        let verified_start: u64 = verified_tail
+            .split_whitespace()
+            .nth(19)
+            .ok_or("verified stat has no start time")?
+            .parse()
+            .map_err(|_| "invalid verified start time")?;
+        if start_time != verified_start {
+            return Ok(None);
+        }
+        Ok(Some(ProcessRecord {
             pid,
             parent_pid,
             start_time,
             argv,
-        })
+        }))
     }
 }
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::ProcessRecord;
+    use super::{ProcessObservation, ProcessRecord};
     use libproc::libproc::{bsd_info::BSDInfo, proc_pid::pidinfo};
     use libproc::processes::{ProcFilter, pids_by_type};
-    use std::collections::BTreeMap;
 
-    pub fn snapshot() -> BTreeMap<i64, ProcessRecord> {
-        pids_by_type(ProcFilter::ByRealUID {
+    pub fn snapshot() -> ProcessObservation {
+        let pids = match pids_by_type(ProcFilter::ByUID {
             // SAFETY: getuid has no preconditions and does not mutate memory.
-            ruid: unsafe { libc::getuid() },
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|pid| read(i64::from(pid)).map(|record| (record.pid, record)))
-        .collect()
+            uid: unsafe { libc::getuid() },
+        }) {
+            Ok(pids) => pids,
+            Err(error) => {
+                return ProcessObservation::error(format!("cannot enumerate processes: {error}"));
+            }
+        };
+        super::collect_observation(Ok(pids.into_iter().map(i64::from).collect()), read_result)
     }
 
     pub fn read(pid: i64) -> Option<ProcessRecord> {
-        let pid32 = i32::try_from(pid).ok().filter(|value| *value > 0)?;
-        let info = pidinfo::<BSDInfo>(pid32, 0).ok()?;
+        read_result(pid).ok().flatten()
+    }
+
+    fn read_result(pid: i64) -> Result<Option<ProcessRecord>, String> {
+        let Some(pid32) = i32::try_from(pid).ok().filter(|value| *value > 0) else {
+            return Ok(None);
+        };
+        let info = match pidinfo::<BSDInfo>(pid32, 0) {
+            Ok(info) => info,
+            Err(error) if process_info_error_is_missing(&error) => return Ok(None),
+            Err(_error) if !process_exists(pid32) => return Ok(None),
+            Err(error) => return Err(format!("cannot read process info: {error}")),
+        };
         // A same-user check is part of identity evidence; denied/foreign reads
         // become absence rather than a guess from a title or PID.
-        if info.pbi_ruid != unsafe { libc::getuid() } || i64::from(info.pbi_pid) != pid {
-            return None;
+        let current_uid = unsafe { libc::getuid() };
+        if i64::from(info.pbi_pid) != pid {
+            return Err("process identity changed during observation".into());
         }
-        let argv = process_arguments(pid32)?;
+        if info.pbi_ruid != current_uid {
+            return Ok(None);
+        }
+        // Login/session supervisors can retain the user's real UID while
+        // running with another effective UID. They cannot be a user-owned
+        // provider client and macOS correctly denies their argv; exclude them
+        // before that denial is classified as incomplete same-user evidence.
+        if info.pbi_uid != current_uid {
+            return Ok(None);
+        }
+        let argv = match process_arguments(pid32) {
+            Some(argv) => argv,
+            None if !process_exists(pid32) => return Ok(None),
+            None => return Err("cannot read process command line".into()),
+        };
         // Re-read after argv so exit/reuse during observation fails closed.
-        let verified = pidinfo::<BSDInfo>(pid32, 0).ok()?;
+        let verified = match pidinfo::<BSDInfo>(pid32, 0) {
+            Ok(info) => info,
+            Err(error) if process_info_error_is_missing(&error) => return Ok(None),
+            Err(_) if !process_exists(pid32) => return Ok(None),
+            Err(error) => return Err(format!("cannot verify process info: {error}")),
+        };
         let start_time = info
             .pbi_start_tvsec
-            .checked_mul(1_000_000)?
-            .checked_add(info.pbi_start_tvusec)?;
+            .checked_mul(1_000_000)
+            .and_then(|value| value.checked_add(info.pbi_start_tvusec))
+            .ok_or_else(|| "invalid process start time".to_owned())?;
         let verified_start = verified
             .pbi_start_tvsec
-            .checked_mul(1_000_000)?
-            .checked_add(verified.pbi_start_tvusec)?;
+            .checked_mul(1_000_000)
+            .and_then(|value| value.checked_add(verified.pbi_start_tvusec))
+            .ok_or_else(|| "invalid verified process start time".to_owned())?;
         if start_time != verified_start || verified.pbi_ruid != info.pbi_ruid {
-            return None;
+            return Ok(None);
         }
-        Some(ProcessRecord {
+        Ok(Some(ProcessRecord {
             pid,
             parent_pid: (info.pbi_ppid > 0).then(|| i64::from(info.pbi_ppid)),
             start_time,
             argv,
-        })
+        }))
+    }
+
+    fn process_exists(pid: i32) -> bool {
+        // SAFETY: signal zero performs an existence/permission check only.
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    fn process_info_error_is_missing(error: &str) -> bool {
+        // libproc returns its errno as a formatted string. ESRCH is definitive
+        // evidence that the enumerated generation vanished; a later `kill(0)`
+        // success may already refer to a reused PID and must not turn that
+        // ordinary race into a permanently partial host observation.
+        error.contains("errno = 3,")
     }
 
     fn process_arguments(pid: i32) -> Option<Vec<String>> {
@@ -362,10 +586,10 @@ mod platform {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
-    use super::ProcessRecord;
+    use super::{ProcessObservation, ProcessRecord};
     use std::collections::BTreeMap;
-    pub fn snapshot() -> BTreeMap<i64, ProcessRecord> {
-        BTreeMap::new()
+    pub fn snapshot() -> ProcessObservation {
+        ProcessObservation::error("process identity observation is unsupported on this platform")
     }
     pub fn read(_pid: i64) -> Option<ProcessRecord> {
         None
@@ -420,6 +644,53 @@ mod tests {
             (3, record(3, Some(2), &["pika", "hook"])),
         ]);
         assert_eq!(provider_ancestor(3, Provider::Codex, &records), Some(1));
+    }
+
+    #[test]
+    fn enumeration_failure_is_not_an_empty_complete_snapshot() {
+        let observed = collect_observation(Err("enumeration denied".into()), |_| Ok(None));
+        assert_eq!(
+            observed.state,
+            ObservationState::Error("enumeration denied".into())
+        );
+        assert!(observed.processes.is_empty());
+        assert!(
+            observed
+                .require_complete("resume the conversation")
+                .unwrap_err()
+                .contains("No provider was launched")
+        );
+    }
+
+    #[test]
+    fn one_denied_pid_makes_the_whole_identity_snapshot_partial() {
+        let observed = collect_observation(Ok(vec![1, 2, 3]), |pid| match pid {
+            1 => Ok(Some(record(1, None, &["codex", "resume", "uuid"]))),
+            2 => Err("permission denied".into()),
+            _ => Ok(None), // A process that vanished during enumeration is benign.
+        });
+        assert_eq!(observed.processes.len(), 1);
+        assert!(matches!(observed.state, ObservationState::Partial(_)));
+        assert!(observed.require_complete("reconcile ownership").is_err());
+    }
+
+    #[test]
+    fn a_later_complete_observation_recovers_after_partial_evidence() {
+        let partial = collect_observation(Ok(vec![1]), |_| Err("permission denied".into()));
+        assert!(partial.require_complete("open").is_err());
+
+        let recovered = collect_observation(Ok(vec![1]), |pid| {
+            Ok(Some(record(pid, None, &["codex", "resume", "uuid"])))
+        });
+        assert_eq!(recovered.state, ObservationState::Complete);
+        assert_eq!(recovered.processes.keys().copied().collect::<Vec<_>>(), [1]);
+        assert!(recovered.require_complete("open").is_ok());
+    }
+
+    #[test]
+    fn foreign_processes_are_outside_the_identity_scan() {
+        assert!(relevant_process_owner(501, 501));
+        assert!(!relevant_process_owner(502, 501));
     }
 
     #[cfg(target_os = "linux")]

@@ -205,4 +205,48 @@ fn real_isolated_tmux_resumes_all_providers_and_reuses_each_exact_home() {
         assert_eq!(second.kind, "ATTACHED LIVE");
         assert_eq!(pika.tmux.list_panes().unwrap().len(), index + 1);
     }
+
+    let fresh = pika
+        .new_session("fresh_claude", Provider::Claude, false)
+        .unwrap();
+    assert_eq!(fresh.kind, "NEW HOME");
+    let OpenTarget::Pending(pending) = fresh.target else {
+        panic!("new conversation did not produce a pending exact home")
+    };
+    assert_eq!(pending.name, "fresh_claude");
+    assert!(pending.expected_session_id.is_some());
+    let pane = pika
+        .tmux
+        .get_pane(pending.tmux_pane.as_deref().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(pane.pika_provider, Some(Provider::Claude));
+    assert_eq!(pane.pika_name.as_deref(), Some("fresh_claude"));
+    assert_eq!(
+        pane.pika_launch_token.as_deref(),
+        Some(pending.launch_token.as_str())
+    );
+    assert!(
+        pika.new_session("fresh_claude", Provider::Claude, false)
+            .is_err(),
+        "a repeated daily command must not create a second pending home"
+    );
+    assert_eq!(
+        pika.store
+            .list_pending()
+            .unwrap()
+            .iter()
+            .filter(|item| item.name == "fresh_claude")
+            .count(),
+        0,
+        "an immediately observable UUID-bearing provider is certified instead of left pending"
+    );
+    let expected = pending.expected_session_id.as_deref().unwrap();
+    let tracked = pika
+        .store
+        .get_session(Provider::Claude, expected)
+        .unwrap()
+        .expect("the exact new Claude identity should be tracked immediately");
+    assert_eq!(tracked.name.as_deref(), Some("fresh_claude"));
+    assert_eq!(tracked.tmux_pane, pending.tmux_pane);
 }

@@ -236,6 +236,38 @@ pub struct PendingLaunch {
     pub created_at: f64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaunchPhase {
+    Reserved,
+    PaneAllocated,
+    PanePrepared,
+    ProviderStarting,
+    ProviderObserved,
+}
+
+impl LaunchPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::PaneAllocated => "pane_allocated",
+            Self::PanePrepared => "pane_prepared",
+            Self::ProviderStarting => "provider_starting",
+            Self::ProviderObserved => "provider_observed",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reserved" => Some(Self::Reserved),
+            "pane_allocated" => Some(Self::PaneAllocated),
+            "pane_prepared" => Some(Self::PanePrepared),
+            "provider_starting" => Some(Self::ProviderStarting),
+            "provider_observed" => Some(Self::ProviderObserved),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LaunchReservation {
     pub provider: Provider,
@@ -953,6 +985,10 @@ impl Store {
             preexisting_session_ids_json=COALESCE(excluded.preexisting_session_ids_json,pending_launches.preexisting_session_ids_json)"#,
             params![pending.launch_token, pending.provider.as_str(), pending.name, pending.cwd, pending.tmux_session, pending.tmux_pane, pending.expected_session_id, pending.root_pid, pending.root_pid_start, preexisting, pending.candidate_session_id, pending.candidate_observed_at, nonzero_or(pending.created_at, now())],
         )?;
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![launch_phase_key(&pending.launch_token), LaunchPhase::Reserved.as_str()],
+        )?;
         tx.commit()?;
         Ok(true)
     }
@@ -969,11 +1005,20 @@ impl Store {
     }
 
     pub fn delete_pending_if_created(&self, launch_token: &str, created_at: f64) -> Result<bool> {
-        let db = self.open_write()?;
-        Ok(db.execute(
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(
             "DELETE FROM pending_launches WHERE launch_token=? AND created_at=?",
             params![launch_token, created_at],
-        )? == 1)
+        )? == 1;
+        if deleted {
+            tx.execute(
+                "DELETE FROM meta WHERE key=?",
+                [launch_phase_key(launch_token)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn get_pending(&self, launch_token: &str) -> Result<Option<PendingLaunch>> {
@@ -1054,25 +1099,104 @@ impl Store {
             "UPDATE pending_launches SET tmux_session=?,tmux_pane=?,root_pid=?,root_pid_start=? WHERE launch_token=?",
             params![tmux_session, tmux_pane, root_pid, root_pid_start, launch_token],
         )?;
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![launch_phase_key(launch_token), LaunchPhase::PaneAllocated.as_str()],
+        )?;
         tx.commit()?;
         Ok(binding)
     }
 
+    pub fn set_launch_phase(&self, launch_token: &str, phase: LaunchPhase) -> Result<bool> {
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM pending_launches WHERE launch_token=?",
+                [launch_token],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if exists {
+            tx.execute(
+                "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![launch_phase_key(launch_token), phase.as_str()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(exists)
+    }
+
+    pub fn observe_launched_generation(
+        &self,
+        launch_token: &str,
+        pid: i64,
+        start_time: i64,
+    ) -> Result<bool> {
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE pending_launches SET root_pid=?,root_pid_start=? WHERE launch_token=?",
+            params![pid, start_time, launch_token],
+        )? == 1;
+        if changed {
+            tx.execute(
+                "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![launch_phase_key(launch_token), LaunchPhase::ProviderObserved.as_str()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    pub fn get_launch_phase(&self, launch_token: &str) -> Result<Option<LaunchPhase>> {
+        if !self.exists() {
+            return Ok(None);
+        }
+        let db = self.open_read()?;
+        let value: Option<String> = db
+            .query_row(
+                "SELECT value FROM meta WHERE key=?",
+                [launch_phase_key(launch_token)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.as_deref().and_then(LaunchPhase::parse))
+    }
+
     pub fn delete_pending(&self, launch_token: &str) -> Result<bool> {
-        let db = self.open_write()?;
-        Ok(db.execute(
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(
             "DELETE FROM pending_launches WHERE launch_token=?",
             [launch_token],
-        )? == 1)
+        )? == 1;
+        tx.execute(
+            "DELETE FROM meta WHERE key=?",
+            [launch_phase_key(launch_token)],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn prune_pending(&self, pending_before: f64, binding_before: f64) -> Result<usize> {
         let mut db = self.open_write()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stale_tokens = {
+            let mut statement =
+                tx.prepare("SELECT launch_token FROM pending_launches WHERE created_at<?")?;
+            statement
+                .query_map([pending_before], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
         let deleted = tx.execute(
             "DELETE FROM pending_launches WHERE created_at<?",
             [pending_before],
         )?;
+        for token in stale_tokens {
+            tx.execute("DELETE FROM meta WHERE key=?", [launch_phase_key(&token)])?;
+        }
         tx.execute(
             "DELETE FROM launch_bindings WHERE created_at<?",
             [binding_before],
@@ -1160,6 +1284,10 @@ impl Store {
         tx.execute(
             "DELETE FROM pending_launches WHERE launch_token=?",
             [launch_token],
+        )?;
+        tx.execute(
+            "DELETE FROM meta WHERE key=?",
+            [launch_phase_key(launch_token)],
         )?;
         tx.commit()?;
         Ok(true)
@@ -2080,6 +2208,10 @@ fn now() -> f64 {
         .as_secs_f64()
 }
 
+fn launch_phase_key(launch_token: &str) -> String {
+    format!("launch_phase:{launch_token}")
+}
+
 fn nonzero_or(value: f64, fallback: f64) -> f64 {
     if value == 0.0 { fallback } else { value }
 }
@@ -2097,6 +2229,18 @@ impl ReconcileLedger<'_> {
     ) -> Result<bool> {
         Ok(self.tx.execute(
             "UPDATE sessions SET root_pid=NULL,updated_at=? WHERE provider=? AND session_id=?",
+            params![observed_at, provider.as_str(), session_id],
+        )? == 1)
+    }
+
+    pub(crate) fn clear_session_home(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        observed_at: f64,
+    ) -> Result<bool> {
+        Ok(self.tx.execute(
+            "UPDATE sessions SET tmux_session=NULL,tmux_pane=NULL,root_pid=NULL,updated_at=? WHERE provider=? AND session_id=?",
             params![observed_at, provider.as_str(), session_id],
         )? == 1)
     }

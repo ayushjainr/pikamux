@@ -123,29 +123,90 @@ impl Tmux {
         name: Option<&str>,
         launch_token: Option<&str>,
     ) -> Result<()> {
+        let pane = self
+            .get_pane(target)?
+            .context("tmux pane disappeared before tag mutation")?;
+        let transition_is_bound = match launch_token {
+            Some(token) => pane.pika_launch_token.as_deref() == Some(token),
+            None => pane.pika_provider == provider && pane.pika_session_id.as_deref() == session_id,
+        };
+        if !transition_is_bound {
+            bail!("tmux tag mutation lacks an exact launch or conversation binding")
+        }
+        self.tag_pane_if_unchanged(&pane, provider, session_id, name, launch_token)
+    }
+
+    pub fn tag_pane_if_unchanged(
+        &self,
+        pane: &Pane,
+        provider: Option<Provider>,
+        session_id: Option<&str>,
+        name: Option<&str>,
+        launch_token: Option<&str>,
+    ) -> Result<()> {
+        // The launch token is written first. If a later option write fails,
+        // the pane remains attributable to the recoverable launch record; the
+        // provider is never started until a full readback succeeds.
         let values = [
+            ("@pika_launch_token", launch_token),
             ("@pika_provider", provider.map(|item| item.as_str())),
             ("@pika_session_id", session_id),
             ("@pika_name", name),
-            ("@pika_launch_token", launch_token),
         ];
-        for (option, value) in values {
-            if let Some(value) = value {
-                self.output(["set-option", "-p", "-t", target, option, value], true)?;
-            }
-        }
-        Ok(())
+        self.mutate_pane_options_if_unchanged(pane, &values)
     }
 
     pub fn clear_tags(&self, target: &str) -> Result<()> {
-        for option in [
-            "@pika_provider",
-            "@pika_session_id",
-            "@pika_name",
-            "@pika_launch_token",
-        ] {
-            self.output(["set-option", "-p", "-u", "-t", target, option], false)?;
+        let _ = target;
+        bail!("tmux tag removal requires a fresh exact pane binding")
+    }
+
+    pub fn clear_tags_if_unchanged(&self, pane: &Pane) -> Result<()> {
+        let values = [
+            ("@pika_launch_token", None),
+            ("@pika_provider", None),
+            ("@pika_session_id", None),
+            ("@pika_name", None),
+        ];
+        self.mutate_pane_options_if_unchanged(pane, &values)
+    }
+
+    fn mutate_pane_options_if_unchanged(
+        &self,
+        pane: &Pane,
+        values: &[(&str, Option<&str>)],
+    ) -> Result<()> {
+        let condition = pane_generation_condition(pane);
+        let mut commands = Vec::new();
+        for (option, value) in values {
+            if let Some(value) = value {
+                commands.push(format!(
+                    "set-option -p -t {} {} {}",
+                    shell_words::quote(&pane.pane_id),
+                    option,
+                    shell_words::quote(value)
+                ));
+            } else {
+                commands.push(format!(
+                    "set-option -p -u -t {} {}",
+                    shell_words::quote(&pane.pane_id),
+                    option
+                ));
+            }
         }
+        let mutation = commands.join(" ; ");
+        self.output(
+            [
+                "if-shell",
+                "-F",
+                "-t",
+                &pane.pane_id,
+                &condition,
+                &mutation,
+                "run-shell 'exit 75'",
+            ],
+            true,
+        )?;
         Ok(())
     }
 
@@ -214,10 +275,16 @@ impl Tmux {
             .and_then(|output| String::from_utf8(output.stdout).ok())
             .and_then(|value| value.trim().parse::<u16>().ok());
         let mut candidates = Vec::new();
-        if let Some(value) = marker.filter(|value| (9876..=9885).contains(value)) {
+        if let Some(value) = marker.filter(|value| (500..=509).contains(value)) {
             candidates.push(value);
         }
-        candidates.extend((9876..=9885).filter(|value| Some(*value) != marker));
+        candidates.extend((500..=509).filter(|value| Some(*value) != marker));
+        let bindings = self
+            .output(["list-keys", "-T", "root"], false)
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
         for value in candidates {
             let option = format!("user-keys[{value}]");
             let current = self.output(["show-options", "-s", "-v", &option], false);
@@ -225,24 +292,33 @@ impl Tmux {
                 .as_ref()
                 .ok()
                 .filter(|output| output.status.success())
-                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-            if existing.is_some()
-                && !(marker == Some(value)
-                    && existing.as_deref() == Some(WINDOWS_TERMINAL_DA2_RESPONSE))
-            {
-                continue;
-            }
-            if existing.is_none()
-                && self
-                    .output(
-                        ["set-option", "-s", &option, WINDOWS_TERMINAL_DA2_RESPONSE],
-                        false,
-                    )
-                    .is_err()
-            {
-                continue;
-            }
+                .and_then(|output| {
+                    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    (!value.is_empty()).then_some(value)
+                });
             let key = format!("User{value}");
+            let binding = bindings
+                .lines()
+                .find(|line| line.split_whitespace().any(|field| field == key));
+            if existing.is_some() || binding.is_some() {
+                // Never change either half of an allocated user key. Our own
+                // existing option+binding pair is already effective and needs
+                // no rewrite; any other allocation belongs to the user.
+                if marker == Some(value)
+                    && existing.as_deref() == Some(WINDOWS_TERMINAL_DA2_RESPONSE)
+                    && binding.is_some_and(|line| line.contains("@pika_provider"))
+                {
+                    return true;
+                }
+                continue;
+            }
+            let option_set = self.output(
+                ["set-option", "-s", &option, WINDOWS_TERMINAL_DA2_RESPONSE],
+                false,
+            );
+            if !option_set.is_ok_and(|output| output.status.success()) {
+                continue;
+            }
             let replay = format!(
                 "send-keys -l {}",
                 shell_words::quote(WINDOWS_TERMINAL_DA2_RESPONSE)
@@ -332,6 +408,132 @@ impl Tmux {
         }
     }
 
+    pub fn create_holding_session(&self, tmux_name: &str, cwd: &str) -> Result<Pane> {
+        self.output(
+            ["new-session", "-d", "-s", tmux_name, "-c", cwd, "sleep 30"],
+            true,
+        )?;
+        self.get_pane(tmux_name)?
+            .context("tmux holding pane disappeared")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_agent_session(
+        &self,
+        tmux_name: &str,
+        cwd: &str,
+        provider: Provider,
+        session_id: Option<&str>,
+        display_name: &str,
+        launch_token: &str,
+    ) -> Result<Pane> {
+        let holding = self.create_holding_session(tmux_name, cwd)?;
+        self.configure_home(tmux_name, None)?;
+        self.prepare_agent_pane(&holding, provider, session_id, display_name, launch_token)
+    }
+
+    pub fn prepare_agent_pane(
+        &self,
+        pane: &Pane,
+        provider: Provider,
+        session_id: Option<&str>,
+        display_name: &str,
+        launch_token: &str,
+    ) -> Result<Pane> {
+        let fresh = self
+            .get_pane(&pane.pane_id)?
+            .context("tmux pane disappeared before launch reservation")?;
+        if fresh.session_name != pane.session_name
+            || fresh.pane_pid != pane.pane_pid
+            || fresh.created != pane.created
+        {
+            bail!("tmux pane generation changed before launch reservation");
+        }
+        self.tag_pane_if_unchanged(
+            &fresh,
+            Some(provider),
+            session_id,
+            Some(display_name),
+            Some(launch_token),
+        )?;
+        self.require_prepared_pane(&fresh, provider, session_id, display_name, launch_token)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_prepared_agent(
+        &self,
+        pane: &Pane,
+        cwd: &str,
+        provider: Provider,
+        agent_argv: &[String],
+        environment: &BTreeMap<String, String>,
+        session_id: Option<&str>,
+        display_name: &str,
+        launch_token: &str,
+    ) -> Result<Pane> {
+        let reserved =
+            self.require_prepared_pane(pane, provider, session_id, display_name, launch_token)?;
+        let wrapper = agent_wrapper(
+            provider,
+            agent_argv,
+            environment,
+            session_id,
+            Some(launch_token),
+        )?;
+        self.output(
+            [
+                "respawn-pane",
+                "-k",
+                "-t",
+                &reserved.pane_id,
+                "-c",
+                cwd,
+                &wrapper,
+            ],
+            true,
+        )?;
+        self.ensure_rgb();
+        let launched = self
+            .get_pane(&reserved.pane_id)?
+            .context("tmux agent pane disappeared after respawn")?;
+        if launched.pika_provider != Some(provider)
+            || launched.pika_session_id.as_deref() != session_id
+            || launched.pika_launch_token.as_deref() != Some(launch_token)
+        {
+            bail!(
+                "provider may have started, but the tmux launch reservation changed; the recoverable launch record was retained"
+            );
+        }
+        Ok(launched)
+    }
+
+    fn require_prepared_pane(
+        &self,
+        expected: &Pane,
+        provider: Provider,
+        session_id: Option<&str>,
+        display_name: &str,
+        launch_token: &str,
+    ) -> Result<Pane> {
+        let current = self
+            .get_pane(&expected.pane_id)?
+            .context("tmux pane disappeared before provider execution")?;
+        if current.session_name != expected.session_name
+            || current.pane_pid != expected.pane_pid
+            || current.created != expected.created
+            || current.current_command != expected.current_command
+            || current.pika_provider != Some(provider)
+            || current.pika_session_id.as_deref() != session_id
+            || current.pika_name.as_deref() != Some(display_name)
+            || current.pika_launch_token.as_deref() != Some(launch_token)
+        {
+            bail!(
+                "tmux pane generation or exact launch reservation changed; provider was not started"
+            )
+        }
+        Ok(current)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_agent_session(
         &self,
@@ -344,37 +546,25 @@ impl Tmux {
         display_name: &str,
         launch_token: Option<&str>,
     ) -> Result<Pane> {
-        self.output(
-            ["new-session", "-d", "-s", tmux_name, "-c", cwd, "sleep 30"],
-            true,
-        )?;
-        self.configure_home(tmux_name, None)?;
-        let holding = self
-            .get_pane(tmux_name)?
-            .context("tmux holding pane disappeared")?;
-        let wrapper = agent_wrapper(provider, agent_argv, environment, session_id, launch_token)?;
-        self.output(
-            [
-                "respawn-pane",
-                "-k",
-                "-t",
-                &holding.pane_id,
-                "-c",
-                cwd,
-                &wrapper,
-            ],
-            true,
-        )?;
-        self.tag_pane(
-            &holding.pane_id,
-            Some(provider),
+        let launch_token = launch_token.context("agent launches require a recovery token")?;
+        let holding = self.prepare_agent_session(
+            tmux_name,
+            cwd,
+            provider,
             session_id,
-            Some(display_name),
+            display_name,
             launch_token,
         )?;
-        self.ensure_rgb();
-        self.get_pane(&holding.pane_id)?
-            .context("tmux agent pane disappeared")
+        self.start_prepared_agent(
+            &holding,
+            cwd,
+            provider,
+            agent_argv,
+            environment,
+            session_id,
+            display_name,
+            launch_token,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -392,36 +582,19 @@ impl Tmux {
         if !is_pika_session(&pane.session_name) {
             bail!("Pika will not respawn a user-owned tmux pane");
         }
-        let wrapper = agent_wrapper(
+        self.configure_home(&pane.session_name, Some(&pane.pane_id))?;
+        let prepared =
+            self.prepare_agent_pane(pane, provider, Some(session_id), display_name, launch_token)?;
+        self.start_prepared_agent(
+            &prepared,
+            cwd,
             provider,
             agent_argv,
             environment,
             Some(session_id),
-            Some(launch_token),
-        )?;
-        self.configure_home(&pane.session_name, Some(&pane.pane_id))?;
-        self.output(
-            [
-                "respawn-pane",
-                "-k",
-                "-t",
-                &pane.pane_id,
-                "-c",
-                cwd,
-                &wrapper,
-            ],
-            true,
-        )?;
-        self.tag_pane(
-            &pane.pane_id,
-            Some(provider),
-            Some(session_id),
-            Some(display_name),
-            Some(launch_token),
-        )?;
-        self.ensure_rgb();
-        self.get_pane(&pane.pane_id)?
-            .context("tmux agent pane disappeared after respawn")
+            display_name,
+            launch_token,
+        )
     }
 
     pub fn internal_name(provider: Provider, identity: &str) -> String {
@@ -480,6 +653,41 @@ fn parse_pane(line: &str) -> Option<Pane> {
 
 fn nonempty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn pane_generation_condition(pane: &Pane) -> String {
+    let pane_pid = pane.pane_pid.to_string();
+    let created = pane.created.to_string();
+    let fields = [
+        ("#{pane_id}", pane.pane_id.as_str()),
+        ("#{pane_pid}", pane_pid.as_str()),
+        ("#{session_created}", created.as_str()),
+        (
+            "#{@pika_provider}",
+            pane.pika_provider.map(Provider::as_str).unwrap_or(""),
+        ),
+        (
+            "#{@pika_session_id}",
+            pane.pika_session_id.as_deref().unwrap_or(""),
+        ),
+        ("#{@pika_name}", pane.pika_name.as_deref().unwrap_or("")),
+        (
+            "#{@pika_launch_token}",
+            pane.pika_launch_token.as_deref().unwrap_or(""),
+        ),
+    ];
+    fields
+        .into_iter()
+        .map(|(field, value)| format!("#{{==:{field},{}}}", format_literal(value)))
+        .reduce(|left, right| format!("#{{&&:{left},{right}}}"))
+        .expect("pane generation has fields")
+}
+
+fn format_literal(value: &str) -> String {
+    value
+        .replace('#', "##")
+        .replace(',', "#,")
+        .replace('}', "#}")
 }
 
 fn agent_wrapper(

@@ -2,7 +2,7 @@ use crate::{
     config::Config,
     model::{Candidate, ObservationKind, Pane, Provider, Session, Status},
     paths::Paths,
-    process::{self, ProcessRecord},
+    process::{self, ProcessObservation, ProcessRecord},
     providers::Providers,
     resolve::{EvidenceState, NameCandidate, NameResolutionError, SelectionEvidence, resolve_name},
     status::{ProjectionFallback, project_status},
@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -39,6 +40,13 @@ pub struct OpenReceipt {
     pub exit_code: i32,
 }
 
+#[derive(Clone, Debug)]
+pub struct ExactPaneBinding {
+    pub pane: Pane,
+    pub provider_pid: i64,
+    pub provider_start_time: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
     #[error("No exact conversation named {0:?}.")]
@@ -57,6 +65,7 @@ pub struct Pika {
     pub config: Config,
     pub store: Store,
     pub tmux: Tmux,
+    process_observer: Arc<dyn Fn() -> ProcessObservation + Send + Sync>,
 }
 
 impl Pika {
@@ -69,6 +78,7 @@ impl Pika {
             config,
             store,
             tmux: Tmux::default(),
+            process_observer: Arc::new(process::observe),
         })
     }
 
@@ -78,7 +88,12 @@ impl Pika {
             config,
             store,
             tmux,
+            process_observer: Arc::new(process::observe),
         }
+    }
+
+    fn observe_processes(&self) -> ProcessObservation {
+        (self.process_observer)()
     }
 
     /// Return the durable cache without scanning providers, processes, tmux, or SSH.
@@ -94,8 +109,17 @@ impl Pika {
     /// deliberately outside this operation so an offline node cannot stall it.
     pub fn reconcile_local(&self) -> Result<Inventory> {
         self.store.initialize()?;
-        let processes = process::snapshot();
-        let panes = self.tmux.list_panes().unwrap_or_default();
+        let observation = self.observe_processes();
+        let processes = require_complete_processes(&observation, "reconcile ownership")?;
+        let panes = match self.tmux.list_panes() {
+            Ok(panes) => panes,
+            Err(_) if !self.tmux.available() => Vec::new(),
+            Err(error) => {
+                return Err(error).context(
+                    "Pika refused to reconcile ownership because tmux could not be observed",
+                );
+            }
+        };
         let providers = Providers::new(&self.paths, &self.config);
         let mut stored = self.store.list_sessions()?;
         let mut wanted = BTreeMap::<Provider, BTreeSet<String>>::new();
@@ -158,11 +182,11 @@ impl Pika {
                         && pane.pika_session_id.as_deref() == Some(&parent.session_id)
                 })
                 .is_some_and(|pane| {
-                    let tree = process::process_tree(pane.pane_pid, &processes);
+                    let tree = process::process_tree(pane.pane_pid, processes);
                     process::find_session_processes(
                         &candidate.session_id,
                         Provider::Codex,
-                        &processes,
+                        processes,
                     )
                     .iter()
                     .any(|pid| tree.contains(pid))
@@ -181,7 +205,7 @@ impl Pika {
             let mut sessions = Vec::with_capacity(stored.len() + fork_imports.len());
             for mut session in stored {
                 let (candidate, continuation_conflicts) =
-                    continuation_candidate(&session, &candidate_map, &panes, &processes, now());
+                    continuation_candidate(&session, &candidate_map, &panes, processes, now());
                 if let Some(candidate) = candidate {
                     if candidate.session_id != session.session_id {
                         session.active_thread_id = Some(candidate.session_id.clone());
@@ -214,7 +238,7 @@ impl Pika {
                 self.reconcile_one_in(
                     &mut session,
                     &panes,
-                    &processes,
+                    processes,
                     ledger,
                     &continuation_conflicts,
                 )?;
@@ -234,6 +258,7 @@ impl Pika {
         })
     }
 
+    #[cfg(test)]
     fn reconcile_one(
         &self,
         session: &mut Session,
@@ -256,11 +281,8 @@ impl Pika {
         let tagged: Vec<&Pane> = panes
             .iter()
             .filter(|pane| {
-                (pane.pika_provider == Some(session.provider)
-                    && pane.pika_session_id.as_deref() == Some(&session.session_id))
-                    || (session.tmux_pane.as_deref() == Some(&pane.pane_id)
-                        && pane.pika_provider.is_none()
-                        && pane.pika_session_id.is_none())
+                pane.pika_provider == Some(session.provider)
+                    && pane.pika_session_id.as_deref() == Some(&session.session_id)
             })
             .collect();
         let owned: BTreeSet<i64> = tagged
@@ -374,11 +396,21 @@ impl Pika {
             session.tmux_session = Some(pane.session_name.clone());
             session.tmux_pane = Some(pane.pane_id.clone());
             session.root_pid = Some(pid);
-        } else if let Some(pid) = outside.first() {
-            session.root_pid = Some(*pid);
         } else {
-            session.root_pid = None;
-            ledger.clear_session_runtime(session.provider, &session.session_id, timestamp)?;
+            if let Some(pid) = outside.first() {
+                session.root_pid = Some(*pid);
+            } else {
+                session.root_pid = None;
+                ledger.clear_session_runtime(session.provider, &session.session_id, timestamp)?;
+            }
+            if tagged.is_empty() {
+                session.tmux_session = None;
+                session.tmux_pane = None;
+                ledger.clear_session_home(session.provider, &session.session_id, timestamp)?;
+            } else if tagged.len() == 1 {
+                session.tmux_session = Some(tagged[0].session_name.clone());
+                session.tmux_pane = Some(tagged[0].pane_id.clone());
+            }
         }
 
         let mut observations = ledger.status_observations(session.provider, &session.session_id)?;
@@ -588,26 +620,107 @@ impl Pika {
             .context("this shell has no Pika conversation identity")?;
         let pane_id =
             std::env::var("TMUX_PANE").context("this command is not running inside a Pika pane")?;
-        let mut session = self
+        let session = self
             .store
             .get_session_by_thread(provider, &identity)?
             .context("the calling conversation is not tracked")?;
-        let panes = self.tmux.list_panes()?;
-        let pane = panes
-            .iter()
-            .find(|pane| pane.pane_id == pane_id)
-            .context("the calling tmux pane no longer exists")?;
-        if pane.pika_provider != Some(provider)
-            || pane.pika_session_id.as_deref() != Some(&session.session_id)
-        {
-            bail!("the calling pane is not tagged for this exact conversation");
-        }
-        let processes = process::snapshot();
-        self.reconcile_one(&mut session, &panes, &processes)?;
-        if session.home_state != "exact" {
-            bail!("the calling pane's exact provider identity could not be proven");
-        }
+        self.exact_pane_binding(&session, Some(&pane_id))?;
         Ok(session)
+    }
+
+    /// Bind a pane ID to one provider UUID and one UUID-bearing process
+    /// generation using fresh tmux and OS observations. A remembered pane ID,
+    /// pane title, lease, or launch token is never sufficient for a pane
+    /// action because tmux IDs can be reused after a server restart.
+    pub fn exact_pane_binding(
+        &self,
+        session: &Session,
+        expected_pane: Option<&str>,
+    ) -> Result<ExactPaneBinding> {
+        let observation = self.observe_processes();
+        let processes = require_complete_processes(&observation, "verify the exact pane")?;
+        let panes = self
+            .tmux
+            .list_panes()
+            .context("Pika refused the pane action because tmux could not be observed")?;
+        let matches = panes
+            .iter()
+            .filter(|pane| {
+                pane.pika_provider == Some(session.provider)
+                    && pane.pika_session_id.as_deref() == Some(&session.session_id)
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1
+            || expected_pane.is_some_and(|expected| matches[0].pane_id != expected)
+        {
+            bail!(
+                "Pika cannot bind one exact pane to {} {} (found {}). No pane action was performed.",
+                session.provider,
+                session.session_id,
+                matches.len()
+            );
+        }
+        let pane = matches[0];
+        let mut identity_pids = BTreeSet::new();
+        for identity in identity_strings(session) {
+            identity_pids.extend(process::find_session_processes(
+                identity,
+                session.provider,
+                processes,
+            ));
+        }
+        if identity_pids.len() != 1 {
+            bail!(
+                "Pika cannot bind the pane to one UUID-bearing {} process (found {}). No pane action was performed.",
+                session.provider,
+                identity_pids.len()
+            );
+        }
+        let provider_pid = *identity_pids.first().expect("one identity PID");
+        let tree = process::process_tree(pane.pane_pid, processes);
+        if !tree.contains(&provider_pid) {
+            bail!(
+                "the exact UUID-bearing process is outside the tagged pane; no pane action was performed"
+            );
+        }
+        let provider_start_time = processes
+            .get(&provider_pid)
+            .map(|record| record.start_time)
+            .context("the UUID-bearing process disappeared from the complete observation")?;
+        if process::process_start_time(provider_pid) != Some(provider_start_time) {
+            bail!("the UUID-bearing process generation changed; no pane action was performed");
+        }
+        let fresh = self
+            .tmux
+            .get_pane(&pane.pane_id)?
+            .context("the exact pane disappeared before the action")?;
+        if !same_pane_generation(pane, &fresh)
+            || fresh.pika_provider != Some(session.provider)
+            || fresh.pika_session_id.as_deref() != Some(&session.session_id)
+            || process::process_start_time(provider_pid) != Some(provider_start_time)
+        {
+            bail!("the exact pane or provider generation changed; no pane action was performed");
+        }
+        Ok(ExactPaneBinding {
+            pane: fresh,
+            provider_pid,
+            provider_start_time,
+        })
+    }
+
+    pub fn capture_exact(&self, session: &Session, lines: usize) -> Result<String> {
+        let before = self.exact_pane_binding(session, session.tmux_pane.as_deref())?;
+        let output = self.tmux.capture(&before.pane.pane_id, lines)?;
+        let after = self.exact_pane_binding(session, Some(&before.pane.pane_id))?;
+        if !same_exact_binding(&before, &after) {
+            bail!("the exact pane changed during capture; captured output was discarded")
+        }
+        Ok(output)
+    }
+
+    pub fn clear_exact_tags(&self, session: &Session) -> Result<()> {
+        let binding = self.exact_pane_binding(session, session.tmux_pane.as_deref())?;
+        self.tmux.clear_tags_if_unchanged(&binding.pane)
     }
 
     pub fn open_name(&self, query: &str, attach: bool, allow_create: bool) -> Result<OpenReceipt> {
@@ -651,17 +764,11 @@ impl Pika {
             .into());
         }
         if session.home_state == "exact" {
-            let pane = session
-                .tmux_pane
-                .as_deref()
-                .context("exact Pika home has no pane identity")?;
-            let tmux_session = session
-                .tmux_session
-                .as_deref()
-                .context("exact Pika home has no tmux session")?;
+            let binding = self.exact_pane_binding(&session, session.tmux_pane.as_deref())?;
             let event = session.last_event_at;
             let code = if attach {
-                self.tmux.attach(tmux_session, Some(pane))?
+                self.tmux
+                    .attach(&binding.pane.session_name, Some(&binding.pane.pane_id))?
             } else {
                 0
             };
@@ -680,20 +787,24 @@ impl Pika {
             });
         }
 
-        let processes = process::snapshot();
-        let panes = self.tmux.list_panes().unwrap_or_default();
+        let observation = self.observe_processes();
+        let processes = require_complete_processes(&observation, "resume the conversation")?;
+        let panes = self
+            .tmux
+            .list_panes()
+            .context("Pika refused to resume because tmux could not be observed")?;
         let owned: BTreeSet<i64> = panes
             .iter()
             .filter(|pane| {
                 pane.pika_provider == Some(session.provider)
                     && pane.pika_session_id.as_deref() == Some(&session.session_id)
             })
-            .flat_map(|pane| process::process_tree(pane.pane_pid, &processes))
+            .flat_map(|pane| process::process_tree(pane.pane_pid, processes))
             .collect();
         let mut outside = BTreeSet::new();
         for identity in identity_strings(&session) {
             outside.extend(
-                process::find_session_processes(identity, session.provider, &processes)
+                process::find_session_processes(identity, session.provider, processes)
                     .into_iter()
                     .filter(|pid| !owned.contains(pid)),
             );
@@ -739,16 +850,19 @@ impl Pika {
     /// pane, with their platform-native birth stamps. This is evidence for an
     /// explicit clean-and-attach choice, never an automatic takeover.
     pub fn outside_identity_generations(&self, session: &Session) -> Result<Vec<(i64, u64)>> {
-        let processes = process::snapshot();
-        let panes = self.tmux.list_panes().unwrap_or_default();
+        let observation = self.observe_processes();
+        let processes = require_complete_processes(&observation, "inspect outside ownership")?;
+        let panes = self.tmux.list_panes().context(
+            "Pika refused to inspect outside ownership because tmux could not be observed",
+        )?;
         let inside: BTreeSet<i64> = panes
             .iter()
-            .flat_map(|pane| process::process_tree(pane.pane_pid, &processes))
+            .flat_map(|pane| process::process_tree(pane.pane_pid, processes))
             .collect();
         let mut outside = BTreeSet::new();
         for identity in identity_strings(session) {
             outside.extend(
-                process::find_session_processes(identity, session.provider, &processes)
+                process::find_session_processes(identity, session.provider, processes)
                     .into_iter()
                     .filter(|pid| !inside.contains(pid)),
             );
@@ -844,10 +958,11 @@ impl Pika {
     fn resume_session(&self, mut session: Session, attach: bool) -> Result<OpenReceipt> {
         let token = Uuid::new_v4().to_string();
         let identity = session.provider_thread_id().to_owned();
+        let tmux_name = Tmux::internal_name(session.provider, &session.session_id);
         let owner_pid = i64::from(std::process::id());
         let owner_start = process::process_start_time(owner_pid)
             .and_then(|value| i64::try_from(value).ok())
-            .unwrap_or_default();
+            .context("Pika cannot pin its own launch reservation process generation")?;
         if !self.store.reserve_resume(
             session.provider,
             &session.session_id,
@@ -861,10 +976,77 @@ impl Pika {
                 shell_words::quote(&session.display_name())
             );
         }
+        let pending = PendingLaunch {
+            launch_token: token.clone(),
+            provider: session.provider,
+            name: session.display_name(),
+            cwd: existing_cwd(session.cwd.as_deref())?.to_owned(),
+            tmux_session: Some(tmux_name.clone()),
+            tmux_pane: None,
+            expected_session_id: Some(session.session_id.clone()),
+            root_pid: None,
+            root_pid_start: None,
+            preexisting_session_ids: None,
+            candidate_session_id: None,
+            candidate_observed_at: None,
+            created_at: now(),
+        };
+        if !self.store.add_pending(&pending)? {
+            self.store
+                .release_resume(session.provider, &session.session_id, &token)?;
+            bail!(
+                "{} is already starting. Wait a moment, then run exactly: `pika {}`.",
+                session.display_name(),
+                shell_words::quote(&session.display_name())
+            )
+        }
         let result = (|| {
+            let observation = self.observe_processes();
+            let processes =
+                require_complete_processes(&observation, "start the exact provider process")?;
+            let panes = self
+                .tmux
+                .list_panes()
+                .context("Pika refused to resume because tmux could not be observed")?;
+            let all_pane_pids = panes
+                .iter()
+                .flat_map(|pane| process::process_tree(pane.pane_pid, processes))
+                .collect::<BTreeSet<_>>();
+            let exact_pids =
+                process::find_session_processes(&identity, session.provider, processes);
+            let outside = exact_pids
+                .iter()
+                .filter(|pid| !all_pane_pids.contains(pid))
+                .copied()
+                .collect::<Vec<_>>();
+            if !outside.is_empty() {
+                bail!(
+                    "{} started elsewhere while Pika was reserving its exact home (PID {}). No second provider was launched.",
+                    session.display_name(),
+                    outside
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+            if !exact_pids.is_empty() {
+                let binding = self.exact_pane_binding(&session, None)?;
+                self.store.delete_pending(&token)?;
+                let code = if attach {
+                    self.tmux
+                        .attach(&binding.pane.session_name, Some(&binding.pane.pane_id))?
+                } else {
+                    0
+                };
+                return Ok(OpenReceipt {
+                    target: OpenTarget::Session(Box::new(session.clone())),
+                    kind: "ATTACHED LIVE",
+                    exit_code: code,
+                });
+            }
             let providers = Providers::new(&self.paths, &self.config);
             let argv = providers.resume_argv(session.provider, &identity);
-            let tmux_name = Tmux::internal_name(session.provider, &session.session_id);
             let environment = launch_environment(
                 session.provider,
                 Some(&session.session_id),
@@ -872,44 +1054,109 @@ impl Pika {
                 &session.display_name(),
             );
             let cwd = existing_cwd(session.cwd.as_deref())?;
-            let reusable = self.tmux.list_panes()?.into_iter().find(|pane| {
+            let reusable = panes.iter().find(|pane| {
                 pane.session_name == tmux_name
-                    && (pane.pika_session_id.as_deref() == Some(&session.session_id)
-                        || session.tmux_pane.as_deref() == Some(&pane.pane_id))
+                    && pane.pika_provider == Some(session.provider)
+                    && pane.pika_session_id.as_deref() == Some(&session.session_id)
             });
-            let pane = if let Some(existing) = reusable {
-                self.tmux.respawn_agent_pane(
-                    &existing,
-                    cwd,
-                    session.provider,
-                    &argv,
-                    &environment,
-                    &session.session_id,
-                    &session.display_name(),
-                    &token,
-                )?
+            let (allocated, new_holder) = if let Some(existing) = reusable {
+                require_idle_pane(existing, processes, false)?;
+                ((*existing).clone(), false)
             } else {
-                self.tmux.create_agent_session(
-                    &tmux_name,
-                    cwd,
-                    session.provider,
-                    &argv,
-                    &environment,
-                    Some(&session.session_id),
-                    &session.display_name(),
-                    Some(&token),
-                )?
+                let free_name = free_tmux_name(&tmux_name, &panes);
+                (self.tmux.create_holding_session(&free_name, cwd)?, true)
             };
+            self.store.finalize_pending_pane(
+                &token,
+                &allocated.session_name,
+                &allocated.pane_id,
+                Some(allocated.pane_pid),
+                process::process_start_time(allocated.pane_pid)
+                    .and_then(|value| i64::try_from(value).ok()),
+            )?;
+            self.tmux
+                .configure_home(&allocated.session_name, Some(&allocated.pane_id))?;
+            let prepared = self.tmux.prepare_agent_pane(
+                &allocated,
+                session.provider,
+                Some(&session.session_id),
+                &session.display_name(),
+                &token,
+            )?;
+            if !self
+                .store
+                .set_launch_phase(&token, crate::store::LaunchPhase::PanePrepared)?
+            {
+                bail!("the recoverable launch record disappeared before provider execution")
+            }
+            if !self
+                .store
+                .bind_launch(&token, session.provider, &session.session_id)?
+            {
+                bail!("the recoverable launch token was already bound to another conversation")
+            }
+            // Persist intent before the only command that can start a provider.
+            if !self
+                .store
+                .set_launch_phase(&token, crate::store::LaunchPhase::ProviderStarting)?
+            {
+                bail!("the recoverable launch record disappeared before provider execution")
+            }
+            // A process could have appeared after the first snapshot. Recheck
+            // the idle tree after tagging and immediately before respawn.
+            let ready_observation = self.observe_processes();
+            let ready_processes = require_complete_processes(
+                &ready_observation,
+                "execute the reserved provider launch",
+            )?;
+            let appeared =
+                process::find_session_processes(&identity, session.provider, ready_processes);
+            if !appeared.is_empty() {
+                bail!(
+                    "{} acquired another exact owner while Pika was preparing its home (PID {}). No second provider was launched.",
+                    session.display_name(),
+                    appeared
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+            require_idle_pane(&prepared, ready_processes, new_holder)?;
+            let pane = self.tmux.start_prepared_agent(
+                &prepared,
+                cwd,
+                session.provider,
+                &argv,
+                &environment,
+                Some(&session.session_id),
+                &session.display_name(),
+                &token,
+            )?;
+            let binding = wait_for_exact_binding(self, &session, &pane.pane_id)?;
+            let start_time = i64::try_from(binding.provider_start_time)
+                .context("provider generation does not fit the state store")?;
+            self.store
+                .observe_launched_generation(&token, binding.provider_pid, start_time)?;
             session.tmux_session = Some(pane.session_name.clone());
             session.tmux_pane = Some(pane.pane_id.clone());
-            session.root_pid = Some(pane.pane_pid);
+            session.root_pid = Some(binding.provider_pid);
             session.status = Status::Starting;
             session.live = true;
             session.home_state = "starting".into();
             session.last_activity_at = now();
-            self.store
-                .bind_launch(&token, session.provider, &session.session_id)?;
             self.store.upsert_session(&session, true)?;
+            if self.store.get_pending(&token)?.is_some()
+                && !self.store.certify_launch(
+                    &token,
+                    session.provider,
+                    &session.session_id,
+                    binding.provider_pid,
+                    start_time,
+                )?
+            {
+                bail!("the launched provider generation could not be certified")
+            }
             let code = if attach {
                 self.tmux.attach(&pane.session_name, Some(&pane.pane_id))?
             } else {
@@ -928,6 +1175,12 @@ impl Pika {
 
     pub fn new_session(&self, name: &str, provider: Provider, attach: bool) -> Result<OpenReceipt> {
         validate_daily_name(name)?;
+        let observation = self.observe_processes();
+        require_complete_processes(&observation, "start a new conversation")?;
+        let existing_panes = self
+            .tmux
+            .list_panes()
+            .context("Pika refused to start a conversation because tmux could not be observed")?;
         if !self.resolve_local(name)?.is_empty() {
             bail!(
                 "{name:?} already names a saved conversation; run exactly: `pika {}`",
@@ -939,12 +1192,16 @@ impl Pika {
         let providers = Providers::new(&self.paths, &self.config);
         let argv = providers.new_argv(provider, name, reserved.as_deref());
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+        let internal = free_tmux_name(
+            &Tmux::internal_name(provider, reserved.as_deref().unwrap_or(&token)),
+            &existing_panes,
+        );
         let pending = PendingLaunch {
             launch_token: token.clone(),
             provider,
             name: name.into(),
             cwd: cwd.clone(),
-            tmux_session: None,
+            tmux_session: Some(internal.clone()),
             tmux_pane: None,
             expected_session_id: reserved.clone(),
             root_pid: None,
@@ -966,31 +1223,136 @@ impl Pika {
                 shell_words::quote(name)
             );
         }
-        let result = (|| {
-            let internal = Tmux::internal_name(provider, reserved.as_deref().unwrap_or(&token));
+        // Failures deliberately retain the phase-stamped pending record. It is
+        // the recovery handle if tmux accepted provider execution before a
+        // later readback/store operation failed.
+        (|| {
             let environment = launch_environment(provider, reserved.as_deref(), &token, name);
-            let pane = self.tmux.create_agent_session(
-                &internal,
+            let allocated = self.tmux.create_holding_session(&internal, &cwd)?;
+            self.store.finalize_pending_pane(
+                &token,
+                &allocated.session_name,
+                &allocated.pane_id,
+                Some(allocated.pane_pid),
+                process::process_start_time(allocated.pane_pid)
+                    .and_then(|value| i64::try_from(value).ok()),
+            )?;
+            self.tmux
+                .configure_home(&allocated.session_name, Some(&allocated.pane_id))?;
+            let prepared = self.tmux.prepare_agent_pane(
+                &allocated,
+                provider,
+                reserved.as_deref(),
+                name,
+                &token,
+            )?;
+            if !self
+                .store
+                .set_launch_phase(&token, crate::store::LaunchPhase::PanePrepared)?
+            {
+                bail!("the recoverable launch record disappeared before provider execution")
+            }
+            if let Some(session_id) = reserved.as_deref()
+                && !self.store.bind_launch(&token, provider, session_id)?
+            {
+                bail!("the recoverable launch token was already bound to another conversation")
+            }
+            if !self
+                .store
+                .set_launch_phase(&token, crate::store::LaunchPhase::ProviderStarting)?
+            {
+                bail!("the recoverable launch record disappeared before provider execution")
+            }
+            let ready_observation = self.observe_processes();
+            let ready_processes = require_complete_processes(
+                &ready_observation,
+                "execute the reserved provider launch",
+            )?;
+            if let Some(session_id) = reserved.as_deref() {
+                let appeared =
+                    process::find_session_processes(session_id, provider, ready_processes);
+                if !appeared.is_empty() {
+                    bail!(
+                        "the reserved conversation UUID acquired another owner before provider execution. No second provider was launched."
+                    )
+                }
+            }
+            require_idle_pane(&prepared, ready_processes, true)?;
+            let pane = self.tmux.start_prepared_agent(
+                &prepared,
                 &cwd,
                 provider,
                 &argv,
                 &environment,
                 reserved.as_deref(),
                 name,
-                Some(&token),
-            )?;
-            self.store.finalize_pending_pane(
                 &token,
-                &pane.session_name,
-                &pane.pane_id,
-                Some(pane.pane_pid),
-                process::process_start_time(pane.pane_pid)
-                    .and_then(|value| i64::try_from(value).ok()),
             )?;
+            if let Some(session_id) = reserved.as_deref() {
+                let mut provisional = Session {
+                    provider,
+                    session_id: session_id.to_owned(),
+                    name: Some(name.to_owned()),
+                    cwd: Some(cwd.clone()),
+                    branch: None,
+                    transcript_path: None,
+                    tmux_session: Some(pane.session_name.clone()),
+                    tmux_pane: Some(pane.pane_id.clone()),
+                    root_pid: None,
+                    status: Status::Starting,
+                    unread: false,
+                    model: None,
+                    source: "pending-launch".into(),
+                    managed: true,
+                    error: None,
+                    attention_reason: None,
+                    created_at: pending.created_at,
+                    updated_at: pending.created_at,
+                    last_event_at: pending.created_at,
+                    last_activity_at: pending.created_at,
+                    live: true,
+                    attached: false,
+                    home_state: "starting".into(),
+                    cpu_percent: None,
+                    rss_kb: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cached_input_tokens: None,
+                    cache_write_tokens: None,
+                    total_tokens: None,
+                    estimated_cost_usd: None,
+                    active_thread_id: None,
+                };
+                if let Ok(binding) = wait_for_exact_binding(self, &provisional, &pane.pane_id) {
+                    let start_time = i64::try_from(binding.provider_start_time)
+                        .context("provider generation does not fit the state store")?;
+                    provisional.root_pid = Some(binding.provider_pid);
+                    self.store.observe_launched_generation(
+                        &token,
+                        binding.provider_pid,
+                        start_time,
+                    )?;
+                    self.store.upsert_session(&provisional, true)?;
+                    let _ = self.store.certify_launch(
+                        &token,
+                        provider,
+                        session_id,
+                        binding.provider_pid,
+                        start_time,
+                    )?;
+                }
+            }
             let current = self
                 .store
                 .get_pending(&token)?
-                .context("pending launch disappeared before attach")?;
+                .unwrap_or_else(|| PendingLaunch {
+                    tmux_session: Some(pane.session_name.clone()),
+                    tmux_pane: Some(pane.pane_id.clone()),
+                    root_pid: Some(pane.pane_pid),
+                    root_pid_start: process::process_start_time(pane.pane_pid)
+                        .and_then(|value| i64::try_from(value).ok()),
+                    ..pending.clone()
+                });
             let code = if attach {
                 self.tmux.attach(&pane.session_name, Some(&pane.pane_id))?
             } else {
@@ -1001,11 +1363,7 @@ impl Pika {
                 kind: "NEW HOME",
                 exit_code: code,
             })
-        })();
-        if result.is_err() {
-            self.store.delete_pending(&token)?;
-        }
-        result
+        })()
     }
 }
 
@@ -1191,6 +1549,94 @@ fn identity_strings(session: &Session) -> Vec<&str> {
         identities.push(active);
     }
     identities
+}
+
+fn require_complete_processes<'a>(
+    observation: &'a ProcessObservation,
+    operation: &str,
+) -> Result<&'a BTreeMap<i64, ProcessRecord>> {
+    observation
+        .require_complete(operation)
+        .map_err(anyhow::Error::msg)
+}
+
+fn same_pane_generation(left: &Pane, right: &Pane) -> bool {
+    left.pane_id == right.pane_id
+        && left.session_name == right.session_name
+        && left.pane_pid == right.pane_pid
+        && left.created == right.created
+}
+
+fn same_exact_binding(left: &ExactPaneBinding, right: &ExactPaneBinding) -> bool {
+    same_pane_generation(&left.pane, &right.pane)
+        && left.provider_pid == right.provider_pid
+        && left.provider_start_time == right.provider_start_time
+}
+
+fn require_idle_pane(
+    pane: &Pane,
+    processes: &BTreeMap<i64, ProcessRecord>,
+    allow_launch_holder: bool,
+) -> Result<()> {
+    if pane.dead {
+        bail!("Pika will not reuse a dead pane without a live generation to bind")
+    }
+    let shell = Path::new(&pane.current_command)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(&pane.current_command)
+        .to_ascii_lowercase();
+    let shell_idle = matches!(
+        shell.as_str(),
+        "bash" | "dash" | "fish" | "ksh" | "sh" | "tcsh" | "zsh"
+    );
+    let launch_holder = allow_launch_holder && shell == "sleep";
+    if !shell_idle && !launch_holder {
+        bail!(
+            "the saved Pika pane is running {:?}; Pika refused to replace it",
+            pane.current_command
+        )
+    }
+    let tree = process::process_tree(pane.pane_pid, processes);
+    if tree != [pane.pane_pid] {
+        bail!("the saved Pika pane acquired another process; Pika refused to replace it")
+    }
+    Ok(())
+}
+
+fn free_tmux_name(base: &str, panes: &[Pane]) -> String {
+    let names = panes
+        .iter()
+        .map(|pane| pane.session_name.as_str())
+        .collect::<BTreeSet<_>>();
+    if !names.contains(base) {
+        return base.to_owned();
+    }
+    for suffix in 2_u32.. {
+        let candidate = format!("{base}-{suffix}");
+        if !names.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!("u32 tmux-name suffix space exhausted")
+}
+
+fn wait_for_exact_binding(pika: &Pika, session: &Session, pane: &str) -> Result<ExactPaneBinding> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match pika.exact_pane_binding(session, Some(pane)) {
+            Ok(binding) => return Ok(binding),
+            Err(error) if std::time::Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                return Err(error).context(
+                    "provider execution was accepted, but exact UUID ownership was not established; the recoverable pending launch was retained",
+                );
+            }
+        }
+    }
 }
 
 fn canonical_directory(value: Option<&str>) -> Option<String> {
@@ -1523,5 +1969,105 @@ mod tests {
                 .root_pid,
             None
         );
+    }
+
+    #[test]
+    fn reused_pane_id_with_missing_tags_is_never_rebound_from_saved_state() {
+        let (_root, pika) = test_pika();
+        let identity = "44444444-4444-4444-8444-444444444444";
+        let mut session = test_session(identity);
+        session.tmux_session = Some("old-server".into());
+        session.tmux_pane = Some("%1".into());
+        pika.store.upsert_session(&session, false).unwrap();
+        let mut replacement = tagged_pane(identity);
+        replacement.session_name = "unrelated-after-restart".into();
+        replacement.pika_provider = None;
+        replacement.pika_session_id = None;
+        let processes = BTreeMap::from([
+            (1, record(1, None, 100, &["zsh"])),
+            (2, record(2, Some(1), 200, &["codex", "resume", identity])),
+        ]);
+
+        pika.reconcile_one(&mut session, &[replacement], &processes)
+            .unwrap();
+        assert_eq!(session.home_state, "outside");
+        assert_eq!(session.tmux_pane, None);
+        assert_eq!(session.tmux_session, None);
+        let stored = pika
+            .store
+            .get_session(Provider::Codex, identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.tmux_pane, None);
+        assert_eq!(stored.tmux_session, None);
+    }
+
+    #[test]
+    fn reused_pane_id_with_wrong_tags_is_not_touched_or_treated_as_home() {
+        let (_root, pika) = test_pika();
+        let identity = "55555555-5555-4555-8555-555555555555";
+        let mut session = test_session(identity);
+        session.tmux_pane = Some("%1".into());
+        pika.store.upsert_session(&session, false).unwrap();
+        let mut replacement = tagged_pane("66666666-6666-4666-8666-666666666666");
+        replacement.pika_name = Some("someone_else".into());
+        let processes = BTreeMap::from([
+            (1, record(1, None, 100, &["zsh"])),
+            (2, record(2, Some(1), 200, &["codex", "resume", identity])),
+        ]);
+
+        pika.reconcile_one(&mut session, &[replacement], &processes)
+            .unwrap();
+        assert_eq!(session.home_state, "outside");
+        assert_eq!(session.tmux_pane, None);
+        assert_eq!(session.root_pid, Some(2));
+    }
+
+    #[test]
+    fn partial_process_observation_cannot_clear_state_or_start_a_provider() {
+        let (_root, mut pika) = test_pika();
+        let identity = "77777777-7777-4777-8777-777777777777";
+        let mut session = test_session(identity);
+        session.tmux_session = Some("pika-c-existing".into());
+        session.tmux_pane = Some("%9".into());
+        session.root_pid = Some(900);
+        pika.store.upsert_session(&session, false).unwrap();
+        pika.process_observer = Arc::new(|| {
+            ProcessObservation::partial(BTreeMap::new(), vec!["PID 900: permission denied".into()])
+        });
+
+        let error = pika.reconcile_local().unwrap_err().to_string();
+        assert!(error.contains("process identity observation was partial"));
+        let unchanged = pika
+            .store
+            .get_session(Provider::Codex, identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.tmux_pane.as_deref(), Some("%9"));
+        assert_eq!(unchanged.root_pid, Some(900));
+        assert!(pika.open_session(unchanged, false).is_err());
+        assert!(pika.store.list_pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_enumeration_blocks_new_launch_then_a_complete_scan_recovers() {
+        let (_root, mut pika) = test_pika();
+        pika.process_observer = Arc::new(|| ProcessObservation::error("enumeration denied"));
+        let error = pika
+            .new_session("blocked_new", Provider::Codex, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("process identity could not be observed"));
+        assert!(pika.store.list_pending().unwrap().is_empty());
+
+        pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
+        pika.tmux = Tmux::with_executable("/usr/bin/false", None);
+        // Recovery reaches the next independent precondition instead of
+        // retaining a sticky observation failure.
+        let error = pika
+            .new_session("blocked_new", Provider::Codex, false)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("process identity could not be observed"));
     }
 }
