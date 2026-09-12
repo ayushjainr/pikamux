@@ -402,7 +402,7 @@ fn unmodified_v050a4_accepts_the_schema_one_bridge_manifest() {
         .to_string(),
     )
     .unwrap();
-    let reference = Path::new(env!("CARGO_MANIFEST_DIR")).join("reference/python/src");
+    let reference = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python-v0.5.0a4");
     let output = Command::new("python3")
         .args([
             "-c",
@@ -468,6 +468,9 @@ fn public_offline_update_checks_then_installs_without_python() {
     .unwrap();
     let executable = installed.release_dir.join("bin/pika");
     let bundle = release_bundle(temp.path(), "0.6.0-alpha.2");
+    let archive = bundle.join(artifact_name("0.6.0-alpha.2", target).unwrap());
+    let held_archive = bundle.join("artifact-held-during-metadata-check");
+    fs::rename(&archive, &held_archive).unwrap();
 
     let checked = update_managed(UpdateRequest {
         executable: &executable,
@@ -481,6 +484,7 @@ fn public_offline_update_checks_then_installs_without_python() {
         root.join("current").canonicalize().unwrap(),
         installed.release_dir
     );
+    fs::rename(held_archive, archive).unwrap();
 
     let updated = update_managed(UpdateRequest {
         executable: &executable,

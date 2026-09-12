@@ -582,6 +582,11 @@ pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
             ));
         }
         let artifact = manifest.artifact_for(target)?;
+        if let Some(outcome) =
+            metadata_update_outcome(&managed, &manifest, artifact, request.check)?
+        {
+            return Ok(outcome);
+        }
         let source_path = bundle.join(&artifact.file);
         let sidecar_path = bundle.join(format!("{}.sha256", artifact.file));
         let source = checked_regular_file(&source_path)?;
@@ -627,6 +632,11 @@ pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
             ));
         }
         let artifact = manifest.artifact_for(target)?;
+        if let Some(outcome) =
+            metadata_update_outcome(&managed, &manifest, artifact, request.check)?
+        {
+            return Ok(outcome);
+        }
         let artifact_path = scratch.path.join(&artifact.file);
         download(
             &format!("{base}/{}", artifact.file),
@@ -645,32 +655,6 @@ pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
         verify_artifact(&artifact_path, artifact)?;
         (manifest, artifact_path)
     };
-
-    match compare_versions(&manifest.version, &managed.version)? {
-        Ordering::Less => {
-            return Err(UpdateError::Safety(
-                "refusing a release downgrade; nothing activated".into(),
-            ));
-        }
-        Ordering::Equal => {
-            let artifact = manifest.artifact_for(target)?;
-            if managed.sha256 != artifact.sha256 {
-                return Err(UpdateError::Safety(
-                    "same version has different package bytes; publish a new version".into(),
-                ));
-            }
-            return Ok(already_current(&managed));
-        }
-        Ordering::Greater => {}
-    }
-    if request.check {
-        return Ok(UpdateOutcome {
-            disposition: UpdateDisposition::Available,
-            previous_version: managed.version,
-            version: manifest.version,
-            launcher: managed.bin_dir.join("pika"),
-        });
-    }
 
     let candidate_dir = scratch.path.join("candidate");
     fs::create_dir(&candidate_dir)?;
@@ -694,6 +678,34 @@ pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
         version: manifest.version,
         launcher: outcome.launcher,
     })
+}
+
+fn metadata_update_outcome(
+    managed: &ManagedInstallation,
+    manifest: &ReleaseManifest,
+    artifact: &ReleaseArtifact,
+    check: bool,
+) -> Result<Option<UpdateOutcome>> {
+    match compare_versions(&manifest.version, &managed.version)? {
+        Ordering::Less => Err(UpdateError::Safety(
+            "refusing a release downgrade; nothing activated".into(),
+        )),
+        Ordering::Equal => {
+            if managed.sha256 != artifact.sha256 {
+                return Err(UpdateError::Safety(
+                    "same version has different package bytes; publish a new version".into(),
+                ));
+            }
+            Ok(Some(already_current(managed)))
+        }
+        Ordering::Greater if check => Ok(Some(UpdateOutcome {
+            disposition: UpdateDisposition::Available,
+            previous_version: managed.version.clone(),
+            version: manifest.version.clone(),
+            launcher: managed.bin_dir.join("pika"),
+        })),
+        Ordering::Greater => Ok(None),
+    }
 }
 
 #[cfg(not(unix))]

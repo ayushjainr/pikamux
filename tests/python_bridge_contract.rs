@@ -241,7 +241,7 @@ fn unmodified_v050a4_updater_installs_bridge_then_first_use_execs_native() {
         String::from_utf8_lossy(&created.stderr)
     );
     copy_tree(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("reference/python/src/pikamux"),
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python-v0.5.0a4/pikamux"),
         &python_site(&old).join("pikamux"),
     );
     executable(

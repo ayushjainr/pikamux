@@ -34,6 +34,11 @@ fi
 
 pika_parent=$(dirname "$pika_output")
 mkdir -p "$pika_parent"
+# Archive commands may change directory while assembling a target. Resolve the
+# stage and final output once so relative CI output paths cannot be reinterpreted
+# from inside a payload directory (notably the Windows zip branch).
+pika_parent=$(cd "$pika_parent" && pwd -P)
+pika_output="$pika_parent/$(basename "$pika_output")"
 pika_stage=$(mktemp -d "$pika_parent/.pika-release.XXXXXXXX")
 cleanup() {
     local pika_status=$?
