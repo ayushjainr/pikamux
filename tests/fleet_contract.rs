@@ -52,7 +52,9 @@ fn session(provider: Provider, id: &str, name: &str) -> Session {
         last_activity_at: 9.0,
         live: true,
         attached: false,
-        home_state: "exact-live".to_owned(),
+        // This is the canonical value emitted by native core reconciliation;
+        // `session_to_wire` translates it to the protocol's exact_home bit.
+        home_state: "exact".to_owned(),
         cpu_percent: Some(0.5),
         rss_kb: Some(1024),
         input_tokens: None,
@@ -204,8 +206,9 @@ fn ssh_config_discovery_is_file_only_and_configured_hosts_rank_first() {
 
 #[test]
 fn wire_never_exports_transcript_tmux_or_process_identity() {
-    let encoded =
-        session_to_wire(&session(Provider::Codex, "thread-id", "work"), false).to_string();
+    let wire = session_to_wire(&session(Provider::Codex, "thread-id", "work"), false);
+    assert_eq!(wire["exact_home"], true);
+    let encoded = wire.to_string();
     for secret in ["transcript", "tmux_pane", "tmux_session", "root_pid"] {
         assert!(!encoded.contains(secret), "leaked {secret}");
     }

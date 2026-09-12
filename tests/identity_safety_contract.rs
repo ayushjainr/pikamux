@@ -248,6 +248,52 @@ fn tag_failure_occurs_before_provider_execution_and_keeps_recovery_record() {
 }
 
 #[test]
+fn pane_replacement_between_readback_and_respawn_never_starts_provider() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let socket = format!("pika-respawn-race-{}", uuid::Uuid::new_v4());
+    let _guard = IsolatedTmux(socket.clone());
+    let wrapper = temp.path().join("tmux-replace-before-respawn");
+    executable(
+        &wrapper,
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in *if-shell*respawn-pane*) pane=$(tmux -L '{}' list-panes -a -F '#{{pane_id}}' | head -n 1); tmux -L '{}' respawn-pane -k -t \"$pane\" 'sleep 30';; esac\nexec tmux \"$@\"\n",
+            socket, socket
+        ),
+    );
+    let pika = launch_fixture(&temp, &socket, wrapper);
+    assert!(
+        pika.new_session("respawn_race", Provider::Claude, false)
+            .is_err()
+    );
+    let pending = pika.store.list_pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pika.store
+            .get_launch_phase(&pending[0].launch_token)
+            .unwrap(),
+        Some(LaunchPhase::ProviderStarting)
+    );
+    let panes = Tmux::with_executable("tmux", Some(socket.clone()))
+        .list_panes()
+        .unwrap();
+    assert_eq!(panes.len(), 1);
+    assert_eq!(panes[0].current_command, "sleep");
+    let observed = process::observe();
+    let processes = observed.require_complete("test respawn race").unwrap();
+    assert!(
+        process::process_tree(panes[0].pane_pid, processes)
+            .into_iter()
+            .all(|pid| processes
+                .get(&pid)
+                .and_then(|record| record.provider())
+                .is_none())
+    );
+}
+
+#[test]
 fn post_execution_readback_failure_retains_exact_pending_generation() {
     if Command::new("tmux").arg("-V").output().is_err() {
         return;
@@ -269,7 +315,7 @@ fn post_execution_readback_failure_retains_exact_pending_generation() {
     executable(
         &wrapper,
         &format!(
-            "#!/bin/sh\nmarker={}\nif [ \"$3\" = list-panes ] && [ -f \"$marker\" ]; then exit 45; fi\nif [ \"$3\" = respawn-pane ]; then\n  {} \"$@\"\n  rc=$?\n  : > \"$marker\"\n  exit $rc\nfi\nexec {} \"$@\"\n",
+            "#!/bin/sh\nmarker={}\nif [ \"$3\" = list-panes ] && [ -f \"$marker\" ]; then exit 45; fi\nif [ \"$3\" = if-shell ] && printf '%s' \"$*\" | grep -q 'respawn-pane'; then\n  {} \"$@\"\n  rc=$?\n  : > \"$marker\"\n  exit $rc\nfi\nexec {} \"$@\"\n",
             shell_words::quote(&marker.to_string_lossy()),
             shell_words::quote(&real_tmux),
             shell_words::quote(&real_tmux),

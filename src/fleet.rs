@@ -620,7 +620,7 @@ pub fn session_to_wire(session: &Session, extended: bool) -> Value {
         "attention_reason": session.attention_reason, "created_at": session.created_at,
         "updated_at": session.updated_at, "last_event_at": session.last_event_at,
         "last_activity_at": session.last_activity_at, "live": session.live,
-        "attached": session.attached, "exact_home": session.home_state == "exact-live",
+        "attached": session.attached, "exact_home": session.has_exact_home(),
         "identity_kind": if session.session_id.starts_with("unbound:") { "placeholder" } else { "conversation" },
         "pane_visible": session.tmux_pane.is_some() || session.tmux_session.is_some(),
         "cpu_percent": session.cpu_percent, "rss_kb": session.rss_kb,

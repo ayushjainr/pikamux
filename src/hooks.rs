@@ -842,99 +842,122 @@ pub fn handle_process_exit(
     owner_token_value: Option<&str>,
     observed_at: f64,
 ) -> Result<bool> {
-    let target = if let Some(token) = launch_token {
-        match store.get_launch_binding(token)? {
-            Some((bound_provider, id)) if bound_provider == provider => {
-                store.get_session(provider, &id)?
+    store.reconcile_transaction(|ledger| {
+        let binding = match launch_token {
+            Some(token) => ledger.get_launch_binding(token)?,
+            None => None,
+        };
+        let target_id = binding
+            .filter(|(bound_provider, _)| *bound_provider == provider)
+            .map(|(_, id)| id)
+            .or_else(|| session_id.map(str::to_owned));
+        let Some(target_id) = target_id else {
+            return Ok(false);
+        };
+        let Some(mut target) = ledger.get_session(provider, &target_id)? else {
+            return Ok(false);
+        };
+        if ledger.is_untracked(provider, &target_id)? {
+            if let Some(token) = launch_token {
+                ledger.delete_launch_binding_if(token, provider, &target_id)?;
             }
-            _ => session_id
-                .map(|id| store.get_session(provider, id))
-                .transpose()?
-                .flatten(),
+            return Ok(false);
         }
-    } else {
-        session_id
-            .map(|id| store.get_session(provider, id))
-            .transpose()?
-            .flatten()
-    };
-    let Some(mut target) = target else {
-        return Ok(false);
-    };
-    if store.is_untracked(provider, &target.session_id)? {
+
+        // The random wrapper token names the exact owner generation recorded
+        // by its lifecycle hook. A recovery claim is an alternate authority
+        // only when it is bound to this exact launch. Missing authority means
+        // an obsolete callback: it must not rewrite newer runtime evidence.
+        let owner_token = owner_token_value.unwrap_or("");
+        let owners = ledger.live_owners(provider, &target_id)?;
+        let matching = owners
+            .iter()
+            .filter(|owner| owner.owner_token == owner_token)
+            .cloned()
+            .collect::<Vec<_>>();
+        let recovery = ledger.get_recovery_owner(provider, &target_id)?;
+        let recovery_matches = launch_token.is_some_and(|token| {
+            recovery
+                .as_ref()
+                .is_some_and(|owner| owner.launch_token == token)
+        });
+        if matching.is_empty() && !recovery_matches {
+            return Ok(false);
+        }
+        for owner in &matching {
+            if !ledger.delete_live_owner_generation(owner)? {
+                return Ok(false);
+            }
+        }
+        if recovery_matches {
+            ledger.delete_recovery_owner(provider, &target_id)?;
+        }
         if let Some(token) = launch_token {
-            store.delete_launch_binding(token)?;
+            ledger.delete_launch_binding_if(token, provider, &target_id)?;
         }
-        return Ok(false);
-    }
-    store.delete_live_owner(
-        provider,
-        &target.session_id,
-        None,
-        Some(owner_token_value.unwrap_or("")),
-    )?;
-    store.delete_recovery_owner(provider, &target.session_id)?;
-    if !matches!(code, 0 | 130) {
-        store.record_status_observation(
-            provider,
-            &target.session_id,
-            &StatusObservation {
-                kind: ObservationKind::Runtime,
-                status: Status::Error,
-                unread: true,
-                attention_reason: Some("exited".into()),
-                error: Some(format!("{} exited with status {code}", provider.as_str())),
-                observed_at,
-                source: "process-exit".into(),
+        if !ledger.live_owners(provider, &target_id)?.is_empty() {
+            return Ok(true);
+        }
+
+        if !matches!(code, 0 | 130) {
+            ledger.record_status_observation(
+                provider,
+                &target_id,
+                &StatusObservation {
+                    kind: ObservationKind::Runtime,
+                    status: Status::Error,
+                    unread: true,
+                    attention_reason: Some("exited".into()),
+                    error: Some(format!("{} exited with status {code}", provider.as_str())),
+                    observed_at,
+                    source: "process-exit".into(),
+                },
+            )?;
+        } else if !(target.unread
+            && matches!(
+                target.status,
+                Status::Ready | Status::NeedsYou | Status::Error | Status::OpenTwice
+            ))
+        {
+            ledger.clear_status_observation(provider, &target_id, ObservationKind::Runtime)?;
+            ledger.record_status_observation(
+                provider,
+                &target_id,
+                &StatusObservation {
+                    kind: ObservationKind::Lifecycle,
+                    status: Status::Parked,
+                    unread: false,
+                    attention_reason: None,
+                    error: None,
+                    observed_at,
+                    source: "process-exit".into(),
+                },
+            )?;
+        }
+        let projection = project_status(
+            &ledger.status_observations(provider, &target_id)?,
+            false,
+            "unknown",
+            ProjectionFallback {
+                status: target.status,
+                unread: target.unread,
+                attention_reason: target.attention_reason.as_deref(),
+                error: target.error.as_deref(),
+                observed_at: target.last_event_at,
             },
-        )?;
-    } else if !(target.unread
-        && matches!(
-            target.status,
-            Status::Ready | Status::NeedsYou | Status::Error | Status::OpenTwice
-        ))
-    {
-        store.clear_status_observation(provider, &target.session_id, ObservationKind::Runtime)?;
-        store.record_status_observation(
-            provider,
-            &target.session_id,
-            &StatusObservation {
-                kind: ObservationKind::Lifecycle,
-                status: Status::Parked,
-                unread: false,
-                attention_reason: None,
-                error: None,
-                observed_at,
-                source: "process-exit".into(),
-            },
-        )?;
-    }
-    let projection = project_status(
-        &store.status_observations(provider, &target.session_id)?,
-        false,
-        "unknown",
-        ProjectionFallback {
-            status: target.status,
-            unread: target.unread,
-            attention_reason: target.attention_reason.as_deref(),
-            error: target.error.as_deref(),
-            observed_at: target.last_event_at,
-        },
-    );
-    target.status = projection.status;
-    target.unread = projection.unread;
-    target.attention_reason = projection.attention_reason;
-    target.error = projection.error;
-    target.last_event_at = projection.observed_at;
-    target.root_pid = None;
-    target.updated_at = observed_at;
-    target.last_activity_at = observed_at;
-    store.upsert_session(&target, true)?;
-    store.clear_session_runtime(provider, &target.session_id, observed_at)?;
-    if let Some(token) = launch_token {
-        store.delete_launch_binding(token)?;
-    }
-    Ok(true)
+        );
+        target.status = projection.status;
+        target.unread = projection.unread;
+        target.attention_reason = projection.attention_reason;
+        target.error = projection.error;
+        target.last_event_at = projection.observed_at;
+        target.root_pid = None;
+        target.updated_at = observed_at;
+        target.last_activity_at = observed_at;
+        ledger.upsert_session(&target, true)?;
+        ledger.clear_session_runtime(provider, &target_id, observed_at)?;
+        Ok(true)
+    })
 }
 
 enum LaunchDecision {

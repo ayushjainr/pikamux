@@ -529,6 +529,16 @@ fn process_exit_uses_binding_and_nonzero_status_becomes_actionable() {
     store
         .bind_launch("token", Provider::Codex, "exact")
         .unwrap();
+    store
+        .set_live_owner(&LiveOwner {
+            provider: Provider::Codex,
+            session_id: "exact".into(),
+            pid: 41,
+            start_time: Some(10),
+            owner_token: "client".into(),
+            last_seen: 10.0,
+        })
+        .unwrap();
     assert!(
         handle_process_exit(
             &store,
@@ -548,6 +558,148 @@ fn process_exit_uses_binding_and_nonzero_status_becomes_actionable() {
     assert_eq!((result.status, result.unread), (Status::Error, true));
     assert_eq!(result.attention_reason.as_deref(), Some("exited"));
     assert!(store.get_launch_binding("token").unwrap().is_none());
+}
+
+#[test]
+fn stale_wrapper_cannot_demote_or_unbind_a_replacement_owner() {
+    let (_temp, store) = store();
+    let mut current = session(Provider::Codex, "replacement", Status::Working);
+    current.root_pid = Some(42);
+    current.live = true;
+    store.upsert_session(&current, true).unwrap();
+    store
+        .bind_launch("new-launch", Provider::Codex, "replacement")
+        .unwrap();
+    store
+        .set_live_owner(&LiveOwner {
+            provider: Provider::Codex,
+            session_id: "replacement".into(),
+            pid: 42,
+            start_time: Some(20),
+            owner_token: "new-owner".into(),
+            last_seen: 20.0,
+        })
+        .unwrap();
+
+    assert!(
+        !handle_process_exit(
+            &store,
+            Provider::Codex,
+            0,
+            Some("replacement"),
+            Some("new-launch"),
+            Some("old-owner"),
+            30.0,
+        )
+        .unwrap()
+    );
+    let result = store
+        .get_session(Provider::Codex, "replacement")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status, Status::Working);
+    assert_eq!(result.root_pid, Some(42));
+    assert!(store.get_launch_binding("new-launch").unwrap().is_some());
+    assert_eq!(
+        store
+            .live_owners(Provider::Codex, "replacement")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn one_duplicate_exit_preserves_the_other_generation_and_safety_state() {
+    let (_temp, store) = store();
+    let mut current = session(Provider::Codex, "duplicate-live", Status::OpenTwice);
+    current.root_pid = Some(51);
+    current.live = true;
+    current.unread = true;
+    current.attention_reason = Some("identity".into());
+    store.upsert_session(&current, true).unwrap();
+    for (pid, start_time, token) in [(51, 10, "leaving"), (52, 20, "remaining")] {
+        store
+            .set_live_owner(&LiveOwner {
+                provider: Provider::Codex,
+                session_id: "duplicate-live".into(),
+                pid,
+                start_time: Some(start_time),
+                owner_token: token.into(),
+                last_seen: 20.0,
+            })
+            .unwrap();
+    }
+    assert!(
+        handle_process_exit(
+            &store,
+            Provider::Codex,
+            0,
+            Some("duplicate-live"),
+            None,
+            Some("leaving"),
+            30.0,
+        )
+        .unwrap()
+    );
+    let result = store
+        .get_session(Provider::Codex, "duplicate-live")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status, Status::OpenTwice);
+    assert_eq!(result.root_pid, Some(51));
+    let owners = store
+        .live_owners(Provider::Codex, "duplicate-live")
+        .unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_eq!((owners[0].pid, owners[0].start_time), (52, Some(20)));
+}
+
+#[test]
+fn pid_reuse_does_not_let_an_old_token_clear_the_new_generation() {
+    let (_temp, store) = store();
+    let mut current = session(Provider::Codex, "pid-reuse", Status::Working);
+    current.root_pid = Some(61);
+    current.live = true;
+    store.upsert_session(&current, true).unwrap();
+    for (start_time, token) in [(10, "old"), (20, "new")] {
+        store
+            .set_live_owner(&LiveOwner {
+                provider: Provider::Codex,
+                session_id: "pid-reuse".into(),
+                pid: 61,
+                start_time: Some(start_time),
+                owner_token: token.into(),
+                last_seen: 20.0,
+            })
+            .unwrap();
+    }
+    assert!(
+        handle_process_exit(
+            &store,
+            Provider::Codex,
+            0,
+            Some("pid-reuse"),
+            None,
+            Some("old"),
+            30.0,
+        )
+        .unwrap()
+    );
+    let result = store
+        .get_session(Provider::Codex, "pid-reuse")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (result.status, result.root_pid),
+        (Status::Working, Some(61))
+    );
+    let owners = store.live_owners(Provider::Codex, "pid-reuse").unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_eq!(
+        (owners[0].owner_token.as_str(), owners[0].start_time),
+        ("new", Some(20))
+    );
 }
 
 #[test]

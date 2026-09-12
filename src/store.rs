@@ -2217,6 +2217,25 @@ fn nonzero_or(value: f64, fallback: f64) -> f64 {
 }
 
 impl ReconcileLedger<'_> {
+    pub(crate) fn get_session(
+        &self,
+        provider: Provider,
+        session_id: &str,
+    ) -> Result<Option<Session>> {
+        self.tx
+            .query_row(
+                "SELECT * FROM sessions WHERE provider=? AND session_id=?",
+                params![provider.as_str(), session_id],
+                session_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn is_untracked(&self, provider: Provider, session_id: &str) -> Result<bool> {
+        is_untracked_tx(self.tx, provider, session_id).map_err(Into::into)
+    }
+
     pub(crate) fn upsert_session(&self, session: &Session, preserve_name: bool) -> Result<bool> {
         upsert_session_tx(self.tx, session, preserve_name)
     }
@@ -2333,6 +2352,19 @@ impl ReconcileLedger<'_> {
         )? == 1)
     }
 
+    pub(crate) fn delete_live_owner_generation(&self, owner: &LiveOwner) -> Result<bool> {
+        Ok(self.tx.execute(
+            "DELETE FROM live_owners WHERE provider=? AND session_id=? AND pid=? AND start_time IS ? AND owner_token=?",
+            params![
+                owner.provider.as_str(),
+                owner.session_id,
+                owner.pid,
+                owner.start_time,
+                owner.owner_token
+            ],
+        )? == 1)
+    }
+
     pub(crate) fn get_recovery_owner(
         &self,
         provider: Provider,
@@ -2357,6 +2389,18 @@ impl ReconcileLedger<'_> {
         launch_token: &str,
     ) -> Result<Option<(Provider, String)>> {
         launch_binding_connection(self.tx, launch_token)
+    }
+
+    pub(crate) fn delete_launch_binding_if(
+        &self,
+        launch_token: &str,
+        provider: Provider,
+        session_id: &str,
+    ) -> Result<bool> {
+        Ok(self.tx.execute(
+            "DELETE FROM launch_bindings WHERE launch_token=? AND provider=? AND session_id=?",
+            params![launch_token, provider.as_str(), session_id],
+        )? == 1)
     }
 }
 

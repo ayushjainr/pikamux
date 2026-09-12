@@ -16,7 +16,7 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
@@ -51,7 +51,7 @@ jobs:
             executable: target/x86_64-pc-windows-msvc/release/pika.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.88.0 --profile minimal --target '${{ matrix.target }}'
@@ -84,7 +84,7 @@ jobs:
           $help = (& '${{ matrix.executable }}' --help | Out-String)
           if ($help -notmatch 'Native Windows agent hosting is unsupported') { throw 'missing client-only support boundary' }
           if ($help -match '(?m)^  (list|new|ask|experts|doctor)\s') { throw 'Windows artifact exposed an agent-hosting command' }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binary-${{ matrix.target }}
           path: ${{ matrix.executable }}
@@ -97,8 +97,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: binary-*
           path: binaries
@@ -146,7 +146,7 @@ jobs:
             cat release/SHA256SUMS
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ github.ref_name }}
           path: release/
@@ -159,11 +159,17 @@ jobs:
     environment: release
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-${{ github.ref_name }}
           path: release
+      - name: Attest release provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: 'release/*'
       - name: Publish the exact reviewed assets
         env:
           GH_TOKEN: ${{ github.token }}

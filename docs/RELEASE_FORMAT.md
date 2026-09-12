@@ -135,8 +135,11 @@ arm64 and Linux x86_64.
 `.github/workflows/release.yml` builds macOS and musl Linux binaries on matching
 arm64/x86_64 runners, verifies each natively, assembles one manifest and checksum
 set, then pauses at the protected `release` environment. Publication uploads the
-exact assembled artifact only after that environment's owner approval. Configure
-the GitHub `release` environment with required reviewers before creating a tag.
+exact assembled artifact only after that environment's owner approval. Every
+third-party workflow action is pinned to an immutable commit. GitHub also issues
+build-provenance attestations for the release payload before publication.
+Configure the GitHub `release` environment with required reviewers before
+creating a tag.
 
 Before approval, inspect `SHA256SUMS`, CI results, artifact sizes, benchmark
 evidence and platform smoke results. Checksums detect transfer mismatch; they are

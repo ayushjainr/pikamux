@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -30,6 +30,9 @@ pub const FAST_CODEX_MODEL: &str = "gpt-5.6-luna";
 pub const FAST_CODEX_EFFORT: &str = "medium";
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_STDERR: usize = 64 * 1024;
+const MAX_CODEX_NOTIFICATIONS: usize = 128;
+const MAX_CODEX_NOTIFICATION_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ANSWER_BYTES: usize = 1024 * 1024;
 pub const MAX_QUESTION_BYTES: usize = 64 * 1024;
 
 /// Cooperative cancellation shared by the board and the exact Pika-owned
@@ -708,7 +711,8 @@ struct CodexSide {
     thread_id: String,
     process: JsonChild,
     request_id: u64,
-    notifications: Vec<Value>,
+    notifications: VecDeque<Value>,
+    notification_bytes: usize,
     policy: ConsultationPolicy,
     timeout: Duration,
     cancellation: CancellationToken,
@@ -731,7 +735,8 @@ impl CodexSide {
             thread_id: String::new(),
             process,
             request_id: 0,
-            notifications: Vec::new(),
+            notifications: VecDeque::new(),
+            notification_bytes: 0,
             policy: policy.clone(),
             timeout: options.timeout,
             cancellation: options.cancellation.clone(),
@@ -785,6 +790,7 @@ impl CodexSide {
             }
             side.thread_id = id.unwrap_or_default().to_owned();
             side.notifications.clear();
+            side.notification_bytes = 0;
             Ok(())
         })();
         if let Err(error) = opened {
@@ -832,13 +838,37 @@ impl CodexSide {
                     &self.cancellation,
                 )?;
             } else if message.get("method").is_some() {
-                self.notifications.push(message);
+                self.retain_notification(message)?;
             }
         }
     }
 
+    fn retain_notification(&mut self, message: Value) -> Result<()> {
+        let bytes = serde_json::to_vec(&message)?.len();
+        if self.notifications.len() >= MAX_CODEX_NOTIFICATIONS
+            || bytes > MAX_CODEX_NOTIFICATION_BYTES
+            || self.notification_bytes.saturating_add(bytes) > MAX_CODEX_NOTIFICATION_BYTES
+        {
+            bail!(
+                "Codex side notification backlog exceeded its 2 MiB/128-message limit; delivery state is preserved and the side will be cleaned up"
+            );
+        }
+        self.notification_bytes += bytes;
+        self.notifications.push_back(message);
+        Ok(())
+    }
+
+    fn pop_notification(&mut self) -> Option<Value> {
+        let value = self.notifications.pop_front()?;
+        self.notification_bytes = self
+            .notification_bytes
+            .saturating_sub(serde_json::to_vec(&value).map_or(0, |bytes| bytes.len()));
+        Some(value)
+    }
+
     fn ask(&mut self, question: &str, delivery: &mut Delivery) -> Result<String, SideFailure> {
         self.notifications.clear();
+        self.notification_bytes = 0;
         let mut params = json!({
             "threadId": self.thread_id,
             "input": [{"type":"text","text":question}],
@@ -868,10 +898,10 @@ impl CodexSide {
         let mut final_text = String::new();
         let mut deltas = String::new();
         loop {
-            let message = if self.notifications.is_empty() {
-                self.process.receive(deadline, &self.cancellation)
+            let message = if let Some(message) = self.pop_notification() {
+                Ok(message)
             } else {
-                Ok(self.notifications.remove(0))
+                self.process.receive(deadline, &self.cancellation)
             }
             .map_err(|error| SideFailure::turn(error, *delivery))?;
             if message.get("id").is_some() && message.get("method").is_some() {
@@ -898,7 +928,11 @@ impl CodexSide {
                 Some("item/agentMessage/delta")
                     if params.get("turnId").and_then(Value::as_str) == Some(&turn_id) =>
                 {
-                    deltas.push_str(params.get("delta").and_then(Value::as_str).unwrap_or(""));
+                    append_answer(
+                        &mut deltas,
+                        params.get("delta").and_then(Value::as_str).unwrap_or(""),
+                    )
+                    .map_err(|error| SideFailure::turn(error, *delivery))?;
                 }
                 Some("item/completed")
                     if params.get("turnId").and_then(Value::as_str) == Some(&turn_id) =>
@@ -913,6 +947,12 @@ impl CodexSide {
                             .and_then(|value| value.get("text"))
                             .and_then(Value::as_str)
                         {
+                            if text.len() > MAX_ANSWER_BYTES {
+                                return Err(SideFailure::turn(
+                                    "Codex side answer exceeded the 1 MiB retention limit; partial answer withheld",
+                                    *delivery,
+                                ));
+                            }
                             final_text = text.to_owned();
                         }
                         let phase = item
@@ -982,6 +1022,14 @@ impl CodexSide {
         self.thread_id.clear();
         Ok(())
     }
+}
+
+fn append_answer(target: &mut String, delta: &str) -> Result<()> {
+    if target.len().saturating_add(delta.len()) > MAX_ANSWER_BYTES {
+        bail!("Codex side answer exceeded the 1 MiB retention limit; partial answer withheld");
+    }
+    target.push_str(delta);
+    Ok(())
 }
 
 struct ClaudeSide {
@@ -1991,5 +2039,22 @@ mod tests {
                 .unwrap_err()
                 .contains("16 MiB frame limit")
         );
+    }
+
+    #[test]
+    fn many_small_answer_deltas_have_one_aggregate_limit() {
+        let mut answer = String::new();
+        let delta = "x".repeat(1024);
+        for _ in 0..1024 {
+            append_answer(&mut answer, &delta).unwrap();
+        }
+        assert_eq!(answer.len(), MAX_ANSWER_BYTES);
+        assert!(
+            append_answer(&mut answer, "x")
+                .unwrap_err()
+                .to_string()
+                .contains("1 MiB")
+        );
+        assert_eq!(answer.len(), MAX_ANSWER_BYTES);
     }
 }

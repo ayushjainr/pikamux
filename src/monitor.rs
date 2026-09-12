@@ -15,6 +15,7 @@ use crossterm::{
     },
 };
 use std::{
+    collections::VecDeque,
     io::{self, IsTerminal, Write},
     sync::{
         Arc,
@@ -402,7 +403,9 @@ struct ChatLine {
 struct ChatState {
     name: String,
     input: String,
-    lines: Vec<ChatLine>,
+    lines: VecDeque<ChatLine>,
+    retained_bytes: usize,
+    history_truncated: bool,
     phase: ChatPhase,
     command_sender: Option<mpsc::Sender<ConsultationInput>>,
     event_receiver: Option<Receiver<ConsultationEvent>>,
@@ -425,10 +428,12 @@ impl ChatState {
         Self {
             name,
             input: String::new(),
-            lines: vec![ChatLine {
+            lines: VecDeque::from([ChatLine {
                 role: ChatRole::Pika,
                 text: "Opening a private side conversation…".into(),
-            }],
+            }]),
+            retained_bytes: "Opening a private side conversation…".len(),
+            history_truncated: false,
             phase: ChatPhase::Opening,
             command_sender: Some(command_sender),
             event_receiver: Some(event_receiver),
@@ -445,10 +450,12 @@ impl ChatState {
         Self {
             name,
             input: String::new(),
-            lines: vec![ChatLine {
+            lines: VecDeque::from([ChatLine {
                 role: ChatRole::Pika,
                 text: "Private consultation is unavailable in this board invocation.".into(),
-            }],
+            }]),
+            retained_bytes: "Private consultation is unavailable in this board invocation.".len(),
+            history_truncated: false,
             phase: ChatPhase::Failed,
             command_sender: None,
             event_receiver: None,
@@ -466,10 +473,7 @@ impl ChatState {
         if question.is_empty() || self.phase != ChatPhase::Ready {
             return;
         }
-        self.lines.push(ChatLine {
-            role: ChatRole::You,
-            text: question.clone(),
-        });
+        self.push_line(ChatRole::You, question.clone());
         self.input.clear();
         self.scroll = 0;
         if self
@@ -492,21 +496,43 @@ impl ChatState {
         self.close_requested = true;
         self.cancellation.cancel();
         self.phase = ChatPhase::Closing;
-        self.lines.push(ChatLine {
-            role: ChatRole::Pika,
-            text: "Closing and discarding the private side conversation…".into(),
-        });
+        self.push_line(
+            ChatRole::Pika,
+            "Closing and discarding the private side conversation…".into(),
+        );
         self.command_sender
             .as_ref()
             .is_none_or(|sender| sender.send(ConsultationInput::Close).is_err())
     }
 
     fn fail(&mut self, message: String) {
-        self.lines.push(ChatLine {
-            role: ChatRole::Pika,
-            text: format!("ERROR · {message}"),
-        });
+        self.push_line(ChatRole::Pika, format!("ERROR · {message}"));
         self.phase = ChatPhase::Failed;
+    }
+
+    fn push_line(&mut self, role: ChatRole, text: String) {
+        const MAX_LINE_BYTES: usize = 64 * 1024;
+        const MAX_HISTORY_BYTES: usize = 256 * 1024;
+        const MAX_HISTORY_LINES: usize = 256;
+        let text = if text.len() > MAX_LINE_BYTES {
+            let mut boundary = MAX_LINE_BYTES;
+            while !text.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            format!("{}\n… response truncated by Pika …", &text[..boundary])
+        } else {
+            text
+        };
+        self.retained_bytes = self.retained_bytes.saturating_add(text.len());
+        self.lines.push_back(ChatLine { role, text });
+        while self.lines.len() > MAX_HISTORY_LINES || self.retained_bytes > MAX_HISTORY_BYTES {
+            if let Some(removed) = self.lines.pop_front() {
+                self.retained_bytes = self.retained_bytes.saturating_sub(removed.text.len());
+                self.history_truncated = true;
+            } else {
+                break;
+            }
+        }
     }
 
     fn accept(&mut self, event: ConsultationEvent) {
@@ -517,20 +543,14 @@ impl ChatState {
                 if !self.close_requested {
                     self.phase = ChatPhase::Ready;
                 }
-                self.lines.push(ChatLine {
-                    role: ChatRole::Pika,
-                    text: "Private side ready. The parent conversation remains untouched.".into(),
-                });
+                self.push_line(
+                    ChatRole::Pika,
+                    "Private side ready. The parent conversation remains untouched.".into(),
+                );
             }
-            ConsultationEvent::Progress(message) => self.lines.push(ChatLine {
-                role: ChatRole::Pika,
-                text: message,
-            }),
+            ConsultationEvent::Progress(message) => self.push_line(ChatRole::Pika, message),
             ConsultationEvent::Answer(answer) => {
-                self.lines.push(ChatLine {
-                    role: ChatRole::Expert,
-                    text: answer,
-                });
+                self.push_line(ChatRole::Expert, answer);
                 if !self.close_requested {
                     self.phase = ChatPhase::Ready;
                 }
@@ -539,14 +559,14 @@ impl ChatState {
                 message,
                 retry_safe,
             } => {
-                self.lines.push(ChatLine {
-                    role: ChatRole::Pika,
-                    text: if retry_safe {
+                self.push_line(
+                    ChatRole::Pika,
+                    if retry_safe {
                         format!("NOT SENT · {message} · safe to retry")
                     } else {
                         format!("DELIVERY UNCERTAIN · {message} · do not resend automatically")
                     },
-                });
+                );
                 self.phase = if self.close_requested {
                     ChatPhase::Closing
                 } else if retry_safe {
@@ -562,10 +582,7 @@ impl ChatState {
         match result {
             Ok(outcome) => {
                 if let Some(note) = outcome.note {
-                    self.lines.push(ChatLine {
-                        role: ChatRole::Pika,
-                        text: note,
-                    });
+                    self.push_line(ChatRole::Pika, note);
                 }
                 self.phase = if outcome.discarded {
                     ChatPhase::Closed
@@ -1211,11 +1228,14 @@ impl Board {
             )),
             ResetColor
         )?;
-        let metadata = match (&chat.policy, &chat.child_id) {
+        let mut metadata = match (&chat.policy, &chat.child_id) {
             (Some(policy), Some(child)) => format!("{policy} · child {}", prefix(child, 8)),
             (Some(policy), None) => policy.clone(),
             _ => phase_label(chat.phase).to_owned(),
         };
+        if chat.history_truncated {
+            metadata.push_str(" · earlier lines omitted");
+        }
         queue!(
             output,
             MoveTo(x as u16, 3),
@@ -1758,6 +1778,18 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         assert!(board.chat.is_none());
+    }
+
+    #[test]
+    fn consultation_panel_retains_a_bounded_tail_with_a_visible_receipt() {
+        let mut chat = ChatState::unavailable("bounded".into());
+        for index in 0..1_000 {
+            chat.push_line(ChatRole::Expert, format!("{index}:{}", "x".repeat(1024)));
+        }
+        assert!(chat.lines.len() <= 256);
+        assert!(chat.retained_bytes <= 256 * 1024);
+        assert!(chat.history_truncated);
+        assert!(chat.lines.back().unwrap().text.starts_with("999:"));
     }
 
     fn wait_for_phase(board: &mut Board, phase: ChatPhase) {

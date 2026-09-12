@@ -164,6 +164,13 @@ impl Session {
         self.status == Status::NeedsYou
             || (self.unread && matches!(self.status, Status::Error | Status::OpenTwice))
     }
+
+    /// Native reconciliation uses `exact`; Python fleet peers expose the same
+    /// fact as `exact-live`. Keep the compatibility spelling at the wire edge
+    /// instead of scattering string comparisons through identity code.
+    pub fn has_exact_home(&self) -> bool {
+        matches!(self.home_state.as_str(), "exact" | "exact-live")
+    }
 }
 
 fn prefix(value: &str, chars: usize) -> &str {

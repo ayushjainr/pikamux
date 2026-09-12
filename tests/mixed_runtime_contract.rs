@@ -341,7 +341,7 @@ impl RustService {
             last_activity_at: 4242.0,
             live: true,
             attached: false,
-            home_state: "exact-live".to_owned(),
+            home_state: "exact".to_owned(),
             cpu_percent: Some(0.0),
             rss_kb: Some(1024),
             input_tokens: None,

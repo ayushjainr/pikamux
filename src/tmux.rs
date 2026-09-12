@@ -246,6 +246,42 @@ impl Tmux {
         Ok(())
     }
 
+    pub fn configure_exact_home(&self, pane: &Pane) -> Result<()> {
+        if !is_pika_session(&pane.session_name) {
+            bail!("Pika will not configure a user-owned tmux pane");
+        }
+        let condition = pane_generation_condition(pane);
+        let mutation = [
+            format!(
+                "set-option -t {} status off",
+                shell_words::quote(&pane.session_name)
+            ),
+            format!(
+                "set-option -t {} mouse on",
+                shell_words::quote(&pane.session_name)
+            ),
+            format!(
+                "set-option -w -t {} history-limit {}",
+                shell_words::quote(&pane.pane_id),
+                HISTORY_LIMIT
+            ),
+        ]
+        .join(" ; ");
+        self.output(
+            [
+                "if-shell",
+                "-F",
+                "-t",
+                &pane.pane_id,
+                &condition,
+                &mutation,
+                "run-shell 'exit 75'",
+            ],
+            true,
+        )?;
+        Ok(())
+    }
+
     pub fn ensure_rgb(&self) {
         let current = self.output(["show-options", "-s", "-v", "terminal-features"], false);
         if current.is_ok_and(|output| {
@@ -387,6 +423,59 @@ impl Tmux {
         )
     }
 
+    /// Attach only if the pane still has the exact tmux generation and Pika
+    /// identity that the caller proved. The condition and attach execute in
+    /// one tmux server command queue, closing the check/use gap between a
+    /// client-side read and terminal handoff.
+    pub fn attach_exact_with_started<F>(&self, pane: &Pane, on_started: F) -> Result<i32>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.attach_exact_with_started_mode(pane, std::env::var_os("TMUX").is_some(), on_started)
+    }
+
+    fn attach_exact_with_started_mode<F>(
+        &self,
+        pane: &Pane,
+        inside_tmux: bool,
+        on_started: F,
+    ) -> Result<i32>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.ensure_terminal_reply_guard();
+        self.ensure_rgb();
+        self.configure_exact_home(pane)?;
+        let condition = pane_generation_condition(pane);
+        let attach = if inside_tmux {
+            format!("switch-client -t {}", shell_words::quote(&pane.pane_id))
+        } else {
+            format!("attach-session -t {}", shell_words::quote(&pane.pane_id))
+        };
+        let mut argv = vec![self.executable.clone()];
+        if let Some(socket) = &self.socket_name {
+            argv.extend(["-L".into(), socket.clone()]);
+        }
+        argv.extend([
+            "if-shell".into(),
+            "-F".into(),
+            "-t".into(),
+            pane.pane_id.clone(),
+            condition,
+            attach,
+            "run-shell 'exit 75'".into(),
+        ]);
+        if inside_tmux {
+            let status = Command::new(&argv[0]).args(&argv[1..]).status()?;
+            if status.success() {
+                on_started()?;
+            }
+            Ok(status.code().unwrap_or(1))
+        } else {
+            terminal::run_pty_bridge_with_started(&argv, None, true, on_started)
+        }
+    }
+
     fn attach_with_started_mode<F>(
         &self,
         session: &str,
@@ -460,7 +549,7 @@ impl Tmux {
         launch_token: &str,
     ) -> Result<Pane> {
         let holding = self.create_holding_session(tmux_name, cwd)?;
-        self.configure_home(tmux_name, None)?;
+        self.configure_exact_home(&holding)?;
         self.prepare_agent_pane(&holding, provider, session_id, display_name, launch_token)
     }
 
@@ -512,15 +601,22 @@ impl Tmux {
             session_id,
             Some(launch_token),
         )?;
+        let condition = pane_generation_condition(&reserved);
+        let mutation = format!(
+            "respawn-pane -k -t {} -c {} {}",
+            shell_words::quote(&reserved.pane_id),
+            shell_words::quote(cwd),
+            shell_words::quote(&wrapper),
+        );
         self.output(
             [
-                "respawn-pane",
-                "-k",
+                "if-shell",
+                "-F",
                 "-t",
                 &reserved.pane_id,
-                "-c",
-                cwd,
-                &wrapper,
+                &condition,
+                &mutation,
+                "run-shell 'exit 75'",
             ],
             true,
         )?;
@@ -614,7 +710,7 @@ impl Tmux {
         if !is_pika_session(&pane.session_name) {
             bail!("Pika will not respawn a user-owned tmux pane");
         }
-        self.configure_home(&pane.session_name, Some(&pane.pane_id))?;
+        self.configure_exact_home(pane)?;
         let prepared =
             self.prepare_agent_pane(pane, provider, Some(session_id), display_name, launch_token)?;
         self.start_prepared_agent(
@@ -851,6 +947,103 @@ mod tests {
             Tmux::internal_name(Provider::Codex, "abcd-efgh-ijkl"),
             "pika-c-abcdefghij"
         );
+    }
+
+    fn exact_test_pane() -> Pane {
+        parse_pane(
+            &[
+                "pika-c-workstream",
+                "%1",
+                "42",
+                "/tmp",
+                "codex",
+                "0",
+                "1",
+                "1",
+                "0",
+                "",
+                "10",
+                "9",
+                "codex",
+                "11111111-1111-4111-8111-111111111111",
+                "workstream",
+                "launch-token",
+            ]
+            .join(SEPARATOR),
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_home_configuration_is_one_generation_guarded_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("tmux-fixture");
+        let trace = temp.path().join("trace");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+                shell_words::quote(&trace.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let tmux = Tmux::with_executable(executable.to_string_lossy(), None);
+        tmux.configure_exact_home(&exact_test_pane()).unwrap();
+        let calls = fs::read_to_string(trace).unwrap();
+        assert_eq!(calls.lines().count(), 1);
+        assert!(calls.contains("if-shell -F -t %1"));
+        assert!(calls.contains("#{@pika_session_id}"));
+        assert!(calls.contains("set-option -t pika-c-workstream status off"));
+        assert!(calls.contains("set-option -w -t"));
+        assert!(calls.contains("history-limit 100000"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_attach_rejects_a_generation_change_before_handoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("tmux-fixture");
+        fs::write(
+            &executable,
+            "#!/bin/sh\ncase \"$*\" in *if-shell*attach-session*) exit 75;; *) exit 0;; esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let tmux = Tmux::with_executable(executable.to_string_lossy(), None);
+        let mut started = false;
+        let code = tmux
+            .attach_exact_with_started_mode(&exact_test_pane(), false, || {
+                started = true;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(code, 75);
+        assert!(!started);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_attach_records_only_after_the_server_accepts_the_exact_pane() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("tmux-fixture");
+        fs::write(
+            &executable,
+            "#!/bin/sh\ncase \"$*\" in *if-shell*attach-session*) sleep 0.25; exit 130;; *) exit 0;; esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let tmux = Tmux::with_executable(executable.to_string_lossy(), None);
+        let mut started = false;
+        let code = tmux
+            .attach_exact_with_started_mode(&exact_test_pane(), false, || {
+                started = true;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(code, 130);
+        assert!(started);
     }
 
     #[cfg(unix)]

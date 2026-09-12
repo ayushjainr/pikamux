@@ -577,7 +577,7 @@ impl Pika {
                 active_thread_id: session.active_thread_id.clone(),
                 name: session.name.clone(),
                 live: session.live,
-                exact_home: session.home_state == "exact",
+                exact_home: session.has_exact_home(),
                 status: session.status,
                 local: true,
                 evidence: SelectionEvidence {
@@ -719,6 +719,16 @@ impl Pika {
         self.tmux.clear_tags_if_unchanged(&binding.pane)
     }
 
+    fn confirm_exact_handoff(&self, session: &Session, expected: &ExactPaneBinding) -> Result<()> {
+        let current = self.exact_pane_binding(session, Some(&expected.pane.pane_id))?;
+        if !same_exact_binding(expected, &current) {
+            bail!(
+                "exact conversation ownership changed during terminal handoff; Pika detached without acknowledging it"
+            );
+        }
+        Ok(())
+    }
+
     pub fn open_name(&self, query: &str, attach: bool, allow_create: bool) -> Result<OpenReceipt> {
         self.store.initialize()?;
         self.reconcile_local()
@@ -759,21 +769,14 @@ impl Pika {
             ))
             .into());
         }
-        if session.home_state == "exact" {
+        if session.has_exact_home() {
             let binding = self.exact_pane_binding(&session, session.tmux_pane.as_deref())?;
             let event = session.last_event_at;
             let code = if attach {
-                self.tmux.attach_with_started(
-                    &binding.pane.session_name,
-                    Some(&binding.pane.pane_id),
-                    || {
-                        open_history::record_session(
-                            &self.store,
-                            session.provider,
-                            &session.session_id,
-                        )
-                    },
-                )?
+                self.tmux.attach_exact_with_started(&binding.pane, || {
+                    self.confirm_exact_handoff(&session, &binding)?;
+                    open_history::record_session(&self.store, session.provider, &session.session_id)
+                })?
             } else {
                 0
             };
@@ -949,10 +952,9 @@ impl Pika {
             bail!("Pika refused a pending home whose exact launch identity changed")
         }
         let code = if attach {
-            self.tmux
-                .attach_with_started(&pane.session_name, Some(&pane.pane_id), || {
-                    open_history::record_pending(&self.store, &pending)
-                })?
+            self.tmux.attach_exact_with_started(&pane, || {
+                open_history::record_pending(&self.store, &pending)
+            })?
         } else {
             0
         };
@@ -1042,17 +1044,14 @@ impl Pika {
                 let binding = self.exact_pane_binding(&session, None)?;
                 self.store.delete_pending(&token)?;
                 let code = if attach {
-                    self.tmux.attach_with_started(
-                        &binding.pane.session_name,
-                        Some(&binding.pane.pane_id),
-                        || {
-                            open_history::record_session(
-                                &self.store,
-                                session.provider,
-                                &session.session_id,
-                            )
-                        },
-                    )?
+                    self.tmux.attach_exact_with_started(&binding.pane, || {
+                        self.confirm_exact_handoff(&session, &binding)?;
+                        open_history::record_session(
+                            &self.store,
+                            session.provider,
+                            &session.session_id,
+                        )
+                    })?
                 } else {
                     0
                 };
@@ -1071,18 +1070,12 @@ impl Pika {
                 &session.display_name(),
             );
             let cwd = existing_cwd(session.cwd.as_deref())?;
-            let reusable = panes.iter().find(|pane| {
-                pane.session_name == tmux_name
-                    && pane.pika_provider == Some(session.provider)
-                    && pane.pika_session_id.as_deref() == Some(&session.session_id)
-            });
-            let (allocated, new_holder) = if let Some(existing) = reusable {
-                require_idle_pane(existing, processes, false)?;
-                ((*existing).clone(), false)
-            } else {
-                let free_name = free_tmux_name(&tmux_name, &panes);
-                (self.tmux.create_holding_session(&free_name, cwd)?, true)
-            };
+            // Never destructively reuse a pane that has been exposed outside
+            // this launch. A fresh private holder makes `respawn-pane -k`
+            // retire only Pika's own inert process; stale tagged panes remain
+            // recoverable evidence until reconciliation clears them safely.
+            let free_name = free_tmux_name(&tmux_name, &panes);
+            let allocated = self.tmux.create_holding_session(&free_name, cwd)?;
             self.store.finalize_pending_pane(
                 &token,
                 &allocated.session_name,
@@ -1091,8 +1084,7 @@ impl Pika {
                 process::process_start_time(allocated.pane_pid)
                     .and_then(|value| i64::try_from(value).ok()),
             )?;
-            self.tmux
-                .configure_home(&allocated.session_name, Some(&allocated.pane_id))?;
+            self.tmux.configure_exact_home(&allocated)?;
             let prepared = self.tmux.prepare_agent_pane(
                 &allocated,
                 session.provider,
@@ -1139,7 +1131,7 @@ impl Pika {
                         .join(", ")
                 )
             }
-            require_idle_pane(&prepared, ready_processes, new_holder)?;
+            require_idle_pane(&prepared, ready_processes, true)?;
             let pane = self.tmux.start_prepared_agent(
                 &prepared,
                 cwd,
@@ -1175,14 +1167,10 @@ impl Pika {
                 bail!("the launched provider generation could not be certified")
             }
             let code = if attach {
-                self.tmux
-                    .attach_with_started(&pane.session_name, Some(&pane.pane_id), || {
-                        open_history::record_session(
-                            &self.store,
-                            session.provider,
-                            &session.session_id,
-                        )
-                    })?
+                self.tmux.attach_exact_with_started(&binding.pane, || {
+                    self.confirm_exact_handoff(&session, &binding)?;
+                    open_history::record_session(&self.store, session.provider, &session.session_id)
+                })?
             } else {
                 0
             };
@@ -1261,8 +1249,7 @@ impl Pika {
                 process::process_start_time(allocated.pane_pid)
                     .and_then(|value| i64::try_from(value).ok()),
             )?;
-            self.tmux
-                .configure_home(&allocated.session_name, Some(&allocated.pane_id))?;
+            self.tmux.configure_exact_home(&allocated)?;
             let prepared = self.tmux.prepare_agent_pane(
                 &allocated,
                 provider,
@@ -1378,10 +1365,9 @@ impl Pika {
                     ..pending.clone()
                 });
             let code = if attach {
-                self.tmux
-                    .attach_with_started(&pane.session_name, Some(&pane.pane_id), || {
-                        open_history::record_pending(&self.store, &current)
-                    })?
+                self.tmux.attach_exact_with_started(&pane, || {
+                    open_history::record_pending(&self.store, &current)
+                })?
             } else {
                 0
             };

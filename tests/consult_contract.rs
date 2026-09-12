@@ -88,6 +88,13 @@ while IFS= read -r line; do
     *'"method":"turn/start"'*)
       turn=$((turn + 1))
       if [ "$mode" = unknown ]; then exit 9; fi
+      if [ "$mode" = notification-flood ]; then
+        index=0
+        while [ "$index" -lt 129 ]; do
+          printf '{{"method":"noise","params":{{"index":%s}}}}\n' "$index"
+          index=$((index + 1))
+        done
+      fi
       printf '{{"id":%s,"result":{{"turn":{{"id":"turn-%s"}}}}}}\n' "$id" "$turn"
       if [ "$mode" != timeout ]; then
         printf '{{"method":"item/completed","params":{{"threadId":"side-id","turnId":"turn-%s","item":{{"type":"agentMessage","phase":"final_answer","text":"answer-%s"}}}}}}\n' "$turn" "$turn"
@@ -199,6 +206,31 @@ fn codex_reports_confirmed_delivery_when_response_times_out() {
     assert_eq!(error.receipt.delivery, Delivery::Confirmed);
     assert!(!error.receipt.retry_safe);
     side.close().unwrap();
+}
+
+#[test]
+fn codex_notification_flood_is_bounded_before_turn_delivery_is_confirmed() {
+    let root = tempfile::tempdir().unwrap();
+    let (executable, log) = codex_fixture(&root, "notification-flood");
+    let mut options = ConsultationOptions::new(executable);
+    options.timeout = Duration::from_secs(2);
+    let mut side = Consultation::open(
+        &session(Provider::Codex, "stable-workstream", root.path()),
+        options,
+    )
+    .unwrap();
+    let error = side.ask("bounded").unwrap_err();
+    assert!(error.to_string().contains("notification backlog"));
+    assert_eq!(error.receipt.delivery, Delivery::Unknown);
+    assert!(!error.receipt.retry_safe);
+    side.close().unwrap();
+    assert_eq!(
+        fs::read_to_string(log)
+            .unwrap()
+            .matches("\"method\":\"turn/start\"")
+            .count(),
+        1
+    );
 }
 
 #[test]

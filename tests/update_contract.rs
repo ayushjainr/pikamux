@@ -1038,3 +1038,34 @@ fn ssh_remote_target_probe_is_fixed_bounded_and_platform_mapped() {
         "incompatible"
     );
 }
+
+#[test]
+fn ci_actions_are_immutable_and_release_bytes_are_attested() {
+    let workflows = [
+        include_str!("../.github/workflows/ci.yml"),
+        include_str!("../.github/workflows/release.yml"),
+    ];
+    let mut actions = 0;
+    for line in workflows
+        .iter()
+        .flat_map(|workflow| workflow.lines())
+        .filter(|line| line.contains("uses: actions/"))
+    {
+        actions += 1;
+        let revision = line
+            .split_once('@')
+            .map(|(_, value)| value.split_whitespace().next().unwrap_or_default())
+            .unwrap_or_default();
+        assert_eq!(revision.len(), 40, "mutable action reference: {line}");
+        assert!(
+            revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "non-SHA action reference: {line}"
+        );
+    }
+    assert!(actions >= 10);
+    let release = workflows[1];
+    assert!(release.contains("actions/attest-build-provenance@"));
+    assert!(release.contains("subject-path: 'release/*'"));
+    assert!(release.contains("id-token: write"));
+    assert!(release.contains("attestations: write"));
+}
