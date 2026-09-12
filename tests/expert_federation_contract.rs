@@ -3,8 +3,9 @@
 use assert_cmd::Command;
 use pikamux::experts::{CardStatus, SourceAvailability, local_source_availability};
 use pikamux::fleet::{
-    CAPABILITIES, ConsultationPolicy, FleetErrorKind, FleetManager, FleetSession, PROTOCOL_NAME,
-    PROTOCOL_VERSION, RemoteConsultation, SshTransport, session_to_wire,
+    CAPABILITIES, ConsultationPolicy, FleetErrorKind, FleetManager, FleetSession,
+    MAX_CACHED_FLEET_ROWS, PROTOCOL_NAME, PROTOCOL_VERSION, RemoteConsultation, SshTransport,
+    session_to_wire,
 };
 use pikamux::model::{ExpertProfile, FleetNode, Provider, Session, Status};
 use pikamux::paths::Paths;
@@ -250,6 +251,62 @@ fn equal_provider_uuid_on_two_nodes_stays_distinct_and_stale_truth_is_preserved(
 }
 
 #[test]
+fn twenty_node_expert_search_ranks_experts_before_ordinary_board_slices() {
+    let root = TempDir::new().unwrap();
+    let store = Store::at(root.path().join("pika.db"));
+    store.initialize().unwrap();
+    let ordinary_per_node = MAX_CACHED_FLEET_ROWS / 20;
+    for node_index in 0..20 {
+        let node_id = Uuid::new_v4().to_string();
+        let alias = format!("node-{node_index:02}");
+        store.upsert_fleet_node(&node(&node_id, &alias)).unwrap();
+        let ordinary = (0..ordinary_per_node)
+            .map(|row_index| {
+                let sequence = node_index * ordinary_per_node + row_index;
+                let session_id = format!("00000000-0000-4000-8000-{sequence:012x}");
+                session_to_wire(&session(&session_id, "ordinary", None), false)
+            })
+            .collect::<Vec<_>>();
+        let expert_id = format!("ffffffff-ffff-4fff-8fff-{node_index:012x}");
+        let expert = session(&expert_id, &format!("needle_{node_index}"), None);
+        let payload = json!({
+            "type":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+            "node_id":node_id, "machine":alias, "captured_at":now(),
+            "sessions":ordinary,
+            "expert_sessions":[session_to_wire(&expert, true)],
+            "profiles":[{
+                "provider":"codex", "session_id":expert_id,
+                "scope":"Owns needle infrastructure", "current_state":"shipping",
+                "topics":["needle"], "artifacts":[], "updated_at":10.0,
+                "source":"interview", "scope_updated_at":10.0,
+                "current_state_updated_at":10.0
+            }],
+            "cards":[{
+                "provider":"codex", "session_id":expert_id,
+                "status":"CURRENT", "detail":"matches remote source",
+                "watched":false, "availability":"source-available",
+                "current_state_status":"CURRENT"
+            }]
+        });
+        store
+            .put_remote_snapshot(&node_id, &payload, now())
+            .unwrap();
+    }
+
+    let directory = FleetManager::new(&store, SshTransport::default())
+        .expert_directory("needle")
+        .unwrap();
+    assert_eq!(directory.matches.len(), 20);
+    assert!(directory.notices.is_empty());
+    assert!(directory.matches.iter().all(|found| {
+        found
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("needle_"))
+    }));
+}
+
+#[test]
 fn experts_cli_merges_local_and_cached_remote_with_exact_json_and_no_ssh() {
     let root = TempDir::new().unwrap();
     let paths = isolated_paths(root.path());
@@ -284,6 +341,10 @@ fn experts_cli_merges_local_and_cached_remote_with_exact_json_and_no_ssh() {
     for collection in ["expert_sessions", "profiles", "cards"] {
         remote_snapshot[collection][0]["session_id"] = json!(remote_thread);
     }
+    remote_snapshot["directory_notices"] = json!([{
+        "kind":"expert-directory-incomplete", "omitted_rows":2,
+        "message":"2 expert cards omitted by the remote snapshot safety budget"
+    }]);
     store.upsert_fleet_node(&node(&remote_id, "atlas")).unwrap();
     store
         .put_remote_snapshot(&remote_id, &remote_snapshot, now())
@@ -380,6 +441,26 @@ fn experts_cli_merges_local_and_cached_remote_with_exact_json_and_no_ssh() {
             .collect::<BTreeSet<_>>(),
         expected_remote
     );
+
+    let notice_output = command(root.path(), &marker)
+        .args(["experts", "pricing", "--json", "--with-notices"])
+        .output()
+        .unwrap();
+    assert!(notice_output.status.success());
+    let notice_payload: Value = serde_json::from_slice(&notice_output.stdout).unwrap();
+    assert_eq!(notice_payload["directory_complete"], false);
+    assert_eq!(notice_payload["notices"][0]["node_name"], "atlas");
+    assert_eq!(notice_payload["notices"][0]["omitted_rows"], 2);
+    assert_eq!(notice_payload["experts"].as_array().unwrap().len(), 2);
+
+    let text_output = command(root.path(), &marker)
+        .args(["experts", "pricing"])
+        .output()
+        .unwrap();
+    assert!(text_output.status.success());
+    let text = String::from_utf8_lossy(&text_output.stdout);
+    assert!(text.contains("Expert directory incomplete:"));
+    assert!(text.contains("atlas · 2 expert cards omitted"));
 }
 
 #[test]

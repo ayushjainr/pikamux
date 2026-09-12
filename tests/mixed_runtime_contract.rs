@@ -357,7 +357,11 @@ impl FleetService for RustService {
             "node_id":"22222222-2222-4222-8222-222222222222",
             "machine":"rust-node", "captured_at":now(),
             "sessions": if self.tracked { vec![session_to_wire(&Self::session(), false)] } else { vec![] },
-            "profiles":[], "cards":[]
+            "profiles":[], "cards":[],
+            "directory_notices":[{
+                "kind":"expert-directory-incomplete", "omitted_rows":1,
+                "message":"one bounded fixture expert was omitted"
+            }]
         }))
     }
 
@@ -395,6 +399,52 @@ impl FleetService for RustService {
         self.tracked = false;
         Ok((2, true))
     }
+}
+
+#[test]
+fn rust_server_emits_directory_notices_only_when_the_client_negotiates_them() {
+    let lab = PythonLab::new();
+    let store = Store::at(lab.database("notice-server.db"));
+    store.initialize().unwrap();
+    store
+        .set_meta("fleet:node_id", "22222222-2222-4222-8222-222222222222")
+        .unwrap();
+    let node_id = store.ensure_local_node_id().unwrap();
+    let requests = [
+        json!({"op":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "expert_directory":true}),
+        json!({"op":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "expert_directory":true, "directory_notices":true}),
+    ];
+    let input = requests
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let mut output = Vec::new();
+    let mut service = RustService {
+        tracked: true,
+        acknowledgements: 0,
+    };
+    handle_fleet_stdio(
+        &store,
+        "rust-node",
+        env!("CARGO_PKG_VERSION"),
+        &mut service,
+        Cursor::new(input),
+        &mut output,
+    )
+    .unwrap();
+    let responses = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 2);
+    assert!(responses[0].get("directory_notices").is_none());
+    assert_eq!(
+        responses[1]["directory_notices"][0]["kind"],
+        "expert-directory-incomplete"
+    );
 }
 
 #[test]

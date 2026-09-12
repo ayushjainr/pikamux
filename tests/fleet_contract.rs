@@ -3,8 +3,8 @@ use pikamux::fleet::{
     CAPABILITIES, ConsultationPolicy, ConsultationTimeouts, FleetError, FleetErrorKind,
     FleetManager, FleetService, FleetSession, FleetTransport, MAX_CACHED_FLEET_ROWS,
     MAX_SNAPSHOT_SESSIONS, NodeCandidate, PROTOCOL_NAME, PROTOCOL_VERSION, RemoteConsultation,
-    SshTransport, discover_node_candidates, discover_ssh_candidates, handle_fleet_stdio,
-    next_remote_node, session_to_wire, validate_snapshot,
+    SshTransport, bound_snapshot_for_transport, discover_node_candidates, discover_ssh_candidates,
+    handle_fleet_stdio, next_remote_node, session_to_wire, validate_snapshot,
 };
 use pikamux::model::{Candidate, FleetNode, Provider, Session, Status};
 use pikamux::store::Store;
@@ -310,6 +310,103 @@ fn strict_snapshot_rejects_more_than_two_thousand_sessions() {
 }
 
 #[test]
+fn sender_reserves_untracked_expert_inside_the_two_thousand_row_wire_bound() {
+    let node_id = Uuid::new_v4().to_string();
+    let watched = (0..MAX_SNAPSHOT_SESSIONS)
+        .map(|index| {
+            let session_id = format!("00000000-0000-4000-8000-{index:012x}");
+            session_to_wire(&session(Provider::Codex, &session_id, "watched"), false)
+        })
+        .collect::<Vec<_>>();
+    let expert_id = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    let expert = session_to_wire(
+        &session(Provider::Codex, expert_id, "untracked-expert"),
+        true,
+    );
+    let payload = json!({
+        "type":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+        "node_id":node_id, "machine":"atlas", "captured_at":now(),
+        "sessions":watched,
+        "expert_sessions":[expert],
+        "profiles":[{
+            "provider":"codex", "session_id":expert_id,
+            "scope":"Owns needle infrastructure", "current_state":"shipping",
+            "topics":["needle"], "artifacts":[], "updated_at":10.0,
+            "source":"interview", "scope_updated_at":10.0,
+            "current_state_updated_at":10.0
+        }],
+        "cards":[{
+            "provider":"codex", "session_id":expert_id,
+            "status":"CURRENT", "detail":"matches remote source",
+            "watched":false, "availability":"source-available",
+            "current_state_status":"CURRENT"
+        }]
+    });
+    let bounded = bound_snapshot_for_transport(payload).unwrap();
+    let validated = validate_snapshot(&bounded, Some(&node_id)).unwrap();
+    assert_eq!(
+        validated["sessions"].as_array().unwrap().len()
+            + validated["expert_sessions"].as_array().unwrap().len(),
+        MAX_SNAPSHOT_SESSIONS
+    );
+    assert_eq!(validated["expert_sessions"][0]["session_id"], expert_id);
+    assert_eq!(
+        validated["directory_notices"][0]["kind"],
+        "snapshot-incomplete"
+    );
+    assert_eq!(validated["directory_notices"][0]["omitted_rows"], 1);
+}
+
+#[test]
+fn sender_bounds_large_expert_profiles_without_rejecting_the_whole_snapshot() {
+    let node_id = Uuid::new_v4().to_string();
+    let large = "x".repeat(8_192);
+    let mut expert_sessions = Vec::new();
+    let mut profiles = Vec::new();
+    let mut cards = Vec::new();
+    for index in 0..6 {
+        let session_id = format!("eeeeeeee-eeee-4eee-8eee-{index:012x}");
+        expert_sessions.push(session_to_wire(
+            &session(Provider::Codex, &session_id, "large-expert"),
+            true,
+        ));
+        profiles.push(json!({
+            "provider":"codex", "session_id":session_id,
+            "scope":large, "current_state":large,
+            "topics":vec![large.clone(); 64], "artifacts":vec![large.clone(); 64],
+            "updated_at":10.0, "source":"interview",
+            "scope_updated_at":10.0, "current_state_updated_at":10.0
+        }));
+        cards.push(json!({
+            "provider":"codex", "session_id":session_id,
+            "status":"CURRENT", "detail":"matches remote source",
+            "watched":false, "availability":"source-available",
+            "current_state_status":"CURRENT"
+        }));
+    }
+    let bounded = bound_snapshot_for_transport(json!({
+        "type":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+        "node_id":node_id, "machine":"atlas", "captured_at":now(),
+        "sessions":[], "expert_sessions":expert_sessions,
+        "profiles":profiles, "cards":cards
+    }))
+    .unwrap();
+    assert!(serde_json::to_vec(&bounded).unwrap().len() <= pikamux::fleet::MAX_MESSAGE_BYTES);
+    let validated = validate_snapshot(&bounded, Some(&node_id)).unwrap();
+    assert!(validated["expert_sessions"].as_array().unwrap().len() < 6);
+    assert_eq!(
+        validated["directory_notices"][0]["kind"],
+        "expert-directory-incomplete"
+    );
+    assert!(
+        validated["directory_notices"][0]["omitted_rows"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+}
+
+#[test]
 fn cached_fleet_accepts_twenty_small_nodes_and_fairly_slices_aggregate_rows() {
     let temp = TempDir::new().unwrap();
     let store = initialized_store(&temp, "state.db");
@@ -498,6 +595,35 @@ fn cached_remote_identity_includes_node_and_stale_cache_cannot_need_attention() 
         .unwrap();
     assert!(stale[0].stale);
     assert!(!stale[0].needs_attention());
+}
+
+#[test]
+fn snapshot_notice_field_is_sent_only_to_capable_nodes() {
+    for supports_notices in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let store = initialized_store(&temp, "notice-negotiation.db");
+        let remote = Uuid::new_v4().to_string();
+        let mut remote_node = node(&remote, "atlas");
+        if !supports_notices {
+            remote_node
+                .capabilities
+                .retain(|capability| capability != "expert-directory-notices-v1");
+        }
+        store.upsert_fleet_node(&remote_node).unwrap();
+        let fake = FakeTransport::with(vec![Ok(snapshot(&remote, CODEX_THREAD_ID))]);
+        FleetManager::new(&store, &fake)
+            .refresh_node(&remote)
+            .unwrap();
+        let requests = fake.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]
+                .1
+                .get("directory_notices")
+                .and_then(Value::as_bool),
+            supports_notices.then_some(true)
+        );
+    }
 }
 
 #[test]

@@ -18,6 +18,9 @@ acts. A live exact home attaches. A saved conversation resumes into tmux. A
 discoverable conversation is adopted. A genuinely new name is created and
 named. Ambiguity is shown; Pika does not guess.
 
+If a conversation is literally named like a Pika command, `pika open NAME`
+provides the exact escape without renaming it.
+
 ## Install from source
 
 Pika supports macOS and Linux on Apple Silicon/ARM64 and x86-64. From this

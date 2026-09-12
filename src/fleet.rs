@@ -39,6 +39,7 @@ pub const MAX_EXPERT_ITEMS: usize = 64;
 pub const MAX_SNAPSHOT_SESSIONS: usize = 2_000;
 pub const MAX_SNAPSHOT_PROFILES: usize = 2_000;
 pub const MAX_SNAPSHOT_CARDS: usize = 2_000;
+pub const MAX_SNAPSHOT_NOTICES: usize = 16;
 pub const MAX_CACHED_FLEET_ROWS: usize = 8_000;
 pub const MAX_CACHED_FLEET_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CACHED_FLEET_NODES: usize = 64;
@@ -55,6 +56,7 @@ pub const CAPABILITIES: &[&str] = &[
     "ask-jsonl",
     "provider-opencode",
     "expert-directory-v1",
+    "expert-directory-notices-v1",
     "setup-explicit-names-v1",
 ];
 const REQUIRED_CAPABILITIES: &[&str] = &[
@@ -263,12 +265,19 @@ pub struct FleetSession {
 
 /// A machine-scoped explanation for cached rows omitted from an aggregate
 /// view. Exact-machine reads are never truncated by the aggregate budget.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FleetCacheNotice {
     pub node_id: String,
     pub node_name: String,
+    pub kind: String,
     pub omitted_rows: usize,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FleetExpertDirectory {
+    pub matches: Vec<ExpertMatch>,
+    pub notices: Vec<FleetCacheNotice>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -722,6 +731,9 @@ pub fn validate_snapshot(
     if object.contains_key("expert_sessions") {
         expected.insert("expert_sessions");
     }
+    if object.contains_key("directory_notices") {
+        expected.insert("directory_notices");
+    }
     exact_fields(object, &expected, "Remote snapshot envelope is malformed")?;
     if object.get("type").and_then(Value::as_str) != Some("snapshot")
         || object.get("protocol").and_then(Value::as_str) != Some(PROTOCOL_NAME)
@@ -791,6 +803,7 @@ pub fn validate_snapshot(
     }
     let profiles = validate_profiles(object.get("profiles"))?;
     let cards = validate_cards(object.get("cards"))?;
+    let directory_notices = validate_directory_notices(object.get("directory_notices"))?;
     let mut normalized = json!({
         "type":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
         "node_id":node_id, "machine":machine, "captured_at":captured_at,
@@ -802,7 +815,295 @@ pub fn validate_snapshot(
             .expect("object")
             .insert("expert_sessions".to_owned(), Value::Array(experts));
     }
+    if object.contains_key("directory_notices") {
+        normalized.as_object_mut().expect("object").insert(
+            "directory_notices".to_owned(),
+            Value::Array(directory_notices),
+        );
+    }
     Ok(normalized)
+}
+
+/// Bound a locally generated snapshot before it reaches the fleet transport.
+///
+/// Expert-bearing rows are admitted before ordinary board rows within the
+/// shared 2,000-row contract. The reserved tail leaves room for truthful
+/// omission receipts without risking the wire limit.
+pub fn bound_snapshot_for_transport(value: Value) -> Result<Value, FleetError> {
+    const NOTICE_RESERVE_BYTES: usize = 64 * 1024;
+    let object = value.as_object().ok_or_else(|| {
+        FleetError::new(
+            FleetErrorKind::Error,
+            "Local fleet snapshot is not an object",
+        )
+    })?;
+    let had_expert_sessions = object.contains_key("expert_sessions");
+    let watched_rows = object
+        .get("sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let expert_rows = object
+        .get("expert_sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let profiles = keyed_values(object.get("profiles"));
+    let cards = keyed_values(object.get("cards"));
+
+    let mut result = Value::Object(
+        object
+            .iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "sessions" | "expert_sessions" | "profiles" | "cards" | "directory_notices"
+                )
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    let result_object = result.as_object_mut().expect("snapshot object");
+    result_object.insert("sessions".to_owned(), Value::Array(Vec::new()));
+    result_object.insert("profiles".to_owned(), Value::Array(Vec::new()));
+    result_object.insert("cards".to_owned(), Value::Array(Vec::new()));
+    if had_expert_sessions {
+        result_object.insert("expert_sessions".to_owned(), Value::Array(Vec::new()));
+    }
+    let mut used_bytes = serde_json::to_vec(&result)
+        .map_err(|error| FleetError::new(FleetErrorKind::Error, error.to_string()))?
+        .len();
+    let payload_budget = MAX_MESSAGE_BYTES.saturating_sub(NOTICE_RESERVE_BYTES);
+    let value_cost = |value: &Value| -> Result<usize, FleetError> {
+        serde_json::to_vec(value)
+            .map_err(|error| FleetError::new(FleetErrorKind::Error, error.to_string()))?
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| {
+                FleetError::new(
+                    FleetErrorKind::Incompatible,
+                    "Fleet snapshot size overflowed its safety counter",
+                )
+            })
+    };
+
+    let mut selected_watched = Vec::new();
+    let mut selected_experts = Vec::new();
+    let mut selected_profiles = Vec::new();
+    let mut selected_cards = Vec::new();
+    let mut selected_keys = BTreeSet::new();
+    let mut selected_card_keys = BTreeSet::new();
+    let mut expert_keys = Vec::new();
+    let mut omitted_expert_keys = BTreeSet::new();
+
+    // An untracked expert is the easiest row to lose behind a large watched
+    // inventory, so it receives the first admission opportunity.
+    for (is_untracked, rows) in [(true, &expert_rows), (false, &watched_rows)] {
+        for row in rows {
+            let Some(key) = wire_value_key(row) else {
+                continue;
+            };
+            let Some(profile) = profiles.get(&key) else {
+                continue;
+            };
+            if selected_keys.contains(&key) {
+                continue;
+            }
+            let row_cost = value_cost(row)?;
+            let profile_cost = value_cost(profile)?;
+            let card = cards.get(&key);
+            let card_cost = card.map(value_cost).transpose()?.unwrap_or(0);
+            let fits = selected_watched.len() + selected_experts.len() < MAX_SNAPSHOT_SESSIONS
+                && selected_profiles.len() < MAX_SNAPSHOT_PROFILES
+                && card.is_none_or(|_| selected_cards.len() < MAX_SNAPSHOT_CARDS)
+                && used_bytes
+                    .checked_add(row_cost)
+                    .and_then(|value| value.checked_add(profile_cost))
+                    .and_then(|value| value.checked_add(card_cost))
+                    .is_some_and(|value| value <= payload_budget);
+            if !fits {
+                omitted_expert_keys.insert(key);
+                continue;
+            }
+            if is_untracked {
+                selected_experts.push(row.clone());
+            } else {
+                selected_watched.push(row.clone());
+            }
+            selected_profiles.push(profile.clone());
+            if let Some(card) = card {
+                selected_cards.push(card.clone());
+                selected_card_keys.insert(key.clone());
+            }
+            used_bytes += row_cost + profile_cost + card_cost;
+            selected_keys.insert(key.clone());
+            expert_keys.push(key);
+        }
+    }
+
+    // Fill remaining watched capacity only after every expert-bearing row has
+    // had a chance to claim space.
+    for row in &watched_rows {
+        let Some(key) = wire_value_key(row) else {
+            continue;
+        };
+        if selected_keys.contains(&key) || profiles.contains_key(&key) {
+            continue;
+        }
+        let cost = value_cost(row)?;
+        if selected_watched.len() + selected_experts.len() >= MAX_SNAPSHOT_SESSIONS
+            || used_bytes
+                .checked_add(cost)
+                .is_none_or(|value| value > payload_budget)
+        {
+            continue;
+        }
+        selected_watched.push(row.clone());
+        selected_keys.insert(key);
+        used_bytes += cost;
+    }
+
+    // Card state is useful but never outranks the identity+profile pair that
+    // makes an expert discoverable. Expert cards are considered first.
+    let mut card_keys = expert_keys;
+    for key in &selected_keys {
+        if !card_keys.contains(key) {
+            card_keys.push(key.clone());
+        }
+    }
+    for key in card_keys {
+        if selected_card_keys.contains(&key) {
+            continue;
+        }
+        let Some(card) = cards.get(&key) else {
+            continue;
+        };
+        let cost = value_cost(card)?;
+        if selected_cards.len() >= MAX_SNAPSHOT_CARDS
+            || used_bytes
+                .checked_add(cost)
+                .is_none_or(|value| value > payload_budget)
+        {
+            continue;
+        }
+        selected_cards.push(card.clone());
+        used_bytes += cost;
+    }
+
+    let retained_rows = selected_watched.len() + selected_experts.len();
+    let omitted_rows = watched_rows
+        .len()
+        .saturating_add(expert_rows.len())
+        .saturating_sub(retained_rows);
+    let mut notices = Vec::new();
+    if !omitted_expert_keys.is_empty() {
+        notices.push(json!({
+            "kind":"expert-directory-incomplete",
+            "omitted_rows":omitted_expert_keys.len(),
+            "message":format!(
+                "{} expert card(s) omitted by the remote snapshot safety budget",
+                omitted_expert_keys.len()
+            ),
+        }));
+    }
+    let ordinary_omitted = omitted_rows.saturating_sub(omitted_expert_keys.len());
+    if ordinary_omitted > 0 {
+        notices.push(json!({
+            "kind":"snapshot-incomplete",
+            "omitted_rows":ordinary_omitted,
+            "message":format!(
+                "{ordinary_omitted} watched conversation(s) omitted by the remote snapshot safety budget"
+            ),
+        }));
+    }
+
+    let result_object = result.as_object_mut().expect("snapshot object");
+    result_object.insert("sessions".to_owned(), Value::Array(selected_watched));
+    result_object.insert("profiles".to_owned(), Value::Array(selected_profiles));
+    result_object.insert("cards".to_owned(), Value::Array(selected_cards));
+    if had_expert_sessions {
+        result_object.insert("expert_sessions".to_owned(), Value::Array(selected_experts));
+    }
+    if !notices.is_empty() {
+        result_object.insert("directory_notices".to_owned(), Value::Array(notices));
+    }
+    let encoded_len = serde_json::to_vec(&result)
+        .map_err(|error| FleetError::new(FleetErrorKind::Error, error.to_string()))?
+        .len();
+    if encoded_len > MAX_MESSAGE_BYTES {
+        return Err(FleetError::new(
+            FleetErrorKind::Incompatible,
+            "Bounded fleet snapshot still exceeds the transport safety limit",
+        ));
+    }
+    Ok(result)
+}
+
+fn wire_value_key(value: &Value) -> Option<(String, String)> {
+    let object = value.as_object()?;
+    Some((
+        object.get("provider")?.as_str()?.to_owned(),
+        object.get("session_id")?.as_str()?.to_owned(),
+    ))
+}
+
+fn validate_directory_notices(value: Option<&Value>) -> Result<Vec<Value>, FleetError> {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return if value.is_none() {
+            Ok(Vec::new())
+        } else {
+            Err(FleetError::new(
+                FleetErrorKind::Incompatible,
+                "Remote expert-directory notices are malformed",
+            ))
+        };
+    };
+    if values.len() > MAX_SNAPSHOT_NOTICES {
+        return Err(FleetError::new(
+            FleetErrorKind::Incompatible,
+            "Remote expert-directory notices exceed the safety limit",
+        ));
+    }
+    let fields = set(&["kind", "omitted_rows", "message"]);
+    for value in values {
+        let object = object(value, "Remote expert-directory notice is malformed")?;
+        exact_fields(
+            object,
+            &fields,
+            "Remote expert-directory notice is malformed",
+        )?;
+        if !matches!(
+            object.get("kind").and_then(Value::as_str),
+            Some("expert-directory-incomplete" | "snapshot-incomplete")
+        ) {
+            return Err(FleetError::new(
+                FleetErrorKind::Incompatible,
+                "Remote expert-directory notice has an unsupported kind",
+            ));
+        }
+        let omitted = object
+            .get("omitted_rows")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                FleetError::new(
+                    FleetErrorKind::Incompatible,
+                    "Remote expert-directory notice has an invalid omitted count",
+                )
+            })?;
+        usize::try_from(omitted).map_err(|_| {
+            FleetError::new(
+                FleetErrorKind::Incompatible,
+                "Remote expert-directory notice count is too large",
+            )
+        })?;
+        required_text(
+            object.get("message"),
+            "Remote expert-directory notice has an invalid message",
+            1_024,
+        )?;
+    }
+    Ok(values.clone())
 }
 
 fn session_from_wire(value: &Value) -> Result<Session, FleetError> {
@@ -1766,6 +2067,7 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
             let Ok(snapshot) = validate_snapshot(&stored.payload, Some(&node.node_id)) else {
                 continue;
             };
+            notices.extend(snapshot_cache_notices(&snapshot, &node));
             let remote_captured_at = snapshot
                 .get("captured_at")
                 .and_then(Value::as_f64)
@@ -1839,46 +2141,15 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 {
                     break;
                 }
-                result.push(FleetSession {
-                    node_id: node.node_id.clone(),
-                    node_name: node.alias.clone(),
+                result.push(cached_fleet_session(
+                    &node,
                     session,
                     stale,
-                    remote_error: node.last_error.clone(),
-                    seen_at: stored.captured_at,
-                    card_status: card
-                        .and_then(|v| v.get("status"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    card_detail: card
-                        .and_then(|v| v.get("detail"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    watched: card
-                        .and_then(|v| v.get("watched"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true),
-                    availability: card
-                        .and_then(|v| v.get("availability"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    scope_updated_at: profile
-                        .and_then(|v| v.get("scope_updated_at"))
-                        .and_then(Value::as_f64)
-                        .map(|value| {
-                            receiver_clock_timestamp(stored.captured_at, remote_captured_at, value)
-                        }),
-                    current_state_updated_at: profile
-                        .and_then(|v| v.get("current_state_updated_at"))
-                        .and_then(Value::as_f64)
-                        .map(|value| {
-                            receiver_clock_timestamp(stored.captured_at, remote_captured_at, value)
-                        }),
-                    current_state_status: card
-                        .and_then(|v| v.get("current_state_status"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                });
+                    stored.captured_at,
+                    remote_captured_at,
+                    card,
+                    profile,
+                ));
                 retained_rows += 1;
                 retained_bytes += encoded_bytes;
             }
@@ -1887,6 +2158,7 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 notices.push(FleetCacheNotice {
                     node_id: node.node_id.clone(),
                     node_name: node.alias.clone(),
+                    kind: "aggregate-truncated".to_owned(),
                     omitted_rows,
                     message: format!(
                         "{omitted_rows} cached conversation(s) on {} not shown · fair aggregate limit is {row_slice} rows and {} KiB for this machine",
@@ -1902,33 +2174,85 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
         })
     }
 
-    /// Merge retained remote expert cards without contacting any machine.
+    /// Search cached expert cards without contacting any machine.
     ///
-    /// Ranking happens independently per immutable node so an equal provider
-    /// UUID on two machines cannot overwrite or borrow another node's profile.
-    pub fn expert_matches(&self, query: &str) -> Result<Vec<ExpertMatch>, FleetError> {
-        let sessions = self.cached_sessions(None, true)?;
-        let mut by_node = BTreeMap::<String, Vec<FleetSession>>::new();
-        for session in sessions {
-            by_node
-                .entry(session.node_id.clone())
-                .or_default()
-                .push(session);
-        }
-
+    /// Each node ranks its complete bounded expert set before the aggregate
+    /// fleet slice is applied. Ordinary board rows therefore cannot hide an
+    /// expert card, and one large machine cannot evict every other machine.
+    pub fn expert_directory(&self, query: &str) -> Result<FleetExpertDirectory, FleetError> {
         let timestamp = now();
         let mut matches = Vec::new();
-        for (node_id, sessions) in by_node {
-            let Some(stored) = self.store.get_remote_snapshot(&node_id)? else {
+        let mut notices = Vec::new();
+        let nodes = self.nodes()?;
+        if nodes.len() > MAX_CACHED_FLEET_NODES {
+            return Err(FleetError::new(
+                FleetErrorKind::Incompatible,
+                format!("Cached fleet exceeds the {MAX_CACHED_FLEET_NODES}-machine safety limit"),
+            ));
+        }
+        let row_slice = if nodes.is_empty() {
+            MAX_CACHED_FLEET_ROWS
+        } else {
+            MAX_CACHED_FLEET_ROWS / nodes.len()
+        };
+        let byte_slice = if nodes.is_empty() {
+            MAX_CACHED_FLEET_BYTES
+        } else {
+            MAX_CACHED_FLEET_BYTES / nodes.len()
+        };
+        for node in nodes {
+            let Some(stored) = self.store.get_remote_snapshot(&node.node_id)? else {
                 continue;
             };
-            let Ok(snapshot) = validate_snapshot(&stored.payload, Some(&node_id)) else {
+            let Ok(snapshot) = validate_snapshot(&stored.payload, Some(&node.node_id)) else {
                 continue;
             };
+            notices.extend(
+                snapshot_cache_notices(&snapshot, &node)
+                    .into_iter()
+                    .filter(|notice| notice.kind == "expert-directory-incomplete"),
+            );
             let remote_captured_at = snapshot
                 .get("captured_at")
                 .and_then(Value::as_f64)
                 .unwrap_or(stored.captured_at);
+            let stale = node.status != "ready"
+                || stored.captured_at > timestamp
+                || timestamp - stored.captured_at > REMOTE_STALE_SECONDS;
+            let cards = keyed_values(snapshot.get("cards"));
+            let profile_values = keyed_values(snapshot.get("profiles"));
+            let mut sessions = Vec::new();
+            for raw in snapshot
+                .get("expert_sessions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .chain(
+                    snapshot
+                        .get("sessions")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten(),
+                )
+            {
+                let session = session_from_wire(raw)?;
+                let key = (
+                    session.provider.as_str().to_owned(),
+                    session.session_id.clone(),
+                );
+                let Some(profile_value) = profile_values.get(&key) else {
+                    continue;
+                };
+                sessions.push(cached_fleet_session(
+                    &node,
+                    session,
+                    stale,
+                    stored.captured_at,
+                    remote_captured_at,
+                    cards.get(&key).and_then(Value::as_object),
+                    profile_value.as_object(),
+                ));
+            }
             let mut profiles = snapshot
                 .get("profiles")
                 .and_then(Value::as_array)
@@ -1966,7 +2290,11 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                     )
                 })
                 .collect::<BTreeMap<_, _>>();
-            for mut found in rank_experts(&profiles, &local_sessions, query, &BTreeSet::new()) {
+            let ranked = rank_experts(&profiles, &local_sessions, query, &BTreeSet::new());
+            let available_matches = ranked.len();
+            let mut retained_matches = 0_usize;
+            let mut retained_bytes = 0_usize;
+            for mut found in ranked {
                 let Some(remote) = wrappers.get(&(found.provider, found.session_id.clone())) else {
                     continue;
                 };
@@ -1998,7 +2326,33 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                         .and_then(parse_card_status)
                         .unwrap_or(CardStatus::Unknown)
                 };
+                let encoded_bytes = serde_json::to_vec(&found)
+                    .map_err(|error| FleetError::new(FleetErrorKind::Error, error.to_string()))?
+                    .len();
+                if retained_matches >= row_slice
+                    || retained_bytes
+                        .checked_add(encoded_bytes)
+                        .is_none_or(|bytes| bytes > byte_slice)
+                {
+                    continue;
+                }
                 matches.push(found);
+                retained_matches += 1;
+                retained_bytes += encoded_bytes;
+            }
+            let omitted_rows = available_matches.saturating_sub(retained_matches);
+            if omitted_rows > 0 {
+                notices.push(FleetCacheNotice {
+                    node_id: node.node_id.clone(),
+                    node_name: node.alias.clone(),
+                    kind: "expert-directory-incomplete".to_owned(),
+                    omitted_rows,
+                    message: format!(
+                        "{omitted_rows} matching expert card(s) on {} not shown · fair aggregate limit is {row_slice} rows and {} KiB for this machine",
+                        node.alias,
+                        byte_slice / 1024,
+                    ),
+                });
             }
         }
         matches.sort_by(|left, right| {
@@ -2012,7 +2366,17 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 .then_with(|| right.node_id.cmp(&left.node_id))
                 .then_with(|| right.session_id.cmp(&left.session_id))
         });
-        Ok(matches)
+        notices.sort_by(|left, right| {
+            left.node_name
+                .cmp(&right.node_name)
+                .then_with(|| left.kind.cmp(&right.kind))
+                .then_with(|| left.message.cmp(&right.message))
+        });
+        Ok(FleetExpertDirectory { matches, notices })
+    }
+
+    pub fn expert_matches(&self, query: &str) -> Result<Vec<ExpertMatch>, FleetError> {
+        Ok(self.expert_directory(query)?.matches)
     }
 
     pub fn resolve(
@@ -2434,14 +2798,21 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
     }
 
     fn snapshot_request(&self, node: &FleetNode) -> Result<Value, FleetError> {
-        self.transport.request(
-            &node.ssh_target,
-            &json!({
-                "op":"snapshot", "expert_directory":true, "protocol":PROTOCOL_NAME,
-                "version":PROTOCOL_VERSION, "expected_node_id":node.node_id,
-            }),
-            false,
-        )
+        let mut request = json!({
+            "op":"snapshot", "expert_directory":true, "protocol":PROTOCOL_NAME,
+            "version":PROTOCOL_VERSION, "expected_node_id":node.node_id,
+        });
+        if node
+            .capabilities
+            .iter()
+            .any(|capability| capability == "expert-directory-notices-v1")
+        {
+            request
+                .as_object_mut()
+                .expect("snapshot request")
+                .insert("directory_notices".to_owned(), Value::Bool(true));
+        }
+        self.transport.request(&node.ssh_target, &request, false)
     }
 
     fn snapshot_request_cancellable(
@@ -2449,15 +2820,22 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
         node: &FleetNode,
         cancellation: &CancellationToken,
     ) -> Result<Value, FleetError> {
-        self.transport.request_cancellable(
-            &node.ssh_target,
-            &json!({
-                "op":"snapshot", "expert_directory":true, "protocol":PROTOCOL_NAME,
-                "version":PROTOCOL_VERSION, "expected_node_id":node.node_id,
-            }),
-            false,
-            cancellation,
-        )
+        let mut request = json!({
+            "op":"snapshot", "expert_directory":true, "protocol":PROTOCOL_NAME,
+            "version":PROTOCOL_VERSION, "expected_node_id":node.node_id,
+        });
+        if node
+            .capabilities
+            .iter()
+            .any(|capability| capability == "expert-directory-notices-v1")
+        {
+            request
+                .as_object_mut()
+                .expect("snapshot request")
+                .insert("directory_notices".to_owned(), Value::Bool(true));
+        }
+        self.transport
+            .request_cancellable(&node.ssh_target, &request, false, cancellation)
     }
 }
 
@@ -3095,6 +3473,7 @@ fn handle_request<S: FleetService>(
             "version",
             "expected_node_id",
             "expert_directory",
+            "directory_notices",
         ],
         "candidates" => &[
             "op",
@@ -3152,7 +3531,17 @@ fn handle_request<S: FleetService>(
         "snapshot" => {
             let extended =
                 optional_bool(request.get("expert_directory"), false, "expert_directory")?;
-            let snapshot = service.snapshot(extended)?;
+            let include_notices =
+                optional_bool(request.get("directory_notices"), false, "directory_notices")?;
+            let mut snapshot = service.snapshot(extended)?;
+            if !include_notices {
+                snapshot
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        FleetError::new(FleetErrorKind::Error, "Local snapshot is malformed")
+                    })?
+                    .remove("directory_notices");
+            }
             validate_snapshot(&snapshot, Some(node_id))
         }
         "candidates" => {
@@ -3754,6 +4143,71 @@ fn keyed_values(value: Option<&Value>) -> BTreeMap<(String, String), Value> {
             ))
         })
         .collect()
+}
+
+fn snapshot_cache_notices(snapshot: &Value, node: &FleetNode) -> Vec<FleetCacheNotice> {
+    snapshot
+        .get("directory_notices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|notice| {
+            Some(FleetCacheNotice {
+                node_id: node.node_id.clone(),
+                node_name: node.alias.clone(),
+                kind: notice.get("kind")?.as_str()?.to_owned(),
+                omitted_rows: usize::try_from(notice.get("omitted_rows")?.as_u64()?).ok()?,
+                message: notice.get("message")?.as_str()?.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn cached_fleet_session(
+    node: &FleetNode,
+    session: Session,
+    stale: bool,
+    seen_at: f64,
+    remote_captured_at: f64,
+    card: Option<&Map<String, Value>>,
+    profile: Option<&Map<String, Value>>,
+) -> FleetSession {
+    FleetSession {
+        node_id: node.node_id.clone(),
+        node_name: node.alias.clone(),
+        session,
+        stale,
+        remote_error: node.last_error.clone(),
+        seen_at,
+        card_status: card
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        card_detail: card
+            .and_then(|value| value.get("detail"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        watched: card
+            .and_then(|value| value.get("watched"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        availability: card
+            .and_then(|value| value.get("availability"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        scope_updated_at: profile
+            .and_then(|value| value.get("scope_updated_at"))
+            .and_then(Value::as_f64)
+            .map(|value| receiver_clock_timestamp(seen_at, remote_captured_at, value)),
+        current_state_updated_at: profile
+            .and_then(|value| value.get("current_state_updated_at"))
+            .and_then(Value::as_f64)
+            .map(|value| receiver_clock_timestamp(seen_at, remote_captured_at, value)),
+        current_state_status: card
+            .and_then(|value| value.get("current_state_status"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
 }
 
 fn profile_from_wire(value: &Value) -> Result<StoredExpertProfile, FleetError> {

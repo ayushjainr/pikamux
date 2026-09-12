@@ -90,7 +90,7 @@ enum Command {
     Sync(NameArg),
     /// Safely update an installer-managed Pika.
     Update(UpdateArgs),
-    #[command(hide = true)]
+    /// Open an exact conversation; use this when its name matches a Pika command.
     Open(NameArg),
     #[command(hide = true)]
     New(NewArgs),
@@ -146,6 +146,9 @@ struct QueryArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+    /// Include expert-directory completeness and omission notices in a JSON envelope.
+    #[arg(long, requires = "json")]
+    with_notices: bool,
 }
 #[derive(Args, Debug)]
 struct PeekArgs {
@@ -721,12 +724,13 @@ fn bare(pika: &Pika) -> Result<i32> {
     });
     let (update_sender, update_receiver) = mpsc::sync_channel(1);
     let update_executable = std::env::current_exe().ok();
-    let _update_check = thread::spawn(move || {
-        let notice = update_executable
-            .as_deref()
-            .and_then(update::cached_update_notice);
-        let _ = update_sender.send(notice);
-    });
+    // Cache-only and bounded: opening or quitting the board never abandons a
+    // network process or scratch directory. Network refresh belongs to the
+    // explicit `pika update --check` command.
+    let update_notice = update_executable
+        .as_deref()
+        .and_then(update::cached_update_notice);
+    let _ = update_sender.send(update_notice);
     let action = monitor::run_items_dynamic_with_local_health(
         cached,
         receiver,
@@ -1018,7 +1022,7 @@ fn fleet_cache_notice(error: &fleet::FleetError) -> BoardItem {
 fn fleet_cache_truncation_notice(notice: &fleet::FleetCacheNotice) -> BoardItem {
     BoardItem::local(Session {
         provider: Provider::Codex,
-        session_id: format!("fleet-cache-truncated:{}", notice.node_id),
+        session_id: format!("fleet-cache-truncated:{}:{}", notice.node_id, notice.kind),
         name: Some(format!("{} cache limited", notice.node_name)),
         cwd: None,
         branch: None,
@@ -2004,11 +2008,10 @@ fn experts(pika: &Pika, a: QueryArgs) -> Result<i32> {
         }
     }
     found.retain(|item| !matches!(item.availability.as_str(), "archived" | "deleted"));
-    found.extend(
-        FleetManager::new(&pika.store, SshTransport::default())
-            .expert_matches(&query)
-            .map_err(anyhow::Error::from)?,
-    );
+    let remote_directory = FleetManager::new(&pika.store, SshTransport::default())
+        .expert_directory(&query)
+        .map_err(anyhow::Error::from)?;
+    found.extend(remote_directory.matches);
     found.sort_by(|left, right| {
         let left_fresh = left.snapshot_stale != Some(true);
         let right_fresh = right.snapshot_stale != Some(true);
@@ -2020,10 +2023,20 @@ fn experts(pika: &Pika, a: QueryArgs) -> Result<i32> {
             .then_with(|| right.node_id.cmp(&left.node_id))
             .then_with(|| right.session_id.cmp(&left.session_id))
     });
-    if a.json {
+    if a.with_notices {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "experts": found,
+                "directory_complete": remote_directory.notices.is_empty(),
+                "notices": remote_directory.notices,
+            }))?
+        )
+    } else if a.json {
         println!("{}", serde_json::to_string(&found)?)
     } else if found.is_empty() {
-        println!("No expert cards match.")
+        println!("No expert cards match.");
+        print_expert_directory_notices(&remote_directory.notices);
     } else {
         for x in found {
             println!(
@@ -2031,8 +2044,19 @@ fn experts(pika: &Pika, a: QueryArgs) -> Result<i32> {
                 x.provider, x.qualified_name, x.availability, x.scope
             )
         }
+        print_expert_directory_notices(&remote_directory.notices);
     }
     Ok(0)
+}
+
+fn print_expert_directory_notices(notices: &[fleet::FleetCacheNotice]) {
+    if notices.is_empty() {
+        return;
+    }
+    println!("\nExpert directory incomplete:");
+    for notice in notices {
+        println!("  {} · {}", notice.node_name, notice.message);
+    }
 }
 fn calling_session(pika: &Pika) -> Result<Session> {
     pika.current_exact_session()
@@ -2154,11 +2178,12 @@ fn expert(pika: &Pika, a: ExpertArgs) -> Result<i32> {
                 })
                 .collect::<Vec<_>>();
             let manager = FleetManager::new(&pika.store, SshTransport::default());
-            for remote in manager
-                .expert_matches("")
-                .map_err(anyhow::Error::from)?
-                .into_iter()
+            let remote_directory = manager.expert_directory("").map_err(anyhow::Error::from)?;
+            for remote in remote_directory
+                .matches
+                .iter()
                 .filter(|item| !matches!(item.availability.as_str(), "archived" | "deleted"))
+                .cloned()
             {
                 let display_name = remote.name.clone().unwrap_or_else(|| {
                     format!(
@@ -2218,6 +2243,7 @@ fn expert(pika: &Pika, a: ExpertArgs) -> Result<i32> {
                         value["detail"].as_str().unwrap_or_default(),
                     )
                 }
+                print_expert_directory_notices(&remote_directory.notices);
             }
         }
         ExpertCommand::Refresh {
@@ -4929,7 +4955,7 @@ impl FleetService for LocalFleetService<'_> {
         }
         // Retain vector ownership only until serialization has completed.
         sessions.clear();
-        Ok(result)
+        fleet::bound_snapshot_for_transport(result)
     }
 
     fn candidates(
@@ -5360,6 +5386,7 @@ done
                 notices: vec![fleet::FleetCacheNotice {
                     node_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
                     node_name: "atlas".into(),
+                    kind: "aggregate-truncated".into(),
                     omitted_rows: 3,
                     message: "3 cached conversations on atlas not shown".into(),
                 }],
