@@ -12,33 +12,33 @@ The native executable was built from the locked dependency graph with the
 release profile in `Cargo.toml`: size optimization, thin LTO, one codegen unit,
 abort-on-panic, and stripped symbols. The comparison runtime is the frozen
 Python v0.5.0a4 reference recorded in `REFERENCE.md`. The measured native source
-is commit `38b08513ff45a372d345ab8157b521dabf1a12a4`; the measured executable's
-SHA-256 is `b2c5aad9c778fa9280b5639ba1fa45841ce016e306e0f2e315b0c4668fcab638`.
+is commit `f3e013c35bb843cbf154033799bf26ec09e8f3b3`; the measured executable's
+SHA-256 is `d35bed57af72f6c1275790b45b2a0a27af22813559944a8df0b3c54cebae7aef`.
 
 | Contract | Samples | Native Rust | Python v0.5.0a4 | Gate |
 | --- | ---: | ---: | ---: | ---: |
-| CLI startup p95 | 100 each | 5.47 ms | 136.15 ms | ≤30 ms |
-| Cached board first-frame p95 | 50 each | 14.58 ms | 453.64 ms | ≤200 ms |
-| Board input redraw p95 / p99 | 1,000 each | 0.121 / 0.135 ms | 8.34 / 8.72 ms | ≤50 / 100 ms |
-| Hook fast-path p95 | 100 each | 12.32 ms | 467.14 ms | ≤75 ms |
-| Full 200-row local reconciliation p95 | 30 each | 90.52 ms | 2,905.05 ms | ≤500 ms |
-| Warm board RSS p95, worst run | 5 × 300 s | 11.16 MiB | 39.98 MiB | ≤40 MiB native |
-| Idle board CPU, mean across runs | 5 × 300 s | 0.619% of one core | 18.124% of one core | ≤1% native |
-| Executable / gzip | one release build | 4.58 / 2.37 MB | interpreter environment required | ≤50 / 20 MiB |
+| CLI startup p95 | 100 each | 5.09 ms | 155.08 ms | ≤30 ms |
+| Cached board first-frame p95 | 50 each | 14.84 ms | 491.78 ms | ≤200 ms |
+| Board input redraw p95 / p99 | 1,000 each | 0.158 / 0.199 ms | 8.74 / 9.17 ms | ≤50 / 100 ms |
+| Hook fast-path p95 | 100 each | 14.21 ms | 501.25 ms | ≤75 ms |
+| Full 200-row local reconciliation p95 | 30 each | 76.20 ms | 2,472.82 ms | ≤500 ms |
+| Warm board RSS p95, worst run | 5 × 300 s | 11.64 MiB | 37.03 MiB | ≤40 MiB native |
+| Idle board CPU, mean across runs | 5 × 300 s | 0.626% of one core | 18.203% of one core | ≤1% native |
+| Executable / gzip | one release build | 4.60 / 2.37 MB | interpreter environment required | ≤50 / 20 MiB |
 
-The 100-launch native startup run had a 3.74 ms p50; one cold outlier reached
-472.18 ms without changing the 5.47 ms p95 gate. The 50-launch
-cached-local-plus-remote board run had a 12.06 ms p50 and 25.37 ms maximum.
+The 100-launch native startup run had a 4.55 ms p50; one cold outlier reached
+417.55 ms without changing the 5.09 ms p95 gate. The 50-launch
+cached-local-plus-remote board run had a 13.64 ms p50 and 15.15 ms maximum.
 
 The steady-state comparison alternated implementation order across five paired
 five-minute runs. Every run repainted the clock once per second, made
 hook-backed SQLite commits visible within one second, and performed fallback
 provider/process reconciliation every twenty seconds. Native CPU ranged from
-0.529% to 0.689% by run, versus 16.510% to 19.800% for Python. Worst observed
-process-tree RSS was 12.06 MiB native and 40.09 MiB Python. Native averaged
-977,392 terminal bytes after the first frame; Python averaged 2,073,385 bytes.
+0.463% to 0.752% by run, versus 16.528% to 20.169% for Python. Worst observed
+process-tree RSS was 12.19 MiB native and 40.13 MiB Python. Native averaged
+978,706 terminal bytes after the first frame; Python averaged 2,077,755 bytes.
 These are aggregate and worst-run results, not a selected run.
-Across all five runs, Rust used 29.3× less mean CPU and 3.3× less peak RSS.
+Across all five runs, Rust used 29.1× less mean CPU and 3.3× less peak RSS.
 
 The same native binary was also exercised with 2,000 local conversations and
 1, 5, and 20 cached offline machines. The complete first frame never waited on
@@ -46,9 +46,9 @@ SSH, and adding machines did not remove local rows.
 
 | Cached machines | First-frame p95 | Input p95 | 60 s RSS p95 / max |
 | ---: | ---: | ---: | ---: |
-| 1 | 25.84 ms | 0.212 ms | 23.66 / 24.31 MiB |
-| 5 | 32.52 ms | 0.226 ms | 22.16 / 24.17 MiB |
-| 20 | 53.38 ms | 0.231 ms | 24.83 / 25.89 MiB |
+| 1 | 25.24 ms | 0.213 ms | 21.52 / 21.94 MiB |
+| 5 | 30.83 ms | 0.201 ms | 23.22 / 24.52 MiB |
+| 20 | 50.00 ms | 0.212 ms | 23.38 / 24.48 MiB |
 
 This directly clears the 2,000-row gates of a complete first frame within one
 second, input p95 within 100 ms, and a bounded memory plateau across the fleet
@@ -61,8 +61,9 @@ OpenCode projects descendant activity and lifecycle with two batched recursive
 queries rather than per-row queries. Hooks remain the immediate status path.
 The federated first-frame contract also supplies 20 cached machines with 2,000
 rows each. The board reads a fair 400-row projection per machine under one
-8,000-row / 16 MiB aggregate budget; exact actions and expert search retain the
-full authoritative snapshots.
+8,000-row / 16 MiB aggregate budget. Exact actions retain the authoritative
+snapshots. Expert search ranks a complete, revision-bound index of up to 2,000
+experts per machine, then materializes only the fair aggregate result slice.
 
 `measure_reconcile.py` invokes the public `pika list --no-usage` boundary, so its
 numbers include process startup, process enumeration, provider metadata reads,

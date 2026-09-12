@@ -120,14 +120,14 @@ the same terminal geometry; hook runs alternate Python/native order.
 
 | Contract | Native Rust | Python v0.5.0a4 |
 | --- | ---: | ---: |
-| CLI startup, p95 (100 launches) | 5.47 ms | 136.15 ms |
-| Cached board first frame, p95 (50 launches) | 14.58 ms | 453.64 ms |
-| Board input redraw, p95 (1,000 keys) | 0.121 ms | 8.34 ms |
-| Hook fast path, p95 (100 events) | 12.32 ms | 467.14 ms |
-| 200-row local reconciliation, p95 (30 runs) | 90.52 ms | 2,905.05 ms |
-| Idle CPU, mean across 5 × 5-minute runs | 0.619% | 18.124% |
-| Warm RSS p95, worst of 5 runs | 11.16 MiB | 39.98 MiB |
-| Binary / gzip | 4.58 MB / 2.37 MB | interpreter environment required |
+| CLI startup, p95 (100 launches) | 5.09 ms | 155.08 ms |
+| Cached board first frame, p95 (50 launches) | 14.84 ms | 491.78 ms |
+| Board input redraw, p95 (1,000 keys) | 0.158 ms | 8.74 ms |
+| Hook fast path, p95 (100 events) | 14.21 ms | 501.25 ms |
+| 200-row local reconciliation, p95 (30 runs) | 76.20 ms | 2,472.82 ms |
+| Idle CPU, mean across 5 × 5-minute runs | 0.626% | 18.203% |
+| Warm RSS p95, worst of 5 runs | 11.64 MiB | 37.03 MiB |
+| Binary / gzip | 4.60 MB / 2.37 MB | interpreter environment required |
 
 Reproduce the measurements with:
 
