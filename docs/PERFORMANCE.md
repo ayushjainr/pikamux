@@ -11,7 +11,9 @@ machine, user database, or transcript was contacted.
 The native executable was built from the locked dependency graph with the
 release profile in `Cargo.toml`: size optimization, thin LTO, one codegen unit,
 abort-on-panic, and stripped symbols. The comparison runtime is the frozen
-Python v0.5.0a4 reference recorded in `REFERENCE.md`.
+Python v0.5.0a4 reference recorded in `REFERENCE.md`. The measured native source
+is commit `0dc9b20d5bdec0a9d3002fdf760300d41989a476`; the measured executable's
+SHA-256 is `8a940a143b08fa1176a86e1946821e3cfb7b83a8ae96d2d4ee12f1687178796f`.
 
 | Contract | Samples | Native Rust | Python v0.5.0a4 | Gate |
 | --- | ---: | ---: | ---: | ---: |
