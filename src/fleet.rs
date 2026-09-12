@@ -20,7 +20,7 @@ use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -3011,7 +3011,7 @@ pub struct ConsultationPolicy {
 }
 
 struct AsyncChildInput {
-    requests: mpsc::Sender<FleetWriteRequest>,
+    requests: Option<mpsc::Sender<FleetWriteRequest>>,
 }
 
 struct FleetWriteRequest {
@@ -3020,9 +3020,9 @@ struct FleetWriteRequest {
 }
 
 impl AsyncChildInput {
-    fn new(mut input: ChildStdin) -> Self {
+    fn new(mut input: impl Write + Send + 'static) -> (Self, thread::JoinHandle<()>) {
         let (requests, receiver) = mpsc::channel::<FleetWriteRequest>();
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             for request in receiver {
                 let result = input
                     .write_all(&request.bytes)
@@ -3035,7 +3035,12 @@ impl AsyncChildInput {
                 }
             }
         });
-        Self { requests }
+        (
+            Self {
+                requests: Some(requests),
+            },
+            worker,
+        )
     }
 
     fn send(
@@ -3052,6 +3057,13 @@ impl AsyncChildInput {
         }
         let (sender, result) = mpsc::sync_channel(1);
         self.requests
+            .as_ref()
+            .ok_or_else(|| {
+                FleetError::new(
+                    FleetErrorKind::Unreachable,
+                    "Remote side input writer stopped",
+                )
+            })?
             .send(FleetWriteRequest {
                 bytes,
                 result: sender,
@@ -3094,6 +3106,10 @@ impl AsyncChildInput {
             }
         }
     }
+
+    fn close(&mut self) {
+        self.requests.take();
+    }
 }
 
 pub struct RemoteConsultation {
@@ -3102,8 +3118,10 @@ pub struct RemoteConsultation {
     policy: ConsultationPolicy,
     child: OwnedChild,
     input: Option<AsyncChildInput>,
-    events: Receiver<Result<Value, FleetError>>,
+    events: Option<Receiver<Result<Value, FleetError>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    pipe_stop: CancellationToken,
+    workers: Vec<thread::JoinHandle<()>>,
     cleanup_confirmed: bool,
     transport_aborted: bool,
     answers_received: u64,
@@ -3180,31 +3198,53 @@ impl RemoteConsultation {
                 format!("Could not start remote side channel: {error}"),
             )
         })?;
-        let input = child.stdin.take().map(AsyncChildInput::new);
-        let output = child.stdout.take().ok_or_else(|| {
-            FleetError::new(
+        let raw_pipes = (|| {
+            Some((
+                child.stdin.take()?,
+                child.stdout.take()?,
+                child.stderr.take()?,
+            ))
+        })();
+        let Some((input, output, errors)) = raw_pipes else {
+            kill_reap(&mut child);
+            return Err(FleetError::new(
                 FleetErrorKind::Error,
-                "Remote side channel has no output pipe",
-            )
-        })?;
-        let errors = child.stderr.take().ok_or_else(|| {
-            FleetError::new(
-                FleetErrorKind::Error,
-                "Remote side channel has no error pipe",
-            )
-        })?;
+                "Remote side channel has incomplete process pipes",
+            ));
+        };
+        let pipe_stop = CancellationToken::default();
+        let cancellable_pipes = (|| -> std::io::Result<_> {
+            Ok((
+                CancellablePipe::new(input, pipe_stop.clone())?,
+                CancellablePipe::new(output, pipe_stop.clone())?,
+                CancellablePipe::new(errors, pipe_stop.clone())?,
+            ))
+        })();
+        let (input, output, errors) = match cancellable_pipes {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                kill_reap(&mut child);
+                return Err(FleetError::new(
+                    FleetErrorKind::Unreachable,
+                    format!("Could not prepare cancellable remote side pipes: {error}"),
+                ));
+            }
+        };
+        let (input, input_worker) = AsyncChildInput::new(input);
         let (sender, events) = mpsc::sync_channel(8);
-        spawn_jsonl_reader(output, sender, MAX_MESSAGE_BYTES);
+        let output_worker = spawn_jsonl_reader(output, sender, MAX_MESSAGE_BYTES);
         let stderr = Arc::new(Mutex::new(Vec::new()));
-        spawn_bounded_stderr(errors, stderr.clone(), MAX_STDERR_BYTES);
+        let stderr_worker = spawn_bounded_stderr(errors, stderr.clone(), MAX_STDERR_BYTES);
         let mut side = Self {
             node,
             session,
             policy,
             child,
-            input,
-            events,
+            input: Some(input),
+            events: Some(events),
             stderr,
+            pipe_stop,
+            workers: vec![input_worker, output_worker, stderr_worker],
             cleanup_confirmed: false,
             transport_aborted: false,
             answers_received: 0,
@@ -3271,18 +3311,31 @@ impl RemoteConsultation {
             ));
         }
         let event = self.read_nonprogress(self.event_timeout)?;
-        let object = object(&event, "Remote side channel event is not an object")?;
+        let object = match object(&event, "Remote side channel event is not an object") {
+            Ok(object) => object,
+            Err(error) => {
+                self.abort();
+                return Err(error);
+            }
+        };
         if object.get("type").and_then(Value::as_str) != Some("answer") {
+            self.abort();
             return Err(FleetError::new(
                 FleetErrorKind::Incompatible,
                 "Remote side channel returned an invalid answer",
             ));
         }
-        let text = required_text(
+        let text = match required_text(
             object.get("text"),
             "Remote side channel returned an invalid answer",
             MAX_MESSAGE_BYTES,
-        )?;
+        ) {
+            Ok(text) => text,
+            Err(error) => {
+                self.abort();
+                return Err(error);
+            }
+        };
         self.answers_received += 1;
         Ok(text)
     }
@@ -3296,7 +3349,7 @@ impl RemoteConsultation {
                 self.cleanup_unknown("Remote cleanup is unconfirmed after the connection closed")
             );
         }
-        if let Some(input) = self.input.take()
+        if let Some(mut input) = self.input.take()
             && input
                 .send(
                     b"{\"close\":true}\n".to_vec(),
@@ -3305,6 +3358,7 @@ impl RemoteConsultation {
                 )
                 .is_err()
         {
+            input.close();
             self.abort();
             return Err(self.cleanup_unknown("Remote cleanup could not be requested"));
         }
@@ -3330,7 +3384,13 @@ impl RemoteConsultation {
                     return Err(self.cleanup_unknown("Remote cleanup could not be confirmed"));
                 }
             };
-            let object = object(&event, "Remote cleanup returned an unexpected event")?;
+            let object = match object(&event, "Remote cleanup returned an unexpected event") {
+                Ok(object) => object,
+                Err(_) => {
+                    self.abort();
+                    return Err(self.cleanup_unknown("Remote cleanup returned an unexpected event"));
+                }
+            };
             if object.get("type").and_then(Value::as_str) != Some("closed") {
                 self.abort();
                 return Err(self.cleanup_unknown("Remote cleanup returned an unexpected event"));
@@ -3354,7 +3414,21 @@ impl RemoteConsultation {
             if !wait_child(&mut self.child, remaining.min(Duration::from_secs(2))) {
                 // The remote cleanup receipt is authoritative; only the local
                 // owned SSH transport is still lingering.
-                kill_reap(&mut self.child);
+                if let Err(error) = self.shutdown_transport() {
+                    return Err(FleetError::new(
+                        FleetErrorKind::Unreachable,
+                        format!(
+                            "Remote cleanup completed but the local SSH transport could not be reaped: {error}"
+                        ),
+                    ));
+                }
+            } else if let Err(error) = self.shutdown_transport() {
+                return Err(FleetError::new(
+                    FleetErrorKind::Unreachable,
+                    format!(
+                        "Remote cleanup completed but the local SSH transport could not be reaped: {error}"
+                    ),
+                ));
             }
             self.cleanup_confirmed = true;
             return Ok(self.closed_receipt());
@@ -3418,9 +3492,17 @@ impl RemoteConsultation {
             };
             let event = match self
                 .events
+                .as_ref()
+                .ok_or_else(|| {
+                    FleetError::new(FleetErrorKind::Unreachable, "Remote side channel closed")
+                })?
                 .recv_timeout(remaining.min(Duration::from_millis(25)))
             {
-                Ok(event) => event?,
+                Ok(Ok(event)) => event,
+                Ok(Err(error)) => {
+                    self.abort();
+                    return Err(error);
+                }
                 Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
                 Err(RecvTimeoutError::Timeout) => {
                     self.abort();
@@ -3447,20 +3529,31 @@ impl RemoteConsultation {
                     ));
                 }
             };
-            let object = object(&event, "Remote side channel event is not an object")?;
+            let object = match object(&event, "Remote side channel event is not an object") {
+                Ok(object) => object,
+                Err(error) => {
+                    self.abort();
+                    return Err(error);
+                }
+            };
             match object.get("type").and_then(Value::as_str) {
                 Some("progress") => {
-                    validate_progress(object)?;
+                    if let Err(error) = validate_progress(object) {
+                        self.abort();
+                        return Err(error);
+                    }
                 }
                 Some("error") => {
-                    return Err(FleetError::new(
+                    let error = FleetError::new(
                         parse_error_kind(object.get("kind").and_then(Value::as_str)),
                         object
                             .get("message")
                             .and_then(Value::as_str)
                             .unwrap_or("remote consultation failed"),
                     )
-                    .with_receipt(object));
+                    .with_receipt(object);
+                    self.abort();
+                    return Err(error);
                 }
                 _ => return Ok(event),
             }
@@ -3469,8 +3562,24 @@ impl RemoteConsultation {
 
     fn abort(&mut self) {
         self.transport_aborted = true;
+        let _ = self.shutdown_transport();
+    }
+
+    fn shutdown_transport(&mut self) -> anyhow::Result<()> {
+        let child_result = terminate_child(&mut self.child);
+        // A helper can inherit SSH's descriptors after leaving the owned
+        // process group. It must neither be signalled nor be allowed to keep
+        // these local workers blocked forever.
+        self.pipe_stop.cancel();
+        if let Some(input) = self.input.as_mut() {
+            input.close();
+        }
         self.input.take();
-        kill_reap(&mut self.child);
+        self.events.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+        child_result
     }
 
     fn cleanup_unknown(&self, message: &str) -> FleetError {
@@ -4167,6 +4276,221 @@ fn receiver_clock_timestamp(received_at: f64, remote_captured_at: f64, event_at:
 mod receiver_clock_tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn consultation_fixture(ssh: &Path, event_timeout: Duration) -> RemoteConsultation {
+        let node_id = "11111111-1111-4111-8111-111111111111";
+        let node = FleetNode {
+            node_id: node_id.into(),
+            alias: "fixture".into(),
+            ssh_target: "fixture".into(),
+            sources: vec!["test".into()],
+            status: "ready".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
+            package_version: Some("test".into()),
+            capabilities: CAPABILITIES.iter().map(|value| (*value).into()).collect(),
+            last_seen: 0.0,
+            last_attempt_at: 0.0,
+            last_error: None,
+            created_at: 0.0,
+            updated_at: 0.0,
+        };
+        let session_id = "22222222-2222-4222-8222-222222222222";
+        let session = FleetSession {
+            node_id: node_id.into(),
+            node_name: "fixture".into(),
+            session: Session {
+                provider: Provider::Codex,
+                session_id: session_id.into(),
+                name: Some("fixture".into()),
+                cwd: Some("/tmp".into()),
+                branch: None,
+                transcript_path: None,
+                tmux_session: None,
+                tmux_pane: None,
+                root_pid: None,
+                status: Status::Working,
+                unread: false,
+                model: None,
+                source: "test".into(),
+                managed: true,
+                error: None,
+                attention_reason: None,
+                created_at: 0.0,
+                updated_at: 0.0,
+                last_event_at: 0.0,
+                last_activity_at: 0.0,
+                live: true,
+                attached: false,
+                home_state: "exact".into(),
+                cpu_percent: None,
+                rss_kb: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                cache_write_tokens: None,
+                total_tokens: None,
+                estimated_cost_usd: None,
+                active_thread_id: None,
+            },
+            stale: false,
+            remote_error: None,
+            seen_at: 0.0,
+            card_status: None,
+            card_detail: None,
+            watched: true,
+            availability: Some("source-available".into()),
+            scope_updated_at: None,
+            current_state_updated_at: None,
+            current_state_status: None,
+        };
+        RemoteConsultation::open(
+            &SshTransport::new(ssh, Duration::from_secs(1), Duration::from_secs(1)),
+            node,
+            session,
+            ConsultationPolicy {
+                consultation_mode: "default".into(),
+                model: "gpt-test".into(),
+                effort: "low".into(),
+            },
+            Duration::from_secs(1),
+            event_timeout,
+            Duration::from_millis(200),
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn opened_fixture() -> String {
+        json!({
+            "type":"opened",
+            "provider":"codex",
+            "parent_id":"22222222-2222-4222-8222-222222222222",
+            "workstream_id":"22222222-2222-4222-8222-222222222222",
+            "consultation_mode":"default",
+            "model":"gpt-test",
+            "effort":"low"
+        })
+        .to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_cleanup_cancels_inherited_pipes_without_signalling_foreign_holder() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("ssh");
+        let pid_path = root.path().join("escaped.pid");
+        let release_path = root.path().join("release");
+        let done_path = root.path().join("escaped.done");
+        let test_binary = std::env::current_exe().unwrap();
+        write_executable(
+            &ssh,
+            &format!(
+                "printf '%s\\n' {}\nPIKA_TEST_ESCAPED_PID={} PIKA_TEST_ESCAPED_RELEASE={} PIKA_TEST_ESCAPED_DONE={} exec {} --exact consult::tests::escaped_pipe_holder_fixture --nocapture",
+                shell_words::quote(&opened_fixture()),
+                shell_words::quote(&pid_path.to_string_lossy()),
+                shell_words::quote(&release_path.to_string_lossy()),
+                shell_words::quote(&done_path.to_string_lossy()),
+                shell_words::quote(&test_binary.to_string_lossy()),
+            ),
+        );
+        let mut side = consultation_fixture(&ssh, Duration::from_secs(30));
+        let holder_pid = (0..500)
+            .find_map(|_| {
+                let value = fs::read_to_string(&pid_path).ok();
+                if value.is_none() {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                value
+            })
+            .expect("escaped pipe holder did not start")
+            .parse::<i32>()
+            .unwrap();
+
+        let started = Instant::now();
+        assert_eq!(
+            side.cancel().unwrap_err().kind,
+            FleetErrorKind::OutcomeUnknown
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(side.workers.is_empty());
+        assert!(side.input.is_none());
+        assert!(side.events.is_none());
+        assert!(side.pipe_stop.is_cancelled());
+        let _ = side.child.exit_status();
+        // Repeated cleanup must use the cached child status; it must never
+        // signal a numeric PID/PGID after ownership has been reaped.
+        assert_eq!(
+            side.cancel().unwrap_err().kind,
+            FleetErrorKind::OutcomeUnknown
+        );
+        assert!(side.close().is_err());
+        // SAFETY: signal zero only observes this disposable foreign fixture.
+        assert_eq!(unsafe { libc::kill(holder_pid, 0) }, 0);
+
+        fs::write(&release_path, b"release").unwrap();
+        for _ in 0..500 {
+            if done_path.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("escaped pipe holder did not finish after release");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_cleanup_interrupts_a_blocked_input_writer_and_reaps_child() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("ssh");
+        write_executable(
+            &ssh,
+            &format!(
+                "printf '%s\\n' {}; exec sleep 30",
+                shell_words::quote(&opened_fixture())
+            ),
+        );
+        let mut side = consultation_fixture(&ssh, Duration::from_millis(50));
+        let started = Instant::now();
+        let error = side.ask(&"x".repeat(MAX_QUESTION_BYTES)).unwrap_err();
+        assert_eq!(error.kind, FleetErrorKind::OutcomeUnknown);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(side.workers.is_empty());
+        assert!(side.pipe_stop.is_cancelled());
+        let _ = side.child.exit_status();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_remote_close_joins_workers_once_and_remains_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("ssh");
+        write_executable(
+            &ssh,
+            &format!(
+                "printf '%s\\n' {}\nwhile IFS= read -r line; do case \"$line\" in *close*) printf '%s\\n' '{{\"type\":\"closed\",\"receipt_version\":2,\"discarded\":true,\"cleanup\":\"complete\"}}'; exit 0;; esac; done",
+                shell_words::quote(&opened_fixture())
+            ),
+        );
+        let mut side = consultation_fixture(&ssh, Duration::from_secs(1));
+        assert_eq!(side.close().unwrap().cleanup.as_deref(), Some("complete"));
+        assert!(side.workers.is_empty());
+        assert!(side.input.is_none());
+        assert!(side.events.is_none());
+        let _ = side.child.exit_status();
+        assert_eq!(side.close().unwrap().cleanup.as_deref(), Some("complete"));
+    }
+
     fn wire_session(provider: Provider, session_id: &str, active_thread_id: Option<&str>) -> Value {
         session_to_wire(
             &Session {
@@ -4813,7 +5137,7 @@ fn spawn_jsonl_reader<R: Read + Send + 'static>(
     reader: R,
     sender: SyncSender<Result<Value, FleetError>>,
     max_frame: usize,
-) {
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         loop {
@@ -4853,13 +5177,13 @@ fn spawn_jsonl_reader<R: Read + Send + 'static>(
                 return;
             }
         }
-    });
+    })
 }
 fn spawn_bounded_stderr<R: Read + Send + 'static>(
     reader: R,
     destination: Arc<Mutex<Vec<u8>>>,
     max: usize,
-) {
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = reader;
         let mut collected = Vec::new();
@@ -4874,7 +5198,7 @@ fn spawn_bounded_stderr<R: Read + Send + 'static>(
         if let Ok(mut target) = destination.lock() {
             *target = collected;
         }
-    });
+    })
 }
 fn wait_child(child: &mut OwnedChild, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
