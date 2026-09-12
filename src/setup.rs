@@ -1,11 +1,24 @@
-use crate::{config::Config, model::Provider, paths::Paths};
+use crate::{
+    config::Config,
+    model::Provider,
+    paths::Paths,
+    store::{HookObservation, Store},
+};
 use anyhow::{Context, Result, bail};
+use regex::Regex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -35,6 +48,99 @@ pub const CLAUDE_EVENTS: &[&str] = &[
 const CLAUDE_NOTIFICATION_MATCHER: &str =
     "permission_prompt|idle_prompt|elicitation_dialog|agent_needs_input|agent_completed";
 const OPENCODE_TEMPLATE: &str = include_str!("../assets/pika-opencode.js.in");
+pub const PENDING_LAUNCH_GRACE_SECONDS: f64 = 90.0;
+const MAX_VERSION_OUTPUT_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderExecutableEvidence {
+    pub available: bool,
+    pub version: Option<String>,
+    pub compatibility_error: Option<String>,
+}
+
+impl ProviderExecutableEvidence {
+    pub fn compatible(&self) -> bool {
+        self.available && self.version.is_some() && self.compatibility_error.is_none()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderCommissioning {
+    pub provider: Provider,
+    pub required: bool,
+    pub executable: String,
+    pub runtime: ProviderExecutableEvidence,
+    pub hooks_active: bool,
+    pub expected_fingerprint: String,
+    pub observation: Option<HookObservation>,
+    pub overdue_launches: Vec<(String, f64)>,
+}
+
+impl ProviderCommissioning {
+    pub fn observed(&self) -> bool {
+        self.observation
+            .as_ref()
+            .is_some_and(|value| value.fingerprint == self.expected_fingerprint)
+    }
+
+    pub fn healthy(&self) -> bool {
+        self.runtime.compatible()
+            && self.hooks_active
+            && self.observed()
+            && self.overdue_launches.is_empty()
+    }
+
+    pub fn missing_proofs(&self) -> Vec<String> {
+        let label = provider_label(self.provider);
+        let mut missing = Vec::new();
+        if !self.runtime.available {
+            missing.push(format!(
+                "{label} executable unavailable ({})",
+                sanitize_version(&self.executable)
+            ));
+        } else if self.runtime.version.is_none() {
+            missing.push(format!("{label} version could not be verified"));
+        } else if let Some(error) = &self.runtime.compatibility_error {
+            missing.push(error.clone());
+        }
+        if !self.hooks_active {
+            missing.push(format!("{label} hooks are not active"));
+        }
+        if !self.observed() {
+            missing.push(format!("{label} matching hook event has not been observed"));
+        }
+        for (name, age) in &self.overdue_launches {
+            missing.push(format!(
+                "{label} launch {} has awaited exact identity for {:.0}s",
+                sanitize_version(name),
+                age.max(0.0),
+            ));
+        }
+        missing
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommissioningReport {
+    pub providers: Vec<ProviderCommissioning>,
+}
+
+impl CommissioningReport {
+    pub fn commissioned(&self) -> bool {
+        self.providers
+            .iter()
+            .filter(|value| value.required)
+            .all(ProviderCommissioning::healthy)
+    }
+
+    pub fn missing_proofs(&self) -> Vec<String> {
+        self.providers
+            .iter()
+            .filter(|value| value.required)
+            .flat_map(ProviderCommissioning::missing_proofs)
+            .collect()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileChange {
@@ -83,6 +189,247 @@ pub struct SetupOptions {
 pub struct ApplyReceipt {
     pub written: Vec<PathBuf>,
     pub backups: Vec<PathBuf>,
+}
+
+/// Revalidate the complete commissioning claim from current evidence. File
+/// writes alone never prove that a provider can run or that its hook has fired.
+pub fn commissioning_report(
+    paths: &SetupPaths,
+    store: &Store,
+    options: &SetupOptions,
+    required: &BTreeSet<Provider>,
+    at: f64,
+) -> CommissioningReport {
+    let executables = Provider::ALL.map(|provider| {
+        (
+            provider,
+            options
+                .provider_executables
+                .get(provider.as_str())
+                .cloned()
+                .unwrap_or_else(|| provider.as_str().to_owned()),
+        )
+    });
+    let runtimes = thread::scope(|scope| {
+        let handles = executables.each_ref().map(|(provider, executable)| {
+            scope.spawn(move || {
+                probe_provider_executable(*provider, executable, Duration::from_secs(3))
+            })
+        });
+        handles.map(|handle| {
+            handle
+                .join()
+                .unwrap_or_else(|_| ProviderExecutableEvidence {
+                    available: false,
+                    version: None,
+                    compatibility_error: Some("provider version probe failed".into()),
+                })
+        })
+    });
+    let pending = store.list_pending().unwrap_or_default();
+    let providers = Provider::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(index, provider)| {
+            let home = match provider {
+                Provider::Codex => &paths.codex_home,
+                Provider::Claude => &paths.claude_home,
+                Provider::Opencode => &paths.opencode_config_home,
+            };
+            let expected_fingerprint =
+                hook_spec_fingerprint(provider, &options.pika_executable).unwrap_or_default();
+            ProviderCommissioning {
+                provider,
+                required: required.contains(&provider),
+                executable: executables[index].1.clone(),
+                runtime: runtimes[index].clone(),
+                hooks_active: hooks_installed(home, provider, &options.pika_executable),
+                expected_fingerprint,
+                observation: store.get_hook_observation(provider).ok().flatten(),
+                overdue_launches: pending
+                    .iter()
+                    .filter(|launch| {
+                        launch.provider == provider
+                            && at - launch.created_at > PENDING_LAUNCH_GRACE_SECONDS
+                    })
+                    .map(|launch| (launch.name.clone(), at - launch.created_at))
+                    .collect(),
+            }
+        })
+        .collect();
+    CommissioningReport { providers }
+}
+
+pub fn probe_provider_executable(
+    provider: Provider,
+    executable: &str,
+    timeout: Duration,
+) -> ProviderExecutableEvidence {
+    let mut command = Command::new(executable);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            return ProviderExecutableEvidence {
+                available: false,
+                version: None,
+                compatibility_error: None,
+            };
+        }
+    };
+    let pid = child.id();
+    let output = child.stdout.take().map(read_probe_stream);
+    let errors = child.stderr.take().map(read_probe_stream);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            _ => {
+                terminate_probe_group(pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let stdout = receive_probe_stream(output, pid);
+    let stderr = receive_probe_stream(errors, pid);
+    let version = [stdout, stderr]
+        .into_iter()
+        .find(|value| !value.trim().is_empty())
+        .map(|value| sanitize_version(&value));
+    let available = status.is_some_and(|value| value.success());
+    let compatibility_error = if available {
+        provider_compatibility_error(provider, version.as_deref())
+    } else {
+        None
+    };
+    ProviderExecutableEvidence {
+        available,
+        version,
+        compatibility_error,
+    }
+}
+
+fn provider_compatibility_error(provider: Provider, version: Option<&str>) -> Option<String> {
+    if provider != Provider::Opencode {
+        return version
+            .is_none()
+            .then(|| format!("{} version could not be verified", provider_label(provider)));
+    }
+    let required = (1_u64, 18_u64, 21_u64);
+    let found = Regex::new(r"(?x)(?:^|[^0-9])(\d+)\.(\d+)\.(\d+)(?:[^0-9]|$)")
+        .expect("static semantic version expression")
+        .captures(version.unwrap_or_default())
+        .and_then(|captures| {
+            Some((
+                captures.get(1)?.as_str().parse().ok()?,
+                captures.get(2)?.as_str().parse().ok()?,
+                captures.get(3)?.as_str().parse().ok()?,
+            ))
+        });
+    match found {
+        Some(found) if found >= required => None,
+        Some(_) => Some(format!(
+            "OpenCode requires version 1.18.21 or newer; found {}",
+            version.unwrap_or("unknown")
+        )),
+        None => Some(format!(
+            "OpenCode requires version 1.18.21 or newer; could not verify {}",
+            version.unwrap_or("unknown")
+        )),
+    }
+}
+
+fn read_probe_stream(mut stream: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut retained = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    let remaining = MAX_VERSION_OUTPUT_BYTES.saturating_sub(retained.len());
+                    retained.extend_from_slice(&buffer[..count.min(remaining)]);
+                }
+            }
+        }
+        let _ = sender.send(retained);
+    });
+    receiver
+}
+
+fn receive_probe_stream(receiver: Option<mpsc::Receiver<Vec<u8>>>, pid: u32) -> String {
+    let Some(receiver) = receiver else {
+        return String::new();
+    };
+    match receiver.recv_timeout(Duration::from_millis(250)) {
+        Ok(value) => String::from_utf8_lossy(&value).into_owned(),
+        Err(_) => {
+            terminate_probe_group(pid);
+            receiver
+                .recv_timeout(Duration::from_millis(250))
+                .map(|value| String::from_utf8_lossy(&value).into_owned())
+                .unwrap_or_default()
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminate_probe_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: the provider probe was placed in its own process group in
+        // `pre_exec`; the negative PID can target only that owned group.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_probe_group(_pid: u32) {}
+
+fn sanitize_version(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn provider_label(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Codex => "Codex",
+        Provider::Claude => "Claude",
+        Provider::Opencode => "OpenCode",
+    }
 }
 
 pub fn proposed_hook_changes(

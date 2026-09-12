@@ -495,14 +495,9 @@ impl Pika {
             .collect();
         let mut candidates = Vec::new();
         for provider in Provider::ALL {
-            candidates.extend(
-                providers
-                    .discover(provider)
-                    .into_iter()
-                    .filter(|candidate| {
-                        !excluded.contains(&(candidate.provider, candidate.session_id.clone()))
-                    }),
-            );
+            candidates.extend(providers.import_candidates(provider).into_iter().filter(
+                |candidate| !excluded.contains(&(candidate.provider, candidate.session_id.clone())),
+            ));
         }
         candidates.sort_by(|left, right| right.updated_at.total_cmp(&left.updated_at));
         candidates.dedup_by(|left, right| {
@@ -525,7 +520,7 @@ impl Pika {
             .map(|session| (session.provider, session.session_id))
             .chain(Provider::ALL.into_iter().flat_map(|provider| {
                 providers
-                    .discover(provider)
+                    .import_candidates(provider)
                     .into_iter()
                     .map(move |candidate| (candidate.provider, candidate.session_id))
             }))

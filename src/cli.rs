@@ -29,6 +29,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use std::{
+    collections::BTreeSet,
     ffi::OsString,
     fs,
     io::{self, BufRead, IsTerminal, Read, Write},
@@ -1830,9 +1831,17 @@ fn skill_command(pika: &Pika, a: SkillArgs) -> Result<i32> {
 }
 
 fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
+    let first_setup = !pika.paths.config.is_file();
     let explicit_machines = a.machines.clone();
+    let explicit_machine_setup = !explicit_machines.is_empty();
     let install_bundle = a.install_bundle.clone();
     let remote_import_all = a.remote_import_all;
+    let explicit_import = a.import_all || a.browse_all || remote_import_all;
+    let tracked_before = if a.dry_run {
+        Vec::new()
+    } else {
+        pika.store.list_sessions()?
+    };
     let executable = std::env::current_exe()?.canonicalize()?;
     let mut executables = pika.config.provider_executables.clone();
     for (provider, value) in [
@@ -1914,7 +1923,7 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
         println!("Backup: {}", backup.display());
     }
     println!(
-        "Provider hooks and consultation skill ready · {} file(s) updated",
+        "Setup files applied · {} file(s) updated",
         receipt.written.len()
     );
     if let Some(request) = &schedule_request {
@@ -1925,7 +1934,85 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
             ),
         }
     }
-    if !a.no_machines && (!explicit_machines.is_empty() || io::stdin().is_terminal()) {
+    if !first_setup {
+        match pika.reconcile_local() {
+            Ok(inventory) => println!(
+                "Reconciled {} tracked conversation name(s).",
+                inventory.sessions.len()
+            ),
+            Err(error) => println!(
+                "Name reconciliation incomplete · {error}. No conversation identity was changed."
+            ),
+        }
+    }
+
+    let required = tracked_before
+        .iter()
+        .map(|session| session.provider)
+        .chain(std::iter::once(options.default_provider))
+        .collect::<BTreeSet<_>>();
+    let commissioning = setup::commissioning_report(
+        &SetupPaths::from(&pika.paths),
+        &pika.store,
+        &options,
+        &required,
+        now(),
+    );
+    println!("\nCommissioning status");
+    for provider in &commissioning.providers {
+        let proof = provider.observation.as_ref().map_or_else(
+            || "not yet proven".to_owned(),
+            |observation| {
+                if provider.observed() {
+                    format!(
+                        "{} · id {} · {:.0}s ago",
+                        setup_receipt_text(&observation.event_name),
+                        setup_receipt_text(&observation.session_id)
+                            .chars()
+                            .take(8)
+                            .collect::<String>(),
+                        (now() - observation.observed_at).max(0.0)
+                    )
+                } else {
+                    "fingerprint does not match this setup".to_owned()
+                }
+            },
+        );
+        println!(
+            "  {:<8} binary {}  hooks {}  observed {} · {} · launches {} · {}",
+            setup_provider_label(provider.provider),
+            if provider.runtime.compatible() {
+                "✓"
+            } else {
+                "✗"
+            },
+            if provider.hooks_active { "✓" } else { "✗" },
+            if provider.observed() { "✓" } else { "○" },
+            proof,
+            if provider.overdue_launches.is_empty() {
+                "healthy"
+            } else {
+                "DEGRADED"
+            },
+            if provider.required {
+                "required"
+            } else {
+                "optional"
+            },
+        );
+    }
+    if commissioning.commissioned() {
+        println!(
+            "\nPika commissioned · required integrations are compatible, active, observed, and healthy."
+        );
+    } else {
+        println!(
+            "\nPika not yet commissioned · missing proof: {}.",
+            commissioning.missing_proofs().join("; ")
+        );
+    }
+
+    if !a.no_machines && (explicit_machine_setup || (first_setup && io::stdin().is_terminal())) {
         let home = directories::BaseDirs::new()
             .context("cannot determine home directory for machine discovery")?;
         let report = fleet::discover_node_candidates(
@@ -2039,33 +2126,25 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
             }
         }
     }
-    if !a.no_import {
-        let configured = Config {
-            default_provider: options.default_provider,
-            provider_executables: options.provider_executables.clone(),
-            provider_runtime_path: options.provider_runtime_path.clone(),
-            ..Config::default()
-        };
-        let providers = crate::providers::Providers::new(&pika.paths, &configured);
-        let candidates = if a.browse_all {
-            Provider::ALL
-                .into_iter()
-                .flat_map(|p| providers.browse(p))
-                .collect()
-        } else {
-            pika.import_named()?
-        };
+    if !a.no_import && (first_setup || explicit_import) {
+        let named = pika.import_named()?;
         let mut selected = if a.import_all {
-            candidates
+            named
         } else {
-            choose_candidates(candidates)?
+            choose_candidates(named)?
         };
-        if !a.import_all
-            && !a.browse_all
-            && io::stdin().is_terminal()
-            && confirm("Browse recent unnamed conversations too? [y/N] ")?
-        {
-            selected.extend(choose_recent_candidates(pika.import_recent_unnamed(20)?)?);
+        let browse_recent = a.browse_all
+            || (!a.import_all
+                && first_setup
+                && io::stdin().is_terminal()
+                && confirm("Browse recent provider-labeled conversations too? [y/N] ")?);
+        if browse_recent {
+            let recent = pika.import_recent_unnamed(20)?;
+            if a.import_all {
+                selected.extend(recent);
+            } else {
+                selected.extend(choose_recent_candidates(recent)?);
+            }
         }
         for c in &selected {
             pika.adopt_candidate(c)?;
@@ -2080,6 +2159,31 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
         );
     }
     Ok(0)
+}
+fn setup_provider_label(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Codex => "Codex",
+        Provider::Claude => "Claude",
+        Provider::Opencode => "OpenCode",
+    }
+}
+fn setup_receipt_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(120)
+        .collect()
 }
 fn choose_machine_candidates(candidates: Vec<NodeCandidate>) -> Result<Vec<NodeCandidate>> {
     if candidates.is_empty() {

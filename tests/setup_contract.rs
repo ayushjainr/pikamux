@@ -2,12 +2,13 @@ use pikamux::model::Provider;
 use pikamux::setup::{
     FileChange, SetupOptions, SetupPaths, apply_changes, claude_settings_change,
     codex_config_change, codex_hooks_change, hooks_installed, opencode_plugin_change,
-    pika_config_change, proposed_hook_changes,
+    pika_config_change, probe_provider_executable, proposed_hook_changes,
 };
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -263,6 +264,39 @@ fn writes_are_private_and_collision_safe_backups_restore_exact_bytes() {
         fs::metadata(target).unwrap().permissions().mode() & 0o777,
         0o600
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_version_probes_are_bounded_and_reap_pipe_holding_descendants() {
+    let temp = tempfile::tempdir().unwrap();
+    let healthy = temp.path().join("healthy");
+    fs::write(
+        &healthy,
+        "#!/bin/sh\nprintf '%s\\n' 'opencode 1.18.21'\n(sleep 5) &\n",
+    )
+    .unwrap();
+    fs::set_permissions(&healthy, fs::Permissions::from_mode(0o700)).unwrap();
+    let started = Instant::now();
+    let evidence = probe_provider_executable(
+        Provider::Opencode,
+        healthy.to_str().unwrap(),
+        Duration::from_secs(1),
+    );
+    assert!(evidence.compatible());
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    let stalled = temp.path().join("stalled");
+    fs::write(&stalled, "#!/bin/sh\nsleep 5\n").unwrap();
+    fs::set_permissions(&stalled, fs::Permissions::from_mode(0o700)).unwrap();
+    let started = Instant::now();
+    let evidence = probe_provider_executable(
+        Provider::Codex,
+        stalled.to_str().unwrap(),
+        Duration::from_millis(50),
+    );
+    assert!(!evidence.available);
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 #[test]

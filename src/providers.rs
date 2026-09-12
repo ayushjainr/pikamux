@@ -33,12 +33,23 @@ impl<'a> Providers<'a> {
         self.records(provider, None, false)
     }
 
+    /// Return only conversations whose provider metadata proves that a human
+    /// explicitly chose the displayed name. This is deliberately narrower
+    /// than [`Self::discover`]: Codex currently persists a title but not its
+    /// author, so a DB/index title can support exact lookup and the opt-in
+    /// recent browser without being advertised as a personal name during
+    /// setup. Existing Pika names remain authoritative in Pika's own store.
+    pub fn import_candidates(&self, provider: Provider) -> Vec<Candidate> {
+        match provider {
+            Provider::Claude => self.records(provider, None, true),
+            Provider::Codex | Provider::Opencode => Vec::new(),
+        }
+    }
+
     pub fn discover(&self, provider: Provider) -> Vec<Candidate> {
-        // "Discover" is the conservative first setup screen: only provider
-        // state that proves a user-authored name belongs here. OpenCode's
-        // current schema exposes titles but not their provenance, so its
-        // sessions remain available through browse/exact lookup instead of
-        // being presented as personally named.
+        // Discovery also serves reconciliation, where Codex fork lineage and
+        // native rename labels are useful even though their authorship is not
+        // proven. Setup must call `import_candidates` instead.
         if provider == Provider::Opencode {
             Vec::new()
         } else {
@@ -236,8 +247,15 @@ fn codex_records(
     named_only: bool,
     identities: Option<&BTreeSet<String>>,
 ) -> Vec<Candidate> {
+    let index_records = codex_index_records(home);
     let Some(database) = newest_matching(home, "state_", ".sqlite") else {
-        return Vec::new();
+        return filter_codex_index(
+            index_records,
+            query,
+            named_only,
+            identities,
+            &BTreeSet::new(),
+        );
     };
     let Ok(db) = readonly(&database) else {
         return Vec::new();
@@ -245,7 +263,7 @@ fn codex_records(
     let Ok(columns) = columns(&db, "threads") else {
         return Vec::new();
     };
-    if !columns.contains("id") || (named_only && !columns.contains("name")) {
+    if !columns.contains("id") {
         return Vec::new();
     }
     let archived = if columns.contains("archived") {
@@ -269,13 +287,39 @@ fn codex_records(
         ],
     );
     let mut conditions = vec![archived.to_owned()];
-    if named_only {
-        conditions.push("name IS NOT NULL AND trim(name) != ''".into());
-    }
-    if query.is_some() {
-        conditions.push("(id=?1 OR lower(name)=lower(?1))".into());
-    }
+    let index_matches = query
+        .map(|needle| {
+            index_records
+                .iter()
+                .filter(|candidate| {
+                    candidate.session_id == needle
+                        || candidate
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(needle))
+                })
+                .map(|candidate| candidate.session_id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut parameters = query.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    if query.is_some() {
+        let marks = (2..2 + index_matches.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>();
+        let indexed = if marks.is_empty() {
+            String::new()
+        } else {
+            format!(" OR id IN ({})", marks.join(","))
+        };
+        let native_name = if columns.contains("name") {
+            " OR lower(name)=lower(?1)"
+        } else {
+            ""
+        };
+        conditions.push(format!("(id=?1{native_name}{indexed})"));
+        parameters.extend(index_matches);
+    }
     if let Some(identities) = identities {
         let first = parameters.len() + 1;
         let marks = (first..first + identities.len())
@@ -335,12 +379,132 @@ fn codex_records(
     let Ok(rows) = rows else {
         return Vec::new();
     };
-    let mut output: Vec<_> = rows
-        .flatten()
-        .filter(|candidate| !codex_worker(candidate, config))
-        .collect();
+    let archived_ids = if columns.contains("archived") {
+        db.prepare("SELECT id FROM threads WHERE COALESCE(archived,0) != 0")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<BTreeSet<_>>>()
+            })
+            .unwrap_or_default()
+    } else {
+        BTreeSet::new()
+    };
+    let database_rows = rows.flatten().collect::<Vec<_>>();
+    let worker_ids = database_rows
+        .iter()
+        .filter(|candidate| codex_worker(candidate, config))
+        .map(|candidate| candidate.session_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut output = database_rows
+        .into_iter()
+        .filter(|candidate| !worker_ids.contains(&candidate.session_id))
+        .collect::<Vec<_>>();
+    let mut positions = output
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| (candidate.session_id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    for indexed in filter_codex_index(index_records, query, named_only, identities, &archived_ids) {
+        if let Some(position) = positions.get(&indexed.session_id).copied() {
+            output[position].name = indexed.name;
+            output[position].updated_at = output[position].updated_at.max(indexed.updated_at);
+        } else if !worker_ids.contains(&indexed.session_id) {
+            positions.insert(indexed.session_id.clone(), output.len());
+            output.push(indexed);
+        }
+    }
+    if named_only {
+        output.retain(|candidate| {
+            candidate
+                .name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+        });
+    }
     output.sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at));
     output
+}
+
+fn codex_index_records(home: &Path) -> Vec<Candidate> {
+    let Ok(file) = File::open(home.join("session_index.jsonl")) else {
+        return Vec::new();
+    };
+    let mut records = BTreeMap::<String, Candidate>::new();
+    for line in BufReader::new(file.take(16 * 1024 * 1024))
+        .lines()
+        .map_while(Result::ok)
+        .take(100_000)
+    {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(identity) = value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(name) = value
+            .get("thread_name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let updated_at = timestamp(value.get("updated_at"));
+        records.insert(
+            identity.to_owned(),
+            Candidate {
+                provider: Provider::Codex,
+                session_id: identity.to_owned(),
+                name: Some(name.to_owned()),
+                cwd: None,
+                branch: None,
+                transcript_path: None,
+                model: None,
+                updated_at,
+                live: false,
+                pid: None,
+                source: "codex-index".into(),
+                parent_session_id: None,
+                created_at: 0.0,
+                lifecycle_status: None,
+            },
+        );
+    }
+    records.into_values().collect()
+}
+
+fn filter_codex_index(
+    records: Vec<Candidate>,
+    query: Option<&str>,
+    named_only: bool,
+    identities: Option<&BTreeSet<String>>,
+    archived_ids: &BTreeSet<String>,
+) -> Vec<Candidate> {
+    records
+        .into_iter()
+        .filter(|candidate| !archived_ids.contains(&candidate.session_id))
+        .filter(|candidate| {
+            !named_only
+                || candidate
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| !name.trim().is_empty())
+        })
+        .filter(|candidate| identities.is_none_or(|wanted| wanted.contains(&candidate.session_id)))
+        .filter(|candidate| {
+            query.is_none_or(|needle| {
+                candidate.session_id == needle
+                    || candidate
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(needle))
+            })
+        })
+        .collect()
 }
 
 fn codex_worker(candidate: &Candidate, config: &Config) -> bool {

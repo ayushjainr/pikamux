@@ -72,7 +72,7 @@ fn saved_codex(identity: &str, name: &str) -> Session {
 }
 
 #[test]
-fn codex_excludes_archived_and_proven_workers_but_preserves_fork_identity() {
+fn codex_first_screen_requires_proven_authorship_but_browse_preserves_safe_labels() {
     let root = tempfile::tempdir().unwrap();
     let paths = paths(root.path());
     fs::create_dir_all(&paths.codex_home).unwrap();
@@ -92,6 +92,7 @@ fn codex_excludes_archived_and_proven_workers_but_preserves_fork_identity() {
     let archived = "44444444-4444-4444-8444-444444444444";
     let worker = "55555555-5555-4555-8555-555555555555";
     let subagent = "66666666-6666-4666-8666-666666666666";
+    let indexed = "77777777-7777-4777-8777-777777777777";
     for (id, name, payload, hidden, updated) in [
         (named, Some("research_thread"), serde_json::json!({}), 0, 10),
         (
@@ -128,24 +129,68 @@ fn codex_excludes_archived_and_proven_workers_but_preserves_fork_identity() {
         )
         .unwrap();
     }
+    let indexed_transcript = paths.codex_home.join(format!("{indexed}.jsonl"));
+    json_line(
+        &indexed_transcript,
+        serde_json::json!({"type":"session_meta","payload":{}}),
+    );
+    db.execute(
+        "INSERT INTO threads VALUES(?1,NULL,'/project','main',?2,'gpt',1,60,0)",
+        params![indexed, indexed_transcript.to_string_lossy()],
+    )
+    .unwrap();
     drop(db);
+    fs::write(
+        paths.codex_home.join("session_index.jsonl"),
+        format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({
+                "id":indexed, "thread_name":"index-generated-label", "updated_at":60
+            }),
+            serde_json::json!({
+                "id":archived, "thread_name":"archived-index-label", "updated_at":70
+            }),
+            serde_json::json!({
+                "id":worker, "thread_name":"worker-index-label", "updated_at":80
+            })
+        ),
+    )
+    .unwrap();
 
     let config = Config {
         codex_worker_originators: vec!["automation_worker".into()],
         ..Config::default()
     };
     let providers = Providers::new(&paths, &config);
+    assert!(providers.import_candidates(Provider::Codex).is_empty());
     let records = providers.discover(Provider::Codex);
     assert_eq!(
         records
             .iter()
             .map(|item| item.session_id.as_str())
             .collect::<Vec<_>>(),
-        vec![fork, named]
+        vec![indexed, fork, named]
     );
-    assert_eq!(records[0].parent_session_id.as_deref(), Some(parent));
+    assert_eq!(records[0].name.as_deref(), Some("index-generated-label"));
+    assert_eq!(records[1].parent_session_id.as_deref(), Some(parent));
+    assert_eq!(
+        providers
+            .find(Provider::Codex, "index-generated-label")
+            .first()
+            .map(|candidate| candidate.session_id.as_str()),
+        Some(indexed)
+    );
     assert!(providers.find(Provider::Codex, archived).is_empty());
     assert!(providers.find(Provider::Codex, worker).is_empty());
+
+    let recent = providers.browse(Provider::Codex);
+    assert_eq!(recent[0].session_id, indexed);
+    assert_eq!(recent[0].name.as_deref(), Some("index-generated-label"));
+    assert!(
+        !recent
+            .iter()
+            .any(|candidate| candidate.session_id == archived)
+    );
 }
 
 #[test]
@@ -196,7 +241,7 @@ fn claude_first_screen_requires_explicit_name_and_exact_uuid_still_resolves() {
 
     let config = Config::default();
     let providers = Providers::new(&paths, &config);
-    let names = providers.discover(Provider::Claude);
+    let names = providers.import_candidates(Provider::Claude);
     assert_eq!(
         names
             .iter()
