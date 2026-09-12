@@ -630,9 +630,10 @@ impl Side {
 
 struct JsonChild {
     child: OwnedChild,
-    writes: mpsc::Sender<WriteRequest>,
-    frames: Receiver<Result<Value, String>>,
+    writes: Option<mpsc::Sender<WriteRequest>>,
+    frames: Option<Receiver<Result<Value, String>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    workers: Vec<thread::JoinHandle<()>>,
 }
 
 struct WriteRequest {
@@ -662,17 +663,18 @@ impl JsonChild {
             .take()
             .context("provider stderr was unavailable")?;
         let (sender, frames) = mpsc::sync_channel(1);
-        let _ = thread::spawn(move || read_json_frames(stdout, sender));
+        let frame_worker = thread::spawn(move || read_json_frames(stdout, sender));
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let stderr_copy = Arc::clone(&stderr);
-        let _ = thread::spawn(move || drain_bounded(stderr_pipe, stderr_copy));
+        let stderr_worker = thread::spawn(move || drain_bounded(stderr_pipe, stderr_copy));
         let (writes, write_requests) = mpsc::channel();
-        let _ = thread::spawn(move || write_requests_loop(stdin, write_requests));
+        let write_worker = thread::spawn(move || write_requests_loop(stdin, write_requests));
         Ok(Self {
             child,
-            writes,
-            frames,
+            writes: Some(writes),
+            frames: Some(frames),
             stderr,
+            workers: vec![frame_worker, stderr_worker, write_worker],
         })
     }
 
@@ -689,6 +691,8 @@ impl JsonChild {
         }
         let (sender, result) = mpsc::sync_channel(1);
         self.writes
+            .as_ref()
+            .context("provider input writer is closed")?
             .send(WriteRequest {
                 bytes,
                 result: sender,
@@ -732,6 +736,8 @@ impl JsonChild {
             }
             match self
                 .frames
+                .as_ref()
+                .context("provider output reader is closed")?
                 .recv_timeout(remaining.min(Duration::from_millis(25)))
             {
                 Ok(Ok(value)) => return Ok(value),
@@ -764,7 +770,17 @@ impl JsonChild {
     }
 
     fn terminate(&mut self) -> Result<()> {
-        terminate_child(&mut self.child)
+        let result = terminate_child(&mut self.child);
+        // Closing both channel ends releases readers blocked on a full frame
+        // queue and the stdin writer blocked waiting for its next request.
+        // The killed process closes the OS pipes, so all three owned helpers
+        // can be joined instead of silently outliving the consultation.
+        self.writes.take();
+        self.frames.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+        result
     }
 }
 
@@ -2426,6 +2442,29 @@ fn decode_chunked(mut value: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[cfg(unix)]
+    #[test]
+    fn json_child_cleanup_joins_all_pipe_workers() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '{}\\n'; sleep 5"]);
+        let mut child = JsonChild::spawn(command).unwrap();
+        assert_eq!(
+            child
+                .receive(
+                    Instant::now() + Duration::from_secs(1),
+                    &CancellationToken::default(),
+                )
+                .unwrap(),
+            serde_json::json!({})
+        );
+        let started = Instant::now();
+        child.terminate().unwrap();
+        assert!(child.workers.is_empty());
+        assert!(child.frames.is_none());
+        assert!(child.writes.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[cfg(unix)]
     #[test]

@@ -14,7 +14,10 @@ use anyhow::{Context, Result, bail};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -99,6 +102,13 @@ pub struct Pika {
     pub store: Store,
     pub tmux: Tmux,
     process_observer: Arc<dyn Fn() -> ProcessObservation + Send + Sync>,
+    local_reconcile_fence: Arc<LocalReconcileFence>,
+}
+
+#[derive(Default)]
+struct LocalReconcileFence {
+    generation: AtomicU64,
+    write_gate: Mutex<()>,
 }
 
 impl Pika {
@@ -112,6 +122,7 @@ impl Pika {
             store,
             tmux: Tmux::default(),
             process_observer: Arc::new(process::observe),
+            local_reconcile_fence: Arc::default(),
         })
     }
 
@@ -122,6 +133,7 @@ impl Pika {
             store,
             tmux,
             process_observer: Arc::new(process::observe),
+            local_reconcile_fence: Arc::default(),
         }
     }
 
@@ -145,7 +157,45 @@ impl Pika {
             .map(|observed| observed.inventory)
     }
 
+    /// Fence an observation that was started for a board which has now closed.
+    ///
+    /// Reconciliation deliberately performs slow provider/process reads before
+    /// taking its write gate. Bumping this generation under that same gate lets
+    /// an exact board action proceed immediately without allowing an older
+    /// observation to commit after it.
+    pub(crate) fn invalidate_local_reconciliation(&self) {
+        let _guard = self
+            .local_reconcile_fence
+            .write_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.local_reconcile_fence
+            .generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn reconciled_write<T>(&self, generation: u64, write: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = self
+            .local_reconcile_fence
+            .write_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .local_reconcile_fence
+            .generation
+            .load(Ordering::Acquire)
+            != generation
+        {
+            bail!("local reconciliation was superseded before it could commit")
+        }
+        write()
+    }
+
     fn reconcile_local_with_candidates(&self) -> Result<ReconciledInventory> {
+        let reconcile_generation = self
+            .local_reconcile_fence
+            .generation
+            .load(Ordering::Acquire);
         self.store.initialize()?;
         let observation = self.observe_processes();
         let processes = require_complete_processes(&observation, "reconcile ownership")?;
@@ -194,14 +244,17 @@ impl Pika {
         // Match the frozen durable-state contract: provider-proven archive or
         // deletion removes the row from daily observation. Pane tags are cleared
         // only through a generation-guarded mutation and remain best effort.
-        for session in &removed {
-            for pane in panes.iter().filter(|pane| {
-                pane.pika_provider == Some(session.provider)
-                    && pane.pika_session_id.as_deref() == Some(&session.session_id)
-            }) {
-                let _ = self.tmux.clear_tags_if_unchanged(pane);
+        self.reconciled_write(reconcile_generation, || {
+            for session in &removed {
+                for pane in panes.iter().filter(|pane| {
+                    pane.pika_provider == Some(session.provider)
+                        && pane.pika_session_id.as_deref() == Some(&session.session_id)
+                }) {
+                    let _ = self.tmux.clear_tags_if_unchanged(pane);
+                }
             }
-        }
+            Ok(())
+        })?;
         let mut wanted = BTreeMap::<Provider, BTreeMap<String, f64>>::new();
         for session in &stored {
             let activity = wanted.entry(session.provider).or_default();
@@ -281,17 +334,24 @@ impl Pika {
         // individual projection remains atomic inside its batch; the final
         // reload below observes hook writes that interleaved between batches.
         for batch in removed.chunks(RECONCILE_WRITE_BATCH) {
-            self.store.reconcile_transaction(|ledger| {
-                for session in batch {
-                    let state =
-                        match source_states.get(&(session.provider, session.session_id.clone())) {
+            self.reconciled_write(reconcile_generation, || {
+                self.store.reconcile_transaction(|ledger| {
+                    for session in batch {
+                        let state = match source_states
+                            .get(&(session.provider, session.session_id.clone()))
+                        {
                             Some(crate::providers::ProviderSourceState::Archived) => "archived",
                             Some(crate::providers::ProviderSourceState::Deleted) => "deleted",
                             _ => "source-unavailable",
                         };
-                    ledger.hide_provider_session(session.provider, &session.session_id, state)?;
-                }
-                Ok(())
+                        ledger.hide_provider_session(
+                            session.provider,
+                            &session.session_id,
+                            state,
+                        )?;
+                    }
+                    Ok(())
+                })
             })?;
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -305,11 +365,13 @@ impl Pika {
             })
             .collect::<Vec<_>>();
         for batch in restorations.chunks(RECONCILE_WRITE_BATCH) {
-            self.store.reconcile_transaction(|ledger| {
-                for session in batch {
-                    ledger.restore_provider_session(session.provider, &session.session_id)?;
-                }
-                Ok(())
+            self.reconciled_write(reconcile_generation, || {
+                self.store.reconcile_transaction(|ledger| {
+                    for session in batch {
+                        ledger.restore_provider_session(session.provider, &session.session_id)?;
+                    }
+                    Ok(())
+                })
             })?;
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -323,52 +385,60 @@ impl Pika {
             if batch.is_empty() {
                 break;
             }
-            let projected = self.store.reconcile_transaction(|ledger| {
-                let mut projected = Vec::with_capacity(batch.len());
-                for mut session in batch {
-                    let (candidate, continuation_conflicts) =
-                        continuation_candidate(&session, &candidate_map, &panes, processes, now());
-                    if let Some(candidate) = candidate {
-                        if candidate.session_id != session.session_id {
-                            session.active_thread_id = Some(candidate.session_id.clone());
+            let projected = self.reconciled_write(reconcile_generation, || {
+                self.store.reconcile_transaction(|ledger| {
+                    let mut projected = Vec::with_capacity(batch.len());
+                    for mut session in batch {
+                        let (candidate, continuation_conflicts) = continuation_candidate(
+                            &session,
+                            &candidate_map,
+                            &panes,
+                            processes,
+                            now(),
+                        );
+                        if let Some(candidate) = candidate {
+                            if candidate.session_id != session.session_id {
+                                session.active_thread_id = Some(candidate.session_id.clone());
+                            }
+                            merge_session_candidate(&mut session, candidate);
+                            if let Some(status) = candidate.lifecycle_status {
+                                let attached = panes.iter().any(|pane| {
+                                    pane.attached
+                                        && pane.pika_provider == Some(session.provider)
+                                        && pane.pika_session_id.as_deref()
+                                            == Some(&session.session_id)
+                                });
+                                let observation = crate::model::StatusObservation {
+                                    kind: ObservationKind::Lifecycle,
+                                    status,
+                                    unread: status == Status::Ready
+                                        && candidate.updated_at > session.last_event_at
+                                        && !attached,
+                                    attention_reason: (status == Status::Ready)
+                                        .then(|| "completed".into()),
+                                    error: None,
+                                    observed_at: candidate.updated_at.max(session.last_activity_at),
+                                    source: candidate.source.clone(),
+                                };
+                                ledger.record_status_observation(
+                                    session.provider,
+                                    &session.session_id,
+                                    &observation,
+                                )?;
+                            }
                         }
-                        merge_session_candidate(&mut session, candidate);
-                        if let Some(status) = candidate.lifecycle_status {
-                            let attached = panes.iter().any(|pane| {
-                                pane.attached
-                                    && pane.pika_provider == Some(session.provider)
-                                    && pane.pika_session_id.as_deref() == Some(&session.session_id)
-                            });
-                            let observation = crate::model::StatusObservation {
-                                kind: ObservationKind::Lifecycle,
-                                status,
-                                unread: status == Status::Ready
-                                    && candidate.updated_at > session.last_event_at
-                                    && !attached,
-                                attention_reason: (status == Status::Ready)
-                                    .then(|| "completed".into()),
-                                error: None,
-                                observed_at: candidate.updated_at.max(session.last_activity_at),
-                                source: candidate.source.clone(),
-                            };
-                            ledger.record_status_observation(
-                                session.provider,
-                                &session.session_id,
-                                &observation,
-                            )?;
-                        }
+                        self.reconcile_one_in(
+                            &mut session,
+                            &panes,
+                            processes,
+                            ledger,
+                            &continuation_conflicts,
+                        )?;
+                        ledger.upsert_session(&session, false)?;
+                        projected.push(session);
                     }
-                    self.reconcile_one_in(
-                        &mut session,
-                        &panes,
-                        processes,
-                        ledger,
-                        &continuation_conflicts,
-                    )?;
-                    ledger.upsert_session(&session, false)?;
-                    projected.push(session);
-                }
-                Ok(projected)
+                    Ok(projected)
+                })
             })?;
             runtime_sessions.extend(
                 projected
@@ -378,11 +448,13 @@ impl Pika {
             std::thread::sleep(Duration::from_millis(1));
         }
         for batch in fork_imports.chunks(RECONCILE_WRITE_BATCH) {
-            self.store.reconcile_transaction(|ledger| {
-                for fork in batch {
-                    let _ = ledger.upsert_session(fork, false)?;
-                }
-                Ok(())
+            self.reconciled_write(reconcile_generation, || {
+                self.store.reconcile_transaction(|ledger| {
+                    for fork in batch {
+                        let _ = ledger.upsert_session(fork, false)?;
+                    }
+                    Ok(())
+                })
             })?;
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -2043,6 +2115,54 @@ mod tests {
             pika_name: Some("portfolio_review".into()),
             pika_launch_token: None,
         }
+    }
+
+    #[test]
+    fn superseded_board_observation_cannot_erase_new_exact_identity() {
+        let (_root, mut pika) = test_pika();
+        let identity = "abababab-abab-4bab-8bab-abababababab";
+        let mut stale = test_session(identity);
+        stale.live = false;
+        stale.root_pid = None;
+        stale.tmux_session = None;
+        stale.tmux_pane = None;
+        pika.store.upsert_session(&stale, false).unwrap();
+
+        let observed = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_observed = Arc::clone(&observed);
+        let worker_release = Arc::clone(&release);
+        pika.process_observer = Arc::new(move || {
+            worker_observed.wait();
+            worker_release.wait();
+            ProcessObservation::complete(BTreeMap::new())
+        });
+
+        let worker = pika.clone();
+        let reconcile = std::thread::spawn(move || worker.reconcile_local());
+        observed.wait();
+
+        // This is the board action boundary: an exact action may now certify a
+        // newer owner while the old process/provider observation is still
+        // blocked. The old observation must never become authoritative later.
+        pika.invalidate_local_reconciliation();
+        let mut exact = stale;
+        exact.live = true;
+        exact.root_pid = Some(99_999);
+        exact.tmux_session = Some("pika-c-new-home".into());
+        exact.tmux_pane = Some("%99".into());
+        pika.store.upsert_session(&exact, false).unwrap();
+
+        release.wait();
+        let error = reconcile.join().unwrap().unwrap_err().to_string();
+        assert!(error.contains("superseded"));
+        let preserved = pika
+            .store
+            .get_session(Provider::Codex, identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.root_pid, Some(99_999));
+        assert_eq!(preserved.tmux_pane.as_deref(), Some("%99"));
     }
 
     #[test]

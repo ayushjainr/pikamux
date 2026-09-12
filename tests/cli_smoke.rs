@@ -250,6 +250,48 @@ fn wait_matches_only_unread_ready_and_uses_python_timeout_code_124() {
 
 #[cfg(unix)]
 #[test]
+fn unavailable_consultation_is_jsonl_only_and_uses_legacy_failure_code() {
+    let (_temp, mut command) = wait_command(true);
+    let output = command
+        .args(["ask", "research_thread", "--jsonl"])
+        .write_stdin("{\"close\":true}\n")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        events
+            .lines()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
+    assert!(events.contains("\"type\":\"error\""));
+    assert!(events.contains("\"delivery\":\"not_sent\""));
+    assert!(events.contains("\"type\":\"closed\""));
+
+    let (_temp, mut missing) = wait_command(true);
+    let output = missing
+        .args(["ask", "claude:archived-or-missing", "--jsonl"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        events
+            .lines()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
+    assert!(events.contains("No exact conversation"));
+    assert!(events.contains("\"type\":\"closed\""));
+}
+
+#[cfg(unix)]
+#[test]
 fn setup_separates_proven_names_from_bounded_recent_labels_and_routine_is_quiet() {
     let fixture = SetupFixture::new();
     let paths = fixture.paths();

@@ -46,6 +46,7 @@ use std::{
 };
 
 const LOCAL_RECONCILE_INTERVAL: Duration = Duration::from_secs(20);
+const JSONL_OPERATIONAL_FAILURE: i32 = 1;
 
 #[derive(Parser, Debug)]
 #[command(name="pika", version=VERSION, about="One home for your Codex, Claude, and OpenCode conversations.", after_help="Run `pika NAME` to find, protect, attach, resume, or create the exact conversation.")]
@@ -734,6 +735,11 @@ fn bare(pika: &Pika) -> Result<i32> {
         refresh_sender.clone(),
         local_refresh_delayed,
     );
+    // Once the board has returned an action, no observation that began for its
+    // old frame may write identity state after that action. The fence waits
+    // only for an already-running bounded write batch; slow provider reads are
+    // invalidated and may finish detached without becoming authoritative.
+    pika.invalidate_local_reconciliation();
     // The background SSH group is owned by this board. Cancellation is observed
     // by the command loop, which kills and reaps its exact process group before
     // the worker returns. Join it before an exact action starts another refresh.
@@ -878,9 +884,9 @@ fn finish_board_observer(
 ) {
     stop.store(true, Ordering::Relaxed);
     // Wake the local observer, but never hold Enter/quit behind an in-flight
-    // provider or tmux read. Exact row actions revalidate independently. A
-    // completed observer is joined; a slow one retains its own Pika clone and
-    // exits after its now-bounded reconciliation call observes `stop`.
+    // provider or tmux read. `bare` fences its writes before reaching here, so
+    // a completed observer can be joined and a slow read can finish detached
+    // without ever becoming authoritative.
     let _ = refresh.try_send(());
     if done.recv_timeout(Duration::from_millis(50)).is_ok() {
         let _ = worker.join();
@@ -1798,7 +1804,8 @@ fn peek(pika: &Pika, a: PeekArgs) -> Result<i32> {
                     .map_err(anyhow::Error::from)?
             );
             if a.ack {
-                manager.acknowledge(&remote).map_err(anyhow::Error::from)?;
+                let acknowledged = manager.acknowledge(&remote).map_err(anyhow::Error::from)?;
+                ensure_peek_acknowledged(acknowledged, &remote.qualified_name())?;
             }
             Ok(0)
         }
@@ -1812,10 +1819,38 @@ fn peek_session(pika: &Pika, s: Session, lines: Option<usize>, ack: bool) -> Res
         pika.capture_exact(&s, lines.unwrap_or(pika.config.peek_lines))?
     );
     if ack {
-        pika.store
-            .acknowledge_attention(s.provider, &s.session_id, s.last_event_at, false)?;
+        let acknowledged =
+            pika.store
+                .acknowledge_attention(s.provider, &s.session_id, s.last_event_at, false)?;
+        ensure_peek_acknowledged(acknowledged, &s.display_name())?;
     }
     Ok(0)
+}
+
+fn ensure_peek_acknowledged(acknowledged: bool, name: &str) -> Result<()> {
+    if !acknowledged {
+        bail!(
+            "A newer event arrived for {name} while its output was being read. That newer event remains unread; run exactly: `pika peek {} --ack` to inspect and acknowledge it.",
+            shell_words::quote(name)
+        )
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod peek_ack_tests {
+    use super::ensure_peek_acknowledged;
+
+    #[test]
+    fn stale_event_acknowledgement_is_never_reported_as_success() {
+        assert!(ensure_peek_acknowledged(true, "returns_tracker").is_ok());
+        let error = ensure_peek_acknowledged(false, "returns_tracker")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("newer event"));
+        assert!(error.contains("remains unread"));
+        assert!(error.contains("pika peek returns_tracker --ack"));
+    }
 }
 fn untrack(pika: &Pika, name: &str) -> Result<i32> {
     match resolve_named_target(pika, name, true, LocalTargetDomain::Daily)? {
@@ -3213,6 +3248,7 @@ struct RemoteJsonlRun {
     stage_durations: BTreeMap<String, Duration>,
     policy: crate::consult::ConsultationPolicy,
     output_ok: bool,
+    retry_safe_override: Option<bool>,
 }
 
 impl RemoteJsonlRun {
@@ -3229,6 +3265,7 @@ impl RemoteJsonlRun {
             stage_durations: BTreeMap::new(),
             policy,
             output_ok: true,
+            retry_safe_override: None,
         }
     }
 
@@ -3248,16 +3285,18 @@ impl RemoteJsonlRun {
                 .into_iter()
                 .map(|(stage, duration)| (stage, rounded_duration(duration)))
                 .collect(),
-            retry_safe: self.delivery == crate::consult::Delivery::NotSent
-                && matches!(
-                    self.stage,
-                    crate::consult::ConsultationStage::Prepare
-                        | crate::consult::ConsultationStage::Turn
-                )
-                && !matches!(
-                    self.cleanup,
-                    crate::consult::Cleanup::Failed | crate::consult::Cleanup::Unknown
-                ),
+            retry_safe: self.retry_safe_override.unwrap_or_else(|| {
+                self.delivery == crate::consult::Delivery::NotSent
+                    && matches!(
+                        self.stage,
+                        crate::consult::ConsultationStage::Prepare
+                            | crate::consult::ConsultationStage::Turn
+                    )
+                    && !matches!(
+                        self.cleanup,
+                        crate::consult::Cleanup::Failed | crate::consult::Cleanup::Unknown
+                    )
+            }),
             parent_transcript_unchanged: None,
             parent_transcript_verification: "not_performed",
             consultation_mode: self.policy.mode.clone(),
@@ -3301,6 +3340,7 @@ impl RemoteJsonlRun {
     fn begin_turn(&mut self) {
         self.turn += 1;
         self.delivery = crate::consult::Delivery::NotSent;
+        self.retry_safe_override = None;
         self.set_stage(crate::consult::ConsultationStage::Turn);
         self.progress(None);
     }
@@ -3352,7 +3392,58 @@ impl RemoteJsonlRun {
         {
             self.answers_received = answers;
         }
+        self.retry_safe_override = receipt.retry_safe;
     }
+}
+
+fn jsonl_preparation_failure(policy: crate::consult::ConsultationPolicy, message: &str) -> i32 {
+    let mut run = RemoteJsonlRun::new(policy);
+    run.cleanup = crate::consult::Cleanup::Complete;
+    run.retry_safe_override = Some(false);
+    run.progress(Some("failed"));
+    let receipt = run.receipt();
+    run.output_ok &= emit_jsonl_value(consultation_error_value_from_parts(
+        &run.policy,
+        &receipt,
+        message,
+        None,
+    ));
+    run.output_ok &= emit_jsonl_value(consultation_closed_value(&receipt, &run.policy, true));
+    JSONL_OPERATIONAL_FAILURE
+}
+
+fn jsonl_policy_or_failure(
+    provider: Provider,
+    fast: bool,
+) -> Result<crate::consult::ConsultationPolicy, i32> {
+    crate::consult::consultation_policy(provider, fast).map_err(|error| {
+        jsonl_preparation_failure(
+            crate::consult::ConsultationPolicy {
+                mode: "invalid".into(),
+                model: None,
+                effort: None,
+            },
+            &error.to_string(),
+        )
+    })
+}
+
+fn unresolved_jsonl_policy(
+    pika: &Pika,
+    name: &str,
+    fast: bool,
+) -> crate::consult::ConsultationPolicy {
+    let provider = name
+        .split_once(':')
+        .and_then(|(prefix, _)| prefix.parse::<Provider>().ok())
+        .unwrap_or(pika.config.default_provider);
+    crate::consult::consultation_policy(provider, fast).unwrap_or(
+        crate::consult::ConsultationPolicy {
+            mode: "invalid".into(),
+            model: None,
+            effort: None,
+        },
+    )
 }
 
 fn rounded_duration(duration: Duration) -> f64 {
@@ -3415,7 +3506,7 @@ mod consultation_jsonl_schema_tests {
     use super::{
         RemoteJsonlRun, consultation_answer_value, consultation_closed_value,
         consultation_error_value_from_parts, consultation_opened_value,
-        consultation_progress_value, remote_opened_value,
+        consultation_progress_value, jsonl_input_error_value, remote_opened_value,
     };
     use crate::{
         consult::{
@@ -3518,6 +3609,36 @@ mod consultation_jsonl_schema_tests {
     }
 
     #[test]
+    fn local_and_remote_input_failures_use_one_flat_machine_schema() {
+        let value = jsonl_input_error_value(&receipt(), &policy(), "oversized input");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["stage"], "input");
+        assert_eq!(value["delivery"], "not_sent");
+        assert_eq!(value["retry_safe"], false);
+        assert_eq!(value["message"], "oversized input");
+        assert!(value.get("receipt").is_none());
+        assert!(value.get("policy").is_none());
+    }
+
+    #[test]
+    fn remote_retry_safety_is_taken_from_the_authoritative_receipt() {
+        let mut run = RemoteJsonlRun::new(policy());
+        run.begin_turn();
+        run.submission_started();
+        run.absorb_remote_receipt(Some(&crate::fleet::ConsultationReceipt {
+            stage: Some("turn".into()),
+            delivery: Some("not_sent".into()),
+            cleanup: Some("pending".into()),
+            answers_received: Some(0),
+            turn: Some(1),
+            retry_safe: Some(true),
+        }));
+        assert!(run.receipt().retry_safe);
+        run.begin_turn();
+        assert!(run.retry_safe_override.is_none());
+    }
+
+    #[test]
     fn frozen_opened_and_answer_schemas_are_flat() {
         let root = tempfile::tempdir().unwrap();
         let executable = root.path().join("codex");
@@ -3611,14 +3732,38 @@ mod consultation_jsonl_schema_tests {
 }
 
 fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
-    let session = match resolve_named_target(pika, &a.name, false, LocalTargetDomain::Expert)? {
+    let resolved = match resolve_named_target(pika, &a.name, false, LocalTargetDomain::Expert) {
+        Ok(target) => target,
+        Err(error) if a.jsonl => {
+            return Ok(jsonl_preparation_failure(
+                unresolved_jsonl_policy(pika, &a.name, a.fast),
+                &error.to_string(),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let session = match resolved {
         Some(NamedTarget::Remote(remote)) => return ask_remote(pika, *remote, a),
         Some(NamedTarget::Local(session)) => *session,
+        None if a.jsonl => {
+            return Ok(jsonl_preparation_failure(
+                unresolved_jsonl_policy(pika, &a.name, a.fast),
+                &format!("No exact conversation named {:?}.", a.name),
+            ));
+        }
         None => bail!("No exact conversation named {:?}.", a.name),
     };
     let mut options =
         crate::consult::ConsultationOptions::new(pika.config.executable(session.provider));
     options.fast = a.fast;
+    let jsonl_policy = if a.jsonl {
+        match jsonl_policy_or_failure(session.provider, a.fast) {
+            Ok(policy) => Some(policy),
+            Err(code) => return Ok(code),
+        }
+    } else {
+        None
+    };
     let jsonl_output_ok = Arc::new(AtomicBool::new(true));
     if a.jsonl {
         let output_ok = Arc::clone(&jsonl_output_ok);
@@ -3634,7 +3779,14 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
         options.opencode_database = Some(pika.paths.opencode_data_home.join("opencode.db"));
     }
     let mut side = if a.jsonl {
-        crate::experts::require_local_source_available(&pika.paths, &pika.config, &session)?;
+        if let Err(error) =
+            crate::experts::require_local_source_available(&pika.paths, &pika.config, &session)
+        {
+            return Ok(jsonl_preparation_failure(
+                jsonl_policy.expect("JSONL policy was prepared"),
+                &error.to_string(),
+            ));
+        }
         match crate::consult::Consultation::open(&session, options) {
             Ok(side) => side,
             Err(error) => {
@@ -3653,7 +3805,7 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
                     &policy,
                     error.receipt.cleanup == crate::consult::Cleanup::Complete,
                 ));
-                return Ok(2);
+                return Ok(JSONL_OPERATIONAL_FAILURE);
             }
         }
     } else {
@@ -3662,7 +3814,7 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
     if a.jsonl {
         if !jsonl_output_ok.load(Ordering::Acquire) {
             let _ = side.close();
-            return Ok(2);
+            return Ok(JSONL_OPERATIONAL_FAILURE);
         }
         return ask_jsonl(&mut side, &session, &a.question.join(" "));
     }
@@ -3704,13 +3856,25 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
 }
 
 fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i32> {
-    require_remote_source_available(&remote)?;
-    let local_policy = crate::consult::consultation_policy(remote.session.provider, a.fast)?;
+    let local_policy = if a.jsonl {
+        match jsonl_policy_or_failure(remote.session.provider, a.fast) {
+            Ok(policy) => policy,
+            Err(code) => return Ok(code),
+        }
+    } else {
+        crate::consult::consultation_policy(remote.session.provider, a.fast)?
+    };
+    if let Err(error) = require_remote_source_available(&remote) {
+        if a.jsonl {
+            return Ok(jsonl_preparation_failure(local_policy, &error.to_string()));
+        }
+        return Err(error);
+    }
     let mut jsonl_run = a.jsonl.then(|| RemoteJsonlRun::new(local_policy.clone()));
     if let Some(run) = jsonl_run.as_mut() {
         run.progress(None);
         if !run.output_ok {
-            return Ok(2);
+            return Ok(JSONL_OPERATIONAL_FAILURE);
         }
     }
     let policy = fleet::ConsultationPolicy {
@@ -3718,10 +3882,23 @@ fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i3
         model: local_policy.model.clone().unwrap_or_default(),
         effort: local_policy.effort.clone().unwrap_or_default(),
     };
-    let node = pika
-        .store
-        .get_fleet_node(&remote.node_id)?
-        .context("Remote expert machine is no longer trusted")?;
+    let node = match pika.store.get_fleet_node(&remote.node_id) {
+        Ok(Some(node)) => node,
+        Ok(None) if a.jsonl => {
+            return Ok(jsonl_preparation_failure(
+                local_policy,
+                "Remote expert machine is no longer trusted",
+            ));
+        }
+        Ok(None) => bail!("Remote expert machine is no longer trusted"),
+        Err(error) if a.jsonl => {
+            return Ok(jsonl_preparation_failure(
+                local_policy,
+                &format!("Remote expert machine could not be read: {error}"),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let opened = fleet::RemoteConsultation::open(
         &SshTransport::default(),
         node,
@@ -3751,7 +3928,7 @@ fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i3
                 &run.policy,
                 false,
             ));
-            return Ok(2);
+            return Ok(JSONL_OPERATIONAL_FAILURE);
         }
         Err(error) => return Err(anyhow::Error::from(error)),
     };
@@ -3760,7 +3937,7 @@ fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i3
         run.progress(Some("complete"));
         if !run.output_ok {
             let _ = side.close();
-            return Ok(2);
+            return Ok(JSONL_OPERATIONAL_FAILURE);
         }
         return ask_remote_jsonl(&mut side, &remote, &a.question.join(" "), run);
     }
@@ -3828,24 +4005,24 @@ fn ask_remote_jsonl(
     let mut result = 0;
     if !run.output_ok {
         let _ = side.close();
-        return Ok(2);
+        return Ok(JSONL_OPERATIONAL_FAILURE);
     }
     if !initial.trim().is_empty() {
         run.begin_turn();
         if !run.output_ok {
             let _ = side.close();
-            return Ok(2);
+            return Ok(JSONL_OPERATIONAL_FAILURE);
         }
         run.submission_started();
         if !run.output_ok {
             let _ = side.close();
-            return Ok(2);
+            return Ok(JSONL_OPERATIONAL_FAILURE);
         }
         match side.ask(initial) {
             Ok(answer) => {
                 run.answer_received();
                 if !run.output_ok {
-                    result = 2;
+                    result = JSONL_OPERATIONAL_FAILURE;
                 }
                 let mut value = consultation_event_value("answer", &run.receipt(), &run.policy);
                 value
@@ -3854,19 +4031,21 @@ fn ask_remote_jsonl(
                     .insert("text".into(), serde_json::json!(answer));
                 run.output_ok &= emit_jsonl_value(value);
                 if !run.output_ok {
-                    result = 2;
+                    result = JSONL_OPERATIONAL_FAILURE;
                 }
             }
             Err(error) => {
                 run.absorb_remote_receipt(error.receipt.as_deref());
                 run.progress(Some("failed"));
-                emit_jsonl_value(consultation_error_value_from_parts(
+                run.output_ok &= emit_jsonl_value(consultation_error_value_from_parts(
                     &run.policy,
                     &run.receipt(),
                     &error.message,
                     None,
                 ));
-                result = 2;
+                if !run.receipt().retry_safe || !run.output_ok {
+                    result = JSONL_OPERATIONAL_FAILURE;
+                }
             }
         }
     }
@@ -3877,27 +4056,36 @@ fn ask_remote_jsonl(
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(error) => {
-                    eprintln!("pika: remote consultation input failed: {error}");
-                    result = 2;
+                    run.output_ok &= emit_jsonl_input_error_from_parts(
+                        &run.receipt(),
+                        &run.policy,
+                        &format!("consultation input failed: {error}"),
+                    );
+                    result = JSONL_OPERATIONAL_FAILURE;
                     break;
                 }
             };
-            let value: serde_json::Value = match serde_json::from_str(&line) {
-                Ok(value) => value,
-                Err(error) => {
-                    let mut value = consultation_event_value("error", &run.receipt(), &run.policy);
-                    let fields = value
-                        .as_object_mut()
-                        .expect("consultation event is an object");
-                    fields.insert("stage".into(), serde_json::json!("input"));
-                    fields.insert("delivery".into(), serde_json::json!("not_sent"));
-                    fields.insert("retry_safe".into(), serde_json::json!(false));
-                    fields.insert(
-                        "message".into(),
-                        serde_json::json!(format!("invalid JSONL question: {error}")),
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(value) if value.is_object() => value,
+                Ok(_) => {
+                    run.output_ok &= emit_jsonl_input_error_from_parts(
+                        &run.receipt(),
+                        &run.policy,
+                        "each --jsonl line must be a JSON object",
                     );
-                    run.output_ok &= emit_jsonl_value(value);
-                    result = 2;
+                    result = JSONL_OPERATIONAL_FAILURE;
+                    break;
+                }
+                Err(error) => {
+                    run.output_ok &= emit_jsonl_input_error_from_parts(
+                        &run.receipt(),
+                        &run.policy,
+                        &format!("invalid JSONL question: {error}"),
+                    );
+                    result = JSONL_OPERATIONAL_FAILURE;
                     break;
                 }
             };
@@ -3909,36 +4097,29 @@ fn ask_remote_jsonl(
                 .and_then(serde_json::Value::as_str)
                 .filter(|question| !question.trim().is_empty())
             else {
-                let mut value = consultation_event_value("error", &run.receipt(), &run.policy);
-                let fields = value
-                    .as_object_mut()
-                    .expect("consultation event is an object");
-                fields.insert("stage".into(), serde_json::json!("input"));
-                fields.insert("delivery".into(), serde_json::json!("not_sent"));
-                fields.insert("retry_safe".into(), serde_json::json!(false));
-                fields.insert(
-                    "message".into(),
-                    serde_json::json!("each JSONL object needs `question` or {\"close\":true}"),
+                run.output_ok &= emit_jsonl_input_error_from_parts(
+                    &run.receipt(),
+                    &run.policy,
+                    "each --jsonl object needs a string `question` or {\"close\":true}",
                 );
-                run.output_ok &= emit_jsonl_value(value);
-                result = 2;
+                result = JSONL_OPERATIONAL_FAILURE;
                 break;
             };
             run.begin_turn();
             if !run.output_ok {
-                result = 2;
+                result = JSONL_OPERATIONAL_FAILURE;
                 break;
             }
             run.submission_started();
             if !run.output_ok {
-                result = 2;
+                result = JSONL_OPERATIONAL_FAILURE;
                 break;
             }
             match side.ask(question) {
                 Ok(answer) => {
                     run.answer_received();
                     if !run.output_ok {
-                        result = 2;
+                        result = JSONL_OPERATIONAL_FAILURE;
                         break;
                     }
                     let mut value = consultation_event_value("answer", &run.receipt(), &run.policy);
@@ -3948,21 +4129,23 @@ fn ask_remote_jsonl(
                         .insert("text".into(), serde_json::json!(answer));
                     run.output_ok &= emit_jsonl_value(value);
                     if !run.output_ok {
-                        result = 2;
+                        result = JSONL_OPERATIONAL_FAILURE;
                         break;
                     }
                 }
                 Err(error) => {
                     run.absorb_remote_receipt(error.receipt.as_deref());
                     run.progress(Some("failed"));
-                    emit_jsonl_value(consultation_error_value_from_parts(
+                    run.output_ok &= emit_jsonl_value(consultation_error_value_from_parts(
                         &run.policy,
                         &run.receipt(),
                         &error.message,
                         None,
                     ));
-                    result = 2;
-                    break;
+                    if !run.receipt().retry_safe || !run.output_ok {
+                        result = JSONL_OPERATIONAL_FAILURE;
+                        break;
+                    }
                 }
             }
         }
@@ -3992,7 +4175,7 @@ fn ask_remote_jsonl(
                 &run.policy,
                 false,
             ));
-            result = 2;
+            result = JSONL_OPERATIONAL_FAILURE;
         }
     }
     Ok(result)
@@ -4006,19 +4189,22 @@ fn ask_jsonl(
     let mut input = io::stdin().lock();
     if !emit_jsonl_value(consultation_opened_value(side, session)) {
         let _ = side.close();
-        return Ok(2);
+        return Ok(JSONL_OPERATIONAL_FAILURE);
     }
     let mut result = 0;
     if !initial.trim().is_empty() {
         match side.ask(initial) {
             Ok(answer) => {
                 if !emit_jsonl_value(consultation_answer_value(side, &answer)) {
-                    result = 2;
+                    result = JSONL_OPERATIONAL_FAILURE;
                 }
             }
             Err(error) => {
-                let _ = emit_jsonl_value(consultation_error_value(side.policy(), &error));
-                result = 2;
+                let retry_safe = error.receipt.retry_safe;
+                let output_ok = emit_jsonl_value(consultation_error_value(side.policy(), &error));
+                if !retry_safe || !output_ok {
+                    result = JSONL_OPERATIONAL_FAILURE;
+                }
             }
         }
     }
@@ -4032,7 +4218,7 @@ fn ask_jsonl(
             Err(error) => {
                 let _ =
                     emit_jsonl_input_error(side, &format!("consultation input failed: {error}"));
-                result = 2;
+                result = JSONL_OPERATIONAL_FAILURE;
                 break;
             }
         };
@@ -4043,12 +4229,12 @@ fn ask_jsonl(
             Ok(value) if value.is_object() => value,
             Ok(_) => {
                 let _ = emit_jsonl_input_error(side, "each --jsonl line must be a JSON object");
-                result = 2;
+                result = JSONL_OPERATIONAL_FAILURE;
                 break;
             }
             Err(error) => {
                 let _ = emit_jsonl_input_error(side, &format!("invalid JSONL question: {error}"));
-                result = 2;
+                result = JSONL_OPERATIONAL_FAILURE;
                 break;
             }
         };
@@ -4064,13 +4250,13 @@ fn ask_jsonl(
                 side,
                 "each --jsonl object needs a string `question` or {\"close\":true}",
             );
-            result = 2;
+            result = JSONL_OPERATIONAL_FAILURE;
             break;
         };
         match side.ask(question) {
             Ok(answer) => {
                 if !emit_jsonl_value(consultation_answer_value(side, &answer)) {
-                    result = 2;
+                    result = JSONL_OPERATIONAL_FAILURE;
                     break;
                 }
             }
@@ -4078,7 +4264,7 @@ fn ask_jsonl(
                 let retry_safe = error.receipt.retry_safe;
                 let output_ok = emit_jsonl_value(consultation_error_value(side.policy(), &error));
                 if !retry_safe || !output_ok {
-                    result = 2;
+                    result = JSONL_OPERATIONAL_FAILURE;
                     break;
                 }
             }
@@ -4086,7 +4272,7 @@ fn ask_jsonl(
     }
     let cleanup = side.close();
     if let Err(error) = &cleanup {
-        result = 2;
+        result = JSONL_OPERATIONAL_FAILURE;
         let _ = emit_jsonl_value(consultation_error_value(side.policy(), error));
     }
     let receipt = side.receipt();
@@ -4228,7 +4414,7 @@ fn serve_fleet_consultation(
     })) {
         cancellation.cancel();
         let _ = side.close();
-        return Ok(2);
+        return Ok(JSONL_OPERATIONAL_FAILURE);
     }
     let mut result = 0;
     for input in inputs {
@@ -4240,7 +4426,7 @@ fn serve_fleet_consultation(
                         "policy":side.policy(),
                     })) {
                         cancellation.cancel();
-                        result = 2;
+                        result = JSONL_OPERATIONAL_FAILURE;
                         break;
                     }
                 }
@@ -4259,7 +4445,7 @@ fn serve_fleet_consultation(
                         if !output_ok {
                             cancellation.cancel();
                         }
-                        result = 2;
+                        result = JSONL_OPERATIONAL_FAILURE;
                         break;
                     }
                 }
@@ -4267,14 +4453,14 @@ fn serve_fleet_consultation(
             FleetConsultationInput::Close => break,
             FleetConsultationInput::InputError(message) => {
                 let _ = emit_jsonl_input_error(side, &message);
-                result = 2;
+                result = JSONL_OPERATIONAL_FAILURE;
                 break;
             }
         }
     }
     let cleanup = side.close();
     if cleanup.is_err() {
-        result = 2;
+        result = JSONL_OPERATIONAL_FAILURE;
     }
     let receipt = side.receipt();
     let _ = emit_jsonl_value(serde_json::json!({
@@ -4289,7 +4475,23 @@ fn serve_fleet_consultation(
 }
 
 fn emit_jsonl_input_error(side: &crate::consult::Consultation, message: &str) -> bool {
-    let mut value = consultation_event_value("error", &side.receipt(), side.policy());
+    emit_jsonl_input_error_from_parts(&side.receipt(), side.policy(), message)
+}
+
+fn emit_jsonl_input_error_from_parts(
+    receipt: &crate::consult::ConsultationReceipt,
+    policy: &crate::consult::ConsultationPolicy,
+    message: &str,
+) -> bool {
+    emit_jsonl_value(jsonl_input_error_value(receipt, policy, message))
+}
+
+fn jsonl_input_error_value(
+    receipt: &crate::consult::ConsultationReceipt,
+    policy: &crate::consult::ConsultationPolicy,
+    message: &str,
+) -> serde_json::Value {
+    let mut value = consultation_event_value("error", receipt, policy);
     let object = value
         .as_object_mut()
         .expect("consultation event is an object");
@@ -4297,7 +4499,7 @@ fn emit_jsonl_input_error(side: &crate::consult::Consultation, message: &str) ->
     object.insert("delivery".into(), serde_json::json!("not_sent"));
     object.insert("retry_safe".into(), serde_json::json!(false));
     object.insert("message".into(), serde_json::json!(message));
-    emit_jsonl_value(value)
+    value
 }
 
 fn consultation_error(error: crate::consult::ConsultationError) -> anyhow::Error {

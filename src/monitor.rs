@@ -210,7 +210,7 @@ impl ConsultationDriver {
         let cancellation = CancellationToken::default();
         let worker_cancellation = cancellation.clone();
         let worker = Arc::clone(&self.worker);
-        thread::spawn(move || {
+        let worker_handle = thread::spawn(move || {
             let result = worker(ConsultationIo {
                 item,
                 commands: command_receiver,
@@ -225,6 +225,7 @@ impl ConsultationDriver {
             event_receiver,
             finish_receiver,
             cancellation,
+            Some(worker_handle),
         )
     }
 }
@@ -512,6 +513,7 @@ struct ChatState {
     scroll: usize,
     close_requested: bool,
     cancellation: CancellationToken,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl ChatState {
@@ -523,6 +525,7 @@ impl ChatState {
         event_receiver: Receiver<ConsultationEvent>,
         finish_receiver: Receiver<std::result::Result<ConsultationOutcome, String>>,
         cancellation: CancellationToken,
+        worker: Option<thread::JoinHandle<()>>,
     ) -> Self {
         Self {
             name,
@@ -543,6 +546,7 @@ impl ChatState {
             scroll: 0,
             close_requested: false,
             cancellation,
+            worker,
         }
     }
 
@@ -566,6 +570,7 @@ impl ChatState {
             scroll: 0,
             close_requested: false,
             cancellation: CancellationToken::default(),
+            worker: None,
         }
     }
 
@@ -712,6 +717,18 @@ impl ChatState {
                 self.fail(error);
                 false
             }
+        }
+    }
+}
+
+impl Drop for ChatState {
+    fn drop(&mut self) {
+        let _ = self.request_close();
+        // The provider/SSH process group belongs to this panel. Cancellation
+        // interrupts every supported worker path; joining here ensures a
+        // second Ctrl-C or Esc cannot let main exit while cleanup is detached.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -2186,6 +2203,26 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         assert!(board.chat.is_none());
+    }
+
+    #[test]
+    fn forced_board_exit_joins_private_consultation_cleanup() {
+        let cleaned = Arc::new(Mutex::new(false));
+        let observed = Arc::clone(&cleaned);
+        let driver = ConsultationDriver::new(move |io| {
+            while !io.cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(2));
+            }
+            *observed.lock().unwrap() = true;
+            Ok(ConsultationOutcome::discarded())
+        });
+        let mut board = board(Status::Working);
+        board.key(key(KeyCode::Char('a')), Some(&driver));
+        let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(board.key(interrupt, Some(&driver)), None);
+        assert_eq!(board.key(interrupt, Some(&driver)), Some(BoardAction::Quit));
+        drop(board);
+        assert!(*cleaned.lock().unwrap());
     }
 
     #[test]

@@ -421,6 +421,34 @@ import json
 import os
 from pathlib import Path
 import urllib.request
+import dataclasses
+import sys
+import types
+
+# The frozen release requires Python 3.10. Apple's command-line-tools Python is
+# 3.9, so this test-only startup shim emulates dataclass(slots=True) closely
+# enough to execute the unmodified updater path. Supported user runtimes need
+# no shim.
+_real_dataclass = dataclasses.dataclass
+def _compatible_dataclass(*args, **kwargs):
+    kwargs.pop("slots", None)
+    return _real_dataclass(*args, **kwargs)
+dataclasses.dataclass = _compatible_dataclass
+
+# The updater does not inspect processes, but importing the frozen CLI loads
+# its Darwin adapter. Keep this offline test independent of optional psutil.
+if "psutil" not in sys.modules:
+    psutil = types.ModuleType("psutil")
+    class _PsutilError(Exception): pass
+    psutil.Error = _PsutilError
+    psutil.Process = lambda _pid: (_ for _ in ()).throw(_PsutilError())
+    psutil.pids = lambda: []
+    for _name in (
+        "RUNNING", "SLEEPING", "DISK_SLEEP", "STOPPED", "TRACING_STOP",
+        "ZOMBIE", "DEAD", "IDLE",
+    ):
+        setattr(psutil, "STATUS_" + _name, _name)
+    sys.modules["psutil"] = psutil
 
 class _OfflineRelease:
     def __init__(self, url, payload):
