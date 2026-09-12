@@ -143,9 +143,15 @@ def main() -> None:
     parser.add_argument("--python-reference", type=Path)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--input-samples", type=int, default=1000)
+    parser.add_argument("--rows", type=int, default=200)
+    parser.add_argument("--remote-nodes", type=int, default=1)
     args = parser.parse_args()
     if args.samples < 1 or args.input_samples < 1:
         raise SystemExit("sample counts must be positive")
+    if args.rows < 0:
+        raise SystemExit("--rows must be non-negative")
+    if not 1 <= args.remote_nodes <= 20:
+        raise SystemExit("--remote-nodes must be between 1 and 20")
     root = Path(__file__).resolve().parents[1]
     binary = args.binary.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="pika-board-benchmark-") as temporary:
@@ -171,7 +177,8 @@ def main() -> None:
                 str(root / "tests" / "fixtures" / "mixed_runtime_driver.py"),
                 "seed-board",
                 str(database),
-                "200",
+                str(args.rows),
+                str(args.remote_nodes),
             ],
             env=seed_environment,
             check=True,

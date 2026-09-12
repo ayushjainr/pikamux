@@ -51,7 +51,9 @@ def process_tree_metrics(root_pid: int) -> tuple[int, float]:
     return sum(row[1] for row in present), sum(row[2] for row in present)
 
 
-def seed(root: Path, project: Path) -> tuple[Path, dict[str, str]]:
+def seed(
+    root: Path, project: Path, rows: int, remote_nodes: int
+) -> tuple[Path, dict[str, str]]:
     for child in (
         "home",
         "config",
@@ -94,7 +96,8 @@ def seed(root: Path, project: Path) -> tuple[Path, dict[str, str]]:
             str(project / "tests" / "fixtures" / "mixed_runtime_driver.py"),
             "seed-board",
             str(database),
-            "200",
+            str(rows),
+            str(remote_nodes),
         ],
         env=base,
         check=True,
@@ -163,11 +166,17 @@ def main() -> None:
     parser.add_argument("--seconds", type=int, default=300)
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--program", choices=("native", "python", "both"), default="both")
+    parser.add_argument("--rows", type=int, default=200)
+    parser.add_argument("--remote-nodes", type=int, default=1)
     args = parser.parse_args()
     if args.seconds < 10:
         raise SystemExit("--seconds must be at least 10")
     if args.runs < 1:
         raise SystemExit("--runs must be at least 1")
+    if args.rows < 0:
+        raise SystemExit("--rows must be non-negative")
+    if not 1 <= args.remote_nodes <= 20:
+        raise SystemExit("--remote-nodes must be between 1 and 20")
     project = Path(__file__).resolve().parents[1]
     programs = {
         "native": args.native.resolve(strict=True),
@@ -186,7 +195,12 @@ def main() -> None:
             # either implementation while keeping contenders non-concurrent.
             ordered = configured if run % 2 == 0 else list(reversed(configured))
             for label, program in ordered:
-                _, environment = seed(root / f"{run}-{label}", project)
+                _, environment = seed(
+                    root / f"{run}-{label}",
+                    project,
+                    args.rows,
+                    args.remote_nodes,
+                )
                 complete_marker = b"q quit" if label == "python" else b"q leave"
                 results[label].append(
                     measure(program, environment, args.seconds, complete_marker)

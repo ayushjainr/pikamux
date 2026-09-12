@@ -205,7 +205,7 @@ def fleet_serve(database: Path) -> None:
     handle_fleet_stdio(FakePika(database), sys.stdin, sys.stdout)
 
 
-def seed_board(database: Path, count: int) -> None:
+def seed_board(database: Path, count: int, remote_count: int = 1) -> None:
     store = Store(database)
     store.initialize()
     statuses = (
@@ -239,53 +239,71 @@ def seed_board(database: Path, count: int) -> None:
                 last_activity_at=2000.0 + index,
             )
         )
-    remote_node_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     captured_at = time.time()
-    store.upsert_fleet_node(
-        FleetNode(
-            node_id=remote_node_id,
-            alias="offline-fixture",
-            ssh_target="offline.invalid",
-            sources=("performance-fixture",),
-            status="ready",
-            protocol_version=2,
-            package_version="fixture",
-            capabilities=tuple(CAPABILITIES),
+    for remote_index in range(remote_count):
+        remote_node_id = (
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            if remote_index == 0
+            else str(uuid.UUID(int=0xA0000000000000000000000000000000 + remote_index))
+        )
+        alias = "offline-fixture" if remote_index == 0 else f"offline-fixture-{remote_index + 1}"
+        store.upsert_fleet_node(
+            FleetNode(
+                node_id=remote_node_id,
+                alias=alias,
+                ssh_target=f"offline-{remote_index + 1}.invalid",
+                sources=("performance-fixture",),
+                status="ready",
+                protocol_version=2,
+                package_version="fixture",
+                capabilities=tuple(CAPABILITIES),
+                created_at=captured_at,
+                updated_at=captured_at,
+            )
+        )
+        remote = Session(
+            "codex",
+            (
+                str(uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"))
+                if remote_index == 0
+                else str(uuid.UUID(int=0xB0000000000000000000000000000000 + remote_index))
+            ),
+            name=(
+                "remote_offline_fixture"
+                if remote_index == 0
+                else f"remote_offline_fixture_{remote_index + 1}"
+            ),
+            cwd=f"/synthetic/remote-project-{remote_index + 1}",
+            status=Status.NEEDS_YOU.value,
+            unread=True,
+            attention_reason="question",
+            source="performance-remote-cache",
+            managed=True,
             created_at=captured_at,
             updated_at=captured_at,
+            last_event_at=captured_at,
+            last_activity_at=captured_at,
+        )
+        store.put_remote_snapshot(
+            remote_node_id,
+            {
+                "type": "snapshot",
+                "protocol": PROTOCOL_NAME,
+                "version": PROTOCOL_VERSION,
+                "node_id": remote_node_id,
+                "machine": alias,
+                "captured_at": captured_at,
+                "sessions": [session_to_wire(remote)],
+                "profiles": [],
+                "cards": [],
+            },
+            captured_at=captured_at,
+        )
+    print(
+        json.dumps(
+            {"seeded": count, "remote_nodes": remote_count}, separators=(",", ":")
         )
     )
-    remote = Session(
-        "codex",
-        str(uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")),
-        name="remote_offline_fixture",
-        cwd="/synthetic/remote-project",
-        status=Status.NEEDS_YOU.value,
-        unread=True,
-        attention_reason="question",
-        source="performance-remote-cache",
-        managed=True,
-        created_at=captured_at,
-        updated_at=captured_at,
-        last_event_at=captured_at,
-        last_activity_at=captured_at,
-    )
-    store.put_remote_snapshot(
-        remote_node_id,
-        {
-            "type": "snapshot",
-            "protocol": PROTOCOL_NAME,
-            "version": PROTOCOL_VERSION,
-            "node_id": remote_node_id,
-            "machine": "offline-fixture",
-            "captured_at": captured_at,
-            "sessions": [session_to_wire(remote)],
-            "profiles": [],
-            "cards": [],
-        },
-        captured_at=captured_at,
-    )
-    print(json.dumps({"seeded": count}, separators=(",", ":")))
 
 
 def validate_rust_transcript(database: Path, transcript: Path) -> None:
@@ -349,7 +367,11 @@ def main() -> None:
     elif args.command == "fleet-serve":
         fleet_serve(args.database)
     elif args.command == "seed-board":
-        seed_board(args.database, int(args.extra[0]))
+        seed_board(
+            args.database,
+            int(args.extra[0]),
+            int(args.extra[1]) if len(args.extra) > 1 else 1,
+        )
     else:
         validate_rust_transcript(args.database, Path(args.extra[0]))
 
