@@ -114,6 +114,13 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
     let temp = tempfile::tempdir().unwrap();
     let socket = format!("pika-rust-receipt-{}", std::process::id());
     let _guard = IsolatedTmux(socket.clone());
+    let committed = temp.path().join("committed");
+    // Keep the pane alive until the handoff is proven, with a finite watchdog.
+    // Runner speed must not determine whether the receipt can be observed.
+    let pane_command = format!(
+        "n=0; while test ! -f {} && test $n -lt 300; do n=$((n + 1)); sleep 0.1; done; sleep 0.3",
+        shell_words::quote(committed.to_str().unwrap())
+    );
     assert!(
         Command::new("tmux")
             .args([
@@ -123,7 +130,7 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
                 "-d",
                 "-s",
                 "pika-c-receipt",
-                "sleep 3"
+                &pane_command
             ])
             .status()
             .unwrap()
@@ -141,7 +148,6 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
     .unwrap();
     let pane = tmux.get_pane("pika-c-receipt").unwrap().unwrap();
     let transcript = temp.path().join("receipt.out");
-    let committed = temp.path().join("committed");
     let output = recorded_terminal(
         &transcript,
         &[

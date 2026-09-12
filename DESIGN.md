@@ -241,10 +241,10 @@ by name, or execute caller-supplied shell text.
 
 # Sources
 
-- `src/pikamux/monitor.py` is the canonical implementation for layout, styling,
+- `src/monitor.rs` is the canonical implementation for layout, styling,
   responsive columns, interaction, and refresh cadence.
-- `src/pikamux/ui.py` owns shared formatting, ordering, and sanitization rules.
-- `src/pikamux/models.py` owns state names and attention semantics.
+- `src/attention.rs` and `src/status.rs` own attention ordering and state projection.
+- `src/model.rs` owns shared state and identity types.
 - This document owns durable rationale, exclusions, and interaction intent; the
   executable files own exact values.
 

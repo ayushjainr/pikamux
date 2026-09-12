@@ -61,7 +61,7 @@ for pika_target in \
     x86_64-pc-windows-msvc
 do
     (cd "$pika_repo_dir" && \
-        cargo tree --locked --offline --target "$pika_target" \
+        cargo tree --color never --locked --offline --target "$pika_target" \
             --edges normal,build --prefix none --format $'{p}\t{l}') |
         sed -e '1d' -e 's/ (\*)$//' -e 's/ (proc-macro)//' \
             >> "$pika_tmp/tree.tsv"
