@@ -298,6 +298,46 @@ fn cached_remote_identity_includes_node_and_stale_cache_cannot_need_attention() 
 }
 
 #[test]
+fn remote_acknowledgement_request_carries_the_selected_event() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "state.db");
+    let remote = Uuid::new_v4().to_string();
+    let mut cached_node = node(&remote, "atlas");
+    cached_node
+        .capabilities
+        .retain(|capability| capability != "ack-event-bound-v1");
+    store.upsert_fleet_node(&cached_node).unwrap();
+    store
+        .put_remote_snapshot(&remote, &snapshot(&remote, "thread"), now())
+        .unwrap();
+    let selected = FleetManager::new(&store, &FakeTransport::default())
+        .cached_sessions(Some(&remote), false)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let fake = FakeTransport::with(vec![
+        Ok(json!({
+            "type":"hello", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+            "node_id":remote, "machine":"atlas", "package_version":"0.6.0",
+            "capabilities":CAPABILITIES,
+        })),
+        Ok(json!({
+            "type":"acknowledged", "node_id":remote, "acknowledged":true,
+        })),
+    ]);
+    assert!(
+        FleetManager::new(&store, &fake)
+            .acknowledge(&selected)
+            .unwrap()
+    );
+    let requests = fake.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[0].2);
+    assert!(requests[1].2);
+    assert_eq!(requests[1].1["expected_last_event_at"], 9.0);
+}
+
+#[test]
 fn remote_clock_skew_does_not_control_local_cache_age_or_polling() {
     for offset in [-3600.0, 3600.0] {
         let temp = TempDir::new().unwrap();
@@ -563,6 +603,8 @@ fn mutation_timeout_reuses_durable_idempotency_key() {
 #[derive(Default)]
 struct Service {
     untracks: usize,
+    current_event_at: f64,
+    acknowledgement_events: Vec<f64>,
 }
 impl FleetService for Service {
     fn snapshot(&mut self, _extended: bool) -> Result<Value, FleetError> {
@@ -582,8 +624,14 @@ impl FleetService for Service {
     ) -> Result<String, FleetError> {
         Ok("tail".to_owned())
     }
-    fn acknowledge(&mut self, _provider: Provider, _id: &str) -> Result<bool, FleetError> {
-        Ok(true)
+    fn acknowledge(
+        &mut self,
+        _provider: Provider,
+        _id: &str,
+        expected_last_event_at: f64,
+    ) -> Result<bool, FleetError> {
+        self.acknowledgement_events.push(expected_last_event_at);
+        Ok(self.current_event_at == expected_last_event_at)
     }
     fn untrack(&mut self, _provider: Provider, _id: &str) -> Result<(i64, bool), FleetError> {
         self.untracks += 1;
@@ -644,6 +692,63 @@ fn server_rejects_changed_node_without_service_action() {
     .unwrap();
     let value: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(value["kind"], "quarantined");
+}
+
+#[test]
+fn remote_acknowledgement_is_bound_to_the_observed_event() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "state.db");
+    let node_id = store.ensure_local_node_id().unwrap();
+    let request = json!({
+        "op":"acknowledge", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+        "expected_node_id":node_id, "provider":"codex", "session_id":"exact",
+        "expected_last_event_at":10.0,
+    });
+    let mut output = Vec::new();
+    let mut service = Service {
+        current_event_at: 20.0,
+        ..Service::default()
+    };
+    handle_fleet_stdio(
+        &store,
+        "atlas",
+        "0.6.0",
+        &mut service,
+        Cursor::new(format!("{request}\n")),
+        &mut output,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["acknowledged"], false);
+    assert_eq!(service.acknowledgement_events, [10.0]);
+}
+
+#[test]
+fn remote_acknowledgement_rejects_a_missing_event_without_service_action() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "state.db");
+    let node_id = store.ensure_local_node_id().unwrap();
+    let request = json!({
+        "op":"acknowledge", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+        "expected_node_id":node_id, "provider":"codex", "session_id":"exact",
+    });
+    let mut output = Vec::new();
+    let mut service = Service {
+        current_event_at: 20.0,
+        ..Service::default()
+    };
+    handle_fleet_stdio(
+        &store,
+        "atlas",
+        "0.6.0",
+        &mut service,
+        Cursor::new(format!("{request}\n")),
+        &mut output,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["kind"], "invalid_request");
+    assert!(service.acknowledgement_events.is_empty());
 }
 
 #[test]

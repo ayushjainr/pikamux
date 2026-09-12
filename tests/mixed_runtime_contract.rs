@@ -278,7 +278,8 @@ fn rust_client_drives_python_v050a4_fleet_envelopes_end_to_end() {
     assert_eq!(node.package_version.as_deref(), Some("0.5.0a4"));
     let session = manager.cached_sessions(Some(&node.node_id), false).unwrap()[0].clone();
     assert_eq!(manager.capture(&session, 17).unwrap(), "python-tail:17");
-    assert!(manager.acknowledge(&session).unwrap());
+    let error = manager.acknowledge(&session).unwrap_err();
+    assert_eq!(error.kind, pikamux::fleet::FleetErrorKind::Incompatible);
     assert_eq!(manager.untrack(&session, Some(REQUEST_ID)).unwrap(), 1);
     assert!(
         manager
@@ -294,21 +295,14 @@ fn rust_client_drives_python_v050a4_fleet_envelopes_end_to_end() {
         .collect();
     assert_eq!(
         operations,
-        [
-            "hello",
-            "snapshot",
-            "peek",
-            "acknowledge",
-            "untrack",
-            "snapshot"
-        ]
+        ["hello", "snapshot", "peek", "hello", "untrack", "snapshot"]
     );
     assert_eq!(
         requests
             .iter()
             .map(|(_, mutating)| *mutating)
             .collect::<Vec<_>>(),
-        [false, false, false, true, true, false]
+        [false, false, false, false, true, false]
     );
 }
 
@@ -384,9 +378,14 @@ impl FleetService for RustService {
         Ok(format!("rust-tail:{lines}"))
     }
 
-    fn acknowledge(&mut self, provider: Provider, session_id: &str) -> Result<bool, FleetError> {
+    fn acknowledge(
+        &mut self,
+        provider: Provider,
+        session_id: &str,
+        expected_last_event_at: f64,
+    ) -> Result<bool, FleetError> {
         assert_eq!((provider, session_id), (Provider::Codex, SESSION_ID));
-        Ok(true)
+        Ok(expected_last_event_at == Self::session().last_event_at)
     }
 
     fn untrack(&mut self, provider: Provider, session_id: &str) -> Result<(i64, bool), FleetError> {
@@ -409,7 +408,7 @@ fn python_v050a4_client_accepts_rust_fleet_envelopes_end_to_end() {
         json!({"op":"hello", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION}),
         json!({"op":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "expert_directory":true}),
         json!({"op":"peek", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "provider":"codex", "session_id":SESSION_ID, "lines":17}),
-        json!({"op":"acknowledge", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "provider":"codex", "session_id":SESSION_ID}),
+        json!({"op":"acknowledge", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "provider":"codex", "session_id":SESSION_ID, "expected_last_event_at":4242.0}),
         json!({"op":"untrack", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "provider":"codex", "session_id":SESSION_ID, "request_id":REQUEST_ID}),
         json!({"op":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "expert_directory":true}),
     ];

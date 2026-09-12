@@ -42,6 +42,7 @@ pub const CAPABILITIES: &[&str] = &[
     "attach",
     "peek",
     "acknowledge",
+    "ack-event-bound-v1",
     "untrack",
     "experts",
     "ask-jsonl",
@@ -1384,7 +1385,7 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
         self.store.list_nodes().map_err(Into::into)
     }
 
-    pub fn verify_node_identity(&self, node: &FleetNode) -> Result<String, FleetError> {
+    fn node_hello(&self, node: &FleetNode) -> Result<Hello, FleetError> {
         let response = self.transport.request(
             &node.ssh_target,
             &json!({
@@ -1394,8 +1395,11 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
             false,
         )?;
         let local_node_id = self.store.ensure_local_node_id()?;
-        let hello = validate_hello(&response, Some(&local_node_id), Some(&node.node_id))?;
-        Ok(hello.package_version)
+        validate_hello(&response, Some(&local_node_id), Some(&node.node_id))
+    }
+
+    pub fn verify_node_identity(&self, node: &FleetNode) -> Result<String, FleetError> {
+        Ok(self.node_hello(node)?.package_version)
     }
 
     /// Preflight an explicit upgrade and return the trusted node plus its
@@ -1900,7 +1904,35 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
     }
 
     pub fn acknowledge(&self, session: &FleetSession) -> Result<bool, FleetError> {
-        let response = self.session_request(session, "acknowledge", true, None)?;
+        let node = self
+            .store
+            .get_fleet_node(&session.node_id)?
+            .ok_or_else(|| {
+                FleetError::new(
+                    FleetErrorKind::NotFound,
+                    format!("Machine {:?} is no longer adopted", session.node_name),
+                )
+            })?;
+        let hello = self.node_hello(&node)?;
+        if !hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == "ack-event-bound-v1")
+        {
+            return Err(FleetError::new(
+                FleetErrorKind::Incompatible,
+                format!(
+                    "{} needs an updated Pika before it can safely acknowledge remote events",
+                    node.alias
+                ),
+            ));
+        }
+        let response = self.session_request(
+            session,
+            "acknowledge",
+            true,
+            Some(json!({"expected_last_event_at":session.session.last_event_at})),
+        )?;
         exact_fields(
             object(&response, "Remote acknowledgement receipt is malformed")?,
             &set(&["type", "node_id", "acknowledged"]),
@@ -2665,7 +2697,12 @@ pub trait FleetService {
         session_id: &str,
         lines: usize,
     ) -> Result<String, FleetError>;
-    fn acknowledge(&mut self, provider: Provider, session_id: &str) -> Result<bool, FleetError>;
+    fn acknowledge(
+        &mut self,
+        provider: Provider,
+        session_id: &str,
+        expected_last_event_at: f64,
+    ) -> Result<bool, FleetError>;
     fn untrack(&mut self, provider: Provider, session_id: &str) -> Result<(i64, bool), FleetError>;
 }
 
@@ -2807,6 +2844,7 @@ fn handle_request<S: FleetService>(
             "expected_node_id",
             "provider",
             "session_id",
+            "expected_last_event_at",
         ],
         _ => {
             return Err(FleetError::new(
@@ -2879,8 +2917,18 @@ fn handle_request<S: FleetService>(
         }
         "acknowledge" => {
             let (provider, session_id) = exact_request_identity(request)?;
+            let expected_last_event_at = request
+                .get("expected_last_event_at")
+                .and_then(Value::as_f64)
+                .filter(|number| number.is_finite() && *number >= 0.0)
+                .ok_or_else(|| {
+                    FleetError::new(
+                        FleetErrorKind::InvalidRequest,
+                        "Acknowledgement requires a valid expected_last_event_at",
+                    )
+                })?;
             Ok(
-                json!({"type":"acknowledged", "node_id":node_id, "acknowledged":service.acknowledge(provider, &session_id)?}),
+                json!({"type":"acknowledged", "node_id":node_id, "acknowledged":service.acknowledge(provider, &session_id, expected_last_event_at)?}),
             )
         }
         "untrack" => {

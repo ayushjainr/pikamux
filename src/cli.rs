@@ -3710,12 +3710,13 @@ impl FleetService for LocalFleetService<'_> {
         &mut self,
         provider: Provider,
         session_id: &str,
+        expected_last_event_at: f64,
     ) -> std::result::Result<bool, FleetError> {
         let session =
             exact_local_session(self.pika, provider, session_id, true).map_err(FleetError::from)?;
         self.pika
             .store
-            .acknowledge_attention(provider, &session.session_id, session.last_event_at, false)
+            .acknowledge_attention(provider, &session.session_id, expected_last_event_at, false)
             .map_err(FleetError::from)
     }
 
