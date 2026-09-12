@@ -28,6 +28,11 @@ pub struct Inventory {
     pub pending: Vec<PendingLaunch>,
 }
 
+struct ReconciledInventory {
+    inventory: Inventory,
+    candidates: BTreeMap<(Provider, String), Candidate>,
+}
+
 #[derive(Clone, Debug)]
 pub enum OpenTarget {
     Session(Box<Session>),
@@ -46,6 +51,32 @@ pub struct ExactPaneBinding {
     pub pane: Pane,
     pub provider_pid: i64,
     pub provider_start_time: u64,
+}
+
+#[derive(Default)]
+struct IdentityOwners {
+    direct: BTreeSet<i64>,
+    leases: BTreeSet<i64>,
+    recovery: Option<crate::store::RecoveryOwner>,
+}
+
+impl IdentityOwners {
+    fn pids(&self) -> BTreeSet<i64> {
+        self.direct
+            .iter()
+            .chain(self.leases.iter())
+            .copied()
+            .chain(self.recovery.as_ref().map(|owner| owner.pid))
+            .collect()
+    }
+
+    fn proves_pane(&self, pid: i64, pane: &Pane) -> bool {
+        self.direct.contains(&pid)
+            || self.recovery.as_ref().is_some_and(|owner| {
+                owner.pid == pid
+                    && pane.pika_launch_token.as_deref() == Some(owner.launch_token.as_str())
+            })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +140,11 @@ impl Pika {
     /// Reconcile local identity and lifecycle evidence once. Remote machines are
     /// deliberately outside this operation so an offline node cannot stall it.
     pub fn reconcile_local(&self) -> Result<Inventory> {
+        self.reconcile_local_with_candidates()
+            .map(|observed| observed.inventory)
+    }
+
+    fn reconcile_local_with_candidates(&self) -> Result<ReconciledInventory> {
         self.store.initialize()?;
         let observation = self.observe_processes();
         let processes = require_complete_processes(&observation, "reconcile ownership")?;
@@ -253,9 +289,12 @@ impl Pika {
             }
             Ok(sessions)
         })?;
-        Ok(Inventory {
-            sessions,
-            pending: self.store.list_pending()?,
+        Ok(ReconciledInventory {
+            inventory: Inventory {
+                sessions,
+                pending: self.store.list_pending()?,
+            },
+            candidates: candidate_map,
         })
     }
 
@@ -291,74 +330,18 @@ impl Pika {
             .flat_map(|pane| process::process_tree(pane.pane_pid, processes))
             .collect();
 
-        let mut direct = BTreeSet::new();
-        for identity in identity_strings(session) {
-            direct.extend(process::find_session_processes(
-                identity,
-                session.provider,
-                processes,
-            ));
-        }
-
         let timestamp = now();
-        let mut leases = BTreeSet::new();
-        for owner in ledger.live_owners(session.provider, &session.session_id)? {
-            let valid_generation = processes.get(&owner.pid).is_some_and(|record| {
-                owner
-                    .start_time
-                    .is_none_or(|start| u64::try_from(start).ok() == Some(record.start_time))
-            });
-            let expired_shared = processes.get(&owner.pid).is_some_and(|record| {
-                process::shared_provider_process(record, session.provider)
-                    && timestamp - owner.last_seen > LIVE_OWNER_LEASE_SECONDS
-            });
-            if !valid_generation || expired_shared {
-                ledger.delete_live_owner(
-                    owner.provider,
-                    &owner.session_id,
-                    owner.pid,
-                    &owner.owner_token,
-                )?;
-            } else if !(session.provider == Provider::Codex
-                && !direct.is_empty()
-                && processes.get(&owner.pid).is_some_and(|record| {
-                    process::shared_provider_process(record, session.provider)
-                }))
-            {
-                leases.insert(owner.pid);
-            }
-        }
-
-        let mut recovery = BTreeSet::new();
-        if let Some(owner) = ledger.get_recovery_owner(session.provider, &session.session_id)? {
-            let valid = processes.get(&owner.pid).is_some_and(|record| {
-                u64::try_from(owner.start_time).ok() == Some(record.start_time)
-                    && record.provider() == Some(session.provider)
-            }) && ledger.get_launch_binding(&owner.launch_token)?
-                == Some((session.provider, session.session_id.clone()));
-            if valid {
-                recovery.insert(owner.pid);
-            } else {
-                ledger.delete_recovery_owner(session.provider, &session.session_id)?;
-            }
-        }
-
-        let identities: BTreeSet<i64> = direct
-            .iter()
-            .chain(leases.iter())
-            .chain(recovery.iter())
-            .copied()
-            .collect();
+        let owners = identity_owners(session, processes, ledger, timestamp)?;
+        let identities = owners.pids();
         let outside: Vec<i64> = identities.difference(&owned).copied().collect();
         let candidate_panes: Vec<(&Pane, i64)> = tagged
             .iter()
             .filter_map(|pane| {
                 let provider_pid =
                     process::provider_process(pane.pane_pid, Some(session.provider), processes)?;
-                let has_direct_proof = direct.contains(&provider_pid)
-                    || recovery.contains(&provider_pid)
-                    || leases.contains(&provider_pid);
-                has_direct_proof.then_some((*pane, provider_pid))
+                owners
+                    .proves_pane(provider_pid, pane)
+                    .then_some((*pane, provider_pid))
             })
             .collect();
 
@@ -550,7 +533,14 @@ impl Pika {
 
     pub fn resolve_local(&self, query: &str) -> Result<Vec<Session>> {
         let providers = Providers::new(&self.paths, &self.config);
-        let mut sessions = self.store.list_sessions()?;
+        // Persisted rows deliberately have no live ownership. Reduce daily
+        // names only from the fresh ownership snapshot, keeping provider clocks
+        // separate from Pika's resume/hook/reconciliation activity clocks.
+        let ReconciledInventory {
+            inventory,
+            candidates: mut metadata,
+        } = self.reconcile_local_with_candidates()?;
+        let mut sessions = inventory.sessions;
         let mut known: BTreeSet<(Provider, String)> = sessions
             .iter()
             .map(|item| (item.provider, item.session_id.clone()))
@@ -564,6 +554,10 @@ impl Pika {
                 if known.insert((candidate.provider, candidate.session_id.clone())) {
                     sessions.push(session_from_candidate(&candidate));
                 }
+                metadata.insert(
+                    (candidate.provider, candidate.session_id.clone()),
+                    candidate,
+                );
             }
         }
         if let Some(provider) = provider_filter {
@@ -595,7 +589,9 @@ impl Pika {
                     evidence: SelectionEvidence {
                         state,
                         canonical_cwd: canonical_directory(session.cwd.as_deref()),
-                        provider_updated_at: Some(session.last_activity_at),
+                        provider_updated_at: metadata
+                            .get(&(session.provider, session.provider_thread_id().to_owned()))
+                            .map(|candidate| candidate.updated_at),
                     },
                 }
             })
@@ -629,10 +625,9 @@ impl Pika {
         Ok(session)
     }
 
-    /// Bind a pane ID to one provider UUID and one UUID-bearing process
-    /// generation using fresh tmux and OS observations. A remembered pane ID,
-    /// pane title, lease, or launch token is never sufficient for a pane
-    /// action because tmux IDs can be reused after a server restart.
+    /// Bind one exact provider identity to a current process generation using
+    /// UUID argv or the provider-hook-certified launch generation. A remembered
+    /// pane ID, title, lease, or launch token alone is never sufficient.
     pub fn exact_pane_binding(
         &self,
         session: &Session,
@@ -662,34 +657,35 @@ impl Pika {
             );
         }
         let pane = matches[0];
-        let mut identity_pids = BTreeSet::new();
-        for identity in identity_strings(session) {
-            identity_pids.extend(process::find_session_processes(
-                identity,
-                session.provider,
-                processes,
-            ));
-        }
+        let owners = self
+            .store
+            .reconcile_transaction(|ledger| identity_owners(session, processes, ledger, now()))?;
+        let identity_pids = owners.pids();
         if identity_pids.len() != 1 {
             bail!(
-                "Pika cannot bind the pane to one UUID-bearing {} process (found {}). No pane action was performed.",
+                "Pika cannot bind the pane to one exact {} process (found {}). No pane action was performed.",
                 session.provider,
                 identity_pids.len()
             );
         }
         let provider_pid = *identity_pids.first().expect("one identity PID");
+        if !owners.proves_pane(provider_pid, pane) {
+            bail!(
+                "the exact pane has no UUID argv or matching certified launch generation; no pane action was performed"
+            );
+        }
         let tree = process::process_tree(pane.pane_pid, processes);
         if !tree.contains(&provider_pid) {
             bail!(
-                "the exact UUID-bearing process is outside the tagged pane; no pane action was performed"
+                "the exact provider process is outside the tagged pane; no pane action was performed"
             );
         }
         let provider_start_time = processes
             .get(&provider_pid)
             .map(|record| record.start_time)
-            .context("the UUID-bearing process disappeared from the complete observation")?;
+            .context("the exact provider process disappeared from the complete observation")?;
         if process::process_start_time(provider_pid) != Some(provider_start_time) {
-            bail!("the UUID-bearing process generation changed; no pane action was performed");
+            bail!("the exact provider process generation changed; no pane action was performed");
         }
         let fresh = self
             .tmux
@@ -698,9 +694,27 @@ impl Pika {
         if !same_pane_generation(pane, &fresh)
             || fresh.pika_provider != Some(session.provider)
             || fresh.pika_session_id.as_deref() != Some(&session.session_id)
+            || fresh.pika_launch_token != pane.pika_launch_token
             || process::process_start_time(provider_pid) != Some(provider_start_time)
         {
             bail!("the exact pane or provider generation changed; no pane action was performed");
+        }
+        if !owners.direct.contains(&provider_pid) {
+            let before = owners.recovery.as_ref().expect("certified pane proof");
+            let current = self
+                .store
+                .get_recovery_owner(session.provider, &session.session_id)?;
+            if !current.as_ref().is_some_and(|owner| {
+                owner.pid == before.pid
+                    && owner.start_time == before.start_time
+                    && owner.launch_token == before.launch_token
+            }) || self.store.get_launch_binding(&before.launch_token)?
+                != Some((session.provider, session.session_id.clone()))
+            {
+                bail!(
+                    "the exact provider launch certificate changed; no pane action was performed"
+                );
+            }
         }
         Ok(ExactPaneBinding {
             pane: fresh,
@@ -736,8 +750,6 @@ impl Pika {
 
     pub fn open_name(&self, query: &str, attach: bool, allow_create: bool) -> Result<OpenReceipt> {
         self.store.initialize()?;
-        self.reconcile_local()
-            .context("Pika could not refresh exact local identity before opening")?;
         let matches = self.resolve_local(query)?;
         if matches.len() > 1 {
             return Err(OpenError::Ambiguous(ambiguity_message(query, &matches)).into());
@@ -997,6 +1009,13 @@ impl Pika {
     }
 
     fn resume_session(&self, mut session: Session, attach: bool) -> Result<OpenReceipt> {
+        // History-only Claude records can legitimately omit cwd. Match the
+        // pinned provider recovery contract by using this invocation's current
+        // directory only when it is absent, never when a saved path is invalid.
+        if session.cwd.is_none() {
+            session.cwd = Some(std::env::current_dir()?.to_string_lossy().into_owned());
+        }
+        existing_cwd(session.cwd.as_deref())?;
         let token = Uuid::new_v4().to_string();
         let identity = session.provider_thread_id().to_owned();
         let tmux_name = Tmux::internal_name(session.provider, &session.session_id);
@@ -1683,9 +1702,65 @@ fn wait_for_exact_binding(pika: &Pika, session: &Session, pane: &str) -> Result<
     }
 }
 
+/// Shared owner evidence for reconciliation and exact actions. Recovery is a
+/// provider-confirmed immutable launch binding plus a still-current process
+/// generation, not a pane label or a transferable token by itself.
+fn identity_owners(
+    session: &Session,
+    processes: &BTreeMap<i64, ProcessRecord>,
+    ledger: &ReconcileLedger<'_>,
+    timestamp: f64,
+) -> Result<IdentityOwners> {
+    let mut owners = IdentityOwners::default();
+    for identity in identity_strings(session) {
+        owners.direct.extend(process::find_session_processes(
+            identity,
+            session.provider,
+            processes,
+        ));
+    }
+    if let Some(owner) = ledger.get_recovery_owner(session.provider, &session.session_id)? {
+        let valid = processes.get(&owner.pid).is_some_and(|record| {
+            u64::try_from(owner.start_time).ok() == Some(record.start_time)
+                && record.provider() == Some(session.provider)
+        }) && ledger.get_launch_binding(&owner.launch_token)?
+            == Some((session.provider, session.session_id.clone()));
+        if valid {
+            owners.recovery = Some(owner);
+        } else {
+            ledger.delete_recovery_owner(session.provider, &session.session_id)?;
+        }
+    }
+    for owner in ledger.live_owners(session.provider, &session.session_id)? {
+        let valid_generation = processes.get(&owner.pid).is_some_and(|record| {
+            record.provider() == Some(session.provider)
+                && owner
+                    .start_time
+                    .is_none_or(|start| u64::try_from(start).ok() == Some(record.start_time))
+        });
+        let shared = processes
+            .get(&owner.pid)
+            .is_some_and(|record| process::shared_provider_process(record, session.provider));
+        if !valid_generation || (shared && timestamp - owner.last_seen > LIVE_OWNER_LEASE_SECONDS) {
+            ledger.delete_live_owner(
+                owner.provider,
+                &owner.session_id,
+                owner.pid,
+                &owner.owner_token,
+            )?;
+        } else if !(session.provider == Provider::Codex
+            && (!owners.direct.is_empty() || owners.recovery.is_some())
+            && shared)
+        {
+            owners.leases.insert(owner.pid);
+        }
+    }
+    Ok(owners)
+}
+
 fn canonical_directory(value: Option<&str>) -> Option<String> {
     let path = Path::new(value?);
-    path.is_dir()
+    (path.is_absolute() && path.is_dir())
         .then(|| path.canonicalize().ok())
         .flatten()
         .map(|path| path.to_string_lossy().into_owned())
@@ -1782,7 +1857,7 @@ mod tests {
             paths,
             Config::default(),
             store,
-            Tmux::with_executable("tmux", Some("never-used".into())),
+            Tmux::with_executable("/usr/bin/true", Some("never-used".into())),
         );
         (root, pika)
     }
@@ -1831,6 +1906,226 @@ mod tests {
             pika_session_id: Some(identity.into()),
             pika_name: Some("portfolio_review".into()),
             pika_launch_token: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn fixture_tmux(root: &Path, panes: &[Pane]) -> Tmux {
+        use std::os::unix::fs::PermissionsExt;
+        let rows = panes
+            .iter()
+            .map(|pane| {
+                [
+                    pane.session_name.clone(),
+                    pane.pane_id.clone(),
+                    pane.pane_pid.to_string(),
+                    pane.cwd.clone(),
+                    pane.current_command.clone(),
+                    "0".into(),
+                    "1".into(),
+                    "1".into(),
+                    "0".into(),
+                    String::new(),
+                    "1".into(),
+                    "1".into(),
+                    pane.pika_provider
+                        .map(|provider| provider.to_string())
+                        .unwrap_or_default(),
+                    pane.pika_session_id.clone().unwrap_or_default(),
+                    pane.pika_name.clone().unwrap_or_default(),
+                    pane.pika_launch_token.clone().unwrap_or_default(),
+                ]
+                .join("\u{1f}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let executable = root.join("tmux-fixture");
+        std::fs::write(&executable, format!(
+            "#!/bin/sh\ncase \"$*\" in\n*list-panes*) printf '%s\\n' {} ;;\n*capture-pane*) printf 'exact fixture output\\n' ;;\n*) exit 0 ;;\nesac\n",
+            shell_words::quote(&rows)
+        )).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Tmux::with_executable(executable.to_string_lossy(), None)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daily_name_uses_fresh_ownership_and_provider_clocks_not_saved_activity() {
+        let (root, mut pika) = test_pika();
+        let first = "11111111-1111-4111-8111-111111111111";
+        let second = "22222222-2222-4222-8222-222222222222";
+        std::fs::create_dir_all(&pika.paths.codex_home).unwrap();
+        let db = rusqlite::Connection::open(pika.paths.codex_home.join("state_1.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,name TEXT,cwd TEXT,rollout_path TEXT,updated_at INTEGER,archived INTEGER)").unwrap();
+        for (identity, updated, saved_activity) in [(first, 10, 9000.0), (second, 20, 100.0)] {
+            let path = root.path().join(format!("{identity}.jsonl"));
+            std::fs::write(&path, "{}\n").unwrap();
+            db.execute(
+                "INSERT INTO threads VALUES(?1,'portfolio_review',?2,?3,?4,0)",
+                rusqlite::params![
+                    identity,
+                    root.path().display().to_string(),
+                    path.display().to_string(),
+                    updated
+                ],
+            )
+            .unwrap();
+            let mut session = test_session(identity);
+            session.cwd = Some(root.path().display().to_string());
+            session.transcript_path = Some(path.display().to_string());
+            session.last_activity_at = saved_activity;
+            session.status = Status::Parked;
+            pika.store.upsert_session(&session, false).unwrap();
+        }
+        let pane = tagged_pane(first);
+        pika.tmux = fixture_tmux(root.path(), &[pane]);
+        pika.process_observer = Arc::new(move || {
+            ProcessObservation::complete(BTreeMap::from([
+                (1, record(1, None, 1, &["sh"])),
+                (2, record(2, Some(1), 2, &["codex", "resume", first])),
+            ]))
+        });
+        let chosen = pika.resolve_local("portfolio_review").unwrap();
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(
+            chosen[0].session_id, first,
+            "the exact live home wins over newer idle history"
+        );
+        assert!(chosen[0].has_exact_home());
+
+        pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
+        pika.tmux = Tmux::with_executable("/usr/bin/false", None);
+        let chosen = pika.resolve_local("portfolio_review").unwrap();
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(
+            chosen[0].session_id, second,
+            "idle reduction uses provider time, not Pika's newer resume/activity time"
+        );
+        db.execute("UPDATE threads SET updated_at=20", []).unwrap();
+        assert_eq!(
+            pika.resolve_local("portfolio_review").unwrap().len(),
+            2,
+            "equal provider times stay ambiguous"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_certified_provider_homes_support_return_peek_and_profile_without_uuid_argv() {
+        let (root, mut pika) = test_pika();
+        let pid = i64::from(std::process::id());
+        let start_time = process::process_start_time(pid).unwrap();
+        for (provider, identity) in [
+            (Provider::Codex, "33333333-3333-4333-8333-333333333333"),
+            (Provider::Claude, "44444444-4444-4444-8444-444444444444"),
+            (Provider::Opencode, "ses_newfixture"),
+        ] {
+            let mut session = test_session(identity);
+            session.provider = provider;
+            session.cwd = Some(root.path().display().to_string());
+            session.transcript_path = None;
+            let token = format!("launch-{provider}");
+            let mut pane = tagged_pane(identity);
+            pane.pane_pid = pid;
+            pane.pika_provider = Some(provider);
+            pane.pika_launch_token = Some(token.clone());
+            pika.store.upsert_session(&session, false).unwrap();
+            pika.store.bind_launch(&token, provider, identity).unwrap();
+            let certificate = crate::store::RecoveryOwner {
+                provider,
+                session_id: identity.into(),
+                pid,
+                start_time: start_time as i64,
+                launch_token: token.clone(),
+                created_at: now(),
+            };
+            pika.store.set_recovery_owner(&certificate).unwrap();
+            let argv = Providers::new(&pika.paths, &pika.config).new_argv(
+                provider,
+                "fresh",
+                Some(identity),
+            );
+            let process = ProcessRecord {
+                pid,
+                parent_pid: None,
+                start_time,
+                argv,
+            };
+            let observed = process.clone();
+            pika.process_observer = Arc::new(move || {
+                ProcessObservation::complete(BTreeMap::from([(pid, observed.clone())]))
+            });
+            pika.tmux = fixture_tmux(root.path(), &[pane.clone()]);
+            assert_eq!(
+                pika.open_session(session.clone(), false).unwrap().kind,
+                "ATTACHED LIVE"
+            );
+            assert_eq!(
+                pika.capture_exact(&session, 20).unwrap(),
+                "exact fixture output"
+            );
+            pika.exact_pane_binding(&session, Some(&pane.pane_id))
+                .unwrap();
+            let proof = crate::experts::PublisherProof::from_verified_identity(
+                &session, provider, identity, identity,
+            )
+            .unwrap();
+            crate::experts::publish(
+                &pika.store,
+                &session,
+                &proof,
+                crate::experts::PublishInput {
+                    scope: "Verified new provider home".into(),
+                    current_state: "Testing exact recovery".into(),
+                    topics: vec!["recovery".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            // A valid launch certificate cannot hide an independent UUID owner.
+            let duplicate = record(
+                pid + 1,
+                None,
+                start_time,
+                &[provider.as_str(), "resume", identity],
+            );
+            let original = process.clone();
+            pika.process_observer = Arc::new(move || {
+                ProcessObservation::complete(BTreeMap::from([
+                    (pid, original.clone()),
+                    (pid + 1, duplicate.clone()),
+                ]))
+            });
+            assert!(
+                pika.exact_pane_binding(&session, Some(&pane.pane_id))
+                    .is_err()
+            );
+            let original = process.clone();
+            pika.process_observer = Arc::new(move || {
+                ProcessObservation::complete(BTreeMap::from([(pid, original.clone())]))
+            });
+            if provider != Provider::Claude {
+                pane.pika_launch_token = Some("copied-or-reused-pane".into());
+                pika.tmux = fixture_tmux(root.path(), &[pane.clone()]);
+                assert!(
+                    pika.exact_pane_binding(&session, Some(&pane.pane_id))
+                        .is_err()
+                );
+                pane.pika_launch_token = Some(token);
+                pika.tmux = fixture_tmux(root.path(), &[pane.clone()]);
+                pika.store
+                    .set_recovery_owner(&crate::store::RecoveryOwner {
+                        start_time: certificate.start_time - 1,
+                        ..certificate
+                    })
+                    .unwrap();
+                assert!(
+                    pika.exact_pane_binding(&session, Some(&pane.pane_id))
+                        .is_err(),
+                    "a reused PID cannot inherit the launch certificate"
+                );
+            }
         }
     }
 
@@ -2143,6 +2438,26 @@ mod tests {
         assert!(pika.store.list_pending().unwrap().is_empty());
     }
 
+    #[test]
+    fn missing_saved_directory_is_not_replaced_or_left_reserved() {
+        let (root, pika) = test_pika();
+        let mut session = test_session("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        session.provider = Provider::Claude;
+        session.cwd = Some(root.path().join("deleted-project").display().to_string());
+        let error = pika
+            .resume_session(session.clone(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("saved working directory no longer exists"));
+        assert!(
+            pika.store
+                .get_resume_reservation(session.provider, &session.session_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(pika.store.list_pending().unwrap().is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejected_exact_attach_preserves_unread_attention() {
@@ -2176,7 +2491,7 @@ mod tests {
         std::fs::write(
             &executable,
             format!(
-                "#!/bin/sh\ncase \"$*\" in\n  *list-panes*) printf '%s\\n' '{row}' ;;\n  *if-shell*attach-session*) exit 75 ;;\n  *) exit 0 ;;\nesac\n"
+                "#!/bin/sh\ncase \"$*\" in\n  *list-panes*) printf '%s\\n' '{row}' ;;\n  *if-shell*attach-session*) sleep 0.25; exit 75 ;;\n  *) exit 0 ;;\nesac\n"
             ),
         )
         .unwrap();

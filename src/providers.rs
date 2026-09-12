@@ -633,6 +633,22 @@ fn claude_records(
     explicit_only: bool,
     identities: Option<&BTreeSet<String>>,
 ) -> Vec<Candidate> {
+    // Inventory once: the live registry and historical lookup share these
+    // exact paths instead of walking the entire projects tree for every row.
+    let mut transcripts: Vec<_> = WalkDir::new(home.join("projects"))
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.file_type().is_file() && entry.path().extension() == Some(OsStr::new("jsonl"))
+        })
+        .map(|entry| entry.into_path())
+        .collect();
+    let transcript_paths = transcripts
+        .iter()
+        .filter_map(|path| Some((path.file_stem()?.to_str()?.to_owned(), path.clone())))
+        .collect::<BTreeMap<_, _>>();
     let mut records: BTreeMap<String, Candidate> = BTreeMap::new();
     for path in fs::read_dir(home.join("sessions"))
         .into_iter()
@@ -661,7 +677,7 @@ fn claude_records(
             continue;
         }
         let visible_name = value.get("name").and_then(Value::as_str);
-        let transcript = find_claude_transcript(home, identity);
+        let transcript = transcript_paths.get(identity).cloned();
         if transcript
             .as_ref()
             .is_some_and(|path| claude_worker(path, identity))
@@ -701,22 +717,19 @@ fn claude_records(
         );
     }
 
-    let mut transcripts: Vec<_> = WalkDir::new(home.join("projects"))
-        .min_depth(2)
-        .max_depth(2)
-        .into_iter()
-        .flatten()
-        .filter(|entry| {
-            entry.file_type().is_file() && entry.path().extension() == Some(OsStr::new("jsonl"))
-        })
-        .map(|entry| entry.into_path())
-        .collect();
     transcripts.sort_by_key(|path| std::cmp::Reverse(modified(path).to_bits()));
-    for path in transcripts.into_iter().take(1000) {
+    for (index, path) in transcripts.into_iter().enumerate() {
         let Some(identity) = path.file_stem().and_then(OsStr::to_str).map(str::to_owned) else {
             continue;
         };
         if identities.is_some_and(|wanted| !wanted.contains(&identity)) {
+            continue;
+        }
+        let exact_identity = query == Some(identity.as_str())
+            || identities.is_some_and(|wanted| wanted.contains(&identity));
+        // A browsing budget must never make an explicitly requested or
+        // already watched immutable identity disappear.
+        if index >= 1000 && !exact_identity {
             continue;
         }
         let title = transcript_title(&path, explicit_only);
@@ -728,7 +741,8 @@ fn claude_records(
         }) {
             continue;
         }
-        if claude_worker(&path, &identity) || (explicit_only && title.is_none()) {
+        if claude_worker(&path, &identity) || (explicit_only && title.is_none() && !exact_identity)
+        {
             continue;
         }
         records
@@ -791,23 +805,38 @@ fn claude_records(
     output
 }
 
-fn find_claude_transcript(home: &Path, identity: &str) -> Option<PathBuf> {
-    let wanted = format!("{identity}.jsonl");
-    WalkDir::new(home.join("projects"))
-        .min_depth(2)
-        .max_depth(2)
-        .into_iter()
-        .flatten()
-        .find(|entry| entry.file_type().is_file() && entry.file_name() == OsStr::new(&wanted))
-        .map(|entry| entry.into_path())
-}
-
 fn transcript_title(path: &Path, explicit_only: bool) -> Option<String> {
-    let file = File::open(path).ok()?;
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
+    const MAX_LINES: usize = 16_384;
+    const MAX_LINE_BYTES: usize = 64 * 1024;
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let mut file = File::open(path).ok()?;
+    // Provider title events are append-only; inspect a bounded recent window.
+    // An unavailable title is not authority to rename an existing Pika row.
+    let offset = file.metadata().ok()?.len().saturating_sub(MAX_BYTES);
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES).read_to_end(&mut bytes).ok()?;
+    // Skip the first incomplete record when the window starts mid-file.
+    let start = if offset > 0 {
+        bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |index| index + 1)
+    } else {
+        0
+    };
+    let lines = bytes[start..].split(|byte| *byte == b'\n');
     let mut explicit = None;
     let mut generated = None;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+    for line in lines.rev().take(MAX_LINES) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if line.len() > MAX_LINE_BYTES {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
         match value.get("type").and_then(Value::as_str) {
@@ -815,8 +844,11 @@ fn transcript_title(path: &Path, explicit_only: bool) -> Option<String> {
                 explicit = ["customTitle", "title", "sessionTitle", "name"]
                     .iter()
                     .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_owned));
+                if explicit.is_some() {
+                    break;
+                }
             }
-            Some("ai-title") if !explicit_only => {
+            Some("ai-title") if !explicit_only && generated.is_none() => {
                 generated = value
                     .get("aiTitle")
                     .and_then(Value::as_str)
@@ -827,6 +859,7 @@ fn transcript_title(path: &Path, explicit_only: bool) -> Option<String> {
                     .get("sessionTitle")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                break;
             }
             _ => {}
         }
@@ -838,19 +871,27 @@ fn claude_worker(path: &Path, identity: &str) -> bool {
     let Ok(file) = File::open(path) else {
         return false;
     };
-    BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
+    let mut bytes = Vec::new();
+    if file.take(1024 * 1024).read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    bytes
+        .split(|byte| *byte == b'\n')
         .take(128)
-        .any(|line| {
-            serde_json::from_str::<Value>(&line)
-                .ok()
-                .is_some_and(|value| {
-                    value.get("sessionId").and_then(Value::as_str) == Some(identity)
-                        && value.get("isSidechain").and_then(Value::as_bool) == Some(false)
-                        && value.get("entrypoint").and_then(Value::as_str) == Some("sdk-cli")
-                })
+        .filter(|line| line.len() <= 64 * 1024)
+        .find_map(|line| {
+            let value = serde_json::from_slice::<Value>(line).ok()?;
+            if value.get("sessionId").and_then(Value::as_str) != Some(identity)
+                || value.get("isSidechain").and_then(Value::as_bool) != Some(false)
+            {
+                return None;
+            }
+            value
+                .get("entrypoint")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
         })
+        .is_some_and(|entrypoint| entrypoint == "sdk-cli")
 }
 
 fn opencode_records(

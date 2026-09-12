@@ -262,6 +262,74 @@ fn claude_first_screen_requires_explicit_name_and_exact_uuid_still_resolves() {
 }
 
 #[test]
+fn claude_history_only_exact_lookup_ignores_title_and_browser_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let identity = "55555555-5555-4555-8555-555555555555";
+    let transcript = paths
+        .claude_home
+        .join(format!("projects/p/{identity}.jsonl"));
+    json_line(
+        &transcript,
+        serde_json::json!({"type":"ai-title","aiTitle":"Generated orientation"}),
+    );
+    fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+        .unwrap();
+    for index in 0..1001 {
+        json_line(
+            &paths
+                .claude_home
+                .join(format!("projects/p/recent-{index}.jsonl")),
+            serde_json::json!({"type":"ai-title","aiTitle":"recent generated title"}),
+        );
+    }
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    assert!(!paths.claude_home.join("sessions").exists());
+    assert!(providers.import_candidates(Provider::Claude).is_empty());
+    let exact = providers.find(Provider::Claude, identity);
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].session_id, identity);
+    assert!(exact[0].name.is_none());
+    assert!(exact[0].cwd.is_none());
+    assert_eq!(
+        providers
+            .tracked(Provider::Claude, &[identity.into()].into_iter().collect())
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn claude_large_history_uses_bounded_recent_title_and_worker_records() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let identity = "66666666-6666-4666-8666-666666666666";
+    let transcript = paths
+        .claude_home
+        .join(format!("projects/p/{identity}.jsonl"));
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    let mut content = "x".repeat(3 * 1024 * 1024);
+    content.push('\n');
+    content.push_str(
+        &serde_json::json!({"type":"custom-title","customTitle":"large_history"}).to_string(),
+    );
+    content.push('\n');
+    fs::write(&transcript, content).unwrap();
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let started = std::time::Instant::now();
+    let exact = providers.find(Provider::Claude, identity);
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].name.as_deref(), Some("large_history"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
 fn opencode_never_claims_title_provenance_and_projects_child_lifecycle() {
     let root = tempfile::tempdir().unwrap();
     let paths = paths(root.path());

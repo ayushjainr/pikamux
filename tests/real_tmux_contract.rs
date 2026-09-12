@@ -249,4 +249,171 @@ fn real_isolated_tmux_resumes_all_providers_and_reuses_each_exact_home() {
         .expect("the exact new Claude identity should be tracked immediately");
     assert_eq!(tracked.name.as_deref(), Some("fresh_claude"));
     assert_eq!(tracked.tmux_pane, pending.tmux_pane);
+
+    // Exercise the actual new-process argv for every provider. Codex/OpenCode
+    // issue their UUID only after startup, so simulate their lifecycle hook's
+    // independently observed PID generation and exact pane certification.
+    pika.config.write(&pika.paths).unwrap();
+    for provider in Provider::ALL {
+        let current = if provider == Provider::Claude {
+            tracked.clone()
+        } else {
+            let name = format!("fresh_{provider}");
+            let receipt = pika.new_session(&name, provider, false).unwrap();
+            let OpenTarget::Pending(pending) = receipt.target else {
+                panic!("new provider did not retain its launch identity")
+            };
+            let identity = if provider == Provider::Codex {
+                "66666666-6666-4666-8666-666666666666"
+            } else {
+                "ses_freshfixture"
+            };
+            let deadline = Instant::now() + Duration::from_secs(4);
+            let (pane, pid, generation) = loop {
+                let pane = pika
+                    .tmux
+                    .get_pane(pending.tmux_pane.as_deref().unwrap())
+                    .unwrap()
+                    .unwrap();
+                let processes = pikamux::process::observe();
+                let processes = processes
+                    .require_complete("certify isolated fake provider")
+                    .unwrap();
+                if let Some(pid) =
+                    pikamux::process::provider_process(pane.pane_pid, Some(provider), processes)
+                {
+                    break (pane, pid, processes[&pid].start_time as i64);
+                }
+                assert!(Instant::now() < deadline, "fake new provider did not start");
+                thread::sleep(Duration::from_millis(25));
+            };
+            let payload = pikamux::hooks::parse_hook_payload(
+                serde_json::to_vec(&serde_json::json!({"session_id":identity,"hook_event_name":"SessionStart","cwd":pending.cwd})).unwrap().as_slice(),
+                provider,
+            ).unwrap();
+            let mut context = pikamux::hooks::HookContext::at(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64(),
+            );
+            context.expected_provider = Some(provider);
+            context.desired_name = Some(name.clone());
+            context.launch_token = Some(pending.launch_token.clone());
+            context.owner_token = format!("isolated-{provider}");
+            context.owner_pid = Some(pid);
+            context.owner_start_time = Some(generation);
+            context.pane_id = Some(pane.pane_id.clone());
+            context.pane_session = Some(pane.session_name.clone());
+            context.exact_home_verified = true;
+            let hook =
+                pikamux::hooks::handle_hook(&pika.store, provider, &payload, &context).unwrap();
+            let tag = hook
+                .tag_request
+                .expect("new UUID must tag its exact launch pane");
+            pika.tmux
+                .tag_pane(
+                    &pane.pane_id,
+                    Some(provider),
+                    Some(identity),
+                    Some(&name),
+                    Some(&pending.launch_token),
+                )
+                .unwrap();
+            pika.store
+                .finalize_pending_pane(
+                    &pending.launch_token,
+                    &pane.session_name,
+                    &pane.pane_id,
+                    Some(pid),
+                    Some(generation),
+                )
+                .unwrap();
+            assert!(
+                pikamux::hooks::certify_hook_home(
+                    &pika.store,
+                    &pending.launch_token,
+                    &tag,
+                    pid,
+                    generation
+                )
+                .unwrap()
+            );
+            pika.store.get_session(provider, identity).unwrap().unwrap()
+        };
+        assert_eq!(
+            pika.open_session(current.clone(), false).unwrap().kind,
+            "ATTACHED LIVE"
+        );
+        assert!(
+            pika.capture_exact(&current, 20)
+                .unwrap()
+                .contains(&format!("fake {provider} ready"))
+        );
+        let publish = Command::new(env!("CARGO_BIN_EXE_pika"))
+            .args([
+                "expert",
+                "publish",
+                "--scope",
+                "Exact new-home expertise",
+                "--now",
+                "Verifying return and peek",
+                "--topic",
+                "identity",
+            ])
+            .env("HOME", temp.path())
+            .env("XDG_CONFIG_HOME", temp.path().join("xdg-config"))
+            .env("XDG_STATE_HOME", temp.path().join("xdg-state"))
+            .env("XDG_DATA_HOME", temp.path().join("xdg-data"))
+            .env("PIKA_CONFIG_HOME", &pika.paths.config_dir)
+            .env("PIKA_STATE_HOME", &pika.paths.state_dir)
+            .env("PIKA_DB_PATH", &pika.paths.database)
+            .env("CODEX_HOME", &pika.paths.codex_home)
+            .env("CLAUDE_CONFIG_DIR", &pika.paths.claude_home)
+            .env("OPENCODE_DATA_HOME", &pika.paths.opencode_data_home)
+            .env("OPENCODE_CONFIG_DIR", &pika.paths.opencode_config_home)
+            .env("PIKA_TMUX_SOCKET", &_guard.0)
+            .env("PIKA_PROVIDER", provider.as_str())
+            .env("PIKA_SESSION_ID", &current.session_id)
+            .env("TMUX_PANE", current.tmux_pane.as_deref().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            publish.status.success(),
+            "new {provider} expert publication failed: {}",
+            String::from_utf8_lossy(&publish.stderr)
+        );
+        assert!(
+            pika.store
+                .get_stored_expert_profile(provider, &current.session_id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // A closed Claude history has no live registry and legitimately no cwd.
+    // Exact resume keeps its UUID and uses the caller's directory only for that
+    // absent value; it does not require manual adoption or name cleanup.
+    let history_id = "77777777-7777-4777-8777-777777777777";
+    let history = pika
+        .paths
+        .claude_home
+        .join(format!("projects/history/{history_id}.jsonl"));
+    fs::create_dir_all(history.parent().unwrap()).unwrap();
+    fs::write(
+        &history,
+        "{\"type\":\"custom-title\",\"customTitle\":\"history_only\"}\n",
+    )
+    .unwrap();
+    let discovered = pika.resolve_local("history_only").unwrap().remove(0);
+    assert!(discovered.cwd.is_none());
+    let resumed = pika.open_session(discovered, false).unwrap();
+    let OpenTarget::Session(resumed) = resumed.target else {
+        panic!("history resume lost exact identity")
+    };
+    assert_eq!(resumed.session_id, history_id);
+    assert_eq!(
+        resumed.cwd.as_deref(),
+        Some(std::env::current_dir().unwrap().to_str().unwrap())
+    );
 }
