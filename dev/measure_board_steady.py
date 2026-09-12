@@ -8,6 +8,7 @@ import os
 import select
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -160,10 +161,13 @@ def main() -> None:
     parser.add_argument("native", type=Path)
     parser.add_argument("python_reference", type=Path)
     parser.add_argument("--seconds", type=int, default=300)
+    parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--program", choices=("native", "python", "both"), default="both")
     args = parser.parse_args()
     if args.seconds < 10:
         raise SystemExit("--seconds must be at least 10")
+    if args.runs < 1:
+        raise SystemExit("--runs must be at least 1")
     project = Path(__file__).resolve().parents[1]
     programs = {
         "native": args.native.resolve(strict=True),
@@ -171,16 +175,48 @@ def main() -> None:
     }
     if args.program != "both":
         programs = {args.program: programs[args.program]}
-    results = {}
+    results: dict[str, list[dict[str, float | int]]] = {
+        label: [] for label in programs
+    }
     with tempfile.TemporaryDirectory(prefix="pika-steady-benchmark-") as temporary:
         root = Path(temporary)
-        for index, (label, program) in enumerate(programs.items()):
-            _, environment = seed(root / f"{index}-{label}", project)
-            complete_marker = b"q quit" if label == "python" else b"q leave"
-            results[label] = measure(
-                program, environment, args.seconds, complete_marker
-            )
-    print(json.dumps(results, indent=2, sort_keys=True))
+        configured = list(programs.items())
+        for run in range(args.runs):
+            # Alternate order so machine drift does not systematically favour
+            # either implementation while keeping contenders non-concurrent.
+            ordered = configured if run % 2 == 0 else list(reversed(configured))
+            for label, program in ordered:
+                _, environment = seed(root / f"{run}-{label}", project)
+                complete_marker = b"q quit" if label == "python" else b"q leave"
+                results[label].append(
+                    measure(program, environment, args.seconds, complete_marker)
+                )
+                print(
+                    f"completed steady-state run {run + 1}/{args.runs}: {label}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    summary = {
+        label: {
+            "runs": len(rows),
+            "cpu_mean_percent_across_runs": round(
+                sum(float(row["cpu_mean_percent"]) for row in rows) / len(rows), 3
+            ),
+            "cpu_worst_run_percent": max(
+                float(row["cpu_mean_percent"]) for row in rows
+            ),
+            "rss_p95_worst_run_mib": max(float(row["rss_p95_mib"]) for row in rows),
+            "rss_max_mib": max(float(row["rss_max_mib"]) for row in rows),
+        }
+        for label, rows in results.items()
+    }
+    print(
+        json.dumps(
+            {"run_seconds": args.seconds, "results": results, "summary": summary},
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":
