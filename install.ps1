@@ -1,8 +1,8 @@
 # Pika's per-user Windows client installer. Compatible with Windows PowerShell 5.1.
 [CmdletBinding()]
 param(
-    [string]$Bundle,
-    [switch]$NoPath
+    [Alias('Bundle')][string]$PikaInstallBundlePath,
+    [Alias('NoPath')][switch]$PikaInstallSkipPath
 )
 
 & {
@@ -248,4 +248,4 @@ param(
         if (Test-Path -LiteralPath $scratch) { [IO.Directory]::Delete($scratch, $true) }
         [Net.ServicePointManager]::SecurityProtocol = $oldTls
     }
-} $Bundle $NoPath
+} $PikaInstallBundlePath $PikaInstallSkipPath
