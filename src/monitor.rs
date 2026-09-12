@@ -1,4 +1,5 @@
 use crate::{
+    consult::CancellationToken,
     model::{Provider, Session, Status},
     usage,
 };
@@ -117,6 +118,9 @@ pub struct ConsultationIo {
     pub item: BoardItem,
     pub commands: Receiver<ConsultationInput>,
     pub events: SyncSender<ConsultationEvent>,
+    /// Flips immediately on the first close request, including while provider
+    /// startup or a turn is blocked. Workers must pass it to owned I/O.
+    pub cancellation: CancellationToken,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,16 +163,25 @@ impl ConsultationDriver {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::sync_channel(64);
         let (finish_sender, finish_receiver) = mpsc::channel();
+        let cancellation = CancellationToken::default();
+        let worker_cancellation = cancellation.clone();
         let worker = Arc::clone(&self.worker);
         thread::spawn(move || {
             let result = worker(ConsultationIo {
                 item,
                 commands: command_receiver,
                 events: event_sender,
+                cancellation: worker_cancellation,
             });
             let _ = finish_sender.send(result.map_err(|error| error.to_string()));
         });
-        ChatState::opening(name, command_sender, event_receiver, finish_receiver)
+        ChatState::opening(
+            name,
+            command_sender,
+            event_receiver,
+            finish_receiver,
+            cancellation,
+        )
     }
 }
 
@@ -182,13 +195,14 @@ pub fn run(sessions: Vec<Session>) -> Result<BoardAction> {
         None,
         None,
         None,
+        None,
     )
 }
 
 /// Backwards-compatible local dynamic board. New integrations should supply
 /// `BoardItem`s to `run_items_dynamic` so node and expert metadata are retained.
 pub fn run_dynamic(sessions: Vec<Session>, updates: Receiver<Vec<Session>>) -> Result<BoardAction> {
-    let (sender, item_updates) = mpsc::channel();
+    let (sender, item_updates) = mpsc::sync_channel(1);
     thread::spawn(move || {
         for sessions in updates {
             if sender
@@ -204,6 +218,7 @@ pub fn run_dynamic(sessions: Vec<Session>, updates: Receiver<Vec<Session>>) -> R
         Some(item_updates),
         None,
         None,
+        None,
     )
 }
 
@@ -215,7 +230,7 @@ pub fn run_items_dynamic(
     updates: Receiver<Vec<BoardItem>>,
     driver: Option<ConsultationDriver>,
 ) -> Result<BoardAction> {
-    run_loop(items, Some(updates), driver, None)
+    run_loop(items, Some(updates), driver, None, None)
 }
 
 /// Dynamic board plus a single best-effort background update notice. The
@@ -226,7 +241,25 @@ pub fn run_items_dynamic_with_notice(
     driver: Option<ConsultationDriver>,
     update_notice: Receiver<Option<String>>,
 ) -> Result<BoardAction> {
-    run_loop(items, Some(updates), driver, Some(update_notice))
+    run_loop(items, Some(updates), driver, Some(update_notice), None)
+}
+
+/// Dynamic board with a coalescing in-place refresh trigger. One render loop
+/// and one caller-owned worker set serve the board for its whole lifetime.
+pub fn run_items_dynamic_with_notice_and_refresh(
+    items: Vec<BoardItem>,
+    updates: Receiver<Vec<BoardItem>>,
+    driver: Option<ConsultationDriver>,
+    update_notice: Receiver<Option<String>>,
+    refresh_request: SyncSender<()>,
+) -> Result<BoardAction> {
+    run_loop(
+        items,
+        Some(updates),
+        driver,
+        Some(update_notice),
+        Some(refresh_request),
+    )
 }
 
 fn run_loop(
@@ -234,6 +267,7 @@ fn run_loop(
     updates: Option<Receiver<Vec<BoardItem>>>,
     driver: Option<ConsultationDriver>,
     update_notice: Option<Receiver<Option<String>>>,
+    refresh_request: Option<SyncSender<()>>,
 ) -> Result<BoardAction> {
     let _terminal = TerminalGuard::enter()?;
     let mut board = Board::new(items);
@@ -294,13 +328,33 @@ fn run_loop(
             Event::Resize(_, _) => dirty = true,
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 if let Some(action) = board.key(key, driver.as_ref()) {
-                    return Ok(action);
+                    if let Some(action) = route_board_action(action, refresh_request.as_ref()) {
+                        return Ok(action);
+                    } else {
+                        dirty = true;
+                        continue;
+                    }
                 }
                 dirty = true;
             }
             _ => {}
         }
     }
+}
+
+fn route_board_action(
+    action: BoardAction,
+    refresh_request: Option<&SyncSender<()>>,
+) -> Option<BoardAction> {
+    if action == BoardAction::Refresh
+        && let Some(request) = refresh_request
+    {
+        // Capacity one deliberately coalesces a burst of `r` keys into one
+        // fresh observation pass instead of growing work or call-stack depth.
+        let _ = request.try_send(());
+        return None;
+    }
+    Some(action)
 }
 
 struct TerminalGuard;
@@ -357,6 +411,7 @@ struct ChatState {
     policy: Option<String>,
     scroll: usize,
     close_requested: bool,
+    cancellation: CancellationToken,
 }
 
 impl ChatState {
@@ -365,6 +420,7 @@ impl ChatState {
         command_sender: mpsc::Sender<ConsultationInput>,
         event_receiver: Receiver<ConsultationEvent>,
         finish_receiver: Receiver<std::result::Result<ConsultationOutcome, String>>,
+        cancellation: CancellationToken,
     ) -> Self {
         Self {
             name,
@@ -381,6 +437,7 @@ impl ChatState {
             policy: None,
             scroll: 0,
             close_requested: false,
+            cancellation,
         }
     }
 
@@ -400,6 +457,7 @@ impl ChatState {
             policy: None,
             scroll: 0,
             close_requested: false,
+            cancellation: CancellationToken::default(),
         }
     }
 
@@ -432,6 +490,7 @@ impl ChatState {
             return true;
         }
         self.close_requested = true;
+        self.cancellation.cancel();
         self.phase = ChatPhase::Closing;
         self.lines.push(ChatLine {
             role: ChatRole::Pika,
@@ -1578,6 +1637,23 @@ mod tests {
     }
 
     #[test]
+    fn repeated_manual_refreshes_are_consumed_and_coalesced_in_place() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        for _ in 0..1_000 {
+            assert_eq!(
+                route_board_action(BoardAction::Refresh, Some(&sender)),
+                None
+            );
+        }
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            route_board_action(BoardAction::Quit, Some(&sender)),
+            Some(BoardAction::Quit)
+        );
+    }
+
+    #[test]
     fn replacement_preserves_node_qualified_selection() {
         let base = session(Status::Working);
         let mut here = BoardItem::local(base.clone());
@@ -1713,6 +1789,71 @@ mod tests {
         board.key(key(KeyCode::Esc), Some(&driver));
         assert!(board.chat.is_none());
         assert_eq!(board.selected_key, selected);
+    }
+
+    #[test]
+    fn first_escape_cancels_blocked_startup_promptly() {
+        let cancelled = Arc::new(Mutex::new(false));
+        let observed = Arc::clone(&cancelled);
+        let driver = ConsultationDriver::new(move |io| {
+            while !io.cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(2));
+            }
+            *observed.lock().unwrap() = true;
+            Ok(ConsultationOutcome::discarded())
+        });
+        let mut board = board(Status::Working);
+        board.key(key(KeyCode::Char('a')), Some(&driver));
+        let started = Instant::now();
+        board.key(key(KeyCode::Esc), Some(&driver));
+        for _ in 0..100 {
+            board.drain_consultation();
+            if board.chat.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(board.chat.is_none());
+        assert!(*cancelled.lock().unwrap());
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn first_escape_cancels_blocked_turn_promptly() {
+        let driver = ConsultationDriver::new(move |io| {
+            io.events.send(ConsultationEvent::Opened {
+                child_id: Some("owned-child".into()),
+                policy: None,
+            })?;
+            assert!(matches!(
+                io.commands.recv()?,
+                ConsultationInput::Question(_)
+            ));
+            while !io.cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Ok(ConsultationOutcome {
+                discarded: true,
+                note: Some("Owned private child discarded.".into()),
+            })
+        });
+        let mut board = board(Status::Working);
+        board.key(key(KeyCode::Char('a')), Some(&driver));
+        wait_for_phase(&mut board, ChatPhase::Ready);
+        board.key(key(KeyCode::Char('q')), Some(&driver));
+        board.key(key(KeyCode::Enter), Some(&driver));
+        assert_eq!(board.chat.as_ref().unwrap().phase, ChatPhase::Waiting);
+        let started = Instant::now();
+        board.key(key(KeyCode::Esc), Some(&driver));
+        for _ in 0..100 {
+            board.drain_consultation();
+            if board.chat.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(board.chat.is_none());
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

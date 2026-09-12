@@ -1,8 +1,10 @@
+use pikamux::consult::CancellationToken;
 use pikamux::fleet::{
-    CAPABILITIES, ConsultationPolicy, FleetError, FleetErrorKind, FleetManager, FleetService,
-    FleetSession, FleetTransport, NodeCandidate, PROTOCOL_NAME, PROTOCOL_VERSION,
-    RemoteConsultation, SshTransport, discover_node_candidates, discover_ssh_candidates,
-    handle_fleet_stdio, next_remote_node, session_to_wire, validate_snapshot,
+    CAPABILITIES, ConsultationPolicy, ConsultationTimeouts, FleetError, FleetErrorKind,
+    FleetManager, FleetService, FleetSession, FleetTransport, NodeCandidate, PROTOCOL_NAME,
+    PROTOCOL_VERSION, RemoteConsultation, SshTransport, discover_node_candidates,
+    discover_ssh_candidates, handle_fleet_stdio, next_remote_node, session_to_wire,
+    validate_snapshot,
 };
 use pikamux::model::{Candidate, FleetNode, Provider, Session, Status};
 use pikamux::store::Store;
@@ -325,6 +327,122 @@ fn attach_refreshes_and_routes_only_exact_node_provider_uuid() {
 }
 
 #[test]
+fn attach_ignores_reassigned_display_alias_and_uses_immutable_node_id() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "state.db");
+    let original_id = Uuid::new_v4().to_string();
+    let replacement_id = Uuid::new_v4().to_string();
+    let thread = "11111111-1111-4111-8111-111111111111";
+    store
+        .upsert_fleet_node(&node(&original_id, "atlas"))
+        .unwrap();
+    store
+        .put_remote_snapshot(&original_id, &snapshot(&original_id, thread), now())
+        .unwrap();
+    let selected = FleetManager::new(&store, &FakeTransport::default())
+        .cached_sessions(None, false)
+        .unwrap()
+        .remove(0);
+
+    let mut renamed = node(&original_id, "atlas-renamed");
+    renamed.ssh_target = "original-route".into();
+    store.upsert_fleet_node(&renamed).unwrap();
+    store
+        .upsert_fleet_node(&node(&replacement_id, "atlas"))
+        .unwrap();
+
+    let fake = FakeTransport::with(vec![Ok(snapshot(&original_id, thread))]);
+    assert_eq!(
+        FleetManager::new(&store, &fake).attach(&selected).unwrap(),
+        0
+    );
+    let calls = fake.exact.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, original_id);
+}
+
+#[test]
+fn attach_fails_closed_when_immutable_node_was_deleted() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "state.db");
+    let node_id = Uuid::new_v4().to_string();
+    let thread = "11111111-1111-4111-8111-111111111111";
+    store.upsert_fleet_node(&node(&node_id, "atlas")).unwrap();
+    store
+        .put_remote_snapshot(&node_id, &snapshot(&node_id, thread), now())
+        .unwrap();
+    let selected = FleetManager::new(&store, &FakeTransport::default())
+        .cached_sessions(None, false)
+        .unwrap()
+        .remove(0);
+    store.delete_fleet_node(&node_id).unwrap();
+    let fake = FakeTransport::default();
+    let error = FleetManager::new(&store, &fake)
+        .attach(&selected)
+        .unwrap_err();
+    assert_eq!(error.kind, FleetErrorKind::NotFound);
+    assert!(fake.exact.lock().unwrap().is_empty());
+}
+
+struct RouteReplacingTransport<'a> {
+    store: &'a Store,
+    response: Value,
+    exact: Mutex<Vec<String>>,
+}
+
+impl FleetTransport for &RouteReplacingTransport<'_> {
+    fn request(
+        &self,
+        _target: &str,
+        _payload: &Value,
+        _mutating: bool,
+    ) -> Result<Value, FleetError> {
+        let node_id = self.response["node_id"].as_str().unwrap();
+        let mut replacement = node(node_id, "atlas");
+        replacement.ssh_target = "concurrently-replaced-route".into();
+        self.store.upsert_fleet_node(&replacement).unwrap();
+        Ok(self.response.clone())
+    }
+
+    fn run_exact(
+        &self,
+        node: &FleetNode,
+        _arguments: &[String],
+        _tty: bool,
+    ) -> Result<i32, FleetError> {
+        self.exact.lock().unwrap().push(node.ssh_target.clone());
+        Ok(0)
+    }
+}
+
+#[test]
+fn attach_fails_closed_when_route_is_replaced_during_refresh() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "state.db");
+    let node_id = Uuid::new_v4().to_string();
+    let thread = "11111111-1111-4111-8111-111111111111";
+    store.upsert_fleet_node(&node(&node_id, "atlas")).unwrap();
+    store
+        .put_remote_snapshot(&node_id, &snapshot(&node_id, thread), now())
+        .unwrap();
+    let selected = FleetManager::new(&store, &FakeTransport::default())
+        .cached_sessions(None, false)
+        .unwrap()
+        .remove(0);
+    let transport = RouteReplacingTransport {
+        store: &store,
+        response: snapshot(&node_id, thread),
+        exact: Mutex::new(Vec::new()),
+    };
+    let error = FleetManager::new(&store, &transport)
+        .attach(&selected)
+        .unwrap_err();
+    assert_eq!(error.kind, FleetErrorKind::Quarantined);
+    assert!(error.message.contains("route changed"));
+    assert!(transport.exact.lock().unwrap().is_empty());
+}
+
+#[test]
 fn mutation_timeout_reuses_durable_idempotency_key() {
     let temp = TempDir::new().unwrap();
     let store = initialized_store(&temp, "state.db");
@@ -534,6 +652,85 @@ fn remote_consultation_reuses_one_connection_and_requires_v2_cleanup() {
     let receipt = side.close().unwrap();
     assert_eq!(receipt.answers_received, Some(2));
     assert_eq!(receipt.cleanup.as_deref(), Some("complete"));
+}
+
+#[test]
+fn remote_consultation_cancellation_kills_owned_transport_promptly() {
+    let temp = TempDir::new().unwrap();
+    let fake = temp.path().join("ssh");
+    let owned_pid = temp.path().join("owned.pid");
+    executable(
+        &fake,
+        &format!(
+            "printf '%s\\n' '{{\"type\":\"opened\",\"provider\":\"codex\",\"parent_id\":\"parent\",\"workstream_id\":\"parent\",\"consultation_mode\":\"default\",\"model\":\"gpt-test\",\"effort\":\"low\"}}'\nIFS= read -r line\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nwait",
+            owned_pid.display()
+        ),
+    );
+    let node_id = Uuid::new_v4().to_string();
+    let trusted = node(&node_id, "atlas");
+    let remote = FleetSession {
+        node_id,
+        node_name: "atlas".into(),
+        session: session(Provider::Codex, "parent", "expert"),
+        stale: false,
+        remote_error: None,
+        seen_at: now(),
+        card_status: None,
+        card_detail: None,
+        watched: true,
+        availability: None,
+        scope_updated_at: None,
+        current_state_updated_at: None,
+        current_state_status: None,
+    };
+    let policy = ConsultationPolicy {
+        consultation_mode: "default".into(),
+        model: "gpt-test".into(),
+        effort: "low".into(),
+    };
+    let cancellation = CancellationToken::default();
+    let transport = SshTransport::new(&fake, Duration::from_secs(1), Duration::from_secs(1));
+    let mut side = RemoteConsultation::open_cancellable(
+        &transport,
+        trusted,
+        remote,
+        policy,
+        ConsultationTimeouts {
+            open: Duration::from_secs(1),
+            event: Duration::from_secs(30),
+            cleanup: Duration::from_secs(1),
+        },
+        cancellation.clone(),
+    )
+    .unwrap();
+    let worker = std::thread::spawn(move || side.ask("one exact question"));
+    for _ in 0..100 {
+        if owned_pid.is_file() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let cancelled_at = std::time::Instant::now();
+    cancellation.cancel();
+    let error = worker.join().unwrap().unwrap_err();
+    assert_eq!(error.kind, FleetErrorKind::OutcomeUnknown);
+    assert_eq!(
+        error
+            .receipt
+            .as_ref()
+            .and_then(|value| value.cleanup.as_deref()),
+        Some("unknown")
+    );
+    assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+    let pid: i32 = fs::read_to_string(owned_pid).unwrap().parse().unwrap();
+    for _ in 0..50 {
+        // SAFETY: signal zero only probes the exact fixture descendant.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("owned remote transport descendant {pid} survived cancellation");
 }
 
 #[test]

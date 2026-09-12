@@ -4,6 +4,7 @@
 //! status document may suggest addresses, but only a validated handshake and
 //! explicit persistence authorize snapshots or actions.
 
+use crate::consult::{CancellationToken, MAX_QUESTION_BYTES};
 use crate::model::{Candidate, ExpertProfile, FleetNode, Provider, Session, Status};
 use crate::store::Store;
 use crate::update::RemoteInstallBundle;
@@ -13,6 +14,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1656,15 +1659,9 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
     }
 
     pub fn attach(&self, session: &FleetSession) -> Result<i32, FleetError> {
-        let current = self
-            .resolve(
-                &format!("{}@{}", session.session.session_id, session.node_name),
-                true,
-                false,
-            )?
-            .ok_or_else(|| {
-                FleetError::new(FleetErrorKind::NotFound, "Remote session disappeared")
-            })?;
+        // The alias is display-only and can be renamed or reassigned after a
+        // board row was selected. Refresh and resolve exclusively through the
+        // immutable node/provider/conversation tuple carried by that row.
         let node = self
             .store
             .get_fleet_node(&session.node_id)?
@@ -1674,12 +1671,53 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                     "Remote machine is no longer trusted",
                 )
             })?;
+        validate_exact_route(&node, session)?;
+        self.refresh_node(&session.node_id)?;
+        let stable_node = self
+            .store
+            .get_fleet_node(&session.node_id)?
+            .ok_or_else(|| {
+                FleetError::new(
+                    FleetErrorKind::NotFound,
+                    "Remote machine was removed before attach",
+                )
+            })?;
+        if stable_node.ssh_target != node.ssh_target {
+            return Err(FleetError::new(
+                FleetErrorKind::Quarantined,
+                "Remote machine route changed during attach; nothing was opened. Retry from a fresh board.",
+            ));
+        }
+        let matches = self
+            .cached_sessions(Some(&session.node_id), false)?
+            .into_iter()
+            .filter(|current| {
+                current.session.provider == session.session.provider
+                    && current.session.session_id == session.session.session_id
+            })
+            .collect::<Vec<_>>();
+        let current = match matches.as_slice() {
+            [current] => current,
+            [] => {
+                return Err(FleetError::new(
+                    FleetErrorKind::NotFound,
+                    "Remote session disappeared on fresh exact lookup",
+                ));
+            }
+            _ => {
+                return Err(FleetError::new(
+                    FleetErrorKind::Quarantined,
+                    "Remote snapshot returned duplicate exact conversation identities",
+                ));
+            }
+        };
+        validate_exact_route(&stable_node, current)?;
         self.transport.run_exact(
-            &node,
+            &stable_node,
             &[
                 "_fleet-open".to_owned(),
                 "--expected-node-id".to_owned(),
-                node.node_id.clone(),
+                stable_node.node_id.clone(),
                 "--provider".to_owned(),
                 current.session.provider.as_str().to_owned(),
                 "--session-id".to_owned(),
@@ -1970,12 +2008,98 @@ pub struct ConsultationPolicy {
     pub effort: String,
 }
 
+struct AsyncChildInput {
+    requests: mpsc::Sender<FleetWriteRequest>,
+}
+
+struct FleetWriteRequest {
+    bytes: Vec<u8>,
+    result: SyncSender<std::result::Result<(), String>>,
+}
+
+impl AsyncChildInput {
+    fn new(mut input: ChildStdin) -> Self {
+        let (requests, receiver) = mpsc::channel::<FleetWriteRequest>();
+        thread::spawn(move || {
+            for request in receiver {
+                let result = input
+                    .write_all(&request.bytes)
+                    .and_then(|_| input.flush())
+                    .map_err(|error| error.to_string());
+                let failed = result.is_err();
+                let _ = request.result.send(result);
+                if failed {
+                    break;
+                }
+            }
+        });
+        Self { requests }
+    }
+
+    fn send(
+        &self,
+        bytes: Vec<u8>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), FleetError> {
+        if bytes.len() > MAX_MESSAGE_BYTES {
+            return Err(FleetError::new(
+                FleetErrorKind::InvalidRequest,
+                "Remote side input exceeded the safety limit",
+            ));
+        }
+        let (sender, result) = mpsc::sync_channel(1);
+        self.requests
+            .send(FleetWriteRequest {
+                bytes,
+                result: sender,
+            })
+            .map_err(|_| {
+                FleetError::new(
+                    FleetErrorKind::Unreachable,
+                    "Remote side input writer stopped",
+                )
+            })?;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(FleetError::new(
+                    FleetErrorKind::OutcomeUnknown,
+                    "Remote side input cancelled",
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(FleetError::new(
+                    FleetErrorKind::Unreachable,
+                    "Remote side input timed out",
+                ));
+            }
+            match result.recv_timeout(remaining.min(Duration::from_millis(25))) {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => {
+                    return Err(FleetError::new(
+                        FleetErrorKind::Unreachable,
+                        format!("Remote side input write failed: {error}"),
+                    ));
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(FleetError::new(
+                        FleetErrorKind::Unreachable,
+                        "Remote side input writer stopped",
+                    ));
+                }
+            }
+        }
+    }
+}
+
 pub struct RemoteConsultation {
     node: FleetNode,
     session: FleetSession,
     policy: ConsultationPolicy,
     child: Child,
-    input: Option<ChildStdin>,
+    input: Option<AsyncChildInput>,
     events: Receiver<Result<Value, FleetError>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     cleanup_confirmed: bool,
@@ -1984,6 +2108,14 @@ pub struct RemoteConsultation {
     turn: u64,
     event_timeout: Duration,
     cleanup_timeout: Duration,
+    cancellation: CancellationToken,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ConsultationTimeouts {
+    pub open: Duration,
+    pub event: Duration,
+    pub cleanup: Duration,
 }
 
 impl RemoteConsultation {
@@ -1995,6 +2127,28 @@ impl RemoteConsultation {
         open_timeout: Duration,
         event_timeout: Duration,
         cleanup_timeout: Duration,
+    ) -> Result<Self, FleetError> {
+        Self::open_cancellable(
+            transport,
+            node,
+            session,
+            policy,
+            ConsultationTimeouts {
+                open: open_timeout,
+                event: event_timeout,
+                cleanup: cleanup_timeout,
+            },
+            CancellationToken::default(),
+        )
+    }
+
+    pub fn open_cancellable(
+        transport: &SshTransport,
+        node: FleetNode,
+        session: FleetSession,
+        policy: ConsultationPolicy,
+        timeouts: ConsultationTimeouts,
+        cancellation: CancellationToken,
     ) -> Result<Self, FleetError> {
         validate_exact_route(&node, &session)?;
         let args = vec![
@@ -2013,6 +2167,7 @@ impl RemoteConsultation {
             policy.effort.clone(),
         ];
         let mut command = transport.command(&node.ssh_target, &args, false)?;
+        owned_process_group(&mut command);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2023,7 +2178,7 @@ impl RemoteConsultation {
                 format!("Could not start remote side channel: {error}"),
             )
         })?;
-        let input = child.stdin.take();
+        let input = child.stdin.take().map(AsyncChildInput::new);
         let output = child.stdout.take().ok_or_else(|| {
             FleetError::new(
                 FleetErrorKind::Error,
@@ -2052,10 +2207,11 @@ impl RemoteConsultation {
             transport_aborted: false,
             answers_received: 0,
             turn: 0,
-            event_timeout,
-            cleanup_timeout,
+            event_timeout: timeouts.event,
+            cleanup_timeout: timeouts.cleanup,
+            cancellation,
         };
-        let opened = match side.read_nonprogress(open_timeout) {
+        let opened = match side.read_nonprogress(timeouts.open) {
             Ok(value) => value,
             Err(error) => {
                 side.abort();
@@ -2076,6 +2232,12 @@ impl RemoteConsultation {
                 "Question cannot be empty",
             ));
         }
+        if question.len() > MAX_QUESTION_BYTES {
+            return Err(FleetError::new(
+                FleetErrorKind::InvalidRequest,
+                "Consultation question exceeded the 64 KiB safety limit",
+            ));
+        }
         if self.cleanup_confirmed || self.transport_aborted {
             return Err(FleetError::new(
                 FleetErrorKind::Error,
@@ -2092,14 +2254,18 @@ impl RemoteConsultation {
                 "Consultation question exceeded the safety limit",
             ));
         }
-        let input = self.input.as_mut().ok_or_else(|| {
+        let input = self.input.as_ref().ok_or_else(|| {
             FleetError::new(FleetErrorKind::Error, "Remote side channel is closed")
         })?;
-        if let Err(error) = input.write_all(&line).and_then(|_| input.flush()) {
+        if let Err(error) = input.send(
+            line,
+            Instant::now() + self.event_timeout,
+            &self.cancellation,
+        ) {
             self.abort();
             return Err(FleetError::new(
                 FleetErrorKind::OutcomeUnknown,
-                format!("Remote turn delivery is unknown: {error}"),
+                format!("Remote turn delivery is unknown: {}", error.message),
             ));
         }
         let event = self.read_nonprogress(self.event_timeout)?;
@@ -2128,10 +2294,13 @@ impl RemoteConsultation {
                 self.cleanup_unknown("Remote cleanup is unconfirmed after the connection closed")
             );
         }
-        if let Some(mut input) = self.input.take() {
+        if let Some(input) = self.input.take() {
             if input
-                .write_all(b"{\"close\":true}\n")
-                .and_then(|_| input.flush())
+                .send(
+                    b"{\"close\":true}\n".to_vec(),
+                    Instant::now() + self.cleanup_timeout,
+                    &CancellationToken::default(),
+                )
                 .is_err()
             {
                 self.abort();
@@ -2181,7 +2350,11 @@ impl RemoteConsultation {
                     receipt: Some(Box::new(ConsultationReceipt { cleanup: Some(cleanup.to_owned()), ..self.closed_receipt() })),
                 });
             }
-            let _ = wait_child(&mut self.child, remaining.min(Duration::from_secs(2)));
+            if !wait_child(&mut self.child, remaining.min(Duration::from_secs(2))) {
+                // The remote cleanup receipt is authoritative; only the local
+                // owned SSH transport is still lingering.
+                kill_reap(&mut self.child);
+            }
             self.cleanup_confirmed = true;
             return Ok(self.closed_receipt());
         }
@@ -2229,6 +2402,12 @@ impl RemoteConsultation {
     fn read_nonprogress(&mut self, timeout: Duration) -> Result<Value, FleetError> {
         let deadline = Instant::now() + timeout;
         loop {
+            if self.cancellation.is_cancelled() {
+                self.abort();
+                return Err(self.cleanup_unknown(
+                    "Remote side connection cancelled; its owned child was terminated locally but remote cleanup could not be confirmed.",
+                ));
+            }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 self.abort();
                 return Err(FleetError::new(
@@ -2236,8 +2415,12 @@ impl RemoteConsultation {
                     "Remote side channel timed out",
                 ));
             };
-            let event = match self.events.recv_timeout(remaining) {
+            let event = match self
+                .events
+                .recv_timeout(remaining.min(Duration::from_millis(25)))
+            {
                 Ok(event) => event?,
+                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
                 Err(RecvTimeoutError::Timeout) => {
                     self.abort();
                     return Err(FleetError::new(
@@ -2287,8 +2470,7 @@ impl RemoteConsultation {
         self.transport_aborted = true;
         self.input.take();
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            kill_reap(&mut self.child);
         }
     }
 
@@ -3028,6 +3210,14 @@ fn run_bounded_command(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> Result<BoundedOutput, FleetError> {
+    if input.is_some_and(|bytes| bytes.len() > MAX_REMOTE_INSTALL_BYTES) {
+        return Err(FleetError::new(
+            FleetErrorKind::InvalidRequest,
+            "Command input exceeded the safety limit",
+        ));
+    }
+    let deadline = Instant::now() + timeout;
+    owned_process_group(command);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3035,23 +3225,56 @@ fn run_bounded_command(
     let mut child = command
         .spawn()
         .map_err(|error| FleetError::new(FleetErrorKind::Unreachable, error.to_string()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Some(input) = input {
-            stdin
-                .write_all(input)
-                .map_err(|error| FleetError::new(FleetErrorKind::Unreachable, error.to_string()))?;
-        }
-    }
     let stdout = child.stdout.take().expect("stdout configured");
     let stderr = child.stderr.take().expect("stderr configured");
     let overflow = Arc::new(AtomicBool::new(false));
     let stdout_thread = spawn_bounded_reader(stdout, stdout_limit, overflow.clone());
     let stderr_thread = spawn_bounded_reader(stderr, stderr_limit, overflow.clone());
-    let deadline = Instant::now() + timeout;
+    let (write_sender, write_result) = mpsc::sync_channel(1);
+    let mut stdin = child.stdin.take().expect("stdin configured");
+    let input = input.map(<[u8]>::to_vec);
+    let writer_thread = thread::spawn(move || {
+        let result = input
+            .as_deref()
+            .map_or(Ok(()), |bytes| stdin.write_all(bytes))
+            .and_then(|_| stdin.flush())
+            .map_err(|error| error.to_string());
+        // Dropping stdin is part of the protocol: remote readers waiting for
+        // EOF must be able to proceed before Pika waits for process exit.
+        drop(stdin);
+        let _ = write_sender.send(result);
+    });
+    let mut write_complete = false;
     let status = loop {
+        if !write_complete {
+            match write_result.try_recv() {
+                Ok(Ok(())) => write_complete = true,
+                Ok(Err(error)) => {
+                    kill_reap(&mut child);
+                    let _ = writer_thread.join();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Err(FleetError::new(
+                        FleetErrorKind::Unreachable,
+                        format!("SSH input write failed: {error}"),
+                    ));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    kill_reap(&mut child);
+                    let _ = writer_thread.join();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Err(FleetError::new(
+                        FleetErrorKind::Unreachable,
+                        "SSH input writer stopped",
+                    ));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if overflow.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_reap(&mut child);
+            let _ = writer_thread.join();
             let _ = stdout_thread.join();
             let _ = stderr_thread.join();
             return Err(FleetError::new(
@@ -3066,8 +3289,8 @@ fn run_bounded_command(
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_reap(&mut child);
+            let _ = writer_thread.join();
             let _ = stdout_thread.join();
             let _ = stderr_thread.join();
             return Err(FleetError::new(
@@ -3077,6 +3300,7 @@ fn run_bounded_command(
         }
         thread::sleep(Duration::from_millis(2));
     };
+    let _ = writer_thread.join();
     let stdout = stdout_thread
         .join()
         .map_err(|_| FleetError::new(FleetErrorKind::Error, "stdout reader failed"))?;
@@ -3094,6 +3318,29 @@ fn run_bounded_command(
         stdout,
         stderr,
     })
+}
+
+fn kill_reap(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_none() {
+        #[cfg(unix)]
+        {
+            // SAFETY: run_bounded_command and RemoteConsultation put each
+            // owned transport child in a new process group before spawning.
+            let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        }
+        #[cfg(not(unix))]
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+fn owned_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
 }
 
 fn spawn_bounded_reader<R: Read + Send + 'static>(
@@ -3393,4 +3640,80 @@ fn now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+#[cfg(all(test, unix))]
+mod bounded_command_tests {
+    use super::*;
+
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[test]
+    fn bounded_io_drains_output_before_child_reads_input() {
+        let input = vec![b'x'; 512 * 1024];
+        let mut command = shell(
+            "head -c 262144 /dev/zero | tr '\\000' x; cat >/dev/null; printf '\\nfinished\\n'",
+        );
+        let output = run_bounded_command(
+            &mut command,
+            Some(&input),
+            Duration::from_secs(2),
+            512 * 1024,
+            1024,
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.ends_with(b"finished\n"));
+    }
+
+    #[test]
+    fn bounded_io_closes_stdin_to_release_eof_reader() {
+        let mut command = shell("cat >/dev/null; printf closed");
+        let output = run_bounded_command(
+            &mut command,
+            Some(b"payload"),
+            Duration::from_secs(1),
+            64,
+            64,
+        )
+        .unwrap();
+        assert_eq!(output.stdout, b"closed");
+    }
+
+    #[test]
+    fn bounded_io_times_out_when_child_never_reads() {
+        let mut command = shell("exec sleep 5");
+        let started = Instant::now();
+        let error = run_bounded_command(
+            &mut command,
+            Some(&vec![b'x'; 4 * 1024 * 1024]),
+            Duration::from_millis(150),
+            64,
+            64,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, FleetErrorKind::Unreachable);
+        assert!(error.message.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bounded_io_times_out_when_reader_stalls_mid_payload() {
+        let mut command = shell("dd bs=1 count=1 >/dev/null 2>/dev/null; exec sleep 5");
+        let started = Instant::now();
+        let error = run_bounded_command(
+            &mut command,
+            Some(&vec![b'x'; 4 * 1024 * 1024]),
+            Duration::from_millis(150),
+            64,
+            64,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, FleetErrorKind::Unreachable);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 }

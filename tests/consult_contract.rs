@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
 use pikamux::consult::{
-    Cleanup, Consultation, ConsultationOptions, ConsultationStage, Delivery, FAST_CODEX_MODEL,
-    consultation_policy,
+    CancellationToken, Cleanup, Consultation, ConsultationOptions, ConsultationStage, Delivery,
+    FAST_CODEX_MODEL, MAX_QUESTION_BYTES, consultation_policy,
 };
 use pikamux::model::{Provider, Session, Status};
 use rusqlite::{Connection, params};
@@ -12,6 +12,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::time::Instant;
 use tempfile::TempDir;
 
 fn session(provider: Provider, id: &str, cwd: &Path) -> Session {
@@ -198,6 +199,100 @@ fn codex_reports_confirmed_delivery_when_response_times_out() {
     assert_eq!(error.receipt.delivery, Delivery::Confirmed);
     assert!(!error.receipt.retry_safe);
     side.close().unwrap();
+}
+
+#[test]
+fn cancellation_interrupts_blocked_codex_startup_and_reaps_owned_child() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("parent-marker");
+    let child_pid = root.path().join("owned-child.pid");
+    fs::write(&marker, "parent untouched").unwrap();
+    let executable = write_executable(
+        &root,
+        "codex-blocked-startup",
+        &format!(
+            "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > {}\nwait\n",
+            shell_quote(&child_pid)
+        ),
+    );
+    let cancellation = CancellationToken::default();
+    let mut options = ConsultationOptions::new(executable);
+    options.cancellation = cancellation.clone();
+    let target = session(Provider::Codex, "stable-workstream", root.path());
+    let worker = std::thread::spawn(move || Consultation::open(&target, options));
+    for _ in 0..500 {
+        if child_pid.is_file() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(child_pid.is_file(), "fixture child never started");
+    let cancelled_at = Instant::now();
+    cancellation.cancel();
+    let error = match worker.join().unwrap() {
+        Ok(_) => panic!("cancelled startup unexpectedly opened"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("cancelled"));
+    assert_eq!(error.receipt.cleanup, Cleanup::Complete);
+    assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+    assert_eq!(fs::read_to_string(marker).unwrap(), "parent untouched");
+    let pid: i32 = fs::read_to_string(child_pid).unwrap().parse().unwrap();
+    for _ in 0..50 {
+        // SAFETY: signal zero probes the exact fixture PID without changing it.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("owned consultation descendant {pid} survived cancellation");
+}
+
+#[test]
+fn cancellation_interrupts_blocked_codex_turn_without_resending() {
+    let root = tempfile::tempdir().unwrap();
+    let (executable, log) = codex_fixture(&root, "timeout");
+    let cancellation = CancellationToken::default();
+    let mut options = ConsultationOptions::new(executable);
+    options.timeout = Duration::from_secs(30);
+    options.cancellation = cancellation.clone();
+    let mut side = Consultation::open(
+        &session(Provider::Codex, "stable-workstream", root.path()),
+        options,
+    )
+    .unwrap();
+    let started = Instant::now();
+    let worker = std::thread::spawn(move || {
+        let error = side.ask("only once").unwrap_err();
+        let cleanup = side.close();
+        (error, cleanup)
+    });
+    std::thread::sleep(Duration::from_millis(75));
+    cancellation.cancel();
+    let (error, cleanup) = worker.join().unwrap();
+    assert!(error.to_string().contains("cancelled"));
+    assert_eq!(error.receipt.delivery, Delivery::Confirmed);
+    assert!(cleanup.is_ok());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let log = fs::read_to_string(log).unwrap();
+    assert_eq!(log.matches("\"method\":\"turn/start\"").count(), 1);
+}
+
+#[test]
+fn oversized_question_is_rejected_before_provider_delivery() {
+    let root = tempfile::tempdir().unwrap();
+    let (executable, log) = codex_fixture(&root, "normal");
+    let mut side = Consultation::open(
+        &session(Provider::Codex, "stable-workstream", root.path()),
+        ConsultationOptions::new(executable),
+    )
+    .unwrap();
+    let error = side.ask(&"x".repeat(MAX_QUESTION_BYTES + 1)).unwrap_err();
+    assert_eq!(error.receipt.delivery, Delivery::NotSent);
+    assert!(error.to_string().contains("64 KiB"));
+    side.close().unwrap();
+    let log = fs::read_to_string(log).unwrap();
+    assert!(!log.contains("\"method\":\"turn/start\""));
 }
 
 #[test]

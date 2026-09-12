@@ -13,8 +13,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,6 +30,22 @@ pub const FAST_CODEX_MODEL: &str = "gpt-5.6-luna";
 pub const FAST_CODEX_EFFORT: &str = "medium";
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_STDERR: usize = 64 * 1024;
+pub const MAX_QUESTION_BYTES: usize = 64 * 1024;
+
+/// Cooperative cancellation shared by the board and the exact Pika-owned
+/// consultation children. Cancelling never signals the parent agent process.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ConsultationPolicy {
@@ -146,6 +165,7 @@ pub struct ConsultationOptions {
     pub opencode_database: Option<PathBuf>,
     pub timeout: Duration,
     pub fast: bool,
+    pub cancellation: CancellationToken,
 }
 
 impl ConsultationOptions {
@@ -155,6 +175,7 @@ impl ConsultationOptions {
             opencode_database: None,
             timeout: Duration::from_secs(900),
             fast: false,
+            cancellation: CancellationToken::default(),
         }
     }
 }
@@ -273,6 +294,9 @@ impl Consultation {
         let question = question.trim();
         if question.is_empty() {
             return Err(self.failure("question cannot be empty"));
+        }
+        if question.len() > MAX_QUESTION_BYTES {
+            return Err(self.failure("question exceeded the 64 KiB safety limit"));
         }
         match self.side.ask(question, &mut self.delivery) {
             Ok(answer) if !answer.trim().is_empty() => {
@@ -447,13 +471,19 @@ impl Side {
 
 struct JsonChild {
     child: Child,
-    stdin: ChildStdin,
+    writes: mpsc::Sender<WriteRequest>,
     frames: Receiver<Result<Value, String>>,
     stderr: Arc<Mutex<Vec<u8>>>,
 }
 
+struct WriteRequest {
+    bytes: Vec<u8>,
+    result: SyncSender<std::result::Result<(), String>>,
+}
+
 impl JsonChild {
     fn spawn(mut command: Command) -> Result<Self> {
+        owned_process_group(&mut command);
         command
             .env("PIKA_EPHEMERAL", "1")
             .stdin(Stdio::piped())
@@ -479,42 +509,90 @@ impl JsonChild {
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let stderr_copy = Arc::clone(&stderr);
         let _ = thread::spawn(move || drain_bounded(stderr_pipe, stderr_copy));
+        let (writes, write_requests) = mpsc::channel();
+        let _ = thread::spawn(move || write_requests_loop(stdin, write_requests));
         Ok(Self {
             child,
-            stdin,
+            writes,
             frames,
             stderr,
         })
     }
 
-    fn send(&mut self, payload: &Value) -> Result<()> {
-        serde_json::to_writer(&mut self.stdin, payload)?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
-        Ok(())
+    fn send(
+        &mut self,
+        payload: &Value,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        let mut bytes = serde_json::to_vec(payload)?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_FRAME {
+            bail!("provider side request exceeded the 16 MiB safety limit");
+        }
+        let (sender, result) = mpsc::sync_channel(1);
+        self.writes
+            .send(WriteRequest {
+                bytes,
+                result: sender,
+            })
+            .context("provider input writer stopped")?;
+        loop {
+            if cancellation.is_cancelled() {
+                let _ = self.terminate();
+                bail!("provider side consultation cancelled");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = self.terminate();
+                bail!("provider side consultation timed out while sending input");
+            }
+            match result.recv_timeout(remaining.min(Duration::from_millis(25))) {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => {
+                    let _ = self.terminate();
+                    bail!("provider input write failed: {error}")
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    let _ = self.terminate();
+                    bail!("provider input writer stopped")
+                }
+            }
+        }
     }
 
-    fn receive(&mut self, deadline: Instant) -> Result<Value> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!("provider side consultation timed out");
-        }
-        match self.frames.recv_timeout(remaining) {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(message)) => bail!(message),
-            Err(RecvTimeoutError::Timeout) => bail!("provider side consultation timed out"),
-            Err(RecvTimeoutError::Disconnected) => {
-                let status = self.child.try_wait()?.map(|value| value.to_string());
-                let detail = self.stderr_tail();
-                bail!(
-                    "provider side consultation exited with status {}{}",
-                    status.as_deref().unwrap_or("unknown"),
-                    if detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {detail}")
-                    }
-                )
+    fn receive(&mut self, deadline: Instant, cancellation: &CancellationToken) -> Result<Value> {
+        loop {
+            if cancellation.is_cancelled() {
+                let _ = self.terminate();
+                bail!("provider side consultation cancelled");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = self.terminate();
+                bail!("provider side consultation timed out");
+            }
+            match self
+                .frames
+                .recv_timeout(remaining.min(Duration::from_millis(25)))
+            {
+                Ok(Ok(value)) => return Ok(value),
+                Ok(Err(message)) => bail!(message),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    let status = self.child.try_wait()?.map(|value| value.to_string());
+                    let detail = self.stderr_tail();
+                    bail!(
+                        "provider side consultation exited with status {}{}",
+                        status.as_deref().unwrap_or("unknown"),
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {detail}")
+                        }
+                    )
+                }
             }
         }
     }
@@ -530,6 +608,20 @@ impl JsonChild {
 
     fn terminate(&mut self) -> Result<()> {
         terminate_child(&mut self.child)
+    }
+}
+
+fn write_requests_loop(mut stdin: ChildStdin, requests: Receiver<WriteRequest>) {
+    for request in requests {
+        let result = stdin
+            .write_all(&request.bytes)
+            .and_then(|_| stdin.flush())
+            .map_err(|error| error.to_string());
+        let failed = result.is_err();
+        let _ = request.result.send(result);
+        if failed {
+            return;
+        }
     }
 }
 
@@ -619,6 +711,7 @@ struct CodexSide {
     notifications: Vec<Value>,
     policy: ConsultationPolicy,
     timeout: Duration,
+    cancellation: CancellationToken,
 }
 
 impl CodexSide {
@@ -641,6 +734,7 @@ impl CodexSide {
             notifications: Vec::new(),
             policy: policy.clone(),
             timeout: options.timeout,
+            cancellation: options.cancellation.clone(),
         };
         let opened = (|| -> Result<()> {
             side.request(
@@ -651,7 +745,11 @@ impl CodexSide {
                 }),
                 Duration::from_secs(15),
             )?;
-            side.process.send(&json!({"method":"initialized"}))?;
+            side.process.send(
+                &json!({"method":"initialized"}),
+                Instant::now() + Duration::from_secs(15),
+                &side.cancellation,
+            )?;
             let mut fork = json!({
                 "threadId": side.parent_id,
                 "ephemeral": true,
@@ -703,11 +801,14 @@ impl CodexSide {
     fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         self.request_id += 1;
         let request_id = self.request_id;
-        self.process
-            .send(&json!({"method":method,"id":request_id,"params":params}))?;
         let deadline = Instant::now() + timeout;
+        self.process.send(
+            &json!({"method":method,"id":request_id,"params":params}),
+            deadline,
+            &self.cancellation,
+        )?;
         loop {
-            let message = self.process.receive(deadline)?;
+            let message = self.process.receive(deadline, &self.cancellation)?;
             if message.get("id").and_then(Value::as_u64) == Some(request_id)
                 && message.get("method").is_none()
             {
@@ -722,10 +823,14 @@ impl CodexSide {
                 return Ok(message.get("result").cloned().unwrap_or_else(|| json!({})));
             }
             if message.get("id").is_some() && message.get("method").is_some() {
-                self.process.send(&json!({
-                    "id": message["id"],
-                    "error": {"code":-32000,"message":"Pika side consultations are non-interactive"}
-                }))?;
+                self.process.send(
+                    &json!({
+                        "id": message["id"],
+                        "error": {"code":-32000,"message":"Pika side consultations are non-interactive"}
+                    }),
+                    deadline,
+                    &self.cancellation,
+                )?;
             } else if message.get("method").is_some() {
                 self.notifications.push(message);
             }
@@ -764,17 +869,21 @@ impl CodexSide {
         let mut deltas = String::new();
         loop {
             let message = if self.notifications.is_empty() {
-                self.process.receive(deadline)
+                self.process.receive(deadline, &self.cancellation)
             } else {
                 Ok(self.notifications.remove(0))
             }
             .map_err(|error| SideFailure::turn(error, *delivery))?;
             if message.get("id").is_some() && message.get("method").is_some() {
                 self.process
-                    .send(&json!({
-                        "id":message["id"],
-                        "error":{"code":-32000,"message":"Pika side consultations are non-interactive"}
-                    }))
+                    .send(
+                        &json!({
+                            "id":message["id"],
+                            "error":{"code":-32000,"message":"Pika side consultations are non-interactive"}
+                        }),
+                        deadline,
+                        &self.cancellation,
+                    )
                     .map_err(|error| SideFailure::turn(error, *delivery))?;
                 continue;
             }
@@ -879,13 +988,18 @@ struct ClaudeSide {
     parent_id: String,
     process: JsonChild,
     timeout: Duration,
+    cancellation: CancellationToken,
 }
 
 impl ClaudeSide {
     fn open(session: &Session, options: &ConsultationOptions) -> Result<Self, SideFailure> {
-        let version =
-            run_output_bounded(&options.executable, &["--version"], Duration::from_secs(5))
-                .map_err(|error| SideFailure::prepare(error, Cleanup::Complete))?;
+        let version = run_output_bounded_cancellable(
+            &options.executable,
+            &["--version"],
+            Duration::from_secs(5),
+            &options.cancellation,
+        )
+        .map_err(|error| SideFailure::prepare(error, Cleanup::Complete))?;
         let found = version_tuple(&version);
         if found < vec![2, 1, 228] {
             return Err(SideFailure::prepare(
@@ -927,23 +1041,28 @@ impl ClaudeSide {
             parent_id,
             process,
             timeout: options.timeout,
+            cancellation: options.cancellation.clone(),
         })
     }
 
     fn ask(&mut self, question: &str, delivery: &mut Delivery) -> Result<String, SideFailure> {
         *delivery = Delivery::Unknown;
-        self.process
-            .send(&json!({
-                "type":"user",
-                "message":{"role":"user","content":[{"type":"text","text":question}]}
-            }))
-            .map_err(|error| SideFailure::turn(error, *delivery))?;
         let deadline = Instant::now() + self.timeout;
+        self.process
+            .send(
+                &json!({
+                    "type":"user",
+                    "message":{"role":"user","content":[{"type":"text","text":question}]}
+                }),
+                deadline,
+                &self.cancellation,
+            )
+            .map_err(|error| SideFailure::turn(error, *delivery))?;
         let mut latest = String::new();
         loop {
             let message = self
                 .process
-                .receive(deadline)
+                .receive(deadline, &self.cancellation)
                 .map_err(|error| SideFailure::turn(error, *delivery))?;
             match message.get("type").and_then(Value::as_str) {
                 Some("assistant") => {
@@ -1010,6 +1129,7 @@ struct OpenCodeSide {
     turn_stderr: Option<Arc<Mutex<Vec<u8>>>>,
     fork_server: Option<Child>,
     closed: bool,
+    cancellation: CancellationToken,
 }
 
 impl OpenCodeSide {
@@ -1020,9 +1140,13 @@ impl OpenCodeSide {
                 Cleanup::Complete,
             ));
         };
-        let version =
-            run_output_bounded(&options.executable, &["--version"], Duration::from_secs(5))
-                .map_err(|error| SideFailure::prepare(error, Cleanup::Complete))?;
+        let version = run_output_bounded_cancellable(
+            &options.executable,
+            &["--version"],
+            Duration::from_secs(5),
+            &options.cancellation,
+        )
+        .map_err(|error| SideFailure::prepare(error, Cleanup::Complete))?;
         if version_tuple(&version) < vec![1, 18, 21] {
             return Err(SideFailure::prepare(
                 "OpenCode side consultations require opencode >= 1.18.21",
@@ -1042,6 +1166,7 @@ impl OpenCodeSide {
             turn_stderr: None,
             fork_server: None,
             closed: false,
+            cancellation: options.cancellation.clone(),
         })
     }
 
@@ -1068,6 +1193,7 @@ impl OpenCodeSide {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        owned_process_group(&mut command);
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
@@ -1078,6 +1204,13 @@ impl OpenCodeSide {
         let base = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let health_deadline = Instant::now() + Duration::from_secs(15);
         loop {
+            if self.cancellation.is_cancelled() {
+                if let Some(server) = &mut self.fork_server {
+                    let _ = terminate_child(server);
+                }
+                self.fork_server = None;
+                bail!("OpenCode side consultation cancelled");
+            }
             if let Some(status) = self
                 .fork_server
                 .as_mut()
@@ -1088,12 +1221,15 @@ impl OpenCodeSide {
             }
             if http_json(
                 base,
-                "/global/health",
-                username,
-                &password,
-                "GET",
-                None,
-                Duration::from_millis(500),
+                HttpRequest {
+                    path: "/global/health",
+                    username,
+                    password: &password,
+                    method: "GET",
+                    payload: None,
+                    timeout: Duration::from_millis(500),
+                },
+                &self.cancellation,
             )
             .is_ok()
             {
@@ -1121,12 +1257,15 @@ impl OpenCodeSide {
         self.fork_uncertain = true;
         let response = http_json(
             base,
-            &endpoint,
-            username,
-            &password,
-            "POST",
-            Some(b"{}"),
-            Duration::from_secs(30),
+            HttpRequest {
+                path: &endpoint,
+                username,
+                password: &password,
+                method: "POST",
+                payload: Some(b"{}"),
+                timeout: Duration::from_secs(30),
+            },
+            &self.cancellation,
         );
         let response = match response {
             Ok(response) => response,
@@ -1220,6 +1359,7 @@ impl OpenCodeSide {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        owned_process_group(&mut command);
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
@@ -1236,6 +1376,25 @@ impl OpenCodeSide {
         self.turn_stderr = Some(stderr);
         let deadline = Instant::now() + self.timeout;
         loop {
+            if self.cancellation.is_cancelled() {
+                let mut terminated = true;
+                if let Some(process) = &mut self.turn_process {
+                    terminated = terminate_child(process).is_ok();
+                }
+                if terminated {
+                    self.turn_process = None;
+                    self.turn_stderr = None;
+                }
+                return Err(SideFailure::turn_with_cleanup(
+                    "OpenCode side consultation cancelled",
+                    *delivery,
+                    if terminated {
+                        Cleanup::Pending
+                    } else {
+                        Cleanup::Failed
+                    },
+                ));
+            }
             match self.completed_answer(&target, checkpoint) {
                 Ok((_seen_user, Some(answer))) => {
                     *delivery = Delivery::Confirmed;
@@ -1445,6 +1604,19 @@ fn terminate_child(child: &mut Child) -> Result<()> {
     }
     // These are Pika-created ephemeral children only. Rust's portable API has
     // no gentle terminate; kill is scoped to this exact owned `Child` handle.
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as i32);
+        // SAFETY: every child passed here was spawned into a new process group
+        // by `owned_process_group`; the negative ID cannot address the parent.
+        if unsafe { libc::kill(process_group, libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).context("could not terminate provider side process group");
+            }
+        }
+    }
+    #[cfg(not(unix))]
     child
         .kill()
         .context("could not terminate provider side child")?;
@@ -1452,9 +1624,29 @@ fn terminate_child(child: &mut Child) -> Result<()> {
     Ok(())
 }
 
+fn owned_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
 fn run_output_bounded(executable: &Path, args: &[&str], timeout: Duration) -> Result<String> {
-    let mut child = Command::new(executable)
-        .args(args)
+    run_output_bounded_cancellable(executable, args, timeout, &CancellationToken::default())
+}
+
+fn run_output_bounded_cancellable(
+    executable: &Path,
+    args: &[&str],
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<String> {
+    let mut command = Command::new(executable);
+    command.args(args);
+    owned_process_group(&mut command);
+    let mut child = command
         .env("PIKA_EPHEMERAL", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1473,6 +1665,10 @@ fn run_output_bounded(executable: &Path, args: &[&str], timeout: Duration) -> Re
     });
     let deadline = Instant::now() + timeout;
     let status = loop {
+        if cancellation.is_cancelled() {
+            terminate_child(&mut child)?;
+            bail!("{} cancelled", executable.display());
+        }
         if let Some(status) = child.try_wait()? {
             break status;
         }
@@ -1564,32 +1760,70 @@ fn basic64(value: &str) -> String {
     output
 }
 
+struct HttpRequest<'a> {
+    path: &'a str,
+    username: &'a str,
+    password: &'a str,
+    method: &'a str,
+    payload: Option<&'a [u8]>,
+    timeout: Duration,
+}
+
 fn http_json(
     address: SocketAddr,
-    path: &str,
-    username: &str,
-    password: &str,
-    method: &str,
-    payload: Option<&[u8]>,
-    timeout: Duration,
+    request: HttpRequest<'_>,
+    cancellation: &CancellationToken,
 ) -> Result<Value> {
-    let mut stream = TcpStream::connect_timeout(&address, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let payload = payload.unwrap_or_default();
-    write!(
-        stream,
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Basic {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    if cancellation.is_cancelled() {
+        bail!("OpenCode side consultation cancelled");
+    }
+    let deadline = Instant::now() + request.timeout;
+    let mut stream =
+        TcpStream::connect_timeout(&address, request.timeout.min(Duration::from_millis(250)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(100)))?;
+    let payload = request.payload.unwrap_or_default();
+    if payload.len() > MAX_QUESTION_BYTES {
+        bail!("OpenCode API request exceeded the 64 KiB safety limit");
+    }
+    let head = format!(
+        "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Basic {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        request.method,
+        request.path,
         address.port(),
-        basic64(&format!("{username}:{password}")),
+        basic64(&format!("{}:{}", request.username, request.password)),
         payload.len()
-    )?;
-    stream.write_all(payload)?;
-    stream.flush()?;
+    );
+    write_all_cancellable(&mut stream, head.as_bytes(), deadline, cancellation)?;
+    write_all_cancellable(&mut stream, payload, deadline, cancellation)?;
+    flush_cancellable(&mut stream, deadline, cancellation)?;
     let mut response = Vec::new();
-    stream
-        .take((MAX_FRAME + 64 * 1024 + 1) as u64)
-        .read_to_end(&mut response)?;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        if cancellation.is_cancelled() {
+            bail!("OpenCode side consultation cancelled");
+        }
+        if Instant::now() >= deadline {
+            bail!("OpenCode API request timed out");
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(size) => {
+                response.extend_from_slice(&chunk[..size]);
+                if response.len() > MAX_FRAME + 64 * 1024 {
+                    bail!("OpenCode API response exceeded the 16 MiB limit");
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     if response.len() > MAX_FRAME + 64 * 1024 {
         bail!("OpenCode API response exceeded the 16 MiB limit");
     }
@@ -1625,6 +1859,61 @@ fn http_json(
         bail!("OpenCode API returned an invalid response");
     }
     Ok(value)
+}
+
+fn write_all_cancellable(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    while !bytes.is_empty() {
+        if cancellation.is_cancelled() {
+            bail!("OpenCode side consultation cancelled");
+        }
+        if Instant::now() >= deadline {
+            bail!("OpenCode API request timed out");
+        }
+        match stream.write(bytes) {
+            Ok(0) => bail!("OpenCode API connection closed while sending request"),
+            Ok(size) => bytes = &bytes[size..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn flush_cancellable(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    loop {
+        if cancellation.is_cancelled() {
+            bail!("OpenCode side consultation cancelled");
+        }
+        if Instant::now() >= deadline {
+            bail!("OpenCode API request timed out");
+        }
+        match stream.flush() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn decode_chunked(mut value: &[u8]) -> Result<Vec<u8>> {
