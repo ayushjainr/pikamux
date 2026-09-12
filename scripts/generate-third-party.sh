@@ -35,6 +35,11 @@ pika_rust_copyright="$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.h
     printf 'Rust standard-library copyright report is missing\n' >&2
     exit 2
 }
+pika_rust_full_copyright="$(rustc --print sysroot)/share/doc/rust/COPYRIGHT.html"
+[ -f "$pika_rust_full_copyright" ] && [ ! -L "$pika_rust_full_copyright" ] || {
+    printf 'Rust toolchain copyright report is missing\n' >&2
+    exit 2
+}
 
 pika_tmp=$(mktemp -d "${TMPDIR:-/tmp}/pika-third-party.XXXXXXXX")
 cleanup() {
@@ -68,6 +73,7 @@ python3 "$pika_script_dir/generate-third-party.py" \
     --tree "$pika_tmp/tree-sorted.tsv" \
     --lock "$pika_repo_dir/Cargo.lock" \
     --rust-copyright "$pika_rust_copyright" \
+    --rust-full-copyright "$pika_rust_full_copyright" \
     --output "$pika_tmp/THIRD_PARTY.md"
 
 if [ "$pika_check" -eq 1 ]; then

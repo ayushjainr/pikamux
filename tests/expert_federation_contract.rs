@@ -143,7 +143,7 @@ fn seed_codex_source(paths: &Paths, current: &Session) {
     fs::create_dir_all(&paths.codex_home).unwrap();
     let db = Connection::open(paths.codex_home.join("state_fixture.sqlite")).unwrap();
     db.execute_batch(
-        "CREATE TABLE threads(\
+        "CREATE TABLE IF NOT EXISTS threads(\
          id TEXT PRIMARY KEY,name TEXT,cwd TEXT,git_branch TEXT,rollout_path TEXT,model TEXT,\
          created_at INTEGER,updated_at INTEGER,archived INTEGER);",
     )
@@ -407,6 +407,11 @@ fn expert_status_includes_unwatched_local_and_cached_remote_cards_without_ssh() 
         .unwrap();
     store.untrack_session(Provider::Codex, THREAD_ID).unwrap();
 
+    let mut missing = session("33333333-3333-4333-8333-333333333333", "temporary", None);
+    missing.name = None;
+    seed_codex_source(&paths, &missing);
+    store.upsert_session(&missing, true).unwrap();
+
     let remote_thread = "22222222-2222-4222-8222-222222222222";
     let remote_id = Uuid::new_v4().to_string();
     let mut remote_snapshot = snapshot(
@@ -435,13 +440,27 @@ fn expert_status_includes_unwatched_local_and_cached_remote_cards_without_ssh() 
     assert!(!marker.exists(), "cached expert status must not start SSH");
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     let values = payload.as_array().unwrap();
-    assert_eq!(values.len(), 2);
+    assert_eq!(values.len(), 3);
     let local = values
         .iter()
         .find(|item| item["session_id"] == THREAD_ID)
         .unwrap();
     assert_eq!(local["watched"], false);
     assert_eq!(local["scope"], "Owns local pricing");
+    assert_eq!(local["current_state"], "Reviewing rollout");
+    assert!(local.get("current_work").is_none());
+    assert!(local.get("machine").is_none());
+    let missing = values
+        .iter()
+        .find(|item| item["session_id"] == "33333333-3333-4333-8333-333333333333")
+        .unwrap();
+    assert_eq!(missing["name"], "codex-33333333");
+    assert!(missing["scope"].is_null());
+    assert!(missing["current_state"].is_null());
+    assert!(missing["scope_updated_at"].is_null());
+    assert!(missing["current_state_updated_at"].is_null());
+    assert_eq!(missing["scope_status"], "MISSING");
+    assert_eq!(missing["current_state_status"], "MISSING");
     let remote = values
         .iter()
         .find(|item| item["session_id"] == remote_thread)
@@ -450,6 +469,51 @@ fn expert_status_includes_unwatched_local_and_cached_remote_cards_without_ssh() 
     assert_eq!(remote["node_id"], remote_id);
     assert_eq!(remote["scope"], "Owns remote pricing");
     assert_eq!(remote["detail"], "matches remote source");
+    assert_eq!(remote["current_state"], "Reviewing rollout");
+    assert!(remote["scope_age_seconds"].is_number());
+    assert!(remote["current_state_age_seconds"].is_number());
+
+    let common = BTreeSet::from([
+        "availability",
+        "current_state",
+        "current_state_age_seconds",
+        "current_state_status",
+        "current_state_updated_at",
+        "detail",
+        "name",
+        "profile_source",
+        "profile_updated_at",
+        "project",
+        "provider",
+        "scope",
+        "scope_age_seconds",
+        "scope_status",
+        "scope_updated_at",
+        "session_id",
+        "status",
+        "watched",
+    ]);
+    for item in [local, missing] {
+        assert_eq!(
+            item.as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            common
+        );
+    }
+    let mut remote_keys = common;
+    remote_keys.extend(["machine", "node_id", "snapshot_seen_at", "snapshot_stale"]);
+    assert_eq!(
+        remote
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        remote_keys
+    );
 }
 
 #[test]

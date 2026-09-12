@@ -97,9 +97,11 @@ path. `preview` accepts prerelease or stable versions; `stable` contains only a
 stable version. Historical `0.5.0a5` and Cargo-style `0.6.0-alpha.1` spellings
 are accepted only for the transition.
 
-`scripts/package-release.sh` refuses an existing output directory, verifies
-each runnable binary's version/help/embedded skill, creates fresh archives, and
-writes checksums over the final bytes. Cross-target assembly may set the internal
+`scripts/package-release.sh` refuses an existing output directory or duplicate
+target mappings, verifies each runnable binary's version/help/embedded skill,
+creates fresh archives, and writes checksums over the final bytes. The verifier
+independently rejects duplicate JSON keys.
+Cross-target assembly may set the internal
 `PIKA_CROSS_PACKAGE=1` flag only after every matrix job has run those checks on
 the matching native runner. `scripts/generate-third-party.sh` deterministically
 rebuilds `THIRD_PARTY.md` from `Cargo.lock` and the checksummed Cargo crate
@@ -109,7 +111,9 @@ authors, reproduces the source license/notice texts, and identifies the
 public-domain SQLite amalgamation compiled by the `bundled` feature. CI rejects
 stale generated output. The same bundle reproduces the pinned Rust toolchain's
 complete standard-library copyright report because that runtime is statically
-linked into Pika.
+linked into Pika. For the self-contained musl libc linked by Linux targets, the
+generator extracts the complete musl-related notice blocks from the pinned Rust
+1.88.0 full toolchain copyright report; the text is never maintained by hand.
 
 ## Managed installation
 
@@ -131,9 +135,12 @@ record the managed paths, version, target, artifact and checksum. Before any roo
 write, Pika checks the candidate command surface, installation owner, launcher,
 current symlink, version ordering and package identity. It takes a nonblocking
 installation lock, stages a complete immutable release, and atomically switches
-`current`. Failure leaves the prior launcher usable. Downgrades and changed bytes
-under an existing version are refused. Old releases remain available for running
-callbacks and rollback.
+`current`. Copied payloads and their directories are synced before the stage is
+renamed; the releases directory and activation directory are synced around the
+atomic symlink swap. A process interruption or power loss therefore recovers to
+either the prior release or the fully persisted new release. Failure leaves the
+prior launcher usable. Downgrades and changed bytes under an existing version are
+refused. Old releases remain available for running callbacks and rollback.
 
 Managed native activation and `pika update` do not open Pika's state database,
 scan provider histories, modify hooks or skills, run setup, restart agents, or

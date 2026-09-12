@@ -17,9 +17,11 @@ import termios
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 
-MARKER = b"PIKA // LIVE OPERATIONS"
+COMPLETE_FRAME_MARKER = b"q leave"
+REMOTE_SENTINEL = b"remote_offline_fixture"
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -27,7 +29,9 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[int((len(ordered) - 1) * fraction)]
 
 
-def read_until(fd: int, marker: bytes, timeout: float) -> None:
+def read_until(
+    fd: int, marker: bytes, timeout: float, required: Optional[bytes] = None
+) -> bytes:
     deadline = time.monotonic() + timeout
     pending = bytearray()
     while time.monotonic() < deadline:
@@ -38,12 +42,15 @@ def read_until(fd: int, marker: bytes, timeout: float) -> None:
             pending.extend(os.read(fd, 65536))
         except OSError as error:
             raise RuntimeError("board exited before rendering") from error
-        if marker in pending:
-            return
+        if marker in pending and (required is None or required in pending):
+            return bytes(pending)
         if len(pending) > 1_048_576:
             del pending[:-len(marker)]
     tail = bytes(pending[-4096:]).decode("utf-8", "replace")
-    raise TimeoutError(f"board did not render a usable frame; tail={tail!r}")
+    requirement = f" and {required!r}" if required is not None else ""
+    raise TimeoutError(
+        f"board did not render {marker!r}{requirement}; tail={tail!r}"
+    )
 
 
 def stop(pid: int, fd: int) -> None:
@@ -72,7 +79,11 @@ def stop(pid: int, fd: int) -> None:
     os.waitpid(pid, 0)
 
 
-def spawn_board(program: Path, environment: dict[str, str]) -> tuple[int, int, float]:
+def spawn_board(
+    program: Path,
+    environment: dict[str, str],
+    complete_marker: bytes = COMPLETE_FRAME_MARKER,
+) -> tuple[int, int, float]:
     started = time.monotonic()
     pid, fd = pty.fork()
     if pid == 0:
@@ -80,7 +91,7 @@ def spawn_board(program: Path, environment: dict[str, str]) -> tuple[int, int, f
         os.execve(str(program), [str(program)], environment)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 150, 0, 0))
     try:
-        read_until(fd, MARKER, 10)
+        read_until(fd, complete_marker, 10, REMOTE_SENTINEL)
     except BaseException:
         stop(pid, fd)
         raise
@@ -92,14 +103,15 @@ def measure(
     environment: dict[str, str],
     samples: int,
     input_samples: int,
+    complete_marker: bytes = COMPLETE_FRAME_MARKER,
 ) -> dict[str, float | int]:
     first_frames = []
     for _ in range(samples):
-        pid, fd, elapsed = spawn_board(program, environment)
+        pid, fd, elapsed = spawn_board(program, environment, complete_marker)
         first_frames.append(elapsed)
         stop(pid, fd)
 
-    pid, fd, _ = spawn_board(program, environment)
+    pid, fd, _ = spawn_board(program, environment, complete_marker)
     inputs = []
     try:
         for index in range(input_samples):
@@ -108,7 +120,7 @@ def measure(
                 os.read(fd, 65536)
             started = time.monotonic()
             os.write(fd, b"\x1b[B" if index % 2 == 0 else b"\x1b[A")
-            read_until(fd, MARKER, 2)
+            read_until(fd, complete_marker, 2)
             inputs.append((time.monotonic() - started) * 1000)
     finally:
         stop(pid, fd)
@@ -138,12 +150,15 @@ def main() -> None:
     binary = args.binary.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="pika-board-benchmark-") as temporary:
         sandbox = Path(temporary)
-        for child in ("home", "config", "state", "cache", "tmp"):
+        for child in ("home", "config", "state", "cache", "tmp", "bin"):
             (sandbox / child).mkdir()
+        fake_ssh = sandbox / "bin" / "ssh"
+        fake_ssh.write_text("#!/bin/sh\n/bin/sleep 2\nexit 255\n")
+        fake_ssh.chmod(0o700)
         database = sandbox / "state" / "pika.db"
         seed_environment = {
             "HOME": str(sandbox / "home"),
-            "PATH": "/usr/bin:/bin",
+            "PATH": f"{sandbox / 'bin'}:/usr/bin:/bin",
             "PYTHONPATH": str(root / "tests" / "fixtures" / "python-v0.5.0a4"),
             "PYTHONDONTWRITEBYTECODE": "1",
             "PIKA_CONFIG_HOME": str(sandbox / "config" / "pika"),
@@ -182,6 +197,7 @@ def main() -> None:
                 environment,
                 args.samples,
                 args.input_samples,
+                b"q quit",
             )
         print(json.dumps(result, indent=2, sort_keys=True))
 

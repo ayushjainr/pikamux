@@ -41,6 +41,17 @@ allowed_top_level = {"LICENSE", "SHA256SUMS", "THIRD_PARTY.md", "pika-version"}
 def fail(message):
     raise SystemExit(f"Pika release verification: {message}")
 
+def unique_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+def parse_json(raw):
+    return json.loads(raw, object_pairs_hook=unique_json_object)
+
 def binary_shape(data, target):
     if len(data) < 64 * 1024 or len(data) > 50 * 1024 * 1024:
         fail(f"native executable has an invalid size: {target}")
@@ -113,7 +124,7 @@ def check_native(manifest_path, asset_root):
         if manifest_path.stat().st_size > 65536:
             fail("native manifest exceeds 64 KiB")
         raw = manifest_path.read_bytes()
-        value = json.loads(raw)
+        value = parse_json(raw)
         if set(value) != {"schema", "package", "version", "channel", "artifacts"}:
             fail("native manifest fields are not exact")
         if value["schema"] != 2 or value["package"] != "pikamux":
@@ -167,7 +178,7 @@ if bridge.is_file():
     try:
         if bridge.stat().st_size > 65536:
             fail("bridge manifest exceeds 64 KiB")
-        value = json.loads(bridge.read_text())
+        value = parse_json(bridge.read_text())
         if set(value) != {"schema", "version", "wheel", "sha256"} or value["schema"] != 1:
             fail("invalid schema-1 bridge manifest")
         version = value["version"]
@@ -208,7 +219,7 @@ if bridge.is_file():
             if not required.issubset(names):
                 fail("bridge has no embedded native manifest")
             with wheel.open(embedded + "pika-native-release.json") as stream:
-                payload = json.load(stream)
+                payload = json.load(stream, object_pairs_hook=unique_json_object)
             if set(payload) != {"schema", "package", "version", "channel", "artifacts"}:
                 fail("embedded native manifest fields are not exact")
             if payload["schema"] != 2 or payload["package"] != "pikamux":

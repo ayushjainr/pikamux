@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
 use pikamux::consult::{
-    CancellationToken, Cleanup, Consultation, ConsultationOptions, ConsultationStage, Delivery,
-    FAST_CODEX_MODEL, MAX_QUESTION_BYTES, consultation_policy,
+    CancellationToken, Cleanup, Consultation, ConsultationOptions, ConsultationProgress,
+    ConsultationStage, Delivery, FAST_CODEX_MODEL, MAX_QUESTION_BYTES, consultation_policy,
 };
 use pikamux::model::{Provider, Session, Status};
 use rusqlite::{Connection, params};
@@ -11,6 +11,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 use tempfile::TempDir;
@@ -185,6 +186,90 @@ fn codex_uses_one_confirmed_ephemeral_child_for_multiple_turns() {
 }
 
 #[test]
+fn progress_observer_reports_real_prepare_delivery_response_and_cleanup_transitions() {
+    let root = tempfile::tempdir().unwrap();
+    let (executable, _) = codex_fixture(&root, "normal");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let mut options = ConsultationOptions::new(executable);
+    options.timeout = Duration::from_secs(2);
+    options.progress = Some(Arc::new(move |event: ConsultationProgress| {
+        observed.lock().unwrap().push((
+            event.receipt.stage,
+            event.receipt.delivery,
+            event.receipt.cleanup,
+            event.outcome,
+        ));
+    }));
+    let mut side = Consultation::open(
+        &session(Provider::Codex, "stable-workstream", root.path()),
+        options,
+    )
+    .unwrap();
+    assert_eq!(side.ask("one").unwrap(), "answer-1");
+    side.close().unwrap();
+
+    let events = events.lock().unwrap();
+    let expected = [
+        (
+            ConsultationStage::Prepare,
+            Delivery::NotSent,
+            Cleanup::Pending,
+            None,
+        ),
+        (
+            ConsultationStage::Prepare,
+            Delivery::NotSent,
+            Cleanup::Pending,
+            Some("complete"),
+        ),
+        (
+            ConsultationStage::Turn,
+            Delivery::NotSent,
+            Cleanup::Pending,
+            None,
+        ),
+        (
+            ConsultationStage::Turn,
+            Delivery::Unknown,
+            Cleanup::Pending,
+            None,
+        ),
+        (
+            ConsultationStage::Turn,
+            Delivery::Confirmed,
+            Cleanup::Pending,
+            None,
+        ),
+        (
+            ConsultationStage::Response,
+            Delivery::Confirmed,
+            Cleanup::Pending,
+            None,
+        ),
+        (
+            ConsultationStage::Response,
+            Delivery::Confirmed,
+            Cleanup::Pending,
+            Some("complete"),
+        ),
+        (
+            ConsultationStage::Cleanup,
+            Delivery::Confirmed,
+            Cleanup::Pending,
+            None,
+        ),
+        (
+            ConsultationStage::Cleanup,
+            Delivery::Confirmed,
+            Cleanup::Complete,
+            Some("complete"),
+        ),
+    ];
+    assert_eq!(events.as_slice(), expected);
+}
+
+#[test]
 fn codex_rejects_invalid_or_parent_fork_identity_before_sending_question() {
     for mode in [
         "empty-child",
@@ -207,6 +292,39 @@ fn codex_rejects_invalid_or_parent_fork_identity_before_sending_question() {
         assert_eq!(error.receipt.cleanup, Cleanup::Complete);
         assert!(!fs::read_to_string(log).unwrap().contains("turn/start"));
     }
+}
+
+#[test]
+fn preparation_failure_emits_terminal_not_sent_progress_before_any_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let (executable, log) = codex_fixture(&root, "mismatch");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let mut options = ConsultationOptions::new(executable);
+    options.progress = Some(Arc::new(move |event: ConsultationProgress| {
+        observed.lock().unwrap().push(event);
+    }));
+    let error = Consultation::open(
+        &session(Provider::Codex, "stable-workstream", root.path()),
+        options,
+    )
+    .err()
+    .expect("mismatched policy must fail preparation");
+    assert_eq!(error.receipt.stage, ConsultationStage::Prepare);
+    assert_eq!(error.receipt.delivery, Delivery::NotSent);
+    assert_eq!(error.receipt.cleanup, Cleanup::Complete);
+    let events = events.lock().unwrap();
+    let failed = events.last().unwrap();
+    assert_eq!(failed.outcome, Some("failed"));
+    assert_eq!(failed.retry_safe, Some(true));
+    assert!(
+        failed
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("did not confirm")
+    );
+    assert!(!fs::read_to_string(log).unwrap().contains("turn/start"));
 }
 
 #[test]

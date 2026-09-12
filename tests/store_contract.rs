@@ -2,8 +2,8 @@ use pikamux::model::{
     ExpertProfile, FleetNode, ObservationKind, Provider, Session, Status, StatusObservation,
 };
 use pikamux::store::{
-    HookObservation, LaunchPhase, LiveOwner, PendingLaunch, Store, StoredExpertProfile,
-    UsageCacheRecord,
+    HookObservation, LaunchPhase, LiveOwner, MAX_REMOTE_SNAPSHOT_BYTES, PendingLaunch, Store,
+    StoredExpertProfile, UsageCacheRecord,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -467,6 +467,118 @@ fn fleet_cache_and_hook_records_round_trip_strictly() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn fleet_refresh_generation_makes_last_started_request_win() {
+    let (_temp, store) = store_fixture();
+    let node = FleetNode {
+        node_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        alias: "atlas".into(),
+        ssh_target: "atlas".into(),
+        sources: vec!["fixture".into()],
+        status: "unknown".into(),
+        protocol_version: Some(2),
+        package_version: Some("0.6".into()),
+        capabilities: vec!["snapshot".into()],
+        last_seen: 0.0,
+        last_attempt_at: 0.0,
+        last_error: None,
+        created_at: 1.0,
+        updated_at: 1.0,
+    };
+    store.upsert_fleet_node(&node).unwrap();
+    let older = store.claim_fleet_refresh(&node.node_id).unwrap();
+    let newer = store.claim_fleet_refresh(&node.node_id).unwrap();
+    assert!(newer > older);
+    assert!(
+        store
+            .put_remote_snapshot_if_current(
+                &node.node_id,
+                &json!({"generation":"newer"}),
+                20.0,
+                newer,
+            )
+            .unwrap()
+    );
+    assert!(
+        !store
+            .put_remote_snapshot_if_current(
+                &node.node_id,
+                &json!({"generation":"older"}),
+                30.0,
+                older,
+            )
+            .unwrap()
+    );
+    assert!(
+        !store
+            .mark_fleet_node_error_if_current(&node.node_id, older, "unreachable", "late failure",)
+            .unwrap()
+    );
+    let stored = store.get_remote_snapshot(&node.node_id).unwrap().unwrap();
+    assert_eq!(stored.payload["generation"], "newer");
+    assert_eq!(
+        store.get_fleet_node(&node.node_id).unwrap().unwrap().status,
+        "ready"
+    );
+
+    store
+        .set_meta(
+            &format!("fleet:refresh-generation:{}", node.node_id),
+            "not-a-generation",
+        )
+        .unwrap();
+    assert!(store.claim_fleet_refresh(&node.node_id).is_err());
+    assert!(
+        store
+            .current_fleet_refresh_generation(&node.node_id)
+            .is_err()
+    );
+}
+
+#[test]
+fn remote_snapshot_storage_rejects_oversized_payload_before_json_parse() {
+    let (_temp, store) = store_fixture();
+    let node = FleetNode {
+        node_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        alias: "atlas".into(),
+        ssh_target: "atlas".into(),
+        sources: vec![],
+        status: "ready".into(),
+        protocol_version: Some(2),
+        package_version: None,
+        capabilities: vec![],
+        last_seen: 0.0,
+        last_attempt_at: 0.0,
+        last_error: None,
+        created_at: 1.0,
+        updated_at: 1.0,
+    };
+    store.upsert_fleet_node(&node).unwrap();
+    let payload = json!({"padding":"x".repeat(MAX_REMOTE_SNAPSHOT_BYTES)});
+    assert!(
+        store
+            .put_remote_snapshot(&node.node_id, &payload, 1.0)
+            .is_err()
+    );
+    assert!(store.get_remote_snapshot(&node.node_id).unwrap().is_none());
+
+    // SQLite length(TEXT) counts Unicode code points, not encoded bytes. Seed a
+    // legacy/corrupt row directly to prove the read-side guard measures the
+    // UTF-8 blob before rusqlite allocates and parses the JSON string.
+    let oversized_unicode = format!(
+        "{{\"padding\":\"{}\"}}",
+        "💡".repeat(MAX_REMOTE_SNAPSHOT_BYTES / 4 + 1)
+    );
+    assert!(oversized_unicode.len() > MAX_REMOTE_SNAPSHOT_BYTES);
+    let db = Connection::open(store.path()).unwrap();
+    db.execute(
+        "INSERT INTO remote_snapshots(node_id,payload_json,captured_at) VALUES (?,?,?)",
+        (&node.node_id, &oversized_unicode, 1.0),
+    )
+    .unwrap();
+    assert!(store.get_remote_snapshot(&node.node_id).is_err());
 }
 
 #[test]

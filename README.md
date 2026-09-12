@@ -18,22 +18,19 @@ acts. A live exact home attaches. A saved conversation resumes into tmux. A
 discoverable conversation is adopted. A genuinely new name is created and
 named. Ambiguity is shown; Pika does not guess.
 
-## Native candidate
+## Install from source
 
-The Rust implementation supports macOS and Linux on Apple Silicon/ARM64 and
-x86-64. It is still behind its publication gates; the public installer may
-continue to deliver the Python baseline until a native release is published.
-Build and exercise this candidate without replacing an installed Pika:
+Pika supports macOS and Linux on Apple Silicon/ARM64 and x86-64. From this
+checkout:
 
 ```sh
-cargo build --release --locked
-target/release/pika --version
+cargo install --path . --locked
+pika setup
 ```
 
-The candidate includes a versionless bootstrap, native updater, and a one-use
-transition wheel for existing Python v0.5.0a4 installations. Their release
-artifacts are built and exercised only in disposable roots here; no native
-publication or installed-Pika cutover is claimed by this repository state.
+Rust 1.88 or newer and tmux are required to build and host conversations. Setup
+previews every change, preserves existing Codex and Claude settings, installs
+the `agent-convo` skill, and configures lifecycle hooks only after approval.
 
 ## What is implemented
 
@@ -51,13 +48,32 @@ publication or installed-Pika cutover is claimed by this repository state.
   boards, exact remote actions, and a fail-closed Python/native transition.
 - Previewable setup with preserved settings, atomic writes, backups, lifecycle
   hooks, the bundled `agent-convo` skill, and launchd/systemd expert refresh.
-- Locally verified native installation, updates, rollback-safe release roots, remote
-  upgrade bundles, checksums, and a portable Windows client/bridge artifact.
+- Locally verified native installation, updates, rollback-safe release roots,
+  remote upgrade bundles, and checksums.
 - Evidence-based doctor, explain, activity, usage, and stale-bookkeeping repair.
 
-Native Windows agent hosting is intentionally out of scope because tmux is not
-native to Windows. The Windows build is a client: it pairs with a macOS/Linux
-Pika host and opens exact remote conversations in Windows Terminal.
+### Make conversations discoverable as experts
+
+`pika setup` installs the agent-facing skill and a quota-aware card refresher.
+Cards describe durable expertise separately from current work, so another agent
+can find the right conversation and consult it without interrupting or modifying
+the parent. Inspect progress or refresh one eligible card with:
+
+```sh
+pika expert status
+pika expert refresh --due
+```
+
+An agent can also publish its own exact card explicitly with `pika expert
+publish`; run `pika expert publish --help` for the scope, current-work, topic,
+and artifact fields.
+
+### Windows client preview
+
+Native Windows hosting is out of scope because tmux is not native to Windows.
+The repository contains an experimental Windows client/bridge artifact for
+pairing with a macOS/Linux Pika host; clean-host installation and self-update
+remain release gates.
 
 ## Safety model
 
@@ -101,13 +117,13 @@ the same terminal geometry; hook runs alternate Python/native order.
 
 | Contract | Native Rust | Python v0.5.0a4 |
 | --- | ---: | ---: |
-| CLI startup, p95 (100 launches) | 5.33 ms | 147.85 ms |
-| Cached board first frame, p95 (30 launches) | 11.16 ms | 484.27 ms |
-| Board input redraw, p95 (1,000 keys) | 0.123 ms | 8.56 ms |
-| Hook fast path, p95 (100 events) | 15.46 ms | 505.63 ms |
-| 200-row local reconciliation, p95 (30 runs) | 73.34 ms | 2,563.51 ms |
-| Warm board RSS, p95 | 7.06 MiB | 36.42 MiB |
-| Binary / gzip | 4.39 MB / 2.26 MB | interpreter environment required |
+| CLI startup, p95 (100 launches) | 4.20 ms | 137.81 ms |
+| Cached board first frame, p95 (30 launches) | 10.85 ms | 461.88 ms |
+| Board input redraw, p95 (1,000 keys) | 0.116 ms | 8.33 ms |
+| Hook fast path, p95 (100 events) | 15.41 ms | 475.64 ms |
+| 200-row local reconciliation, p95 (30 runs) | 78.37 ms | 2,259.89 ms |
+| Warm board RSS, p95 | 10.77 MiB | 36.42 MiB |
+| Binary / gzip | 4.43 MB / 2.28 MB | interpreter environment required |
 
 Reproduce the measurements with:
 
@@ -120,16 +136,14 @@ python3 dev/measure_reconcile.py target/release/pika dev/python-v050a4 --samples
 ```
 
 Timing is hardware-specific; the behavioural gates are not. See the full
-[performance methodology](docs/PERFORMANCE.md),
-[PRD.md](PRD.md), [the mixed-runtime evidence](docs/MIXED_RUNTIME_COMPATIBILITY.md),
-and [the execution ledger](EXECUTION_LEDGER.md) for the frozen contracts and
-acceptance record.
+[performance methodology](docs/PERFORMANCE.md) and
+[mixed-runtime evidence](docs/MIXED_RUNTIME_COMPATIBILITY.md) for the frozen
+contracts and acceptance method.
 
 ## Release boundary
 
-This workspace does not replace an installed Python Pika merely because it
-builds successfully. Publishing, changing the global `pika` command, migrating
-live machines, and retiring rollback runtimes are separate, reversible release
-decisions after native artifacts pass their target-platform CI gates.
+The native release workflow keeps publication, installed-command cutover, live
+machine migration, and rollback-runtime retirement as separate, reversible
+decisions after target-platform CI passes.
 
 MIT licensed. See [LICENSE](LICENSE) and [THIRD_PARTY.md](THIRD_PARTY.md).

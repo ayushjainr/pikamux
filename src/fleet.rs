@@ -11,7 +11,7 @@ use crate::consult::{
 use crate::experts::{CardStatus, ExpertMatch, rank_experts, remote_source_availability};
 use crate::model::{Candidate, ExpertProfile, FleetNode, Provider, Session, Status};
 use crate::providers::Providers;
-use crate::store::{Store, StoredExpertProfile};
+use crate::store::{MAX_REMOTE_SNAPSHOT_BYTES, Store, StoredExpertProfile};
 use crate::update::RemoteInstallBundle;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -31,11 +31,17 @@ use uuid::Uuid;
 pub const PROTOCOL_NAME: &str = "pikamux-fleet";
 pub const PROTOCOL_VERSION: i64 = 2;
 pub const REMOTE_STALE_SECONDS: f64 = 45.0;
-pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_MESSAGE_BYTES: usize = MAX_REMOTE_SNAPSHOT_BYTES;
 pub const MAX_STDERR_BYTES: usize = 64 * 1024;
 pub const MAX_REMOTE_INSTALL_BYTES: usize = 101 * 1024 * 1024;
 pub const MAX_TEXT_CHARS: usize = 8_192;
 pub const MAX_EXPERT_ITEMS: usize = 64;
+pub const MAX_SNAPSHOT_SESSIONS: usize = 2_000;
+pub const MAX_SNAPSHOT_PROFILES: usize = 2_000;
+pub const MAX_SNAPSHOT_CARDS: usize = 2_000;
+pub const MAX_CACHED_FLEET_ROWS: usize = 8_000;
+pub const MAX_CACHED_FLEET_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_CACHED_FLEET_NODES: usize = 64;
 pub const CAPABILITIES: &[&str] = &[
     "inventory",
     "candidates",
@@ -736,12 +742,26 @@ pub fn validate_snapshot(
         object.get("sessions"),
         true,
         "Remote snapshot has no complete session list",
+        MAX_SNAPSHOT_SESSIONS,
     )?;
     let experts = if let Some(raw) = object.get("expert_sessions") {
-        validate_session_array(Some(raw), true, "Remote expert inventory is malformed")?
+        validate_session_array(
+            Some(raw),
+            true,
+            "Remote expert inventory is malformed",
+            MAX_SNAPSHOT_SESSIONS,
+        )?
     } else {
         Vec::new()
     };
+    if sessions.len().saturating_add(experts.len()) > MAX_SNAPSHOT_SESSIONS {
+        return Err(FleetError::new(
+            FleetErrorKind::Incompatible,
+            format!(
+                "Remote session inventories exceed the {MAX_SNAPSHOT_SESSIONS}-record safety limit"
+            ),
+        ));
+    }
     let mut identities = HashSet::new();
     for raw in sessions.iter().chain(experts.iter()) {
         let session = session_from_wire(raw)?;
@@ -903,6 +923,14 @@ fn validate_profiles(value: Option<&Value>) -> Result<Vec<Value>, FleetError> {
             "Remote expert profiles are malformed",
         )
     })?;
+    if values.len() > MAX_SNAPSHOT_PROFILES {
+        return Err(FleetError::new(
+            FleetErrorKind::Incompatible,
+            format!(
+                "Remote expert profiles exceed the {MAX_SNAPSHOT_PROFILES}-record safety limit"
+            ),
+        ));
+    }
     let mut seen = HashSet::new();
     for value in values {
         let object = object(value, "Remote expert profile is malformed")?;
@@ -972,6 +1000,12 @@ fn validate_cards(value: Option<&Value>) -> Result<Vec<Value>, FleetError> {
             "Remote thread profiles are malformed",
         )
     })?;
+    if values.len() > MAX_SNAPSHOT_CARDS {
+        return Err(FleetError::new(
+            FleetErrorKind::Incompatible,
+            format!("Remote thread profiles exceed the {MAX_SNAPSHOT_CARDS}-record safety limit"),
+        ));
+    }
     let mut seen = HashSet::new();
     for value in values {
         let object = object(value, "Remote thread profile is malformed")?;
@@ -1056,10 +1090,17 @@ fn validate_session_array(
     value: Option<&Value>,
     extended: bool,
     message: &str,
+    limit: usize,
 ) -> Result<Vec<Value>, FleetError> {
     let values = value
         .and_then(Value::as_array)
         .ok_or_else(|| FleetError::new(FleetErrorKind::Incompatible, message))?;
+    if values.len() > limit {
+        return Err(FleetError::new(
+            FleetErrorKind::Incompatible,
+            format!("{message}: exceeds the {limit}-record safety limit"),
+        ));
+    }
     for value in values {
         let object = object(value, message)?;
         let base = set(SESSION_FIELDS);
@@ -1077,6 +1118,21 @@ fn validate_session_array(
 
 pub trait FleetTransport {
     fn request(&self, target: &str, payload: &Value, mutating: bool) -> Result<Value, FleetError>;
+    fn request_cancellable(
+        &self,
+        target: &str,
+        payload: &Value,
+        mutating: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, FleetError> {
+        if cancellation.is_cancelled() {
+            return Err(FleetError::new(
+                FleetErrorKind::Unreachable,
+                "Fleet request cancelled before dispatch",
+            ));
+        }
+        self.request(target, payload, mutating)
+    }
     fn run_exact(
         &self,
         node: &FleetNode,
@@ -1275,6 +1331,16 @@ impl FleetInstallTransport for SshTransport {
 
 impl FleetTransport for SshTransport {
     fn request(&self, target: &str, payload: &Value, mutating: bool) -> Result<Value, FleetError> {
+        self.request_cancellable(target, payload, mutating, &CancellationToken::default())
+    }
+
+    fn request_cancellable(
+        &self,
+        target: &str,
+        payload: &Value,
+        mutating: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, FleetError> {
         let mut input = serde_json::to_vec(payload)
             .map_err(|error| FleetError::new(FleetErrorKind::InvalidRequest, error.to_string()))?;
         input.push(b'\n');
@@ -1286,12 +1352,13 @@ impl FleetTransport for SshTransport {
         }
         let mut command =
             self.command(target, &["_fleet".to_owned(), "--stdio".to_owned()], false)?;
-        let output = run_bounded_command(
+        let output = run_bounded_command_cancellable(
             &mut command,
             Some(&input),
             self.overall_timeout,
             MAX_MESSAGE_BYTES,
             MAX_STDERR_BYTES,
+            cancellation,
         )
         .map_err(|error| {
             if error.kind == FleetErrorKind::Unreachable && mutating {
@@ -1559,14 +1626,23 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
     }
 
     pub fn refresh_node(&self, value: &str) -> Result<Vec<FleetSession>, FleetError> {
+        self.refresh_node_cancellable(value, &CancellationToken::default())
+    }
+
+    pub fn refresh_node_cancellable(
+        &self,
+        value: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<FleetSession>, FleetError> {
         let node = self.store.get_fleet_node(value)?.ok_or_else(|| {
             FleetError::new(
                 FleetErrorKind::NotFound,
                 format!("Unknown Pika machine {value:?}"),
             )
         })?;
+        let generation = self.store.claim_fleet_refresh(&node.node_id)?;
         let snapshot = match self
-            .snapshot_request(&node)
+            .snapshot_request_cancellable(&node, cancellation)
             .and_then(|value| validate_snapshot(&value, Some(&node.node_id)))
         {
             Ok(snapshot) => snapshot,
@@ -1578,14 +1654,26 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                     FleetErrorKind::Quarantined => "quarantined",
                     _ => "error",
                 };
-                let _ = self
-                    .store
-                    .mark_fleet_node_error(&node.node_id, status, &error.message);
+                let _ = self.store.mark_fleet_node_error_if_current(
+                    &node.node_id,
+                    generation,
+                    status,
+                    &error.message,
+                );
                 return Err(error);
             }
         };
-        self.store
-            .put_remote_snapshot(&node.node_id, &snapshot, now())?;
+        if !self.store.put_remote_snapshot_if_current(
+            &node.node_id,
+            &snapshot,
+            now(),
+            generation,
+        )? {
+            return Err(FleetError::new(
+                FleetErrorKind::Error,
+                "Remote refresh was superseded by a newer request; retry from the current cache",
+            ));
+        }
         self.cached_sessions(Some(&node.node_id), false)
     }
 
@@ -1596,13 +1684,42 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
     ) -> Result<Vec<FleetSession>, FleetError> {
         let timestamp = now();
         let mut result = Vec::new();
-        for node in self.nodes()? {
+        let nodes = self.nodes()?;
+        let selected_nodes = nodes
+            .iter()
+            .filter(|node| node_id.is_none_or(|expected| expected == node.node_id))
+            .count();
+        if selected_nodes > MAX_CACHED_FLEET_NODES {
+            return Err(FleetError::new(
+                FleetErrorKind::Incompatible,
+                format!("Cached fleet exceeds the {MAX_CACHED_FLEET_NODES}-machine safety limit"),
+            ));
+        }
+        let mut cached_bytes = 0_usize;
+        for node in nodes {
             if node_id.is_some_and(|expected| expected != node.node_id) {
                 continue;
             }
             let Some(stored) = self.store.get_remote_snapshot(&node.node_id)? else {
                 continue;
             };
+            cached_bytes = cached_bytes
+                .checked_add(stored.encoded_bytes)
+                .ok_or_else(|| {
+                    FleetError::new(
+                        FleetErrorKind::Incompatible,
+                        "Cached fleet size overflowed its safety counter",
+                    )
+                })?;
+            if cached_bytes > MAX_CACHED_FLEET_BYTES {
+                return Err(FleetError::new(
+                    FleetErrorKind::Incompatible,
+                    format!(
+                        "Cached fleet exceeds the {} MiB board safety limit",
+                        MAX_CACHED_FLEET_BYTES / (1024 * 1024)
+                    ),
+                ));
+            }
             let Ok(snapshot) = validate_snapshot(&stored.payload, Some(&node.node_id)) else {
                 continue;
             };
@@ -1615,6 +1732,26 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 || timestamp - stored.captured_at > REMOTE_STALE_SECONDS;
             let cards = keyed_values(snapshot.get("cards"));
             let profiles = keyed_values(snapshot.get("profiles"));
+            let session_count = snapshot
+                .get("sessions")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len)
+                + if include_experts {
+                    snapshot
+                        .get("expert_sessions")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len)
+                } else {
+                    0
+                };
+            if result.len().saturating_add(session_count) > MAX_CACHED_FLEET_ROWS {
+                return Err(FleetError::new(
+                    FleetErrorKind::Incompatible,
+                    format!(
+                        "Cached fleet exceeds the {MAX_CACHED_FLEET_ROWS}-row board safety limit"
+                    ),
+                ));
+            }
             let mut all = snapshot
                 .get("sessions")
                 .and_then(Value::as_array)
@@ -2221,6 +2358,22 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 "version":PROTOCOL_VERSION, "expected_node_id":node.node_id,
             }),
             false,
+        )
+    }
+
+    fn snapshot_request_cancellable(
+        &self,
+        node: &FleetNode,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, FleetError> {
+        self.transport.request_cancellable(
+            &node.ssh_target,
+            &json!({
+                "op":"snapshot", "expert_directory":true, "protocol":PROTOCOL_NAME,
+                "version":PROTOCOL_VERSION, "expected_node_id":node.node_id,
+            }),
+            false,
+            cancellation,
         )
     }
 }
@@ -3638,6 +3791,25 @@ fn run_bounded_command(
     run_bounded_command_with_identity(command, input, timeout, stdout_limit, stderr_limit, None)
 }
 
+fn run_bounded_command_cancellable(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<BoundedOutput, FleetError> {
+    run_bounded_command_inner(
+        command,
+        input,
+        timeout,
+        stdout_limit,
+        stderr_limit,
+        None,
+        cancellation,
+    )
+}
+
 fn run_bounded_command_with_identity(
     command: &mut Command,
     input: Option<&[u8]>,
@@ -3646,10 +3818,36 @@ fn run_bounded_command_with_identity(
     stderr_limit: usize,
     identity_guard: Option<(&str, Duration)>,
 ) -> Result<BoundedOutput, FleetError> {
+    run_bounded_command_inner(
+        command,
+        input,
+        timeout,
+        stdout_limit,
+        stderr_limit,
+        identity_guard,
+        &CancellationToken::default(),
+    )
+}
+
+fn run_bounded_command_inner(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    identity_guard: Option<(&str, Duration)>,
+    cancellation: &CancellationToken,
+) -> Result<BoundedOutput, FleetError> {
     if input.is_some_and(|bytes| bytes.len() > MAX_REMOTE_INSTALL_BYTES) {
         return Err(FleetError::new(
             FleetErrorKind::InvalidRequest,
             "Command input exceeded the safety limit",
+        ));
+    }
+    if cancellation.is_cancelled() {
+        return Err(FleetError::new(
+            FleetErrorKind::Unreachable,
+            "Fleet request cancelled before process start",
         ));
     }
     let deadline = Instant::now() + timeout;
@@ -3710,11 +3908,15 @@ fn run_bounded_command_with_identity(
     let (write_sender, write_result) = mpsc::sync_channel(1);
     let input = input.map(<[u8]>::to_vec);
     let writer_stop = stop.clone();
+    let writer_cancellation = cancellation.clone();
     let writer_thread = thread::spawn(move || {
         let result = (|| -> Result<(), FleetError> {
             if let Some((identity_result, deadline)) = identity_result {
                 loop {
-                    if writer_stop.is_cancelled() || Instant::now() >= deadline {
+                    if writer_stop.is_cancelled()
+                        || writer_cancellation.is_cancelled()
+                        || Instant::now() >= deadline
+                    {
                         return Err(FleetError::new(
                             FleetErrorKind::Quarantined,
                             "Remote installation identity was not verified before the deadline; nothing installed",
@@ -3758,6 +3960,12 @@ fn run_bounded_command_with_identity(
     });
     let mut write_complete = false;
     let outcome = loop {
+        if cancellation.is_cancelled() {
+            break Err(FleetError::new(
+                FleetErrorKind::Unreachable,
+                "Fleet request cancelled",
+            ));
+        }
         if !write_complete {
             match write_result.try_recv() {
                 Ok(Ok(())) => write_complete = true,

@@ -1,10 +1,12 @@
 use pikamux::{
+    consult::CancellationToken,
     model::{Provider, Session, Status},
     paths::Paths,
     store::Store,
     usage::{
-        CostBasis, PRICING_AS_OF, format_cost, format_tokens, hydrate_cached_sessions,
-        hydrate_sessions, refresh_one_due, usage_for_session,
+        CostBasis, MAX_USAGE_SCAN_PER_TICK, PRICING_AS_OF, UsageRefreshCursor, format_cost,
+        format_tokens, hydrate_cached_sessions, hydrate_sessions, refresh_one_due,
+        refresh_one_due_bounded, usage_for_session,
     },
 };
 use rusqlite::Connection;
@@ -464,4 +466,27 @@ fn claude_usage_rejects_an_unbounded_single_record() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("record exceeds"));
+}
+
+#[test]
+fn board_usage_scans_a_bounded_window_and_deduplicates_shared_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths(temp.path());
+    let store = Store::from_paths(&paths);
+    store.initialize().unwrap();
+    let sessions = (0..2_000)
+        .map(|index| session(Provider::Opencode, &format!("session-{index:04}"), None))
+        .collect::<Vec<_>>();
+    let mut cursor = UsageRefreshCursor::default();
+    let report = refresh_one_due_bounded(
+        &paths,
+        &store,
+        &sessions,
+        &mut cursor,
+        &CancellationToken::default(),
+    );
+    assert_eq!(report.sessions_checked, MAX_USAGE_SCAN_PER_TICK);
+    assert_eq!(report.sources_checked, 1);
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.hydrated, 0);
 }

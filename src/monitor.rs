@@ -410,7 +410,15 @@ fn run_loop(
             last_draw = Instant::now();
             dirty = false;
         }
-        if !event::poll(Duration::from_millis(100))? {
+        // Terminal input wakes poll immediately. When no consultation is
+        // animating, a 500 ms ceiling keeps store-backed lifecycle changes
+        // visible within one second while avoiding ten idle wakeups per second.
+        let input_wait = if animated {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(500)
+        };
+        if !event::poll(input_wait)? {
             continue;
         }
         match event::read()? {

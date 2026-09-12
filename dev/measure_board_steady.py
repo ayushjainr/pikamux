@@ -51,13 +51,27 @@ def process_tree_metrics(root_pid: int) -> tuple[int, float]:
 
 
 def seed(root: Path, project: Path) -> tuple[Path, dict[str, str]]:
-    for child in ("home", "config", "state", "cache", "tmp", "codex", "claude", "opencode"):
+    for child in (
+        "home",
+        "config",
+        "state",
+        "cache",
+        "tmp",
+        "codex",
+        "claude",
+        "opencode",
+        "bin",
+    ):
         (root / child).mkdir(parents=True, exist_ok=True)
+    fake_ssh = root / "bin" / "ssh"
+    fake_ssh.write_text("#!/bin/sh\n/bin/sleep 2\nexit 255\n")
+    fake_ssh.chmod(0o700)
     database = root / "state" / "pika.db"
     tmux = shutil.which("tmux")
-    path_parts = ["/usr/bin", "/bin"]
+    path_parts = [str(root / "bin")]
     if tmux:
-        path_parts.insert(0, str(Path(tmux).parent))
+        path_parts.append(str(Path(tmux).parent))
+    path_parts.extend(["/usr/bin", "/bin"])
     path = os.pathsep.join(path_parts)
     base = {
         "HOME": str(root / "home"),

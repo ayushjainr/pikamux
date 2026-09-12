@@ -3,6 +3,7 @@ use crate::{
     attention::{self, AttentionTarget},
     client_bridge::{self, ClientWindowOutcome, TcpClientBridgeTransport},
     config::Config,
+    consult::CancellationToken,
     core::{OpenError, Pika},
     doctor,
     fleet::{
@@ -10,7 +11,7 @@ use crate::{
         NodeCandidate, SshTransport,
     },
     hooks::{self, HookContext},
-    model::{Provider, Session},
+    model::{Provider, Session, Status},
     monitor::{
         self, BoardAction, BoardItem, ConsultationDriver, ConsultationEvent, ConsultationInput,
         ConsultationOutcome, ExpertAnnotation,
@@ -30,7 +31,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
     io::{self, BufRead, IsTerminal, Read, Write},
@@ -43,6 +44,8 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const LOCAL_RECONCILE_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Parser, Debug)]
 #[command(name="pika", version=VERSION, about="One home for your Codex, Claude, and OpenCode conversations.", after_help="Run `pika NAME` to find, protect, attach, resume, or create the exact conversation.")]
@@ -607,9 +610,9 @@ fn bare(pika: &Pika) -> Result<i32> {
         );
         return print_sessions(inventory.sessions, true);
     }
-    // Paint local durable state immediately. Fleet cache parsing and provider
-    // observation stay behind the first frame.
-    let cached = board_items_local(pika)?;
+    // Paint all bounded durable state immediately, including offline fleet
+    // rows. No provider, process, tmux, or SSH observation belongs here.
+    let cached = board_items(pika)?;
     // At most one unpublished snapshot is useful: the board always wants the
     // newest complete observation, never a backlog of stale inventories.
     let (sender, receiver) = monitor::latest_channel();
@@ -630,9 +633,7 @@ fn bare(pika: &Pika) -> Result<i32> {
         let mut consecutive_failures = 0;
         while !worker_stop.load(Ordering::Relaxed) {
             if Instant::now() >= next_reconcile {
-                let refresh = worker
-                    .reconcile_local()
-                    .and_then(|inventory| board_items_from_inventory(&worker, inventory));
+                let refresh = worker.reconcile_local().and_then(|_| board_items(&worker));
                 worker_refresh_delayed.store(
                     record_local_refresh_result(&mut consecutive_failures, refresh.is_ok()),
                     Ordering::Relaxed,
@@ -650,11 +651,14 @@ fn bare(pika: &Pika) -> Result<i32> {
                         local_sender.publish(items);
                     }
                 }
-                next_reconcile = Instant::now() + Duration::from_secs(10);
+                // Hooks and store notifications carry normal lifecycle changes
+                // immediately. This slower full provider/process sweep is the
+                // bounded fallback for missed hooks and external changes.
+                next_reconcile = Instant::now() + LOCAL_RECONCILE_INTERVAL;
             }
             let wait = next_reconcile
                 .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(250));
+                .min(Duration::from_millis(500));
             match refresh_receiver.recv_timeout(wait) {
                 Ok(()) => next_reconcile = Instant::now(),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -672,9 +676,11 @@ fn bare(pika: &Pika) -> Result<i32> {
         let _ = local_done_sender.send(());
     });
     let remote_stop = Arc::clone(&stop);
+    let remote_cancel = CancellationToken::default();
+    let worker_remote_cancel = remote_cancel.clone();
     let remote_worker = pika.clone();
-    let _remote_refresh = thread::spawn(move || {
-        while !remote_stop.load(Ordering::Relaxed) {
+    let remote_refresh = thread::spawn(move || {
+        while !remote_stop.load(Ordering::Relaxed) && !worker_remote_cancel.is_cancelled() {
             let manager = FleetManager::new(&remote_worker.store, SshTransport::default());
             if let Ok(nodes) = manager.nodes()
                 && let Some(node) = fleet::next_remote_node(&nodes, None, now(), false)
@@ -683,29 +689,33 @@ fn bare(pika: &Pika) -> Result<i32> {
                 // store-driven local publisher observes that commit and builds
                 // the next complete board, preventing an older remote read
                 // from overwriting a newer local hook state.
-                let _ = manager.refresh_node(&node.node_id);
+                let _ = manager.refresh_node_cancellable(&node.node_id, &worker_remote_cancel);
             }
-            for _ in 0..10 {
-                if remote_stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
+            // The board unparks this exact worker during shutdown. A single
+            // parked interval avoids periodic cancellation polling while
+            // preserving the one-second fleet cadence.
+            thread::park_timeout(Duration::from_secs(1));
         }
     });
     let usage_stop = Arc::clone(&stop);
+    let usage_cancel = CancellationToken::default();
+    let worker_usage_cancel = usage_cancel.clone();
     let usage_worker = pika.clone();
-    let _usage_refresh = thread::spawn(move || {
-        while !usage_stop.load(Ordering::Relaxed) {
+    let usage_refresh = thread::spawn(move || {
+        let mut cursor = usage::UsageRefreshCursor::default();
+        while !usage_stop.load(Ordering::Relaxed) && !worker_usage_cancel.is_cancelled() {
             if let Ok(sessions) = usage_worker.store.list_sessions() {
-                let _ = usage::refresh_one_due(&usage_worker.paths, &usage_worker.store, &sessions);
+                let _ = usage::refresh_one_due_bounded(
+                    &usage_worker.paths,
+                    &usage_worker.store,
+                    &sessions,
+                    &mut cursor,
+                    &worker_usage_cancel,
+                );
             }
-            for _ in 0..20 {
-                if usage_stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
+            // See the fleet worker above: one interruptible wait is cheaper
+            // than repeatedly waking only to inspect the same stop token.
+            thread::park_timeout(Duration::from_secs(2));
         }
     });
     let (update_sender, update_receiver) = mpsc::sync_channel(1);
@@ -724,6 +734,16 @@ fn bare(pika: &Pika) -> Result<i32> {
         refresh_sender.clone(),
         local_refresh_delayed,
     );
+    // The background SSH group is owned by this board. Cancellation is observed
+    // by the command loop, which kills and reaps its exact process group before
+    // the worker returns. Join it before an exact action starts another refresh.
+    stop.store(true, Ordering::Relaxed);
+    remote_cancel.cancel();
+    usage_cancel.cancel();
+    remote_refresh.thread().unpark();
+    usage_refresh.thread().unpark();
+    let _ = remote_refresh.join();
+    let _ = usage_refresh.join();
     finish_board_observer(&stop, &refresh_sender, &local_done_receiver, local_refresh);
     // Do not delay Enter/quit behind provider metadata or a bounded SSH
     // timeout. Exact actions revalidate independently before mutating state.
@@ -871,22 +891,11 @@ fn board_items(pika: &Pika) -> Result<Vec<BoardItem>> {
     board_items_from_inventory(pika, pika.cached_inventory()?)
 }
 
-fn board_items_local(pika: &Pika) -> Result<Vec<BoardItem>> {
-    board_items_from_inventory_inner(pika, pika.cached_inventory()?, false)
-}
-
 fn board_items_from_inventory(
     pika: &Pika,
     inventory: crate::core::Inventory,
 ) -> Result<Vec<BoardItem>> {
-    board_items_from_inventory_inner(pika, inventory, true)
-}
-
-fn board_items_from_inventory_inner(
-    pika: &Pika,
-    mut inventory: crate::core::Inventory,
-    include_remote: bool,
-) -> Result<Vec<BoardItem>> {
+    let mut inventory = inventory;
     let _ = usage::hydrate_cached_sessions(&pika.store, &mut inventory.sessions);
     let profiles = pika
         .store
@@ -926,27 +935,89 @@ fn board_items_from_inventory_inner(
         pending_token: Some(pending.launch_token),
         expert: None,
     }));
-    if include_remote {
-        for remote in FleetManager::new(&pika.store, SshTransport::default())
-            .cached_sessions(None, false)
-            .map_err(anyhow::Error::from)?
-        {
-            items.push(BoardItem {
-                session: remote.session,
-                node_id: Some(remote.node_id),
-                node_name: Some(remote.node_name),
-                stale: remote.stale,
-                pending_token: None,
-                expert: remote.card_detail.map(|detail| ExpertAnnotation {
-                    scope: Some(detail),
-                    current_work: None,
-                    topics: Vec::new(),
-                    freshness: remote.card_status,
-                }),
-            });
-        }
-    }
+    append_cached_fleet(
+        &mut items,
+        FleetManager::new(&pika.store, SshTransport::default()).cached_sessions(None, false),
+    );
     Ok(items)
+}
+
+fn append_cached_fleet(
+    items: &mut Vec<BoardItem>,
+    cached: std::result::Result<Vec<fleet::FleetSession>, fleet::FleetError>,
+) {
+    match cached {
+        Ok(remotes) => {
+            for remote in remotes {
+                items.push(BoardItem {
+                    session: remote.session,
+                    node_id: Some(remote.node_id),
+                    node_name: Some(remote.node_name),
+                    stale: remote.stale,
+                    pending_token: None,
+                    expert: remote.card_detail.map(|detail| ExpertAnnotation {
+                        scope: Some(detail),
+                        current_work: None,
+                        topics: Vec::new(),
+                        freshness: remote.card_status,
+                    }),
+                });
+            }
+        }
+        Err(error) => items.push(fleet_cache_notice(&error)),
+    }
+}
+
+const FLEET_CACHE_NOTICE_SOURCE: &str = "fleet-cache-safety-notice";
+
+fn fleet_cache_notice(error: &fleet::FleetError) -> BoardItem {
+    BoardItem::local(Session {
+        provider: Provider::Codex,
+        session_id: "fleet-cache-safety-limit".into(),
+        name: Some("Fleet cache unavailable".into()),
+        cwd: None,
+        branch: None,
+        transcript_path: None,
+        tmux_session: None,
+        tmux_pane: None,
+        root_pid: None,
+        status: Status::Error,
+        unread: true,
+        model: None,
+        source: FLEET_CACHE_NOTICE_SOURCE.into(),
+        managed: false,
+        error: Some(error.message.clone()),
+        attention_reason: Some("cached fleet exceeded a safety limit".into()),
+        created_at: now(),
+        updated_at: now(),
+        last_event_at: now(),
+        last_activity_at: now(),
+        live: false,
+        attached: false,
+        home_state: "unavailable".into(),
+        cpu_percent: None,
+        rss_kb: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        cache_write_tokens: None,
+        total_tokens: None,
+        estimated_cost_usd: None,
+        active_thread_id: None,
+    })
+}
+
+fn reject_fleet_cache_notice(item: &BoardItem) -> Result<()> {
+    if item.session.source == FLEET_CACHE_NOTICE_SOURCE {
+        bail!(
+            "{}",
+            item.session
+                .error
+                .as_deref()
+                .unwrap_or("Cached fleet is unavailable")
+        );
+    }
+    Ok(())
 }
 
 fn exact_remote(pika: &Pika, item: &BoardItem) -> Result<fleet::FleetSession> {
@@ -966,6 +1037,7 @@ fn exact_remote(pika: &Pika, item: &BoardItem) -> Result<fleet::FleetSession> {
 }
 
 fn open_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
+    reject_fleet_cache_notice(&item)?;
     if let Some(token) = item.pending_token.as_deref() {
         let receipt = pika.open_pending(token, true)?;
         return finish_local_open(pika, &receipt);
@@ -1088,6 +1160,7 @@ fn maybe_open_client_window(
 }
 
 fn peek_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
+    reject_fleet_cache_notice(&item)?;
     if item.pending_token.is_some() {
         bail!("This conversation is still starting; open it to see provider output.")
     }
@@ -1105,6 +1178,7 @@ fn peek_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
 }
 
 fn untrack_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
+    reject_fleet_cache_notice(&item)?;
     if item.pending_token.is_some() {
         bail!("A starting conversation cannot be unwatched until its exact identity is known.")
     }
@@ -1123,6 +1197,7 @@ fn untrack_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
 }
 
 fn ask_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
+    reject_fleet_cache_notice(&item)?;
     if item.node_id.is_some() {
         return ask_remote(
             pika,
@@ -1141,6 +1216,7 @@ fn ask_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
 
 fn board_consultation_driver(pika: Pika) -> ConsultationDriver {
     ConsultationDriver::new(move |io| {
+        reject_fleet_cache_notice(&io.item)?;
         if io.item.pending_token.is_some() {
             bail!("the conversation is still starting")
         }
@@ -1973,9 +2049,10 @@ fn expert(pika: &Pika, a: ExpertArgs) -> Result<i32> {
                 .into_iter()
                 .filter_map(|session| {
                     let key = (session.provider, session.session_id.clone());
-                    let profile = profiles.get(&key);
-                    let state = crate::experts::card_state(&session, profile);
-                    let profile = profile.map(|stored| &stored.profile);
+                    let stored = profiles.get(&key);
+                    let state = crate::experts::card_state(&session, stored);
+                    let freshness = crate::experts::profile_freshness(&session, stored, now());
+                    let profile = stored.map(|stored| &stored.profile);
                     let availability = source_index.availability(&session).as_str();
                     if matches!(availability, "archived" | "deleted") {
                         return None;
@@ -1983,23 +2060,22 @@ fn expert(pika: &Pika, a: ExpertArgs) -> Result<i32> {
                     Some(serde_json::json!({
                         "provider": session.provider,
                         "session_id": session.session_id,
-                        "name": session.name,
+                        "name": session.display_name(),
                         "project": session.cwd,
-                        "branch": session.branch,
                         "watched": !untracked.contains(&key),
                         "availability": availability,
                         "status": state.status,
                         "detail": state.detail,
-                        "scope": profile.map_or("", |profile| profile.summary.as_str()),
-                        "current_work": profile.map_or("", |profile| profile.current_state.as_str()),
-                        "topics": profile.map_or(&[][..], |profile| profile.topics.as_slice()),
-                        "artifacts": profile.map_or(&[][..], |profile| profile.artifacts.as_slice()),
+                        "scope": profile.map(|profile| profile.summary.as_str()),
+                        "current_state": profile.map(|profile| profile.current_state.as_str()),
                         "profile_updated_at": profile.map(|profile| profile.updated_at),
                         "profile_source": profile.map(|profile| profile.source.as_str()),
-                        "machine": serde_json::Value::Null,
-                        "node_id": serde_json::Value::Null,
-                        "snapshot_stale": serde_json::Value::Null,
-                        "snapshot_seen_at": serde_json::Value::Null,
+                        "scope_updated_at": freshness.scope_updated_at,
+                        "scope_age_seconds": freshness.scope_age_seconds,
+                        "scope_status": freshness.scope_status,
+                        "current_state_updated_at": freshness.current_state_updated_at,
+                        "current_state_age_seconds": freshness.current_state_age_seconds,
+                        "current_state_status": freshness.current_state_status,
                     }))
                 })
                 .collect::<Vec<_>>();
@@ -2010,22 +2086,32 @@ fn expert(pika: &Pika, a: ExpertArgs) -> Result<i32> {
                 .into_iter()
                 .filter(|item| !matches!(item.availability.as_str(), "archived" | "deleted"))
             {
+                let display_name = remote.name.clone().unwrap_or_else(|| {
+                    format!(
+                        "{}-{}",
+                        remote.provider.as_str(),
+                        remote.session_id.chars().take(8).collect::<String>()
+                    )
+                });
                 values.push(serde_json::json!({
                     "provider": remote.provider,
                     "session_id": remote.session_id,
-                    "name": remote.name,
+                    "name": display_name,
                     "project": remote.project,
-                    "branch": remote.branch,
                     "watched": remote.watched,
                     "availability": remote.availability,
                     "status": remote.card_status,
                     "detail": remote.card_detail.unwrap_or_else(|| "cached remote expert card".into()),
                     "scope": remote.scope,
-                    "current_work": remote.current_state,
-                    "topics": remote.topics,
-                    "artifacts": remote.artifacts,
+                    "current_state": remote.current_state,
                     "profile_updated_at": remote.profile_updated_at,
                     "profile_source": remote.profile_source,
+                    "scope_updated_at": remote.freshness.scope_updated_at,
+                    "scope_age_seconds": remote.freshness.scope_age_seconds,
+                    "scope_status": remote.freshness.scope_status,
+                    "current_state_updated_at": remote.freshness.current_state_updated_at,
+                    "current_state_age_seconds": remote.freshness.current_state_age_seconds,
+                    "current_state_status": remote.freshness.current_state_status,
                     "machine": remote.machine,
                     "node_id": remote.node_id,
                     "snapshot_stale": remote.snapshot_stale,
@@ -2913,6 +2999,578 @@ fn update_command(a: UpdateArgs) -> Result<i32> {
     println!("{}", outcome.message());
     Ok(0)
 }
+
+fn consultation_receipt_fields(
+    receipt: &crate::consult::ConsultationReceipt,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "receipt_version".into(),
+        serde_json::json!(receipt.receipt_version),
+    );
+    fields.insert("stage".into(), serde_json::json!(receipt.stage));
+    fields.insert(
+        "elapsed_seconds".into(),
+        serde_json::json!(receipt.elapsed_seconds),
+    );
+    fields.insert(
+        "stage_elapsed_seconds".into(),
+        serde_json::json!(receipt.stage_elapsed_seconds),
+    );
+    fields.insert("turn".into(), serde_json::json!(receipt.turn));
+    fields.insert("delivery".into(), serde_json::json!(receipt.delivery));
+    fields.insert("cleanup".into(), serde_json::json!(receipt.cleanup));
+    fields.insert(
+        "answers_received".into(),
+        serde_json::json!(receipt.answers_received),
+    );
+    fields.insert(
+        "stage_durations_seconds".into(),
+        serde_json::json!(receipt.stage_durations_seconds),
+    );
+    fields
+}
+
+fn consultation_policy_fields(
+    policy: &crate::consult::ConsultationPolicy,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        ("consultation_mode".into(), serde_json::json!(policy.mode)),
+        ("model".into(), serde_json::json!(policy.model)),
+        ("effort".into(), serde_json::json!(policy.effort)),
+    ])
+}
+
+fn consultation_event_value(
+    event_type: &str,
+    receipt: &crate::consult::ConsultationReceipt,
+    policy: &crate::consult::ConsultationPolicy,
+) -> serde_json::Value {
+    let mut fields = consultation_receipt_fields(receipt);
+    fields.extend(consultation_policy_fields(policy));
+    fields.insert("type".into(), serde_json::json!(event_type));
+    serde_json::Value::Object(fields)
+}
+
+fn consultation_progress_value(
+    progress: &crate::consult::ConsultationProgress,
+) -> serde_json::Value {
+    let mut fields = consultation_receipt_fields(&progress.receipt);
+    fields.insert("type".into(), serde_json::json!("progress"));
+    if let Some(outcome) = progress.outcome {
+        fields.insert("outcome".into(), serde_json::json!(outcome));
+    }
+    if let Some(message) = &progress.message {
+        fields.insert("message".into(), serde_json::json!(message));
+    }
+    if let Some(retry_safe) = progress.retry_safe {
+        fields.insert("retry_safe".into(), serde_json::json!(retry_safe));
+    }
+    if let Some(cleanup_error) = &progress.cleanup_error {
+        fields.insert("cleanup_error".into(), serde_json::json!(cleanup_error));
+    }
+    serde_json::Value::Object(fields)
+}
+
+fn emit_jsonl_value(value: serde_json::Value) -> bool {
+    let Ok(line) = serde_json::to_string(&value) else {
+        return false;
+    };
+    let mut output = io::stdout().lock();
+    writeln!(output, "{line}").is_ok() && output.flush().is_ok()
+}
+
+fn consultation_opened_value(
+    side: &crate::consult::Consultation,
+    session: &Session,
+) -> serde_json::Value {
+    let mut value = consultation_event_value("opened", &side.receipt(), side.policy());
+    let fields = value
+        .as_object_mut()
+        .expect("consultation event is an object");
+    fields.insert("ephemeral".into(), serde_json::json!(true));
+    fields.insert("provider".into(), serde_json::json!(session.provider));
+    fields.insert(
+        "workstream_id".into(),
+        serde_json::json!(session.session_id),
+    );
+    fields.insert("parent_id".into(), serde_json::json!(side.parent_id()));
+    fields.insert("name".into(), serde_json::json!(session.display_name()));
+    value
+}
+
+fn consultation_answer_value(
+    side: &crate::consult::Consultation,
+    answer: &str,
+) -> serde_json::Value {
+    let mut value = consultation_event_value("answer", &side.receipt(), side.policy());
+    value
+        .as_object_mut()
+        .expect("consultation event is an object")
+        .insert("text".into(), serde_json::json!(answer));
+    value
+}
+
+fn consultation_error_value(
+    policy: &crate::consult::ConsultationPolicy,
+    error: &crate::consult::ConsultationError,
+) -> serde_json::Value {
+    consultation_error_value_from_parts(
+        policy,
+        &error.receipt,
+        &error.to_string(),
+        error.cleanup_error.as_deref(),
+    )
+}
+
+fn consultation_error_value_from_parts(
+    policy: &crate::consult::ConsultationPolicy,
+    receipt: &crate::consult::ConsultationReceipt,
+    message: &str,
+    cleanup_error: Option<&str>,
+) -> serde_json::Value {
+    let mut value = consultation_event_value("error", receipt, policy);
+    let fields = value
+        .as_object_mut()
+        .expect("consultation event is an object");
+    fields.insert("message".into(), serde_json::json!(message));
+    fields.insert("outcome".into(), serde_json::json!("failed"));
+    fields.insert("retry_safe".into(), serde_json::json!(receipt.retry_safe));
+    if let Some(cleanup_error) = cleanup_error {
+        fields.insert("cleanup_error".into(), serde_json::json!(cleanup_error));
+    }
+    value
+}
+
+fn consultation_closed_value(
+    receipt: &crate::consult::ConsultationReceipt,
+    policy: &crate::consult::ConsultationPolicy,
+    discarded: bool,
+) -> serde_json::Value {
+    let mut value = consultation_event_value("closed", receipt, policy);
+    let fields = value
+        .as_object_mut()
+        .expect("consultation event is an object");
+    fields.insert("discarded".into(), serde_json::json!(discarded));
+    fields.insert(
+        "parent_transcript_unchanged".into(),
+        serde_json::Value::Null,
+    );
+    fields.insert(
+        "parent_transcript_verification".into(),
+        serde_json::json!("not_performed"),
+    );
+    value
+}
+
+struct RemoteJsonlRun {
+    started: Instant,
+    stage_started: Instant,
+    stage: crate::consult::ConsultationStage,
+    delivery: crate::consult::Delivery,
+    cleanup: crate::consult::Cleanup,
+    turn: u32,
+    answers_received: u32,
+    stage_durations: BTreeMap<String, Duration>,
+    policy: crate::consult::ConsultationPolicy,
+    output_ok: bool,
+}
+
+impl RemoteJsonlRun {
+    fn new(policy: crate::consult::ConsultationPolicy) -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            stage_started: now,
+            stage: crate::consult::ConsultationStage::Prepare,
+            delivery: crate::consult::Delivery::NotSent,
+            cleanup: crate::consult::Cleanup::Pending,
+            turn: 0,
+            answers_received: 0,
+            stage_durations: BTreeMap::new(),
+            policy,
+            output_ok: true,
+        }
+    }
+
+    fn receipt(&self) -> crate::consult::ConsultationReceipt {
+        let mut durations = self.stage_durations.clone();
+        *durations.entry(self.stage_name().into()).or_default() += self.stage_started.elapsed();
+        crate::consult::ConsultationReceipt {
+            receipt_version: 2,
+            stage: self.stage,
+            elapsed_seconds: rounded_duration(self.started.elapsed()),
+            stage_elapsed_seconds: rounded_duration(self.stage_started.elapsed()),
+            turn: self.turn,
+            delivery: self.delivery,
+            cleanup: self.cleanup,
+            answers_received: self.answers_received,
+            stage_durations_seconds: durations
+                .into_iter()
+                .map(|(stage, duration)| (stage, rounded_duration(duration)))
+                .collect(),
+            retry_safe: self.delivery == crate::consult::Delivery::NotSent
+                && matches!(
+                    self.stage,
+                    crate::consult::ConsultationStage::Prepare
+                        | crate::consult::ConsultationStage::Turn
+                )
+                && !matches!(
+                    self.cleanup,
+                    crate::consult::Cleanup::Failed | crate::consult::Cleanup::Unknown
+                ),
+            parent_transcript_unchanged: None,
+            parent_transcript_verification: "not_performed",
+            consultation_mode: self.policy.mode.clone(),
+            model: self.policy.model.clone(),
+            effort: self.policy.effort.clone(),
+        }
+    }
+
+    fn stage_name(&self) -> &'static str {
+        match self.stage {
+            crate::consult::ConsultationStage::Prepare => "prepare",
+            crate::consult::ConsultationStage::Turn => "turn",
+            crate::consult::ConsultationStage::Response => "response",
+            crate::consult::ConsultationStage::Cleanup => "cleanup",
+        }
+    }
+
+    fn set_stage(&mut self, stage: crate::consult::ConsultationStage) {
+        if self.stage != stage {
+            *self
+                .stage_durations
+                .entry(self.stage_name().into())
+                .or_default() += self.stage_started.elapsed();
+            self.stage = stage;
+            self.stage_started = Instant::now();
+        }
+    }
+
+    fn progress(&mut self, outcome: Option<&'static str>) {
+        self.output_ok &= emit_jsonl_value(consultation_progress_value(
+            &crate::consult::ConsultationProgress {
+                receipt: self.receipt(),
+                outcome,
+                message: None,
+                retry_safe: None,
+                cleanup_error: None,
+            },
+        ));
+    }
+
+    fn begin_turn(&mut self) {
+        self.turn += 1;
+        self.delivery = crate::consult::Delivery::NotSent;
+        self.set_stage(crate::consult::ConsultationStage::Turn);
+        self.progress(None);
+    }
+
+    fn submission_started(&mut self) {
+        self.delivery = crate::consult::Delivery::Unknown;
+        self.progress(None);
+    }
+
+    fn answer_received(&mut self) {
+        self.delivery = crate::consult::Delivery::Confirmed;
+        self.progress(None);
+        self.answers_received += 1;
+        self.set_stage(crate::consult::ConsultationStage::Response);
+        self.progress(None);
+        self.progress(Some("complete"));
+    }
+
+    fn cleanup_started(&mut self) {
+        self.set_stage(crate::consult::ConsultationStage::Cleanup);
+        self.progress(None);
+    }
+
+    fn absorb_remote_receipt(&mut self, receipt: Option<&fleet::ConsultationReceipt>) {
+        let Some(receipt) = receipt else { return };
+        if let Some(stage) = receipt.stage.as_deref().and_then(parse_consultation_stage) {
+            self.set_stage(stage);
+        }
+        if let Some(delivery) = receipt
+            .delivery
+            .as_deref()
+            .and_then(parse_consultation_delivery)
+        {
+            self.delivery = delivery;
+        }
+        if let Some(cleanup) = receipt
+            .cleanup
+            .as_deref()
+            .and_then(parse_consultation_cleanup)
+        {
+            self.cleanup = cleanup;
+        }
+        if let Some(turn) = receipt.turn.and_then(|value| u32::try_from(value).ok()) {
+            self.turn = turn;
+        }
+        if let Some(answers) = receipt
+            .answers_received
+            .and_then(|value| u32::try_from(value).ok())
+        {
+            self.answers_received = answers;
+        }
+    }
+}
+
+fn rounded_duration(duration: Duration) -> f64 {
+    (duration.as_secs_f64() * 1_000.0).round() / 1_000.0
+}
+
+fn parse_consultation_stage(value: &str) -> Option<crate::consult::ConsultationStage> {
+    match value {
+        "prepare" => Some(crate::consult::ConsultationStage::Prepare),
+        "turn" => Some(crate::consult::ConsultationStage::Turn),
+        "response" => Some(crate::consult::ConsultationStage::Response),
+        "cleanup" => Some(crate::consult::ConsultationStage::Cleanup),
+        _ => None,
+    }
+}
+
+fn parse_consultation_delivery(value: &str) -> Option<crate::consult::Delivery> {
+    match value {
+        "not_sent" => Some(crate::consult::Delivery::NotSent),
+        "unknown" => Some(crate::consult::Delivery::Unknown),
+        "confirmed" => Some(crate::consult::Delivery::Confirmed),
+        _ => None,
+    }
+}
+
+fn parse_consultation_cleanup(value: &str) -> Option<crate::consult::Cleanup> {
+    match value {
+        "pending" => Some(crate::consult::Cleanup::Pending),
+        "complete" => Some(crate::consult::Cleanup::Complete),
+        "failed" => Some(crate::consult::Cleanup::Failed),
+        "unknown" => Some(crate::consult::Cleanup::Unknown),
+        _ => None,
+    }
+}
+
+fn remote_opened_value(run: &RemoteJsonlRun, remote: &fleet::FleetSession) -> serde_json::Value {
+    let mut value = consultation_event_value("opened", &run.receipt(), &run.policy);
+    let fields = value
+        .as_object_mut()
+        .expect("consultation event is an object");
+    fields.insert("ephemeral".into(), serde_json::json!(true));
+    fields.insert(
+        "provider".into(),
+        serde_json::json!(remote.session.provider),
+    );
+    fields.insert(
+        "workstream_id".into(),
+        serde_json::json!(remote.session.session_id),
+    );
+    fields.insert(
+        "parent_id".into(),
+        serde_json::json!(remote.session.provider_thread_id()),
+    );
+    fields.insert("name".into(), serde_json::json!(remote.qualified_name()));
+    value
+}
+
+#[cfg(test)]
+mod consultation_jsonl_schema_tests {
+    use super::{
+        RemoteJsonlRun, consultation_answer_value, consultation_closed_value,
+        consultation_error_value_from_parts, consultation_opened_value,
+        consultation_progress_value, remote_opened_value,
+    };
+    use crate::{
+        consult::{
+            Cleanup, Consultation, ConsultationOptions, ConsultationPolicy, ConsultationProgress,
+            ConsultationReceipt, ConsultationStage, Delivery,
+        },
+        model::{Provider, Session, Status},
+    };
+    use std::{collections::BTreeSet, fs, os::unix::fs::PermissionsExt, time::Duration};
+
+    fn keys(value: &serde_json::Value) -> BTreeSet<&str> {
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn receipt() -> ConsultationReceipt {
+        ConsultationReceipt {
+            receipt_version: 2,
+            stage: ConsultationStage::Response,
+            elapsed_seconds: 1.25,
+            stage_elapsed_seconds: 0.25,
+            turn: 1,
+            delivery: Delivery::Confirmed,
+            cleanup: Cleanup::Pending,
+            answers_received: 1,
+            stage_durations_seconds: [("prepare".into(), 1.0)].into_iter().collect(),
+            retry_safe: false,
+            parent_transcript_unchanged: None,
+            parent_transcript_verification: "not_performed",
+            consultation_mode: "default".into(),
+            model: Some("gpt-test".into()),
+            effort: Some("medium".into()),
+        }
+    }
+
+    fn policy() -> ConsultationPolicy {
+        ConsultationPolicy {
+            mode: "default".into(),
+            model: Some("gpt-test".into()),
+            effort: Some("medium".into()),
+        }
+    }
+
+    fn base() -> BTreeSet<&'static str> {
+        BTreeSet::from([
+            "answers_received",
+            "cleanup",
+            "delivery",
+            "elapsed_seconds",
+            "receipt_version",
+            "stage",
+            "stage_durations_seconds",
+            "stage_elapsed_seconds",
+            "turn",
+        ])
+    }
+
+    fn policy_keys() -> BTreeSet<&'static str> {
+        BTreeSet::from(["consultation_mode", "effort", "model"])
+    }
+
+    #[test]
+    fn frozen_progress_error_and_closed_schemas_are_flat() {
+        let receipt = receipt();
+        let mut progress_keys = base();
+        progress_keys.extend(["outcome", "type"]);
+        let progress = consultation_progress_value(&ConsultationProgress {
+            receipt: receipt.clone(),
+            outcome: Some("complete"),
+            message: None,
+            retry_safe: None,
+            cleanup_error: None,
+        });
+        assert_eq!(keys(&progress), progress_keys);
+
+        let mut error_keys = base();
+        error_keys.extend(policy_keys());
+        error_keys.extend(["message", "outcome", "retry_safe", "type"]);
+        let error = consultation_error_value_from_parts(&policy(), &receipt, "failed", None);
+        assert_eq!(keys(&error), error_keys);
+
+        let mut closed_keys = base();
+        closed_keys.extend(policy_keys());
+        closed_keys.extend([
+            "discarded",
+            "parent_transcript_unchanged",
+            "parent_transcript_verification",
+            "type",
+        ]);
+        let closed = consultation_closed_value(&receipt, &policy(), true);
+        assert_eq!(keys(&closed), closed_keys);
+        for value in [&progress, &error, &closed] {
+            assert!(value.get("receipt").is_none());
+            assert!(value.get("policy").is_none());
+        }
+    }
+
+    #[test]
+    fn frozen_opened_and_answer_schemas_are_flat() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("codex");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nwhile IFS= read -r line; do\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) echo '{\"id\":1,\"result\":{}}' ;;\n*'\"method\":\"thread/fork\"'*) echo '{\"id\":2,\"result\":{\"thread\":{\"id\":\"22222222-2222-4222-8222-222222222222\",\"ephemeral\":true},\"model\":\"gpt-5.6-sol\",\"reasoningEffort\":\"medium\"}}' ;;\nesac\ndone\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let session = Session {
+            provider: Provider::Codex,
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+            name: Some("named".into()),
+            cwd: Some(root.path().to_string_lossy().into_owned()),
+            branch: None,
+            transcript_path: None,
+            tmux_session: None,
+            tmux_pane: None,
+            root_pid: None,
+            status: Status::Working,
+            unread: false,
+            model: None,
+            source: "fixture".into(),
+            managed: true,
+            error: None,
+            attention_reason: None,
+            created_at: 1.0,
+            updated_at: 1.0,
+            last_event_at: 1.0,
+            last_activity_at: 1.0,
+            live: true,
+            attached: false,
+            home_state: String::new(),
+            cpu_percent: None,
+            rss_kb: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            total_tokens: None,
+            estimated_cost_usd: None,
+            active_thread_id: None,
+        };
+        let mut options = ConsultationOptions::new(executable);
+        options.timeout = Duration::from_secs(1);
+        let mut side = Consultation::open(&session, options).unwrap();
+
+        let mut opened_keys = base();
+        opened_keys.extend(policy_keys());
+        opened_keys.extend([
+            "ephemeral",
+            "name",
+            "parent_id",
+            "provider",
+            "type",
+            "workstream_id",
+        ]);
+        let opened = consultation_opened_value(&side, &session);
+        assert_eq!(keys(&opened), opened_keys);
+        assert!(opened.get("child_id").is_none());
+
+        let remote = crate::fleet::FleetSession {
+            node_id: "33333333-3333-4333-8333-333333333333".into(),
+            node_name: "atlas".into(),
+            session: session.clone(),
+            stale: false,
+            remote_error: None,
+            seen_at: 1.0,
+            card_status: None,
+            card_detail: None,
+            watched: true,
+            availability: Some("source-available".into()),
+            scope_updated_at: None,
+            current_state_updated_at: None,
+            current_state_status: None,
+        };
+        let remote_run = RemoteJsonlRun::new(policy());
+        let remote_opened = remote_opened_value(&remote_run, &remote);
+        assert_eq!(keys(&remote_opened), opened_keys);
+        assert_eq!(remote_opened["name"], "named@atlas");
+        assert!(remote_opened.get("machine").is_none());
+        assert!(remote_opened.get("node_id").is_none());
+
+        let mut answer_keys = base();
+        answer_keys.extend(policy_keys());
+        answer_keys.extend(["text", "type"]);
+        let answer = consultation_answer_value(&side, "answer");
+        assert_eq!(keys(&answer), answer_keys);
+        side.close().unwrap();
+    }
+}
+
 fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
     let session = match resolve_named_target(pika, &a.name, false, LocalTargetDomain::Expert)? {
         Some(NamedTarget::Remote(remote)) => return ask_remote(pika, *remote, a),
@@ -2922,11 +3580,51 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
     let mut options =
         crate::consult::ConsultationOptions::new(pika.config.executable(session.provider));
     options.fast = a.fast;
+    let jsonl_output_ok = Arc::new(AtomicBool::new(true));
+    if a.jsonl {
+        let output_ok = Arc::clone(&jsonl_output_ok);
+        let cancellation = options.cancellation.clone();
+        options.progress = Some(Arc::new(move |progress| {
+            if !emit_jsonl_value(consultation_progress_value(&progress)) {
+                output_ok.store(false, Ordering::Release);
+                cancellation.cancel();
+            }
+        }));
+    }
     if session.provider == Provider::Opencode {
         options.opencode_database = Some(pika.paths.opencode_data_home.join("opencode.db"));
     }
-    let mut side = open_local_consultation(pika, &session, options)?;
+    let mut side = if a.jsonl {
+        crate::experts::require_local_source_available(&pika.paths, &pika.config, &session)?;
+        match crate::consult::Consultation::open(&session, options) {
+            Ok(side) => side,
+            Err(error) => {
+                // The failing preparation receipt is authoritative even when
+                // policy selection itself failed (for example, an unsupported
+                // fast profile). Keep --jsonl machine-readable on that path
+                // instead of re-running the same fallible policy lookup.
+                let policy = crate::consult::ConsultationPolicy {
+                    mode: error.receipt.consultation_mode.clone(),
+                    model: error.receipt.model.clone(),
+                    effort: error.receipt.effort.clone(),
+                };
+                emit_jsonl_value(consultation_error_value(&policy, &error));
+                emit_jsonl_value(consultation_closed_value(
+                    &error.receipt,
+                    &policy,
+                    error.receipt.cleanup == crate::consult::Cleanup::Complete,
+                ));
+                return Ok(2);
+            }
+        }
+    } else {
+        open_local_consultation(pika, &session, options)?
+    };
     if a.jsonl {
+        if !jsonl_output_ok.load(Ordering::Acquire) {
+            let _ = side.close();
+            return Ok(2);
+        }
         return ask_jsonl(&mut side, &session, &a.question.join(" "));
     }
     let question = if a.question.is_empty() {
@@ -2969,6 +3667,13 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
 fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i32> {
     require_remote_source_available(&remote)?;
     let local_policy = crate::consult::consultation_policy(remote.session.provider, a.fast)?;
+    let mut jsonl_run = a.jsonl.then(|| RemoteJsonlRun::new(local_policy.clone()));
+    if let Some(run) = jsonl_run.as_mut() {
+        run.progress(None);
+        if !run.output_ok {
+            return Ok(2);
+        }
+    }
     let policy = fleet::ConsultationPolicy {
         consultation_mode: local_policy.mode.clone(),
         model: local_policy.model.clone().unwrap_or_default(),
@@ -2978,7 +3683,7 @@ fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i3
         .store
         .get_fleet_node(&remote.node_id)?
         .context("Remote expert machine is no longer trusted")?;
-    let mut side = fleet::RemoteConsultation::open(
+    let opened = fleet::RemoteConsultation::open(
         &SshTransport::default(),
         node,
         remote.clone(),
@@ -2986,10 +3691,39 @@ fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i3
         Duration::from_secs(30),
         Duration::from_secs(900),
         Duration::from_secs(30),
-    )
-    .map_err(anyhow::Error::from)?;
+    );
+    let mut side = match opened {
+        Ok(side) => side,
+        Err(error) if a.jsonl => {
+            let mut run = jsonl_run.expect("JSONL run exists");
+            run.absorb_remote_receipt(error.receipt.as_deref());
+            if error.receipt.is_none() {
+                run.cleanup = crate::consult::Cleanup::Unknown;
+            }
+            run.progress(Some("failed"));
+            emit_jsonl_value(consultation_error_value_from_parts(
+                &run.policy,
+                &run.receipt(),
+                &error.message,
+                None,
+            ));
+            emit_jsonl_value(consultation_closed_value(
+                &run.receipt(),
+                &run.policy,
+                false,
+            ));
+            return Ok(2);
+        }
+        Err(error) => return Err(anyhow::Error::from(error)),
+    };
     if a.jsonl {
-        return ask_remote_jsonl(&mut side, &remote, &a.question.join(" "));
+        let run = jsonl_run.as_mut().expect("JSONL run exists");
+        run.progress(Some("complete"));
+        if !run.output_ok {
+            let _ = side.close();
+            return Ok(2);
+        }
+        return ask_remote_jsonl(&mut side, &remote, &a.question.join(" "), run);
     }
     let question = if a.question.is_empty() {
         if !io::stdin().is_terminal() {
@@ -3048,32 +3782,51 @@ fn ask_remote_jsonl(
     side: &mut fleet::RemoteConsultation,
     remote: &fleet::FleetSession,
     initial: &str,
+    run: &mut RemoteJsonlRun,
 ) -> Result<i32> {
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "type": "opened",
-            "ephemeral": true,
-            "provider": remote.session.provider,
-            "workstream_id": remote.session.session_id,
-            "node_id": remote.node_id,
-            "machine": remote.node_name,
-        }))?
-    );
+    let opened = remote_opened_value(run, remote);
+    run.output_ok &= emit_jsonl_value(opened);
     let mut result = 0;
+    if !run.output_ok {
+        let _ = side.close();
+        return Ok(2);
+    }
     if !initial.trim().is_empty() {
+        run.begin_turn();
+        if !run.output_ok {
+            let _ = side.close();
+            return Ok(2);
+        }
+        run.submission_started();
+        if !run.output_ok {
+            let _ = side.close();
+            return Ok(2);
+        }
         match side.ask(initial) {
-            Ok(answer) => println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({"type":"answer", "text":answer}))?
-            ),
+            Ok(answer) => {
+                run.answer_received();
+                if !run.output_ok {
+                    result = 2;
+                }
+                let mut value = consultation_event_value("answer", &run.receipt(), &run.policy);
+                value
+                    .as_object_mut()
+                    .expect("consultation event is an object")
+                    .insert("text".into(), serde_json::json!(answer));
+                run.output_ok &= emit_jsonl_value(value);
+                if !run.output_ok {
+                    result = 2;
+                }
+            }
             Err(error) => {
-                println!(
-                    "{}",
-                    serde_json::to_string(
-                        &serde_json::json!({"type":"error", "kind":error.kind.as_str(), "message":error.message, "receipt":error.receipt})
-                    )?
-                );
+                run.absorb_remote_receipt(error.receipt.as_deref());
+                run.progress(Some("failed"));
+                emit_jsonl_value(consultation_error_value_from_parts(
+                    &run.policy,
+                    &run.receipt(),
+                    &error.message,
+                    None,
+                ));
                 result = 2;
             }
         }
@@ -3093,12 +3846,18 @@ fn ask_remote_jsonl(
             let value: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(error) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string(
-                            &serde_json::json!({"type":"error", "kind":"invalid_request", "message":format!("invalid JSONL question: {error}")})
-                        )?
+                    let mut value = consultation_event_value("error", &run.receipt(), &run.policy);
+                    let fields = value
+                        .as_object_mut()
+                        .expect("consultation event is an object");
+                    fields.insert("stage".into(), serde_json::json!("input"));
+                    fields.insert("delivery".into(), serde_json::json!("not_sent"));
+                    fields.insert("retry_safe".into(), serde_json::json!(false));
+                    fields.insert(
+                        "message".into(),
+                        serde_json::json!(format!("invalid JSONL question: {error}")),
                     );
+                    run.output_ok &= emit_jsonl_value(value);
                     result = 2;
                     break;
                 }
@@ -3106,52 +3865,94 @@ fn ask_remote_jsonl(
             if value.get("close").and_then(serde_json::Value::as_bool) == Some(true) {
                 break;
             }
-            let Some(question) = value.get("question").and_then(serde_json::Value::as_str) else {
-                println!(
-                    "{}",
-                    serde_json::to_string(
-                        &serde_json::json!({"type":"error", "kind":"invalid_request", "message":"each JSONL object needs `question` or {\"close\":true}"})
-                    )?
+            let Some(question) = value
+                .get("question")
+                .and_then(serde_json::Value::as_str)
+                .filter(|question| !question.trim().is_empty())
+            else {
+                let mut value = consultation_event_value("error", &run.receipt(), &run.policy);
+                let fields = value
+                    .as_object_mut()
+                    .expect("consultation event is an object");
+                fields.insert("stage".into(), serde_json::json!("input"));
+                fields.insert("delivery".into(), serde_json::json!("not_sent"));
+                fields.insert("retry_safe".into(), serde_json::json!(false));
+                fields.insert(
+                    "message".into(),
+                    serde_json::json!("each JSONL object needs `question` or {\"close\":true}"),
                 );
+                run.output_ok &= emit_jsonl_value(value);
                 result = 2;
                 break;
             };
+            run.begin_turn();
+            if !run.output_ok {
+                result = 2;
+                break;
+            }
+            run.submission_started();
+            if !run.output_ok {
+                result = 2;
+                break;
+            }
             match side.ask(question) {
-                Ok(answer) => println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({"type":"answer", "text":answer}))?
-                ),
+                Ok(answer) => {
+                    run.answer_received();
+                    if !run.output_ok {
+                        result = 2;
+                        break;
+                    }
+                    let mut value = consultation_event_value("answer", &run.receipt(), &run.policy);
+                    value
+                        .as_object_mut()
+                        .expect("consultation event is an object")
+                        .insert("text".into(), serde_json::json!(answer));
+                    run.output_ok &= emit_jsonl_value(value);
+                    if !run.output_ok {
+                        result = 2;
+                        break;
+                    }
+                }
                 Err(error) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string(
-                            &serde_json::json!({"type":"error", "kind":error.kind.as_str(), "message":error.message, "receipt":error.receipt})
-                        )?
-                    );
+                    run.absorb_remote_receipt(error.receipt.as_deref());
+                    run.progress(Some("failed"));
+                    emit_jsonl_value(consultation_error_value_from_parts(
+                        &run.policy,
+                        &run.receipt(),
+                        &error.message,
+                        None,
+                    ));
                     result = 2;
                     break;
                 }
             }
-            io::stdout().flush()?;
         }
     }
+    run.cleanup_started();
     match side.close() {
-        Ok(receipt) => println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "type":"closed", "receipt_version":2, "discarded":true,
-                "cleanup":receipt.cleanup, "answers_received":receipt.answers_received,
-                "turn":receipt.turn, "retry_safe":receipt.retry_safe,
-            }))?
-        ),
+        Ok(receipt) => {
+            run.absorb_remote_receipt(Some(&receipt));
+            run.cleanup = crate::consult::Cleanup::Complete;
+            run.progress(Some("complete"));
+            emit_jsonl_value(consultation_closed_value(&run.receipt(), &run.policy, true));
+        }
         Err(error) => {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "type":"closed", "receipt_version":2, "discarded":false,
-                    "cleanup":"unknown", "kind":error.kind.as_str(), "message":error.message,
-                }))?
-            );
+            run.absorb_remote_receipt(error.receipt.as_deref());
+            if error.receipt.is_none() {
+                run.cleanup = crate::consult::Cleanup::Unknown;
+            }
+            run.progress(Some("failed"));
+            emit_jsonl_value(consultation_error_value_from_parts(
+                &run.policy,
+                &run.receipt(),
+                &error.message,
+                None,
+            ));
+            emit_jsonl_value(consultation_closed_value(
+                &run.receipt(),
+                &run.policy,
+                false,
+            ));
             result = 2;
         }
     }
@@ -3164,48 +3965,20 @@ fn ask_jsonl(
     initial: &str,
 ) -> Result<i32> {
     let mut input = io::stdin().lock();
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "type": "opened",
-            "ephemeral": true,
-            "provider": session.provider,
-            "workstream_id": session.session_id,
-            "parent_id": side.parent_id(),
-            "child_id": side.child_id(),
-            "name": session.display_name(),
-            "receipt": side.receipt(),
-            "policy": side.policy(),
-            "consultation_mode": side.policy().mode,
-            "model": side.policy().model.as_deref().unwrap_or(""),
-            "effort": side.policy().effort.as_deref().unwrap_or(""),
-        }))?
-    );
+    if !emit_jsonl_value(consultation_opened_value(side, session)) {
+        let _ = side.close();
+        return Ok(2);
+    }
     let mut result = 0;
     if !initial.trim().is_empty() {
         match side.ask(initial) {
-            Ok(answer) => println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "type": "answer",
-                    "text": answer,
-                    "receipt": side.receipt(),
-                    "policy": side.policy(),
-                }))?
-            ),
+            Ok(answer) => {
+                if !emit_jsonl_value(consultation_answer_value(side, &answer)) {
+                    result = 2;
+                }
+            }
             Err(error) => {
-                let receipt = &error.receipt;
-                println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
-                        "type":"error", "kind":"error", "message":error.to_string(),
-                        "stage":receipt.stage, "delivery":receipt.delivery,
-                        "cleanup":receipt.cleanup, "answers_received":receipt.answers_received,
-                        "turn":receipt.turn, "retry_safe":receipt.retry_safe,
-                        "receipt":receipt, "cleanup_error":error.cleanup_error,
-                        "policy":side.policy(),
-                    }))?
-                );
+                let _ = emit_jsonl_value(consultation_error_value(side.policy(), &error));
                 result = 2;
             }
         }
@@ -3218,7 +3991,8 @@ fn ask_jsonl(
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(error) => {
-                emit_jsonl_input_error(side, &format!("consultation input failed: {error}"))?;
+                let _ =
+                    emit_jsonl_input_error(side, &format!("consultation input failed: {error}"));
                 result = 2;
                 break;
             }
@@ -3229,12 +4003,12 @@ fn ask_jsonl(
         let value: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&line) {
             Ok(value) if value.is_object() => value,
             Ok(_) => {
-                emit_jsonl_input_error(side, "each --jsonl line must be a JSON object")?;
+                let _ = emit_jsonl_input_error(side, "each --jsonl line must be a JSON object");
                 result = 2;
                 break;
             }
             Err(error) => {
-                emit_jsonl_input_error(side, &format!("invalid JSONL question: {error}"))?;
+                let _ = emit_jsonl_input_error(side, &format!("invalid JSONL question: {error}"));
                 result = 2;
                 break;
             }
@@ -3242,95 +4016,46 @@ fn ask_jsonl(
         if value.get("close").and_then(serde_json::Value::as_bool) == Some(true) {
             break;
         }
-        let Some(question) = value.get("question").and_then(serde_json::Value::as_str) else {
-            emit_jsonl_input_error(
+        let Some(question) = value
+            .get("question")
+            .and_then(serde_json::Value::as_str)
+            .filter(|question| !question.trim().is_empty())
+        else {
+            let _ = emit_jsonl_input_error(
                 side,
                 "each --jsonl object needs a string `question` or {\"close\":true}",
-            )?;
+            );
             result = 2;
             break;
         };
         match side.ask(question) {
-            Ok(answer) => println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "type": "answer",
-                    "text": answer,
-                    "receipt": side.receipt(),
-                    "policy": side.policy(),
-                }))?
-            ),
+            Ok(answer) => {
+                if !emit_jsonl_value(consultation_answer_value(side, &answer)) {
+                    result = 2;
+                    break;
+                }
+            }
             Err(error) => {
                 let retry_safe = error.receipt.retry_safe;
-                let receipt = &error.receipt;
-                println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
-                        "type": "error",
-                        "error": error.to_string(),
-                        "message": error.to_string(),
-                        "kind": "error",
-                        "stage": receipt.stage,
-                        "delivery": receipt.delivery,
-                        "cleanup": receipt.cleanup,
-                        "answers_received": receipt.answers_received,
-                        "turn": receipt.turn,
-                        "retry_safe": receipt.retry_safe,
-                        "receipt": receipt,
-                        "cleanup_error": error.cleanup_error,
-                        "policy": side.policy(),
-                    }))?
-                );
-                if !retry_safe {
+                let output_ok = emit_jsonl_value(consultation_error_value(side.policy(), &error));
+                if !retry_safe || !output_ok {
                     result = 2;
                     break;
                 }
             }
         }
-        io::stdout().flush()?;
     }
     let cleanup = side.close();
     if let Err(error) = &cleanup {
         result = 2;
-        let receipt = &error.receipt;
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "type": "error",
-                "error": error.to_string(),
-                "message": error.to_string(),
-                "kind": "outcome_unknown",
-                "stage": receipt.stage,
-                "delivery": receipt.delivery,
-                "cleanup": receipt.cleanup,
-                "answers_received": receipt.answers_received,
-                "turn": receipt.turn,
-                "retry_safe": receipt.retry_safe,
-                "receipt": receipt,
-                "cleanup_error": &error.cleanup_error,
-                "policy": side.policy(),
-            }))?
-        );
+        let _ = emit_jsonl_value(consultation_error_value(side.policy(), error));
     }
     let receipt = side.receipt();
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "type": "closed",
-            "discarded": cleanup.is_ok(),
-            "receipt_version": receipt.receipt_version,
-            "stage": receipt.stage,
-            "delivery": receipt.delivery,
-            "cleanup": receipt.cleanup,
-            "answers_received": receipt.answers_received,
-            "turn": receipt.turn,
-            "retry_safe": receipt.retry_safe,
-            "parent_transcript_unchanged": null,
-            "parent_transcript_verification": "not_performed",
-            "receipt": receipt,
-            "policy": side.policy(),
-        }))?
-    );
+    let _ = emit_jsonl_value(consultation_closed_value(
+        &receipt,
+        side.policy(),
+        cleanup.is_ok(),
+    ));
     Ok(result)
 }
 
@@ -3448,50 +4173,53 @@ fn serve_fleet_consultation(
     inputs: mpsc::Receiver<FleetConsultationInput>,
     cancellation: &crate::consult::CancellationToken,
 ) -> Result<i32> {
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "type": "opened",
-            "ephemeral": true,
-            "provider": session.provider,
-            "workstream_id": session.session_id,
-            "parent_id": side.parent_id(),
-            "child_id": side.child_id(),
-            "name": session.display_name(),
-            "receipt": side.receipt(),
-            "policy": side.policy(),
-            "consultation_mode": side.policy().mode,
-            "model": side.policy().model.as_deref().unwrap_or(""),
-            "effort": side.policy().effort.as_deref().unwrap_or(""),
-        }))?
-    );
-    io::stdout().flush()?;
+    if !emit_jsonl_value(serde_json::json!({
+        "type": "opened",
+        "ephemeral": true,
+        "provider": session.provider,
+        "workstream_id": session.session_id,
+        "parent_id": side.parent_id(),
+        "child_id": side.child_id(),
+        "name": session.display_name(),
+        "receipt": side.receipt(),
+        "policy": side.policy(),
+        "consultation_mode": side.policy().mode,
+        "model": side.policy().model.as_deref().unwrap_or(""),
+        "effort": side.policy().effort.as_deref().unwrap_or(""),
+    })) {
+        cancellation.cancel();
+        let _ = side.close();
+        return Ok(2);
+    }
     let mut result = 0;
     for input in inputs {
         match input {
             FleetConsultationInput::Question(question) => match side.ask(&question) {
-                Ok(answer) => println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
+                Ok(answer) => {
+                    if !emit_jsonl_value(serde_json::json!({
                         "type":"answer", "text":answer, "receipt":side.receipt(),
                         "policy":side.policy(),
-                    }))?
-                ),
+                    })) {
+                        cancellation.cancel();
+                        result = 2;
+                        break;
+                    }
+                }
                 Err(_error) if cancellation.is_cancelled() => break,
                 Err(error) => {
                     let retry_safe = error.receipt.retry_safe;
                     let receipt = &error.receipt;
-                    println!(
-                        "{}",
-                        serde_json::to_string(&serde_json::json!({
-                            "type":"error", "kind":"error", "message":error.to_string(),
-                            "stage":receipt.stage, "delivery":receipt.delivery,
-                            "cleanup":receipt.cleanup, "answers_received":receipt.answers_received,
-                            "turn":receipt.turn, "retry_safe":retry_safe, "receipt":receipt,
-                            "cleanup_error":error.cleanup_error, "policy":side.policy(),
-                        }))?
-                    );
-                    if !retry_safe {
+                    let output_ok = emit_jsonl_value(serde_json::json!({
+                        "type":"error", "kind":"error", "message":error.to_string(),
+                        "stage":receipt.stage, "delivery":receipt.delivery,
+                        "cleanup":receipt.cleanup, "answers_received":receipt.answers_received,
+                        "turn":receipt.turn, "retry_safe":retry_safe, "receipt":receipt,
+                        "cleanup_error":error.cleanup_error, "policy":side.policy(),
+                    }));
+                    if !retry_safe || !output_ok {
+                        if !output_ok {
+                            cancellation.cancel();
+                        }
                         result = 2;
                         break;
                     }
@@ -3499,46 +4227,38 @@ fn serve_fleet_consultation(
             },
             FleetConsultationInput::Close => break,
             FleetConsultationInput::InputError(message) => {
-                emit_jsonl_input_error(side, &message)?;
+                let _ = emit_jsonl_input_error(side, &message);
                 result = 2;
                 break;
             }
         }
-        io::stdout().flush()?;
     }
     let cleanup = side.close();
     if cleanup.is_err() {
         result = 2;
     }
     let receipt = side.receipt();
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "type":"closed", "receipt_version":receipt.receipt_version,
-            "discarded":cleanup.is_ok(), "cleanup":receipt.cleanup,
-            "answers_received":receipt.answers_received, "turn":receipt.turn,
-            "retry_safe":receipt.retry_safe,
-            "kind":cleanup.as_ref().err().map(|_| "outcome_unknown"),
-            "message":cleanup.as_ref().err().map(ToString::to_string),
-        }))?
-    );
-    io::stdout().flush()?;
+    let _ = emit_jsonl_value(serde_json::json!({
+        "type":"closed", "receipt_version":receipt.receipt_version,
+        "discarded":cleanup.is_ok(), "cleanup":receipt.cleanup,
+        "answers_received":receipt.answers_received, "turn":receipt.turn,
+        "retry_safe":receipt.retry_safe,
+        "kind":cleanup.as_ref().err().map(|_| "outcome_unknown"),
+        "message":cleanup.as_ref().err().map(ToString::to_string),
+    }));
     Ok(result)
 }
 
-fn emit_jsonl_input_error(side: &crate::consult::Consultation, message: &str) -> Result<()> {
-    let receipt = side.receipt();
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "type":"error", "kind":"invalid_request", "message":message,
-            "stage":receipt.stage, "delivery":receipt.delivery,
-            "cleanup":receipt.cleanup, "answers_received":receipt.answers_received,
-            "turn":receipt.turn, "retry_safe":receipt.retry_safe,
-            "receipt":receipt, "policy":side.policy(),
-        }))?
-    );
-    Ok(())
+fn emit_jsonl_input_error(side: &crate::consult::Consultation, message: &str) -> bool {
+    let mut value = consultation_event_value("error", &side.receipt(), side.policy());
+    let object = value
+        .as_object_mut()
+        .expect("consultation event is an object");
+    object.insert("stage".into(), serde_json::json!("input"));
+    object.insert("delivery".into(), serde_json::json!("not_sent"));
+    object.insert("retry_safe".into(), serde_json::json!(false));
+    object.insert("message".into(), serde_json::json!(message));
+    emit_jsonl_value(value)
 }
 
 fn consultation_error(error: crate::consult::ConsultationError) -> anyhow::Error {
@@ -4358,6 +5078,33 @@ done
             vec!["process changed during observation".into()],
         );
         assert!(complete_hook_processes(&observation).is_none());
+    }
+
+    #[test]
+    fn oversized_fleet_cache_preserves_local_rows_and_adds_an_honest_notice() {
+        let root = tempfile::tempdir().unwrap();
+        let local = BoardItem::local(fixture_session(root.path()));
+        let mut items = vec![local.clone()];
+        append_cached_fleet(
+            &mut items,
+            Err(fleet::FleetError::new(
+                FleetErrorKind::Incompatible,
+                "Cached fleet exceeds the 8000-row board safety limit",
+            )),
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], local);
+        assert_eq!(items[1].session.source, FLEET_CACHE_NOTICE_SOURCE);
+        assert_eq!(items[1].session.status, Status::Error);
+        assert!(
+            items[1]
+                .session
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("safety limit")
+        );
+        assert!(reject_fleet_cache_notice(&items[1]).is_err());
     }
 
     #[test]

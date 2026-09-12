@@ -328,6 +328,21 @@ fn schema_two_selects_only_exact_target_and_filename() {
     assert!(ReleaseManifest::parse(unknown.as_bytes()).is_err());
     let false_stable = json.replace("\"preview\"", "\"stable\"");
     assert!(ReleaseManifest::parse(false_stable.as_bytes()).is_err());
+
+    let artifact_row = format!(
+        r#""{target}":{{"file":"{}","sha256":"{}","bytes":42}}"#,
+        artifact_name("0.6.0-alpha.1", target).unwrap(),
+        "a".repeat(64)
+    );
+    let duplicate = format!(
+        r#"{{"schema":2,"package":"pikamux","version":"0.6.0-alpha.1","channel":"preview","artifacts":{{{artifact_row},{artifact_row}}}}}"#
+    );
+    let error = ReleaseManifest::parse(duplicate.as_bytes()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate native artifact target")
+    );
 }
 
 #[test]
@@ -431,6 +446,20 @@ fn staged_install_is_atomic_idempotent_and_retains_previous_release() {
     assert!(upgraded.activated);
     assert!(old.is_dir());
     assert_ne!(root.join("current").canonicalize().unwrap(), old);
+    assert!(fs::read_dir(&root).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".current-")
+    }));
+    assert!(fs::read_dir(root.join("releases")).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".stage-")
+    }));
 }
 
 #[test]
@@ -948,6 +977,23 @@ fn release_packager_emits_a_strict_manifest_and_refuses_replacement() {
             .success()
     );
     assert_eq!(fs::read(output.join("SHA256SUMS")).unwrap(), before);
+
+    let duplicate_output = temp.path().join("duplicate-release");
+    let duplicate = Command::new("bash")
+        .arg("scripts/package-release.sh")
+        .arg(version)
+        .arg(&duplicate_output)
+        .arg(format!("{target}={}", binary.display()))
+        .arg(format!("{target}={}", binary.display()))
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate.stderr).contains("Duplicate release target"),
+        "{}",
+        String::from_utf8_lossy(&duplicate.stderr)
+    );
+    assert!(!duplicate_output.exists());
 }
 
 #[test]
@@ -1265,6 +1311,60 @@ fn release_verifier_rejects_unexpected_top_level_regular_files() {
     assert!(
         String::from_utf8_lossy(&rejected.stderr)
             .contains("unexpected top-level file(s): unexpected.txt"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn release_verifier_rejects_duplicate_json_artifact_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let bundle = temp.path().join("release");
+    let version = env!("CARGO_PKG_VERSION");
+    let targets = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-musl",
+        "x86_64-unknown-linux-musl",
+        "x86_64-pc-windows-msvc",
+    ];
+    let mut package = Command::new("bash");
+    package
+        .arg("scripts/package-release.sh")
+        .arg(version)
+        .arg(&bundle)
+        .env("PIKA_CROSS_PACKAGE", "1");
+    for target in targets {
+        package.arg(format!(
+            "{target}={}",
+            shaped_cross_binary(temp.path(), target).display()
+        ));
+    }
+    assert!(package.status().unwrap().success());
+
+    let manifest_path = bundle.join("pika-native-release.json");
+    let raw = fs::read_to_string(&manifest_path).unwrap();
+    let row = raw
+        .lines()
+        .find(|line| line.contains("\"aarch64-apple-darwin\":"))
+        .unwrap();
+    assert!(row.ends_with(','));
+    fs::write(
+        &manifest_path,
+        raw.replacen(row, &format!("{row}\n{row}"), 1),
+    )
+    .unwrap();
+    rewrite_release_checksums(&bundle);
+
+    let rejected = Command::new("bash")
+        .arg("scripts/verify-release.sh")
+        .arg(&bundle)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("duplicate JSON key: aarch64-apple-darwin"),
         "{}",
         String::from_utf8_lossy(&rejected.stderr)
     );

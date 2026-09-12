@@ -165,12 +165,24 @@ impl fmt::Display for ConsultationError {
 impl std::error::Error for ConsultationError {}
 
 #[derive(Clone, Debug)]
+pub struct ConsultationProgress {
+    pub receipt: ConsultationReceipt,
+    pub outcome: Option<&'static str>,
+    pub message: Option<String>,
+    pub retry_safe: Option<bool>,
+    pub cleanup_error: Option<String>,
+}
+
+pub type ConsultationProgressObserver = Arc<dyn Fn(ConsultationProgress) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct ConsultationOptions {
     pub executable: PathBuf,
     pub opencode_database: Option<PathBuf>,
     pub timeout: Duration,
     pub fast: bool,
     pub cancellation: CancellationToken,
+    pub progress: Option<ConsultationProgressObserver>,
 }
 
 impl ConsultationOptions {
@@ -181,6 +193,7 @@ impl ConsultationOptions {
             timeout: Duration::from_secs(900),
             fast: false,
             cancellation: CancellationToken::default(),
+            progress: None,
         }
     }
 }
@@ -197,6 +210,7 @@ pub struct Consultation {
     answers_received: u32,
     stage_durations: BTreeMap<String, Duration>,
     close_attempted: bool,
+    progress: Option<ConsultationProgressObserver>,
 }
 
 impl Consultation {
@@ -210,9 +224,24 @@ impl Consultation {
                 model: None,
                 effort: None,
             };
-            ConsultationError::new(error.to_string(), initial_receipt(&policy))
+            let receipt = initial_receipt(&policy);
+            emit_progress(
+                &options.progress,
+                &receipt,
+                Some("failed"),
+                Some(&error.to_string()),
+                None,
+            );
+            ConsultationError::new(error.to_string(), receipt)
         })?;
         let started = Instant::now();
+        emit_progress(
+            &options.progress,
+            &initial_receipt(&policy),
+            None,
+            None,
+            None,
+        );
         let result = match session.provider {
             Provider::Codex => CodexSide::open(session, &options, &policy).map(Side::Codex),
             Provider::Claude => ClaudeSide::open(session, &options).map(Side::Claude),
@@ -227,10 +256,17 @@ impl Consultation {
                 receipt.cleanup = failure.cleanup;
                 receipt.retry_safe = failure.delivery == Delivery::NotSent
                     && !matches!(failure.cleanup, Cleanup::Failed | Cleanup::Unknown);
+                emit_progress(
+                    &options.progress,
+                    &receipt,
+                    Some("failed"),
+                    Some(&failure.message),
+                    None,
+                );
                 return Err(ConsultationError::new(failure.message, receipt));
             }
         };
-        Ok(Self {
+        let consultation = Self {
             side,
             policy,
             started,
@@ -242,7 +278,10 @@ impl Consultation {
             answers_received: 0,
             stage_durations: BTreeMap::new(),
             close_attempted: false,
-        })
+            progress: options.progress,
+        };
+        consultation.notify(Some("complete"));
+        Ok(consultation)
     }
 
     pub fn policy(&self) -> &ConsultationPolicy {
@@ -258,65 +297,108 @@ impl Consultation {
     }
 
     pub fn receipt(&self) -> ConsultationReceipt {
-        let mut stage_durations = self.stage_durations.clone();
-        *stage_durations
-            .entry(stage_name(self.stage).to_owned())
-            .or_default() += self.stage_started.elapsed();
-        ConsultationReceipt {
-            receipt_version: 2,
+        receipt_from_snapshot(ReceiptSnapshot {
+            started: self.started,
+            stage_started: self.stage_started,
             stage: self.stage,
-            elapsed_seconds: rounded(self.started.elapsed()),
-            stage_elapsed_seconds: rounded(self.stage_started.elapsed()),
-            turn: self.turn,
             delivery: self.delivery,
             cleanup: self.cleanup,
+            turn: self.turn,
             answers_received: self.answers_received,
-            stage_durations_seconds: stage_durations
-                .into_iter()
-                .map(|(stage, duration)| (stage, rounded(duration)))
-                .collect(),
-            retry_safe: self.delivery == Delivery::NotSent
-                && matches!(
-                    self.stage,
-                    ConsultationStage::Prepare | ConsultationStage::Turn
-                )
-                && !matches!(self.cleanup, Cleanup::Failed | Cleanup::Unknown),
-            parent_transcript_unchanged: None,
-            parent_transcript_verification: "not_performed",
-            consultation_mode: self.policy.mode.clone(),
-            model: self.policy.model.clone(),
-            effort: self.policy.effort.clone(),
-        }
+            stage_durations: &self.stage_durations,
+            policy: &self.policy,
+        })
+    }
+
+    fn notify(&self, outcome: Option<&'static str>) {
+        emit_progress(&self.progress, &self.receipt(), outcome, None, None);
+    }
+
+    fn notify_failure(&self, error: &ConsultationError) {
+        emit_progress(
+            &self.progress,
+            &error.receipt,
+            Some("failed"),
+            Some(&error.to_string()),
+            error.cleanup_error.as_deref(),
+        );
     }
 
     pub fn ask(&mut self, question: &str) -> Result<String, ConsultationError> {
         self.turn += 1;
         self.set_stage(ConsultationStage::Turn);
         self.delivery = Delivery::NotSent;
+        self.notify(None);
         if self.close_attempted {
-            return Err(self.failure("side consultation is closed"));
+            let error = self.failure("side consultation is closed");
+            self.notify_failure(&error);
+            return Err(error);
         }
         let question = question.trim();
         if question.is_empty() {
-            return Err(self.failure("question cannot be empty"));
+            let error = self.failure("question cannot be empty");
+            self.notify_failure(&error);
+            return Err(error);
         }
         if question.len() > MAX_QUESTION_BYTES {
-            return Err(self.failure("question exceeded the 64 KiB safety limit"));
+            let error = self.failure("question exceeded the 64 KiB safety limit");
+            self.notify_failure(&error);
+            return Err(error);
         }
-        match self.side.ask(question, &mut self.delivery) {
+
+        let progress = self.progress.clone();
+        let started = self.started;
+        let stage_started = self.stage_started;
+        let stage = self.stage;
+        let cleanup = self.cleanup;
+        let turn = self.turn;
+        let answers_received = self.answers_received;
+        let stage_durations = self.stage_durations.clone();
+        let policy = self.policy.clone();
+        let mut last_delivery = self.delivery;
+        let mut delivery_progress = |delivery: Delivery| {
+            if delivery == last_delivery {
+                return;
+            }
+            last_delivery = delivery;
+            let receipt = receipt_from_snapshot(ReceiptSnapshot {
+                started,
+                stage_started,
+                stage,
+                delivery,
+                cleanup,
+                turn,
+                answers_received,
+                stage_durations: &stage_durations,
+                policy: &policy,
+            });
+            emit_progress(&progress, &receipt, None, None, None);
+        };
+        let result = self
+            .side
+            .ask(question, &mut self.delivery, &mut delivery_progress);
+        match result {
             Ok(answer) if !answer.trim().is_empty() => {
                 self.delivery = Delivery::Confirmed;
                 self.answers_received += 1;
                 self.set_stage(ConsultationStage::Response);
+                self.notify(None);
+                self.notify(Some("complete"));
                 Ok(answer.trim().to_owned())
             }
-            Ok(_) => Err(self.failure("provider side turn returned no answer")),
+            Ok(_) => {
+                let error = self.failure("provider side turn returned no answer");
+                self.notify_failure(&error);
+                Err(error)
+            }
             Err(failure) => {
                 self.delivery = failure.delivery;
                 if failure.cleanup != Cleanup::Pending {
                     self.cleanup = failure.cleanup;
                 }
-                Err(self.failure(failure.message))
+                let error = self.failure(failure.message);
+                self.notify_failure(&error);
+                Err(error)
             }
         }
     }
@@ -331,15 +413,18 @@ impl Consultation {
         }
         self.close_attempted = true;
         self.set_stage(ConsultationStage::Cleanup);
+        self.notify(None);
         match self.side.close() {
             Ok(()) => {
                 self.cleanup = Cleanup::Complete;
+                self.notify(Some("complete"));
                 Ok(())
             }
             Err(error) => {
                 self.cleanup = Cleanup::Failed;
                 let mut result = self.failure(error.to_string());
                 result.cleanup_error = Some(error.to_string());
+                self.notify_failure(&result);
                 Err(result)
             }
         }
@@ -358,6 +443,70 @@ impl Consultation {
 
     fn failure(&self, message: impl Into<String>) -> ConsultationError {
         ConsultationError::new(message, self.receipt())
+    }
+}
+
+struct ReceiptSnapshot<'a> {
+    started: Instant,
+    stage_started: Instant,
+    stage: ConsultationStage,
+    delivery: Delivery,
+    cleanup: Cleanup,
+    turn: u32,
+    answers_received: u32,
+    stage_durations: &'a BTreeMap<String, Duration>,
+    policy: &'a ConsultationPolicy,
+}
+
+fn receipt_from_snapshot(snapshot: ReceiptSnapshot<'_>) -> ConsultationReceipt {
+    let mut stage_durations = snapshot.stage_durations.clone();
+    *stage_durations
+        .entry(stage_name(snapshot.stage).to_owned())
+        .or_default() += snapshot.stage_started.elapsed();
+    ConsultationReceipt {
+        receipt_version: 2,
+        stage: snapshot.stage,
+        elapsed_seconds: rounded(snapshot.started.elapsed()),
+        stage_elapsed_seconds: rounded(snapshot.stage_started.elapsed()),
+        turn: snapshot.turn,
+        delivery: snapshot.delivery,
+        cleanup: snapshot.cleanup,
+        answers_received: snapshot.answers_received,
+        stage_durations_seconds: stage_durations
+            .into_iter()
+            .map(|(stage, duration)| (stage, rounded(duration)))
+            .collect(),
+        retry_safe: snapshot.delivery == Delivery::NotSent
+            && matches!(
+                snapshot.stage,
+                ConsultationStage::Prepare | ConsultationStage::Turn
+            )
+            && !matches!(snapshot.cleanup, Cleanup::Failed | Cleanup::Unknown),
+        parent_transcript_unchanged: None,
+        parent_transcript_verification: "not_performed",
+        consultation_mode: snapshot.policy.mode.clone(),
+        model: snapshot.policy.model.clone(),
+        effort: snapshot.policy.effort.clone(),
+    }
+}
+
+fn emit_progress(
+    observer: &Option<ConsultationProgressObserver>,
+    receipt: &ConsultationReceipt,
+    outcome: Option<&'static str>,
+    message: Option<&str>,
+    cleanup_error: Option<&str>,
+) {
+    if let Some(observer) = observer {
+        observer(ConsultationProgress {
+            receipt: receipt.clone(),
+            outcome,
+            message: message.map(str::to_owned),
+            retry_safe: outcome
+                .is_some_and(|value| value == "failed")
+                .then_some(receipt.retry_safe),
+            cleanup_error: cleanup_error.map(str::to_owned),
+        });
     }
 }
 
@@ -441,11 +590,16 @@ enum Side {
 }
 
 impl Side {
-    fn ask(&mut self, question: &str, delivery: &mut Delivery) -> Result<String, SideFailure> {
+    fn ask(
+        &mut self,
+        question: &str,
+        delivery: &mut Delivery,
+        progress: &mut dyn FnMut(Delivery),
+    ) -> Result<String, SideFailure> {
         match self {
-            Self::Codex(side) => side.ask(question, delivery),
-            Self::Claude(side) => side.ask(question, delivery),
-            Self::Opencode(side) => side.ask(question, delivery),
+            Self::Codex(side) => side.ask(question, delivery, progress),
+            Self::Claude(side) => side.ask(question, delivery, progress),
+            Self::Opencode(side) => side.ask(question, delivery, progress),
         }
     }
 
@@ -874,7 +1028,12 @@ impl CodexSide {
         Some(value)
     }
 
-    fn ask(&mut self, question: &str, delivery: &mut Delivery) -> Result<String, SideFailure> {
+    fn ask(
+        &mut self,
+        question: &str,
+        delivery: &mut Delivery,
+        progress: &mut dyn FnMut(Delivery),
+    ) -> Result<String, SideFailure> {
         self.notifications.clear();
         self.notification_bytes = 0;
         let mut params = json!({
@@ -887,6 +1046,7 @@ impl CodexSide {
         params["model"] = Value::String(self.policy.model.clone().unwrap_or_default());
         params["effort"] = Value::String(self.policy.effort.clone().unwrap_or_default());
         *delivery = Delivery::Unknown;
+        progress(*delivery);
         let result = self
             .request("turn/start", params, Duration::from_secs(60))
             .map_err(|error| SideFailure::turn(error, *delivery))?;
@@ -902,6 +1062,7 @@ impl CodexSide {
             ));
         };
         *delivery = Delivery::Confirmed;
+        progress(*delivery);
         let deadline = Instant::now() + self.timeout;
         let mut final_text = String::new();
         let mut deltas = String::new();
@@ -1101,8 +1262,14 @@ impl ClaudeSide {
         })
     }
 
-    fn ask(&mut self, question: &str, delivery: &mut Delivery) -> Result<String, SideFailure> {
+    fn ask(
+        &mut self,
+        question: &str,
+        delivery: &mut Delivery,
+        progress: &mut dyn FnMut(Delivery),
+    ) -> Result<String, SideFailure> {
         *delivery = Delivery::Unknown;
+        progress(*delivery);
         let deadline = Instant::now() + self.timeout;
         self.process
             .send(
@@ -1123,6 +1290,7 @@ impl ClaudeSide {
             match message.get("type").and_then(Value::as_str) {
                 Some("assistant") => {
                     *delivery = Delivery::Confirmed;
+                    progress(*delivery);
                     if let Some(content) = message
                         .get("message")
                         .and_then(|value| value.get("content"))
@@ -1140,6 +1308,7 @@ impl ClaudeSide {
                 }
                 Some("result") => {
                     *delivery = Delivery::Confirmed;
+                    progress(*delivery);
                     if message.get("subtype").and_then(Value::as_str) != Some("success")
                         || message.get("is_error").and_then(Value::as_bool) == Some(true)
                     {
@@ -1358,7 +1527,12 @@ impl OpenCodeSide {
         Ok(id.to_owned())
     }
 
-    fn ask(&mut self, question: &str, delivery: &mut Delivery) -> Result<String, SideFailure> {
+    fn ask(
+        &mut self,
+        question: &str,
+        delivery: &mut Delivery,
+        progress: &mut dyn FnMut(Delivery),
+    ) -> Result<String, SideFailure> {
         if self.closed {
             return Err(SideFailure::turn(
                 "OpenCode side consultation is closed",
@@ -1367,6 +1541,7 @@ impl OpenCodeSide {
         }
         if self.thread_id.is_none() {
             *delivery = Delivery::NotSent;
+            progress(*delivery);
             if let Err(error) = self.fork() {
                 return Err(SideFailure::turn_with_cleanup(
                     error,
@@ -1418,6 +1593,7 @@ impl OpenCodeSide {
         let mut child =
             OwnedChild::spawn(&mut command).map_err(|error| SideFailure::turn(error, *delivery))?;
         *delivery = Delivery::Unknown;
+        progress(*delivery);
         let stderr = Arc::new(Mutex::new(Vec::new()));
         if let Some(pipe) = child.stderr.take() {
             let stderr_copy = Arc::clone(&stderr);
@@ -1449,6 +1625,7 @@ impl OpenCodeSide {
             match self.completed_answer(&target, checkpoint) {
                 Ok((_seen_user, Some(answer))) => {
                     *delivery = Delivery::Confirmed;
+                    progress(*delivery);
                     let mut terminated = true;
                     if let Some(process) = &mut self.turn_process {
                         terminated = terminate_child(process).is_ok();
@@ -1459,7 +1636,10 @@ impl OpenCodeSide {
                     }
                     return Ok(answer);
                 }
-                Ok((true, None)) => *delivery = Delivery::Confirmed,
+                Ok((true, None)) => {
+                    *delivery = Delivery::Confirmed;
+                    progress(*delivery);
+                }
                 Ok((false, None)) => {}
                 Err(_) => {}
             }
@@ -1471,6 +1651,7 @@ impl OpenCodeSide {
                 if let Ok((seen_user, Some(answer))) = self.completed_answer(&target, checkpoint) {
                     if seen_user {
                         *delivery = Delivery::Confirmed;
+                        progress(*delivery);
                     }
                     self.turn_process = None;
                     return Ok(answer);

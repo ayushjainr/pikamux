@@ -3,6 +3,7 @@
 /target/
 /.toolchains/
 /.sandbox/
+/.planning/
 /artifacts/
 /dist/
 /.venv/

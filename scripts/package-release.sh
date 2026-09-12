@@ -50,6 +50,7 @@ trap cleanup EXIT
 
 pika_rows=''
 pika_count=0
+pika_seen_targets='|'
 for pika_pair in "$@"; do
     pika_target=${pika_pair%%=*}
     pika_binary=${pika_pair#*=}
@@ -58,6 +59,10 @@ for pika_pair in "$@"; do
         aarch64-apple-darwin|x86_64-apple-darwin|aarch64-unknown-linux-musl|x86_64-unknown-linux-musl|x86_64-pc-windows-msvc) ;;
         *) fail "Unsupported release target: $pika_target" ;;
     esac
+    case "$pika_seen_targets" in
+        *"|$pika_target|"*) fail "Duplicate release target: $pika_target" ;;
+    esac
+    pika_seen_targets="$pika_seen_targets$pika_target|"
     [ -f "$pika_binary" ] && [ ! -L "$pika_binary" ] || \
         fail "Binary is not a regular file: $pika_binary"
     if [ "$pika_target" != x86_64-pc-windows-msvc ]; then

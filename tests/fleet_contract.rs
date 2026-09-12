@@ -1,10 +1,10 @@
 use pikamux::consult::CancellationToken;
 use pikamux::fleet::{
     CAPABILITIES, ConsultationPolicy, ConsultationTimeouts, FleetError, FleetErrorKind,
-    FleetManager, FleetService, FleetSession, FleetTransport, NodeCandidate, PROTOCOL_NAME,
-    PROTOCOL_VERSION, RemoteConsultation, SshTransport, discover_node_candidates,
-    discover_ssh_candidates, handle_fleet_stdio, next_remote_node, session_to_wire,
-    validate_snapshot,
+    FleetManager, FleetService, FleetSession, FleetTransport, MAX_CACHED_FLEET_ROWS,
+    MAX_SNAPSHOT_SESSIONS, NodeCandidate, PROTOCOL_NAME, PROTOCOL_VERSION, RemoteConsultation,
+    SshTransport, discover_node_candidates, discover_ssh_candidates, handle_fleet_stdio,
+    next_remote_node, session_to_wire, validate_snapshot,
 };
 use pikamux::model::{Candidate, FleetNode, Provider, Session, Status};
 use pikamux::store::Store;
@@ -247,6 +247,83 @@ fn strict_snapshot_rejects_identity_changes_duplicates_and_extensions() {
     let mut extension = snapshot(&expected, "thread");
     extension["profiles"][0]["transcript_path"] = json!("/secret");
     assert!(validate_snapshot(&extension, Some(&expected)).is_err());
+}
+
+#[test]
+fn strict_snapshot_rejects_more_than_two_thousand_sessions() {
+    let node_id = Uuid::new_v4().to_string();
+    let sessions = (0..=MAX_SNAPSHOT_SESSIONS)
+        .map(|index| {
+            let session_id = format!("00000000-0000-4000-8000-{index:012x}");
+            session_to_wire(
+                &session(Provider::Codex, &session_id, "bounded-remote"),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "type":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+        "node_id":node_id, "machine":"atlas", "captured_at":now(),
+        "sessions":sessions, "profiles":[], "cards":[]
+    });
+    let error = validate_snapshot(&payload, Some(&node_id)).unwrap_err();
+    assert_eq!(error.kind, FleetErrorKind::Incompatible);
+    assert!(error.message.contains("safety limit"));
+}
+
+#[test]
+fn cached_fleet_accepts_twenty_small_nodes_but_rejects_aggregate_row_amplification() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "state.db");
+    for index in 0..20 {
+        let node_id = Uuid::new_v4().to_string();
+        store
+            .upsert_fleet_node(&node(&node_id, &format!("node-{index}")))
+            .unwrap();
+        store
+            .put_remote_snapshot(&node_id, &snapshot(&node_id, CODEX_THREAD_ID), now())
+            .unwrap();
+    }
+    assert_eq!(
+        FleetManager::new(&store, &FakeTransport::default())
+            .cached_sessions(None, false)
+            .unwrap()
+            .len(),
+        20
+    );
+
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "amplified.db");
+    let rows_per_node = (MAX_CACHED_FLEET_ROWS / 5) + 1;
+    for node_index in 0..5 {
+        let node_id = Uuid::new_v4().to_string();
+        store
+            .upsert_fleet_node(&node(&node_id, &format!("large-{node_index}")))
+            .unwrap();
+        let sessions = (0..rows_per_node)
+            .map(|row_index| {
+                let sequence = node_index * rows_per_node + row_index;
+                let session_id = format!("00000000-0000-4000-8000-{sequence:012x}");
+                session_to_wire(
+                    &session(Provider::Codex, &session_id, "bounded-remote"),
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let payload = json!({
+            "type":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+            "node_id":node_id, "machine":format!("large-{node_index}"),
+            "captured_at":now(), "sessions":sessions, "profiles":[], "cards":[]
+        });
+        store
+            .put_remote_snapshot(&node_id, &payload, now())
+            .unwrap();
+    }
+    let error = FleetManager::new(&store, &FakeTransport::default())
+        .cached_sessions(None, false)
+        .unwrap_err();
+    assert_eq!(error.kind, FleetErrorKind::Incompatible);
+    assert!(error.message.contains("row board safety limit"));
 }
 
 #[test]
@@ -802,6 +879,49 @@ fn ssh_timeout_is_bounded_and_mutation_becomes_outcome_unknown() {
         .unwrap_err();
     assert_eq!(error.kind, FleetErrorKind::OutcomeUnknown);
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn snapshot_request_cancellation_joins_and_kills_owned_descendants() {
+    let _process = fake_process_guard();
+    let temp = TempDir::new().unwrap();
+    let fake = temp.path().join("ssh");
+    let owned_pid = temp.path().join("snapshot-child.pid");
+    executable(
+        &fake,
+        &format!(
+            "sleep 30 &\nprintf '%s' \"$!\" > '{}'\nwait",
+            owned_pid.display()
+        ),
+    );
+    let transport = SshTransport::new(&fake, Duration::from_secs(1), Duration::from_secs(30));
+    let cancellation = CancellationToken::default();
+    let worker_token = cancellation.clone();
+    let worker = std::thread::spawn(move || {
+        transport.request_cancellable("atlas", &json!({"op":"snapshot"}), false, &worker_token)
+    });
+    for _ in 0..100 {
+        if owned_pid.is_file() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(owned_pid.is_file(), "fake SSH descendant never started");
+    let cancelled_at = std::time::Instant::now();
+    cancellation.cancel();
+    let error = worker.join().unwrap().unwrap_err();
+    assert_eq!(error.kind, FleetErrorKind::Unreachable);
+    assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+
+    let pid: i32 = fs::read_to_string(&owned_pid).unwrap().parse().unwrap();
+    for _ in 0..50 {
+        // SAFETY: signal zero only probes the exact disposable fixture descendant.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("owned snapshot descendant {pid} survived cancellation");
 }
 
 #[test]

@@ -20,9 +20,12 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs;
+use std::fs::File;
+use std::io::Read;
 #[cfg(any(unix, test))]
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
@@ -39,6 +42,7 @@ pub const WEEK_MINUTES: f64 = 7.0 * 24.0 * 60.0;
 pub const OBSERVATION_MAX_AGE_SECONDS: f64 = 30.0 * 60.0;
 pub const REFRESH_WINDOW_SECONDS: f64 = 6.0 * 60.0 * 60.0;
 pub const QUOTA_RESERVE_PERCENT: f64 = 10.0;
+const MAX_CLAUDE_QUOTA_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct QuotaSnapshot {
@@ -171,7 +175,7 @@ impl SystemQuotaSource {
     }
 
     fn read_claude(&self, now: f64) -> Result<Option<QuotaSnapshot>> {
-        let data = match fs::read_to_string(&self.claude_cache) {
+        let file = match File::open(&self.claude_cache) {
             Ok(value) => value,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -183,7 +187,15 @@ impl SystemQuotaSource {
                 });
             }
         };
-        let value: Value = serde_json::from_str(&data).context("invalid Claude quota cache")?;
+        let mut data = Vec::new();
+        file.take(MAX_CLAUDE_QUOTA_CACHE_BYTES + 1)
+            .read_to_end(&mut data)
+            .context("cannot read bounded Claude quota cache")?;
+        if data.len() as u64 > MAX_CLAUDE_QUOTA_CACHE_BYTES {
+            bail!("Claude quota cache exceeds the 4 MiB safety limit");
+        }
+        let data = std::str::from_utf8(&data).context("Claude quota cache is not UTF-8")?;
+        let value: Value = serde_json::from_str(data).context("invalid Claude quota cache")?;
         Ok(parse_claude_quota(&value, now))
     }
 }
@@ -1056,6 +1068,32 @@ mod tests {
         let mut stale = claude;
         stale["cachedUsageUtilization"]["fetchedAtMs"] = json!(1_998_199_000_i64);
         assert!(parse_claude_quota(&stale, 2_000_000.0).is_none());
+    }
+
+    #[test]
+    fn claude_quota_cache_read_is_bounded_before_json_parsing() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("claude-quota.json");
+        fs::write(
+            &cache,
+            vec![b'x'; MAX_CLAUDE_QUOTA_CACHE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let paths = Paths {
+            config_dir: root.path().join("config"),
+            state_dir: root.path().join("state"),
+            config: root.path().join("config/config.json"),
+            database: root.path().join("state/pika.db"),
+            codex_home: root.path().join("codex"),
+            claude_home: root.path().join("claude"),
+            opencode_data_home: root.path().join("opencode"),
+            opencode_config_home: root.path().join("opencode-config"),
+        };
+        let error = SystemQuotaSource::new(&Config::default(), &paths)
+            .with_claude_cache(cache)
+            .read_claude(1.0)
+            .unwrap_err();
+        assert!(error.to_string().contains("4 MiB safety limit"));
     }
 
     #[cfg(unix)]

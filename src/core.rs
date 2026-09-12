@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 pub const LIVE_OWNER_LEASE_SECONDS: f64 = 300.0;
 const CONTINUATION_FRESH_SECONDS: f64 = 30.0 * 60.0;
+const RECONCILE_WRITE_BATCH: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct Inventory {
@@ -274,75 +275,129 @@ impl Pika {
                 fork_imports.push(fork);
             }
         }
-        let sessions = self.store.reconcile_transaction(|ledger| {
-            let mut sessions = Vec::with_capacity(stored.len() + fork_imports.len());
-            for session in &removed {
-                let state = match source_states.get(&(session.provider, session.session_id.clone()))
-                {
-                    Some(crate::providers::ProviderSourceState::Archived) => "archived",
-                    Some(crate::providers::ProviderSourceState::Deleted) => "deleted",
-                    _ => "source-unavailable",
-                };
-                ledger.hide_provider_session(session.provider, &session.session_id, state)?;
-            }
-            for session in &stored {
+        // Reconciliation may project thousands of sessions, but hooks are the
+        // latency-sensitive truth path. Commit bounded batches so a hook never
+        // waits behind an inventory-sized SQLite writer transaction. Every
+        // individual projection remains atomic inside its batch; the final
+        // reload below observes hook writes that interleaved between batches.
+        for batch in removed.chunks(RECONCILE_WRITE_BATCH) {
+            self.store.reconcile_transaction(|ledger| {
+                for session in batch {
+                    let state =
+                        match source_states.get(&(session.provider, session.session_id.clone())) {
+                            Some(crate::providers::ProviderSourceState::Archived) => "archived",
+                            Some(crate::providers::ProviderSourceState::Deleted) => "deleted",
+                            _ => "source-unavailable",
+                        };
+                    ledger.hide_provider_session(session.provider, &session.session_id, state)?;
+                }
+                Ok(())
+            })?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let restorations = stored
+            .iter()
+            .filter(|session| {
                 let key = (session.provider, session.session_id.clone());
-                if provider_hidden_keys.contains(&key)
+                provider_hidden_keys.contains(&key)
                     && source_states.get(&key)
                         == Some(&crate::providers::ProviderSourceState::Present)
-                {
+            })
+            .collect::<Vec<_>>();
+        for batch in restorations.chunks(RECONCILE_WRITE_BATCH) {
+            self.store.reconcile_transaction(|ledger| {
+                for session in batch {
                     ledger.restore_provider_session(session.provider, &session.session_id)?;
                 }
+                Ok(())
+            })?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut remaining = stored.into_iter();
+        let mut runtime_sessions = BTreeMap::new();
+        loop {
+            let batch = remaining
+                .by_ref()
+                .take(RECONCILE_WRITE_BATCH)
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
             }
-            for mut session in stored {
-                let (candidate, continuation_conflicts) =
-                    continuation_candidate(&session, &candidate_map, &panes, processes, now());
-                if let Some(candidate) = candidate {
-                    if candidate.session_id != session.session_id {
-                        session.active_thread_id = Some(candidate.session_id.clone());
+            let projected = self.store.reconcile_transaction(|ledger| {
+                let mut projected = Vec::with_capacity(batch.len());
+                for mut session in batch {
+                    let (candidate, continuation_conflicts) =
+                        continuation_candidate(&session, &candidate_map, &panes, processes, now());
+                    if let Some(candidate) = candidate {
+                        if candidate.session_id != session.session_id {
+                            session.active_thread_id = Some(candidate.session_id.clone());
+                        }
+                        merge_session_candidate(&mut session, candidate);
+                        if let Some(status) = candidate.lifecycle_status {
+                            let attached = panes.iter().any(|pane| {
+                                pane.attached
+                                    && pane.pika_provider == Some(session.provider)
+                                    && pane.pika_session_id.as_deref() == Some(&session.session_id)
+                            });
+                            let observation = crate::model::StatusObservation {
+                                kind: ObservationKind::Lifecycle,
+                                status,
+                                unread: status == Status::Ready
+                                    && candidate.updated_at > session.last_event_at
+                                    && !attached,
+                                attention_reason: (status == Status::Ready)
+                                    .then(|| "completed".into()),
+                                error: None,
+                                observed_at: candidate.updated_at.max(session.last_activity_at),
+                                source: candidate.source.clone(),
+                            };
+                            ledger.record_status_observation(
+                                session.provider,
+                                &session.session_id,
+                                &observation,
+                            )?;
+                        }
                     }
-                    merge_session_candidate(&mut session, candidate);
-                    if let Some(status) = candidate.lifecycle_status {
-                        let attached = panes.iter().any(|pane| {
-                            pane.attached
-                                && pane.pika_provider == Some(session.provider)
-                                && pane.pika_session_id.as_deref() == Some(&session.session_id)
-                        });
-                        let observation = crate::model::StatusObservation {
-                            kind: ObservationKind::Lifecycle,
-                            status,
-                            unread: status == Status::Ready
-                                && candidate.updated_at > session.last_event_at
-                                && !attached,
-                            attention_reason: (status == Status::Ready).then(|| "completed".into()),
-                            error: None,
-                            observed_at: candidate.updated_at.max(session.last_activity_at),
-                            source: candidate.source.clone(),
-                        };
-                        ledger.record_status_observation(
-                            session.provider,
-                            &session.session_id,
-                            &observation,
-                        )?;
-                    }
+                    self.reconcile_one_in(
+                        &mut session,
+                        &panes,
+                        processes,
+                        ledger,
+                        &continuation_conflicts,
+                    )?;
+                    ledger.upsert_session(&session, false)?;
+                    projected.push(session);
                 }
-                self.reconcile_one_in(
-                    &mut session,
-                    &panes,
-                    processes,
-                    ledger,
-                    &continuation_conflicts,
-                )?;
-                ledger.upsert_session(&session, false)?;
-                sessions.push(session);
-            }
-            for fork in fork_imports {
-                if ledger.upsert_session(&fork, false)? {
-                    sessions.push(fork);
+                Ok(projected)
+            })?;
+            runtime_sessions.extend(
+                projected
+                    .into_iter()
+                    .map(|session| ((session.provider, session.session_id.clone()), session)),
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for batch in fork_imports.chunks(RECONCILE_WRITE_BATCH) {
+            self.store.reconcile_transaction(|ledger| {
+                for fork in batch {
+                    let _ = ledger.upsert_session(fork, false)?;
                 }
+                Ok(())
+            })?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut sessions = self.store.list_sessions()?;
+        for session in &mut sessions {
+            if let Some(runtime) =
+                runtime_sessions.get(&(session.provider, session.session_id.clone()))
+            {
+                session.live = runtime.live;
+                session.attached = runtime.attached;
+                session.home_state.clone_from(&runtime.home_state);
+                session.cpu_percent = runtime.cpu_percent;
+                session.rss_kb = runtime.rss_kb;
             }
-            Ok(sessions)
-        })?;
+        }
         Ok(ReconciledInventory {
             inventory: Inventory {
                 sessions,
@@ -1915,9 +1970,11 @@ fn now() -> f64 {
 mod tests {
     use super::*;
     use crate::{
+        hooks::{HookContext, handle_hook, parse_hook_payload},
         model::ExpertProfile,
         store::{LiveOwner, StoredExpertProfile},
     };
+    use std::sync::{Arc, Barrier};
     fn test_pika() -> (tempfile::TempDir, Pika) {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths {
@@ -1986,6 +2043,71 @@ mod tests {
             pika_name: Some("portfolio_review".into()),
             pika_launch_token: None,
         }
+    }
+
+    #[test]
+    fn two_thousand_row_reconcile_yields_to_hook_bursts_without_losing_truth() {
+        let (_root, mut pika) = test_pika();
+        pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
+        let target_id = "00000000-0000-4000-8000-000000000000";
+        for index in 0..2_000 {
+            let id = format!("00000000-0000-4000-8000-{index:012x}");
+            let mut session = test_session(&id);
+            session.name = Some(format!("session-{index:04}"));
+            session.live = false;
+            session.root_pid = None;
+            session.status = Status::Parked;
+            pika.store.upsert_session(&session, false).unwrap();
+        }
+
+        let participants = 7;
+        let barrier = Arc::new(Barrier::new(participants));
+        let reconcile_barrier = Arc::clone(&barrier);
+        let reconcile_pika = pika.clone();
+        let reconcile = std::thread::spawn(move || {
+            reconcile_barrier.wait();
+            reconcile_pika.reconcile_local()
+        });
+        let mut hooks = Vec::new();
+        for index in 0..5 {
+            let store = pika.store.clone();
+            let hook_barrier = Arc::clone(&barrier);
+            hooks.push(std::thread::spawn(move || {
+                let payload = parse_hook_payload(
+                    serde_json::to_vec(&serde_json::json!({
+                        "session_id":target_id,
+                        "hook_event_name":"Stop",
+                        "cwd":"/tmp",
+                    }))
+                    .unwrap()
+                    .as_slice(),
+                    Provider::Codex,
+                )
+                .unwrap();
+                hook_barrier.wait();
+                handle_hook(
+                    &store,
+                    Provider::Codex,
+                    &payload,
+                    &HookContext::at(10_000.0 + index as f64),
+                )
+            }));
+        }
+        barrier.wait();
+        let inventory = reconcile.join().unwrap().unwrap();
+        for hook in hooks {
+            hook.join().unwrap().unwrap();
+        }
+
+        assert_eq!(inventory.sessions.len(), 2_000);
+        let target = pika
+            .store
+            .get_session(Provider::Codex, target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.status, Status::Ready);
+        assert!(target.unread);
+        assert_eq!(target.last_event_at, 10_004.0);
     }
 
     #[test]
@@ -2816,6 +2938,131 @@ mod tests {
         assert!(
             stored.unread,
             "a rejected handoff must not acknowledge attention"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proven_exact_attach_acknowledges_only_the_selected_event() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (root, mut pika) = test_pika();
+        let identity = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let provider_pid = i64::from(std::process::id());
+        let start_time =
+            process::process_start_time(provider_pid).expect("test process has a generation");
+        let separator = '\u{1f}'.to_string();
+        let row = [
+            "pika-c-portfolio".to_owned(),
+            "%1".to_owned(),
+            provider_pid.to_string(),
+            "/tmp".to_owned(),
+            "codex".to_owned(),
+            "0".to_owned(),
+            "1".to_owned(),
+            "1".to_owned(),
+            "0".to_owned(),
+            String::new(),
+            "1".to_owned(),
+            "1".to_owned(),
+            "codex".to_owned(),
+            identity.to_owned(),
+            "portfolio_review".to_owned(),
+            String::new(),
+        ]
+        .join(&separator);
+        let client_pid = root.path().join("client-pid");
+        let handoff_seen = root.path().join("handoff-seen");
+        let executable = root.path().join("tmux-fixture");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *list-panes*) printf '%s\\n' '{row}' ;;\n  *list-clients*) if [ -f {client_pid} ]; then touch {handoff_seen}; printf '%s\\t%%1\\n' \"$(cat {client_pid})\"; fi ;;\n  *if-shell*attach-session*) printf '%s' \"$$\" > {client_pid}; sleep 0.25; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                client_pid = shell_words::quote(&client_pid.to_string_lossy()),
+                handoff_seen = shell_words::quote(&handoff_seen.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        pika.tmux = Tmux::with_executable(executable.to_string_lossy(), None);
+
+        let mut session = test_session(identity);
+        session.tmux_session = Some("pika-c-portfolio".into());
+        session.tmux_pane = Some("%1".into());
+        session.root_pid = Some(provider_pid);
+        session.status = Status::Ready;
+        session.unread = true;
+        session.last_event_at = 42.0;
+        let mut newer_session = session.clone();
+        newer_session.last_event_at = 43.0;
+        newer_session.attention_reason = Some("newer result ready".into());
+
+        let store = pika.store.clone();
+        let marker = handoff_seen.clone();
+        let inserted = Arc::new(AtomicBool::new(false));
+        let inserted_from_observer = Arc::clone(&inserted);
+        let observed = record(
+            provider_pid,
+            None,
+            start_time,
+            &["codex", "resume", identity],
+        );
+        pika.process_observer = Arc::new(move || {
+            if marker.exists() && !inserted_from_observer.swap(true, Ordering::SeqCst) {
+                store.upsert_session(&newer_session, false).unwrap();
+                store
+                    .record_status_observation(
+                        Provider::Codex,
+                        identity,
+                        &crate::model::StatusObservation {
+                            kind: ObservationKind::Lifecycle,
+                            status: Status::Ready,
+                            unread: true,
+                            attention_reason: Some("newer result ready".into()),
+                            error: None,
+                            observed_at: 43.0,
+                            source: "test-newer-event".into(),
+                        },
+                    )
+                    .unwrap();
+            }
+            ProcessObservation::complete(BTreeMap::from([(provider_pid, observed.clone())]))
+        });
+
+        pika.store.upsert_session(&session, false).unwrap();
+        pika.store
+            .record_status_observation(
+                Provider::Codex,
+                identity,
+                &crate::model::StatusObservation {
+                    kind: ObservationKind::Lifecycle,
+                    status: Status::Ready,
+                    unread: true,
+                    attention_reason: Some("selected result ready".into()),
+                    error: None,
+                    observed_at: 42.0,
+                    source: "test-selected-event".into(),
+                },
+            )
+            .unwrap();
+
+        let receipt = pika.open_session(session, true).unwrap();
+        assert_eq!(receipt.exit_code, 0);
+        assert!(inserted.load(Ordering::SeqCst));
+        let stored = pika
+            .store
+            .get_session(Provider::Codex, identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.last_event_at, 43.0);
+        assert!(
+            stored.unread,
+            "the newer concurrent event must survive handoff"
+        );
+        assert_eq!(
+            stored.attention_reason.as_deref(),
+            Some("newer result ready")
         );
     }
 }

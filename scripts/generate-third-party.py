@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import re
 import tarfile
@@ -75,6 +76,35 @@ def fence_for(text: str) -> str:
     return "`" * max(4, longest + 1)
 
 
+def musl_notices_from_rust_copyright(path: Path) -> list[Notice]:
+    """Extract complete, source-backed notice blocks that mention musl.
+
+    Rust's musl targets ship a self-contained libc archive outside the Rust
+    standard-library report. The pinned full toolchain report is the matching
+    source of truth, so retain each complete `<pre>` block that identifies
+    musl and its copyright holder rather than maintaining a handwritten copy.
+    """
+    if path.is_symlink() or not path.is_file():
+        fail("Rust toolchain copyright report is not a regular file")
+    raw = path.read_bytes()
+    if len(raw) > 16 * 1024 * 1024:
+        fail("Rust toolchain copyright report exceeds 16 MiB")
+    try:
+        report = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("Rust toolchain copyright report is not UTF-8")
+    blocks: dict[str, Notice] = {}
+    for encoded in re.findall(r"<pre(?:\s[^>]*)?>(.*?)</pre>", report, re.I | re.S):
+        text = html.unescape(encoded)
+        if "musl libc" not in text or "Rich Felker" not in text:
+            continue
+        notice = read_notice(text.encode("utf-8"), "Rust 1.88.0 COPYRIGHT.html musl block")
+        blocks[notice.digest] = notice
+    if not blocks:
+        fail("Rust 1.88.0 COPYRIGHT.html contains no complete musl notice")
+    return [blocks[digest] for digest in sorted(blocks)]
+
+
 def package_key(package: dict[str, object]) -> tuple[str, str]:
     return str(package["name"]), str(package["version"])
 
@@ -105,6 +135,7 @@ def main() -> None:
     parser.add_argument("--tree", type=Path, required=True)
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--rust-copyright", type=Path, required=True)
+    parser.add_argument("--rust-full-copyright", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -276,9 +307,6 @@ def main() -> None:
             }
         )
 
-    notice_bytes = sum(len(notice.text.encode("utf-8")) for notice in notices.values())
-    if notice_bytes > MAX_TOTAL_NOTICE_BYTES:
-        fail("deduplicated notices exceed the 4 MiB output budget")
     if sqlite_notice_id is None:
         fail("the expected bundled SQLite attribution was not generated")
     if args.rust_copyright.is_symlink() or not args.rust_copyright.is_file():
@@ -291,6 +319,16 @@ def main() -> None:
         ("Rust standard library 1.88.0", "COPYRIGHT-library.html")
     )
     rust_notice_id = rust_notice.digest
+    musl_notice_ids: list[str] = []
+    for musl_notice in musl_notices_from_rust_copyright(args.rust_full_copyright):
+        notices[musl_notice.digest] = musl_notice
+        notice_uses[musl_notice.digest].append(
+            ("Rust 1.88.0 self-contained musl libc", "COPYRIGHT.html")
+        )
+        musl_notice_ids.append(musl_notice.digest)
+    notice_bytes = sum(len(notice.text.encode("utf-8")) for notice in notices.values())
+    if notice_bytes > MAX_TOTAL_NOTICE_BYTES:
+        fail("deduplicated notices exceed the 4 MiB output budget")
     short_ids: dict[str, str] = {}
     for digest in notices:
         short = digest[:12]
@@ -311,6 +349,12 @@ def main() -> None:
         "",
         "The binary also statically links the Rust 1.88.0 standard library. Its complete "
         f"library copyright report is included as N-{rust_notice_id[:12]}.",
+        "",
+        "Rust's Linux targets also link its self-contained musl libc. Complete musl-related "
+        "notice blocks are extracted from the pinned Rust 1.88.0 full toolchain copyright "
+        "report and included as "
+        + ", ".join(f"N-{digest[:12]}" for digest in musl_notice_ids)
+        + ".",
         "",
         "| Package | Version | License | Cargo.lock SHA-256 | Declared authors | Source | Included notices |",
         "| --- | --- | --- | --- | --- | --- | --- |",

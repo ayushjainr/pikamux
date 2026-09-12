@@ -8,10 +8,14 @@ use crate::consult::{
     CancellablePipe, CancellationToken, OwnedChild, poll_owned_child, terminate_child,
 };
 use fs2::FileExt;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, MapAccess, Visitor},
+};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -79,7 +83,42 @@ pub struct ReleaseManifest {
     pub package: String,
     pub version: String,
     pub channel: String,
+    #[serde(deserialize_with = "deserialize_unique_artifacts")]
     pub artifacts: BTreeMap<String, ReleaseArtifact>,
+}
+
+fn deserialize_unique_artifacts<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, ReleaseArtifact>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct UniqueArtifacts;
+
+    impl<'de> Visitor<'de> for UniqueArtifacts {
+        type Value = BTreeMap<String, ReleaseArtifact>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an object with unique native artifact targets")
+        }
+
+        fn visit_map<A>(self, mut entries: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut artifacts = BTreeMap::new();
+            while let Some((target, artifact)) = entries.next_entry::<String, ReleaseArtifact>()? {
+                if artifacts.insert(target.clone(), artifact).is_some() {
+                    return Err(de::Error::custom(format!(
+                        "duplicate native artifact target: {target}"
+                    )));
+                }
+            }
+            Ok(artifacts)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueArtifacts)
 }
 
 impl ReleaseManifest {
@@ -1304,6 +1343,8 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
     reject_symlink(&releases)?;
     fs::create_dir_all(&releases)?;
     set_private_directory(&releases)?;
+    sync_directory(&releases)?;
+    sync_directory(request.root)?;
     let current = request.root.join("current");
     validate_current(&current, &releases)?;
     let launcher = request.bin_dir.join("pika");
@@ -1350,7 +1391,6 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
         &release_artifact.sha256[..12]
     );
     let release_dir = releases.join(release_name);
-    let mut prepared_here = false;
     if release_dir.exists() {
         validate_existing_release(&release_dir, request, release_artifact)?;
     } else {
@@ -1366,17 +1406,20 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
             let _ = fs::remove_dir_all(&stage);
             return Err(error.into());
         }
-        prepared_here = true;
+        sync_directory(&releases)?;
     }
 
     let launcher_created = ensure_launcher(&launcher, &expected_launcher_target)?;
     if let Err(error) = atomic_symlink(&release_dir, &current) {
         if launcher_created {
             let _ = fs::remove_file(&launcher);
+            if let Some(parent) = launcher.parent() {
+                let _ = sync_directory(parent);
+            }
         }
-        if prepared_here {
-            let _ = fs::remove_dir_all(&release_dir);
-        }
+        // The fully synced release is deliberately retained. If the current
+        // symlink was renamed before a directory-sync failure, removing its
+        // target would turn a recoverable activation error into a broken home.
         return Err(error);
     }
     Ok(InstallOutcome {
@@ -1407,6 +1450,7 @@ fn prepare_release(
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&installed, fs::Permissions::from_mode(0o700))?;
     validate_candidate(&installed, &request.manifest.version)?;
+    sync_file(&installed)?;
 
     let receipt = InstallReceipt {
         schema: MANIFEST_SCHEMA,
@@ -1430,6 +1474,7 @@ fn prepare_release(
     let bundled_artifact = bundle.join(&artifact.file);
     fs::copy(request.artifact, &bundled_artifact)?;
     fs::set_permissions(&bundled_artifact, fs::Permissions::from_mode(0o600))?;
+    sync_file(&bundled_artifact)?;
     let manifest_bytes = serde_json::to_vec_pretty(request.manifest)
         .map_err(|error| UpdateError::Manifest(error.to_string()))?;
     write_new_file(&bundle.join(NATIVE_MANIFEST_FILE), &manifest_bytes, 0o600)?;
@@ -1448,6 +1493,11 @@ fn prepare_release(
         include_bytes!("../scripts/install.sh"),
         0o700,
     )?;
+    // Persist every payload before the stage name can become a release, then
+    // persist the directory hierarchy bottom-up.
+    sync_directory(&bin)?;
+    sync_directory(&bundle)?;
+    sync_directory(stage)?;
     Ok(())
 }
 
@@ -1803,7 +1853,12 @@ fn initialize_or_validate_root(root: &Path, existed: bool) -> Result<()> {
             "new installation root is not empty".into(),
         ));
     }
-    write_new_file(&marker, ROOT_MARKER.as_bytes(), 0o600)
+    write_new_file(&marker, ROOT_MARKER.as_bytes(), 0o600)?;
+    sync_directory(root)?;
+    if let Some(parent) = root.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
 }
 
 fn reject_symlink(path: &Path) -> Result<()> {
@@ -1935,6 +1990,7 @@ fn ensure_launcher(launcher: &Path, expected: &Path) -> Result<bool> {
     fs::create_dir_all(parent)?;
     use std::os::unix::fs::symlink;
     symlink(expected, launcher)?;
+    sync_directory(parent)?;
     Ok(true)
 }
 
@@ -1946,8 +2002,14 @@ fn atomic_symlink(target: &Path, link: &Path) -> Result<()> {
         .ok_or_else(|| UpdateError::Safety("activation path has no parent".into()))?;
     let temporary = parent.join(format!(".current-{}", Uuid::new_v4()));
     symlink(target, &temporary)?;
+    // Make both the old activation and the temporary replacement durable
+    // before rename. After the atomic swap, persist the selected name.
+    if let Err(error) = sync_directory(parent) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
     match fs::rename(&temporary, link) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_directory(parent),
         Err(error) => {
             let _ = fs::remove_file(&temporary);
             Err(error.into())
@@ -1972,6 +2034,32 @@ fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         .open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_file(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(UpdateError::Safety(format!(
+            "durability boundary is not a directory: {}",
+            path.display()
+        )));
+    }
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    // Managed activation is Unix-only; keep shared receipt validation
+    // buildable for the Windows client without claiming directory fsync.
     Ok(())
 }
 

@@ -7,6 +7,7 @@
 //! never subscription bills.
 
 use crate::{
+    consult::CancellationToken,
     model::{Provider, Session},
     paths::Paths,
     store::{Store, UsageCacheRecord},
@@ -16,11 +17,11 @@ use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub const PRICING_AS_OF: &str = "2026-08-12";
@@ -28,6 +29,9 @@ const MAX_CODEX_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CLAUDE_INITIAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CLAUDE_INCREMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_USAGE_RECORD_BYTES: u64 = 1024 * 1024;
+pub const MAX_USAGE_SCAN_PER_TICK: usize = 64;
+const USAGE_SQLITE_DEADLINE: Duration = Duration::from_millis(400);
+const USAGE_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 const NO_USAGE_MODEL: &str = "__pika_no_usage__";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -57,6 +61,13 @@ pub struct UsageReport {
     pub hydrated: usize,
     pub unavailable: usize,
     pub errors: Vec<String>,
+    pub sessions_checked: usize,
+    pub sources_checked: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct UsageRefreshCursor {
+    after: Option<(Provider, String)>,
 }
 
 pub fn format_tokens(value: Option<i64>) -> String {
@@ -149,6 +160,25 @@ pub fn hydrate_cached_sessions(store: &Store, sessions: &mut [Session]) -> Usage
 /// Refresh at most one changed source. This bounds each board tick to one
 /// provider read; unchanged misses and parse failures are fingerprint-cached.
 pub fn refresh_one_due(paths: &Paths, store: &Store, sessions: &[Session]) -> UsageReport {
+    refresh_one_due_bounded(
+        paths,
+        store,
+        sessions,
+        &mut UsageRefreshCursor::default(),
+        &CancellationToken::default(),
+    )
+}
+
+/// Inspect a bounded round-robin window and refresh at most one session. Source
+/// fingerprints are shared within the tick, so OpenCode's one database is not
+/// stat'ed once per conversation.
+pub fn refresh_one_due_bounded(
+    paths: &Paths,
+    store: &Store,
+    sessions: &[Session],
+    cursor: &mut UsageRefreshCursor,
+    cancellation: &CancellationToken,
+) -> UsageReport {
     let mut report = UsageReport::default();
     let cached = store
         .list_cached_usage()
@@ -156,29 +186,67 @@ pub fn refresh_one_due(paths: &Paths, store: &Store, sessions: &[Session]) -> Us
         .into_iter()
         .map(|row| ((row.provider, row.session_id.clone()), row))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut due = sessions
-        .iter()
-        .filter_map(|session| {
-            let path = usage_source(paths, session)?;
-            let current = fingerprint(&path).ok()?;
-            let row = cached.get(&(session.provider, session.session_id.clone()));
-            let unchanged = row.is_some_and(|row| {
-                row.source_path == path.to_string_lossy()
-                    && row.source_mtime_ns == current.mtime_ns
-                    && row.source_size == current.size
-            });
-            (!unchanged).then_some((
-                row.map_or(0.0, |row| row.updated_at),
-                session,
-                path,
-                current,
-            ))
-        })
-        .collect::<Vec<_>>();
-    due.sort_by(|left, right| left.0.total_cmp(&right.0));
-    let Some((_, session, path, current)) = due.into_iter().next() else {
+    let mut ordered = sessions.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        (left.provider, &left.session_id).cmp(&(right.provider, &right.session_id))
+    });
+    if ordered.is_empty() {
+        return report;
+    }
+    let start = cursor.after.as_ref().map_or(0, |after| {
+        ordered.partition_point(|session| {
+            (session.provider, &session.session_id) <= (after.0, &after.1)
+        }) % ordered.len()
+    });
+    let mut fingerprints = BTreeMap::<PathBuf, Option<Fingerprint>>::new();
+    let mut selected = None;
+    for offset in 0..ordered.len().min(MAX_USAGE_SCAN_PER_TICK) {
+        if cancellation.is_cancelled() {
+            return report;
+        }
+        let session = ordered[(start + offset) % ordered.len()];
+        cursor.after = Some((session.provider, session.session_id.clone()));
+        report.sessions_checked += 1;
+        let Some(path) = usage_source(paths, session) else {
+            continue;
+        };
+        let current = if let Some(value) = fingerprints.get(&path) {
+            *value
+        } else {
+            report.sources_checked += 1;
+            let measured = match fingerprint(&path) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    report.errors.push(format!(
+                        "{}:{}: {error}",
+                        session.provider, session.session_id
+                    ));
+                    None
+                }
+            };
+            fingerprints.insert(path.clone(), measured);
+            measured
+        };
+        let Some(current) = current else {
+            continue;
+        };
+        let row = cached.get(&(session.provider, session.session_id.clone()));
+        let unchanged = row.is_some_and(|row| {
+            row.source_path == path.to_string_lossy()
+                && row.source_mtime_ns == current.mtime_ns
+                && row.source_size == current.size
+        });
+        if !unchanged {
+            selected = Some((session, path, current));
+            break;
+        }
+    }
+    let Some((session, path, current)) = selected else {
         return report;
     };
+    if cancellation.is_cancelled() {
+        return report;
+    }
     match usage_for_session(paths, store, session) {
         Ok(Some(_)) => report.hydrated = 1,
         Ok(None) => {
@@ -445,6 +513,9 @@ fn opencode_usage(home: &Path, store: &Store, session: &Session) -> Result<Optio
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    db.busy_timeout(USAGE_SQLITE_BUSY_TIMEOUT)?;
+    let deadline = Instant::now() + USAGE_SQLITE_DEADLINE;
+    db.progress_handler(1_000, Some(move || Instant::now() >= deadline));
     let columns = table_columns(&db, "session")?;
     if !columns.contains("id") || !columns.contains("parent_id") {
         return Ok(None);

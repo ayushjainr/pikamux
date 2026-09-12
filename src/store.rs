@@ -25,6 +25,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 // no provider/process I/O, so a writer held for longer than this is abnormal;
 // report the lock explicitly instead of freezing a hook or board action.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(500);
+pub const MAX_REMOTE_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
 const SCHEMA: &str = r#"
 CREATE TABLE sessions (
@@ -348,6 +349,7 @@ pub struct RemoteSnapshot {
     pub node_id: String,
     pub payload: Value,
     pub captured_at: f64,
+    pub encoded_bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1788,10 +1790,11 @@ impl Store {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM remote_snapshots WHERE node_id=?", [node_id])?;
         tx.execute(
-            "DELETE FROM meta WHERE key LIKE ? OR key LIKE ?",
+            "DELETE FROM meta WHERE key LIKE ? OR key LIKE ? OR key=?",
             params![
                 format!("fleet:pending-adopt:{node_id}:%"),
-                format!("fleet:pending-untrack:{node_id}:%")
+                format!("fleet:pending-untrack:{node_id}:%"),
+                fleet_refresh_generation_key(node_id),
             ],
         )?;
         let deleted = tx.execute("DELETE FROM fleet_nodes WHERE node_id=?", [node_id])? == 1;
@@ -1819,6 +1822,100 @@ impl Store {
         )? == 1)
     }
 
+    /// Reserve a monotonically increasing refresh generation before remote I/O.
+    /// The durable claim coordinates boards and exact actions in other Pika
+    /// processes without holding SQLite open across SSH.
+    pub fn claim_fleet_refresh(&self, node_id: &str) -> Result<u64> {
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let trusted = tx
+            .query_row(
+                "SELECT 1 FROM fleet_nodes WHERE node_id=?",
+                [node_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !trusted {
+            bail!("fleet refresh requires an adopted node");
+        }
+        let key = fleet_refresh_generation_key(node_id);
+        let current = tx
+            .query_row("SELECT value FROM meta WHERE key=?", [&key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .context("stored fleet refresh generation is invalid")
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let generation = current
+            .checked_add(1)
+            .context("fleet refresh generation exhausted")?;
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, generation.to_string()],
+        )?;
+        let timestamp = now();
+        tx.execute(
+            "UPDATE fleet_nodes SET last_attempt_at=?,updated_at=? WHERE node_id=?",
+            params![timestamp, timestamp, node_id],
+        )?;
+        tx.commit()?;
+        Ok(generation)
+    }
+
+    pub fn current_fleet_refresh_generation(&self, node_id: &str) -> Result<u64> {
+        if !self.exists() {
+            return Ok(0);
+        }
+        self.get_meta(&fleet_refresh_generation_key(node_id))?
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .context("stored fleet refresh generation is invalid")
+            })
+            .transpose()
+            .map(|value| value.unwrap_or(0))
+    }
+
+    /// Record an error only if this request remains the newest refresh claim.
+    pub fn mark_fleet_node_error_if_current(
+        &self,
+        node_id: &str,
+        generation: u64,
+        status: &str,
+        error: &str,
+    ) -> Result<bool> {
+        if ![
+            "unreachable",
+            "auth",
+            "incompatible",
+            "quarantined",
+            "error",
+        ]
+        .contains(&status)
+        {
+            bail!("unsupported fleet node status: {status}");
+        }
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !fleet_refresh_is_current(&tx, node_id, generation)? {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let timestamp = now();
+        let changed = tx.execute(
+            "UPDATE fleet_nodes SET status=?,last_error=?,last_attempt_at=?,updated_at=? WHERE node_id=?",
+            params![status, error, timestamp, timestamp, node_id],
+        )? == 1;
+        tx.commit()?;
+        Ok(changed)
+    }
+
     pub fn put_remote_snapshot(
         &self,
         node_id: &str,
@@ -1829,6 +1926,9 @@ impl Store {
             bail!("remote snapshot must be a JSON object");
         }
         let encoded = serde_json::to_string(payload)?;
+        if encoded.len() > MAX_REMOTE_SNAPSHOT_BYTES {
+            bail!("remote snapshot exceeds the 4 MiB safety limit");
+        }
         let mut db = self.open_write()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let trusted = tx
@@ -1854,6 +1954,41 @@ impl Store {
         Ok(())
     }
 
+    /// Commit a remote snapshot only while its pre-I/O refresh claim is still
+    /// current. A later-started request therefore wins even if an older SSH
+    /// response arrives last.
+    pub fn put_remote_snapshot_if_current(
+        &self,
+        node_id: &str,
+        payload: &Value,
+        captured_at: f64,
+        generation: u64,
+    ) -> Result<bool> {
+        if !payload.is_object() {
+            bail!("remote snapshot must be a JSON object");
+        }
+        let encoded = serde_json::to_string(payload)?;
+        if encoded.len() > MAX_REMOTE_SNAPSHOT_BYTES {
+            bail!("remote snapshot exceeds the 4 MiB safety limit");
+        }
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !fleet_refresh_is_current(&tx, node_id, generation)? {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO remote_snapshots(node_id,payload_json,captured_at) VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET payload_json=excluded.payload_json,captured_at=excluded.captured_at",
+            params![node_id, encoded, captured_at],
+        )?;
+        tx.execute(
+            "UPDATE fleet_nodes SET status='ready',last_seen=?,last_error=NULL,last_attempt_at=?,updated_at=? WHERE node_id=?",
+            params![captured_at, captured_at, now(), node_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn get_remote_snapshot(&self, node_id: &str) -> Result<Option<RemoteSnapshot>> {
         if !self.exists() {
             return Ok(None);
@@ -1861,9 +1996,20 @@ impl Store {
         let db = self.open_read()?;
         let snapshot = db
             .query_row(
-                "SELECT node_id,payload_json,captured_at FROM remote_snapshots WHERE node_id=?",
+                "SELECT node_id,payload_json,captured_at,length(CAST(payload_json AS BLOB)) FROM remote_snapshots WHERE node_id=?",
                 [node_id],
                 |row| {
+                    let encoded_bytes: i64 = row.get(3)?;
+                    if encoded_bytes < 0
+                        || usize::try_from(encoded_bytes)
+                            .ok()
+                            .is_none_or(|size| size > MAX_REMOTE_SNAPSHOT_BYTES)
+                    {
+                        return Err(conversion_error(
+                            1,
+                            "stored remote snapshot exceeds the 4 MiB safety limit",
+                        ));
+                    }
                     let encoded: String = row.get(1)?;
                     let payload = parse_json_value(&encoded, 1)?;
                     if !payload.is_object() {
@@ -1876,6 +2022,7 @@ impl Store {
                         node_id: row.get(0)?,
                         payload,
                         captured_at: row.get(2)?,
+                        encoded_bytes: encoded_bytes as usize,
                     })
                 },
             )
@@ -2893,6 +3040,21 @@ fn live_owner_from_row(row: &Row<'_>) -> rusqlite::Result<LiveOwner> {
         owner_token: row.get(4)?,
         last_seen: row.get(5)?,
     })
+}
+
+fn fleet_refresh_generation_key(node_id: &str) -> String {
+    format!("fleet:refresh-generation:{node_id}")
+}
+
+fn fleet_refresh_is_current(tx: &Transaction<'_>, node_id: &str, generation: u64) -> Result<bool> {
+    let key = fleet_refresh_generation_key(node_id);
+    let current = tx
+        .query_row("SELECT value FROM meta WHERE key=?", [&key], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .and_then(|value| value.parse::<u64>().ok());
+    Ok(current == Some(generation))
 }
 
 fn recovery_owner_from_row(row: &Row<'_>) -> rusqlite::Result<RecoveryOwner> {

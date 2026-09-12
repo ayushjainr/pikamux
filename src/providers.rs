@@ -32,6 +32,8 @@ const MAX_CLAUDE_DISCOVERY_FILES: usize = 1_000;
 const MAX_CLAUDE_METADATA_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CLAUDE_TITLE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CLAUDE_CHANGED_TITLES: usize = 16;
+const PROVIDER_SQLITE_DEADLINE: Duration = Duration::from_millis(400);
+const PROVIDER_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub struct Providers<'a> {
     paths: &'a Paths,
@@ -1720,13 +1722,17 @@ fn opencode_source_states(
 
 fn readonly(path: &Path) -> Result<Connection> {
     let uri = format!("file:{}?mode=ro", path.to_string_lossy());
-    Connection::open_with_flags(
+    let db = Connection::open_with_flags(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .with_context(|| format!("cannot open {}", path.display()))
+    .with_context(|| format!("cannot open {}", path.display()))?;
+    db.busy_timeout(PROVIDER_SQLITE_BUSY_TIMEOUT)?;
+    let deadline = Instant::now() + PROVIDER_SQLITE_DEADLINE;
+    db.progress_handler(1_000, Some(move || Instant::now() >= deadline));
+    Ok(db)
 }
 
 fn columns(db: &Connection, table: &str) -> Result<BTreeSet<String>> {

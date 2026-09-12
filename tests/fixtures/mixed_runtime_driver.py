@@ -12,7 +12,9 @@ import io
 import importlib.util
 import json
 import sys
+import time
 import types
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -53,14 +55,17 @@ if sys.platform == "darwin" and importlib.util.find_spec("psutil") is None:
 from pikamux import __version__
 from pikamux.fleet import (
     CAPABILITIES,
+    PROTOCOL_NAME,
+    PROTOCOL_VERSION,
     FleetError,
     FleetManager,
     NodeCandidate,
     handle_fleet_stdio,
+    session_to_wire,
     validate_snapshot,
 )
 from pikamux.hooks import handle_hook
-from pikamux.models import FleetSession, Session, Status
+from pikamux.models import FleetNode, FleetSession, Session, Status
 from pikamux.store import Store
 
 
@@ -234,6 +239,52 @@ def seed_board(database: Path, count: int) -> None:
                 last_activity_at=2000.0 + index,
             )
         )
+    remote_node_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    captured_at = time.time()
+    store.upsert_fleet_node(
+        FleetNode(
+            node_id=remote_node_id,
+            alias="offline-fixture",
+            ssh_target="offline.invalid",
+            sources=("performance-fixture",),
+            status="ready",
+            protocol_version=2,
+            package_version="fixture",
+            capabilities=tuple(CAPABILITIES),
+            created_at=captured_at,
+            updated_at=captured_at,
+        )
+    )
+    remote = Session(
+        "codex",
+        str(uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")),
+        name="remote_offline_fixture",
+        cwd="/synthetic/remote-project",
+        status=Status.NEEDS_YOU.value,
+        unread=True,
+        attention_reason="question",
+        source="performance-remote-cache",
+        managed=True,
+        created_at=captured_at,
+        updated_at=captured_at,
+        last_event_at=captured_at,
+        last_activity_at=captured_at,
+    )
+    store.put_remote_snapshot(
+        remote_node_id,
+        {
+            "type": "snapshot",
+            "protocol": PROTOCOL_NAME,
+            "version": PROTOCOL_VERSION,
+            "node_id": remote_node_id,
+            "machine": "offline-fixture",
+            "captured_at": captured_at,
+            "sessions": [session_to_wire(remote)],
+            "profiles": [],
+            "cards": [],
+        },
+        captured_at=captured_at,
+    )
     print(json.dumps({"seeded": count}, separators=(",", ":")))
 
 
