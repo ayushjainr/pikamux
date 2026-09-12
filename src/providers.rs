@@ -1,0 +1,2397 @@
+use crate::{
+    config::Config,
+    consult::{CancellablePipe, CancellationToken, OwnedChild, terminate_child},
+    model::{Candidate, Provider, Session, Status},
+    paths::Paths,
+};
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OpenFlags, types::ValueRef};
+use serde_json::Value;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
+    fs::{self, File},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::mpsc,
+    time::{Duration, Instant, UNIX_EPOCH},
+};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use walkdir::WalkDir;
+
+const MAX_PROVIDER_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_PROVIDER_RESULTS: usize = 2_000;
+const MAX_CODEX_INDEX_RECORDS: usize = 100_000;
+const MAX_CODEX_RECONCILE_NAMED: usize = 128;
+const MAX_CODEX_METADATA_LINE_BYTES: u64 = 64 * 1024;
+const MAX_CODEX_METADATA_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CODEX_LIFECYCLE_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_CODEX_LIFECYCLE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CODEX_LIFECYCLE_RECORDS: usize = 16;
+const MAX_CLAUDE_DISCOVERY_FILES: usize = 1_000;
+const MAX_CLAUDE_TRANSCRIPT_FILES: usize = 10_000;
+const MAX_CLAUDE_TRANSCRIPT_ENTRIES: usize = 20_000;
+const MAX_CLAUDE_SESSION_ENTRIES: usize = 10_000;
+const MAX_CLAUDE_PROJECT_ENTRIES: usize = 10_000;
+const MAX_CLAUDE_EXACT_PATH_CHECKS: usize = 100_000;
+const MAX_CLAUDE_METADATA_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CLAUDE_TITLE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CLAUDE_CHANGED_TITLES: usize = 16;
+const PROVIDER_SQLITE_DEADLINE: Duration = Duration::from_millis(400);
+const PROVIDER_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+
+pub struct Providers<'a> {
+    paths: &'a Paths,
+    config: &'a Config,
+}
+
+/// Provider-owned durable metadata state for one immutable conversation ID.
+///
+/// This deliberately avoids transcript contents and process discovery. It is
+/// safe to use as the final source-access gate immediately before a private
+/// consultation starts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderSourceState {
+    Present,
+    Archived,
+    Deleted,
+    Unknown,
+}
+
+impl<'a> Providers<'a> {
+    pub fn new(paths: &'a Paths, config: &'a Config) -> Self {
+        Self { paths, config }
+    }
+
+    pub fn browse(&self, provider: Provider) -> Vec<Candidate> {
+        self.records(provider, None, false)
+    }
+
+    /// Return only conversations whose provider metadata proves that a human
+    /// explicitly chose the displayed name. This is deliberately narrower
+    /// than [`Self::discover`]: Codex currently persists a title but not its
+    /// author, so a DB/index title can support exact lookup and the opt-in
+    /// recent browser without being advertised as a personal name during
+    /// setup. Existing Pika names remain authoritative in Pika's own store.
+    pub fn import_candidates(&self, provider: Provider) -> Vec<Candidate> {
+        match provider {
+            Provider::Claude => self.records(provider, None, true),
+            Provider::Codex | Provider::Opencode => Vec::new(),
+        }
+    }
+
+    pub fn discover(&self, provider: Provider) -> Vec<Candidate> {
+        // Discovery also serves reconciliation, where Codex fork lineage and
+        // native rename labels are useful even though their authorship is not
+        // proven. Setup must call `import_candidates` instead.
+        if provider == Provider::Opencode {
+            Vec::new()
+        } else {
+            self.records(provider, None, true)
+        }
+    }
+
+    pub fn find(&self, provider: Provider, query: &str) -> Vec<Candidate> {
+        match provider {
+            // Claude's generated title is orientation, not a stable name.
+            // Exact UUID lookup remains available even for an unnamed record.
+            Provider::Claude => {
+                claude_records(&self.paths.claude_home, Some(query), true, None, None)
+            }
+            _ => self.records(provider, Some(query), false),
+        }
+    }
+
+    fn records(&self, provider: Provider, query: Option<&str>, named_only: bool) -> Vec<Candidate> {
+        match provider {
+            Provider::Codex => codex_records(
+                &self.paths.codex_home,
+                self.config,
+                query,
+                named_only,
+                None,
+                false,
+                None,
+            ),
+            Provider::Claude => {
+                claude_records(&self.paths.claude_home, query, named_only, None, None)
+            }
+            Provider::Opencode => opencode_records(
+                &self.paths.opencode_data_home,
+                self.config,
+                query,
+                named_only,
+                None,
+            ),
+        }
+    }
+
+    /// Read watched UUID metadata in one provider pass. A refresh must not
+    /// reopen and rescan the same provider store once per board row.
+    pub fn tracked(&self, provider: Provider, identities: &BTreeSet<String>) -> Vec<Candidate> {
+        if identities.is_empty() {
+            return Vec::new();
+        }
+        match provider {
+            Provider::Codex => codex_records(
+                &self.paths.codex_home,
+                self.config,
+                None,
+                false,
+                Some(identities),
+                false,
+                None,
+            ),
+            Provider::Claude => {
+                claude_records(&self.paths.claude_home, None, true, Some(identities), None)
+            }
+            Provider::Opencode => {
+                let mut records = opencode_records(
+                    &self.paths.opencode_data_home,
+                    self.config,
+                    None,
+                    false,
+                    Some(identities),
+                );
+                for record in &mut records {
+                    if opencode_placeholder(record.name.as_deref()) {
+                        record.name = None;
+                    }
+                }
+                records
+            }
+        }
+    }
+
+    /// One reconciliation pass per provider. Codex includes a bounded recent
+    /// set of named rows so renamed forks can be imported without reopening
+    /// and rescanning its database and index a second time.
+    pub fn reconcile_records(
+        &self,
+        provider: Provider,
+        activity: &BTreeMap<String, f64>,
+    ) -> Vec<Candidate> {
+        let identities = activity.keys().cloned().collect::<BTreeSet<_>>();
+        match provider {
+            Provider::Codex => codex_records(
+                &self.paths.codex_home,
+                self.config,
+                None,
+                false,
+                Some(&identities),
+                true,
+                Some(activity),
+            ),
+            Provider::Claude => claude_records(
+                &self.paths.claude_home,
+                None,
+                true,
+                Some(&identities),
+                Some(activity),
+            ),
+            Provider::Opencode => self.tracked(provider, &identities),
+        }
+    }
+
+    pub fn source_state(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        transcript_path: Option<&str>,
+    ) -> ProviderSourceState {
+        match provider {
+            Provider::Codex => {
+                codex_source_state(&self.paths.codex_home, session_id, transcript_path)
+            }
+            Provider::Claude => {
+                if transcript_path.map(Path::new).is_some_and(Path::is_file) {
+                    ProviderSourceState::Present
+                } else {
+                    ProviderSourceState::Unknown
+                }
+            }
+            Provider::Opencode => opencode_source_state(&self.paths.opencode_data_home, session_id),
+        }
+    }
+
+    /// Resolve durable source state with at most one metadata connection per
+    /// provider. The returned key is Pika's stable conversation identity even
+    /// when a provider's active leaf differs.
+    pub fn source_states(
+        &self,
+        sessions: &[Session],
+    ) -> BTreeMap<(Provider, String), ProviderSourceState> {
+        let mut states = BTreeMap::new();
+        for provider in Provider::ALL {
+            let provider_sessions = sessions
+                .iter()
+                .filter(|session| session.provider == provider)
+                .collect::<Vec<_>>();
+            match provider {
+                Provider::Codex => codex_source_states(&self.paths.codex_home, &provider_sessions),
+                Provider::Claude => provider_sessions
+                    .iter()
+                    .map(|session| {
+                        let state = if session
+                            .transcript_path
+                            .as_deref()
+                            .map(Path::new)
+                            .is_some_and(Path::is_file)
+                        {
+                            ProviderSourceState::Present
+                        } else {
+                            ProviderSourceState::Unknown
+                        };
+                        ((provider, session.session_id.clone()), state)
+                    })
+                    .collect(),
+                Provider::Opencode => {
+                    opencode_source_states(&self.paths.opencode_data_home, &provider_sessions)
+                }
+            }
+            .into_iter()
+            .for_each(|(key, state)| {
+                states.insert(key, state);
+            });
+        }
+        states
+    }
+
+    pub fn new_argv(
+        &self,
+        provider: Provider,
+        name: &str,
+        session_id: Option<&str>,
+    ) -> Vec<String> {
+        let executable = self.config.executable(provider);
+        match provider {
+            Provider::Codex | Provider::Opencode => vec![executable],
+            Provider::Claude => {
+                let mut argv = vec![executable, "--name".into(), name.into()];
+                if let Some(identity) = session_id {
+                    argv.extend(["--session-id".into(), identity.into()]);
+                }
+                argv
+            }
+        }
+    }
+
+    pub fn resume_argv(&self, provider: Provider, session_id: &str) -> Vec<String> {
+        let executable = self.config.executable(provider);
+        match provider {
+            Provider::Codex => vec![executable, "resume".into(), session_id.into()],
+            Provider::Claude => vec![executable, "--resume".into(), session_id.into()],
+            Provider::Opencode => vec![executable, "--session".into(), session_id.into()],
+        }
+    }
+
+    pub fn valid_id(provider: Provider, value: &str) -> bool {
+        match provider {
+            Provider::Opencode => value.strip_prefix("ses_").is_some_and(|tail| {
+                (4..=124).contains(&tail.len())
+                    && tail
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric())
+            }),
+            _ => uuid::Uuid::parse_str(value)
+                .is_ok_and(|parsed| parsed.hyphenated().to_string() == value.to_ascii_lowercase()),
+        }
+    }
+
+    /// Set Codex's provider-native title through its documented app-server
+    /// protocol. Failure is non-destructive and callers retain a durable retry
+    /// marker; this never edits Codex's SQLite state directly.
+    pub fn set_codex_native_name(&self, session_id: &str, name: &str) -> bool {
+        self.set_codex_native_name_with_timeout(session_id, name, Duration::from_millis(3500))
+    }
+
+    fn set_codex_native_name_with_timeout(
+        &self,
+        session_id: &str,
+        name: &str,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        // Bound input before JSON escaping or copying it into the I/O worker.
+        if name.len() > 64 * 1024
+            || name.trim().is_empty()
+            || !Self::valid_id(Provider::Codex, session_id)
+        {
+            return false;
+        }
+        let executable = self.config.executable(Provider::Codex);
+        let mut command = Command::new(executable);
+        command
+            .args(["app-server", "--stdio"])
+            .env("CODEX_HOME", &self.paths.codex_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let child = match OwnedChild::spawn(&mut command) {
+            Ok(child) => child,
+            Err(_) => return false,
+        };
+        finish_codex_native_name(child, session_id, name, deadline)
+    }
+}
+
+fn finish_codex_native_name(
+    mut child: OwnedChild,
+    session_id: &str,
+    name: &str,
+    deadline: Instant,
+) -> bool {
+    let stop = CancellationToken::default();
+    let named = (|| {
+        // The absolute deadline includes process startup. Never begin a request
+        // if startup has already exhausted it, but still clean up the group.
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let input = CancellablePipe::new(child.stdin.take()?, stop.clone()).ok()?;
+        let output = CancellablePipe::new(child.stdout.take()?, stop.clone()).ok()?;
+        let session_id = session_id.to_owned();
+        let name = name.to_owned();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = codex_name_protocol(input, output, &session_id, &name);
+            let _ = sender.send(result.is_ok_and(|named| named));
+        });
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
+    })()
+    .unwrap_or(false);
+    stop.cancel();
+    // The unreaped leader pins its PGID until owned descendants are killed.
+    // Never signal the caller's group or wait for a foreign pipe holder.
+    let cleaned = terminate_child(&mut child).is_ok();
+    named && cleaned
+}
+
+fn codex_name_protocol(
+    mut input: impl Write,
+    output: impl Read,
+    session_id: &str,
+    name: &str,
+) -> Result<bool> {
+    const MAX_FRAME_BYTES: usize = 64 * 1024;
+    const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+    let write = |input: &mut dyn Write, value: &Value| -> Result<()> {
+        serde_json::to_writer(&mut *input, value)?;
+        input.write_all(b"\n")?;
+        input.flush()?;
+        Ok(())
+    };
+    write(
+        &mut input,
+        &serde_json::json!({
+            "method":"initialize", "id":1,
+            "params":{"clientInfo":{"name":"pikamux","version":crate::VERSION},
+                      "capabilities":{"experimentalApi":true}}
+        }),
+    )?;
+    let mut output = BufReader::new(output);
+    let mut total_bytes = 0;
+    let mut sent_name = false;
+    loop {
+        let mut line = Vec::new();
+        // Take wraps the buffered reader, so even an unterminated JSON frame
+        // cannot grow a read_until allocation beyond the explicit frame bound.
+        let read = output
+            .by_ref()
+            .take((MAX_FRAME_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)?;
+        total_bytes += read;
+        if read == 0 || line.len() > MAX_FRAME_BYTES || total_bytes > MAX_OUTPUT_BYTES {
+            return Ok(false);
+        }
+        let Ok(response) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if response.get("id").and_then(Value::as_i64) == Some(1) && !sent_name {
+            if response.get("error").is_some() || response.get("result").is_none() {
+                return Ok(false);
+            }
+            write(&mut input, &serde_json::json!({"method":"initialized"}))?;
+            write(
+                &mut input,
+                &serde_json::json!({
+                    "method":"thread/name/set", "id":2,
+                    "params":{"threadId":session_id,"name":name}
+                }),
+            )?;
+            sent_name = true;
+        } else if response.get("id").and_then(Value::as_i64) == Some(2) && sent_name {
+            return Ok(response.get("result").is_some() && response.get("error").is_none());
+        }
+    }
+}
+
+fn codex_records(
+    home: &Path,
+    config: &Config,
+    query: Option<&str>,
+    named_only: bool,
+    identities: Option<&BTreeSet<String>>,
+    include_named_with_identities: bool,
+    reconcile_activity: Option<&BTreeMap<String, f64>>,
+) -> Vec<Candidate> {
+    let index_records = codex_index_records(home);
+    let Some(database) = newest_matching(home, "state_", ".sqlite") else {
+        let mut records = filter_codex_index(
+            index_records,
+            query,
+            named_only,
+            if include_named_with_identities {
+                None
+            } else {
+                identities
+            },
+            &BTreeSet::new(),
+        );
+        if include_named_with_identities {
+            retain_reconciliation_index(&mut records, identities.expect("identities supplied"));
+        }
+        return records;
+    };
+    let Ok(db) = readonly(&database) else {
+        return Vec::new();
+    };
+    let Ok(columns) = columns(&db, "threads") else {
+        return Vec::new();
+    };
+    if !columns.contains("id") {
+        return Vec::new();
+    }
+    let archived = if columns.contains("archived") {
+        "COALESCE(archived,0)=0"
+    } else {
+        "1=1"
+    };
+    let fields = select_fields(
+        &columns,
+        &[
+            "id",
+            "name",
+            "cwd",
+            "git_branch",
+            "rollout_path",
+            "model",
+            "created_at",
+            "created_at_ms",
+            "updated_at",
+            "updated_at_ms",
+        ],
+    );
+    let mut conditions = vec![archived.to_owned()];
+    let index_matches = query
+        .map(|needle| {
+            index_records
+                .iter()
+                .filter(|candidate| {
+                    candidate.session_id == needle
+                        || candidate
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(needle))
+                })
+                .map(|candidate| candidate.session_id.clone())
+                .take(MAX_PROVIDER_RESULTS)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut parameters = query.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    if query.is_some() {
+        let indexed = if index_matches.is_empty() {
+            String::new()
+        } else {
+            parameters.push(serde_json::to_string(&index_matches).unwrap_or_else(|_| "[]".into()));
+            format!(
+                " OR id IN (SELECT value FROM json_each(?{}))",
+                parameters.len()
+            )
+        };
+        let native_name = if columns.contains("name") {
+            " OR lower(name)=lower(?1)"
+        } else {
+            ""
+        };
+        conditions.push(format!("(id=?1{native_name}{indexed})"));
+    }
+    let mut identity_marks = String::new();
+    if let Some(identities) = identities {
+        parameters.push(
+            serde_json::to_string(&identities.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|_| "[]".into()),
+        );
+        identity_marks = format!("SELECT value FROM json_each(?{})", parameters.len());
+        if include_named_with_identities && columns.contains("name") {
+            conditions.push(format!(
+                "(id IN ({identity_marks}) OR (name IS NOT NULL AND trim(name) != ''))"
+            ));
+        } else {
+            conditions.push(format!("id IN ({identity_marks})"));
+        }
+    }
+    let mut sql = format!(
+        "SELECT {fields} FROM threads WHERE {}",
+        conditions.join(" AND ")
+    );
+    if include_named_with_identities {
+        let updated = if columns.contains("updated_at_ms") {
+            "COALESCE(updated_at_ms,0)"
+        } else if columns.contains("updated_at") {
+            "COALESCE(updated_at,0)"
+        } else {
+            "0"
+        };
+        sql.push_str(&format!(
+            " ORDER BY CASE WHEN id IN ({identity_marks}) THEN 0 ELSE 1 END,{updated} DESC LIMIT {}",
+            identities.map_or(MAX_PROVIDER_RESULTS, |values| values
+                .len()
+                .saturating_add(MAX_CODEX_RECONCILE_NAMED))
+        ));
+    } else {
+        let updated = if columns.contains("updated_at_ms") {
+            "COALESCE(updated_at_ms,0)"
+        } else if columns.contains("updated_at") {
+            "COALESCE(updated_at,0)"
+        } else {
+            "0"
+        };
+        sql.push_str(&format!(
+            " ORDER BY {updated} DESC LIMIT {MAX_PROVIDER_RESULTS}"
+        ));
+    }
+    let Ok(mut statement) = db.prepare(&sql) else {
+        return Vec::new();
+    };
+    let mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Candidate> {
+        let session_id: String = row.get(0)?;
+        let transcript: Option<String> = row.get(4)?;
+        let created_ms = timestamp_sql(row.get_ref(7)?);
+        let created = timestamp_sql(row.get_ref(6)?);
+        let updated_ms = timestamp_sql(row.get_ref(9)?);
+        let updated = timestamp_sql(row.get_ref(8)?);
+        Ok(Candidate {
+            provider: Provider::Codex,
+            session_id,
+            name: row.get(1)?,
+            cwd: row.get(2)?,
+            branch: row.get(3)?,
+            transcript_path: transcript.clone(),
+            model: row.get(5)?,
+            created_at: if created_ms != 0.0 {
+                created_ms
+            } else {
+                created
+            },
+            updated_at: if updated_ms != 0.0 {
+                updated_ms
+            } else {
+                updated
+            },
+            live: false,
+            pid: None,
+            source: "codex-state".into(),
+            parent_session_id: None,
+            lifecycle_status: None,
+        })
+    };
+    let rows = statement.query_map(rusqlite::params_from_iter(parameters), mapper);
+    let Ok(rows) = rows else {
+        return Vec::new();
+    };
+    // The provider database can retain an arbitrarily large archive. Only
+    // index records that could enter this bounded result need an archive
+    // lookup; querying that exact set avoids collecting the whole archive.
+    let archived_ids = codex_archived_index_ids(&db, &columns, &index_records);
+    let tracked = identities.cloned().unwrap_or_default();
+    let broad_scan = query.is_none() && identities.is_none();
+    let mut metadata_budget = MAX_CODEX_METADATA_TOTAL_BYTES;
+    let mut worker_ids = BTreeSet::new();
+    let mut output = Vec::new();
+    for mut candidate in rows.flatten() {
+        let Some(path) = candidate.transcript_path.as_deref() else {
+            output.push(candidate);
+            continue;
+        };
+        match read_first_json_budgeted(path, &mut metadata_budget) {
+            Some(metadata) => {
+                candidate.parent_session_id = metadata
+                    .pointer("/payload/forked_from_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if codex_worker_metadata(&metadata, config) {
+                    worker_ids.insert(candidate.session_id);
+                } else {
+                    output.push(candidate);
+                }
+            }
+            // A broad inventory cannot safely advertise an unclassified
+            // transcript after its aggregate metadata budget is exhausted.
+            // Existing watched identities remain visible and fail closed.
+            None if query.is_none() && (broad_scan || !tracked.contains(&candidate.session_id)) => {
+            }
+            None => output.push(candidate),
+        }
+    }
+    let mut positions = output
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| (candidate.session_id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    // If archive evidence is unreadable, retain only database-backed active
+    // rows. An index-only label is not enough evidence to resurrect a thread.
+    let mut indexed_records = archived_ids
+        .as_ref()
+        .map(|archived_ids| {
+            filter_codex_index(
+                index_records,
+                query,
+                named_only,
+                if include_named_with_identities {
+                    None
+                } else {
+                    identities
+                },
+                archived_ids,
+            )
+        })
+        .unwrap_or_default();
+    if include_named_with_identities {
+        let identities = identities.expect("reconciliation identities supplied");
+        retain_reconciliation_index(&mut indexed_records, identities);
+    }
+    for indexed in indexed_records {
+        if let Some(position) = positions.get(&indexed.session_id).copied() {
+            output[position].name = indexed.name;
+            output[position].updated_at = output[position].updated_at.max(indexed.updated_at);
+        } else if !worker_ids.contains(&indexed.session_id) {
+            positions.insert(indexed.session_id.clone(), output.len());
+            output.push(indexed);
+        }
+    }
+    if named_only {
+        output.retain(|candidate| {
+            candidate
+                .name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+        });
+    }
+    output.sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at));
+    hydrate_codex_lifecycle(&mut output, reconcile_activity);
+    output
+}
+
+fn retain_reconciliation_index(records: &mut Vec<Candidate>, identities: &BTreeSet<String>) {
+    records.sort_by(|left, right| right.updated_at.total_cmp(&left.updated_at));
+    let mut named_extras = 0_usize;
+    records.retain(|candidate| {
+        if identities.contains(&candidate.session_id) {
+            return true;
+        }
+        let named = candidate
+            .name
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty());
+        if named && named_extras < MAX_CODEX_RECONCILE_NAMED {
+            named_extras += 1;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+fn codex_index_records(home: &Path) -> Vec<Candidate> {
+    let Ok(file) = File::open(home.join("session_index.jsonl")) else {
+        return Vec::new();
+    };
+    let mut records = BTreeMap::<String, Candidate>::new();
+    for line in BufReader::new(file.take(16 * 1024 * 1024))
+        .lines()
+        .map_while(Result::ok)
+        .take(MAX_CODEX_INDEX_RECORDS)
+    {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(identity) = value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(name) = value
+            .get("thread_name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let updated_at = timestamp(value.get("updated_at"));
+        records.insert(
+            identity.to_owned(),
+            Candidate {
+                provider: Provider::Codex,
+                session_id: identity.to_owned(),
+                name: Some(name.to_owned()),
+                cwd: None,
+                branch: None,
+                transcript_path: None,
+                model: None,
+                updated_at,
+                live: false,
+                pid: None,
+                source: "codex-index".into(),
+                parent_session_id: None,
+                created_at: 0.0,
+                lifecycle_status: None,
+            },
+        );
+    }
+    records.into_values().collect()
+}
+
+fn codex_archived_index_ids(
+    db: &Connection,
+    columns: &BTreeSet<String>,
+    index_records: &[Candidate],
+) -> Option<BTreeSet<String>> {
+    if !columns.contains("archived") || index_records.is_empty() {
+        return Some(BTreeSet::new());
+    }
+    let identities = index_records
+        .iter()
+        .map(|candidate| candidate.session_id.as_str())
+        .take(MAX_CODEX_INDEX_RECORDS)
+        .collect::<BTreeSet<_>>();
+    let mut archived = BTreeSet::new();
+    for chunk in identities.iter().copied().collect::<Vec<_>>().chunks(500) {
+        let marks = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id FROM threads WHERE COALESCE(archived,0) != 0 AND id IN ({marks}) LIMIT {}",
+            chunk.len()
+        );
+        let mut statement = db.prepare(&sql).ok()?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()?;
+        archived.extend(rows.collect::<rusqlite::Result<Vec<_>>>().ok()?);
+    }
+    Some(archived)
+}
+
+fn filter_codex_index(
+    records: Vec<Candidate>,
+    query: Option<&str>,
+    named_only: bool,
+    identities: Option<&BTreeSet<String>>,
+    archived_ids: &BTreeSet<String>,
+) -> Vec<Candidate> {
+    records
+        .into_iter()
+        .filter(|candidate| !archived_ids.contains(&candidate.session_id))
+        .filter(|candidate| {
+            !named_only
+                || candidate
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| !name.trim().is_empty())
+        })
+        .filter(|candidate| identities.is_none_or(|wanted| wanted.contains(&candidate.session_id)))
+        .filter(|candidate| {
+            query.is_none_or(|needle| {
+                candidate.session_id == needle
+                    || candidate
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(needle))
+            })
+        })
+        .collect()
+}
+
+fn codex_worker_metadata(value: &Value, config: &Config) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return false;
+    }
+    let payload = value.get("payload").and_then(Value::as_object);
+    let source = payload.and_then(|item| item.get("source"));
+    if source.and_then(Value::as_str) == Some("exec") {
+        return true;
+    }
+    if payload
+        .and_then(|item| item.get("thread_source"))
+        .and_then(Value::as_str)
+        == Some("subagent")
+        || source
+            .and_then(Value::as_object)
+            .is_some_and(|item| item.contains_key("subagent"))
+    {
+        return true;
+    }
+    payload
+        .and_then(|item| item.get("originator"))
+        .and_then(Value::as_str)
+        .is_some_and(|origin| {
+            origin.eq_ignore_ascii_case("codex_exec")
+                || config
+                    .codex_worker_originators
+                    .iter()
+                    .any(|item| item.eq_ignore_ascii_case(origin))
+        })
+}
+
+fn hydrate_codex_lifecycle(
+    records: &mut [Candidate],
+    reconcile_activity: Option<&BTreeMap<String, f64>>,
+) {
+    let identities = reconcile_activity
+        .map(|activity| activity.keys().map(String::as_str).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let mut due = records
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.transcript_path.is_some()
+                && reconcile_activity.is_none_or(|activity| {
+                    candidate.updated_at
+                        > activity.get(&candidate.session_id).copied().unwrap_or(0.0)
+                })
+        })
+        .map(|(index, candidate)| {
+            let tracked = identities.contains(candidate.session_id.as_str());
+            let related = candidate
+                .parent_session_id
+                .as_deref()
+                .is_some_and(|parent| identities.contains(parent));
+            (index, tracked, related, candidate.updated_at)
+        })
+        .collect::<Vec<_>>();
+    due.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| right.3.total_cmp(&left.3))
+    });
+    let selected = due
+        .iter()
+        .take(MAX_CODEX_LIFECYCLE_RECORDS)
+        .map(|(index, _, _, _)| *index)
+        .collect::<BTreeSet<_>>();
+    let mut byte_budget = MAX_CODEX_LIFECYCLE_TOTAL_BYTES;
+    for (index, candidate) in records.iter_mut().enumerate() {
+        if selected.contains(&index) {
+            if let Some(path) = candidate.transcript_path.as_deref() {
+                candidate.lifecycle_status = codex_lifecycle(path, &mut byte_budget);
+            }
+        } else if let Some(activity) = reconcile_activity
+            && let Some(previous) = activity.get(&candidate.session_id)
+            && candidate.updated_at > *previous
+        {
+            // Do not advance the reconciliation cursor for a changed watched
+            // row whose transcript did not fit this cycle's fixed budget.
+            candidate.updated_at = *previous;
+        } else if reconcile_activity.is_some()
+            && candidate
+                .parent_session_id
+                .as_deref()
+                .is_some_and(|parent| identities.contains(parent))
+        {
+            // A newly discovered related fork becomes watched with a zero
+            // cursor, so the next cycle prioritizes its lifecycle evidence.
+            candidate.updated_at = 0.0;
+        }
+    }
+}
+
+fn codex_lifecycle(path: &str, byte_budget: &mut u64) -> Option<Status> {
+    reverse_lines_bounded(
+        Path::new(path),
+        MAX_CODEX_LIFECYCLE_FILE_BYTES.min(*byte_budget),
+        byte_budget,
+    )
+    .into_iter()
+    .find_map(|line| {
+        if !line.contains("\"event_msg\"") {
+            return None;
+        }
+        let value: Value = serde_json::from_str(&line).ok()?;
+        match value.pointer("/payload/type").and_then(Value::as_str) {
+            Some("task_started") => Some(Status::Working),
+            Some("task_complete") => Some(Status::Ready),
+            _ => None,
+        }
+    })
+}
+
+fn claude_records(
+    home: &Path,
+    query: Option<&str>,
+    explicit_only: bool,
+    identities: Option<&BTreeSet<String>>,
+    reconcile_activity: Option<&BTreeMap<String, f64>>,
+) -> Vec<Candidate> {
+    let exact_identities = claude_exact_identities(query, identities);
+    // Inventory once: the live registry and historical lookup share these
+    // exact paths instead of walking the entire projects tree for every row.
+    // General discovery is capped independently from exact UUIDs, so the
+    // 10,001st transcript cannot make a requested or watched identity vanish.
+    let mut transcripts = claude_transcript_paths(home, &exact_identities, query);
+    let transcript_paths = transcripts
+        .iter()
+        .filter_map(|path| Some((path.file_stem()?.to_str()?.to_owned(), path.clone())))
+        .collect::<BTreeMap<_, _>>();
+    let mut records: BTreeMap<String, Candidate> = BTreeMap::new();
+    let mut session_paths = claude_session_paths(home, &exact_identities, identities.is_some());
+    session_paths.sort_by_key(|path| {
+        let identity = path.file_stem().and_then(OsStr::to_str).unwrap_or("");
+        (
+            std::cmp::Reverse(
+                identities.is_some_and(|wanted| wanted.contains(identity))
+                    || query.is_some_and(|needle| needle == identity),
+            ),
+            std::cmp::Reverse(modified(path).to_bits()),
+        )
+    });
+    if identities.is_none() {
+        session_paths.truncate(MAX_CLAUDE_DISCOVERY_FILES);
+    } else {
+        session_paths.retain(|path| {
+            path.file_stem()
+                .and_then(OsStr::to_str)
+                .is_some_and(|identity| identities.is_some_and(|wanted| wanted.contains(identity)))
+        });
+    }
+    let mut metadata_budget = MAX_CLAUDE_METADATA_TOTAL_BYTES;
+    let mut worker_budget = MAX_CLAUDE_METADATA_TOTAL_BYTES;
+    let mut worker_states = BTreeMap::<String, Option<bool>>::new();
+    for path in session_paths {
+        let Some(value) = read_bounded_json_budgeted(&path, &mut metadata_budget) else {
+            continue;
+        };
+        if value.get("kind").and_then(Value::as_str) != Some("interactive") {
+            continue;
+        }
+        let Some(identity) = value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if identities.is_some_and(|wanted| !wanted.contains(identity)) {
+            continue;
+        }
+        let visible_name = value.get("name").and_then(Value::as_str);
+        let transcript = transcript_paths.get(identity).cloned();
+        let exact_identity =
+            query == Some(identity) || identities.is_some_and(|wanted| wanted.contains(identity));
+        let worker = transcript.as_ref().map_or(Some(false), |path| {
+            claude_worker_bounded(path, identity, &mut worker_budget)
+        });
+        worker_states.insert(identity.to_owned(), worker);
+        if worker == Some(true) || (worker.is_none() && !exact_identity) {
+            continue;
+        }
+        let name = if value.get("nameSource").and_then(Value::as_str) == Some("derived") {
+            None
+        } else {
+            visible_name.map(str::to_owned)
+        };
+        records.insert(
+            identity.into(),
+            Candidate {
+                provider: Provider::Claude,
+                session_id: identity.into(),
+                name,
+                cwd: value.get("cwd").and_then(Value::as_str).map(str::to_owned),
+                branch: None,
+                transcript_path: transcript.map(|path| path.to_string_lossy().into_owned()),
+                model: value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                updated_at: timestamp(value.get("updatedAt").or_else(|| value.get("startedAt"))),
+                created_at: timestamp(value.get("startedAt")),
+                live: false,
+                pid: None,
+                source: if value.get("nameSource").and_then(Value::as_str) == Some("custom") {
+                    "claude-live-custom".into()
+                } else {
+                    "claude-live".into()
+                },
+                parent_session_id: None,
+                lifecycle_status: None,
+            },
+        );
+    }
+
+    transcripts.sort_by_key(|path| std::cmp::Reverse(modified(path).to_bits()));
+    let mut title_budget = MAX_CLAUDE_TITLE_TOTAL_BYTES;
+    let mut changed_titles = 0_usize;
+    for (index, path) in transcripts.into_iter().enumerate() {
+        let Some(identity) = path.file_stem().and_then(OsStr::to_str).map(str::to_owned) else {
+            continue;
+        };
+        if identities.is_some_and(|wanted| !wanted.contains(&identity)) {
+            continue;
+        }
+        let exact_identity = query == Some(identity.as_str())
+            || identities.is_some_and(|wanted| wanted.contains(&identity));
+        // A browsing budget must never make an explicitly requested or
+        // already watched immutable identity disappear.
+        if index >= 1000 && !exact_identity {
+            continue;
+        }
+        let source_updated_at = modified(&path);
+        let previous_activity = reconcile_activity
+            .and_then(|activity| activity.get(&identity))
+            .copied()
+            .unwrap_or(0.0);
+        let changed = reconcile_activity.is_none() || source_updated_at > previous_activity;
+        let scan_title =
+            reconcile_activity.is_none() || (changed && changed_titles < MAX_CLAUDE_CHANGED_TITLES);
+        let title = if scan_title {
+            changed_titles += usize::from(reconcile_activity.is_some());
+            transcript_title(&path, explicit_only, &mut title_budget)
+        } else {
+            None
+        };
+        if query.is_some_and(|needle| {
+            identity != needle
+                && !title
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(needle))
+        }) {
+            continue;
+        }
+        let worker = worker_states
+            .entry(identity.clone())
+            .or_insert_with(|| claude_worker_bounded(&path, &identity, &mut worker_budget));
+        if *worker == Some(true)
+            || (worker.is_none() && !exact_identity)
+            || (explicit_only && title.is_none() && !exact_identity)
+        {
+            continue;
+        }
+        let effective_updated_at = if reconcile_activity.is_some() && changed && !scan_title {
+            previous_activity
+        } else {
+            source_updated_at
+        };
+        records
+            .entry(identity.clone())
+            .and_modify(|existing| {
+                if title.is_some() {
+                    existing.name = title.clone();
+                }
+                existing.transcript_path = Some(path.to_string_lossy().into_owned());
+                existing.updated_at = existing.updated_at.max(effective_updated_at);
+                existing.source = if explicit_only {
+                    "claude-live+explicit-history".into()
+                } else {
+                    "claude-live+history".into()
+                };
+            })
+            .or_insert(Candidate {
+                provider: Provider::Claude,
+                session_id: identity,
+                name: title,
+                cwd: None,
+                branch: None,
+                transcript_path: Some(path.to_string_lossy().into_owned()),
+                model: None,
+                updated_at: effective_updated_at,
+                live: false,
+                pid: None,
+                source: "claude-history".into(),
+                parent_session_id: None,
+                created_at: 0.0,
+                lifecycle_status: None,
+            });
+    }
+    let mut output: Vec<_> = records.into_values().collect();
+    if explicit_only {
+        output.retain(|candidate| {
+            let exact_identity = query == Some(candidate.session_id.as_str())
+                || identities.is_some_and(|wanted| wanted.contains(&candidate.session_id));
+            let explicit_name = candidate
+                .name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+                && matches!(
+                    candidate.source.as_str(),
+                    "claude-live-custom" | "claude-live+explicit-history" | "claude-history"
+                );
+            exact_identity || explicit_name
+        });
+    }
+    if let Some(needle) = query {
+        output.retain(|candidate| {
+            candidate.session_id == needle
+                || candidate
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(needle))
+        });
+    }
+    output.sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at));
+    output
+}
+
+fn claude_exact_identities(
+    query: Option<&str>,
+    identities: Option<&BTreeSet<String>>,
+) -> BTreeSet<String> {
+    query
+        .into_iter()
+        .chain(identities.into_iter().flatten().map(String::as_str))
+        .filter(|identity| Providers::valid_id(Provider::Claude, identity))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn claude_transcript_paths(
+    home: &Path,
+    exact_identities: &BTreeSet<String>,
+    requested: Option<&str>,
+) -> Vec<PathBuf> {
+    let projects = home.join("projects");
+    let mut selected = BTreeMap::<String, PathBuf>::new();
+    let mut general = 0_usize;
+    // Count every traversed entry before filtering. A tree full of directories,
+    // errors, or unrelated files must not bypass the work bound.
+    for entry in WalkDir::new(&projects)
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+        .take(MAX_CLAUDE_TRANSCRIPT_ENTRIES)
+        .flatten()
+    {
+        if !entry.file_type().is_file() || entry.path().extension() != Some(OsStr::new("jsonl")) {
+            continue;
+        }
+        let Some(identity) = entry.path().file_stem().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let exact = exact_identities.contains(identity);
+        if !exact && general >= MAX_CLAUDE_TRANSCRIPT_FILES {
+            continue;
+        }
+        let is_new = !selected.contains_key(identity);
+        let replace = selected
+            .get(identity)
+            .is_none_or(|existing| modified(entry.path()) > modified(existing));
+        if replace {
+            selected.insert(identity.to_owned(), entry.into_path());
+        }
+        if !exact && is_new {
+            general += 1;
+        }
+    }
+
+    // The browsing traversal is intentionally finite. Recover exact UUIDs by
+    // probing their deterministic basename beneath a bounded project set. The
+    // explicitly requested UUID is checked first, followed by watched IDs.
+    let mut ordered_exact = requested
+        .filter(|identity| exact_identities.contains(*identity))
+        .map(str::to_owned)
+        .into_iter()
+        .collect::<Vec<_>>();
+    ordered_exact.extend(
+        exact_identities
+            .iter()
+            .filter(|identity| Some(identity.as_str()) != requested)
+            .cloned(),
+    );
+    let project_paths = fs::read_dir(&projects)
+        .into_iter()
+        .flatten()
+        .take(MAX_CLAUDE_PROJECT_ENTRIES)
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_type().ok()?.is_dir().then(|| entry.path()))
+        .collect::<Vec<_>>();
+    let mut checks = 0_usize;
+    'identities: for identity in ordered_exact {
+        if selected.contains_key(&identity) {
+            continue;
+        }
+        for project in &project_paths {
+            if checks >= MAX_CLAUDE_EXACT_PATH_CHECKS {
+                break 'identities;
+            }
+            checks += 1;
+            let candidate = project.join(format!("{identity}.jsonl"));
+            if candidate.is_file() {
+                selected.insert(identity, candidate);
+                break;
+            }
+        }
+    }
+    selected.into_values().collect()
+}
+
+fn claude_session_paths(
+    home: &Path,
+    exact_identities: &BTreeSet<String>,
+    exact_only: bool,
+) -> Vec<PathBuf> {
+    let sessions = home.join("sessions");
+    let mut selected = exact_identities
+        .iter()
+        .filter_map(|identity| {
+            let path = sessions.join(format!("{identity}.json"));
+            path.is_file().then_some((identity.clone(), path))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if exact_only {
+        return selected.into_values().collect();
+    }
+    for entry in fs::read_dir(&sessions)
+        .into_iter()
+        .flatten()
+        .take(MAX_CLAUDE_SESSION_ENTRIES)
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_file())
+            || path.extension() != Some(OsStr::new("json"))
+        {
+            continue;
+        }
+        let Some(identity) = path.file_stem().and_then(OsStr::to_str) else {
+            continue;
+        };
+        selected.entry(identity.to_owned()).or_insert(path);
+    }
+    selected.into_values().collect()
+}
+
+fn transcript_title(path: &Path, explicit_only: bool, byte_budget: &mut u64) -> Option<String> {
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
+    const MAX_LINES: usize = 16_384;
+    const MAX_LINE_BYTES: usize = 64 * 1024;
+    let deadline = Instant::now() + Duration::from_millis(100);
+    if *byte_budget == 0 {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let limit = MAX_BYTES.min(*byte_budget);
+    // Provider title events are append-only; inspect a bounded recent window.
+    // An unavailable title is not authority to rename an existing Pika row.
+    let offset = file.metadata().ok()?.len().saturating_sub(limit);
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes).ok()?;
+    *byte_budget = byte_budget.saturating_sub(bytes.len() as u64);
+    // Skip the first incomplete record when the window starts mid-file.
+    let start = if offset > 0 {
+        bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |index| index + 1)
+    } else {
+        0
+    };
+    let lines = bytes[start..].split(|byte| *byte == b'\n');
+    let mut explicit = None;
+    let mut generated = None;
+    for line in lines.rev().take(MAX_LINES) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if line.len() > MAX_LINE_BYTES {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("custom-title" | "session-title") => {
+                explicit = ["customTitle", "title", "sessionTitle", "name"]
+                    .iter()
+                    .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_owned));
+                if explicit.is_some() {
+                    break;
+                }
+            }
+            Some("ai-title") if !explicit_only && generated.is_none() => {
+                generated = value
+                    .get("aiTitle")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            _ if value.get("sessionTitle").and_then(Value::as_str).is_some() => {
+                explicit = value
+                    .get("sessionTitle")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                break;
+            }
+            _ => {}
+        }
+    }
+    explicit.or(generated)
+}
+
+fn claude_worker_bounded(path: &Path, identity: &str, byte_budget: &mut u64) -> Option<bool> {
+    if *byte_budget == 0 {
+        return None;
+    }
+    let Ok(file) = File::open(path) else {
+        return None;
+    };
+    let source_size = file.metadata().ok()?.len();
+    let mut bytes = Vec::new();
+    let limit = MAX_PROVIDER_METADATA_BYTES.min(*byte_budget);
+    if file.take(limit).read_to_end(&mut bytes).is_err() {
+        return None;
+    }
+    *byte_budget = byte_budget.saturating_sub(bytes.len() as u64);
+    let entrypoint = bytes
+        .split(|byte| *byte == b'\n')
+        .take(128)
+        .filter(|line| line.len() <= 64 * 1024)
+        .find_map(|line| {
+            let value = serde_json::from_slice::<Value>(line).ok()?;
+            if value.get("sessionId").and_then(Value::as_str) != Some(identity)
+                || value.get("isSidechain").and_then(Value::as_bool) != Some(false)
+            {
+                return None;
+            }
+            value
+                .get("entrypoint")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    match entrypoint {
+        Some(value) => Some(value == "sdk-cli"),
+        None if source_size > bytes.len() as u64 => None,
+        None => Some(false),
+    }
+}
+
+fn opencode_records(
+    home: &Path,
+    config: &Config,
+    query: Option<&str>,
+    named_only: bool,
+    identities: Option<&BTreeSet<String>>,
+) -> Vec<Candidate> {
+    let database = home.join("opencode.db");
+    let Ok(db) = readonly(&database) else {
+        return Vec::new();
+    };
+    let Ok(columns) = columns(&db, "session") else {
+        return Vec::new();
+    };
+    if !["id", "title", "directory", "parent_id"]
+        .iter()
+        .all(|item| columns.contains(*item))
+    {
+        return Vec::new();
+    }
+    let fields = select_fields(
+        &columns,
+        &[
+            "id",
+            "title",
+            "directory",
+            "parent_id",
+            "time_created",
+            "time_updated",
+            "model",
+        ],
+    );
+    let mut conditions = vec!["parent_id IS NULL".to_owned()];
+    if columns.contains("time_archived") {
+        conditions.push("time_archived IS NULL".into());
+    }
+    if named_only {
+        conditions.push("title IS NOT NULL AND trim(title) != ''".into());
+    }
+    if query.is_some() {
+        conditions.push("(id=?1 OR lower(title)=lower(?1))".into());
+    }
+    let mut parameters = query.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    if let Some(identities) = identities {
+        parameters.push(
+            serde_json::to_string(&identities.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|_| "[]".into()),
+        );
+        conditions.push(format!(
+            "id IN (SELECT value FROM json_each(?{}))",
+            parameters.len()
+        ));
+    }
+    let sql = format!(
+        "SELECT {fields} FROM session WHERE {} ORDER BY COALESCE(time_updated,0) DESC LIMIT {MAX_PROVIDER_RESULTS}",
+        conditions.join(" AND ")
+    );
+    let Ok(mut statement) = db.prepare(&sql) else {
+        return Vec::new();
+    };
+    let mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Candidate> {
+        let model: Option<String> = row.get(6)?;
+        let session_id: String = row.get(0)?;
+        Ok(Candidate {
+            provider: Provider::Opencode,
+            session_id: session_id.clone(),
+            name: row.get(1)?,
+            cwd: row.get(2)?,
+            branch: None,
+            transcript_path: Some(database.to_string_lossy().into_owned()),
+            model: model.and_then(|value| opencode_model(&value)),
+            updated_at: timestamp_sql(row.get_ref(5).unwrap_or(ValueRef::Null)),
+            created_at: timestamp_sql(row.get_ref(4)?),
+            live: false,
+            pid: None,
+            source: "opencode-state".into(),
+            parent_session_id: None,
+            lifecycle_status: None,
+        })
+    };
+    let rows = statement.query_map(rusqlite::params_from_iter(parameters), mapper);
+    let Ok(rows) = rows else {
+        return Vec::new();
+    };
+    let mut output: Vec<_> = rows
+        .flatten()
+        .filter(|item| !named_only || !opencode_placeholder(item.name.as_deref()))
+        .filter(|item| !opencode_automation(item, config))
+        .collect();
+    let roots = output
+        .iter()
+        .map(|candidate| candidate.session_id.clone())
+        .collect::<Vec<_>>();
+    let has_archived = columns.contains("time_archived");
+    let updated = opencode_tree_updated_batch(&db, &roots, has_archived);
+    let lifecycle = opencode_lifecycle_batch(&db, &roots, has_archived);
+    for candidate in &mut output {
+        if let Some(value) = updated.get(&candidate.session_id) {
+            candidate.updated_at = candidate.updated_at.max(*value);
+        }
+        candidate.lifecycle_status = lifecycle.get(&candidate.session_id).copied().flatten();
+    }
+    output.sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at));
+    output
+}
+
+fn opencode_tree_updated_batch(
+    db: &Connection,
+    roots: &[String],
+    has_archived: bool,
+) -> BTreeMap<String, f64> {
+    if roots.is_empty() {
+        return BTreeMap::new();
+    }
+    let archive_clause = if has_archived {
+        " AND time_archived IS NULL"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "WITH RECURSIVE tree(root_id,id) AS (\
+         SELECT id,id FROM session WHERE id IN (SELECT value FROM json_each(?1)){archive_clause} \
+         UNION \
+         SELECT tree.root_id,child.id FROM session AS child JOIN tree ON child.parent_id=tree.id \
+         WHERE 1=1{archive_clause}\
+         ) SELECT tree.root_id,MAX(session.time_updated) \
+         FROM tree JOIN session ON session.id=tree.id GROUP BY tree.root_id"
+    );
+    let encoded = serde_json::to_string(roots).unwrap_or_else(|_| "[]".into());
+    let Ok(mut statement) = db.prepare(&sql) else {
+        return BTreeMap::new();
+    };
+    statement
+        .query_map([encoded], |row| {
+            Ok((row.get::<_, String>(0)?, timestamp_sql(row.get_ref(1)?)))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+fn opencode_lifecycle_batch(
+    db: &Connection,
+    roots: &[String],
+    has_archived: bool,
+) -> BTreeMap<String, Option<Status>> {
+    if roots.is_empty() {
+        return BTreeMap::new();
+    }
+    if !columns(db, "message").ok().is_some_and(|value| {
+        ["id", "session_id", "time_created", "data"]
+            .iter()
+            .all(|column| value.contains(*column))
+    }) {
+        return BTreeMap::new();
+    }
+    let archive_clause = if has_archived {
+        " AND time_archived IS NULL"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "WITH RECURSIVE tree(root_id,id) AS (\
+         SELECT id,id FROM session WHERE id IN (SELECT value FROM json_each(?1)){archive_clause} \
+         UNION \
+         SELECT tree.root_id,child.id FROM session AS child JOIN tree ON child.parent_id=tree.id \
+         WHERE 1=1{archive_clause}\
+         ), latest AS (\
+         SELECT tree.root_id,message.session_id,message.data,\
+         ROW_NUMBER() OVER (PARTITION BY tree.root_id,message.session_id ORDER BY message.time_created DESC,message.id DESC) AS position \
+         FROM tree JOIN message ON message.session_id=tree.id\
+         ), scored AS (\
+         SELECT root_id,CASE \
+           WHEN length(data)>?2 OR NOT json_valid(data) THEN 0 \
+           WHEN json_extract(data,'$.role')='user' THEN 2 \
+           WHEN json_extract(data,'$.role')='assistant' AND (\
+             json_type(data,'$.time.completed') IS NULL OR \
+             json_type(data,'$.time.completed')='null' OR \
+             json_extract(data,'$.time.completed')=0\
+           ) THEN 2 \
+           WHEN json_extract(data,'$.role')='assistant' THEN 1 \
+           ELSE 0 END AS lifecycle \
+         FROM latest WHERE position=1\
+         ) SELECT root_id,MAX(lifecycle) FROM scored GROUP BY root_id"
+    );
+    let encoded = serde_json::to_string(roots).unwrap_or_else(|_| "[]".into());
+    let Ok(mut statement) = db.prepare(&sql) else {
+        return BTreeMap::new();
+    };
+    let Ok(rows) = statement.query_map(
+        rusqlite::params![encoded, MAX_PROVIDER_METADATA_BYTES as i64],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    ) else {
+        return BTreeMap::new();
+    };
+    let mut output = BTreeMap::new();
+    for (root, lifecycle) in rows.flatten() {
+        output.insert(
+            root,
+            match lifecycle {
+                2 => Some(Status::Working),
+                1 => Some(Status::Ready),
+                _ => None,
+            },
+        );
+    }
+    output
+}
+
+fn opencode_placeholder(value: Option<&str>) -> bool {
+    value.is_some_and(|title| {
+        title.starts_with("New session - ") || (title.contains(" (fork #") && title.ends_with(')'))
+    })
+}
+
+fn opencode_automation(item: &Candidate, config: &Config) -> bool {
+    item.cwd.as_deref().is_some_and(|cwd| {
+        Path::new(cwd)
+            .components()
+            .any(|part| part.as_os_str() == "opencode-runtime")
+    }) && item.name.as_deref().is_some_and(|name| {
+        config
+            .opencode_worker_title_prefixes
+            .iter()
+            .any(|prefix| name.to_lowercase().starts_with(&prefix.to_lowercase()))
+    })
+}
+
+fn opencode_model(raw: &str) -> Option<String> {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return Some(raw.into());
+    };
+    let model = value
+        .get("id")
+        .or_else(|| value.get("modelID"))
+        .and_then(Value::as_str)?;
+    let provider = value
+        .get("providerID")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let variant = value
+        .get("variant")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let label = provider.map_or_else(
+        || model.to_owned(),
+        |provider| format!("{provider}/{model}"),
+    );
+    Some(variant.map_or(label.clone(), |variant| format!("{label}[{variant}]")))
+}
+
+fn codex_source_state(
+    home: &Path,
+    session_id: &str,
+    transcript_path: Option<&str>,
+) -> ProviderSourceState {
+    let transcript_exists = transcript_path.map(Path::new).is_some_and(Path::is_file);
+    let Some(database) = newest_matching(home, "state_", ".sqlite") else {
+        return if transcript_exists {
+            ProviderSourceState::Present
+        } else {
+            ProviderSourceState::Unknown
+        };
+    };
+    let Ok(db) = readonly(&database) else {
+        return ProviderSourceState::Unknown;
+    };
+    let Ok(columns) = columns(&db, "threads") else {
+        return ProviderSourceState::Unknown;
+    };
+    if !columns.contains("id") {
+        return ProviderSourceState::Unknown;
+    }
+    let archived = if columns.contains("archived") {
+        db.query_row(
+            "SELECT COALESCE(archived,0) FROM threads WHERE id=?1 LIMIT 1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+    } else {
+        db.query_row(
+            "SELECT 0 FROM threads WHERE id=?1 LIMIT 1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+    };
+    match archived {
+        Some(value) if value != 0 => ProviderSourceState::Archived,
+        Some(_) if transcript_exists => ProviderSourceState::Present,
+        Some(_) => ProviderSourceState::Unknown,
+        // Older Codex stores and migrated conversations can retain a valid
+        // rollout without a row in the newest state DB.
+        None if transcript_exists => ProviderSourceState::Present,
+        None => ProviderSourceState::Deleted,
+    }
+}
+
+fn codex_source_states(
+    home: &Path,
+    sessions: &[&Session],
+) -> BTreeMap<(Provider, String), ProviderSourceState> {
+    let mut indexed = BTreeMap::new();
+    let Some(database) = newest_matching(home, "state_", ".sqlite") else {
+        for session in sessions {
+            let present = session
+                .transcript_path
+                .as_deref()
+                .map(Path::new)
+                .is_some_and(Path::is_file);
+            indexed.insert(
+                (Provider::Codex, session.session_id.clone()),
+                if present {
+                    ProviderSourceState::Present
+                } else {
+                    ProviderSourceState::Unknown
+                },
+            );
+        }
+        return indexed;
+    };
+    let Ok(db) = readonly(&database) else {
+        return sessions
+            .iter()
+            .map(|session| {
+                (
+                    (Provider::Codex, session.session_id.clone()),
+                    ProviderSourceState::Unknown,
+                )
+            })
+            .collect();
+    };
+    let Ok(columns) = columns(&db, "threads") else {
+        return sessions
+            .iter()
+            .map(|session| {
+                (
+                    (Provider::Codex, session.session_id.clone()),
+                    ProviderSourceState::Unknown,
+                )
+            })
+            .collect();
+    };
+    if !columns.contains("id") {
+        return sessions
+            .iter()
+            .map(|session| {
+                (
+                    (Provider::Codex, session.session_id.clone()),
+                    ProviderSourceState::Unknown,
+                )
+            })
+            .collect();
+    }
+    let identities = sessions
+        .iter()
+        .map(|session| session.provider_thread_id().to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut rows = BTreeMap::<String, bool>::new();
+    for chunk in identities.iter().collect::<Vec<_>>().chunks(500) {
+        let marks = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let archived = if columns.contains("archived") {
+            "COALESCE(archived,0) != 0"
+        } else {
+            "0"
+        };
+        let sql = format!("SELECT id,{archived} FROM threads WHERE id IN ({marks})");
+        let parameters = chunk.iter().map(|identity| identity.as_str());
+        if let Ok(mut statement) = db.prepare(&sql)
+            && let Ok(found) = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+        {
+            rows.extend(found.flatten());
+        }
+    }
+    for session in sessions {
+        let transcript_exists = session
+            .transcript_path
+            .as_deref()
+            .map(Path::new)
+            .is_some_and(Path::is_file);
+        let state = match rows.get(session.provider_thread_id()) {
+            Some(true) => ProviderSourceState::Archived,
+            Some(false) if transcript_exists => ProviderSourceState::Present,
+            Some(false) => ProviderSourceState::Unknown,
+            None if transcript_exists => ProviderSourceState::Present,
+            None => ProviderSourceState::Deleted,
+        };
+        indexed.insert((Provider::Codex, session.session_id.clone()), state);
+    }
+    indexed
+}
+
+fn opencode_source_state(home: &Path, session_id: &str) -> ProviderSourceState {
+    let database = home.join("opencode.db");
+    let Ok(db) = readonly(&database) else {
+        return ProviderSourceState::Unknown;
+    };
+    let Ok(columns) = columns(&db, "session") else {
+        return ProviderSourceState::Unknown;
+    };
+    if !columns.contains("id") {
+        return ProviderSourceState::Unknown;
+    }
+    let archived = if columns.contains("time_archived") {
+        db.query_row(
+            "SELECT time_archived IS NOT NULL FROM session WHERE id=?1 LIMIT 1",
+            [session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .ok()
+    } else {
+        db.query_row(
+            "SELECT 0 FROM session WHERE id=?1 LIMIT 1",
+            [session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .ok()
+    };
+    match archived {
+        Some(true) => ProviderSourceState::Archived,
+        Some(false) => ProviderSourceState::Present,
+        None => ProviderSourceState::Deleted,
+    }
+}
+
+fn opencode_source_states(
+    home: &Path,
+    sessions: &[&Session],
+) -> BTreeMap<(Provider, String), ProviderSourceState> {
+    let unknown = || {
+        sessions
+            .iter()
+            .map(|session| {
+                (
+                    (Provider::Opencode, session.session_id.clone()),
+                    ProviderSourceState::Unknown,
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let database = home.join("opencode.db");
+    let Ok(db) = readonly(&database) else {
+        return unknown();
+    };
+    let Ok(columns) = columns(&db, "session") else {
+        return unknown();
+    };
+    if !columns.contains("id") {
+        return unknown();
+    }
+    let identities = sessions
+        .iter()
+        .map(|session| session.provider_thread_id().to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut rows = BTreeMap::<String, bool>::new();
+    for chunk in identities.iter().collect::<Vec<_>>().chunks(500) {
+        let marks = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let archived = if columns.contains("time_archived") {
+            "time_archived IS NOT NULL"
+        } else {
+            "0"
+        };
+        let sql = format!("SELECT id,{archived} FROM session WHERE id IN ({marks})");
+        let parameters = chunk.iter().map(|identity| identity.as_str());
+        if let Ok(mut statement) = db.prepare(&sql)
+            && let Ok(found) = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+        {
+            rows.extend(found.flatten());
+        }
+    }
+    sessions
+        .iter()
+        .map(|session| {
+            let state = match rows.get(session.provider_thread_id()) {
+                Some(true) => ProviderSourceState::Archived,
+                Some(false) => ProviderSourceState::Present,
+                None => ProviderSourceState::Deleted,
+            };
+            ((Provider::Opencode, session.session_id.clone()), state)
+        })
+        .collect()
+}
+
+fn readonly(path: &Path) -> Result<Connection> {
+    let uri = format!("file:{}?mode=ro", path.to_string_lossy());
+    let db = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("cannot open {}", path.display()))?;
+    db.busy_timeout(PROVIDER_SQLITE_BUSY_TIMEOUT)?;
+    let deadline = Instant::now() + PROVIDER_SQLITE_DEADLINE;
+    db.progress_handler(1_000, Some(move || Instant::now() >= deadline));
+    Ok(db)
+}
+
+fn columns(db: &Connection, table: &str) -> Result<BTreeSet<String>> {
+    let mut statement = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    Ok(statement
+        .query_map([], |row| row.get(1))?
+        .flatten()
+        .collect())
+}
+
+fn select_fields(columns: &BTreeSet<String>, wanted: &[&str]) -> String {
+    wanted
+        .iter()
+        .map(|field| {
+            if columns.contains(*field) {
+                (*field).to_owned()
+            } else {
+                format!("NULL AS {field}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn newest_matching(root: &Path, prefix: &str, suffix: &str) -> Option<PathBuf> {
+    let mut paths: Vec<_> = fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix) && name.ends_with(suffix))
+        })
+        .collect();
+    paths.sort_by_key(|path| std::cmp::Reverse(modified(path).to_bits()));
+    paths.into_iter().next()
+}
+
+fn modified(path: &Path) -> f64 {
+    fs::metadata(path)
+        .and_then(|value| value.modified())
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map_or(0.0, |value| value.as_secs_f64())
+}
+
+fn timestamp(value: Option<&Value>) -> f64 {
+    match value {
+        Some(Value::Number(number)) => normalize_timestamp(number.as_f64().unwrap_or(0.0)),
+        Some(Value::String(value)) => value
+            .parse::<f64>()
+            .ok()
+            .map(normalize_timestamp)
+            .or_else(|| {
+                OffsetDateTime::parse(value, &Rfc3339)
+                    .ok()
+                    .map(|date| date.unix_timestamp() as f64)
+            })
+            .unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+fn timestamp_sql(value: ValueRef<'_>) -> f64 {
+    match value {
+        ValueRef::Integer(value) => normalize_timestamp(value as f64),
+        ValueRef::Real(value) => normalize_timestamp(value),
+        ValueRef::Text(value) => timestamp(Some(&Value::String(
+            String::from_utf8_lossy(value).into_owned(),
+        ))),
+        _ => 0.0,
+    }
+}
+
+fn normalize_timestamp(value: f64) -> f64 {
+    if value > 10_000_000_000.0 {
+        value / 1000.0
+    } else {
+        value
+    }
+}
+
+fn read_first_json_budgeted(path: impl AsRef<Path>, budget: &mut u64) -> Option<Value> {
+    if *budget == 0 {
+        return None;
+    }
+    let limit = MAX_CODEX_METADATA_LINE_BYTES.min(*budget);
+    let mut line = Vec::new();
+    let read = BufReader::new(File::open(path).ok()?)
+        .take(limit + 1)
+        .read_until(b'\n', &mut line)
+        .ok()?;
+    *budget = budget.saturating_sub(read as u64);
+    if line.len() as u64 > limit {
+        return None;
+    }
+    serde_json::from_slice(&line).ok()
+}
+
+fn read_bounded_json_budgeted(path: &Path, budget: &mut u64) -> Option<Value> {
+    if *budget == 0 {
+        return None;
+    }
+    let limit = MAX_CODEX_METADATA_LINE_BYTES.min(*budget);
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    *budget = budget.saturating_sub(bytes.len() as u64);
+    if bytes.len() as u64 > limit {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn reverse_lines_bounded(path: &Path, limit: u64, budget: &mut u64) -> Vec<String> {
+    if limit == 0 || *budget == 0 {
+        return Vec::new();
+    }
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(mut position) = file.seek(SeekFrom::End(0)) else {
+        return Vec::new();
+    };
+    let mut remainder = Vec::new();
+    let mut output = Vec::new();
+    let mut scanned = 0_u64;
+    while position > 0 && scanned < limit && *budget > 0 {
+        let size = usize::try_from(
+            position
+                .min(65_536)
+                .min(limit.saturating_sub(scanned))
+                .min(*budget),
+        )
+        .unwrap_or(65_536);
+        position -= size as u64;
+        scanned += size as u64;
+        *budget = budget.saturating_sub(size as u64);
+        if file.seek(SeekFrom::Start(position)).is_err() {
+            break;
+        }
+        let mut chunk = vec![0; size];
+        if file.read_exact(&mut chunk).is_err() {
+            break;
+        }
+        chunk.extend_from_slice(&remainder);
+        let mut lines: Vec<_> = chunk
+            .split(|byte| *byte == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect();
+        remainder = lines.remove(0);
+        output.extend(
+            lines
+                .into_iter()
+                .rev()
+                .filter(|line| !line.is_empty())
+                .map(|line| String::from_utf8_lossy(&line).into_owned()),
+        );
+    }
+    // `remainder` is a complete first line only when we reached the beginning;
+    // otherwise it is a truncated JSON fragment and must not be interpreted.
+    if position == 0 && !remainder.is_empty() {
+        output.push(String::from_utf8_lossy(&remainder).into_owned());
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_provider_timestamps() {
+        assert_eq!(
+            timestamp(Some(&Value::String("2026-08-12T10:30:00Z".into()))),
+            1_786_530_600.0
+        );
+    }
+
+    #[test]
+    fn recognizes_only_native_opencode_placeholders() {
+        assert!(opencode_placeholder(Some("New session - 2026-01-01")));
+        assert!(opencode_placeholder(Some("Research (fork #2)")));
+        assert!(!opencode_placeholder(Some("oc_research")));
+    }
+
+    #[test]
+    fn validates_provider_ids() {
+        assert!(Providers::valid_id(
+            Provider::Codex,
+            "11111111-1111-4111-8111-111111111111"
+        ));
+        assert!(Providers::valid_id(Provider::Opencode, "ses_abcdef12"));
+        assert!(!Providers::valid_id(Provider::Opencode, "ses_bad-name"));
+    }
+
+    #[test]
+    fn provider_json_readers_reject_oversized_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_line = temp.path().join("first.jsonl");
+        fs::write(
+            &first_line,
+            format!("{{\"padding\":\"{}\"}}\n{{}}\n", "x".repeat(1024 * 1024)),
+        )
+        .unwrap();
+        let mut budget = MAX_CODEX_METADATA_TOTAL_BYTES;
+        assert!(read_first_json_budgeted(&first_line, &mut budget).is_none());
+
+        let document = temp.path().join("session.json");
+        fs::write(
+            &document,
+            format!("{{\"padding\":\"{}\"}}", "x".repeat(1024 * 1024)),
+        )
+        .unwrap();
+        let mut document_budget = MAX_CLAUDE_METADATA_TOTAL_BYTES;
+        assert!(read_bounded_json_budgeted(&document, &mut document_budget).is_none());
+
+        fs::write(&document, br#"{"kind":"interactive"}"#).unwrap();
+        let mut document_budget = MAX_CLAUDE_METADATA_TOTAL_BYTES;
+        assert_eq!(
+            read_bounded_json_budgeted(&document, &mut document_budget).unwrap()["kind"],
+            "interactive"
+        );
+    }
+
+    #[test]
+    fn codex_lifecycle_healing_is_incremental_under_a_fixed_cycle_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut original = Vec::new();
+        let mut first_activity = BTreeMap::new();
+        for index in 0..20 {
+            let id = format!("00000000-0000-4000-8000-{index:012}");
+            let transcript = temp.path().join(format!("{index}.jsonl"));
+            fs::write(
+                &transcript,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({"type":"session_meta","payload":{}}),
+                    serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}})
+                ),
+            )
+            .unwrap();
+            first_activity.insert(id.clone(), 0.0);
+            original.push(Candidate {
+                provider: Provider::Codex,
+                session_id: id,
+                name: Some(format!("thread-{index}")),
+                cwd: None,
+                branch: None,
+                transcript_path: Some(transcript.to_string_lossy().into_owned()),
+                model: None,
+                updated_at: (index + 1) as f64,
+                live: false,
+                pid: None,
+                source: "fixture".into(),
+                parent_session_id: None,
+                created_at: 1.0,
+                lifecycle_status: None,
+            });
+        }
+
+        let mut first = original.clone();
+        hydrate_codex_lifecycle(&mut first, Some(&first_activity));
+        assert_eq!(
+            first
+                .iter()
+                .filter(|candidate| candidate.lifecycle_status == Some(Status::Ready))
+                .count(),
+            MAX_CODEX_LIFECYCLE_RECORDS
+        );
+        let second_activity = first
+            .iter()
+            .map(|candidate| (candidate.session_id.clone(), candidate.updated_at))
+            .collect::<BTreeMap<_, _>>();
+        let mut second = original;
+        hydrate_codex_lifecycle(&mut second, Some(&second_activity));
+        assert_eq!(
+            second
+                .iter()
+                .filter(|candidate| candidate.lifecycle_status == Some(Status::Ready))
+                .count(),
+            20 - MAX_CODEX_LIFECYCLE_RECORDS
+        );
+        assert!(second.iter().all(|candidate| candidate.updated_at > 0.0));
+    }
+
+    #[test]
+    fn native_name_protocol_bounds_unterminated_frames_and_total_output() {
+        assert!(!codex_name_protocol(Vec::new(), std::io::repeat(b'x'), "id", "name").unwrap());
+        let notification = format!(
+            "{{\"method\":\"notice\",\"params\":\"{}\"}}\n",
+            "x".repeat(1024)
+        );
+        let mut output = std::io::Cursor::new(notification.repeat(2048));
+        assert!(!codex_name_protocol(Vec::new(), &mut output, "id", "name").unwrap());
+        assert!(output.position() <= 1024 * 1024 + 64 * 1024);
+    }
+
+    #[test]
+    fn native_name_protocol_rejects_initialization_error_without_a_name_request() {
+        let mut input = Vec::new();
+        assert!(
+            !codex_name_protocol(&mut input, &b"{\"id\":1,\"error\":{}}\n"[..], "id", "name")
+                .unwrap()
+        );
+        assert!(
+            !String::from_utf8(input)
+                .unwrap()
+                .contains("thread/name/set")
+        );
+    }
+
+    #[cfg(unix)]
+    fn native_name_fixture(temp: &tempfile::TempDir, body: &str) -> (Paths, Config) {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = temp.path().join("codex-naming-fixture");
+        fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = Paths {
+            config_dir: temp.path().join("config"),
+            state_dir: temp.path().join("state"),
+            config: temp.path().join("config/config.json"),
+            database: temp.path().join("state/pika.db"),
+            codex_home: temp.path().join("codex-home"),
+            claude_home: temp.path().join("claude-home"),
+            opencode_data_home: temp.path().join("opencode-data"),
+            opencode_config_home: temp.path().join("opencode-config"),
+        };
+        let mut config = Config::default();
+        config
+            .provider_executables
+            .insert("codex".into(), executable.to_string_lossy().into_owned());
+        (paths, config)
+    }
+
+    #[cfg(unix)]
+    fn ready_native_name_fixture(
+        temp: &tempfile::TempDir,
+        body: &str,
+    ) -> (OwnedChild, std::os::fd::OwnedFd) {
+        use std::os::fd::AsFd;
+        let pid_file = temp.path().join("descendant.pid");
+        let (paths, config) = native_name_fixture(
+            temp,
+            &format!(
+                "sleep 30 &\nprintf '%s\\n' \"$!\" > {}\n{body}\nwait",
+                shell_words::quote(&pid_file.to_string_lossy())
+            ),
+        );
+        let mut command = Command::new(config.executable(Provider::Codex));
+        command
+            .args(["app-server", "--stdio"])
+            .env("CODEX_HOME", &paths.codex_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let child = OwnedChild::spawn(&mut command).unwrap();
+        let output = child
+            .stdout
+            .as_ref()
+            .unwrap()
+            .as_fd()
+            .try_clone_to_owned()
+            .unwrap();
+        // Startup scheduling is not the blocked-I/O behavior under test. Prove
+        // the fixture created its descendant before starting that deadline.
+        // Production still sets its absolute deadline before process spawn.
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+                .is_some_and(|pid| pid > 0)
+            {
+                return (child, output);
+            }
+            assert!(
+                Instant::now() < ready_deadline,
+                "naming fixture never started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_naming_descendants_closed(output: &std::os::fd::OwnedFd) {
+        use std::os::fd::AsRawFd;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut descriptor = libc::pollfd {
+            fd: output.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // This pipe is inherited by both owned processes. HUP proves all
+            // writers have closed, without depending on orphan/PID reaping
+            // latency or signalling any process by a potentially recycled PID.
+            let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+            assert!(result >= 0, "failed to inspect fixture pipe");
+            if descriptor.revents & libc::POLLHUP != 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned naming descendant retained its pipe after cleanup"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_name_deadline_bounds_blocked_writes_and_kills_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let (child, output) =
+            ready_native_name_fixture(&temp, "printf '%s\\n' '{\"id\":1,\"result\":{}}'");
+        let started = Instant::now();
+        assert!(!finish_codex_native_name(
+            child,
+            "11111111-1111-4111-8111-111111111111",
+            &"x".repeat(64 * 1024),
+            started + Duration::from_secs(1)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_naming_descendants_closed(&output);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_name_expired_startup_deadline_skips_protocol_and_kills_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let request_file = temp.path().join("request");
+        let (child, output) = ready_native_name_fixture(
+            &temp,
+            &format!(
+                "IFS= read -r request && printf '%s' \"$request\" > {}",
+                shell_words::quote(&request_file.to_string_lossy())
+            ),
+        );
+        let deadline = Instant::now();
+        assert!(!finish_codex_native_name(
+            child,
+            "11111111-1111-4111-8111-111111111111",
+            "name",
+            deadline
+        ));
+        assert!(deadline.elapsed() < Duration::from_secs(1));
+        assert_naming_descendants_closed(&output);
+        assert!(!request_file.exists(), "expired operation sent a request");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_name_stdout_flood_is_rejected_before_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let (paths, config) = native_name_fixture(&temp, "exec /usr/bin/yes flood");
+        let started = Instant::now();
+        assert!(
+            !Providers::new(&paths, &config)
+                .set_codex_native_name("11111111-1111-4111-8111-111111111111", "name")
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_native_name_uses_app_server_instead_of_editing_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("codex");
+        let log = temp.path().join("requests.jsonl");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nIFS= read -r a; printf '%s\\n' \"$a\" >> '{}'; printf '%s\\n' '{{\"id\":1,\"result\":{{}}}}'; IFS= read -r b; printf '%s\\n' \"$b\" >> '{}'; IFS= read -r c; printf '%s\\n' \"$c\" >> '{}'; printf '%s\\n' '{{\"id\":2,\"result\":{{}}}}'\n",
+                log.display(),
+                log.display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = Paths {
+            config_dir: temp.path().join("config"),
+            state_dir: temp.path().join("state"),
+            config: temp.path().join("config/config.json"),
+            database: temp.path().join("state/pika.db"),
+            codex_home: temp.path().join("codex-home"),
+            claude_home: temp.path().join("claude-home"),
+            opencode_data_home: temp.path().join("opencode-data"),
+            opencode_config_home: temp.path().join("opencode-config"),
+        };
+        let mut config = Config::default();
+        config
+            .provider_executables
+            .insert("codex".into(), executable.to_string_lossy().into_owned());
+        let id = "11111111-1111-4111-8111-111111111111";
+        assert!(Providers::new(&paths, &config).set_codex_native_name(id, "research_pipeline"));
+        let requests = std::fs::read_to_string(log).unwrap();
+        assert!(requests.contains("thread/name/set"));
+        assert!(requests.contains(id));
+        assert!(requests.contains("research_pipeline"));
+    }
+}

@@ -91,16 +91,13 @@ conversation the process belongs to and whether it is safe to enter.
 
 ## Install a Pika node
 
-Pikamux requires Linux or macOS, Python 3.10 or newer, and tmux. Codex, Claude, and/or
+Pika requires Linux or macOS and tmux. Codex, Claude, and/or
 OpenCode must already be installed. Pika requires OpenCode 1.18.21
 or newer; setup and doctor reject an older or unparseable version. This lower
 bound is not certification of every future provider release.
 
-Native macOS hosting is new in this alpha candidate. Install prerequisites with
-`brew install uv tmux`, then use the same commands below. On macOS only, Pika
-installs psutil (BSD-3-Clause) for native process arguments, ancestry and birth
-timestamps. Linux retains its `/proc` implementation with no Python runtime
-dependencies. Native process and tmux tests do not certify every provider's TUI.
+Pika runs natively on macOS and Linux. Install tmux with your package manager,
+then follow the [installation guide](installing.md).
 
 Expert refresh uses a user LaunchAgent on macOS and a user systemd timer on Linux.
 The Mac job checks eligibility every ten minutes while logged in and awake; missed
@@ -115,7 +112,7 @@ the terminal location when available and the exact command. It does not offer a
 takeover button that cannot work, or replace this safety gate with plain PID kills.
 
 ```bash
-uv tool install --editable /path/to/pikamux
+cargo install --path /path/to/pikamux --locked
 pika setup
 ```
 
@@ -210,12 +207,12 @@ Install the same release on Windows, then pair each server whose agents may be
 opened locally:
 
 ```powershell
-uv tool install C:\path\to\pikamux
-pika setup devbox
+Expand-Archive .\pikamux-VERSION-x86_64-pc-windows-msvc.zip -DestinationPath .\pika
+Set-Location .\pika
+./pika.exe setup devbox
 ```
 
-Use a checkout of the same candidate installed on the Linux node, or its matching
-wheel. Do not install an older tag and assume it includes unreleased features.
+Download the Windows client ZIP from the same release as the host.
 
 Pairing performs two SSH identity receipts, stores a different random secret for
 that exact Pika node on each side, and starts the loopback-only client bridge.
@@ -293,8 +290,7 @@ running it. Handshakes report the remote package version, and `pika machines
 upgrade MACHINE` is the explicit rolling-upgrade path; Pika never follows a
 mutable branch during remote installation.
 Bootstrap downloads the matching public tag over HTTPS without requiring GitHub
-SSH credentials. While this candidate is private or untagged, install a matching
-authorized checkout or wheel on the remote node manually before pairing.
+SSH credentials. You can also supply a verified native release bundle.
 `pika setup --yes` never selects machines or installs remotely by itself.
 
 For an explicit non-interactive rollout:
@@ -801,13 +797,12 @@ non-sensitive. See [security and privacy](../SECURITY.md).
 
 ## Development
 
-Linux and Windows use only the Python standard library at runtime. macOS adds
-psutil for native, argument-preserving process inspection.
+Build and run Pika with Rust 1.88 or newer:
 
 ```bash
-uv sync --locked --group dev
-uv run pytest -q --timeout=90
-uv run pika --help
+cargo build --locked
+cargo test --locked
+cargo run -- --help
 ```
 
 The integration suite uses an isolated tmux socket and fake provider processes;

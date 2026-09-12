@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.0 — Pika in Rust
+
+- Ship a small native executable for macOS and Linux, with prebuilt downloads
+  ready to run.
+- Keep the live board, return by name, private consultations, expert discovery,
+  and SSH/Tailscale federation in one familiar command.
+- Reduce board startup, redraw latency, background CPU, and memory use. See
+  [measured performance](docs/PERFORMANCE.md) for the benchmark details.
+- Preserve existing conversation identities, expert cards, and local state.
+- Verify native release downloads before activation and retain prior native
+  releases for `pika update --rollback`.
+- Include an experimental native Windows client for pairing with a Pika host.
+
 ## 0.5.0a4 — reliable returns and consultations
 
 - Support private consultations from newer Codex conversations with paginated

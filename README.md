@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.sh 
 ```
 
 The [installer](install.sh)
-handles Python and offers setup. It asks before changing shell or agent settings
+installs the native executable and offers setup. It asks before changing shell or agent settings
 and backs up existing configuration. See the [installation guide](docs/installing.md)
 for prerequisites and troubleshooting.
 
@@ -63,7 +63,7 @@ steps instead of opening a duplicate.
 | **x** | Stop watching; keep the agent running and its history |
 | **q** | Leave the board; keep agents running |
 
-Installer-managed copies show update notices on the board. Press **U** to review
+Run `pika update --check` to check for a new release. Available updates appear on the board. Press **U** to review
 an update; installation requires your approval and leaves running agents alone.
 See [installation and updates](docs/installing.md) for other install methods.
 

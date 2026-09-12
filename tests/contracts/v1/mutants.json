@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "reference_source_commit": "36de1b1eed1a182ed4e608d47f95d362f15d571a",
+  "mutants": [
+    {"id":"attention_wrong_status","family":"attention","case":"safety_beats_newer_work","path":"/status","replacement":"WORKING"},
+    {"id":"attention_drops_unread","family":"attention","case":"question_beats_unbound_ownership","path":"/unread","replacement":false},
+    {"id":"attention_changes_reason","family":"attention","case":"question_beats_unbound_ownership","path":"/attention_reason","replacement":"completed"},
+    {"id":"attention_hides_source","family":"attention","case":"newer_lifecycle_fact_wins_within_its_kind","path":"/source","replacement":"reconcile"},
+    {"id":"identity_wrong_uuid","family":"identity","case":"exact_uuid_beats_name_collision","path":"/choices","replacement":["name_collision"]},
+    {"id":"identity_collapses_duplicate","family":"identity","case":"genuine_live_duplicates_stay_ambiguous","path":"/choices","replacement":["second"]},
+    {"id":"identity_hides_unknown","family":"identity","case":"unknown_storage_stays_ambiguous","path":"/choices","replacement":["current"]}
+  ]
+}

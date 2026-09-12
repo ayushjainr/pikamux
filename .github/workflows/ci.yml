@@ -1,111 +1,82 @@
-name: Verify
+name: CI
 
 on:
-  push:
   pull_request:
-  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'media/**']
 
 permissions:
   contents: read
 
-concurrency:
-  group: verify-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
 
 jobs:
-  linux:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  test:
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.10', '3.13']
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: '22'
-      - name: Install test tools
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install pinned Rust toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y tmux ncurses-term
-          python -m pip install uv==0.8.15
-      - run: uv sync --locked --group dev
-      - run: uv run pytest -q --timeout=90
-      - run: uv run python scripts/build_release.py --output dist/candidate
-      - name: Verify fresh-host install and staged update
-        env:
-          PIKA_INSTALL_BUNDLE: dist/candidate
-          PIKA_BOOTSTRAP_BUNDLE: dist/candidate
-        run: uv run pytest -q tests/test_installation.py tests/test_bootstrap.py --timeout=300
-      - name: Verify distribution allowlist
-        env:
-          PIKA_RELEASE_DIST: dist/candidate
-        run: uv run pytest -q tests/test_release_contract.py --timeout=90
-      - name: Verify installed wheel and sdist
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+          rustup override set 1.88.0
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-targets -- --test-threads=1
+      - name: Dependency license inventory
+        shell: bash
         run: |
-          uv venv .wheel-check
-          uv pip install --python .wheel-check/bin/python dist/candidate/*.whl
-          .wheel-check/bin/pika --version
-          .wheel-check/bin/pika --help
-          .wheel-check/bin/pika skill show
-          .wheel-check/bin/pika skill install .wheel-check/skill --json
-          .wheel-check/bin/python -m pikamux.monitor --demo
-          uv venv .sdist-check
-          uv pip install --python .sdist-check/bin/python dist/candidate/*.tar.gz
-          .sdist-check/bin/pika --help
-          .sdist-check/bin/pika skill show
-
-  macos:
-    runs-on: macos-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+          cargo fetch --locked
+          scripts/generate-third-party.sh /tmp/THIRD_PARTY.md
+          diff -u THIRD_PARTY.md /tmp/THIRD_PARTY.md
+      - name: RustSec dependency audit
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit --deny warnings
+      - name: Release smoke and performance evidence
+        shell: bash
+        run: |
+          cargo build --release --locked
+          PIKA_BENCH_SAMPLES=30 scripts/benchmark-native.sh target/release/pika | tee native-benchmark.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.13'
-      - name: Install test tools
-        run: |
-          brew install tmux
-          python -m pip install uv==0.8.15
-      - run: uv sync --locked --group dev
-      - run: uv run pytest -q --timeout=90
-      - run: uv run python scripts/build_release.py --output dist/candidate
-      - name: Verify fresh-host install and staged update
-        env:
-          PIKA_INSTALL_BUNDLE: dist/candidate
-          PIKA_BOOTSTRAP_BUNDLE: dist/candidate
-        run: uv run pytest -q tests/test_installation.py tests/test_bootstrap.py --timeout=300
-      - name: Verify distribution allowlist
-        env:
-          PIKA_RELEASE_DIST: dist/candidate
-        run: uv run pytest -q tests/test_release_contract.py --timeout=90
-      - name: Verify clean installed package
-        run: |
-          uv venv .wheel-check
-          uv pip install --python .wheel-check/bin/python dist/candidate/*.whl
-          .wheel-check/bin/pika --version
-          .wheel-check/bin/pika --help
-          .wheel-check/bin/python -c 'from pikamux.processes import process_start_time; import os; assert process_start_time(os.getpid())'
-          .wheel-check/bin/python -m pikamux.monitor --demo
+          name: native-benchmark-${{ matrix.os }}
+          path: native-benchmark.txt
+          if-no-files-found: error
 
   windows-client:
-    runs-on: windows-latest
-    timeout-minutes: 10
+    name: Windows x86_64 client/bridge only
+    runs-on: windows-2022
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.13'
-      - run: python -m pip install .
-      - run: pika --help
-      - run: pika --version
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+          rustup override set 1.88.0
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Check client contracts
+        run: cargo clippy --locked --lib --bin pika --test client_bridge_contract --test client_cli_contract -- -D warnings
+      - name: Test client contracts
+        run: cargo test --locked --test client_bridge_contract --test client_cli_contract
+      - name: Verify client-only command surface
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          $help = (& target/release/pika.exe --help | Out-String)
+          if ($help -notmatch 'Native Windows agent hosting is unsupported') { throw 'missing client-only support boundary' }
+          if ($help -match '(?m)^  (list|new|ask|experts|doctor)\s') { throw 'Windows help exposed an agent-hosting command' }
+          $status = (& target/release/pika.exe status | Out-String)
+          if ($status -notmatch 'Client/bridge only') { throw 'Windows status did not identify the client-only runtime' }

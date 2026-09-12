@@ -10,14 +10,12 @@ to share with the selected model provider; avoid sensitive work for a first tria
 
 ## Release compatibility
 
-Use Pika 0.5.0a4 or newer for Codex conversations with paginated history. If you
-installed an earlier release, run `pika update` before consulting those conversations.
 Claude consultation requires CLI 2.1.228 or newer; OpenCode has temporary
 persisted-side cleanup limits. Read [consultation boundaries](../SECURITY.md#consultation-boundaries).
 
 ## 1. Install the agent workflow
 
-Use the [Mac/Linux installer](installing.md#fresh-mac-or-linux-machine), with tmux
+Use the [Mac/Linux installer](installing.md), with tmux
 and an authenticated supported provider CLI available. Run `pika setup` if you
 skipped onboarding. Review the changes and the bundled `agent-convo` skill in the
 same approval step. Codex users must review and trust hooks through `/hooks`.

@@ -1,0 +1,777 @@
+use pikamux::{
+    config::Config,
+    core::Pika,
+    model::{Provider, Session, Status},
+    paths::Paths,
+    providers::Providers,
+    store::Store,
+    tmux::Tmux,
+};
+use rusqlite::{Connection, params};
+use std::collections::{BTreeMap, BTreeSet};
+use std::{fs, path::Path};
+
+fn paths(root: &Path) -> Paths {
+    let config_dir = root.join("config/pika");
+    let state_dir = root.join("state/pika");
+    Paths {
+        config: config_dir.join("config.json"),
+        config_dir,
+        database: state_dir.join("pika.db"),
+        state_dir,
+        codex_home: root.join("codex"),
+        claude_home: root.join("claude"),
+        opencode_data_home: root.join("opencode-data"),
+        opencode_config_home: root.join("opencode-config"),
+    }
+}
+
+fn json_line(path: &Path, value: serde_json::Value) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        path,
+        format!("{}\n", serde_json::to_string(&value).unwrap()),
+    )
+    .unwrap();
+}
+
+fn saved_codex(identity: &str, name: &str) -> Session {
+    Session {
+        provider: Provider::Codex,
+        session_id: identity.into(),
+        active_thread_id: None,
+        name: Some(name.into()),
+        cwd: Some("/project".into()),
+        branch: None,
+        transcript_path: None,
+        tmux_session: None,
+        tmux_pane: None,
+        root_pid: None,
+        status: Status::Working,
+        unread: false,
+        model: None,
+        source: "managed".into(),
+        managed: true,
+        error: None,
+        attention_reason: None,
+        created_at: 1.0,
+        updated_at: 1.0,
+        last_event_at: 1.0,
+        last_activity_at: 1.0,
+        live: false,
+        attached: false,
+        home_state: "missing".into(),
+        cpu_percent: None,
+        rss_kb: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        cache_write_tokens: None,
+        total_tokens: None,
+        estimated_cost_usd: None,
+    }
+}
+
+#[test]
+fn codex_first_screen_requires_proven_authorship_but_browse_preserves_safe_labels() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    fs::create_dir_all(&paths.codex_home).unwrap();
+    let db = Connection::open(paths.codex_home.join("state_1.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(
+            id TEXT PRIMARY KEY, name TEXT, cwd TEXT, git_branch TEXT,
+            rollout_path TEXT, model TEXT, created_at INTEGER,
+            updated_at INTEGER, archived INTEGER
+         );",
+    )
+    .unwrap();
+
+    let parent = "11111111-1111-4111-8111-111111111111";
+    let named = "22222222-2222-4222-8222-222222222222";
+    let fork = "33333333-3333-4333-8333-333333333333";
+    let archived = "44444444-4444-4444-8444-444444444444";
+    let worker = "55555555-5555-4555-8555-555555555555";
+    let subagent = "66666666-6666-4666-8666-666666666666";
+    let indexed = "77777777-7777-4777-8777-777777777777";
+    for (id, name, payload, hidden, updated) in [
+        (named, Some("research_thread"), serde_json::json!({}), 0, 10),
+        (
+            fork,
+            Some("returns_tracker"),
+            serde_json::json!({"forked_from_id":parent}),
+            0,
+            20,
+        ),
+        (archived, Some("old_archived"), serde_json::json!({}), 1, 30),
+        (
+            worker,
+            Some("codex-generated"),
+            serde_json::json!({"originator":"automation_worker"}),
+            0,
+            40,
+        ),
+        (
+            subagent,
+            Some("side-worker"),
+            serde_json::json!({"thread_source":"subagent"}),
+            0,
+            50,
+        ),
+    ] {
+        let transcript = paths.codex_home.join(format!("{id}.jsonl"));
+        json_line(
+            &transcript,
+            serde_json::json!({"type":"session_meta","payload":payload}),
+        );
+        db.execute(
+            "INSERT INTO threads VALUES(?1,?2,'/project','main',?3,'gpt',1,?4,?5)",
+            params![id, name, transcript.to_string_lossy(), updated, hidden],
+        )
+        .unwrap();
+    }
+    let indexed_transcript = paths.codex_home.join(format!("{indexed}.jsonl"));
+    json_line(
+        &indexed_transcript,
+        serde_json::json!({"type":"session_meta","payload":{}}),
+    );
+    db.execute(
+        "INSERT INTO threads VALUES(?1,NULL,'/project','main',?2,'gpt',1,60,0)",
+        params![indexed, indexed_transcript.to_string_lossy()],
+    )
+    .unwrap();
+    drop(db);
+    fs::write(
+        paths.codex_home.join("session_index.jsonl"),
+        format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({
+                "id":indexed, "thread_name":"index-generated-label", "updated_at":60
+            }),
+            serde_json::json!({
+                "id":archived, "thread_name":"archived-index-label", "updated_at":70
+            }),
+            serde_json::json!({
+                "id":worker, "thread_name":"worker-index-label", "updated_at":80
+            })
+        ),
+    )
+    .unwrap();
+
+    let config = Config {
+        codex_worker_originators: vec!["automation_worker".into()],
+        ..Config::default()
+    };
+    let providers = Providers::new(&paths, &config);
+    assert!(providers.import_candidates(Provider::Codex).is_empty());
+    let records = providers.discover(Provider::Codex);
+    assert_eq!(
+        records
+            .iter()
+            .map(|item| item.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![indexed, fork, named]
+    );
+    assert_eq!(records[0].name.as_deref(), Some("index-generated-label"));
+    assert_eq!(records[1].parent_session_id.as_deref(), Some(parent));
+    assert_eq!(
+        providers
+            .find(Provider::Codex, "index-generated-label")
+            .first()
+            .map(|candidate| candidate.session_id.as_str()),
+        Some(indexed)
+    );
+    assert!(providers.find(Provider::Codex, archived).is_empty());
+    assert!(providers.find(Provider::Codex, worker).is_empty());
+
+    let recent = providers.browse(Provider::Codex);
+    assert_eq!(recent[0].session_id, indexed);
+    assert_eq!(recent[0].name.as_deref(), Some("index-generated-label"));
+    assert!(
+        !recent
+            .iter()
+            .any(|candidate| candidate.session_id == archived)
+    );
+}
+
+#[test]
+fn claude_first_screen_requires_explicit_name_and_exact_uuid_still_resolves() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let custom = "11111111-1111-4111-8111-111111111111";
+    let derived = "22222222-2222-4222-8222-222222222222";
+    let history = "33333333-3333-4333-8333-333333333333";
+    let worker = "44444444-4444-4444-8444-444444444444";
+    let sessions = paths.claude_home.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    for (id, name, source) in [
+        (custom, "data_plugin", "custom"),
+        (derived, "Generated title", "derived"),
+        (worker, "Inherited worker name", "custom"),
+    ] {
+        fs::write(
+            sessions.join(format!("{id}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "kind":"interactive", "sessionId":id, "name":name,
+                "nameSource":source, "cwd":"/project", "updatedAt":10
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    json_line(
+        &paths.claude_home.join(format!("projects/p/{custom}.jsonl")),
+        serde_json::json!({"sessionId":custom,"isSidechain":false,"entrypoint":"cli"}),
+    );
+    json_line(
+        &paths
+            .claude_home
+            .join(format!("projects/p/{derived}.jsonl")),
+        serde_json::json!({"type":"ai-title","aiTitle":"Generated title"}),
+    );
+    json_line(
+        &paths
+            .claude_home
+            .join(format!("projects/p/{history}.jsonl")),
+        serde_json::json!({"type":"custom-title","customTitle":"durable_expert"}),
+    );
+    json_line(
+        &paths.claude_home.join(format!("projects/p/{worker}.jsonl")),
+        serde_json::json!({"sessionId":worker,"isSidechain":false,"entrypoint":"sdk-cli"}),
+    );
+
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let names = providers.import_candidates(Provider::Claude);
+    assert_eq!(
+        names
+            .iter()
+            .map(|item| item.name.as_deref().unwrap())
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["data_plugin", "durable_expert"].into_iter().collect()
+    );
+    assert!(
+        providers
+            .find(Provider::Claude, "Generated title")
+            .is_empty()
+    );
+    let exact = providers.find(Provider::Claude, derived);
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].session_id, derived);
+    assert!(exact[0].name.is_none());
+    assert!(providers.find(Provider::Claude, worker).is_empty());
+}
+
+#[test]
+fn claude_history_only_exact_lookup_ignores_title_and_browser_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let identity = "55555555-5555-4555-8555-555555555555";
+    let transcript = paths
+        .claude_home
+        .join(format!("projects/p/{identity}.jsonl"));
+    json_line(
+        &transcript,
+        serde_json::json!({"type":"ai-title","aiTitle":"Generated orientation"}),
+    );
+    fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+        .unwrap();
+    for index in 0..1001 {
+        json_line(
+            &paths
+                .claude_home
+                .join(format!("projects/p/recent-{index}.jsonl")),
+            serde_json::json!({"type":"ai-title","aiTitle":"recent generated title"}),
+        );
+    }
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    assert!(!paths.claude_home.join("sessions").exists());
+    assert!(providers.import_candidates(Provider::Claude).is_empty());
+    let exact = providers.find(Provider::Claude, identity);
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].session_id, identity);
+    assert!(exact[0].name.is_none());
+    assert!(exact[0].cwd.is_none());
+    assert_eq!(
+        providers
+            .tracked(Provider::Claude, &[identity.into()].into_iter().collect())
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn claude_exact_uuid_survives_the_ten_thousand_transcript_browse_cap() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let project = paths.claude_home.join("projects/p");
+    fs::create_dir_all(&project).unwrap();
+    for index in 0..10_001 {
+        fs::write(project.join(format!("filler-{index:05}.jsonl")), b"{}\n").unwrap();
+    }
+    let identity = "77777777-7777-4777-8777-777777777777";
+    json_line(
+        &project.join(format!("{identity}.jsonl")),
+        serde_json::json!({"type":"custom-title","customTitle":"exact_old_expert"}),
+    );
+
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let requested = providers.find(Provider::Claude, identity);
+    assert_eq!(requested.len(), 1);
+    assert_eq!(requested[0].session_id, identity);
+    assert_eq!(requested[0].name.as_deref(), Some("exact_old_expert"));
+    let tracked = providers.tracked(Provider::Claude, &BTreeSet::from([identity.into()]));
+    assert_eq!(tracked.len(), 1);
+    assert_eq!(tracked[0].session_id, identity);
+}
+
+#[test]
+fn codex_archive_lookup_is_scoped_to_bounded_index_candidates() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    fs::create_dir_all(&paths.codex_home).unwrap();
+    let target = "88888888-8888-4888-8888-888888888888";
+    fs::write(
+        paths.codex_home.join("session_index.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "id":target, "thread_name":"archived_target", "updated_at":10
+            })
+        ),
+    )
+    .unwrap();
+    let db = Connection::open(paths.codex_home.join("state_1.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(
+            id, name TEXT, cwd TEXT, git_branch TEXT, rollout_path TEXT,
+            model TEXT, created_at INTEGER, updated_at INTEGER, archived INTEGER
+         );",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES(?1,'archived_target',NULL,NULL,NULL,NULL,1,10,1)",
+        [target],
+    )
+    .unwrap();
+    // An unrelated row with a non-text ID made the old whole-archive collector
+    // discard all archive evidence. A candidate-scoped query never decodes it.
+    db.execute(
+        "INSERT INTO threads VALUES(42,'unrelated',NULL,NULL,NULL,NULL,1,11,1)",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    assert!(providers.find(Provider::Codex, target).is_empty());
+    assert!(
+        providers
+            .find(Provider::Codex, "archived_target")
+            .is_empty()
+    );
+}
+
+#[test]
+fn claude_large_history_uses_bounded_recent_title_and_worker_records() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let identity = "66666666-6666-4666-8666-666666666666";
+    let transcript = paths
+        .claude_home
+        .join(format!("projects/p/{identity}.jsonl"));
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    let mut content = "x".repeat(3 * 1024 * 1024);
+    content.push('\n');
+    content.push_str(
+        &serde_json::json!({"type":"custom-title","customTitle":"large_history"}).to_string(),
+    );
+    content.push('\n');
+    fs::write(&transcript, content).unwrap();
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let started = std::time::Instant::now();
+    let exact = providers.find(Provider::Claude, identity);
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].name.as_deref(), Some("large_history"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn opencode_never_claims_title_provenance_and_projects_child_lifecycle() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    fs::create_dir_all(&paths.opencode_data_home).unwrap();
+    let db = Connection::open(paths.opencode_data_home.join("opencode.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session(
+            id TEXT PRIMARY KEY, title TEXT, directory TEXT, parent_id TEXT,
+            time_created INTEGER, time_updated INTEGER, time_archived INTEGER, model TEXT
+         );
+         CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);",
+    ).unwrap();
+    for row in [
+        (
+            "ses_root0001",
+            "oc_house_style",
+            "/project",
+            None,
+            1,
+            10,
+            None,
+        ),
+        (
+            "ses_child001",
+            "child",
+            "/project",
+            Some("ses_root0001"),
+            2,
+            30,
+            None,
+        ),
+        (
+            "ses_archive1",
+            "archived",
+            "/project",
+            None,
+            1,
+            40,
+            Some(40),
+        ),
+        (
+            "ses_auto000",
+            "automation: worker",
+            "/tmp/opencode-runtime/run",
+            None,
+            1,
+            50,
+            None,
+        ),
+        (
+            "ses_new0000",
+            "New session - 2026-01-01",
+            "/project",
+            None,
+            1,
+            20,
+            None,
+        ),
+    ] {
+        db.execute(
+            "INSERT INTO session VALUES(?1,?2,?3,?4,?5,?6,?7,NULL)",
+            params![row.0, row.1, row.2, row.3, row.4, row.5, row.6],
+        )
+        .unwrap();
+    }
+    db.execute(
+        "INSERT INTO message VALUES('m1','ses_child001',31,?1)",
+        [serde_json::json!({"role":"user"}).to_string()],
+    )
+    .unwrap();
+    drop(db);
+
+    let config = Config {
+        opencode_worker_title_prefixes: vec!["automation:".into()],
+        ..Config::default()
+    };
+    let providers = Providers::new(&paths, &config);
+    assert!(providers.discover(Provider::Opencode).is_empty());
+    let browse = providers.browse(Provider::Opencode);
+    assert_eq!(
+        browse
+            .iter()
+            .map(|item| item.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ses_root0001", "ses_new0000"]
+    );
+    assert_eq!(browse[0].updated_at, 30.0);
+    assert_eq!(browse[0].lifecycle_status, Some(Status::Working));
+    assert!(
+        providers
+            .find(Provider::Opencode, "ses_child001")
+            .is_empty()
+    );
+    assert!(
+        providers
+            .find(Provider::Opencode, "ses_archive1")
+            .is_empty()
+    );
+    assert!(providers.find(Provider::Opencode, "ses_auto000").is_empty());
+}
+
+#[test]
+fn reconciliation_persists_native_rename_and_active_leaf_lifecycle() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    fs::create_dir_all(&paths.codex_home).unwrap();
+    let db = Connection::open(paths.codex_home.join("state_1.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(
+            id TEXT PRIMARY KEY, name TEXT, cwd TEXT, rollout_path TEXT,
+            created_at INTEGER, updated_at INTEGER, archived INTEGER
+         );",
+    )
+    .unwrap();
+    let root_id = "77777777-7777-4777-8777-777777777777";
+    let leaf_id = "88888888-8888-4888-8888-888888888888";
+    let transcript = paths.codex_home.join("leaf.jsonl");
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"forked_from_id":root_id}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}})
+        ),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES(?1,'strategy_dashboard','/project',?2,1,20,0)",
+        params![leaf_id, transcript.to_string_lossy()],
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::from_paths(&paths);
+    store.initialize().unwrap();
+    let mut saved = saved_codex(root_id, "old_name");
+    saved.active_thread_id = Some(leaf_id.into());
+    store.upsert_session(&saved, false).unwrap();
+    let pika = Pika::with_components(
+        paths,
+        Config::default(),
+        store.clone(),
+        Tmux::with_executable("/usr/bin/false", Some("isolated".into())),
+    );
+    let reconciled = pika.reconcile_local().unwrap().sessions.remove(0);
+    assert_eq!(reconciled.name.as_deref(), Some("strategy_dashboard"));
+    assert_eq!(reconciled.status, Status::Ready);
+    assert!(reconciled.unread);
+    assert_eq!(
+        store
+            .get_session(Provider::Codex, root_id)
+            .unwrap()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("strategy_dashboard")
+    );
+}
+
+#[test]
+fn renamed_independent_codex_fork_becomes_a_distinct_watched_row() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    fs::create_dir_all(&paths.codex_home).unwrap();
+    let db = Connection::open(paths.codex_home.join("state_1.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(
+            id TEXT PRIMARY KEY, name TEXT, cwd TEXT, rollout_path TEXT,
+            created_at INTEGER, updated_at INTEGER, archived INTEGER
+         );",
+    )
+    .unwrap();
+    let root_id = "99999999-9999-4999-8999-999999999999";
+    let fork_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let root_transcript = paths.codex_home.join("root.jsonl");
+    let fork_transcript = paths.codex_home.join("fork.jsonl");
+    json_line(
+        &root_transcript,
+        serde_json::json!({"type":"session_meta","payload":{}}),
+    );
+    json_line(
+        &fork_transcript,
+        serde_json::json!({"type":"session_meta","payload":{"forked_from_id":root_id}}),
+    );
+    for (id, name, transcript, updated) in [
+        (root_id, "returns_tracker", &root_transcript, 10),
+        (fork_id, "strategy_dashboard", &fork_transcript, 20),
+    ] {
+        db.execute(
+            "INSERT INTO threads VALUES(?1,?2,'/project',?3,1,?4,0)",
+            params![id, name, transcript.to_string_lossy(), updated],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let store = Store::from_paths(&paths);
+    store.initialize().unwrap();
+    store
+        .upsert_session(&saved_codex(root_id, "returns_tracker"), false)
+        .unwrap();
+    let pika = Pika::with_components(
+        paths,
+        Config::default(),
+        store,
+        Tmux::with_executable("/usr/bin/false", Some("isolated".into())),
+    );
+    let rows = pika.reconcile_local().unwrap().sessions;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| {
+        row.session_id == fork_id && row.name.as_deref() == Some("strategy_dashboard")
+    }));
+}
+
+#[test]
+fn codex_reconciliation_handles_two_thousand_watched_rows_in_one_bounded_pass() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    fs::create_dir_all(&paths.codex_home).unwrap();
+    let mut db = Connection::open(paths.codex_home.join("state_1.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(
+            id TEXT PRIMARY KEY, name TEXT, cwd TEXT, rollout_path TEXT,
+            created_at INTEGER, updated_at INTEGER, archived INTEGER
+         );",
+    )
+    .unwrap();
+    let transcript = paths.codex_home.join("shared.jsonl");
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}})
+        ),
+    )
+    .unwrap();
+    let transaction = db.transaction().unwrap();
+    let mut activity = BTreeMap::new();
+    for index in 0..2_000 {
+        let id = format!("00000000-0000-4000-8000-{index:012}");
+        transaction
+            .execute(
+                "INSERT INTO threads VALUES(?1,?2,'/project',?3,1,?4,0)",
+                params![
+                    id,
+                    format!("thread-{index}"),
+                    transcript.to_string_lossy(),
+                    index as i64 + 1
+                ],
+            )
+            .unwrap();
+        activity.insert(id, 0.0);
+    }
+    transaction.commit().unwrap();
+    drop(db);
+
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let records = providers.reconcile_records(Provider::Codex, &activity);
+    assert_eq!(records.len(), 2_000);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|candidate| candidate.lifecycle_status == Some(Status::Ready))
+            .count(),
+        16
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|candidate| candidate.updated_at == 0.0)
+            .count(),
+        2_000 - 16
+    );
+}
+
+#[test]
+fn opencode_reconciliation_batches_two_thousand_roots_and_their_lifecycle() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    fs::create_dir_all(&paths.opencode_data_home).unwrap();
+    let mut db = Connection::open(paths.opencode_data_home.join("opencode.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session(
+            id TEXT PRIMARY KEY, title TEXT, directory TEXT, parent_id TEXT,
+            time_created INTEGER, time_updated INTEGER, time_archived INTEGER, model TEXT
+         );
+         CREATE TABLE message(
+            id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT
+         );",
+    )
+    .unwrap();
+    let transaction = db.transaction().unwrap();
+    let mut activity = BTreeMap::new();
+    for index in 0..2_000 {
+        let id = format!("ses_{index:012}");
+        transaction
+            .execute(
+                "INSERT INTO session VALUES(?1,?2,'/project',NULL,1,?3,NULL,NULL)",
+                params![id, format!("thread-{index}"), index as i64 + 1],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO message VALUES(?1,?2,?3,?4)",
+                params![
+                    format!("msg-{index}"),
+                    id,
+                    index as i64 + 1,
+                    serde_json::json!({"role":"assistant","time":{"completed":true}}).to_string()
+                ],
+            )
+            .unwrap();
+        activity.insert(id, 0.0);
+    }
+    transaction.commit().unwrap();
+    drop(db);
+
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let records = providers.reconcile_records(Provider::Opencode, &activity);
+    assert_eq!(records.len(), 2_000);
+    assert!(
+        records
+            .iter()
+            .all(|candidate| candidate.lifecycle_status == Some(Status::Ready))
+    );
+}
+
+#[test]
+fn claude_reconciliation_defers_changed_titles_beyond_its_cycle_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let transcripts = paths.claude_home.join("projects/p");
+    fs::create_dir_all(&transcripts).unwrap();
+    let mut activity = BTreeMap::new();
+    for index in 0..2_000 {
+        let id = format!("00000000-0000-4000-8000-{index:012}");
+        fs::write(
+            transcripts.join(format!("{id}.jsonl")),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "sessionId":id,"isSidechain":false,"entrypoint":"cli",
+                    "type":"custom-title","customTitle":format!("thread-{index}")
+                })
+            ),
+        )
+        .unwrap();
+        activity.insert(id, 0.0);
+    }
+
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let records = providers.reconcile_records(Provider::Claude, &activity);
+    assert_eq!(records.len(), 2_000);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|candidate| candidate.name.is_some() && candidate.updated_at > 0.0)
+            .count(),
+        16
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|candidate| candidate.updated_at == 0.0)
+            .count(),
+        2_000 - 16
+    );
+}
