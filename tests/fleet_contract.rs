@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -156,8 +156,19 @@ fn executable(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+fn fake_process_guard() -> MutexGuard<'static, ()> {
+    // Several fixtures exercise process-group termination. Keep those signals
+    // from overlapping another shell-backed fixture's spawn inside this one
+    // libtest process; the rest of the fleet contracts remain parallel.
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn ssh_config_discovery_is_file_only_and_configured_hosts_rank_first() {
+    let _process = fake_process_guard();
     let temp = TempDir::new().unwrap();
     let ssh = temp.path().join("ssh");
     fs::create_dir_all(ssh.join("conf.d")).unwrap();
@@ -568,6 +579,7 @@ fn server_rejects_changed_node_without_service_action() {
 
 #[test]
 fn ssh_payload_stays_on_stdin_and_remote_argv_is_fixed() {
+    let _process = fake_process_guard();
     let temp = TempDir::new().unwrap();
     let fake = temp.path().join("ssh");
     let log = temp.path().join("argv");
@@ -596,6 +608,7 @@ fn ssh_payload_stays_on_stdin_and_remote_argv_is_fixed() {
 
 #[test]
 fn ssh_timeout_is_bounded_and_mutation_becomes_outcome_unknown() {
+    let _process = fake_process_guard();
     let temp = TempDir::new().unwrap();
     let fake = temp.path().join("ssh");
     executable(&fake, "sleep 2");
@@ -610,6 +623,7 @@ fn ssh_timeout_is_bounded_and_mutation_becomes_outcome_unknown() {
 
 #[test]
 fn remote_consultation_reuses_one_connection_and_requires_v2_cleanup() {
+    let _process = fake_process_guard();
     let temp = TempDir::new().unwrap();
     let fake = temp.path().join("ssh");
     let body = "printf '%s\\n' '{\"type\":\"opened\",\"provider\":\"codex\",\"parent_id\":\"parent\",\"workstream_id\":\"parent\",\"consultation_mode\":\"default\",\"model\":\"gpt-test\",\"effort\":\"low\"}'\nwhile IFS= read -r line; do\n case \"$line\" in\n *\\\"close\\\"*) printf '%s\\n' '{\"type\":\"closed\",\"receipt_version\":2,\"discarded\":true,\"cleanup\":\"complete\"}'; exit 0 ;;\n *) printf '%s\\n' '{\"type\":\"answer\",\"text\":\"from remote expert\"}' ;;\n esac\ndone";
@@ -656,6 +670,7 @@ fn remote_consultation_reuses_one_connection_and_requires_v2_cleanup() {
 
 #[test]
 fn remote_consultation_cancellation_kills_owned_transport_promptly() {
+    let _process = fake_process_guard();
     let temp = TempDir::new().unwrap();
     let fake = temp.path().join("ssh");
     let owned_pid = temp.path().join("owned.pid");
@@ -735,6 +750,7 @@ fn remote_consultation_cancellation_kills_owned_transport_promptly() {
 
 #[test]
 fn remote_consultation_refuses_wrong_leaf_before_sending_question() {
+    let _process = fake_process_guard();
     let temp = TempDir::new().unwrap();
     let fake = temp.path().join("ssh");
     executable(
@@ -783,6 +799,7 @@ fn remote_consultation_refuses_wrong_leaf_before_sending_question() {
 
 #[test]
 fn remote_consultation_rejects_partial_frames_and_unverified_cleanup() {
+    let _process = fake_process_guard();
     let temp = TempDir::new().unwrap();
     let node_id = Uuid::new_v4().to_string();
     let remote = FleetSession {
