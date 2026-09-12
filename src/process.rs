@@ -493,10 +493,41 @@ mod platform {
         if info.pbi_uid != current_uid {
             return Ok(None);
         }
+        if info.pbi_status == super::MACOS_ZOMBIE_STATUS {
+            return Ok(None);
+        }
+        let start_time = info
+            .pbi_start_tvsec
+            .checked_mul(1_000_000)
+            .and_then(|value| value.checked_add(info.pbi_start_tvusec))
+            .ok_or_else(|| "invalid process start time".to_owned())?;
         let argv = match process_arguments(pid32) {
             Some(argv) => argv,
-            None if !process_exists(pid32) => return Ok(None),
-            None => return Err("cannot read process command line".into()),
+            None => match pidinfo::<BSDInfo>(pid32, 0) {
+                Err(error) if process_info_error_is_missing(&error) => return Ok(None),
+                Err(_) if !process_exists(pid32) => return Ok(None),
+                Err(error) => {
+                    return Err(format!("cannot verify unreadable process info: {error}"));
+                }
+                Ok(current)
+                    if super::mac_unreadable_process_is_transient(
+                        pid,
+                        start_time,
+                        Some((
+                            i64::from(current.pbi_pid),
+                            current
+                                .pbi_start_tvsec
+                                .checked_mul(1_000_000)
+                                .and_then(|value| value.checked_add(current.pbi_start_tvusec))
+                                .unwrap_or_default(),
+                            current.pbi_status,
+                        )),
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Ok(_) => return Err("cannot read process command line".into()),
+            },
         };
         // Re-read after argv so exit/reuse during observation fails closed.
         let verified = match pidinfo::<BSDInfo>(pid32, 0) {
@@ -505,11 +536,6 @@ mod platform {
             Err(_) if !process_exists(pid32) => return Ok(None),
             Err(error) => return Err(format!("cannot verify process info: {error}")),
         };
-        let start_time = info
-            .pbi_start_tvsec
-            .checked_mul(1_000_000)
-            .and_then(|value| value.checked_add(info.pbi_start_tvusec))
-            .ok_or_else(|| "invalid process start time".to_owned())?;
         let verified_start = verified
             .pbi_start_tvsec
             .checked_mul(1_000_000)
@@ -581,6 +607,23 @@ mod platform {
             }
         }
         (output.len() == count as usize).then_some(output)
+    }
+}
+
+// Darwin's proc status value for an unreaped zombie. Kept as a numeric wire
+// value so this race-classification helper remains testable on every host.
+const MACOS_ZOMBIE_STATUS: u32 = 5;
+
+fn mac_unreadable_process_is_transient(
+    original_pid: i64,
+    original_start: u64,
+    reread: Option<(i64, u64, u32)>,
+) -> bool {
+    match reread {
+        None => true,
+        Some((pid, start, status)) => {
+            status == MACOS_ZOMBIE_STATUS || pid != original_pid || start != original_start
+        }
     }
 }
 
@@ -672,6 +715,26 @@ mod tests {
         assert_eq!(observed.processes.len(), 1);
         assert!(matches!(observed.state, ObservationState::Partial(_)));
         assert!(observed.require_complete("reconcile ownership").is_err());
+    }
+
+    #[test]
+    fn macos_unreadable_pid_race_skips_only_absent_zombie_or_reused_processes() {
+        assert!(mac_unreadable_process_is_transient(42, 100, None));
+        assert!(mac_unreadable_process_is_transient(
+            42,
+            100,
+            Some((42, 100, MACOS_ZOMBIE_STATUS))
+        ));
+        assert!(mac_unreadable_process_is_transient(
+            42,
+            100,
+            Some((42, 101, 2))
+        ));
+        assert!(!mac_unreadable_process_is_transient(
+            42,
+            100,
+            Some((42, 100, 2))
+        ));
     }
 
     #[test]

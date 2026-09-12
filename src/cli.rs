@@ -17,10 +17,11 @@ use crate::{
     },
     paths::Paths,
     process,
+    resolve::NameResolutionError,
     scheduler::{self, ScheduleRequest},
     setup::{self, SetupOptions, SetupPaths},
     setup_preview, skill,
-    store::Store,
+    store::{Store, StoreChangeWatcher},
     terminal::{self, Palette},
     update::{self, InstallRequest, ReleaseManifest, UpdateRequest},
     usage, wait as wait_contract,
@@ -606,7 +607,7 @@ fn bare(pika: &Pika) -> Result<i32> {
     let cached = board_items(pika)?;
     // At most one unpublished snapshot is useful: the board always wants the
     // newest complete observation, never a backlog of stale inventories.
-    let (sender, receiver) = mpsc::sync_channel(1);
+    let (sender, receiver) = monitor::latest_channel();
     let (refresh_sender, refresh_receiver) = mpsc::sync_channel(1);
     let stop = Arc::new(AtomicBool::new(false));
     let local_refresh_delayed = Arc::new(AtomicBool::new(false));
@@ -634,15 +635,16 @@ fn bare(pika: &Pika) -> Result<i32> {
                     Ordering::Relaxed,
                 );
                 if let Ok(items) = refresh {
-                    match local_sender.try_send(items) {
-                        Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                        Err(mpsc::TrySendError::Disconnected(_)) => break,
-                    }
-                    // Consume reconciliation's own commits only after a
-                    // successful observation. On failure, leave hook commits
-                    // visible to the independent cached-update path below.
-                    if let Some(watcher) = &mut store_changes {
-                        let _ = watcher.changed();
+                    local_sender.publish(items);
+                    // Never consume a coalesced reconcile/hook commit without
+                    // re-reading the cache. If this creates the first watcher,
+                    // the read also closes the database-creation race window.
+                    if let Some(items) =
+                        snapshot_after_store_change(&worker.store, &mut store_changes, || {
+                            board_items(&worker)
+                        })
+                    {
+                        local_sender.publish(items);
                     }
                 }
                 next_reconcile = Instant::now() + Duration::from_secs(10);
@@ -653,15 +655,12 @@ fn bare(pika: &Pika) -> Result<i32> {
             match refresh_receiver.recv_timeout(wait) {
                 Ok(()) => next_reconcile = Instant::now(),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let changed = store_changes
-                        .as_mut()
-                        .and_then(|watcher| watcher.changed().ok())
-                        .unwrap_or(false);
-                    if changed && let Ok(items) = board_items(&worker) {
-                        match local_sender.try_send(items) {
-                            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                            Err(mpsc::TrySendError::Disconnected(_)) => break,
-                        }
+                    if let Some(items) =
+                        snapshot_after_store_change(&worker.store, &mut store_changes, || {
+                            board_items(&worker)
+                        })
+                    {
+                        local_sender.publish(items);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -680,10 +679,7 @@ fn bare(pika: &Pika) -> Result<i32> {
             {
                 let _ = manager.refresh_node(&node.node_id);
                 if let Ok(items) = board_items(&remote_worker) {
-                    match remote_sender.try_send(items) {
-                        Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                        Err(mpsc::TrySendError::Disconnected(_)) => break,
-                    }
+                    remote_sender.publish(items);
                 }
             }
             for _ in 0..10 {
@@ -737,9 +733,56 @@ fn record_local_refresh_result(consecutive_failures: &mut u8, succeeded: bool) -
     *consecutive_failures >= 2
 }
 
+fn ensure_store_change_watcher(store: &Store, watcher: &mut Option<StoreChangeWatcher>) -> bool {
+    if watcher.is_none() {
+        *watcher = store.change_watcher().ok();
+        return watcher.is_some();
+    }
+    false
+}
+
+fn store_changed(store: &Store, watcher: &mut Option<StoreChangeWatcher>) -> bool {
+    if ensure_store_change_watcher(store, watcher) {
+        return true;
+    }
+    match watcher.as_mut().map(StoreChangeWatcher::changed) {
+        Some(Ok(changed)) => changed,
+        Some(Err(_)) => {
+            // A replaced/corrupt connection is not permanent: retry from a
+            // fresh data_version baseline on the next poll.
+            *watcher = None;
+            false
+        }
+        None => false,
+    }
+}
+
+fn snapshot_after_store_change<T>(
+    store: &Store,
+    watcher: &mut Option<StoreChangeWatcher>,
+    load: impl FnOnce() -> Result<T>,
+) -> Option<T> {
+    if !store_changed(store, watcher) {
+        return None;
+    }
+    match load() {
+        Ok(snapshot) => Some(snapshot),
+        Err(_) => {
+            // Re-establishing the watcher makes the next poll reload once even
+            // if SQLite has no newer commit after this transient read failure.
+            *watcher = None;
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod board_refresh_tests {
-    use super::record_local_refresh_result;
+    use super::{
+        ensure_store_change_watcher, record_local_refresh_result, snapshot_after_store_change,
+        store_changed,
+    };
+    use crate::store::Store;
 
     #[test]
     fn local_refresh_notice_requires_consecutive_failures_and_clears_on_success() {
@@ -753,6 +796,38 @@ mod board_refresh_tests {
         assert!(!record_local_refresh_result(&mut failures, false));
         assert!(!record_local_refresh_result(&mut failures, true));
         assert!(!record_local_refresh_result(&mut failures, false));
+    }
+
+    #[test]
+    fn watcher_created_after_first_database_initialization_observes_later_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::at(root.path().join("state/pika.db"));
+        let mut watcher = store.change_watcher().ok();
+        assert!(watcher.is_none());
+
+        store.initialize().unwrap();
+        ensure_store_change_watcher(&store, &mut watcher);
+        assert!(watcher.is_some());
+        store.set_meta("board-test", "updated").unwrap();
+        assert!(store_changed(&store, &mut watcher));
+    }
+
+    #[test]
+    fn hook_commit_between_reconcile_snapshot_and_watcher_consume_is_reloaded() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::at(root.path().join("state/pika.db"));
+        store.initialize().unwrap();
+        let mut watcher = None;
+        assert!(ensure_store_change_watcher(&store, &mut watcher));
+
+        let reconcile_snapshot = store.get_meta("interleaved-hook").unwrap();
+        assert_eq!(reconcile_snapshot, None);
+        store.set_meta("interleaved-hook", "newest").unwrap();
+
+        let delivered = snapshot_after_store_change(&store, &mut watcher, || {
+            store.get_meta("interleaved-hook")
+        });
+        assert_eq!(delivered, Some(Some("newest".into())));
     }
 }
 
@@ -1228,6 +1303,163 @@ fn short_age(timestamp: f64) -> String {
         format!("{}d", seconds / 86_400)
     }
 }
+
+#[derive(Debug)]
+enum NamedTarget {
+    Local(Box<Session>),
+    Remote(Box<fleet::FleetSession>),
+}
+
+#[derive(Clone, Copy)]
+enum LocalTargetDomain {
+    Daily,
+    Expert,
+}
+
+impl LocalTargetDomain {
+    fn includes_remote_experts(self) -> bool {
+        matches!(self, Self::Expert)
+    }
+}
+
+/// Expert actions deliberately retain stopped-watching conversations. They
+/// are private transcript consultations, not operational board actions, and
+/// stopping observation has never deleted their durable expertise.
+fn resolve_structural_local(
+    pika: &Pika,
+    name: &str,
+    include_provider_candidates: bool,
+) -> Result<Vec<Session>> {
+    let (provider, query) = name
+        .split_once(':')
+        .and_then(|(prefix, query)| {
+            prefix
+                .parse::<Provider>()
+                .ok()
+                .map(|provider| (Some(provider), query))
+        })
+        .unwrap_or((None, name));
+    let mut matches = pika
+        .store
+        .list_sessions()?
+        .into_iter()
+        .chain(pika.store.list_untracked_sessions()?)
+        .filter(|session| provider.is_none_or(|value| session.provider == value))
+        .filter(|session| {
+            session.session_id == query
+                || session.provider_thread_id() == query
+                || session
+                    .name
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(query))
+        })
+        .collect::<Vec<_>>();
+    if include_provider_candidates {
+        let providers = crate::providers::Providers::new(&pika.paths, &pika.config);
+        for candidate in Provider::ALL
+            .into_iter()
+            .filter(|value| provider.is_none_or(|expected| expected == *value))
+            .flat_map(|provider| providers.find(provider, query))
+            .filter(|candidate| {
+                candidate.session_id == query
+                    || candidate
+                        .name
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(query))
+            })
+        {
+            if !matches.iter().any(|session| {
+                session.provider == candidate.provider
+                    && (session.session_id == candidate.session_id
+                        || session.provider_thread_id() == candidate.session_id)
+            }) {
+                matches.push(crate::core::session_from_candidate(&candidate));
+            }
+        }
+    }
+    Ok(matches)
+}
+
+fn resolve_expert_local(pika: &Pika, name: &str) -> Result<Vec<Session>> {
+    resolve_structural_local(pika, name, false)
+}
+
+/// Resolve one user-supplied name across both local daily names and explicit
+/// remote routes. A literal local `name@alias` never loses merely because the
+/// suffix is also an adopted machine alias.
+fn resolve_named_target(
+    pika: &Pika,
+    name: &str,
+    fresh_remote: bool,
+    domain: LocalTargetDomain,
+) -> Result<Option<NamedTarget>> {
+    let manager = FleetManager::new(&pika.store, SshTransport::default());
+    let remote_result = manager.resolve(name, fresh_remote, domain.includes_remote_experts());
+    let local_result = match domain {
+        LocalTargetDomain::Daily => pika.resolve_local(name),
+        LocalTargetDomain::Expert => resolve_expert_local(pika, name),
+    };
+    let local = match local_result {
+        Ok(local) => local,
+        Err(error)
+            if remote_result.as_ref().is_ok_and(Option::is_some)
+                && error.downcast_ref::<NameResolutionError>()
+                    == Some(&NameResolutionError::SavedUnavailable) =>
+        {
+            // A source-health failure must not let a remote route silently
+            // win over a literal persisted local `name@alias`. Recover only
+            // the structural local identity so combination below can report
+            // the collision; the local action itself remains unavailable.
+            resolve_structural_local(pika, name, true)?
+        }
+        Err(error) => return Err(error),
+    };
+    let remote = match remote_result {
+        Ok(remote) => remote,
+        Err(error) if error.kind == FleetErrorKind::NotFound && !local.is_empty() => None,
+        Err(error) => return Err(error.into()),
+    };
+    combine_named_targets(name, local, remote)
+}
+
+fn combine_named_targets(
+    name: &str,
+    local: Vec<Session>,
+    remote: Option<fleet::FleetSession>,
+) -> Result<Option<NamedTarget>> {
+    match (local.as_slice(), remote) {
+        ([], None) => Ok(None),
+        ([session], None) => Ok(Some(NamedTarget::Local(Box::new(session.clone())))),
+        ([], Some(remote)) => Ok(Some(NamedTarget::Remote(Box::new(remote)))),
+        (local, Some(remote)) => {
+            let local_identities = local
+                .iter()
+                .map(|session| format!("{}:{}", session.provider, session.session_id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "AMBIGUOUS TARGET · {name:?} matches local {local_identities} and remote {}. Use the exact local UUID or exact UUID@machine; no action was taken.",
+                remote.qualified_name()
+            )
+        }
+        (local, None) => bail!(
+            "AMBIGUOUS TARGET · {name:?} matches {} local conversations. Use PROVIDER:NAME or the exact UUID; no action was taken.",
+            local.len()
+        ),
+    }
+}
+
+fn local_wait_target(name: &str, target: Option<NamedTarget>) -> Result<Session> {
+    match target {
+        Some(NamedTarget::Local(session)) => Ok(*session),
+        Some(NamedTarget::Remote(remote)) => bail!(
+            "Remote waits are not supported because cached attention can become stale. Run exactly: `pika sync {}` and inspect again.",
+            shell_words::quote(&remote.node_name)
+        ),
+        None => bail!("No exact conversation named {name:?}."),
+    }
+}
+
 fn open_name(pika: &Pika, name: &str, allow_create: bool) -> Result<i32> {
     if name == "-" {
         let (provider, session_id) = pika
@@ -1282,34 +1514,33 @@ fn open_name(pika: &Pika, name: &str, allow_create: bool) -> Result<i32> {
         }
         return open_local_session(pika, selected);
     }
-    let manager = FleetManager::new(&pika.store, SshTransport::default());
-    if let Some(remote) = manager
-        .resolve(name, false, false)
-        .map_err(anyhow::Error::from)?
-    {
-        if let Some(code) = maybe_open_client_window(
-            pika,
-            &remote.node_id,
-            remote.session.provider,
-            &remote.session.session_id,
-        )? {
-            return Ok(code);
+    match resolve_named_target(pika, name, false, LocalTargetDomain::Daily)? {
+        Some(NamedTarget::Remote(remote)) => {
+            if let Some(code) = maybe_open_client_window(
+                pika,
+                &remote.node_id,
+                remote.session.provider,
+                &remote.session.session_id,
+            )? {
+                return Ok(code);
+            }
+            return FleetManager::new(&pika.store, SshTransport::default())
+                .attach(&remote)
+                .map_err(anyhow::Error::from);
         }
-        return manager.attach(&remote).map_err(anyhow::Error::from);
-    }
-    let matches = pika.resolve_local(name)?;
-    if !matches.is_empty() {
-        let selected = choose_session(matches, &format!("Choose {name}"))?;
-        let local_node_id = pika.store.ensure_local_node_id()?;
-        if let Some(code) = maybe_open_client_window(
-            pika,
-            &local_node_id,
-            selected.provider,
-            &selected.session_id,
-        )? {
-            return Ok(code);
+        Some(NamedTarget::Local(selected)) => {
+            let local_node_id = pika.store.ensure_local_node_id()?;
+            if let Some(code) = maybe_open_client_window(
+                pika,
+                &local_node_id,
+                selected.provider,
+                &selected.session_id,
+            )? {
+                return Ok(code);
+            }
+            return open_local_session(pika, *selected);
         }
-        return open_local_session(pika, selected);
+        None => {}
     }
     let receipt = pika.open_name(name, true, allow_create)?;
     finish_local_open(pika, &receipt)
@@ -1399,47 +1630,24 @@ fn next(pika: &Pika) -> Result<i32> {
         }
     }
 }
-fn select_one(pika: &Pika, name: &str) -> Result<Session> {
-    let m = pika.resolve_local(name)?;
-    match m.as_slice() {
-        [] => bail!("No exact conversation named {name:?}."),
-        [s] => Ok(s.clone()),
-        many => bail!(
-            "{name:?} matches {} conversations; run `pika PROVIDER:{name}`.",
-            many.len()
-        ),
-    }
-}
-fn select_current_local(pika: &Pika, name: &str) -> Result<Session> {
-    let selected = select_one(pika, name)?;
-    Ok(pika
-        .reconcile_local()?
-        .sessions
-        .into_iter()
-        .find(|session| {
-            session.provider == selected.provider && session.session_id == selected.session_id
-        })
-        .unwrap_or(selected))
-}
 fn peek(pika: &Pika, a: PeekArgs) -> Result<i32> {
-    let manager = FleetManager::new(&pika.store, SshTransport::default());
-    if let Some(remote) = manager
-        .resolve(&a.name, true, false)
-        .map_err(anyhow::Error::from)?
-    {
-        println!(
-            "{}",
-            manager
-                .capture(&remote, a.lines.unwrap_or(pika.config.peek_lines))
-                .map_err(anyhow::Error::from)?
-        );
-        if a.ack {
-            manager.acknowledge(&remote).map_err(anyhow::Error::from)?;
+    match resolve_named_target(pika, &a.name, true, LocalTargetDomain::Daily)? {
+        Some(NamedTarget::Remote(remote)) => {
+            let manager = FleetManager::new(&pika.store, SshTransport::default());
+            println!(
+                "{}",
+                manager
+                    .capture(&remote, a.lines.unwrap_or(pika.config.peek_lines))
+                    .map_err(anyhow::Error::from)?
+            );
+            if a.ack {
+                manager.acknowledge(&remote).map_err(anyhow::Error::from)?;
+            }
+            Ok(0)
         }
-        return Ok(0);
+        Some(NamedTarget::Local(session)) => peek_session(pika, *session, a.lines, a.ack),
+        None => bail!("No exact conversation named {:?}.", a.name),
     }
-    let s = select_current_local(pika, &a.name)?;
-    peek_session(pika, s, a.lines, a.ack)
 }
 fn peek_session(pika: &Pika, s: Session, lines: Option<usize>, ack: bool) -> Result<i32> {
     println!(
@@ -1453,22 +1661,20 @@ fn peek_session(pika: &Pika, s: Session, lines: Option<usize>, ack: bool) -> Res
     Ok(0)
 }
 fn untrack(pika: &Pika, name: &str) -> Result<i32> {
-    let manager = FleetManager::new(&pika.store, SshTransport::default());
-    if let Some(remote) = manager
-        .resolve(name, true, false)
-        .map_err(anyhow::Error::from)?
-    {
-        manager
-            .untrack(&remote, None)
-            .map_err(anyhow::Error::from)?;
-        println!(
-            "Stopped watching {}. The remote agent and its history were not stopped or archived.",
-            remote.qualified_name()
-        );
-        return Ok(0);
+    match resolve_named_target(pika, name, true, LocalTargetDomain::Daily)? {
+        Some(NamedTarget::Remote(remote)) => {
+            FleetManager::new(&pika.store, SshTransport::default())
+                .untrack(&remote, None)
+                .map_err(anyhow::Error::from)?;
+            println!(
+                "Stopped watching {}. The remote agent and its history were not stopped or archived.",
+                remote.qualified_name()
+            );
+            Ok(0)
+        }
+        Some(NamedTarget::Local(session)) => untrack_exact(pika, *session),
+        None => bail!("No exact conversation named {name:?}."),
     }
-    let s = select_current_local(pika, name)?;
-    untrack_exact(pika, s)
 }
 fn untrack_exact(pika: &Pika, s: Session) -> Result<i32> {
     pika.store.untrack_session(s.provider, &s.session_id)?;
@@ -1489,13 +1695,18 @@ fn untrack_exact(pika: &Pika, s: Session) -> Result<i32> {
     Ok(0)
 }
 fn wait(pika: &Pika, a: WaitArgs) -> Result<i32> {
-    if a.name.contains('@') {
-        bail!(
-            "Remote waits are not supported because cached attention can become stale. Run exactly: `pika sync {}` and inspect again.",
-            shell_words::quote(a.name.rsplit_once('@').map_or(&a.name, |(_, node)| node))
-        )
-    }
-    let initial = select_current_local(pika, &a.name)?;
+    let selected = local_wait_target(
+        &a.name,
+        resolve_named_target(pika, &a.name, true, LocalTargetDomain::Daily)?,
+    )?;
+    let initial = pika
+        .reconcile_local()?
+        .sessions
+        .into_iter()
+        .find(|session| {
+            session.provider == selected.provider && session.session_id == selected.session_id
+        })
+        .unwrap_or(selected);
     let start = Instant::now();
     let mut next_reconcile = start + Duration::from_secs(5);
     loop {
@@ -1779,12 +1990,8 @@ fn expert(pika: &Pika, a: ExpertArgs) -> Result<i32> {
 }
 
 fn select_expert_target(pika: &Pika, name: &str) -> Result<Session> {
-    if name.contains('@') {
-        let manager = FleetManager::new(&pika.store, SshTransport::default());
-        if let Some(remote) = manager
-            .resolve(name, false, true)
-            .map_err(anyhow::Error::from)?
-        {
+    match resolve_named_target(pika, name, false, LocalTargetDomain::Expert)? {
+        Some(NamedTarget::Remote(remote)) => {
             let node = pika
                 .store
                 .get_fleet_node(&remote.node_id)?
@@ -1796,38 +2003,8 @@ fn select_expert_target(pika: &Pika, name: &str) -> Result<Session> {
                 shell_words::quote(&remote.node_name)
             )
         }
-    }
-    let (provider, query) = name
-        .split_once(':')
-        .and_then(|(prefix, query)| {
-            prefix
-                .parse::<Provider>()
-                .ok()
-                .map(|provider| (Some(provider), query))
-        })
-        .unwrap_or((None, name));
-    let matches = pika
-        .store
-        .list_sessions()?
-        .into_iter()
-        .chain(pika.store.list_untracked_sessions()?)
-        .filter(|session| provider.is_none_or(|value| session.provider == value))
-        .filter(|session| {
-            session.session_id == query
-                || session.provider_thread_id() == query
-                || session
-                    .name
-                    .as_deref()
-                    .is_some_and(|value| value.eq_ignore_ascii_case(query))
-        })
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [session] => Ok(session.clone()),
-        [] => bail!("No tracked or unwatched expert conversation matches {name:?}."),
-        many => bail!(
-            "{name:?} matches {} expert conversations; use PROVIDER:{name} or the exact UUID.",
-            many.len()
-        ),
+        Some(NamedTarget::Local(session)) => Ok(*session),
+        None => bail!("No tracked or unwatched expert conversation matches {name:?}."),
     }
 }
 fn split_values(v: Vec<String>) -> Vec<String> {
@@ -1842,14 +2019,11 @@ fn split_values(v: Vec<String>) -> Vec<String> {
         .collect()
 }
 fn explain(pika: &Pika, a: ExplainArgs) -> Result<i32> {
-    let manager = FleetManager::new(&pika.store, SshTransport::default());
-    let remote = manager
-        .resolve(&a.name, false, false)
-        .map_err(anyhow::Error::from)?;
-    let s = if let Some(remote) = &remote {
-        remote.session.clone()
-    } else {
-        select_current_local(pika, &a.name)?
+    let target = resolve_named_target(pika, &a.name, false, LocalTargetDomain::Daily)?
+        .with_context(|| format!("No exact conversation named {:?}.", a.name))?;
+    let (s, remote) = match target {
+        NamedTarget::Remote(remote) => (remote.session.clone(), Some(remote)),
+        NamedTarget::Local(session) => (*session, None),
     };
     let o = if remote.is_some() {
         Vec::new()
@@ -2590,14 +2764,11 @@ fn update_command(a: UpdateArgs) -> Result<i32> {
     Ok(0)
 }
 fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
-    let manager = FleetManager::new(&pika.store, SshTransport::default());
-    if let Some(remote) = manager
-        .resolve(&a.name, false, true)
-        .map_err(anyhow::Error::from)?
-    {
-        return ask_remote(pika, remote, a);
-    }
-    let session = select_one(pika, &a.name)?;
+    let session = match resolve_named_target(pika, &a.name, false, LocalTargetDomain::Expert)? {
+        Some(NamedTarget::Remote(remote)) => return ask_remote(pika, *remote, a),
+        Some(NamedTarget::Local(session)) => *session,
+        None => bail!("No exact conversation named {:?}.", a.name),
+    };
     let mut options =
         crate::consult::ConsultationOptions::new(pika.config.executable(session.provider));
     options.fast = a.fast;
@@ -3787,6 +3958,81 @@ mod fleet_consultation_tests {
             estimated_cost_usd: None,
             active_thread_id: Some("parent-thread".into()),
         }
+    }
+
+    #[test]
+    fn literal_local_at_name_and_remote_route_are_explicitly_ambiguous() {
+        let root = tempfile::tempdir().unwrap();
+        let mut local = fixture_session(root.path());
+        local.name = Some("work@atlas".into());
+        let mut remote_session = fixture_session(root.path());
+        remote_session.name = Some("work".into());
+        remote_session.session_id = "22222222-2222-4222-8222-222222222222".into();
+        let remote = fleet::FleetSession {
+            node_id: "33333333-3333-4333-8333-333333333333".into(),
+            node_name: "atlas".into(),
+            session: remote_session,
+            stale: false,
+            remote_error: None,
+            seen_at: 1.0,
+            card_status: None,
+            card_detail: None,
+            watched: true,
+            availability: Some("source-available".into()),
+            scope_updated_at: None,
+            current_state_updated_at: None,
+            current_state_status: None,
+        };
+
+        let local_only = combine_named_targets("work@atlas", vec![local.clone()], None).unwrap();
+        let wait_target = local_wait_target("work@atlas", local_only).unwrap();
+        assert_eq!(wait_target.session_id, local.session_id);
+        let error = combine_named_targets("work@atlas", vec![local], Some(remote)).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("AMBIGUOUS TARGET"));
+        assert!(message.contains("exact local UUID"));
+        assert!(message.contains("no action was taken"));
+    }
+
+    #[test]
+    fn expert_resolution_preserves_stopped_watching_local_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        let state_dir = root.path().join("state");
+        let paths = crate::paths::Paths {
+            config: config_dir.join("config.json"),
+            database: state_dir.join("pika.db"),
+            config_dir,
+            state_dir,
+            codex_home: root.path().join("codex-home"),
+            claude_home: root.path().join("claude-home"),
+            opencode_data_home: root.path().join("opencode-data"),
+            opencode_config_home: root.path().join("opencode-config"),
+        };
+        let store = Store::at(&paths.database);
+        let mut session = fixture_session(root.path());
+        session.session_id = "11111111-1111-4111-8111-111111111111".into();
+        session.active_thread_id = None;
+        session.name = Some("unwatched_expert".into());
+        store.upsert_session(&session, false).unwrap();
+        store
+            .untrack_session(session.provider, &session.session_id)
+            .unwrap();
+        let pika = Pika::with_components(
+            paths,
+            crate::config::Config::default(),
+            store,
+            crate::tmux::Tmux::with_executable("fixture-tmux", Some("isolated".into())),
+        );
+
+        let matches = resolve_expert_local(&pika, "unwatched_expert").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].session_id, session.session_id);
+        assert!(
+            pika.store
+                .is_untracked(session.provider, &session.session_id)
+                .unwrap()
+        );
     }
 
     #[test]

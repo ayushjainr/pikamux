@@ -11,13 +11,15 @@ It uses copied reference code, disposable databases and fake transports only.
 | --- | --- |
 | Python database → Rust | Python creates the full schema and writes a Claude lifecycle hook; Rust opens it, reads it and writes the next real hook event. |
 | Rust database → Python | Rust creates the full schema and writes a hook; Python opens it, reads it and writes the next real hook event. |
-| Rust client → Python server | Real Rust requests and real Python responses for hello, expert-directory snapshot, peek, acknowledge, untrack and the post-mutation snapshot. |
-| Python client → Rust server | Real Rust response envelopes are consumed by Python's FleetManager for hello, snapshot, peek, acknowledge, untrack and refresh. |
+| Rust client → Python server | Real Rust requests and real Python responses for hello, expert-directory snapshot, peek, untrack and the post-mutation snapshot. Event acknowledgement is rejected as incompatible because Python v0.5 cannot bind it to the selected event. |
+| Python client → Rust server | Frozen Python consumes Rust response envelopes for hello, snapshot, peek and untrack. Its legacy acknowledgement request has no event timestamp and is deliberately rejected by Rust v0.6. |
 
 The alternating hook assertions cover session projection, unread state and the
 single-provider hook-observation row. The fleet assertions cover immutable node
 identity, protocol/capability validation, exact provider/session routing,
-mutation request IDs and post-untrack inventory.
+mutation request IDs and post-untrack inventory. Acknowledgement is intentionally
+not a mixed-version operation: v0.6 requires `expected_last_event_at`, which the
+v0.5 wire cannot provide without risking acknowledgement of a newer result.
 
 Run the evidence locally with:
 
@@ -46,7 +48,8 @@ field validation.
 - The harness intentionally does not run SSH, tmux, provider CLIs, hooks from a
   live agent, or any installer.
 - Adoption, attach and consultation streaming are tested elsewhere; this
-  transition harness covers the requested hello/snapshot/peek/ack/untrack set.
+  transition harness covers hello/snapshot/peek/untrack and explicitly verifies
+  that acknowledgement fails closed across the v0.5/v0.6 boundary.
 - It proves the frozen v0.5.0a4 schema, not arbitrary older or partially
   migrated databases.
 - Python 3.10+ runs the frozen code directly. Apple's system Python 3.9 lacks

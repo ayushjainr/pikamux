@@ -48,7 +48,7 @@ publication or installed-Pika cutover is claimed by this repository state.
   fork/turn/response/cleanup receipts.
 - Durable expert cards and quota-aware refresh for agent-to-agent discovery.
 - Trusted SSH/Tailscale federation with immutable node identity, cached remote
-  boards, exact remote actions, and mixed Python/native protocol compatibility.
+  boards, exact remote actions, and a fail-closed Python/native transition.
 - Previewable setup with preserved settings, atomic writes, backups, lifecycle
   hooks, the bundled `agent-convo` skill, and launchd/systemd expert refresh.
 - Locally verified native installation, updates, rollback-safe release roots, remote

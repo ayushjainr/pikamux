@@ -42,6 +42,7 @@ bridge_targets = {
     "x86_64-unknown-linux-musl",
 }
 native_targets = bridge_targets | {"x86_64-pc-windows-msvc"}
+allowed_top_level = {"LICENSE", "SHA256SUMS", "THIRD_PARTY.md", "pika-version"}
 
 def fail(message):
     raise SystemExit(f"Pika release verification: {message}")
@@ -72,13 +73,17 @@ def check_native(manifest_path, asset_root):
                 fail(f"native artifact checksum mismatch: {target}")
             if (asset_root / f"{expected}.sha256").read_text() != checksum + "\n":
                 fail(f"native sidecar mismatch: {target}")
+        return value
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         fail(f"invalid native release: {exc}")
 
 native = root / "pika-native-release.json"
 bridge = root / "pika-release.json"
 if native.is_file():
-    check_native(native, root)
+    native_manifest = check_native(native, root)
+    allowed_top_level.update({"install.sh", native.name})
+    for artifact in native_manifest["artifacts"].values():
+        allowed_top_level.update({artifact["file"], f'{artifact["file"]}.sha256'})
 if bridge.is_file():
     try:
         value = json.loads(bridge.read_text())
@@ -89,6 +94,7 @@ if bridge.is_file():
             fail("bridge version is not accepted by the frozen updater")
         if value["wheel"] != f"pikamux-{version}-py3-none-any.whl":
             fail("bridge wheel/version mismatch")
+        allowed_top_level.update({bridge.name, value["wheel"]})
         wheel_path = root / value["wheel"]
         data = wheel_path.read_bytes()
         if wheel_path.is_symlink() or len(data) > 64 * 1024 * 1024:
@@ -185,6 +191,15 @@ if bridge.is_file():
         fail(f"invalid transition bridge: {exc}")
 if not native.is_file() and not bridge.is_file():
     fail("release contains neither a native nor bridge manifest")
+regular_files = {
+    path.name for path in root.iterdir() if path.is_file() and not path.is_symlink()
+}
+missing = sorted(allowed_top_level - regular_files)
+if missing:
+    fail(f"release is missing top-level file(s): {', '.join(missing)}")
+unexpected = sorted(regular_files - allowed_top_level)
+if unexpected:
+    fail(f"release contains unexpected top-level file(s): {', '.join(unexpected)}")
 PY
 
 printf 'Pika release verified: %s\n' "$pika_release"

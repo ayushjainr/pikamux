@@ -860,6 +860,138 @@ fn public_cli_installs_and_checks_a_native_bundle_end_to_end() {
 }
 
 #[test]
+fn default_shell_bootstrap_succeeds_without_a_controlling_tty() {
+    let temporary = tempfile::tempdir().unwrap();
+    let temp = temporary.path().canonicalize().unwrap();
+    let bundle = temp.join("release");
+    let root = temp.join("managed");
+    let bin = temp.join("bin");
+    let home = temp.join("home");
+    let codex_home = temp.join("codex");
+    let fake_bin = temp.join("fake-bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let tmux = fake_bin.join("tmux");
+    fs::write(&tmux, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let version = env!("CARGO_PKG_VERSION");
+    let target = native_target().unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_pika"));
+    let packaged = Command::new("bash")
+        .arg("scripts/package-release.sh")
+        .arg(version)
+        .arg(&bundle)
+        .arg(format!("{target}={}", binary.display()))
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    let path = format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap());
+    let installed = Command::new("python3")
+        .args([
+            "-c",
+            "import os,sys; os.setsid(); os.execv('/bin/bash', ['bash', *sys.argv[1:]])",
+        ])
+        .arg(bundle.join("install.sh"))
+        .arg("--bundle")
+        .arg(&bundle)
+        .arg("--root")
+        .arg(&root)
+        .arg("--bin-dir")
+        .arg(&bin)
+        .env("PATH", path)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("PIKA_CONFIG_HOME", home.join("pika-config"))
+        .env("PIKA_STATE_HOME", home.join("pika-state"))
+        .env("CODEX_HOME", &codex_home)
+        .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+        .env("OPENCODE_CONFIG_DIR", home.join("opencode"))
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&installed.stderr).contains("/dev/tty"));
+    assert!(String::from_utf8_lossy(&installed.stdout).contains("Next:"));
+    assert_eq!(
+        fs::read_to_string(codex_home.join("skills/agent-convo/SKILL.md")).unwrap(),
+        pikamux::skill::AGENT_CONVO_SKILL
+    );
+    assert_eq!(
+        Command::new(bin.join("pika"))
+            .arg("--version")
+            .output()
+            .unwrap()
+            .stdout,
+        format!("pika {version}\n").as_bytes()
+    );
+}
+
+#[test]
+fn release_verifier_rejects_unexpected_top_level_regular_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let bundle = temp.path().join("release");
+    let version = env!("CARGO_PKG_VERSION");
+    let binary = Path::new(env!("CARGO_BIN_EXE_pika"));
+    let targets = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-musl",
+        "x86_64-unknown-linux-musl",
+        "x86_64-pc-windows-msvc",
+    ];
+    let mut package = Command::new("bash");
+    package
+        .arg("scripts/package-release.sh")
+        .arg(version)
+        .arg(&bundle)
+        .env("PIKA_CROSS_PACKAGE", "1");
+    for target in targets {
+        package.arg(format!("{target}={}", binary.display()));
+    }
+    let packaged = package.output().unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let verified = Command::new("bash")
+        .arg("scripts/verify-release.sh")
+        .arg(&bundle)
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+
+    fs::write(bundle.join("unexpected.txt"), "must not be published\n").unwrap();
+    let rejected = Command::new("bash")
+        .arg("scripts/verify-release.sh")
+        .arg(&bundle)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("unexpected top-level file(s): unexpected.txt"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
 fn remote_payload_is_version_pinned_allowlisted_and_installer_verified() {
     let temp = tempfile::tempdir().unwrap();
     let version = env!("CARGO_PKG_VERSION");

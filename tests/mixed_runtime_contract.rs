@@ -251,7 +251,7 @@ impl FleetTransport for &PythonTransport<'_> {
 }
 
 #[test]
-fn rust_client_drives_python_v050a4_fleet_envelopes_end_to_end() {
+fn rust_client_supports_non_ack_v050a4_operations_and_rejects_legacy_ack() {
     let lab = PythonLab::new();
     let python_database = lab.database("python-fleet.db");
     let local_store = Store::at(lab.database("rust-client.db"));
@@ -308,6 +308,7 @@ fn rust_client_drives_python_v050a4_fleet_envelopes_end_to_end() {
 
 struct RustService {
     tracked: bool,
+    acknowledgements: usize,
 }
 
 impl RustService {
@@ -384,6 +385,7 @@ impl FleetService for RustService {
         session_id: &str,
         expected_last_event_at: f64,
     ) -> Result<bool, FleetError> {
+        self.acknowledgements += 1;
         assert_eq!((provider, session_id), (Provider::Codex, SESSION_ID));
         Ok(expected_last_event_at == Self::session().last_event_at)
     }
@@ -396,7 +398,7 @@ impl FleetService for RustService {
 }
 
 #[test]
-fn python_v050a4_client_accepts_rust_fleet_envelopes_end_to_end() {
+fn python_v050a4_non_ack_operations_interoperate_but_legacy_ack_is_rejected() {
     let lab = PythonLab::new();
     let server_store = Store::at(lab.database("rust-server.db"));
     server_store.initialize().unwrap();
@@ -408,7 +410,7 @@ fn python_v050a4_client_accepts_rust_fleet_envelopes_end_to_end() {
         json!({"op":"hello", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION}),
         json!({"op":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "expert_directory":true}),
         json!({"op":"peek", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "provider":"codex", "session_id":SESSION_ID, "lines":17}),
-        json!({"op":"acknowledge", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "provider":"codex", "session_id":SESSION_ID, "expected_last_event_at":4242.0}),
+        json!({"op":"acknowledge", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "provider":"codex", "session_id":SESSION_ID}),
         json!({"op":"untrack", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "provider":"codex", "session_id":SESSION_ID, "request_id":REQUEST_ID}),
         json!({"op":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":node_id, "expert_directory":true}),
     ];
@@ -419,15 +421,23 @@ fn python_v050a4_client_accepts_rust_fleet_envelopes_end_to_end() {
         .join("\n")
         + "\n";
     let mut output = Vec::new();
+    let mut service = RustService {
+        tracked: true,
+        acknowledgements: 0,
+    };
     handle_fleet_stdio(
         &server_store,
         "rust-node",
         env!("CARGO_PKG_VERSION"),
-        &mut RustService { tracked: true },
+        &mut service,
         Cursor::new(input),
         &mut output,
     )
     .unwrap();
+    assert_eq!(
+        service.acknowledgements, 0,
+        "legacy acknowledgement must be rejected before service mutation"
+    );
     let transcript = lab.database("rust-transcript.jsonl");
     fs::write(&transcript, output).unwrap();
     let validated = lab.json(&[
@@ -437,8 +447,20 @@ fn python_v050a4_client_accepts_rust_fleet_envelopes_end_to_end() {
     ]);
     assert_eq!(validated["version"], "0.5.0a4");
     assert_eq!(validated["node_id"], node_id);
+    assert_eq!(validated["acknowledgement"], "incompatible");
+    assert!(
+        validated["acknowledgement_request"]["expected_last_event_at"].is_null(),
+        "frozen Python's acknowledgement wire has no event binding"
+    );
     assert_eq!(
         validated["operations"],
-        json!(["hello", "snapshot", "peek", "ack", "untrack"])
+        json!([
+            "hello",
+            "snapshot",
+            "peek",
+            "acknowledge",
+            "untrack",
+            "snapshot"
+        ])
     );
 }

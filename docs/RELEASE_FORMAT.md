@@ -122,9 +122,12 @@ installation lock, stages a complete immutable release, and atomically switches
 under an existing version are refused. Old releases remain available for running
 callbacks and rollback.
 
-Installation and update do not open Pika's state database, scan provider
-histories, modify hooks or skills, run setup, restart agents, or update another
-machine. `pika setup` separately previews integration changes.
+Managed native activation and `pika update` do not open Pika's state database,
+scan provider histories, modify hooks or skills, run setup, restart agents, or
+update another machine. Unless `--no-setup` is selected, the public `install.sh`
+bootstrap then installs the embedded agent-convo skill with backup and symlink
+safeguards before offering the separately previewed `pika setup`; provider hooks
+and configuration still change only through that approved setup flow.
 
 ## CI and publication
 

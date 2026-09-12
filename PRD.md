@@ -317,6 +317,11 @@ silently converted into managed installations.
 Test Python coordinator → Rust node and Rust coordinator → Python node, as well
 as homogeneous pairs. Pin protocol 2, its capabilities and strict envelope limits
 from `fleet.py`; additive fields are accepted only where old parsers allow them.
+The v0.5 acknowledgement wire has no selected-event timestamp. Native v0.6 must
+therefore reject acknowledgement in both mixed-version directions rather than
+weaken F10's event binding; hello, snapshot, peek and untrack remain supported
+during that transition, and the incompatibility must be explicit in the pairing
+matrix and receipts.
 
 Inspection found `client_cli.py` declares fleet version 1 while `fleet.py` declares
 version 2. Treat this as an unresolved compatibility discrepancy requiring a
@@ -507,8 +512,10 @@ parent is not proof of pollution. Record the actual guarantee tested, not a blan
 - **CP5.1: Fleet inventory.** Passive discovery, selected-node trust, versioned strict
   envelopes, cache age and fair bounded scheduler; stalled SSH never stalls local UI.
 - **CP5.2: Exact remote actions.** Attach/peek/ack/untrack/ask and expertise directory
-  on all supported Python/Rust pairs; changed node ID and malformed/truncated messages
-  fail closed; outcome is separate from later snapshot refresh.
+  on capability-compatible pairs. During the v0.5/v0.6 transition, hello, snapshot,
+  peek and untrack interoperate while event-unbound acknowledgement fails closed;
+  changed node ID and malformed/truncated messages fail closed, and action outcome
+  remains separate from later snapshot refresh.
 - **CP5.3: Client bridge.** Reproduce/version-resolve the experimental client path;
   loopback-only listener, exact IDs, deduplication, tunnel absence versus rejection,
   pairing secret rotation, and confirmed-window-launch versus confirmed-attach.

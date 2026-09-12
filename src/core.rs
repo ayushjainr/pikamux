@@ -159,6 +159,39 @@ impl Pika {
         };
         let providers = Providers::new(&self.paths, &self.config);
         let mut stored = self.store.list_sessions()?;
+        let removed = stored
+            .iter()
+            .filter(|session| {
+                matches!(
+                    providers.source_state(
+                        session.provider,
+                        session.provider_thread_id(),
+                        session.transcript_path.as_deref(),
+                    ),
+                    crate::providers::ProviderSourceState::Archived
+                        | crate::providers::ProviderSourceState::Deleted
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed_keys = removed
+            .iter()
+            .map(|session| (session.provider, session.session_id.clone()))
+            .collect::<BTreeSet<_>>();
+        stored.retain(|session| {
+            !removed_keys.contains(&(session.provider, session.session_id.clone()))
+        });
+        // Match the frozen durable-state contract: provider-proven archive or
+        // deletion removes the row from daily observation. Pane tags are cleared
+        // only through a generation-guarded mutation and remain best effort.
+        for session in &removed {
+            for pane in panes.iter().filter(|pane| {
+                pane.pika_provider == Some(session.provider)
+                    && pane.pika_session_id.as_deref() == Some(&session.session_id)
+            }) {
+                let _ = self.tmux.clear_tags_if_unchanged(pane);
+            }
+        }
         let mut wanted = BTreeMap::<Provider, BTreeSet<String>>::new();
         for session in &stored {
             wanted
@@ -240,6 +273,9 @@ impl Pika {
         }
         let sessions = self.store.reconcile_transaction(|ledger| {
             let mut sessions = Vec::with_capacity(stored.len() + fork_imports.len());
+            for session in &removed {
+                ledger.delete_session(session.provider, &session.session_id, false)?;
+            }
             for mut session in stored {
                 let (candidate, continuation_conflicts) =
                     continuation_candidate(&session, &candidate_map, &panes, processes, now());
@@ -764,6 +800,23 @@ impl Pika {
         Ok(())
     }
 
+    fn record_exact_handoff(
+        &self,
+        session: &Session,
+        expected: &ExactPaneBinding,
+        expected_event_at: f64,
+    ) -> Result<()> {
+        self.confirm_exact_handoff(session, expected)?;
+        open_history::record_session(&self.store, session.provider, &session.session_id)?;
+        self.store.acknowledge_attention(
+            session.provider,
+            &session.session_id,
+            expected_event_at,
+            true,
+        )?;
+        Ok(())
+    }
+
     pub fn open_name(&self, query: &str, attach: bool, allow_create: bool) -> Result<OpenReceipt> {
         self.store.initialize()?;
         let matches = self.resolve_local(query)?;
@@ -815,29 +868,13 @@ impl Pika {
         if session.has_exact_home() {
             let binding = self.exact_pane_binding(&session, session.tmux_pane.as_deref())?;
             let event = session.last_event_at;
-            let mut handoff_started = false;
             let code = if attach {
                 self.tmux.attach_exact_with_started(&binding.pane, || {
-                    self.confirm_exact_handoff(&session, &binding)?;
-                    open_history::record_session(
-                        &self.store,
-                        session.provider,
-                        &session.session_id,
-                    )?;
-                    handoff_started = true;
-                    Ok(())
+                    self.record_exact_handoff(&session, &binding, event)
                 })?
             } else {
                 0
             };
-            if handoff_started {
-                self.store.acknowledge_attention(
-                    session.provider,
-                    &session.session_id,
-                    event,
-                    true,
-                )?;
-            }
             return Ok(OpenReceipt {
                 target: OpenTarget::Session(Box::new(session)),
                 kind: "ATTACHED LIVE",
@@ -1043,6 +1080,7 @@ impl Pika {
         }
         existing_cwd(session.cwd.as_deref())?;
         let token = Uuid::new_v4().to_string();
+        let selected_event = session.last_event_at;
         let identity = session.provider_thread_id().to_owned();
         let tmux_name = Tmux::internal_name(session.provider, &session.session_id);
         let owner_pid = i64::from(std::process::id());
@@ -1121,12 +1159,7 @@ impl Pika {
                 self.store.delete_pending(&token)?;
                 let code = if attach {
                     self.tmux.attach_exact_with_started(&binding.pane, || {
-                        self.confirm_exact_handoff(&session, &binding)?;
-                        open_history::record_session(
-                            &self.store,
-                            session.provider,
-                            &session.session_id,
-                        )
+                        self.record_exact_handoff(&session, &binding, selected_event)
                     })?
                 } else {
                     0
@@ -1244,8 +1277,7 @@ impl Pika {
             }
             let code = if attach {
                 self.tmux.attach_exact_with_started(&binding.pane, || {
-                    self.confirm_exact_handoff(&session, &binding)?;
-                    open_history::record_session(&self.store, session.provider, &session.session_id)
+                    self.record_exact_handoff(&session, &binding, selected_event)
                 })?
             } else {
                 0
@@ -2539,12 +2571,47 @@ mod tests {
         assert!(!error.contains("process identity could not be observed"));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn archived_saved_source_is_not_a_daily_target_or_resumed_by_exact_id() {
+    fn provider_proven_archive_is_removed_from_daily_inventory() {
         let (root, mut pika) = test_pika();
         pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
         let identity = "88888888-8888-4888-8888-888888888888";
         let archived = root.path().join("archived_sessions/thread.jsonl");
+        let tag_cleanup = root.path().join("tag-cleanup");
+        let tmux_fixture = root.path().join("tmux-fixture");
+        let pane_line = [
+            "pika-c-archived",
+            "%9",
+            "1",
+            "/tmp",
+            "sh",
+            "0",
+            "1",
+            "1",
+            "0",
+            "",
+            "10",
+            "9",
+            "codex",
+            identity,
+            "archived_work",
+            "",
+        ]
+        .join("\u{1f}");
+        std::fs::write(
+            &tmux_fixture,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *list-panes*) printf '%s\\n' {};;\n  *if-shell*) printf '%s' \"$*\" > {};;\nesac\n",
+                shell_words::quote(&pane_line),
+                shell_words::quote(&tag_cleanup.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&tmux_fixture).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+        std::fs::set_permissions(&tmux_fixture, permissions).unwrap();
+        pika.tmux = Tmux::with_executable(tmux_fixture.to_string_lossy(), None);
         std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
         std::fs::write(&archived, "retained history\n").unwrap();
         let mut session = test_session(identity);
@@ -2552,19 +2619,37 @@ mod tests {
         session.live = false;
         session.status = Status::Parked;
         session.root_pid = None;
+        session.tmux_session = Some("pika-c-archived".into());
+        session.tmux_pane = Some("%9".into());
         session.transcript_path = Some(archived.display().to_string());
         pika.store.upsert_session(&session, false).unwrap();
+        std::fs::create_dir_all(&pika.paths.codex_home).unwrap();
+        let db =
+            rusqlite::Connection::open(pika.paths.codex_home.join("state_archive.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,name TEXT,cwd TEXT,rollout_path TEXT,updated_at INTEGER,archived INTEGER)").unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES(?1,'archived_work','/tmp',?2,10,1)",
+            rusqlite::params![identity, archived.display().to_string()],
+        )
+        .unwrap();
 
-        let error = pika.resolve_local("archived_work").unwrap_err().to_string();
-        assert!(error.contains("archived"));
-        let exact = pika.resolve_local(identity).unwrap();
-        assert_eq!(exact.len(), 1, "exact identity remains diagnosable");
-        let error = pika
-            .open_session(exact[0].clone(), false)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("codex unarchive"));
+        assert!(pika.reconcile_local().unwrap().sessions.is_empty());
+        assert!(pika.cached_inventory().unwrap().sessions.is_empty());
+        assert!(
+            pika.store
+                .get_session(Provider::Codex, identity)
+                .unwrap()
+                .is_none()
+        );
+        assert!(pika.resolve_local("archived_work").unwrap().is_empty());
+        assert!(pika.resolve_local(identity).unwrap().is_empty());
         assert!(pika.store.list_pending().unwrap().is_empty());
+        let cleanup = std::fs::read_to_string(tag_cleanup).unwrap();
+        assert!(cleanup.contains("if-shell -F -t %9"));
+        assert!(
+            cleanup.contains("set-option -p -u -t '%9' @pika_session_id"),
+            "{cleanup}"
+        );
     }
 
     #[test]

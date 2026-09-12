@@ -57,8 +57,8 @@ Completion requires self-score and an independent adversarial score of at least
 
 | Gate | Result |
 | --- | --- |
-| Native behavior suite | 343 tests pass from a Git-archive clean checkout on macOS arm64, including isolated real-tmux journeys, mixed-runtime compatibility, and the frozen-updater transition |
-| Mixed-runtime transition | Real Python v0.5.0a4 and Rust alternated SQLite hook writes; each consumed the other's fleet v2 envelopes |
+| Native behavior suite | 363 tests pass in the macOS arm64 implementation worktree, including isolated real-tmux journeys, mixed-runtime compatibility, and the frozen-updater transition; clean-checkout rerun follows the repair commit |
+| Mixed-runtime transition | Real Python v0.5.0a4 and Rust alternated SQLite hook writes; hello/snapshot/peek/untrack interoperate, while acknowledgement deliberately fails closed because the v0.5 wire cannot bind an event |
 | Formatting/lint/MSRV | `cargo +1.88.0 fmt --check` and warnings-as-errors Clippy passed for all targets/features |
 | Dependency integrity | Locked license inventory reproduced exactly; RustSec scanned 157 locked crates with zero advisories after updating `time` to 0.3.47 |
 | Native packaging | The macOS arm64 release archive, strict manifest, sidecar, offline install, version/help, and embedded skill pass in a disposable root; relative-output structural assembly verifies all five target archive/checksum layouts |

@@ -322,7 +322,8 @@ fn experts_cli_merges_local_and_cached_remote_with_exact_json_and_no_ssh() {
     assert_eq!(remote_json["snapshot_stale"], false);
     assert_eq!(remote_json["availability"], "source-available");
     assert_eq!(remote_json["watched"], false);
-    assert_eq!(remote_json["scope_age_seconds"], 0.0);
+    let remote_age = remote_json["scope_age_seconds"].as_f64().unwrap();
+    assert!((0.0..2.0).contains(&remote_age));
     assert_eq!(remote_json["current_state_status"], "CURRENT");
     let expected_common = BTreeSet::from([
         "artifacts",

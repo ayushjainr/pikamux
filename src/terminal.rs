@@ -3,6 +3,8 @@ use std::{
     collections::BTreeMap,
     io::{self, IsTerminal, Write},
     process::Command,
+    sync::atomic::{AtomicU32, Ordering},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -10,6 +12,273 @@ pub const FOREGROUND_ENV: &str = "PIKA_TERMINAL_FOREGROUND";
 pub const BACKGROUND_ENV: &str = "PIKA_TERMINAL_BACKGROUND";
 pub const WINDOWS_TERMINAL_DA2: &[u8] = b"\x1b[>0;10;1c";
 const PALETTE_QUERY: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
+
+#[cfg(unix)]
+const SIGNAL_HUP: u32 = 1 << 0;
+#[cfg(unix)]
+const SIGNAL_INT: u32 = 1 << 1;
+#[cfg(unix)]
+const SIGNAL_QUIT: u32 = 1 << 2;
+#[cfg(unix)]
+const SIGNAL_TERM: u32 = 1 << 3;
+#[cfg(unix)]
+const SIGNAL_WINCH: u32 = 1 << 4;
+#[cfg(unix)]
+const SIGNAL_TSTP: u32 = 1 << 5;
+#[cfg(unix)]
+const SIGNAL_CONT: u32 = 1 << 6;
+#[cfg(unix)]
+static PENDING_SIGNALS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(unix)]
+extern "C" fn bridge_signal_handler(signal: libc::c_int) {
+    let flag = match signal {
+        libc::SIGHUP => SIGNAL_HUP,
+        libc::SIGINT => SIGNAL_INT,
+        libc::SIGQUIT => SIGNAL_QUIT,
+        libc::SIGTERM => SIGNAL_TERM,
+        libc::SIGWINCH => SIGNAL_WINCH,
+        libc::SIGTSTP => SIGNAL_TSTP,
+        libc::SIGCONT => SIGNAL_CONT,
+        _ => 0,
+    };
+    if flag != 0 {
+        PENDING_SIGNALS.fetch_or(flag, Ordering::Relaxed);
+    }
+}
+
+#[cfg(unix)]
+struct BridgeSignalGuard {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+#[cfg(unix)]
+impl BridgeSignalGuard {
+    fn install() -> Result<Self> {
+        PENDING_SIGNALS.store(0, Ordering::Relaxed);
+        let mut guard = Self {
+            previous: Vec::new(),
+        };
+        for signal in [
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+            libc::SIGWINCH,
+            libc::SIGTSTP,
+            libc::SIGCONT,
+        ] {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = bridge_signal_handler as usize;
+            unsafe { libc::sigemptyset(&mut action.sa_mask) };
+            let mut previous = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+            if unsafe { libc::sigaction(signal, &action, previous.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error())
+                    .context("cannot install terminal bridge signal handler");
+            }
+            guard
+                .previous
+                .push((signal, unsafe { previous.assume_init() }));
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BridgeSignalGuard {
+    fn drop(&mut self) {
+        for (signal, action) in self.previous.iter().rev() {
+            unsafe { libc::sigaction(*signal, action, std::ptr::null_mut()) };
+        }
+        PENDING_SIGNALS.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(unix)]
+struct TerminalModeGuard {
+    input: libc::c_int,
+    prior: libc::termios,
+    raw: libc::termios,
+    raw_active: bool,
+}
+
+#[cfg(unix)]
+impl TerminalModeGuard {
+    fn new(input: libc::c_int, prior: libc::termios) -> Result<Self> {
+        let mut raw = prior;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        let mut guard = Self {
+            input,
+            prior,
+            raw,
+            raw_active: false,
+        };
+        guard.enter_raw()?;
+        Ok(guard)
+    }
+
+    fn enter_raw(&mut self) -> Result<()> {
+        if !self.raw_active {
+            if unsafe { libc::tcsetattr(self.input, libc::TCSANOW, &self.raw) } != 0 {
+                return Err(io::Error::last_os_error()).context("cannot enter raw terminal mode");
+            }
+            self.raw_active = true;
+        }
+        Ok(())
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if self.raw_active {
+            if unsafe { libc::tcsetattr(self.input, libc::TCSADRAIN, &self.prior) } != 0 {
+                return Err(io::Error::last_os_error()).context("cannot restore terminal mode");
+            }
+            self.raw_active = false;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(unix)]
+struct MasterFdGuard(libc::c_int);
+
+#[cfg(unix)]
+impl Drop for MasterFdGuard {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+#[cfg(unix)]
+struct PtyChildGuard {
+    pid: libc::pid_t,
+    reaped: bool,
+}
+
+#[cfg(unix)]
+impl PtyChildGuard {
+    fn new(pid: libc::pid_t) -> Self {
+        Self { pid, reaped: false }
+    }
+
+    fn poll(&mut self) -> Result<Option<libc::c_int>> {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+        if waited == self.pid {
+            self.reaped = true;
+            Ok(Some(status))
+        } else if waited == 0 || io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            Ok(None)
+        } else {
+            Err(io::Error::last_os_error()).context("cannot inspect terminal client")
+        }
+    }
+
+    fn wait(&mut self) -> Result<libc::c_int> {
+        loop {
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+            if waited == self.pid {
+                self.reaped = true;
+                return Ok(status);
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return Err(io::Error::last_os_error()).context("cannot wait for terminal client");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PtyChildGuard {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        // forkpty makes the exact child a new process-group leader. Kill only
+        // that owned group, then reap the leader so no early bridge error can
+        // orphan a terminal client or leave a zombie behind.
+        unsafe {
+            libc::kill(-self.pid, libc::SIGKILL);
+            libc::kill(self.pid, libc::SIGKILL);
+        }
+        loop {
+            let waited = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
+            if waited == self.pid
+                || (waited < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted)
+            {
+                break;
+            }
+        }
+        self.reaped = true;
+    }
+}
+
+#[cfg(unix)]
+fn forward_signal(child: libc::pid_t, signal: libc::c_int) {
+    if unsafe { libc::kill(-child, signal) } != 0 {
+        unsafe { libc::kill(child, signal) };
+    }
+}
+
+#[cfg(unix)]
+fn suspend_bridge(child: libc::pid_t, terminal: &mut TerminalModeGuard) -> Result<()> {
+    terminal.restore()?;
+    forward_signal(child, libc::SIGTSTP);
+    let mut default_action: libc::sigaction = unsafe { std::mem::zeroed() };
+    default_action.sa_sigaction = libc::SIG_DFL;
+    unsafe { libc::sigemptyset(&mut default_action.sa_mask) };
+    let mut bridge_action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    if unsafe { libc::sigaction(libc::SIGTSTP, &default_action, bridge_action.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error()).context("cannot suspend terminal bridge");
+    }
+    let bridge_action = unsafe { bridge_action.assume_init() };
+    unsafe { libc::raise(libc::SIGTSTP) };
+    if unsafe { libc::sigaction(libc::SIGTSTP, &bridge_action, std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error()).context("cannot resume terminal bridge");
+    }
+    terminal.enter_raw()?;
+    forward_signal(child, libc::SIGCONT);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn handle_bridge_signals(
+    child: libc::pid_t,
+    terminal: &mut TerminalModeGuard,
+    resized: &mut bool,
+) -> Result<()> {
+    let pending = PENDING_SIGNALS.swap(0, Ordering::Relaxed);
+    for (flag, signal) in [
+        (SIGNAL_HUP, libc::SIGHUP),
+        (SIGNAL_INT, libc::SIGINT),
+        (SIGNAL_QUIT, libc::SIGQUIT),
+        (SIGNAL_TERM, libc::SIGTERM),
+    ] {
+        if pending & flag != 0 {
+            forward_signal(child, signal);
+        }
+    }
+    if pending & SIGNAL_TSTP != 0 {
+        suspend_bridge(child, terminal)?;
+        *resized = true;
+    }
+    if pending & SIGNAL_CONT != 0 {
+        terminal.enter_raw()?;
+        forward_signal(child, libc::SIGCONT);
+        *resized = true;
+    }
+    if pending & SIGNAL_WINCH != 0 {
+        *resized = true;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Palette {
@@ -288,21 +557,24 @@ pub fn run_pty_bridge(
     palette: Option<Palette>,
     suppress_da2: bool,
 ) -> Result<i32> {
-    run_pty_bridge_with_started(argv, palette, suppress_da2, || Ok(()))
+    run_pty_bridge_with_handoff(argv, palette, suppress_da2, |_| false, || Ok(()))
 }
 
-/// Run an interactive child and invoke `on_started` exactly once after the
-/// terminal client completes successfully. Process survival is not proof that
-/// tmux accepted the attach, so every non-zero exit remains fail-closed.
+/// Run an interactive child and invoke `on_handoff` exactly once while the
+/// client remains alive, but only after `handoff_proven` positively identifies
+/// the child as the accepted terminal client. Time or process survival alone
+/// are never sufficient evidence.
 #[cfg(unix)]
-pub fn run_pty_bridge_with_started<F>(
+pub fn run_pty_bridge_with_handoff<F, P>(
     argv: &[String],
     palette: Option<Palette>,
     suppress_da2: bool,
-    on_started: F,
+    mut handoff_proven: P,
+    on_handoff: F,
 ) -> Result<i32>
 where
     F: FnOnce() -> Result<()>,
+    P: FnMut(i32) -> bool,
 {
     use std::os::unix::process::CommandExt;
     if argv.is_empty() {
@@ -310,11 +582,21 @@ where
     }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         let mut child = Command::new(&argv[0]).args(&argv[1..]).spawn()?;
-        let status = child.wait()?;
-        if status.success() {
-            on_started()?;
+        let child_id = i32::try_from(child.id()).context("terminal client PID does not fit i32")?;
+        let mut on_handoff = Some(on_handoff);
+        loop {
+            if on_handoff.is_some() && handoff_proven(child_id) {
+                if let Err(error) = on_handoff.take().expect("handoff callback present")() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
+            if let Some(status) = child.try_wait()? {
+                return Ok(status.code().unwrap_or(1));
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-        return Ok(status.code().unwrap_or(1));
     }
     let mut master = 0;
     let child = unsafe {
@@ -333,11 +615,15 @@ where
         eprintln!("pika: cannot start {}: {error}", argv[0]);
         unsafe { libc::_exit(127) };
     }
-    let code = bridge_parent(child, master, palette, suppress_da2)?;
-    if code == 0 {
-        on_started()?;
-    }
-    Ok(code)
+    let mut child = PtyChildGuard::new(child);
+    bridge_parent(
+        &mut child,
+        master,
+        palette,
+        suppress_da2,
+        &mut handoff_proven,
+        on_handoff,
+    )
 }
 
 #[cfg(not(unix))]
@@ -346,37 +632,58 @@ pub fn run_pty_bridge(
     _palette: Option<Palette>,
     _suppress_da2: bool,
 ) -> Result<i32> {
-    run_pty_bridge_with_started(argv, None, false, || Ok(()))
+    run_pty_bridge_with_handoff(argv, None, false, |_| false, || Ok(()))
 }
 
 #[cfg(not(unix))]
-pub fn run_pty_bridge_with_started<F>(
+pub fn run_pty_bridge_with_handoff<F, P>(
     argv: &[String],
     _palette: Option<Palette>,
     _suppress_da2: bool,
-    on_started: F,
+    mut handoff_proven: P,
+    on_handoff: F,
 ) -> Result<i32>
 where
     F: FnOnce() -> Result<()>,
+    P: FnMut(i32) -> bool,
 {
     if argv.is_empty() {
         bail!("missing terminal bridge command");
     }
     let mut child = Command::new(&argv[0]).args(&argv[1..]).spawn()?;
-    let status = child.wait()?;
-    if status.success() {
-        on_started()?;
+    let child_id = i32::try_from(child.id()).context("terminal client PID does not fit i32")?;
+    let mut on_handoff = Some(on_handoff);
+    loop {
+        if on_handoff.is_some() && handoff_proven(child_id) {
+            if let Err(error) = on_handoff.take().expect("handoff callback present")() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.code().unwrap_or(1));
+        }
+        thread::sleep(Duration::from_millis(10));
     }
-    Ok(status.code().unwrap_or(1))
 }
 
 #[cfg(unix)]
-fn bridge_parent(
-    child: libc::pid_t,
+fn bridge_parent<F, P>(
+    child: &mut PtyChildGuard,
     master: libc::c_int,
     palette: Option<Palette>,
     suppress_da2: bool,
-) -> Result<i32> {
+    handoff_proven: &mut P,
+    on_handoff: F,
+) -> Result<i32>
+where
+    F: FnOnce() -> Result<()>,
+    P: FnMut(i32) -> bool,
+{
+    // Own the master before any fallible terminal or signal initialization.
+    // The caller's child guard owns the corresponding process generation.
+    let _master_guard = MasterFdGuard(master);
     let input = libc::STDIN_FILENO;
     let output = libc::STDOUT_FILENO;
     let mut prior = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -384,32 +691,23 @@ fn bridge_parent(
         bail!("cannot read terminal mode");
     }
     let prior = unsafe { prior.assume_init() };
-    let mut raw = prior;
-    unsafe { libc::cfmakeraw(&mut raw) };
-    if unsafe { libc::tcsetattr(input, libc::TCSANOW, &raw) } != 0 {
-        bail!("cannot enter raw terminal mode");
-    }
-    struct Guard {
-        mode: libc::termios,
-        master: libc::c_int,
-    }
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            unsafe {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSADRAIN, &self.mode);
-                libc::close(self.master);
-            }
-        }
-    }
-    let _guard = Guard {
-        mode: prior,
-        master,
-    };
+    let _signals = BridgeSignalGuard::install()?;
+    let mut terminal = TerminalModeGuard::new(input, prior)?;
     let mut color_filter = palette.map(ColorQueryFilter::new);
     let mut input_filter = suppress_da2.then(|| ExactInputFilter::new(&[WINDOWS_TERMINAL_DA2]));
+    let mut on_handoff = Some(on_handoff);
     let mut status = None;
+    let mut resized = true;
     loop {
-        copy_terminal_size(input, master);
+        handle_bridge_signals(child.pid, &mut terminal, &mut resized)?;
+        if resized {
+            copy_terminal_size(input, master);
+            forward_signal(child.pid, libc::SIGWINCH);
+            resized = false;
+        }
+        if on_handoff.is_some() && handoff_proven(child.pid) {
+            on_handoff.take().expect("handoff callback present")()?;
+        }
         let mut descriptors = [
             libc::pollfd {
                 fd: input,
@@ -423,7 +721,10 @@ fn bridge_parent(
             },
         ];
         let polled = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, 100) };
-        if polled < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+        if polled < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
             return Err(io::Error::last_os_error()).context("terminal bridge poll failed");
         }
         if descriptors[0].revents & libc::POLLIN != 0 {
@@ -435,9 +736,12 @@ fn bridge_parent(
                     |filter| filter.feed(&buffer[..count as usize]),
                 );
                 write_fd(master, &visible)?;
+            } else if count < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return Err(io::Error::last_os_error())
+                    .context("terminal bridge input read failed");
             }
         }
-        if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        if descriptors[1].revents & libc::POLLIN != 0 {
             let mut buffer = [0_u8; 65_536];
             let count = unsafe { libc::read(master, buffer.as_mut_ptr().cast(), buffer.len()) };
             if count > 0 {
@@ -452,13 +756,21 @@ fn bridge_parent(
                 }
             } else if count == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EIO) {
                 break;
+            } else if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return Err(io::Error::last_os_error()).context("terminal bridge PTY read failed");
             }
+        } else if descriptors[1].revents & libc::POLLHUP != 0 {
+            // A hangup without readable bytes is EOF. Reading a blocking PTY
+            // master here can otherwise wait forever when a short-lived
+            // descendant briefly retains the slave descriptor.
+            break;
         }
-        let mut candidate = 0;
-        let waited = unsafe { libc::waitpid(child, &mut candidate, libc::WNOHANG) };
-        if waited == child {
+        if let Some(candidate) = child.poll()? {
             status = Some(candidate);
-            if descriptors[1].revents == 0 {
+            // POLLHUP is not pending output. Exit after the leader is reaped
+            // once no readable PTY bytes remain, even if a platform keeps the
+            // hangup bit asserted on the master descriptor.
+            if descriptors[1].revents & libc::POLLIN == 0 {
                 break;
             }
         }
@@ -469,9 +781,7 @@ fn bridge_parent(
     let raw_status = if let Some(status) = status {
         status
     } else {
-        let mut value = 0;
-        unsafe { libc::waitpid(child, &mut value, 0) };
-        value
+        child.wait()?
     };
     Ok(wait_exit_code(raw_status))
 }
@@ -552,7 +862,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn attach_callback_records_only_successful_terminal_completion() {
+    fn handoff_callback_requires_positive_proof_not_time_or_exit_status() {
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -560,10 +870,11 @@ mod tests {
 
         let failed_calls = Arc::new(AtomicUsize::new(0));
         let failed_counter = Arc::clone(&failed_calls);
-        let failed = run_pty_bridge_with_started(
+        let failed = run_pty_bridge_with_handoff(
             &["sh".into(), "-c".into(), "exit 17".into()],
             None,
             false,
+            |_| false,
             move || {
                 failed_counter.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -575,10 +886,11 @@ mod tests {
 
         let interrupted_calls = Arc::new(AtomicUsize::new(0));
         let interrupted_counter = Arc::clone(&interrupted_calls);
-        let interrupted = run_pty_bridge_with_started(
+        let interrupted = run_pty_bridge_with_handoff(
             &["sh".into(), "-c".into(), "sleep 0.25; exit 130".into()],
             None,
             false,
+            |_| false,
             move || {
                 interrupted_counter.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -590,10 +902,11 @@ mod tests {
 
         let successful_calls = Arc::new(AtomicUsize::new(0));
         let successful_counter = Arc::clone(&successful_calls);
-        let successful = run_pty_bridge_with_started(
+        let successful = run_pty_bridge_with_handoff(
             &["sh".into(), "-c".into(), "sleep 0.25; exit 0".into()],
             None,
             false,
+            |_| true,
             move || {
                 successful_counter.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -602,5 +915,35 @@ mod tests {
         .unwrap();
         assert_eq!(successful, 0);
         assert_eq!(successful_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_callback_error_kills_and_reaps_the_owned_client() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("client.pid");
+        let command = format!(
+            "printf '%s' \"$$\" > {}; exec sleep 30",
+            shell_words::quote(&pid_file.to_string_lossy())
+        );
+        let proof_file = pid_file.clone();
+        let error = run_pty_bridge_with_handoff(
+            &["sh".into(), "-c".into(), command],
+            None,
+            false,
+            move |_| proof_file.exists(),
+            || bail!("fixture handoff failed"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("fixture handoff failed"));
+        let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("owned terminal client {pid} survived callback failure");
     }
 }

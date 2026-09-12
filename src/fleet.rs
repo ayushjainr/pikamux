@@ -10,6 +10,7 @@ use crate::consult::{
 };
 use crate::experts::{CardStatus, ExpertMatch, rank_experts, remote_source_availability};
 use crate::model::{Candidate, ExpertProfile, FleetNode, Provider, Session, Status};
+use crate::providers::Providers;
 use crate::store::{Store, StoredExpertProfile};
 use crate::update::RemoteInstallBundle;
 use serde::{Deserialize, Serialize};
@@ -804,6 +805,21 @@ fn session_from_wire(value: &Value) -> Result<Session, FleetError> {
             "Remote session identity kind contradicts its identifier",
         ));
     }
+    if identity_kind == "conversation" && !Providers::valid_id(provider, &session_id) {
+        return Err(FleetError::new(
+            FleetErrorKind::Incompatible,
+            "Remote session has a noncanonical provider conversation identity",
+        ));
+    }
+    if active_thread_id
+        .as_deref()
+        .is_some_and(|value| !Providers::valid_id(provider, value))
+    {
+        return Err(FleetError::new(
+            FleetErrorKind::Incompatible,
+            "Remote session has a noncanonical active conversation identity",
+        ));
+    }
     let boolean = |field: &str, default: bool| -> Result<bool, FleetError> {
         match object.get(field) {
             None => Ok(default),
@@ -1590,6 +1606,10 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
             let Ok(snapshot) = validate_snapshot(&stored.payload, Some(&node.node_id)) else {
                 continue;
             };
+            let remote_captured_at = snapshot
+                .get("captured_at")
+                .and_then(Value::as_f64)
+                .unwrap_or(stored.captured_at);
             let stale = node.status != "ready"
                 || stored.captured_at > timestamp
                 || timestamp - stored.captured_at > REMOTE_STALE_SECONDS;
@@ -1642,10 +1662,16 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                         .map(str::to_owned),
                     scope_updated_at: profile
                         .and_then(|v| v.get("scope_updated_at"))
-                        .and_then(Value::as_f64),
+                        .and_then(Value::as_f64)
+                        .map(|value| {
+                            receiver_clock_timestamp(stored.captured_at, remote_captured_at, value)
+                        }),
                     current_state_updated_at: profile
                         .and_then(|v| v.get("current_state_updated_at"))
-                        .and_then(Value::as_f64),
+                        .and_then(Value::as_f64)
+                        .map(|value| {
+                            receiver_clock_timestamp(stored.captured_at, remote_captured_at, value)
+                        }),
                     current_state_status: card
                         .and_then(|v| v.get("current_state_status"))
                         .and_then(Value::as_str)
@@ -1679,13 +1705,34 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
             let Ok(snapshot) = validate_snapshot(&stored.payload, Some(&node_id)) else {
                 continue;
             };
-            let profiles = snapshot
+            let remote_captured_at = snapshot
+                .get("captured_at")
+                .and_then(Value::as_f64)
+                .unwrap_or(stored.captured_at);
+            let mut profiles = snapshot
                 .get("profiles")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
                 .map(profile_from_wire)
                 .collect::<Result<Vec<_>, _>>()?;
+            for profile in &mut profiles {
+                profile.profile.updated_at = receiver_clock_timestamp(
+                    stored.captured_at,
+                    remote_captured_at,
+                    profile.profile.updated_at,
+                );
+                profile.profile.scope_updated_at = receiver_clock_timestamp(
+                    stored.captured_at,
+                    remote_captured_at,
+                    profile.profile.scope_updated_at,
+                );
+                profile.profile.current_state_updated_at = receiver_clock_timestamp(
+                    stored.captured_at,
+                    remote_captured_at,
+                    profile.profile.current_state_updated_at,
+                );
+            }
             let local_sessions = sessions
                 .iter()
                 .map(|item| item.session.clone())
@@ -2923,8 +2970,8 @@ fn handle_request<S: FleetService>(
                 .filter(|number| number.is_finite() && *number >= 0.0)
                 .ok_or_else(|| {
                     FleetError::new(
-                        FleetErrorKind::InvalidRequest,
-                        "Acknowledgement requires a valid expected_last_event_at",
+                        FleetErrorKind::Incompatible,
+                        "Event-bound acknowledgement requires expected_last_event_at; legacy acknowledgement is incompatible",
                     )
                 })?;
             Ok(
@@ -2975,6 +3022,12 @@ fn exact_request_identity(request: &Map<String, Value>) -> Result<(Provider, Str
             "Invalid exact conversation identity",
         )
     })?;
+    if !Providers::valid_id(provider, &session) {
+        return Err(FleetError::new(
+            FleetErrorKind::InvalidRequest,
+            "Invalid exact conversation identity",
+        ));
+    }
     Ok((provider, session))
 }
 fn request_uuid(request: &Map<String, Value>) -> Result<String, FleetError> {
@@ -3304,7 +3357,114 @@ fn validate_exact_route(node: &FleetNode, session: &FleetSession) -> Result<(), 
         Some(&Value::String(session.session.session_id.clone())),
         "Invalid exact conversation identity",
     )?;
+    if !Providers::valid_id(session.session.provider, &session.session.session_id) {
+        return Err(FleetError::new(
+            FleetErrorKind::InvalidRequest,
+            "Invalid exact conversation identity",
+        ));
+    }
     Ok(())
+}
+
+/// Translate a peer timestamp onto the local observation clock. Peer clock
+/// offset cancels because only the peer-relative age at capture crosses the
+/// trust boundary; elapsed freshness then advances on the receiver's clock.
+fn receiver_clock_timestamp(received_at: f64, remote_captured_at: f64, event_at: f64) -> f64 {
+    received_at - (remote_captured_at - event_at).max(0.0)
+}
+
+#[cfg(test)]
+mod receiver_clock_tests {
+    use super::*;
+
+    fn wire_session(provider: Provider, session_id: &str, active_thread_id: Option<&str>) -> Value {
+        session_to_wire(
+            &Session {
+                provider,
+                session_id: session_id.into(),
+                name: None,
+                cwd: None,
+                branch: None,
+                transcript_path: None,
+                tmux_session: None,
+                tmux_pane: None,
+                root_pid: None,
+                status: Status::Parked,
+                unread: false,
+                model: None,
+                source: "test".into(),
+                managed: true,
+                error: None,
+                attention_reason: None,
+                created_at: 0.0,
+                updated_at: 0.0,
+                last_event_at: 0.0,
+                last_activity_at: 0.0,
+                live: false,
+                attached: false,
+                home_state: "saved-idle".into(),
+                cpu_percent: None,
+                rss_kb: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                cache_write_tokens: None,
+                total_tokens: None,
+                estimated_cost_usd: None,
+                active_thread_id: active_thread_id.map(str::to_owned),
+            },
+            true,
+        )
+    }
+
+    fn snapshot_with(session: Value) -> Value {
+        json!({
+            "type":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+            "node_id":"11111111-1111-4111-8111-111111111111", "machine":"remote",
+            "captured_at":1.0, "sessions":[session], "expert_sessions":[],
+            "profiles":[], "cards":[]
+        })
+    }
+
+    #[test]
+    fn future_peer_clock_cannot_pin_remote_freshness() {
+        let observed = receiver_clock_timestamp(1_000.0, 4_000_000_000.0, 4_000_000_100.0);
+        assert_eq!(observed, 1_000.0);
+        assert_eq!((1_075.0_f64 - observed).max(0.0), 75.0);
+    }
+
+    #[test]
+    fn peer_relative_age_survives_clock_translation() {
+        assert_eq!(
+            receiver_clock_timestamp(1_000.0, 4_000_000_000.0, 3_999_999_970.0),
+            970.0
+        );
+    }
+
+    #[test]
+    fn snapshots_reject_provider_mismatched_conversation_ids() {
+        for (provider, invalid) in [
+            (Provider::Codex, "ses_abcdef12"),
+            (Provider::Claude, "not-a-uuid"),
+            (Provider::Opencode, "22222222-2222-4222-8222-222222222222"),
+        ] {
+            let error =
+                validate_snapshot(&snapshot_with(wire_session(provider, invalid, None)), None)
+                    .unwrap_err();
+            assert!(error.message.contains("noncanonical"));
+        }
+    }
+
+    #[test]
+    fn snapshots_reject_noncanonical_active_thread_ids() {
+        let session = wire_session(
+            Provider::Codex,
+            "22222222-2222-4222-8222-222222222222",
+            Some("ses_wrong-provider"),
+        );
+        let error = validate_snapshot(&snapshot_with(session), None).unwrap_err();
+        assert!(error.message.contains("active conversation"));
+    }
 }
 fn mutation_request_id(
     store: &Store,

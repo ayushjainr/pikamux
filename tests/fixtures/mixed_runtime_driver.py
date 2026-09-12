@@ -53,6 +53,7 @@ if sys.platform == "darwin" and importlib.util.find_spec("psutil") is None:
 from pikamux import __version__
 from pikamux.fleet import (
     CAPABILITIES,
+    FleetError,
     FleetManager,
     NodeCandidate,
     handle_fleet_stdio,
@@ -127,15 +128,23 @@ class FakePika:
 class TranscriptTransport:
     def __init__(self, responses: list[dict[str, Any]]) -> None:
         self.responses = responses
+        self.requests: list[dict[str, Any]] = []
 
     def request(
         self, target: str, payload: dict[str, Any], *, mutating: bool = False
     ) -> dict[str, Any]:
         assert target == "rust.invalid"
         assert isinstance(mutating, bool)
+        self.requests.append(payload)
         if not self.responses:
             raise AssertionError(f"no Rust response left for {payload!r}")
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if response.get("type") == "error":
+            raise FleetError(
+                str(response.get("message") or "remote Pika error"),
+                kind=str(response.get("kind") or "error"),
+            )
+        return response
 
     def run_exact(self, node: Any, arguments: list[str], *, tty: bool) -> int:
         raise AssertionError("attach is outside this compatibility test")
@@ -243,18 +252,30 @@ def validate_rust_transcript(database: Path, transcript: Path) -> None:
     assert len(sessions) == 1
     session: FleetSession = sessions[0]
     assert manager.capture(session, 17) == "rust-tail:17"
-    assert manager.acknowledge(session) is True
+    try:
+        manager.acknowledge(session)
+    except FleetError as exc:
+        assert exc.kind == "incompatible"
+        acknowledgement = exc.kind
+    else:
+        raise AssertionError("legacy acknowledgement unexpectedly succeeded")
     assert manager.untrack(
         session, request_id="33333333-3333-4333-8333-333333333333"
     ) == 2
     assert manager.cached_sessions(node.node_id) == []
     assert transport.responses == []
+    acknowledgement_request = next(
+        request for request in transport.requests if request["op"] == "acknowledge"
+    )
+    assert "expected_last_event_at" not in acknowledgement_request
     print(
         json.dumps(
             {
                 "version": __version__,
                 "node_id": node.node_id,
-                "operations": ["hello", "snapshot", "peek", "ack", "untrack"],
+                "operations": [request["op"] for request in transport.requests],
+                "acknowledgement": acknowledgement,
+                "acknowledgement_request": acknowledgement_request,
             },
             separators=(",", ":"),
         )

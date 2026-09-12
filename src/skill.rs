@@ -44,9 +44,11 @@ pub fn install(target: &Path) -> Result<SkillInstallReceipt> {
     if target.as_os_str().is_empty() {
         bail!("skill destination cannot be empty");
     }
+    let destination = target.join("SKILL.md");
+    reject_symlink_components(&destination)?;
     fs::create_dir_all(target)
         .with_context(|| format!("cannot create skill directory {}", target.display()))?;
-    let destination = target.join("SKILL.md");
+    reject_symlink_components(&destination)?;
     if fs::read_to_string(&destination).ok().as_deref() == Some(AGENT_CONVO_SKILL) {
         return Ok(SkillInstallReceipt {
             path: destination,
@@ -55,6 +57,7 @@ pub fn install(target: &Path) -> Result<SkillInstallReceipt> {
         });
     }
     let backup = if destination.exists() {
+        reject_symlink_components(&destination)?;
         let path = target.join(format!("SKILL-{}.pika-backup", Uuid::new_v4()));
         fs::copy(&destination, &path)
             .with_context(|| format!("cannot back up existing skill {}", destination.display()))?;
@@ -73,6 +76,7 @@ pub fn install(target: &Path) -> Result<SkillInstallReceipt> {
     let mut file = options.open(&temporary)?;
     file.write_all(AGENT_CONVO_SKILL.as_bytes())?;
     file.sync_all()?;
+    reject_symlink_components(&destination)?;
     fs::rename(&temporary, &destination)?;
     Ok(SkillInstallReceipt {
         path: destination,
@@ -81,20 +85,80 @@ pub fn install(target: &Path) -> Result<SkillInstallReceipt> {
     })
 }
 
+fn reject_symlink_components(path: &Path) -> Result<()> {
+    for component in path.ancestors() {
+        match fs::symlink_metadata(component) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "skill destination crosses externally managed symlink {}",
+                    component.display()
+                )
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot inspect {}", component.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     #[test]
     fn install_is_idempotent_and_backs_up_other_content() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("agent-convo")).unwrap();
-        fs::write(root.path().join("agent-convo/SKILL.md"), "old").unwrap();
-        let first = install(&root.path().join("agent-convo")).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        fs::create_dir(root.join("agent-convo")).unwrap();
+        fs::write(root.join("agent-convo/SKILL.md"), "old").unwrap();
+        let first = install(&root.join("agent-convo")).unwrap();
         assert!(first.changed);
         assert!(first.backup.unwrap().is_file());
-        let second = install(&root.path().join("agent-convo")).unwrap();
+        let second = install(&root.join("agent-convo")).unwrap();
         assert!(!second.changed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_symlinked_target_or_ancestor_without_touching_external_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+
+        let external_target = root.join("external-target");
+        fs::create_dir(&external_target).unwrap();
+        fs::write(external_target.join("SKILL.md"), "externally managed\n").unwrap();
+        let linked_target = root.join("linked-target");
+        symlink(&external_target, &linked_target).unwrap();
+
+        let error = install(&linked_target).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(
+            fs::read_to_string(external_target.join("SKILL.md")).unwrap(),
+            "externally managed\n"
+        );
+        assert_eq!(fs::read_dir(&external_target).unwrap().count(), 1);
+
+        let external_ancestor = root.join("external-ancestor");
+        let external_skill = external_ancestor.join("skills/agent-convo");
+        fs::create_dir_all(&external_skill).unwrap();
+        fs::write(external_skill.join("SKILL.md"), "ancestor managed\n").unwrap();
+        let linked_ancestor = root.join("linked-ancestor");
+        symlink(&external_ancestor, &linked_ancestor).unwrap();
+
+        let error = install(&linked_ancestor.join("skills/agent-convo")).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        assert_eq!(
+            fs::read_to_string(external_skill.join("SKILL.md")).unwrap(),
+            "ancestor managed\n"
+        );
+        assert_eq!(fs::read_dir(&external_skill).unwrap().count(), 1);
     }
 
     #[test]

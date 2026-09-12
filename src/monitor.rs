@@ -18,7 +18,7 @@ use std::{
     collections::VecDeque,
     io::{self, IsTerminal, Write},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
@@ -78,6 +78,48 @@ impl BoardItem {
 }
 
 type BoardKey = (Option<String>, Provider, String);
+
+/// A one-slot channel whose producer always replaces an unpublished value.
+/// The board polls for changes already, so a separate wakeup queue would only
+/// reintroduce the stale-snapshot race this channel is meant to avoid.
+#[derive(Clone)]
+pub(crate) struct LatestSender<T> {
+    value: Arc<Mutex<Option<T>>>,
+}
+
+pub(crate) struct LatestReceiver<T> {
+    value: Arc<Mutex<Option<T>>>,
+}
+
+pub(crate) fn latest_channel<T>() -> (LatestSender<T>, LatestReceiver<T>) {
+    let value = Arc::new(Mutex::new(None));
+    (
+        LatestSender {
+            value: Arc::clone(&value),
+        },
+        LatestReceiver { value },
+    )
+}
+
+impl<T> LatestSender<T> {
+    pub(crate) fn publish(&self, value: T) {
+        *self.value.lock().expect("latest-value channel poisoned") = Some(value);
+    }
+}
+
+impl<T> LatestReceiver<T> {
+    fn take(&self) -> Option<T> {
+        self.value
+            .lock()
+            .expect("latest-value channel poisoned")
+            .take()
+    }
+}
+
+enum ItemUpdates {
+    Queue(Receiver<Vec<BoardItem>>),
+    Latest(LatestReceiver<Vec<BoardItem>>),
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BoardAction {
@@ -218,7 +260,7 @@ pub fn run_dynamic(sessions: Vec<Session>, updates: Receiver<Vec<Session>>) -> R
     });
     run_loop(
         sessions.into_iter().map(BoardItem::local).collect(),
-        Some(item_updates),
+        Some(ItemUpdates::Queue(item_updates)),
         None,
         None,
         None,
@@ -234,7 +276,14 @@ pub fn run_items_dynamic(
     updates: Receiver<Vec<BoardItem>>,
     driver: Option<ConsultationDriver>,
 ) -> Result<BoardAction> {
-    run_loop(items, Some(updates), driver, None, None, None)
+    run_loop(
+        items,
+        Some(ItemUpdates::Queue(updates)),
+        driver,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Dynamic board plus a single best-effort background update notice. The
@@ -247,7 +296,7 @@ pub fn run_items_dynamic_with_notice(
 ) -> Result<BoardAction> {
     run_loop(
         items,
-        Some(updates),
+        Some(ItemUpdates::Queue(updates)),
         driver,
         Some(update_notice),
         None,
@@ -266,7 +315,7 @@ pub fn run_items_dynamic_with_notice_and_refresh(
 ) -> Result<BoardAction> {
     run_loop(
         items,
-        Some(updates),
+        Some(ItemUpdates::Queue(updates)),
         driver,
         Some(update_notice),
         Some(refresh_request),
@@ -276,9 +325,9 @@ pub fn run_items_dynamic_with_notice_and_refresh(
 
 /// Local observation health is separate from conversation status and cached
 /// item updates. A latest-value flag cannot queue a stale warning after recovery.
-pub fn run_items_dynamic_with_local_health(
+pub(crate) fn run_items_dynamic_with_local_health(
     items: Vec<BoardItem>,
-    updates: Receiver<Vec<BoardItem>>,
+    updates: LatestReceiver<Vec<BoardItem>>,
     driver: Option<ConsultationDriver>,
     update_notice: Receiver<Option<String>>,
     refresh_request: SyncSender<()>,
@@ -286,7 +335,7 @@ pub fn run_items_dynamic_with_local_health(
 ) -> Result<BoardAction> {
     run_loop(
         items,
-        Some(updates),
+        Some(ItemUpdates::Latest(updates)),
         driver,
         Some(update_notice),
         Some(refresh_request),
@@ -296,7 +345,7 @@ pub fn run_items_dynamic_with_local_health(
 
 fn run_loop(
     items: Vec<BoardItem>,
-    updates: Option<Receiver<Vec<BoardItem>>>,
+    updates: Option<ItemUpdates>,
     driver: Option<ConsultationDriver>,
     update_notice: Option<Receiver<Option<String>>>,
     refresh_request: Option<SyncSender<()>>,
@@ -311,14 +360,18 @@ fn run_loop(
         .unwrap_or_else(Instant::now);
     loop {
         if let Some(updates) = &updates {
-            loop {
-                match updates.try_recv() {
-                    Ok(items) => {
+            match updates {
+                ItemUpdates::Queue(updates) => {
+                    while let Ok(items) = updates.try_recv() {
                         board.replace_items(items);
                         dirty = true;
                     }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break,
+                }
+                ItemUpdates::Latest(updates) => {
+                    if let Some(items) = updates.take() {
+                        board.replace_items(items);
+                        dirty = true;
+                    }
                 }
             }
         }
@@ -1685,6 +1738,34 @@ mod tests {
             estimated_cost_usd: None,
             active_thread_id: None,
         }
+    }
+
+    #[test]
+    fn latest_channel_keeps_newest_snapshot_during_a_burst() {
+        let (sender, receiver) = latest_channel();
+        for value in 0..2_000 {
+            sender.publish(vec![value]);
+        }
+        assert_eq!(receiver.take(), Some(vec![1_999]));
+        assert_eq!(receiver.take(), None);
+    }
+
+    #[test]
+    fn board_renders_two_thousand_rows_with_bounded_output() {
+        let started = Instant::now();
+        let items = (0..2_000)
+            .map(|index| {
+                let mut value = session(Status::Working);
+                value.session_id = format!("{index:08}-1111-4111-8111-111111111111");
+                value.name = Some(format!("thread-{index}"));
+                BoardItem::local(value)
+            })
+            .collect();
+        let board = Board::new(items);
+        let mut rendered = Vec::new();
+        board.draw(&mut rendered, 120, 35).unwrap();
+        assert!(rendered.len() < 128 * 1024);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     fn key(code: KeyCode) -> KeyEvent {

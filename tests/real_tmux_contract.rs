@@ -12,7 +12,7 @@ use std::{
     collections::BTreeMap,
     fs,
     os::unix::fs::PermissionsExt,
-    process::Command,
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -24,6 +24,21 @@ impl Drop for IsolatedTmux {
         let _ = Command::new("tmux")
             .args(["-L", &self.0, "kill-server"])
             .status();
+    }
+}
+
+struct AttachedClient {
+    child: Child,
+    socket: String,
+}
+
+impl Drop for AttachedClient {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux")
+            .args(["-L", &self.socket, "kill-server"])
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -74,6 +89,104 @@ fn saved(provider: Provider, identity: &str, name: &str, cwd: &std::path::Path) 
         total_tokens: None,
         estimated_cost_usd: None,
         active_thread_id: None,
+    }
+}
+
+#[test]
+fn real_isolated_tmux_list_clients_proves_the_exact_selected_pane() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("tmux unavailable; isolated client format integration not exercised");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let socket = format!("pika-rust-client-proof-{}", std::process::id());
+    let _server = IsolatedTmux(socket.clone());
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-s",
+                "proof",
+                "sleep 30"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let pane = Command::new("tmux")
+        .args([
+            "-L",
+            &socket,
+            "display-message",
+            "-p",
+            "-t",
+            "proof",
+            "#{pane_id}",
+        ])
+        .output()
+        .unwrap();
+    assert!(pane.status.success());
+    let pane = String::from_utf8(pane.stdout).unwrap().trim().to_owned();
+
+    let transcript = temp.path().join("script.out");
+    let child = match Command::new("script")
+        .args([
+            "-q",
+            transcript.to_str().unwrap(),
+            "tmux",
+            "-L",
+            &socket,
+            "attach-session",
+            "-t",
+            &pane,
+        ])
+        .env("TERM", "xterm-256color")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("script unavailable; isolated client format integration not exercised");
+            return;
+        }
+        Err(error) => panic!("cannot start isolated pseudo-terminal: {error}"),
+    };
+    // Keeping script's input pipe open keeps its pseudo-terminal client alive
+    // while the server-side client inventory is inspected.
+    let mut client = AttachedClient { child, socket };
+    let _input = client.child.stdin.take().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let output = Command::new("tmux")
+            .args([
+                "-L",
+                &client.socket,
+                "list-clients",
+                "-F",
+                "#{client_pid}\t#{pane_id}",
+            ])
+            .output()
+            .unwrap();
+        if output.status.success()
+            && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                line.split_once('\t').is_some_and(|(pid, selected)| {
+                    pid.parse::<i32>().is_ok_and(|pid| pid > 0) && selected == pane
+                })
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tmux never exposed client_pid with its exact selected pane: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        thread::sleep(Duration::from_millis(20));
     }
 }
 

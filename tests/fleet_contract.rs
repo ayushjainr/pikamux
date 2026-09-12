@@ -18,6 +18,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use uuid::Uuid;
 
+const CODEX_THREAD_ID: &str = "11111111-1111-4111-8111-111111111111";
+const CODEX_PARENT_ID: &str = "22222222-2222-4222-8222-222222222222";
+const CODEX_ACTIVE_ID: &str = "33333333-3333-4333-8333-333333333333";
+const CODEX_OTHER_ID: &str = "44444444-4444-4444-8444-444444444444";
+const CLAUDE_THREAD_ID: &str = "55555555-5555-4555-8555-555555555555";
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -86,10 +92,13 @@ fn node(id: &str, alias: &str) -> FleetNode {
 }
 
 fn snapshot(id: &str, session_id: &str) -> Value {
+    let session_id = Uuid::parse_str(session_id)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| CODEX_THREAD_ID.to_owned());
     json!({
         "type":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
         "node_id":id, "machine":"atlas", "captured_at":now(),
-        "sessions":[session_to_wire(&session(Provider::Codex, session_id, "remote-work"), false)],
+        "sessions":[session_to_wire(&session(Provider::Codex, &session_id, "remote-work"), false)],
         "profiles":[{
             "provider":"codex", "session_id":session_id,
             "scope":"Owns pricing infrastructure", "current_state":"Validating rollout",
@@ -647,7 +656,7 @@ fn server_validates_exact_route_and_replays_mutation_receipt_once() {
     let request_id = Uuid::new_v4().to_string();
     let request = json!({
         "op":"untrack", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
-        "expected_node_id":node_id, "provider":"claude", "session_id":"exact-thread",
+        "expected_node_id":node_id, "provider":"claude", "session_id":CLAUDE_THREAD_ID,
         "request_id":request_id,
     });
     let bytes = format!("{request}\n{request}\n");
@@ -701,7 +710,7 @@ fn remote_acknowledgement_is_bound_to_the_observed_event() {
     let node_id = store.ensure_local_node_id().unwrap();
     let request = json!({
         "op":"acknowledge", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
-        "expected_node_id":node_id, "provider":"codex", "session_id":"exact",
+        "expected_node_id":node_id, "provider":"codex", "session_id":CODEX_THREAD_ID,
         "expected_last_event_at":10.0,
     });
     let mut output = Vec::new();
@@ -730,7 +739,7 @@ fn remote_acknowledgement_rejects_a_missing_event_without_service_action() {
     let node_id = store.ensure_local_node_id().unwrap();
     let request = json!({
         "op":"acknowledge", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
-        "expected_node_id":node_id, "provider":"codex", "session_id":"exact",
+        "expected_node_id":node_id, "provider":"codex", "session_id":CODEX_THREAD_ID,
     });
     let mut output = Vec::new();
     let mut service = Service {
@@ -747,7 +756,7 @@ fn remote_acknowledgement_rejects_a_missing_event_without_service_action() {
     )
     .unwrap();
     let value: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(value["kind"], "invalid_request");
+    assert_eq!(value["kind"], "incompatible");
     assert!(service.acknowledgement_events.is_empty());
 }
 
@@ -800,14 +809,18 @@ fn remote_consultation_reuses_one_connection_and_requires_v2_cleanup() {
     let _process = fake_process_guard();
     let temp = TempDir::new().unwrap();
     let fake = temp.path().join("ssh");
-    let body = "printf '%s\\n' '{\"type\":\"opened\",\"provider\":\"codex\",\"parent_id\":\"parent\",\"workstream_id\":\"parent\",\"consultation_mode\":\"default\",\"model\":\"gpt-test\",\"effort\":\"low\"}'\nwhile IFS= read -r line; do\n case \"$line\" in\n *\\\"close\\\"*) printf '%s\\n' '{\"type\":\"closed\",\"receipt_version\":2,\"discarded\":true,\"cleanup\":\"complete\"}'; exit 0 ;;\n *) printf '%s\\n' '{\"type\":\"answer\",\"text\":\"from remote expert\"}' ;;\n esac\ndone";
-    executable(&fake, body);
+    let opened = json!({"type":"opened", "provider":"codex", "parent_id":CODEX_PARENT_ID,
+        "workstream_id":CODEX_PARENT_ID, "consultation_mode":"default", "model":"gpt-test", "effort":"low"});
+    let body = format!(
+        "printf '%s\\n' '{opened}'\nwhile IFS= read -r line; do\n case \"$line\" in\n *\\\"close\\\"*) printf '%s\\n' '{{\"type\":\"closed\",\"receipt_version\":2,\"discarded\":true,\"cleanup\":\"complete\"}}'; exit 0 ;;\n *) printf '%s\\n' '{{\"type\":\"answer\",\"text\":\"from remote expert\"}}' ;;\n esac\ndone"
+    );
+    executable(&fake, &body);
     let node_id = Uuid::new_v4().to_string();
     let trusted = node(&node_id, "atlas");
     let remote = FleetSession {
         node_id: node_id.clone(),
         node_name: "atlas".into(),
-        session: session(Provider::Codex, "parent", "expert"),
+        session: session(Provider::Codex, CODEX_PARENT_ID, "expert"),
         stale: false,
         remote_error: None,
         seen_at: now(),
@@ -851,7 +864,7 @@ fn remote_consultation_cancellation_kills_owned_transport_promptly() {
     executable(
         &fake,
         &format!(
-            "printf '%s\\n' '{{\"type\":\"opened\",\"provider\":\"codex\",\"parent_id\":\"parent\",\"workstream_id\":\"parent\",\"consultation_mode\":\"default\",\"model\":\"gpt-test\",\"effort\":\"low\"}}'\nIFS= read -r line\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nwait",
+            "printf '%s\\n' '{{\"type\":\"opened\",\"provider\":\"codex\",\"parent_id\":\"{CODEX_PARENT_ID}\",\"workstream_id\":\"{CODEX_PARENT_ID}\",\"consultation_mode\":\"default\",\"model\":\"gpt-test\",\"effort\":\"low\"}}'\nIFS= read -r line\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nwait",
             owned_pid.display()
         ),
     );
@@ -860,7 +873,7 @@ fn remote_consultation_cancellation_kills_owned_transport_promptly() {
     let remote = FleetSession {
         node_id,
         node_name: "atlas".into(),
-        session: session(Provider::Codex, "parent", "expert"),
+        session: session(Provider::Codex, CODEX_PARENT_ID, "expert"),
         stale: false,
         remote_error: None,
         seen_at: now(),
@@ -929,12 +942,14 @@ fn remote_consultation_refuses_wrong_leaf_before_sending_question() {
     let fake = temp.path().join("ssh");
     executable(
         &fake,
-        "printf '%s\\n' '{\"type\":\"opened\",\"provider\":\"codex\",\"parent_id\":\"old-parent\",\"consultation_mode\":\"default\",\"model\":\"gpt-test\",\"effort\":\"low\"}'; sleep 2",
+        &format!(
+            "printf '%s\\n' '{{\"type\":\"opened\",\"provider\":\"codex\",\"parent_id\":\"{CODEX_OTHER_ID}\",\"consultation_mode\":\"default\",\"model\":\"gpt-test\",\"effort\":\"low\"}}'; sleep 2"
+        ),
     );
     let node_id = Uuid::new_v4().to_string();
     let trusted = node(&node_id, "atlas");
-    let mut base = session(Provider::Codex, "parent", "expert");
-    base.active_thread_id = Some("active-leaf".to_owned());
+    let mut base = session(Provider::Codex, CODEX_PARENT_ID, "expert");
+    base.active_thread_id = Some(CODEX_ACTIVE_ID.to_owned());
     let remote = FleetSession {
         node_id,
         node_name: "atlas".into(),
@@ -979,7 +994,7 @@ fn remote_consultation_rejects_partial_frames_and_unverified_cleanup() {
     let remote = FleetSession {
         node_id: node_id.clone(),
         node_name: "atlas".into(),
-        session: session(Provider::Codex, "parent", "expert"),
+        session: session(Provider::Codex, CODEX_PARENT_ID, "expert"),
         stale: false,
         remote_error: None,
         seen_at: now(),
@@ -1014,8 +1029,12 @@ fn remote_consultation_rejects_partial_frames_and_unverified_cleanup() {
     assert!(error.message.contains("partial JSONL"));
 
     let bad_cleanup = temp.path().join("bad-cleanup-ssh");
-    let body = "printf '%s\\n' '{\"type\":\"opened\",\"provider\":\"codex\",\"parent_id\":\"parent\",\"workstream_id\":\"parent\",\"consultation_mode\":\"default\",\"model\":\"gpt-test\",\"effort\":\"low\"}'\nwhile IFS= read -r line; do\n case \"$line\" in\n *\\\"close\\\"*) printf '%s\\n' '{\"type\":\"closed\",\"discarded\":true}'; exit 0 ;;\n *) printf '%s\\n' '{\"type\":\"answer\",\"text\":\"useful\"}' ;;\n esac\ndone";
-    executable(&bad_cleanup, body);
+    let opened = json!({"type":"opened", "provider":"codex", "parent_id":CODEX_PARENT_ID,
+        "workstream_id":CODEX_PARENT_ID, "consultation_mode":"default", "model":"gpt-test", "effort":"low"});
+    let body = format!(
+        "printf '%s\\n' '{opened}'\nwhile IFS= read -r line; do\n case \"$line\" in\n *\\\"close\\\"*) printf '%s\\n' '{{\"type\":\"closed\",\"discarded\":true}}'; exit 0 ;;\n *) printf '%s\\n' '{{\"type\":\"answer\",\"text\":\"useful\"}}' ;;\n esac\ndone"
+    );
+    executable(&bad_cleanup, &body);
     let transport = SshTransport::new(&bad_cleanup, Duration::from_secs(1), Duration::from_secs(1));
     let mut side = RemoteConsultation::open(
         &transport,

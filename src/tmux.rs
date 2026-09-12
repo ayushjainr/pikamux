@@ -241,6 +241,19 @@ impl Tmux {
         Ok(())
     }
 
+    fn client_is_attached_to_pane(&self, client_pid: i32, pane_id: &str) -> bool {
+        let Ok(output) = self.output(["list-clients", "-F", "#{client_pid}\t#{pane_id}"], false)
+        else {
+            return false;
+        };
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                line.split_once('\t').is_some_and(|(pid, pane)| {
+                    pid.parse::<i32>() == Ok(client_pid) && pane == pane_id
+                })
+            })
+    }
+
     pub fn configure_home(&self, session: &str, pane: Option<&str>) -> Result<()> {
         if !is_pika_session(session) {
             return Ok(());
@@ -497,7 +510,13 @@ impl Tmux {
             }
             Ok(status.code().unwrap_or(1))
         } else {
-            terminal::run_pty_bridge_with_started(&argv, None, true, on_started)
+            terminal::run_pty_bridge_with_handoff(
+                &argv,
+                None,
+                true,
+                |client_pid| self.client_is_attached_to_pane(client_pid, &pane.pane_id),
+                on_started,
+            )
         }
     }
 
@@ -544,7 +563,18 @@ impl Tmux {
                 "-t".into(),
                 pane.unwrap_or(session).into(),
             ]);
-            terminal::run_pty_bridge_with_started(&argv, None, true, on_started)
+            let target_pane = pane.map(str::to_owned);
+            terminal::run_pty_bridge_with_handoff(
+                &argv,
+                None,
+                true,
+                |client_pid| {
+                    target_pane
+                        .as_deref()
+                        .is_some_and(|pane_id| self.client_is_attached_to_pane(client_pid, pane_id))
+                },
+                on_started,
+            )
         }
     }
 
@@ -1330,7 +1360,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn attach_handoff_records_a_delayed_successful_detach() {
+    fn successful_exit_without_client_proof_does_not_record_handoff() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("tmux-fixture");
         fs::write(
@@ -1348,7 +1378,37 @@ mod tests {
             })
             .unwrap();
         assert_eq!(code, 0);
+        assert!(!started, "exit status alone is not terminal handoff proof");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn positive_client_proof_records_handoff_before_detach() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("client.pid");
+        let release = temp.path().join("release");
+        let executable = temp.path().join("tmux-fixture");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  list-clients) if test -f {pid}; then printf '%s\\t%%1\\n' \"$(cat {pid})\"; fi; exit 0;;\nesac\ncase \"$*\" in\n  *attach-session*) printf '%s' \"$$\" > {pid}; n=0; while test ! -f {release} && test \"$n\" -lt 200; do n=$((n + 1)); sleep 0.01; done; test -f {release};;\n  *) exit 0;;\nesac\n",
+                pid = shell_words::quote(&pid_file.to_string_lossy()),
+                release = shell_words::quote(&release.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let tmux = Tmux::with_executable(executable.to_string_lossy(), None);
+        let mut started = false;
+        let code = tmux
+            .attach_with_started_mode("pika-c-workstream", Some("%1"), false, || {
+                started = true;
+                fs::write(&release, "attached").map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(code, 0);
         assert!(started);
+        assert_eq!(fs::read_to_string(release).unwrap(), "attached");
     }
 
     #[cfg(unix)]

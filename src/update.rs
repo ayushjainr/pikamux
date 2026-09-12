@@ -30,6 +30,7 @@ pub const MAX_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_RELEASE_LIST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CANDIDATE_OUTPUT_BYTES: usize = 1024 * 1024;
 const CANDIDATE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const ARCHIVE_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 pub const RELEASE_API: &str =
     "https://api.github.com/repos/ayushjainr/pikamux/releases?per_page=100";
 pub const RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/ayushjainr/pikamux/releases/download";
@@ -912,11 +913,14 @@ fn extract_candidate(archive: &Path, target: &str, destination: &Path) -> Result
     if target == "x86_64-pc-windows-msvc" {
         return Err(UpdateError::UnsupportedTarget(target.into()));
     }
-    let listing = Command::new("tar")
-        .args(["-tzf"])
-        .arg(archive)
-        .output()
-        .map_err(|error| UpdateError::Candidate(format!("cannot inspect archive: {error}")))?;
+    let mut command = Command::new("tar");
+    command.args(["-tzf"]).arg(archive);
+    let listing = run_command_bounded(
+        command,
+        ARCHIVE_OPERATION_TIMEOUT,
+        4096,
+        "archive inspection",
+    )?;
     checked_command(&listing, "archive inspection")?;
     if listing.stdout.len() > 4096 {
         return Err(UpdateError::UnsafeArchiveMember(
@@ -932,25 +936,34 @@ fn extract_candidate(archive: &Path, target: &str, destination: &Path) -> Result
             "native archive must contain exactly one executable named pika".into(),
         ));
     }
-    let verbose = Command::new("tar")
-        .args(["-tvzf"])
-        .arg(archive)
-        .output()
-        .map_err(|error| UpdateError::Candidate(format!("cannot inspect archive: {error}")))?;
+    let mut command = Command::new("tar");
+    command.args(["-tvzf"]).arg(archive);
+    let verbose = run_command_bounded(
+        command,
+        ARCHIVE_OPERATION_TIMEOUT,
+        4096,
+        "archive inspection",
+    )?;
     checked_command(&verbose, "archive inspection")?;
     if verbose.stdout.first() != Some(&b'-') {
         return Err(UpdateError::UnsafeArchiveMember(
             "pika is not a regular archive member".into(),
         ));
     }
-    let extracted = Command::new("tar")
+    validate_archive_expanded_size(archive, MAX_ARTIFACT_BYTES as usize)?;
+    let mut command = Command::new("tar");
+    command
         .args(["-xzf"])
         .arg(archive)
         .arg("-C")
         .arg(destination)
-        .arg("pika")
-        .output()
-        .map_err(|error| UpdateError::Candidate(format!("cannot extract archive: {error}")))?;
+        .arg("pika");
+    let extracted = run_command_bounded(
+        command,
+        ARCHIVE_OPERATION_TIMEOUT,
+        4096,
+        "archive extraction",
+    )?;
     checked_command(&extracted, "archive extraction")?;
     let candidate_path = destination.join("pika");
     let candidate = checked_regular_file(&candidate_path)?;
@@ -962,6 +975,25 @@ fn extract_candidate(archive: &Path, target: &str, destination: &Path) -> Result
     }
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(candidate, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_archive_expanded_size(archive: &Path, limit: usize) -> Result<()> {
+    let mut command = Command::new("tar");
+    command.args(["-xOzf"]).arg(archive).arg("pika");
+    let output = run_command_bounded(
+        command,
+        ARCHIVE_OPERATION_TIMEOUT,
+        limit,
+        "archive expansion preflight",
+    )?;
+    checked_command(&output, "archive expansion preflight")?;
+    if output.stdout.is_empty() {
+        return Err(UpdateError::Candidate(
+            "native executable has an invalid size".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1374,8 +1406,26 @@ fn run_candidate_bounded(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    run_command_bounded(
+        command,
+        timeout,
+        MAX_CANDIDATE_OUTPUT_BYTES,
+        "candidate probe",
+    )
+}
+
+fn run_command_bounded(
+    mut command: Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    operation: &str,
+) -> Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = OwnedChild::spawn(&mut command)
-        .map_err(|error| UpdateError::Candidate(error.to_string()))?;
+        .map_err(|error| UpdateError::Candidate(format!("cannot run {operation}: {error}")))?;
     let stop = CancellationToken::default();
     let Some(stdout) = child.stdout.take() else {
         return Err(UpdateError::Candidate(
@@ -1390,8 +1440,9 @@ fn run_candidate_bounded(
     let stdout = CancellablePipe::new(stdout, stop.clone())?;
     let stderr = CancellablePipe::new(stderr, stop.clone())?;
     let (sender, receiver) = mpsc::sync_channel(2);
-    let stdout_worker = drain_candidate_output(true, stdout, sender.clone());
-    let stderr_worker = drain_candidate_output(false, stderr, sender.clone());
+    let stdout_worker = drain_bounded_output(true, stdout, sender.clone(), stdout_limit);
+    let stderr_worker =
+        drain_bounded_output(false, stderr, sender.clone(), MAX_CANDIDATE_OUTPUT_BYTES);
     drop(sender);
 
     let deadline = Instant::now() + timeout;
@@ -1405,7 +1456,7 @@ fn run_candidate_bounded(
                 Ok(None) => {
                     return Err(UpdateError::Candidate(format!(
                         "{} exceeded its {} second deadline",
-                        arguments.join(" "),
+                        operation,
                         timeout.as_secs_f64()
                     )));
                 }
@@ -1426,10 +1477,20 @@ fn run_candidate_bounded(
                 .recv_timeout(remaining)
                 .map_err(|_| UpdateError::Candidate("candidate output did not close".into()))?;
             let bytes = result.map_err(|error| UpdateError::Candidate(error.to_string()))?;
-            if bytes.len() > MAX_CANDIDATE_OUTPUT_BYTES {
-                return Err(UpdateError::Candidate(
-                    "candidate output exceeds 1 MiB".into(),
-                ));
+            let limit = if is_stdout {
+                stdout_limit
+            } else {
+                MAX_CANDIDATE_OUTPUT_BYTES
+            };
+            if bytes.len() > limit {
+                if operation == "candidate probe" && limit == MAX_CANDIDATE_OUTPUT_BYTES {
+                    return Err(UpdateError::Candidate(
+                        "candidate output exceeds 1 MiB".into(),
+                    ));
+                }
+                return Err(UpdateError::Candidate(format!(
+                    "{operation} output exceeds its {limit} byte safety limit"
+                )));
             }
             if is_stdout {
                 stdout = Some(bytes);
@@ -1459,16 +1520,26 @@ fn run_candidate_bounded(
     outcome
 }
 
+#[cfg(test)]
 fn drain_candidate_output<R: Read + Send + 'static>(
+    is_stdout: bool,
+    stream: R,
+    sender: mpsc::SyncSender<(bool, io::Result<Vec<u8>>)>,
+) -> thread::JoinHandle<()> {
+    drain_bounded_output(is_stdout, stream, sender, MAX_CANDIDATE_OUTPUT_BYTES)
+}
+
+fn drain_bounded_output<R: Read + Send + 'static>(
     is_stdout: bool,
     mut stream: R,
     sender: mpsc::SyncSender<(bool, io::Result<Vec<u8>>)>,
+    limit: usize,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut bytes = Vec::new();
         let result = stream
             .by_ref()
-            .take((MAX_CANDIDATE_OUTPUT_BYTES + 1) as u64)
+            .take((limit + 1) as u64)
             .read_to_end(&mut bytes)
             .map(|_| bytes);
         let _ = sender.send((is_stdout, result));
@@ -1928,5 +1999,26 @@ mod bounded_candidate_tests {
         assert_eq!(result.unwrap(), b"partial");
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(held_writer);
+    }
+
+    #[test]
+    fn archive_expansion_is_rejected_before_extraction_when_it_exceeds_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("pika"), vec![0_u8; 128 * 1024]).unwrap();
+        let archive = directory.path().join("pika.tar.gz");
+        let status = Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&source)
+            .arg("pika")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error = validate_archive_expanded_size(&archive, 64 * 1024).unwrap_err();
+        assert!(error.to_string().contains("safety limit"));
     }
 }

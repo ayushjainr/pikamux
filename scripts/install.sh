@@ -152,13 +152,14 @@ if [ -z "$pika_no_setup" ]; then
         printf '%s\n' \
             'tmux is missing. Pika is installed; Pika needs tmux to host agents.' \
             'Install tmux with Homebrew or your Linux package manager, then run `pika setup`.'
-    elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
-        printf 'Start Pika setup now? [y/N] ' > /dev/tty
-        IFS= read -r pika_answer < /dev/tty || pika_answer=''
+    elif { exec 3<>/dev/tty; } 2>/dev/null; then
+        printf 'Start Pika setup now? [y/N] ' >&3
+        IFS= read -r pika_answer <&3 || pika_answer=''
         case "$pika_answer" in
-            y|Y|yes|YES|Yes) "$pika_launcher" setup < /dev/tty ;;
+            y|Y|yes|YES|Yes) "$pika_launcher" setup <&3 ;;
             *) printf 'Next: %s setup\n' "$pika_launcher" ;;
         esac
+        exec 3>&-
     else
         printf 'Next: %s setup\n' "$pika_launcher"
     fi

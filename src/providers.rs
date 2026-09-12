@@ -20,6 +20,8 @@ use std::{
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use walkdir::WalkDir;
 
+const MAX_PROVIDER_METADATA_BYTES: u64 = 1024 * 1024;
+
 pub struct Providers<'a> {
     paths: &'a Paths,
     config: &'a Config,
@@ -671,10 +673,7 @@ fn claude_records(
         .map(|entry| entry.path())
         .filter(|path| path.extension() == Some(OsStr::new("json")))
     {
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        let Some(value) = read_bounded_json(&path) else {
             continue;
         };
         if value.get("kind").and_then(Value::as_str) != Some("interactive") {
@@ -1291,11 +1290,28 @@ fn normalize_timestamp(value: f64) -> f64 {
 }
 
 fn read_first_json(path: impl AsRef<Path>) -> Option<Value> {
-    let line = BufReader::new(File::open(path).ok()?)
-        .lines()
-        .next()?
+    let mut line = Vec::new();
+    BufReader::new(File::open(path).ok()?)
+        .take(MAX_PROVIDER_METADATA_BYTES + 1)
+        .read_until(b'\n', &mut line)
         .ok()?;
-    serde_json::from_str(&line).ok()
+    if line.len() as u64 > MAX_PROVIDER_METADATA_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&line).ok()
+}
+
+fn read_bounded_json(path: &Path) -> Option<Value> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_PROVIDER_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_PROVIDER_METADATA_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn reverse_lines(path: &Path) -> Vec<String> {
@@ -1374,6 +1390,29 @@ mod tests {
         ));
         assert!(Providers::valid_id(Provider::Opencode, "ses_abcdef12"));
         assert!(!Providers::valid_id(Provider::Opencode, "ses_bad-name"));
+    }
+
+    #[test]
+    fn provider_json_readers_reject_oversized_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_line = temp.path().join("first.jsonl");
+        fs::write(
+            &first_line,
+            format!("{{\"padding\":\"{}\"}}\n{{}}\n", "x".repeat(1024 * 1024)),
+        )
+        .unwrap();
+        assert!(read_first_json(&first_line).is_none());
+
+        let document = temp.path().join("session.json");
+        fs::write(
+            &document,
+            format!("{{\"padding\":\"{}\"}}", "x".repeat(1024 * 1024)),
+        )
+        .unwrap();
+        assert!(read_bounded_json(&document).is_none());
+
+        fs::write(&document, br#"{"kind":"interactive"}"#).unwrap();
+        assert_eq!(read_bounded_json(&document).unwrap()["kind"], "interactive");
     }
 
     #[test]
