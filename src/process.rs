@@ -103,9 +103,22 @@ pub struct ProcessRecord {
     pub argv: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ProcessGeneration {
+    pub pid: i64,
+    pub start_time: u64,
+}
+
 impl ProcessRecord {
     pub fn provider(&self) -> Option<Provider> {
         process_kind(&self.argv)
+    }
+
+    pub fn generation(&self) -> ProcessGeneration {
+        ProcessGeneration {
+            pid: self.pid,
+            start_time: self.start_time,
+        }
     }
 }
 
@@ -138,6 +151,10 @@ pub fn snapshot() -> BTreeMap<i64, ProcessRecord> {
 
 pub fn process_start_time(pid: i64) -> Option<u64> {
     platform::read(pid).map(|record| record.start_time)
+}
+
+pub fn process_generation(pid: i64) -> Option<ProcessGeneration> {
+    platform::read(pid).map(|record| record.generation())
 }
 
 pub fn process_alive(pid: i64, generation: Option<u64>) -> bool {
@@ -246,6 +263,85 @@ pub fn process_tree(root: i64, processes: &BTreeMap<i64, ProcessRecord>) -> Vec<
         }
     }
     output
+}
+
+/// Return a process tree only when the pane/root PID is still the exact
+/// generation captured by the caller. A reusable numeric PID is never an
+/// ancestry root for an identity-changing action.
+pub fn process_tree_generation(
+    root: ProcessGeneration,
+    processes: &BTreeMap<i64, ProcessRecord>,
+) -> Vec<i64> {
+    if processes.get(&root.pid).map(ProcessRecord::generation) != Some(root) {
+        return Vec::new();
+    }
+    process_tree(root.pid, processes)
+}
+
+fn ancestry_path(
+    root: ProcessGeneration,
+    descendant: ProcessGeneration,
+    processes: &BTreeMap<i64, ProcessRecord>,
+) -> Option<Vec<ProcessRecord>> {
+    let mut current = descendant.pid;
+    let mut seen = BTreeSet::new();
+    let mut path = Vec::new();
+    loop {
+        if !seen.insert(current) {
+            return None;
+        }
+        let record = processes.get(&current)?;
+        if current == descendant.pid && record.generation() != descendant {
+            return None;
+        }
+        path.push(record.clone());
+        if current == root.pid {
+            return (record.generation() == root).then_some(path);
+        }
+        current = record.parent_pid?;
+    }
+}
+
+fn revalidate_ancestry_with(
+    root: ProcessGeneration,
+    descendant: ProcessGeneration,
+    processes: &BTreeMap<i64, ProcessRecord>,
+    mut read: impl FnMut(i64) -> Option<ProcessRecord>,
+) -> Result<(), String> {
+    let path = ancestry_path(root, descendant, processes).ok_or_else(|| {
+        "the provider is no longer descended from the exact pane generation".to_owned()
+    })?;
+    for expected in path {
+        let current = read(expected.pid)
+            .ok_or_else(|| format!("process {} disappeared during ancestry proof", expected.pid))?;
+        if current.start_time != expected.start_time {
+            return Err(format!(
+                "process {} changed generation during ancestry proof",
+                expected.pid
+            ));
+        }
+        // The pane root's parent is outside the ownership chain. Reparenting
+        // a descendant changes membership; reparenting the root itself does
+        // not move the provider outside that root.
+        if expected.pid != root.pid && current.parent_pid != expected.parent_pid {
+            return Err(format!(
+                "process {} changed parent during ancestry proof",
+                expected.pid
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Re-read every `(pid, start_time, parent_pid)` edge from the exact provider
+/// to the pane root. This must be called immediately before an exact action;
+/// a process reparent, root exit/reuse, or descendant reuse fails closed.
+pub fn revalidate_ancestry(
+    root: ProcessGeneration,
+    descendant: ProcessGeneration,
+    processes: &BTreeMap<i64, ProcessRecord>,
+) -> Result<(), String> {
+    revalidate_ancestry_with(root, descendant, processes, platform::read)
 }
 
 pub fn provider_process(
@@ -693,6 +789,61 @@ mod tests {
             (3, record(3, Some(2), &["pika", "hook"])),
         ]);
         assert_eq!(provider_ancestor(3, Provider::Codex, &records), Some(1));
+    }
+
+    #[test]
+    fn generation_bound_tree_rejects_reused_root_pid() {
+        let records = BTreeMap::from([
+            (1, record(1, None, &["zsh"])),
+            (2, record(2, Some(1), &["codex", "resume", "uuid"])),
+        ]);
+        assert_eq!(
+            process_tree_generation(records[&1].generation(), &records),
+            vec![1, 2]
+        );
+        assert!(
+            process_tree_generation(
+                ProcessGeneration {
+                    pid: 1,
+                    start_time: 999,
+                },
+                &records,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn ancestry_revalidation_rejects_ppid_change_and_generation_reuse() {
+        let records = BTreeMap::from([
+            (1, record(1, None, &["zsh"])),
+            (2, record(2, Some(1), &["sh"])),
+            (3, record(3, Some(2), &["codex", "resume", "uuid"])),
+        ]);
+        let root = records[&1].generation();
+        let provider = records[&3].generation();
+        revalidate_ancestry_with(root, provider, &records, |pid| records.get(&pid).cloned())
+            .unwrap();
+
+        let error = revalidate_ancestry_with(root, provider, &records, |pid| {
+            let mut current = records.get(&pid)?.clone();
+            if pid == 3 {
+                current.parent_pid = Some(1);
+            }
+            Some(current)
+        })
+        .unwrap_err();
+        assert!(error.contains("changed parent"));
+
+        let error = revalidate_ancestry_with(root, provider, &records, |pid| {
+            let mut current = records.get(&pid)?.clone();
+            if pid == 1 {
+                current.start_time += 1;
+            }
+            Some(current)
+        })
+        .unwrap_err();
+        assert!(error.contains("changed generation"));
     }
 
     #[test]

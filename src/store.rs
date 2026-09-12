@@ -28,10 +28,14 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 const BUSY_TIMEOUT: Duration = Duration::from_millis(500);
 pub const MAX_REMOTE_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const REMOTE_BOARD_CACHE_SCHEMA: u32 = 1;
-const REMOTE_BOARD_CACHE_CHUNK_BYTES: usize = 256 * 1024;
-const MAX_REMOTE_BOARD_CACHE_HEADER_BYTES: usize = 256 * 1024;
+const REMOTE_EXPERT_CACHE_SCHEMA: u32 = 1;
+// The aggregate budget is divided fairly across as many as 64 machines. A
+// 64-KiB page leaves room for the per-node manifest inside its 256-KiB slice,
+// so every valid dense node can contribute at least one row.
+const REMOTE_CACHE_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_REMOTE_CACHE_HEADER_BYTES: usize = 64 * 1024;
 const MAX_REMOTE_BOARD_CACHE_BYTES: usize = MAX_REMOTE_SNAPSHOT_BYTES + 512 * 1024;
-const MAX_REMOTE_BOARD_CACHE_CHUNKS: usize = 64;
+const MAX_REMOTE_CACHE_CHUNKS: usize = 128;
 
 const SCHEMA: &str = r#"
 CREATE TABLE sessions (
@@ -377,6 +381,21 @@ pub struct RemoteBoardProjection {
     pub directory_notices: Vec<Value>,
 }
 
+/// Bounded expert-only rows for aggregate expert search. The board inventory
+/// and unrelated session payload never enter an expert query's input budget.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoteExpertProjection {
+    pub rows: Vec<Value>,
+    pub protocol: String,
+    pub version: i64,
+    pub source_experts: usize,
+    pub source_captured_at: f64,
+    pub remote_captured_at: f64,
+    pub source_encoded_bytes: usize,
+    pub input_bytes: usize,
+    pub directory_notices: Vec<Value>,
+}
+
 /// Result of a size-gated full-snapshot read. When `snapshot` is `None`, SQLite
 /// returned only metadata and never materialized or parsed the oversized JSON.
 #[derive(Clone, Debug, PartialEq)]
@@ -403,14 +422,32 @@ struct RemoteBoardCacheHeader {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct RemoteExpertCacheHeader {
+    schema: u32,
+    node_id: String,
+    protocol: String,
+    version: i64,
+    source_captured_at: f64,
+    remote_captured_at: f64,
+    source_encoded_bytes: usize,
+    source_experts: usize,
+    chunks: Vec<RemoteBoardCacheChunk>,
+    directory_notices: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RemoteBoardCacheChunk {
     bytes: usize,
     rows: usize,
 }
 
 struct PreparedRemoteSnapshot {
+    revision: String,
+    node_id: String,
     encoded: String,
     board_cache: Option<PreparedRemoteBoardCache>,
+    expert_cache: Option<PreparedRemoteBoardCache>,
 }
 
 struct PreparedRemoteBoardCache {
@@ -626,6 +663,98 @@ impl Store {
     fn open_write(&self) -> Result<Connection> {
         self.initialize()?;
         self.open_write_raw()
+    }
+
+    fn open_fleet_cache(&self) -> Result<Connection> {
+        let parent = self
+            .path
+            .parent()
+            .context("Pika database path has no parent directory")?;
+        fs::create_dir_all(parent)?;
+        let file = self
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("Pika database path has no valid file name")?;
+        let path = parent.join(format!(".{file}.fleet-cache.sqlite3"));
+        let db = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        db.busy_timeout(Duration::from_secs(30))?;
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE IF NOT EXISTS projections(
+               node_id TEXT NOT NULL, revision TEXT NOT NULL, kind TEXT NOT NULL,
+               header TEXT NOT NULL, PRIMARY KEY(node_id,revision,kind));
+             CREATE TABLE IF NOT EXISTS projection_chunks(
+               node_id TEXT NOT NULL, revision TEXT NOT NULL, kind TEXT NOT NULL,
+               chunk_index INTEGER NOT NULL, value TEXT NOT NULL,
+               PRIMARY KEY(node_id,revision,kind,chunk_index));",
+        )?;
+        set_mode(&path, 0o600)?;
+        Ok(db)
+    }
+
+    fn stage_remote_cache(&self, prepared: &PreparedRemoteSnapshot) -> Result<()> {
+        let mut db = self.open_fleet_cache()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (kind, cache) in [
+            ("board", prepared.board_cache.as_ref()),
+            ("expert", prepared.expert_cache.as_ref()),
+        ] {
+            let Some(cache) = cache else { continue };
+            tx.execute(
+                "INSERT INTO projections(node_id,revision,kind,header) VALUES (?,?,?,?)",
+                params![prepared.node_id, prepared.revision, kind, cache.header],
+            )?;
+            for (index, chunk) in cache.chunks.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO projection_chunks(node_id,revision,kind,chunk_index,value) VALUES (?,?,?,?,?)",
+                    params![prepared.node_id, prepared.revision, kind, index, chunk],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn discard_remote_cache_revision(&self, node_id: &str, revision: &str) {
+        let Ok(mut db) = self.open_fleet_cache() else {
+            return;
+        };
+        let Ok(tx) = db.transaction_with_behavior(TransactionBehavior::Immediate) else {
+            return;
+        };
+        let _ = tx.execute(
+            "DELETE FROM projection_chunks WHERE node_id=? AND revision=?",
+            params![node_id, revision],
+        );
+        let _ = tx.execute(
+            "DELETE FROM projections WHERE node_id=? AND revision=?",
+            params![node_id, revision],
+        );
+        let _ = tx.commit();
+    }
+
+    fn prune_remote_cache(&self, node_id: &str, revision: &str) {
+        let Ok(mut db) = self.open_fleet_cache() else {
+            return;
+        };
+        let Ok(tx) = db.transaction_with_behavior(TransactionBehavior::Immediate) else {
+            return;
+        };
+        let _ = tx.execute(
+            "DELETE FROM projection_chunks WHERE node_id=? AND revision<>?",
+            params![node_id, revision],
+        );
+        let _ = tx.execute(
+            "DELETE FROM projections WHERE node_id=? AND revision<>?",
+            params![node_id, revision],
+        );
+        let _ = tx.commit();
     }
 
     pub(crate) fn reconcile_transaction<T>(
@@ -1891,16 +2020,24 @@ impl Store {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM remote_snapshots WHERE node_id=?", [node_id])?;
         tx.execute(
-            "DELETE FROM meta WHERE key LIKE ? OR key LIKE ? OR key LIKE ? OR key=?",
+            "DELETE FROM meta WHERE key LIKE ? OR key LIKE ? OR key LIKE ? OR key LIKE ? OR key=? OR key=?",
             params![
                 format!("fleet:pending-adopt:{node_id}:%"),
                 format!("fleet:pending-untrack:{node_id}:%"),
                 remote_board_cache_pattern(node_id),
+                remote_expert_cache_pattern(node_id),
                 fleet_refresh_generation_key(node_id),
+                remote_cache_revision_key(node_id),
             ],
         )?;
         let deleted = tx.execute("DELETE FROM fleet_nodes WHERE node_id=?", [node_id])? == 1;
         tx.commit()?;
+        if deleted {
+            if let Ok(cache) = self.open_fleet_cache() {
+                let _ = cache.execute("DELETE FROM projection_chunks WHERE node_id=?", [node_id]);
+                let _ = cache.execute("DELETE FROM projections WHERE node_id=?", [node_id]);
+            }
+        }
         Ok(deleted)
     }
 
@@ -2061,26 +2198,35 @@ impl Store {
         captured_at: f64,
     ) -> Result<()> {
         let prepared = prepare_remote_snapshot(node_id, payload, captured_at)?;
+        self.stage_remote_cache(&prepared)?;
         let mut db = self.open_write()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let trusted = tx
-            .query_row(
-                "SELECT 1 FROM fleet_nodes WHERE node_id=?",
-                [node_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !trusted {
-            bail!("remote snapshot requires an adopted fleet node");
-        }
-        write_remote_snapshot_tx(&tx, node_id, &prepared, captured_at)?;
-        tx.execute(
+        let result = (|| -> Result<()> {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let trusted = tx
+                .query_row(
+                    "SELECT 1 FROM fleet_nodes WHERE node_id=?",
+                    [node_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !trusted {
+                bail!("remote snapshot requires an adopted fleet node");
+            }
+            write_remote_snapshot_tx(&tx, node_id, &prepared, captured_at)?;
+            tx.execute(
             "UPDATE fleet_nodes SET status='ready',last_seen=?,last_error=NULL,last_attempt_at=?,updated_at=? WHERE node_id=?",
             params![captured_at, captured_at, now(), node_id],
         )?;
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })();
+        if result.is_ok() {
+            self.prune_remote_cache(node_id, &prepared.revision);
+        } else {
+            self.discard_remote_cache_revision(node_id, &prepared.revision);
+        }
+        result
     }
 
     /// Atomically make an onboarded node and its validated first snapshot
@@ -2095,47 +2241,49 @@ impl Store {
     ) -> Result<bool> {
         Uuid::parse_str(&node.node_id).context("fleet node_id is not a UUID")?;
         let prepared = prepare_remote_snapshot(&node.node_id, payload, captured_at)?;
+        self.stage_remote_cache(&prepared)?;
         let mut db = self.open_write()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !fleet_refresh_is_current(&tx, &node.node_id, generation)? {
-            tx.commit()?;
-            return Ok(false);
-        }
-        if let Some(collision) = tx
-            .query_row(
-                "SELECT node_id FROM fleet_nodes WHERE alias=? COLLATE NOCASE",
-                [&node.alias],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            && collision != node.node_id
-        {
-            bail!(
-                "machine alias {:?} already belongs to another node",
-                node.alias
+        let result = (|| -> Result<bool> {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !fleet_refresh_is_current(&tx, &node.node_id, generation)? {
+                tx.commit()?;
+                return Ok(false);
+            }
+            if let Some(collision) = tx
+                .query_row(
+                    "SELECT node_id FROM fleet_nodes WHERE alias=? COLLATE NOCASE",
+                    [&node.alias],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                && collision != node.node_id
+            {
+                bail!(
+                    "machine alias {:?} already belongs to another node",
+                    node.alias
+                );
+            }
+            let existing: Option<(f64, f64, f64)> = tx
+                .query_row(
+                    "SELECT last_seen,last_attempt_at,created_at FROM fleet_nodes WHERE node_id=?",
+                    [&node.node_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let timestamp = now();
+            let created_at = nonzero_or(
+                node.created_at,
+                existing.map_or(timestamp, |(_, _, created)| created),
             );
-        }
-        let existing: Option<(f64, f64, f64)> = tx
-            .query_row(
-                "SELECT last_seen,last_attempt_at,created_at FROM fleet_nodes WHERE node_id=?",
-                [&node.node_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let timestamp = now();
-        let created_at = nonzero_or(
-            node.created_at,
-            existing.map_or(timestamp, |(_, _, created)| created),
-        );
-        let updated_at = nonzero_or(node.updated_at, timestamp);
-        let last_seen = nonzero_or(node.last_seen, existing.map_or(0.0, |old| old.0));
-        let last_attempt_at = nonzero_or(
-            node.last_attempt_at,
-            existing.map_or(updated_at, |old| old.1),
-        );
-        let sources = serde_json::to_string(&node.sources)?;
-        let capabilities = serde_json::to_string(&node.capabilities)?;
-        tx.execute(
+            let updated_at = nonzero_or(node.updated_at, timestamp);
+            let last_seen = nonzero_or(node.last_seen, existing.map_or(0.0, |old| old.0));
+            let last_attempt_at = nonzero_or(
+                node.last_attempt_at,
+                existing.map_or(updated_at, |old| old.1),
+            );
+            let sources = serde_json::to_string(&node.sources)?;
+            let capabilities = serde_json::to_string(&node.capabilities)?;
+            tx.execute(
             r#"INSERT INTO fleet_nodes(node_id,alias,ssh_target,sources_json,status,protocol_version,package_version,capabilities_json,last_seen,last_attempt_at,last_error,created_at,updated_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET
             alias=excluded.alias,ssh_target=excluded.ssh_target,sources_json=excluded.sources_json,
@@ -2145,13 +2293,20 @@ impl Store {
             last_error=excluded.last_error,updated_at=excluded.updated_at"#,
             params![node.node_id, node.alias, node.ssh_target, sources, node.status, node.protocol_version, node.package_version, capabilities, last_seen, last_attempt_at, node.last_error, created_at, updated_at],
         )?;
-        write_remote_snapshot_tx(&tx, &node.node_id, &prepared, captured_at)?;
-        tx.execute(
+            write_remote_snapshot_tx(&tx, &node.node_id, &prepared, captured_at)?;
+            tx.execute(
             "UPDATE fleet_nodes SET status='ready',last_seen=?,last_error=NULL,last_attempt_at=?,updated_at=? WHERE node_id=?",
             params![captured_at, captured_at, timestamp, node.node_id],
         )?;
-        tx.commit()?;
-        Ok(true)
+            tx.commit()?;
+            Ok(true)
+        })();
+        if matches!(result, Ok(true)) {
+            self.prune_remote_cache(&node.node_id, &prepared.revision);
+        } else {
+            self.discard_remote_cache_revision(&node.node_id, &prepared.revision);
+        }
+        result
     }
 
     /// Commit a remote snapshot only while its pre-I/O refresh claim is still
@@ -2165,30 +2320,39 @@ impl Store {
         generation: u64,
     ) -> Result<bool> {
         let prepared = prepare_remote_snapshot(node_id, payload, captured_at)?;
+        self.stage_remote_cache(&prepared)?;
         let mut db = self.open_write()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !fleet_refresh_is_current(&tx, node_id, generation)? {
-            tx.commit()?;
-            return Ok(false);
-        }
-        let trusted = tx
-            .query_row(
-                "SELECT 1 FROM fleet_nodes WHERE node_id=?",
-                [node_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !trusted {
-            bail!("remote snapshot requires an adopted fleet node");
-        }
-        write_remote_snapshot_tx(&tx, node_id, &prepared, captured_at)?;
-        tx.execute(
+        let result = (|| -> Result<bool> {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !fleet_refresh_is_current(&tx, node_id, generation)? {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let trusted = tx
+                .query_row(
+                    "SELECT 1 FROM fleet_nodes WHERE node_id=?",
+                    [node_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !trusted {
+                bail!("remote snapshot requires an adopted fleet node");
+            }
+            write_remote_snapshot_tx(&tx, node_id, &prepared, captured_at)?;
+            tx.execute(
             "UPDATE fleet_nodes SET status='ready',last_seen=?,last_error=NULL,last_attempt_at=?,updated_at=? WHERE node_id=?",
             params![captured_at, captured_at, now(), node_id],
         )?;
-        tx.commit()?;
-        Ok(true)
+            tx.commit()?;
+            Ok(true)
+        })();
+        if matches!(result, Ok(true)) {
+            self.prune_remote_cache(node_id, &prepared.revision);
+        } else {
+            self.discard_remote_cache_revision(node_id, &prepared.revision);
+        }
+        result
     }
 
     pub fn get_remote_snapshot(&self, node_id: &str) -> Result<Option<RemoteSnapshot>> {
@@ -2311,11 +2475,90 @@ impl Store {
         };
         let source_encoded_bytes = usize::try_from(source_encoded_bytes)
             .context("stored remote snapshot has a negative size")?;
+        let revision = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key=?",
+                [remote_cache_revision_key(node_id)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(revision) = revision {
+            tx.commit()?;
+            let cache = self.open_fleet_cache()?;
+            let encoded_header = cache
+                .query_row(
+                    "SELECT CASE WHEN length(CAST(header AS BLOB))<=? THEN header ELSE NULL END FROM projections WHERE node_id=? AND revision=? AND kind='board'",
+                    params![MAX_REMOTE_CACHE_HEADER_BYTES as i64, node_id, revision],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            let Some(encoded_header) = encoded_header else {
+                return Ok(None);
+            };
+            let header_bytes = encoded_header.len();
+            if header_bytes > max_bytes {
+                bail!("stored remote board cache header exceeds its per-node input budget");
+            }
+            let header: RemoteBoardCacheHeader = serde_json::from_str(&encoded_header)
+                .context("stored remote board cache header is malformed")?;
+            if header.schema != REMOTE_BOARD_CACHE_SCHEMA
+                || header.node_id != node_id
+                || header.source_captured_at != source_captured_at
+                || header.source_encoded_bytes != source_encoded_bytes
+                || header.chunks.len() > MAX_REMOTE_CACHE_CHUNKS
+                || header.source_sessions > 2_000
+            {
+                bail!("stored remote board cache does not match its source snapshot");
+            }
+            let mut input_bytes = header_bytes;
+            let mut rows = Vec::new();
+            for (index, chunk) in header.chunks.iter().enumerate() {
+                if chunk.bytes == 0
+                    || chunk.bytes > MAX_REMOTE_BOARD_CACHE_BYTES
+                    || chunk.rows == 0
+                    || chunk.rows > 2_000
+                {
+                    bail!("stored remote board cache chunk metadata is invalid");
+                }
+                if rows.len() >= max_rows || chunk.bytes > max_bytes.saturating_sub(input_bytes) {
+                    break;
+                }
+                let encoded = cache
+                    .query_row(
+                        "SELECT CASE WHEN length(CAST(value AS BLOB))=? THEN value ELSE NULL END FROM projection_chunks WHERE node_id=? AND revision=? AND kind='board' AND chunk_index=?",
+                        params![i64::try_from(chunk.bytes)?, node_id, revision, index],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten()
+                    .context("stored remote board cache chunk is missing or changed")?;
+                let mut values: Vec<Value> = serde_json::from_str(&encoded)
+                    .context("stored remote board cache chunk is malformed")?;
+                if values.len() != chunk.rows {
+                    bail!("stored remote board cache chunk row count changed");
+                }
+                input_bytes += chunk.bytes;
+                values.truncate(max_rows.saturating_sub(rows.len()));
+                rows.extend(values);
+            }
+            return Ok(Some(RemoteBoardProjection {
+                rows,
+                protocol: header.protocol,
+                version: header.version,
+                source_sessions: header.source_sessions,
+                source_captured_at,
+                remote_captured_at: header.remote_captured_at,
+                source_encoded_bytes,
+                input_bytes,
+                directory_notices: header.directory_notices,
+            }));
+        }
         let header_key = remote_board_cache_header_key(node_id);
         let header = tx
             .query_row(
                 "SELECT CASE WHEN length(CAST(value AS BLOB))<=? THEN value ELSE NULL END,length(CAST(value AS BLOB)) FROM meta WHERE key=?",
-                params![MAX_REMOTE_BOARD_CACHE_HEADER_BYTES as i64, header_key],
+                params![MAX_REMOTE_CACHE_HEADER_BYTES as i64, header_key],
                 |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?;
@@ -2334,7 +2577,7 @@ impl Store {
             || header.node_id != node_id
             || header.source_captured_at != source_captured_at
             || header.source_encoded_bytes != source_encoded_bytes
-            || header.chunks.len() > MAX_REMOTE_BOARD_CACHE_CHUNKS
+            || header.chunks.len() > MAX_REMOTE_CACHE_CHUNKS
             || header.source_sessions > 2_000
         {
             bail!("stored remote board cache does not match its source snapshot");
@@ -2378,6 +2621,187 @@ impl Store {
             protocol: header.protocol,
             version: header.version,
             source_sessions: header.source_sessions,
+            source_captured_at,
+            remote_captured_at: header.remote_captured_at,
+            source_encoded_bytes,
+            input_bytes,
+            directory_notices: header.directory_notices,
+        }))
+    }
+
+    /// Load only persisted expert-bearing pages within this machine's fair
+    /// aggregate slice. A fleet expert query never parses the full remote
+    /// board snapshot or unrelated conversations.
+    pub fn get_remote_expert_projection(
+        &self,
+        node_id: &str,
+        max_bytes: usize,
+        max_rows: usize,
+    ) -> Result<Option<RemoteExpertProjection>> {
+        if !self.exists() {
+            return Ok(None);
+        }
+        let mut db = self.open_read()?;
+        let tx = db.transaction()?;
+        let source = tx
+            .query_row(
+                "SELECT captured_at,length(CAST(payload_json AS BLOB)) FROM remote_snapshots WHERE node_id=?",
+                [node_id],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((source_captured_at, source_encoded_bytes)) = source else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let source_encoded_bytes = usize::try_from(source_encoded_bytes)
+            .context("stored remote snapshot has a negative size")?;
+        let revision = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key=?",
+                [remote_cache_revision_key(node_id)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(revision) = revision {
+            tx.commit()?;
+            let cache = self.open_fleet_cache()?;
+            let encoded_header = cache
+                .query_row(
+                    "SELECT CASE WHEN length(CAST(header AS BLOB))<=? THEN header ELSE NULL END FROM projections WHERE node_id=? AND revision=? AND kind='expert'",
+                    params![MAX_REMOTE_CACHE_HEADER_BYTES as i64, node_id, revision],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            let Some(encoded_header) = encoded_header else {
+                return Ok(None);
+            };
+            let header_bytes = encoded_header.len();
+            if header_bytes > max_bytes {
+                bail!("stored remote expert cache header exceeds its per-node input budget");
+            }
+            let header: RemoteExpertCacheHeader = serde_json::from_str(&encoded_header)
+                .context("stored remote expert cache header is malformed")?;
+            if header.schema != REMOTE_EXPERT_CACHE_SCHEMA
+                || header.node_id != node_id
+                || header.source_captured_at != source_captured_at
+                || header.source_encoded_bytes != source_encoded_bytes
+                || header.chunks.len() > MAX_REMOTE_CACHE_CHUNKS
+                || header.source_experts > 2_000
+            {
+                bail!("stored remote expert cache does not match its source snapshot");
+            }
+            let mut input_bytes = header_bytes;
+            let mut rows = Vec::new();
+            for (index, chunk) in header.chunks.iter().enumerate() {
+                if chunk.bytes == 0
+                    || chunk.bytes > MAX_REMOTE_BOARD_CACHE_BYTES
+                    || chunk.rows == 0
+                    || chunk.rows > 2_000
+                {
+                    bail!("stored remote expert cache chunk metadata is invalid");
+                }
+                if rows.len() >= max_rows || chunk.bytes > max_bytes.saturating_sub(input_bytes) {
+                    break;
+                }
+                let encoded = cache
+                    .query_row(
+                        "SELECT CASE WHEN length(CAST(value AS BLOB))=? THEN value ELSE NULL END FROM projection_chunks WHERE node_id=? AND revision=? AND kind='expert' AND chunk_index=?",
+                        params![i64::try_from(chunk.bytes)?, node_id, revision, index],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten()
+                    .context("stored remote expert cache chunk is missing or changed")?;
+                let mut values: Vec<Value> = serde_json::from_str(&encoded)
+                    .context("stored remote expert cache chunk is malformed")?;
+                if values.len() != chunk.rows {
+                    bail!("stored remote expert cache chunk row count changed");
+                }
+                input_bytes += chunk.bytes;
+                values.truncate(max_rows.saturating_sub(rows.len()));
+                rows.extend(values);
+            }
+            return Ok(Some(RemoteExpertProjection {
+                rows,
+                protocol: header.protocol,
+                version: header.version,
+                source_experts: header.source_experts,
+                source_captured_at,
+                remote_captured_at: header.remote_captured_at,
+                source_encoded_bytes,
+                input_bytes,
+                directory_notices: header.directory_notices,
+            }));
+        }
+        let header_key = remote_expert_cache_header_key(node_id);
+        let header = tx
+            .query_row(
+                "SELECT CASE WHEN length(CAST(value AS BLOB))<=? THEN value ELSE NULL END,length(CAST(value AS BLOB)) FROM meta WHERE key=?",
+                params![MAX_REMOTE_CACHE_HEADER_BYTES as i64, header_key],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((Some(encoded_header), header_bytes)) = header else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let header_bytes = usize::try_from(header_bytes)
+            .context("stored remote expert cache header has a negative size")?;
+        if header_bytes > max_bytes {
+            bail!("stored remote expert cache header exceeds its per-node input budget");
+        }
+        let header: RemoteExpertCacheHeader = serde_json::from_str(&encoded_header)
+            .context("stored remote expert cache header is malformed")?;
+        if header.schema != REMOTE_EXPERT_CACHE_SCHEMA
+            || header.node_id != node_id
+            || header.source_captured_at != source_captured_at
+            || header.source_encoded_bytes != source_encoded_bytes
+            || header.chunks.len() > MAX_REMOTE_CACHE_CHUNKS
+            || header.source_experts > 2_000
+        {
+            bail!("stored remote expert cache does not match its source snapshot");
+        }
+        let mut input_bytes = header_bytes;
+        let mut rows = Vec::new();
+        for (index, chunk) in header.chunks.iter().enumerate() {
+            if chunk.bytes == 0
+                || chunk.bytes > MAX_REMOTE_BOARD_CACHE_BYTES
+                || chunk.rows == 0
+                || chunk.rows > 2_000
+            {
+                bail!("stored remote expert cache chunk metadata is invalid");
+            }
+            if rows.len() >= max_rows || chunk.bytes > max_bytes.saturating_sub(input_bytes) {
+                break;
+            }
+            let key = remote_expert_cache_chunk_key(node_id, index);
+            let encoded = tx
+                .query_row(
+                    "SELECT CASE WHEN length(CAST(value AS BLOB))=? THEN value ELSE NULL END FROM meta WHERE key=?",
+                    params![i64::try_from(chunk.bytes)?, key],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+                .context("stored remote expert cache chunk is missing or changed")?;
+            let mut values: Vec<Value> = serde_json::from_str(&encoded)
+                .context("stored remote expert cache chunk is malformed")?;
+            if values.len() != chunk.rows {
+                bail!("stored remote expert cache chunk row count changed");
+            }
+            input_bytes += chunk.bytes;
+            let remaining_rows = max_rows.saturating_sub(rows.len());
+            values.truncate(remaining_rows);
+            rows.extend(values);
+        }
+        tx.commit()?;
+        Ok(Some(RemoteExpertProjection {
+            rows,
+            protocol: header.protocol,
+            version: header.version,
+            source_experts: header.source_experts,
             source_captured_at,
             remote_captured_at: header.remote_captured_at,
             source_encoded_bytes,
@@ -3467,6 +3891,26 @@ fn remote_board_cache_chunk_key(node_id: &str, index: usize) -> String {
     format!("{}chunk:{index:04}", remote_board_cache_prefix(node_id))
 }
 
+fn remote_expert_cache_prefix(node_id: &str) -> String {
+    format!("fleet:expert-cache:{node_id}:")
+}
+
+fn remote_expert_cache_pattern(node_id: &str) -> String {
+    format!("{}%", remote_expert_cache_prefix(node_id))
+}
+
+fn remote_expert_cache_header_key(node_id: &str) -> String {
+    format!("{}header", remote_expert_cache_prefix(node_id))
+}
+
+fn remote_expert_cache_chunk_key(node_id: &str, index: usize) -> String {
+    format!("{}chunk:{index:04}", remote_expert_cache_prefix(node_id))
+}
+
+fn remote_cache_revision_key(node_id: &str) -> String {
+    format!("fleet:cache-revision:{node_id}")
+}
+
 fn prepare_remote_snapshot(
     node_id: &str,
     payload: &Value,
@@ -3480,9 +3924,13 @@ fn prepare_remote_snapshot(
         bail!("remote snapshot exceeds the 4 MiB safety limit");
     }
     let board_cache = prepare_remote_board_cache(node_id, object, captured_at, encoded.len())?;
+    let expert_cache = prepare_remote_expert_cache(node_id, object, captured_at, encoded.len())?;
     Ok(PreparedRemoteSnapshot {
+        revision: Uuid::new_v4().to_string(),
+        node_id: node_id.to_owned(),
         encoded,
         board_cache,
+        expert_cache,
     })
 }
 
@@ -3530,24 +3978,7 @@ fn prepare_remote_board_cache(
     };
     let profiles = keyed("profiles");
     let cards = keyed("cards");
-    let mut chunk_rows = Vec::<String>::new();
-    let mut chunk_content_bytes = 0_usize;
-    let mut chunks = Vec::<String>::new();
-    let mut chunk_metadata = Vec::<RemoteBoardCacheChunk>::new();
-    let flush = |rows: &mut Vec<String>,
-                 chunks: &mut Vec<String>,
-                 metadata: &mut Vec<RemoteBoardCacheChunk>| {
-        if rows.is_empty() {
-            return;
-        }
-        let encoded = format!("[{}]", rows.join(","));
-        metadata.push(RemoteBoardCacheChunk {
-            bytes: encoded.len(),
-            rows: rows.len(),
-        });
-        chunks.push(encoded);
-        rows.clear();
-    };
+    let mut encoded_rows = Vec::with_capacity(sessions.len());
     for session in sessions {
         let Some(session_object) = session.as_object() else {
             return Ok(None);
@@ -3565,19 +3996,10 @@ fn prepare_remote_board_cache(
             "profile": profiles.get(&key).map(|value| (*value).clone()).unwrap_or(Value::Null),
             "card": cards.get(&key).map(|value| (*value).clone()).unwrap_or(Value::Null),
         });
-        let encoded_row = serde_json::to_string(&row)?;
-        let next_bytes = 2 + chunk_content_bytes + chunk_rows.len() + encoded_row.len();
-        if !chunk_rows.is_empty() && next_bytes > REMOTE_BOARD_CACHE_CHUNK_BYTES {
-            flush(&mut chunk_rows, &mut chunks, &mut chunk_metadata);
-            chunk_content_bytes = 0;
-        }
-        chunk_content_bytes = chunk_content_bytes
-            .checked_add(encoded_row.len())
-            .context("remote board cache size overflowed")?;
-        chunk_rows.push(encoded_row);
+        encoded_rows.push(serde_json::to_string(&row)?);
     }
-    flush(&mut chunk_rows, &mut chunks, &mut chunk_metadata);
-    if chunk_metadata.len() > MAX_REMOTE_BOARD_CACHE_CHUNKS
+    let (chunks, chunk_metadata) = chunk_cache_rows(encoded_rows)?;
+    if chunk_metadata.len() > MAX_REMOTE_CACHE_CHUNKS
         || chunks.iter().map(String::len).sum::<usize>() > MAX_REMOTE_BOARD_CACHE_BYTES
     {
         return Ok(None);
@@ -3599,13 +4021,164 @@ fn prepare_remote_board_cache(
         chunks: chunk_metadata,
         directory_notices,
     })?;
-    if header.len() > MAX_REMOTE_BOARD_CACHE_HEADER_BYTES
+    if header.len() > MAX_REMOTE_CACHE_HEADER_BYTES
         || header.len() + chunks.iter().map(String::len).sum::<usize>()
             > MAX_REMOTE_BOARD_CACHE_BYTES
     {
         return Ok(None);
     }
     Ok(Some(PreparedRemoteBoardCache { header, chunks }))
+}
+
+fn prepare_remote_expert_cache(
+    node_id: &str,
+    object: &serde_json::Map<String, Value>,
+    captured_at: f64,
+    source_encoded_bytes: usize,
+) -> Result<Option<PreparedRemoteBoardCache>> {
+    let Some(source_node_id) = object.get("node_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(protocol) = object.get("protocol").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(version) = object.get("version").and_then(Value::as_i64) else {
+        return Ok(None);
+    };
+    let Some(remote_captured_at) = object.get("captured_at").and_then(Value::as_f64) else {
+        return Ok(None);
+    };
+    if source_node_id != node_id {
+        return Ok(None);
+    }
+    let keyed = |field: &str| {
+        object
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| {
+                let row = value.as_object()?;
+                Some((
+                    (
+                        row.get("provider")?.as_str()?.to_owned(),
+                        row.get("session_id")?.as_str()?.to_owned(),
+                    ),
+                    value,
+                ))
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let profiles = keyed("profiles");
+    let cards = keyed("cards");
+    let mut seen = BTreeSet::new();
+    let mut encoded_rows = Vec::new();
+    for session in object
+        .get("expert_sessions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(
+            object
+                .get("sessions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+    {
+        let Some(row) = session.as_object() else {
+            return Ok(None);
+        };
+        let Some(key) = row
+            .get("provider")
+            .and_then(Value::as_str)
+            .zip(row.get("session_id").and_then(Value::as_str))
+            .map(|(provider, session_id)| (provider.to_owned(), session_id.to_owned()))
+        else {
+            return Ok(None);
+        };
+        let Some(profile) = profiles.get(&key) else {
+            continue;
+        };
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        encoded_rows.push(serde_json::to_string(&serde_json::json!({
+            "session": session,
+            "profile": (*profile).clone(),
+            "card": cards.get(&key).map(|value| (*value).clone()).unwrap_or(Value::Null),
+        }))?);
+    }
+    if encoded_rows.len() > 2_000 {
+        return Ok(None);
+    }
+    let source_experts = encoded_rows.len();
+    let (chunks, chunk_metadata) = chunk_cache_rows(encoded_rows)?;
+    if chunk_metadata.len() > MAX_REMOTE_CACHE_CHUNKS
+        || chunks.iter().map(String::len).sum::<usize>() > MAX_REMOTE_BOARD_CACHE_BYTES
+    {
+        return Ok(None);
+    }
+    let directory_notices = object
+        .get("directory_notices")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let header = serde_json::to_string(&RemoteExpertCacheHeader {
+        schema: REMOTE_EXPERT_CACHE_SCHEMA,
+        node_id: node_id.to_owned(),
+        protocol: protocol.to_owned(),
+        version,
+        source_captured_at: captured_at,
+        remote_captured_at,
+        source_encoded_bytes,
+        source_experts,
+        chunks: chunk_metadata,
+        directory_notices,
+    })?;
+    if header.len() > MAX_REMOTE_CACHE_HEADER_BYTES
+        || header.len() + chunks.iter().map(String::len).sum::<usize>()
+            > MAX_REMOTE_BOARD_CACHE_BYTES
+    {
+        return Ok(None);
+    }
+    Ok(Some(PreparedRemoteBoardCache { header, chunks }))
+}
+
+fn chunk_cache_rows(
+    encoded_rows: Vec<String>,
+) -> Result<(Vec<String>, Vec<RemoteBoardCacheChunk>)> {
+    let mut pending = Vec::<String>::new();
+    let mut content_bytes = 0_usize;
+    let mut chunks = Vec::<String>::new();
+    let mut metadata = Vec::<RemoteBoardCacheChunk>::new();
+    let flush = |rows: &mut Vec<String>,
+                 chunks: &mut Vec<String>,
+                 metadata: &mut Vec<RemoteBoardCacheChunk>| {
+        if rows.is_empty() {
+            return;
+        }
+        let encoded = format!("[{}]", rows.join(","));
+        metadata.push(RemoteBoardCacheChunk {
+            bytes: encoded.len(),
+            rows: rows.len(),
+        });
+        chunks.push(encoded);
+        rows.clear();
+    };
+    for row in encoded_rows {
+        let next_bytes = 2 + content_bytes + pending.len() + row.len();
+        if !pending.is_empty() && next_bytes > REMOTE_CACHE_CHUNK_BYTES {
+            flush(&mut pending, &mut chunks, &mut metadata);
+            content_bytes = 0;
+        }
+        content_bytes = content_bytes
+            .checked_add(row.len())
+            .context("remote cache size overflowed")?;
+        pending.push(row);
+    }
+    flush(&mut pending, &mut chunks, &mut metadata);
+    Ok((chunks, metadata))
 }
 
 fn write_remote_snapshot_tx(
@@ -3618,22 +4191,13 @@ fn write_remote_snapshot_tx(
         "INSERT INTO remote_snapshots(node_id,payload_json,captured_at) VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET payload_json=excluded.payload_json,captured_at=excluded.captured_at",
         params![node_id, &prepared.encoded, captured_at],
     )?;
+    // Large projection pages were committed to the independent cache WAL
+    // before this transaction. The lifecycle writer performs only the
+    // authoritative snapshot replacement and one small manifest swap.
     tx.execute(
-        "DELETE FROM meta WHERE key LIKE ?",
-        [remote_board_cache_pattern(node_id)],
+        "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![remote_cache_revision_key(node_id), prepared.revision],
     )?;
-    if let Some(cache) = &prepared.board_cache {
-        tx.execute(
-            "INSERT INTO meta(key,value) VALUES (?,?)",
-            params![remote_board_cache_header_key(node_id), &cache.header],
-        )?;
-        for (index, chunk) in cache.chunks.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO meta(key,value) VALUES (?,?)",
-                params![remote_board_cache_chunk_key(node_id, index), chunk],
-            )?;
-        }
-    }
     Ok(())
 }
 

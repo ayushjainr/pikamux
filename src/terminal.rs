@@ -159,25 +159,52 @@ impl Drop for MasterFdGuard {
 struct PtyChildGuard {
     pid: libc::pid_t,
     reaped: bool,
+    exit_observed: bool,
 }
 
 #[cfg(unix)]
 impl PtyChildGuard {
     fn new(pid: libc::pid_t) -> Self {
-        Self { pid, reaped: false }
+        Self {
+            pid,
+            reaped: false,
+            exit_observed: false,
+        }
     }
 
-    fn poll(&mut self) -> Result<Option<libc::c_int>> {
-        let mut status = 0;
-        let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
-        if waited == self.pid {
-            self.reaped = true;
-            Ok(Some(status))
-        } else if waited == 0 || io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            Ok(None)
+    /// Observe terminal-client exit without consuming its wait status.
+    ///
+    /// A numeric PID can be reused as soon as `waitpid` reaps it. The bridge
+    /// therefore uses `waitid(..., WNOWAIT)` to latch exit first, disables all
+    /// child-directed actions, drains the PTY, and performs the sole reap in
+    /// `wait`. This closes the interval in which a late signal or handoff
+    /// proof could otherwise target a different process generation.
+    fn observe_exit(&mut self) -> Result<bool> {
+        if self.exit_observed {
+            return Ok(true);
+        }
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let observed = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if observed == 0 {
+            let info = unsafe { info.assume_init() };
+            self.exit_observed = unsafe { info.si_pid() } == self.pid;
+            Ok(self.exit_observed)
+        } else if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            Ok(false)
         } else {
             Err(io::Error::last_os_error()).context("cannot inspect terminal client")
         }
+    }
+
+    fn actions_allowed(&self) -> bool {
+        !self.exit_observed && !self.reaped
     }
 
     fn wait(&mut self) -> Result<libc::c_int> {
@@ -696,17 +723,19 @@ where
     let mut color_filter = palette.map(ColorQueryFilter::new);
     let mut input_filter = suppress_da2.then(|| ExactInputFilter::new(&[WINDOWS_TERMINAL_DA2]));
     let mut on_handoff = Some(on_handoff);
-    let mut status = None;
     let mut resized = true;
     loop {
-        handle_bridge_signals(child.pid, &mut terminal, &mut resized)?;
-        if resized {
-            copy_terminal_size(input, master);
-            forward_signal(child.pid, libc::SIGWINCH);
-            resized = false;
-        }
-        if on_handoff.is_some() && handoff_proven(child.pid) {
-            on_handoff.take().expect("handoff callback present")()?;
+        child.observe_exit()?;
+        if child.actions_allowed() {
+            handle_bridge_signals(child.pid, &mut terminal, &mut resized)?;
+            if resized {
+                copy_terminal_size(input, master);
+                forward_signal(child.pid, libc::SIGWINCH);
+                resized = false;
+            }
+            if on_handoff.is_some() && handoff_proven(child.pid) {
+                on_handoff.take().expect("handoff callback present")()?;
+            }
         }
         let mut descriptors = [
             libc::pollfd {
@@ -727,7 +756,7 @@ where
             }
             return Err(io::Error::last_os_error()).context("terminal bridge poll failed");
         }
-        if descriptors[0].revents & libc::POLLIN != 0 {
+        if child.actions_allowed() && descriptors[0].revents & libc::POLLIN != 0 {
             let mut buffer = [0_u8; 4096];
             let count = unsafe { libc::read(input, buffer.as_mut_ptr().cast(), buffer.len()) };
             if count > 0 {
@@ -765,24 +794,19 @@ where
             // descendant briefly retains the slave descriptor.
             break;
         }
-        if let Some(candidate) = child.poll()? {
-            status = Some(candidate);
-            // POLLHUP is not pending output. Exit after the leader is reaped
-            // once no readable PTY bytes remain, even if a platform keeps the
-            // hangup bit asserted on the master descriptor.
-            if descriptors[1].revents & libc::POLLIN == 0 {
-                break;
-            }
+        child.observe_exit()?;
+        // Once exit is observed, one complete poll/read cycle with no
+        // readable bytes proves the PTY's currently buffered output is
+        // drained. Descendants retaining the slave cannot keep Pika hung, and
+        // the leader is still unreaped so its PID cannot be reused.
+        if child.exit_observed && descriptors[1].revents & libc::POLLIN == 0 {
+            break;
         }
     }
     if let Some(filter) = &mut color_filter {
         write_fd(output, &filter.finish())?;
     }
-    let raw_status = if let Some(status) = status {
-        status
-    } else {
-        child.wait()?
-    };
+    let raw_status = child.wait()?;
     Ok(wait_exit_code(raw_status))
 }
 
@@ -858,6 +882,36 @@ mod tests {
             b"beforemiddleafter"
         );
         assert_eq!(replies.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_pty_exit_disables_actions_until_the_single_reap() {
+        let pid = unsafe { libc::fork() };
+        assert!(
+            pid >= 0,
+            "fixture fork failed: {}",
+            io::Error::last_os_error()
+        );
+        if pid == 0 {
+            unsafe { libc::_exit(23) };
+        }
+        let mut child = PtyChildGuard::new(pid);
+        for _ in 0..1_000 {
+            if child.observe_exit().unwrap() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(child.exit_observed, "child exit was not observed");
+        assert!(
+            !child.actions_allowed(),
+            "exit must close every action path"
+        );
+        assert!(!child.reaped, "WNOWAIT must leave the sole reap to wait()");
+        let status = child.wait().unwrap();
+        assert!(child.reaped);
+        assert_eq!(wait_exit_code(status), 23);
     }
 
     #[cfg(unix)]

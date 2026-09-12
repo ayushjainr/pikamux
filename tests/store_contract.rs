@@ -7,6 +7,8 @@ use pikamux::store::{
 };
 use rusqlite::Connection;
 use serde_json::json;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -742,6 +744,73 @@ fn remote_snapshot_storage_rejects_oversized_payload_before_json_parse() {
     )
     .unwrap();
     assert!(store.get_remote_snapshot(&node.node_id).is_err());
+}
+
+#[test]
+fn maximum_fleet_cache_refresh_does_not_block_lifecycle_hooks() {
+    let (_temp, store) = store_fixture();
+    let node = FleetNode {
+        node_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        alias: "atlas".into(),
+        ssh_target: "atlas".into(),
+        sources: vec![],
+        status: "ready".into(),
+        protocol_version: Some(2),
+        package_version: None,
+        capabilities: vec![],
+        last_seen: 0.0,
+        last_attempt_at: 0.0,
+        last_error: None,
+        created_at: 1.0,
+        updated_at: 1.0,
+    };
+    store.upsert_fleet_node(&node).unwrap();
+    let sessions = (0..2_000)
+        .map(|sequence| {
+            json!({
+                "provider":"codex",
+                "session_id":format!("00000000-0000-4000-8000-{sequence:012x}"),
+                "name":"dense"
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "protocol":"pikamux-fleet", "version":2,
+        "node_id":node.node_id, "captured_at":12.0,
+        "sessions":sessions, "profiles":[], "cards":[],
+        "padding":"x".repeat(MAX_REMOTE_SNAPSHOT_BYTES - 512 * 1024)
+    });
+    assert!(serde_json::to_vec(&payload).unwrap().len() < MAX_REMOTE_SNAPSHOT_BYTES);
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_store = store.clone();
+    let writer_barrier = Arc::clone(&barrier);
+    let node_id = node.node_id.clone();
+    let writer = thread::spawn(move || {
+        writer_barrier.wait();
+        writer_store.put_remote_snapshot(&node_id, &payload, 12.0)
+    });
+    barrier.wait();
+    let mut worst = Duration::ZERO;
+    for sequence in 0..32 {
+        let started = Instant::now();
+        store
+            .record_hook_observation(&HookObservation {
+                provider: Provider::Codex,
+                fingerprint: format!("hook-{sequence}"),
+                event_name: "Stop".into(),
+                session_id: format!("session-{sequence}"),
+                observed_at: 20.0 + f64::from(sequence),
+                source: Some("concurrency-contract".into()),
+                managed: true,
+            })
+            .unwrap();
+        worst = worst.max(started.elapsed());
+    }
+    writer.join().unwrap().unwrap();
+    assert!(
+        worst < Duration::from_millis(500),
+        "lifecycle hook exceeded its writer budget during max fleet refresh: {worst:?}"
+    );
 }
 
 #[test]

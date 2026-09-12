@@ -53,6 +53,7 @@ pub struct OpenReceipt {
 #[derive(Clone, Debug)]
 pub struct ExactPaneBinding {
     pub pane: Pane,
+    pub pane_start_time: u64,
     pub provider_pid: i64,
     pub provider_start_time: u64,
 }
@@ -845,6 +846,15 @@ impl Pika {
             );
         }
         let pane = matches[0];
+        let pane_generation = processes
+            .get(&pane.pane_pid)
+            .map(ProcessRecord::generation)
+            .context("the tmux pane root disappeared from the complete observation")?;
+        if process::process_generation(pane.pane_pid) != Some(pane_generation) {
+            bail!(
+                "the tmux pane root generation changed after observation; no pane action was performed"
+            );
+        }
         let owners = self
             .store
             .reconcile_transaction(|ledger| identity_owners(session, processes, ledger, now()))?;
@@ -862,7 +872,7 @@ impl Pika {
                 "the exact pane has no UUID argv or matching certified launch generation; no pane action was performed"
             );
         }
-        let tree = process::process_tree(pane.pane_pid, processes);
+        let tree = process::process_tree_generation(pane_generation, processes);
         if !tree.contains(&provider_pid) {
             bail!(
                 "the exact provider process is outside the tagged pane; no pane action was performed"
@@ -872,9 +882,13 @@ impl Pika {
             .get(&provider_pid)
             .map(|record| record.start_time)
             .context("the exact provider process disappeared from the complete observation")?;
-        if process::process_start_time(provider_pid) != Some(provider_start_time) {
-            bail!("the exact provider process generation changed; no pane action was performed");
-        }
+        let provider_generation = process::ProcessGeneration {
+            pid: provider_pid,
+            start_time: provider_start_time,
+        };
+        process::revalidate_ancestry(pane_generation, provider_generation, processes)
+            .map_err(anyhow::Error::msg)
+            .context("the exact pane ancestry changed after tmux observation; no pane action was performed")?;
         let fresh = self
             .tmux
             .get_pane(&pane.pane_id)?
@@ -883,10 +897,12 @@ impl Pika {
             || fresh.pika_provider != Some(session.provider)
             || fresh.pika_session_id.as_deref() != Some(&session.session_id)
             || fresh.pika_launch_token != pane.pika_launch_token
-            || process::process_start_time(provider_pid) != Some(provider_start_time)
         {
             bail!("the exact pane or provider generation changed; no pane action was performed");
         }
+        process::revalidate_ancestry(pane_generation, provider_generation, processes)
+            .map_err(anyhow::Error::msg)
+            .context("the exact pane ancestry changed immediately before the action; no pane action was performed")?;
         if !owners.direct.contains(&provider_pid) {
             let before = owners.recovery.as_ref().expect("certified pane proof");
             let current = self
@@ -906,6 +922,7 @@ impl Pika {
         }
         Ok(ExactPaneBinding {
             pane: fresh,
+            pane_start_time: pane_generation.start_time,
             provider_pid,
             provider_start_time,
         })
@@ -1840,6 +1857,7 @@ fn same_pane_generation(left: &Pane, right: &Pane) -> bool {
 
 fn same_exact_binding(left: &ExactPaneBinding, right: &ExactPaneBinding) -> bool {
     same_pane_generation(&left.pane, &right.pane)
+        && left.pane_start_time == right.pane_start_time
         && left.provider_pid == right.provider_pid
         && left.provider_start_time == right.provider_start_time
 }
