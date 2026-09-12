@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "family": "identity_name_resolution",
+  "reference": {
+    "version": "0.5.0a4",
+    "source_commit": "36de1b1eed1a182ed4e608d47f95d362f15d571a",
+    "tests": ["test_thread_resolution.py", "test_adversarial.py", "test_lifecycle.py"]
+  },
+  "cases": [
+    {
+      "id": "exact_uuid_beats_name_collision",
+      "query": "id-one",
+      "candidates": [
+        {"label":"exact","provider":"codex","session_id":"id-one","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":10.0},
+        {"label":"name_collision","provider":"claude","session_id":"id-two","name":"id-one","cwd":"/projects/a","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["exact"]}
+    },
+    {
+      "id": "active_leaf_alias_resolves_stable_home",
+      "query": "leaf-id",
+      "candidates": [
+        {"label":"stable_home","provider":"codex","session_id":"root-id","active_thread_id":"leaf-id","name":"research","cwd":"/projects/a","exact_home":true,"live":true,"status":"WORKING","evidence":"available","provider_updated_at":20.0},
+        {"label":"leaf_row","provider":"codex","session_id":"leaf-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["stable_home"]}
+    },
+    {
+      "id": "native_duplicate_prefers_exact_home",
+      "query": "research",
+      "candidates": [
+        {"label":"stale_alias","provider":"codex","session_id":"root-id","active_thread_id":"leaf-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":10.0},
+        {"label":"exact_alias","provider":"codex","session_id":"leaf-id","name":"research","cwd":"/projects/a","exact_home":true,"live":true,"status":"WORKING","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["exact_alias"]}
+    },
+    {
+      "id": "archived_hidden_from_name",
+      "query": "research",
+      "candidates": [
+        {"label":"archived","provider":"codex","session_id":"old-id","name":"research","cwd":"/projects/a","evidence":"archived","provider_updated_at":30.0},
+        {"label":"current","provider":"codex","session_id":"new-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["current"]}
+    },
+    {
+      "id": "archived_exact_uuid_remains_addressable",
+      "query": "old-id",
+      "candidates": [
+        {"label":"archived","provider":"codex","session_id":"old-id","name":"research","cwd":"/projects/a","evidence":"archived","provider_updated_at":30.0},
+        {"label":"current","provider":"codex","session_id":"new-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["archived"]}
+    },
+    {
+      "id": "confirmed_missing_dead_row_is_not_a_choice",
+      "query": "research",
+      "candidates": [
+        {"label":"missing","provider":"codex","session_id":"gone-id","name":"research","cwd":"/projects/a","evidence":"missing","provider_updated_at":30.0},
+        {"label":"current","provider":"codex","session_id":"new-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["current"]}
+    },
+    {
+      "id": "unknown_storage_stays_ambiguous",
+      "query": "research",
+      "candidates": [
+        {"label":"unknown","provider":"codex","session_id":"uncertain-id","name":"research","cwd":"/projects/a","evidence":"unknown","provider_updated_at":30.0},
+        {"label":"current","provider":"codex","session_id":"new-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["unknown","current"]}
+    },
+    {
+      "id": "exact_live_home_wins_same_project",
+      "query": "research",
+      "candidates": [
+        {"label":"exact_live","provider":"codex","session_id":"live-id","name":"research","cwd":"/projects/a","exact_home":true,"live":true,"status":"WORKING","evidence":"available","provider_updated_at":10.0},
+        {"label":"newer_parked","provider":"codex","session_id":"parked-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["exact_live"]}
+    },
+    {
+      "id": "outside_live_is_not_silently_replaced",
+      "query": "research",
+      "candidates": [
+        {"label":"outside_live","provider":"codex","session_id":"live-id","name":"research","cwd":"/projects/a","live":true,"status":"UNBOUND","evidence":"available","provider_updated_at":10.0},
+        {"label":"newer_parked","provider":"codex","session_id":"parked-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["outside_live","newer_parked"]}
+    },
+    {
+      "id": "genuine_live_duplicates_stay_ambiguous",
+      "query": "research",
+      "candidates": [
+        {"label":"first","provider":"codex","session_id":"first-id","name":"research","cwd":"/projects/a","exact_home":true,"live":true,"status":"WORKING","evidence":"available","provider_updated_at":10.0},
+        {"label":"second","provider":"codex","session_id":"second-id","name":"research","cwd":"/projects/a","exact_home":true,"live":true,"status":"WORKING","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["first","second"]}
+    },
+    {
+      "id": "provider_activity_not_reconciliation_time_wins",
+      "query": "research",
+      "candidates": [
+        {"label":"older","provider":"codex","session_id":"old-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":10.0},
+        {"label":"newer","provider":"codex","session_id":"new-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["newer"]}
+    },
+    {
+      "id": "provider_activity_tie_stays_ambiguous",
+      "query": "research",
+      "candidates": [
+        {"label":"first","provider":"codex","session_id":"first-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":20.0},
+        {"label":"second","provider":"codex","session_id":"second-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["first","second"]}
+    },
+    {
+      "id": "different_directory_stays_ambiguous",
+      "query": "research",
+      "candidates": [
+        {"label":"first","provider":"codex","session_id":"first-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":10.0},
+        {"label":"second","provider":"codex","session_id":"second-id","name":"research","cwd":"/projects/b","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["first","second"]}
+    },
+    {
+      "id": "cross_provider_collision_stays_ambiguous",
+      "query": "research",
+      "candidates": [
+        {"label":"codex","provider":"codex","session_id":"codex-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":10.0},
+        {"label":"claude","provider":"claude","session_id":"claude-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["codex","claude"]}
+    },
+    {
+      "id": "remote_identity_is_never_folded_into_local",
+      "query": "research",
+      "candidates": [
+        {"label":"local","provider":"codex","session_id":"same-id","name":"research","cwd":"/projects/a","evidence":"available","provider_updated_at":10.0},
+        {"label":"remote","provider":"codex","session_id":"same-id","name":"research","cwd":"/projects/a","local":false,"evidence":"available","provider_updated_at":20.0}
+      ],
+      "expected": {"choices":["local","remote"]}
+    },
+    {
+      "id": "all_saved_matches_unavailable_is_explicit",
+      "query": "research",
+      "candidates": [
+        {"label":"archived","provider":"codex","session_id":"old-id","name":"research","cwd":"/projects/a","evidence":"archived","provider_updated_at":20.0},
+        {"label":"missing","provider":"codex","session_id":"gone-id","name":"research","cwd":"/projects/a","evidence":"missing","provider_updated_at":10.0}
+      ],
+      "expected": {"error":"saved_unavailable"}
+    }
+  ]
+}

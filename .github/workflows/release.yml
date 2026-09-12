@@ -1,0 +1,127 @@
+name: Native release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  MACOSX_DEPLOYMENT_TARGET: '13.0'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            executable: target/aarch64-apple-darwin/release/pika
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            executable: target/x86_64-apple-darwin/release/pika
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            executable: target/aarch64-unknown-linux-musl/release/pika
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            executable: target/x86_64-unknown-linux-musl/release/pika
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            executable: target/x86_64-pc-windows-msvc/release/pika.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --target '${{ matrix.target }}'
+          rustup override set 1.88.0
+      - name: Install musl compiler
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Build
+        run: cargo build --release --locked --target '${{ matrix.target }}'
+      - name: Verify host binary
+        if: runner.os != 'Windows'
+        run: |
+          test "$(${{ matrix.executable }} --version)" = "pika ${GITHUB_REF_NAME#v}"
+          ${{ matrix.executable }} --help >/dev/null
+          ${{ matrix.executable }} skill show >/dev/null
+      - name: Verify Windows client boundary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $expected = 'pika ' + $env:GITHUB_REF_NAME.TrimStart('v')
+          if ((& '${{ matrix.executable }}' --version) -ne $expected) { throw 'binary version mismatch' }
+          $help = (& '${{ matrix.executable }}' --help | Out-String)
+          if ($help -notmatch 'Native Windows agent hosting is unsupported') { throw 'missing client-only support boundary' }
+          if ($help -match '(?m)^  (list|new|ask|experts|doctor)\s') { throw 'Windows artifact exposed an agent-hosting command' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ matrix.executable }}
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: binaries
+      - name: Assemble and verify immutable assets
+        shell: bash
+        run: |
+          chmod +x binaries/*/pika scripts/*.sh scripts/*.pl
+          PIKA_CROSS_PACKAGE=1 scripts/package-release.sh "${GITHUB_REF_NAME#v}" release \
+            aarch64-apple-darwin=binaries/binary-aarch64-apple-darwin/pika \
+            x86_64-apple-darwin=binaries/binary-x86_64-apple-darwin/pika \
+            aarch64-unknown-linux-musl=binaries/binary-aarch64-unknown-linux-musl/pika \
+            x86_64-unknown-linux-musl=binaries/binary-x86_64-unknown-linux-musl/pika \
+            x86_64-pc-windows-msvc=binaries/binary-x86_64-pc-windows-msvc/pika.exe
+          (cd release && sha256sum --check SHA256SUMS)
+          {
+            echo '### Native release checksums'
+            echo '```text'
+            cat release/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.ref_name }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: assemble
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.ref_name }}
+          path: release
+      - name: Publish the exact reviewed assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          release_kind=()
+          case "${GITHUB_REF_NAME#v}" in
+            *a*|*b*|*rc*|*-alpha.*|*-beta.*|*-rc.*) release_kind+=(--prerelease) ;;
+            *) release_kind+=(--latest) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" release/* --verify-tag \
+            --title "Pika ${GITHUB_REF_NAME#v}" --generate-notes "${release_kind[@]}"

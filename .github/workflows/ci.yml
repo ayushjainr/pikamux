@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+          rustup override set 1.88.0
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-targets --all-features
+      - name: Mixed Python and native compatibility
+        run: scripts/test-mixed-runtime.sh
+      - name: Dependency license inventory
+        shell: bash
+        run: |
+          scripts/generate-third-party.sh /tmp/THIRD_PARTY.md
+          diff -u THIRD_PARTY.md /tmp/THIRD_PARTY.md
+      - name: RustSec dependency audit
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit --deny warnings
+      - name: Release smoke and performance evidence
+        shell: bash
+        run: |
+          cargo build --release --locked
+          PIKA_BENCH_SAMPLES=30 scripts/benchmark-native.sh target/release/pika | tee native-benchmark.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-benchmark-${{ matrix.os }}
+          path: native-benchmark.txt
+          if-no-files-found: error
+
+  windows-client:
+    name: Windows x86_64 client/bridge only
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+          rustup override set 1.88.0
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Check client contracts
+        run: cargo clippy --locked --lib --bin pika --test client_bridge_contract --test client_cli_contract -- -D warnings
+      - name: Test client contracts
+        run: cargo test --locked --test client_bridge_contract --test client_cli_contract
+      - name: Verify client-only command surface
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          $help = (& target/release/pika.exe --help | Out-String)
+          if ($help -notmatch 'Native Windows agent hosting is unsupported') { throw 'missing client-only support boundary' }
+          if ($help -match '(?m)^  (list|new|ask|experts|doctor)\s') { throw 'Windows help exposed an agent-hosting command' }
+          $status = (& target/release/pika.exe status | Out-String)
+          if ($status -notmatch 'Client/bridge only') { throw 'Windows status did not identify the client-only runtime' }

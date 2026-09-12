@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "family": "attention",
+  "reference": {
+    "version": "0.5.0a4",
+    "source_commit": "36de1b1eed1a182ed4e608d47f95d362f15d571a",
+    "tests": ["test_status_projection.py", "test_hooks.py", "test_store.py", "test_adversarial.py"]
+  },
+  "cases": [
+    {
+      "id": "safety_beats_newer_work",
+      "live": true,
+      "home_state": "exact-live",
+      "observations": [
+        {"kind":"safety","status":"OPEN TWICE","unread":true,"attention_reason":"identity","error":"two exact roots","observed_at":10.0,"source":"reconcile"},
+        {"kind":"lifecycle","status":"WORKING","unread":false,"attention_reason":null,"error":null,"observed_at":20.0,"source":"hook"}
+      ],
+      "expected": {"status":"OPEN TWICE","unread":true,"attention_reason":"identity","error":"two exact roots","observed_at":10.0,"source":"reconcile","kind":"safety","rule":"safety_precedence"}
+    },
+    {
+      "id": "runtime_failure_wins_only_when_process_is_gone",
+      "live": false,
+      "home_state": "saved-idle",
+      "observations": [
+        {"kind":"runtime","status":"ERROR","unread":true,"attention_reason":"exited","error":"status 9","observed_at":20.0,"source":"process_exit"},
+        {"kind":"lifecycle","status":"WORKING","unread":false,"attention_reason":null,"error":null,"observed_at":10.0,"source":"hook"}
+      ],
+      "expected": {"status":"ERROR","unread":true,"attention_reason":"exited","error":"status 9","observed_at":20.0,"source":"process_exit","kind":"runtime","rule":"runtime_failure_without_live_process"}
+    },
+    {
+      "id": "exact_live_process_sheds_old_runtime_failure",
+      "live": true,
+      "home_state": "exact-live",
+      "observations": [
+        {"kind":"runtime","status":"ERROR","unread":true,"attention_reason":"exited","error":"status 130","observed_at":20.0,"source":"process_exit"},
+        {"kind":"lifecycle","status":"WORKING","unread":false,"attention_reason":null,"error":null,"observed_at":10.0,"source":"hook"}
+      ],
+      "expected": {"status":"WORKING","unread":false,"attention_reason":null,"error":null,"observed_at":10.0,"source":"hook","kind":"lifecycle","rule":"lifecycle"}
+    },
+    {
+      "id": "question_beats_unbound_ownership",
+      "live": true,
+      "home_state": "unbound",
+      "observations": [
+        {"kind":"lifecycle","status":"NEEDS YOU","unread":true,"attention_reason":"question","error":null,"observed_at":30.0,"source":"pre_tool"}
+      ],
+      "expected": {"status":"NEEDS YOU","unread":true,"attention_reason":"question","error":null,"observed_at":30.0,"source":"pre_tool","kind":"lifecycle","rule":"lifecycle"}
+    },
+    {
+      "id": "newer_lifecycle_fact_wins_within_its_kind",
+      "live": true,
+      "home_state": "exact-live",
+      "observations": [
+        {"kind":"lifecycle","status":"NEEDS YOU","unread":true,"attention_reason":"question","error":null,"observed_at":30.0,"source":"pre_tool"},
+        {"kind":"lifecycle","status":"WORKING","unread":false,"attention_reason":null,"error":null,"observed_at":31.0,"source":"post_tool"}
+      ],
+      "expected": {"status":"WORKING","unread":false,"attention_reason":null,"error":null,"observed_at":31.0,"source":"post_tool","kind":"lifecycle","rule":"lifecycle"}
+    },
+    {
+      "id": "newest_fact_does_not_depend_on_input_order",
+      "live": true,
+      "home_state": "exact-live",
+      "observations": [
+        {"kind":"lifecycle","status":"WORKING","unread":false,"attention_reason":null,"error":null,"observed_at":31.0,"source":"post_tool"},
+        {"kind":"lifecycle","status":"NEEDS YOU","unread":true,"attention_reason":"question","error":null,"observed_at":30.0,"source":"pre_tool"}
+      ],
+      "expected": {"status":"WORKING","unread":false,"attention_reason":null,"error":null,"observed_at":31.0,"source":"post_tool","kind":"lifecycle","rule":"lifecycle"}
+    },
+    {
+      "id": "dead_working_process_is_parked",
+      "live": false,
+      "home_state": "saved-idle",
+      "observations": [
+        {"kind":"lifecycle","status":"WORKING","unread":true,"attention_reason":"old work","error":"stale","observed_at":40.0,"source":"hook"}
+      ],
+      "expected": {"status":"PARKED","unread":false,"attention_reason":null,"error":null,"observed_at":40.0,"source":"hook","kind":"lifecycle","rule":"working_process_gone"}
+    },
+    {
+      "id": "unread_result_survives_process_exit",
+      "live": false,
+      "home_state": "no-live-home",
+      "observations": [
+        {"kind":"lifecycle","status":"READY","unread":true,"attention_reason":"completed","error":null,"observed_at":50.0,"source":"stop"}
+      ],
+      "expected": {"status":"READY","unread":true,"attention_reason":"completed","error":null,"observed_at":50.0,"source":"stop","kind":"lifecycle","rule":"lifecycle"}
+    },
+    {
+      "id": "collected_result_parks_after_process_exit",
+      "live": false,
+      "home_state": "no-live-home",
+      "observations": [
+        {"kind":"lifecycle","status":"READY","unread":false,"attention_reason":"stale completion","error":"stale","observed_at":60.0,"source":"ack"}
+      ],
+      "expected": {"status":"PARKED","unread":false,"attention_reason":null,"error":null,"observed_at":60.0,"source":"ack","kind":"lifecycle","rule":"completed_and_collected_process_gone"}
+    },
+    {
+      "id": "unbound_without_lifecycle_is_explicit",
+      "live": true,
+      "home_state": "unbound",
+      "fallback": {"observed_at":70.0},
+      "observations": [],
+      "expected": {"status":"UNBOUND","unread":false,"attention_reason":null,"error":null,"observed_at":70.0,"source":"ownership","kind":"ownership","rule":"unbound_without_lifecycle"}
+    },
+    {
+      "id": "live_without_turn_evidence_is_ready_but_read",
+      "live": true,
+      "home_state": "exact-live",
+      "fallback": {"observed_at":80.0},
+      "observations": [],
+      "expected": {"status":"READY","unread":false,"attention_reason":null,"error":null,"observed_at":80.0,"source":"process","kind":"runtime","rule":"live_without_turn_evidence"}
+    },
+    {
+      "id": "legacy_actionable_fallback_is_preserved",
+      "live": false,
+      "home_state": "no-live-home",
+      "fallback": {"status":"ERROR","unread":true,"attention_reason":"exited","error":"legacy failure","observed_at":90.0},
+      "observations": [],
+      "expected": {"status":"ERROR","unread":true,"attention_reason":"exited","error":"legacy failure","observed_at":90.0,"source":"legacy","kind":"legacy","rule":"legacy_observation"}
+    },
+    {
+      "id": "dead_without_evidence_is_parked",
+      "live": false,
+      "home_state": "no-live-home",
+      "fallback": {"status":"WORKING","unread":true,"attention_reason":"old","error":"old","observed_at":100.0},
+      "observations": [],
+      "expected": {"status":"PARKED","unread":false,"attention_reason":null,"error":null,"observed_at":100.0,"source":"process","kind":"runtime","rule":"no_live_process"}
+    }
+  ]
+}

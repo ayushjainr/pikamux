@@ -1,0 +1,3764 @@
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import os
+import queue
+import re
+import select
+import shlex
+import sys
+import termios
+import threading
+import time
+import tty
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from datetime import datetime
+from textwrap import wrap
+from typing import Protocol
+
+from .consult import (
+    Consultation,
+    ConsultationError,
+    ConsultationPolicy,
+    consultation_for,
+    consultation_policy,
+)
+from .consult_reporting import ConsultationRun
+from .experts import ExpertCardState, profile_source_label, profile_freshness
+from .explain import explain_session
+from . import installation
+from .fleet import REMOTE_STALE_SECONDS
+from .models import ExpertProfile, FleetNode, FleetSession, PendingLaunch, Session, Status
+from .pricing import PRICING_AS_OF
+from .ui import (
+    PROVIDER_MARK,
+    format_bytes,
+    format_cost,
+    format_tokens,
+    provider_identity_label,
+    provider_label,
+    short_path,
+    sorted_attention_sessions,
+    sorted_sessions,
+    terminal_text,
+)
+
+REFRESH_SECONDS = 2.0
+USAGE_REFRESH_SECONDS = 30.0
+EXPERT_CARD_REFRESH_SECONDS = 300.0
+PREVIEW_REFRESH_SECONDS = 2.0
+PLAYBOOK_ROTATION_SECONDS = 300
+MORNING_GAP_SECONDS = 6 * 60 * 60
+HANDOFF_DISPLAY_SECONDS = 15.0
+SLOW_REFRESH_SECONDS = 1.0
+KEY_SEQUENCE_TIMEOUT_SECONDS = 0.05
+MIN_WIDTH = 58
+MIN_HEIGHT = 15
+SPLIT_MIN_WIDTH = 104
+SPLIT_MIN_HEIGHT = 20
+SPINNER = ("◐", "◓", "◑", "◒")
+PLAYBOOK_TIPS = (
+    (
+        "experts",
+        ("pika experts QUERY finds exact conversation threads by work context."),
+        "pika experts QUERY finds the thread that worked on it.",
+    ),
+    (
+        "ask",
+        (
+            "pika ask NAME opens a multi-turn side consultation without touching "
+            "the parent transcript."
+        ),
+        "pika ask NAME explores without touching the parent.",
+    ),
+    (
+        "detach",
+        "Delegate, then Ctrl-b d. The agent keeps working; /exit stops it.",
+        "Ctrl-b d keeps work alive; /exit stops it.",
+    ),
+    (
+        "switch",
+        "pika . opens this repository's conversation; "
+        "pika - returns to the previous one.",
+        "pika . opens here; pika - goes back.",
+    ),
+    (
+        "next",
+        "pika next opens the oldest workstream needing you — "
+        "no inventory triage required.",
+        "pika next opens the oldest needed work.",
+    ),
+    (
+        "activity",
+        "pika activity catches up on completed, blocked, and failed transitions "
+        "without reading transcripts.",
+        "pika activity is a transcript-free catch-up feed.",
+    ),
+    (
+        "peek",
+        "pika peek NAME inspects without switching; "
+        "redirected peeks keep unread state.",
+        "pika peek NAME inspects without switching.",
+    ),
+    (
+        "wait",
+        "pika wait NAME --for ready --timeout 600 turns delegation "
+        "into a shell primitive.",
+        "pika wait NAME --for ready is scriptable.",
+    ),
+    (
+        "name",
+        "Use task-specific names: the briefing should read like a delegation ledger.",
+        "Use task names; make Pika read as a ledger.",
+    ),
+    (
+        "collision",
+        "Providers may share a name; Pika asks for provider + exact identity.",
+        "Same name? Pika asks provider + exact ID.",
+    ),
+    (
+        "doctor",
+        "Run pika doctor before relying on disconnects; safe means every check passed.",
+        "Run pika doctor before disconnecting.",
+    ),
+    (
+        "refresh",
+        "Press r to run a deliberate reconciliation; "
+        "stale state remains visibly marked.",
+        "Press r to reconcile stale state now.",
+    ),
+    (
+        "adopt",
+        "A live process outside an exact home stays unbound; "
+        "use pika NAME to protect it.",
+        "UNBOUND? Exit agent; rerun pika NAME.",
+    ),
+    (
+        "resume",
+        "For a parked workstream, pika NAME checks its saved history "
+        "and resumes only if exact.",
+        "PARKED? pika NAME checks its recovery path.",
+    ),
+)
+
+RESET = "\x1b[0m"
+BOLD = "\x1b[1m"
+DIM = "\x1b[2m"
+REVERSE = "\x1b[7m"
+FG_RED = "\x1b[31m"
+FG_GREEN = "\x1b[32m"
+FG_YELLOW = "\x1b[33m"
+FG_BLUE = "\x1b[34m"
+FG_MAGENTA = "\x1b[35m"
+FG_CYAN = "\x1b[36m"
+FG_BRIGHT_BLACK = "\x1b[90m"
+
+_ANSI_ESCAPE = re.compile(
+    r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\))"
+    r"|(?:\x1bP.*?\x1b\\)"
+    r"|(?:\x1b\[[0-?]*[ -/]*[@-~])",
+    re.DOTALL,
+)
+_MOUSE = re.compile(rb"^\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+_CSI_KEY = re.compile(rb"^\x1b\[[0-?]*[ -/]*[@-~]")
+_SS3_KEY = re.compile(rb"^\x1bO[@-~]")
+
+
+class MonitorPika(Protocol):
+    def refresh(self, *, usage: bool = False) -> list[Session]: ...
+
+    def hydrate_usage(
+        self, sessions: list[Session | FleetSession]
+    ) -> list[Session | FleetSession]: ...
+
+    def open(self, session: Session | FleetSession, *, attach: bool = True) -> int: ...
+
+    def open_on_client(self, session: Session | FleetSession): ...
+
+    def open_pending(self, session: PendingLaunch, *, attach: bool = True) -> int: ...
+
+    def enter(self, query: str, *, attach: bool = True) -> int: ...
+
+    def acknowledge(
+        self, session: Session | FleetSession, *, attaching: bool = False
+    ) -> bool: ...
+
+    def untrack(self, session: Session | FleetSession) -> int: ...
+
+    def capture(self, session: Session | FleetSession, lines: int) -> str: ...
+
+    def next_attention(
+        self, sessions: list[Session | FleetSession] | None = None
+    ) -> Session | FleetSession | None: ...
+
+    def expert_card_states(
+        self, sessions: list[Session | FleetSession] | None = None
+    ) -> list[ExpertCardState]: ...
+
+    @property
+    def tmux(self): ...
+
+    @property
+    def store(self): ...
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorFrame:
+    ansi: str
+    plain: str
+    selected_key: tuple[str, ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffSummary:
+    since: float
+    finished: int
+    decisions: int
+    errors: int
+    first: bool = False
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.finished or self.decisions or self.errors)
+
+
+@dataclass(frozen=True, slots=True)
+class AskMessage:
+    role: str
+    text: str
+
+
+class _InlineAskWorker:
+    """Own one provider-native side process without blocking the TUI."""
+
+    def __init__(
+        self,
+        session: Session | FleetSession,
+        policy: ConsultationPolicy,
+        opener: Callable[[], Consultation] | None = None,
+    ) -> None:
+        self.session = replace(session)
+        self.policy = policy
+        self._opener = opener or (lambda: consultation_for(session, policy=policy))
+        self._requests: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._closing = threading.Event()
+        self._consultation: ConsultationRun | None = None
+        self._consultation_lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"pika-side-{session.provider}-{session.session_id[:8]}",
+            daemon=True,
+        )
+
+    @property
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def ask(self, question: str) -> None:
+        if not self._closing.is_set():
+            self._requests.put(("ask", question))
+
+    def poll(self) -> list[tuple[str, object]]:
+        events: list[tuple[str, object]] = []
+        while True:
+            try:
+                events.append(self._events.get_nowait())
+            except queue.Empty:
+                return events
+
+    def close(self) -> None:
+        if self._closing.is_set():
+            return
+        self._closing.set()
+        self._requests.put(("close", ""))
+        threading.Thread(
+            target=self._close_consultation,
+            name="pika-side-cancel",
+            daemon=True,
+        ).start()
+
+    def _close_consultation(self) -> None:
+        with self._consultation_lock:
+            consultation = self._consultation
+            self._consultation = None
+        if consultation is not None:
+            try:
+                consultation.close()
+            except Exception as exc:  # noqa: BLE001 - cleanup proof belongs in the TUI
+                self._events.put(("error", f"side cleanup failed: {exc}"))
+
+    def _run(self) -> None:
+        try:
+            consultation = ConsultationRun.open(
+                self._opener,
+                on_event=lambda event: self._events.put(("progress", event)),
+            )
+            with self._consultation_lock:
+                if self._closing.is_set():
+                    should_close = True
+                else:
+                    self._consultation = consultation
+                    should_close = False
+            if should_close:
+                consultation.close()
+                return
+            self._events.put(("opened", ""))
+            while not self._closing.is_set():
+                command, value = self._requests.get()
+                if command == "close":
+                    break
+                try:
+                    answer = consultation.ask(value)
+                except Exception as exc:  # noqa: BLE001 - shown inside recoverable UI
+                    if not self._closing.is_set():
+                        self._events.put(("error", str(exc)))
+                else:
+                    self._events.put(("answer", answer))
+        except Exception as exc:  # noqa: BLE001 - provider startup is recoverable
+            if not self._closing.is_set():
+                self._events.put(("error", str(exc)))
+        finally:
+            self._close_consultation()
+            self._events.put(("closed", ""))
+
+
+@dataclass(slots=True)
+class MonitorState:
+    sessions: list[Session | FleetSession] = field(default_factory=list)
+    selected_key: tuple[str, ...] | None = None
+    last_update: float = 0.0
+    refresh_error: str | None = None
+    refresh_warning: str | None = None
+    usage_warning: str | None = None
+    toast: str | None = None
+    toast_until: float = 0.0
+    mode: str = "sessions"
+    peek_lines: list[str] = field(default_factory=list)
+    peek_offset: int = 0
+    show_usage: bool = False
+    refresh_started_at: float = 0.0
+    emphasize_refresh: bool = False
+    handoff: HandoffSummary | None = None
+    handoff_until: float = 0.0
+    expert_cards: dict[tuple[str, ...], ExpertCardState] = field(default_factory=dict)
+    expert_cards_updated_at: float = 0.0
+    expert_freshness: dict[tuple[str, ...], dict] = field(default_factory=dict)
+    preview_key: tuple[str, ...] | None = None
+    preview_lines: list[str] = field(default_factory=list)
+    preview_error: str | None = None
+    preview_updated_at: float = 0.0
+    ask_target: Session | FleetSession | None = None
+    ask_policy: ConsultationPolicy | None = None
+    ask_confirmed: bool = False
+    ask_messages: list[AskMessage] = field(default_factory=list)
+    ask_input: str = ""
+    ask_outbox: str | None = None
+    ask_status: str = "closed"
+    ask_error: str | None = None
+    ask_pending: bool = False
+    ask_scroll: int = 0
+    ask_progress: dict = field(default_factory=dict)
+    untrack_target: Session | FleetSession | None = None
+    machines: list[FleetNode] = field(default_factory=list)
+    filter_text: str = ""
+    order_keys: list[tuple[str, ...]] = field(default_factory=list)
+    left_offset: int = 0
+    left_anchor_key: tuple[str, ...] | None = None
+    left_anchor_row: int = 0
+    table_offset: int = 0
+    cached_initial: bool = False
+    explanations: dict[tuple[str, ...], dict] = field(default_factory=dict)
+    action_error: str | None = None
+    action_error_offset: int = 0
+    action_error_target: Session | FleetSession | PendingLaunch | None = None
+    update_version: str | None = None
+    update_status: str = "available"
+    update_detail: str | None = None
+
+    def ordered(self) -> list[Session | FleetSession]:
+        # Once visible, workstreams retain their relative position until the
+        # user requests a regroup. Status updates must not move the next key's
+        # target while somebody is navigating.
+        by_key = {item.key: item for item in self.sessions}
+        self.order_keys = [key for key in self.order_keys if key in by_key]
+        known = set(self.order_keys)
+        self.order_keys.extend(
+            item.key
+            for _label, members in _split_groups(self.sessions)
+            for item in members
+            if item.key not in known
+        )
+        query = self.filter_text.casefold()
+        return [
+            by_key[key] for key in self.order_keys
+            if not query or query in " ".join((
+                by_key[key].display_name, by_key[key].provider,
+                by_key[key].cwd or "", by_key[key].session_id,
+            )).casefold()
+        ]
+
+    def selected(self) -> Session | FleetSession | None:
+        ordered = self.ordered()
+        if not ordered:
+            self.selected_key = None
+            return None
+        for item in ordered:
+            if item.key == self.selected_key:
+                return item
+        attention = [item for item in ordered if item.needs_attention]
+        selected = attention[0] if attention else ordered[0]
+        self.selected_key = selected.key
+        return selected
+
+    def move(self, amount: int) -> None:
+        ordered = self.ordered()
+        selected = self.selected()
+        if not ordered or selected is None:
+            return
+        index = next(i for i, item in enumerate(ordered) if item.key == selected.key)
+        index = max(0, min(len(ordered) - 1, index + amount))
+        self.selected_key = ordered[index].key
+
+    def edge(self, *, last: bool) -> None:
+        ordered = self.ordered()
+        if ordered:
+            self.selected_key = ordered[-1 if last else 0].key
+
+    def notify(self, message: str, *, now: float | None = None) -> None:
+        self.toast = terminal_text(message)
+        self.toast_until = (now or time.monotonic()) + 3.0
+
+    def fail_action(
+        self, message: str,
+        target: Session | FleetSession | PendingLaunch | None = None,
+    ) -> None:
+        self.action_error = _safe_chat_text(message)
+        self.action_error_offset = 0
+        target = target if target is not None else self.selected()
+        self.action_error_target = (
+            replace(target, session=replace(target.session))
+            if isinstance(target, FleetSession)
+            else replace(target) if target is not None else None
+        )
+        self.mode = "action-error"
+
+    def expert_card(self, session: Session | None) -> ExpertCardState | None:
+        return self.expert_cards.get(session.key) if session is not None else None
+
+    def begin_ask(self, session: Session | FleetSession, *, fast: bool = False) -> None:
+        base = session.session if isinstance(session, FleetSession) else session
+        policy = consultation_policy(base, fast=fast)
+        self.mode = "ask"
+        self.ask_target = replace(session)
+        self.ask_policy = policy
+        self.ask_confirmed = False
+        self.ask_messages = []
+        self.ask_input = ""
+        self.ask_outbox = None
+        self.ask_status = "opening"
+        self.ask_error = None
+        self.ask_pending = False
+        self.ask_scroll = 0
+        self.ask_progress = {}
+
+    def close_ask(self) -> None:
+        self.mode = "sessions"
+        self.ask_status = "closed"
+        self.ask_policy = None
+        self.ask_confirmed = False
+        self.ask_pending = False
+        self.ask_outbox = None
+
+    def begin_untrack(self, session: Session | FleetSession) -> None:
+        self.mode = "untrack"
+        self.untrack_target = replace(session)
+
+    def close_untrack(self) -> None:
+        self.mode = "sessions"
+        self.untrack_target = None
+
+
+def strip_terminal_sequences(value: str) -> str:
+    return terminal_text(_ANSI_ESCAPE.sub("", value))
+
+
+def _fit(value: object, width: int, *, align: str = "left") -> str:
+    text = terminal_text(value)
+    if width <= 0:
+        return ""
+    if len(text) > width:
+        text = text[: max(1, width - 1)] + "…"
+    return text.rjust(width) if align == "right" else text.ljust(width)
+
+
+def _paint(value: str, code: str, enabled: bool) -> str:
+    return f"{code}{value}{RESET}" if enabled and value else value
+
+
+def _status_code(status: str) -> str:
+    return {
+        "PROTECTED": FG_MAGENTA,
+        Status.NEEDS_YOU.value: FG_YELLOW,
+        Status.OPEN_TWICE.value: FG_RED,
+        Status.ERROR.value: FG_RED,
+        Status.READY.value: FG_GREEN,
+        Status.WORKING.value: FG_CYAN,
+        Status.STARTING.value: FG_YELLOW,
+        Status.PARKED.value: FG_BRIGHT_BLACK,
+        Status.UNBOUND.value: FG_MAGENTA,
+    }.get(status, "")
+
+
+def _public_status(session: Session | FleetSession | PendingLaunch) -> str:
+    """Translate identity safety stops without weakening their internal state."""
+    if isinstance(session, FleetSession) and session.stale:
+        return "CACHED"
+    if isinstance(session, PendingLaunch):
+        return Status.STARTING.value
+    if session.home_state == "identity-error":
+        return "PROTECTED"
+    return session.status
+
+
+def _line(left: str, right: str, width: int) -> str:
+    left = terminal_text(left)
+    right = terminal_text(right)
+    if len(right) + 2 >= width:
+        return _fit(right, width, align="right")
+    room = width - len(right) - 2
+    return _fit(left, room) + "  " + right
+
+
+def _session_counts(sessions: list[Session | FleetSession]) -> dict[str, int]:
+    current = [
+        item for item in sessions if not (isinstance(item, FleetSession) and item.stale)
+    ]
+    return {
+        "decisions": sum(item.status == Status.NEEDS_YOU.value for item in current),
+        "results": sum(
+            item.status == Status.READY.value and item.unread for item in current
+        ),
+        "working": sum(item.status == Status.WORKING.value for item in current),
+        "starting": sum(item.status == Status.STARTING.value for item in current),
+        "parked": sum(item.status == Status.PARKED.value for item in current),
+        "errors": sum(
+            item.status == Status.ERROR.value
+            and item.home_state != "identity-error"
+            and item.unread
+            for item in current
+        ),
+        "protected_pauses": sum(
+            (
+                item.home_state in {"identity-error", "open-twice"}
+                or item.status == Status.OPEN_TWICE.value
+            )
+            and item.unread
+            for item in current
+        ),
+        "unbound": sum(item.status == Status.UNBOUND.value for item in current),
+        "protected": sum(item.exact_home for item in current),
+        "cached": len(sessions) - len(current),
+    }
+
+
+def _noun(value: int, singular: str, plural: str | None = None) -> str:
+    return singular if value == 1 else (plural or singular + "s")
+
+
+def build_handoff(
+    sessions: list[Session], *, since: float, now: float
+) -> HandoffSummary | None:
+    if not since or now - since < MORNING_GAP_SECONDS:
+        return None
+    recent = [item for item in sessions if item.last_event_at > since]
+    return HandoffSummary(
+        since=since,
+        finished=sum(
+            item.status == Status.READY.value and item.unread for item in recent
+        ),
+        decisions=sum(item.status == Status.NEEDS_YOU.value for item in recent),
+        errors=sum(
+            item.status in {Status.ERROR.value, Status.OPEN_TWICE.value}
+            for item in recent
+        ),
+    )
+
+
+def _handoff_text(handoff: HandoffSummary) -> str:
+    if handoff.first:
+        return (
+            f"FIRST HANDOFF // CURRENT STATE · {handoff.finished} results · "
+            f"{handoff.decisions} decisions · {handoff.errors} exceptions"
+        )
+    if not handoff.changed:
+        return "SINCE YOUR LAST VISIT · no new handoffs"
+    return (
+        f"SINCE YOUR LAST VISIT · {handoff.finished} finished · "
+        f"{handoff.decisions} {_noun(handoff.decisions, 'decision')} · "
+        f"{handoff.errors} {_noun(handoff.errors, 'exception')}"
+    )
+
+
+def _briefing_lines(
+    sessions: list[Session | FleetSession],
+    *,
+    width: int,
+    handoff: HandoffSummary | None,
+    initialized: bool,
+    refresh_error: str | None,
+) -> tuple[str, str]:
+    if not initialized:
+        return (
+            _fit("INITIAL HANDOFF · scanning current workstreams", width),
+            _fit("No state is shown until the first reconciliation completes", width),
+        )
+    counts = _session_counts(sessions)
+    interventions = (
+        counts["decisions"]
+        + counts["errors"]
+        + counts["protected_pauses"]
+    )
+    if not interventions:
+        prefix = (
+            "LAST KNOWN · no decisions waiting"
+            if refresh_error
+            else "No decisions waiting on current observations"
+            if counts["cached"]
+            else "YOU'RE CLEAR · no decisions waiting"
+        )
+        headline = (
+            f"{prefix} · {counts['working']} working · "
+            f"{counts['starting']} starting · {counts['parked']} parked · "
+            f"{counts['protected']} exact live"
+        )
+        if counts["cached"]:
+            headline += f" · {counts['cached']} cached"
+        if counts["results"]:
+            headline += f" · {counts['results']} results available"
+    elif width < 80:
+        headline = (
+            f"NEED {counts['decisions']} · RESULTS {counts['results']} · "
+            f"PROTECTED {counts['protected_pauses']} · FAILED {counts['errors']} · "
+            f"UNBOUND {counts['unbound']}"
+        )
+    else:
+        headline = (
+            f"YOU'RE NEEDED IN {interventions} "
+            f"{_noun(interventions, 'PLACE')} · "
+            f"{counts['results']} "
+            f"{_noun(counts['results'], 'RESULT', 'RESULTS')} WAITING · "
+            f"{counts['working']} STILL WORKING · "
+            f"{counts['starting']} STARTING"
+        )
+        if counts["errors"]:
+            headline += f" · {counts['errors']} FAILED"
+        if counts["protected_pauses"]:
+            headline += f" · {counts['protected_pauses']} PROTECTED"
+        if counts["unbound"]:
+            headline += f" · {counts['unbound']} UNBOUND"
+
+    if handoff is not None:
+        context = _handoff_text(handoff)
+    else:
+        attention = sorted_attention_sessions(
+            item for item in sessions if item.needs_attention
+        )
+        if attention:
+            next_item = attention[0]
+            reason = next_item.error or next_item.attention_reason or next_item.status
+            context = f"NEXT → {next_item.display_name} · {reason} · n to open"
+        else:
+            unbound = next(
+                (item for item in sessions if item.status == Status.UNBOUND.value),
+                None,
+            )
+            context = (
+                f"NEXT → {unbound.display_name} · run pika {unbound.display_name}"
+                if unbound
+                else (
+                    f"WORKING {counts['working']} · PARKED {counts['parked']} · "
+                    f"UNBOUND {counts['unbound']}"
+                )
+            )
+    return _fit(headline, width), _fit(context, width)
+
+
+@dataclass(frozen=True, slots=True)
+class _Column:
+    label: str
+    width: int
+    field: str
+
+
+def _columns(width: int, *, show_usage: bool) -> list[_Column]:
+    columns = [
+        _Column("AG", 2, "provider"),
+        _Column("NAME", 20, "name"),
+        _Column("STATE", 10, "status"),
+        _Column("SINCE", 9, "age"),
+    ]
+    if show_usage:
+        if width >= 74:
+            columns.extend([_Column("CPU", 6, "cpu"), _Column("RAM", 6, "ram")])
+        if width >= 94:
+            columns.append(_Column("TOKENS", 8, "tokens"))
+        if width >= 112:
+            columns.append(_Column("MODEL", 14, "model"))
+        if width >= 128:
+            columns.append(_Column("API-EQUIV", 10, "cost"))
+    else:
+        if width >= 74:
+            columns.insert(3, _Column("WHY", 10, "why"))
+            columns.insert(4, _Column("VIEW", 4, "view"))
+        if width >= 104:
+            columns.insert(-1, _Column("REPO", 18, "repo"))
+        if width >= 122:
+            repo_index = next(
+                i for i, item in enumerate(columns) if item.field == "repo"
+            )
+            columns.insert(repo_index + 1, _Column("BRANCH", 12, "branch"))
+    used = 3 + sum(item.width for item in columns) + 2 * (len(columns) - 1)
+    extra = max(0, width - used)
+    mutable = list(columns)
+    name_index = next(i for i, item in enumerate(mutable) if item.field == "name")
+    name_extra = min(extra, 12)
+    item = mutable[name_index]
+    mutable[name_index] = _Column(item.label, item.width + name_extra, item.field)
+    extra -= name_extra
+    flexible_index = next(
+        (i for i, item in enumerate(mutable) if item.field == "repo"),
+        name_index,
+    )
+    if extra:
+        item = mutable[flexible_index]
+        mutable[flexible_index] = _Column(item.label, item.width + extra, item.field)
+    return mutable
+
+
+def _human_age_at(timestamp: float, now: float) -> str:
+    if not timestamp:
+        return "—"
+    seconds = max(0, int(now - timestamp))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h"
+    days = hours // 24
+    return f"{days}d" if days < 60 else f"{days // 30}mo"
+
+
+def semantic_age(session: Session, now: float) -> str:
+    prefix = {
+        Status.NEEDS_YOU.value: "WAIT",
+        Status.OPEN_TWICE.value: "DUPLICATE",
+        Status.READY.value: "RESULT",
+        Status.WORKING.value: "ACTIVE",
+        Status.STARTING.value: "STARTING",
+        Status.PARKED.value: "IDLE",
+        Status.ERROR.value: "FAILED",
+        Status.UNBOUND.value: "UNBOUND",
+    }.get(session.status, "AGE")
+    timestamp = (
+        session.last_event_at
+        if session.status
+        in {
+            Status.NEEDS_YOU.value,
+            Status.READY.value,
+            Status.ERROR.value,
+            Status.OPEN_TWICE.value,
+        }
+        else session.last_activity_at
+    )
+    return f"{prefix} {_human_age_at(timestamp, now)}"
+
+
+def _field(session: Session, field: str, width: int, now: float) -> str:
+    values = {
+        "provider": PROVIDER_MARK.get(session.provider, "?"),
+        "name": session.display_name,
+        "status": _public_status(session),
+        "why": session.attention_reason or "—",
+        "view": "yes" if session.attached else ("no" if session.tmux_session else "—"),
+        "repo": short_path(session.cwd, width),
+        "branch": session.branch or "—",
+        "age": semantic_age(session, now),
+        "cpu": (
+            f"{session.cpu_percent:.1f}%" if session.cpu_percent is not None else "—"
+        ),
+        "ram": format_bytes(session.rss_kb),
+        "tokens": format_tokens(session.total_tokens),
+        "cost": format_cost(session.estimated_cost_usd),
+        "model": session.model or "—",
+    }
+    return values[field]
+
+
+def _table_row(
+    session: Session,
+    columns: list[_Column],
+    *,
+    selected: bool,
+    color: bool,
+    now: float,
+) -> tuple[str, str]:
+    marker = ("›" if selected else " ") + ("◆" if session.unread else " ")
+    plain_cells = [
+        _fit(_field(session, item.field, item.width, now), item.width)
+        for item in columns
+    ]
+    row_width = sum(item.width for item in columns) + 2 * (len(columns) - 1) + 3
+    plain = _fit(f"{marker} " + "  ".join(plain_cells), row_width)
+    if selected:
+        return plain, _paint(plain, REVERSE + BOLD, color)
+    rendered = list(plain_cells)
+    status_index = next(i for i, item in enumerate(columns) if item.field == "status")
+    rendered[status_index] = _paint(
+        rendered[status_index], _status_code(_public_status(session)), color
+    )
+    if session.unread:
+        marker = " " + _paint("◆", FG_MAGENTA, color)
+    return plain, f"{marker} " + "  ".join(rendered)
+
+
+def _visible_rows(
+    ordered: list[Session], selected: Session | None, slots: int
+) -> tuple[list[Session], int]:
+    if len(ordered) <= slots:
+        return ordered, 0
+    selected_index = 0
+    if selected is not None:
+        selected_index = next(
+            (i for i, item in enumerate(ordered) if item.key == selected.key), 0
+        )
+    start = max(0, min(len(ordered) - slots, selected_index - slots // 2))
+    return ordered[start : start + slots], start
+
+
+def _viewport_offset(start: int, selected: int, count: int, slots: int) -> int:
+    """Scroll only when selection leaves the viewport, including after resize."""
+    start = max(0, min(start, max(0, count - slots)))
+    if selected < start:
+        return selected
+    if selected >= start + slots:
+        return max(0, selected - slots + 1)
+    return start
+
+
+def _observation_scope(state: MonitorState, now: float) -> str:
+    if state.cached_initial:
+        return "LAST KNOWN · checking current state"
+    if state.refresh_error or state.refresh_warning:
+        return "PARTIAL OBSERVATIONS · some current state is unavailable"
+    unavailable = [
+        f"{node.alias} (last seen {_human_age_at(node.last_seen, now)} ago)"
+        for node in state.machines
+        if node.status != "ready" or not node.last_seen
+        or now - node.last_seen > REMOTE_STALE_SECONDS
+    ]
+    cached = _session_counts(state.sessions)["cached"]
+    if unavailable:
+        return "UNAVAILABLE · " + ", ".join(unavailable) + " · other observations only"
+    if cached:
+        return f"PARTIAL · {cached} cached remote rows · current observations only"
+    if not state.last_update:
+        return "Checking current state"
+    return f"Observed {_human_age_at(state.last_update, now)} ago"
+
+
+def _help_lines(state: MonitorState, width: int, slots: int) -> list[str]:
+    counts = _session_counts(state.sessions)
+    if width < 80:
+        items = [
+            "↑↓/jk move · Enter open · n next",
+            "a ask · A fast ask · p peek · x stop watching",
+            "u usage · r refresh · U update · ? keys · q/Esc close",
+            (
+                f"Need {counts['decisions']} · results {counts['results']} · "
+                f"starting {counts['starting']} · failed {counts['errors']} · "
+                f"protected {counts['protected_pauses']} · "
+                f"unbound {counts['unbound']}"
+            ),
+        ]
+    else:
+        items = [
+            "↑/k  previous workstream        ↓/j  next workstream",
+            "Enter open selected             n    open oldest attention",
+            "a/A   ask here / faster Codex     p    peek recent pane output",
+            "u     operations / usage view    U    review Pika update",
+            "r     reconcile now",
+            "x     stop watching selected     Esc  cancel confirmation",
+            "g/G   first / last               ?    close this help",
+            "q/Esc close this help",
+            "",
+            (
+                f"Inventory: {counts['decisions']} decisions · "
+                f"{counts['results']} results · "
+                f"{counts['working']} working · {counts['starting']} starting · "
+                f"{counts['parked']} parked · "
+                f"{counts['protected_pauses']} protected · "
+                f"{counts['errors']} errors · {counts['unbound']} unbound"
+            ),
+            "Pika never guesses identity. Enter acts on the selected provider + exact ID.",
+            "A paired SSH client gets a new window; otherwise Enter attaches here.",
+            "Operations update every 2s; visible usage updates every 30s.",
+        ]
+    return [_fit(value, width) for value in items[:slots]]
+
+
+def _playbook_options(
+    sessions: list[Session],
+    *,
+    selected: Session | None,
+    refresh_error: str | None,
+) -> list[tuple[str, str, str]]:
+    if refresh_error:
+        categories = ["refresh", "doctor"]
+    elif selected and selected.status in {
+        Status.ERROR.value,
+        Status.OPEN_TWICE.value,
+    }:
+        categories = ["doctor", "peek"]
+    elif selected and selected.status == Status.UNBOUND.value:
+        categories = ["adopt", "doctor"]
+    elif any(
+        item.status in {Status.ERROR.value, Status.OPEN_TWICE.value}
+        for item in sessions
+    ):
+        categories = ["doctor", "next"]
+    elif any(item.status == Status.UNBOUND.value for item in sessions):
+        categories = ["adopt", "doctor"]
+    elif any(item.status == Status.NEEDS_YOU.value for item in sessions):
+        categories = ["next", "peek"]
+    elif any(item.status == Status.READY.value and item.unread for item in sessions):
+        categories = ["peek", "next"]
+    elif any(item.status == Status.WORKING.value for item in sessions):
+        categories = ["detach", "wait", "experts", "ask"]
+    elif any(item.status == Status.PARKED.value for item in sessions):
+        categories = ["resume", "switch", "experts", "ask"]
+    else:
+        categories = ["name", "switch", "experts", "ask", "doctor"]
+    names: dict[str, set[str]] = {}
+    for item in sessions:
+        names.setdefault(item.display_name.casefold(), set()).add(item.provider)
+    if any(len(providers) > 1 for providers in names.values()):
+        categories.insert(0, "collision")
+    ordered: list[tuple[str, str, str]] = []
+    for category in dict.fromkeys(categories):
+        ordered.extend(item for item in PLAYBOOK_TIPS if item[0] == category)
+    return ordered or list(PLAYBOOK_TIPS)
+
+
+def playbook_tip(
+    now: float,
+    sessions: list[Session] | None = None,
+    *,
+    selected: Session | None = None,
+    refresh_error: str | None = None,
+    compact: bool = False,
+) -> tuple[int, int, str]:
+    options = _playbook_options(
+        sessions or [], selected=selected, refresh_error=refresh_error
+    )
+    index = int(now // PLAYBOOK_ROTATION_SECONDS) % len(options)
+    _category, wide, narrow = options[index]
+    return index, len(options), narrow if compact else wide
+
+
+def _peek_view(state: MonitorState, width: int, slots: int) -> list[str]:
+    lines = state.peek_lines
+    if not lines:
+        return [_fit("No pane output available.", width)]
+    end = max(0, len(lines) - state.peek_offset)
+    start = max(0, end - slots)
+    visible = lines[start:end]
+    return [_fit(line, width) for line in visible]
+
+
+def _identity_text(session: Session | FleetSession) -> str:
+    if isinstance(session, FleetSession):
+        age = _human_age_at(session.seen_at, time.time())
+        if session.stale:
+            return (
+                f"CACHED ON {session.node_name.upper()} · {provider_label(session.provider)} · "
+                f"id {session.session_id[:8]} · last sync {age} ago"
+            )
+        proof = "REMOTE EXACT" if session.exact_home else "REMOTE TRACKED"
+        return (
+            f"{proof} · {session.node_name} · {provider_label(session.provider)} · "
+            f"id {session.session_id[:8]}"
+        )
+    if isinstance(session, PendingLaunch):
+        return (
+            f"IDENTITY PENDING · {provider_label(session.provider)} · "
+            f"launch {session.launch_token[:8]} · PIKA HOME LIVE"
+        )
+    provider = provider_label(session.provider)
+    fingerprint = session.session_id[:8]
+    if session.home_state == "exact-live":
+        return f"EXACT HOME · {provider} · id {fingerprint} · PROTECTED LIVE"
+    if session.home_state == "identity-error":
+        return (
+            f"PROTECTED PAUSE · {provider} · id {fingerprint} · "
+            "IDENTITY UNVERIFIED"
+        )
+    if session.home_state == "open-twice":
+        return f"OPEN TWICE · {provider} · id {fingerprint} · CLOSE ONE COPY"
+    if session.home_state == "unbound":
+        return f"UNBOUND PROCESS · {provider} · id {fingerprint} · EXIT + PIKA NAME"
+    if session.home_state == "outside-live":
+        command = shlex.join(["pika", session.display_name])
+        owner = f"PID {session.root_pid}" if session.root_pid else "THIS SESSION"
+        return (
+            f"LIVE OUTSIDE PIKA · {provider} · id {fingerprint} · NOT PROTECTED · "
+            f"ENTER: RECOVERY OPTIONS · MANUAL: IN {provider.upper()} TERMINAL FOR "
+            f"{owner}, /exit; WAIT FOR SHELL; THEN {command}"
+        )
+    if session.home_state == "saved-idle":
+        return f"SAVED HOME · {provider} · id {fingerprint} · NOT LIVE"
+    if session.home_state == "no-live-home":
+        return f"TRACKED WORKSTREAM · {provider} · id {fingerprint} · NO LIVE HOME"
+    return f"HOME STATE UNKNOWN · {provider} · id {fingerprint}"
+
+
+def _age_phrase(session: Session | FleetSession, now: float) -> str:
+    if isinstance(session, FleetSession) and session.stale:
+        return f"cached {_human_age_at(session.seen_at, now)} ago"
+    event_age = _human_age_at(session.last_event_at, now)
+    activity_age = _human_age_at(session.last_activity_at, now)
+    if session.home_state == "identity-error":
+        return f"protected pause for {event_age}"
+    return {
+        Status.NEEDS_YOU.value: f"waiting on you for {event_age}",
+        Status.READY.value: f"result ready for {event_age}",
+        Status.WORKING.value: f"last active {activity_age} ago",
+        Status.STARTING.value: f"identity pending for {event_age}",
+        Status.PARKED.value: f"last active {activity_age} ago",
+        Status.OPEN_TWICE.value: f"duplicate open for {event_age}",
+        Status.ERROR.value: f"failed {event_age} ago",
+        Status.UNBOUND.value: f"last active {activity_age} ago",
+    }.get(session.status, f"last active {activity_age} ago")
+
+
+def _needs_you_group(session: Session | FleetSession) -> bool:
+    if isinstance(session, FleetSession) and session.stale:
+        return False
+    return session.status == Status.NEEDS_YOU.value
+
+
+def _split_groups(
+    sessions: list[Session | FleetSession],
+) -> list[tuple[str, list[Session | FleetSession]]]:
+    ordered = sorted_sessions(sessions)
+    groups = {label: [] for label in ("NEEDS YOU", "WORKING", "READY", "PARKED")}
+    for item in ordered:
+        if isinstance(item, FleetSession) and item.stale:
+            label = "PARKED"
+        elif item.status in {Status.NEEDS_YOU.value, Status.ERROR.value,
+                             Status.OPEN_TWICE.value, Status.UNBOUND.value}:
+            label = "NEEDS YOU"
+        elif item.status in {Status.WORKING.value, Status.STARTING.value}:
+            label = "WORKING"
+        elif item.status == Status.READY.value:
+            label = "READY"
+        else:
+            label = "PARKED"
+        groups[label].append(item)
+    return [(label, members) for label, members in groups.items() if members]
+
+
+def _group_color(label: str) -> str:
+    return {
+        "NEEDS YOU": FG_RED,
+        "WORKING": FG_CYAN,
+        "READY": FG_GREEN,
+        "PARKED": FG_BRIGHT_BLACK,
+    }.get(label, FG_BLUE)
+
+
+def _split_left_pane(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    now: float,
+    color: bool,
+) -> tuple[list[str], list[str]]:
+    selected = state.selected()
+    entries: list[tuple[str, Session | None]] = []
+    labels = {
+        item.key: label
+        for label, members in _split_groups(state.sessions)
+        for item in members
+    }
+    previous_label = None
+    for item in state.ordered():
+        label = labels[item.key]
+        if label != previous_label:
+            entries.append((label, None))
+        entries.append(("", item))
+        previous_label = label
+
+    selected_index = next(
+        (
+            index
+            for index, (_label, item) in enumerate(entries)
+            if item is not None and selected is not None and item.key == selected.key
+        ),
+        0,
+    )
+    if selected is not None and selected.key == state.left_anchor_key:
+        state.left_offset = selected_index - state.left_anchor_row
+    state.left_offset = _viewport_offset(
+        state.left_offset, selected_index, len(entries), height
+    )
+    state.left_anchor_key = selected.key if selected is not None else None
+    state.left_anchor_row = selected_index - state.left_offset
+    entries = entries[state.left_offset : state.left_offset + height]
+
+    plain_lines: list[str] = []
+    ansi_lines: list[str] = []
+    for label, item in entries:
+        if item is None:
+            plain = _fit(label, width)
+            ansi = _paint(plain, DIM + _group_color(label), color) if label else plain
+        else:
+            is_selected = selected is not None and item.key == selected.key
+            marker = "›" if is_selected else " "
+            signal = "◆" if item.unread or _needs_you_group(item) else "□" if item.live else "·"
+            provider = PROVIDER_MARK.get(item.provider, "?")
+            age = (
+                "resolve"
+                if item.status == Status.UNBOUND.value
+                else _human_age_at(
+                    item.last_event_at
+                    if item.status
+                    in {
+                        Status.NEEDS_YOU.value,
+                        Status.READY.value,
+                        Status.ERROR.value,
+                        Status.OPEN_TWICE.value,
+                    }
+                    else item.last_activity_at,
+                    now,
+                )
+            )
+            # Transitional states and recovery problems belong on the row, not
+            # in another section. Cached state must never look current.
+            age = {
+                "CACHED": "cached",
+                "PROTECTED": "check identity",
+                Status.ERROR.value: "open blocked",
+                Status.OPEN_TWICE.value: "open twice",
+                Status.STARTING.value: "starting",
+                Status.UNBOUND.value: "outside Pika",
+            }.get(_public_status(item), age)
+            prefix = f"{marker}{signal} {provider} "
+            name_width = max(4, width - len(prefix) - len(age) - 1)
+            plain = _fit(f"{prefix}{_fit(item.display_name, name_width)} {age}", width)
+            if is_selected:
+                ansi = _paint(plain, REVERSE + BOLD, color)
+            else:
+                ansi = _paint(plain, _status_code(_public_status(item)), color)
+        plain_lines.append(plain)
+        ansi_lines.append(ansi)
+
+    while len(plain_lines) < height:
+        plain_lines.append(" " * width)
+        ansi_lines.append(" " * width)
+    return plain_lines[:height], ansi_lines[:height]
+
+
+def _detail_value(label: str, value: str, width: int) -> str:
+    label_width = 9
+    return _fit(f"{_fit(label, label_width)}{terminal_text(value)}", width)
+
+
+def _wrapped_detail(
+    value: str, *, width: int, first_prefix: str = "", continuation: str = ""
+) -> list[str]:
+    available = max(1, width - len(first_prefix))
+    chunks = wrap(
+        terminal_text(value),
+        width=available,
+        break_long_words=False,
+        break_on_hyphens=False,
+    ) or [""]
+    lines = [_fit(first_prefix + chunks[0], width)]
+    continuation = continuation or " " * len(first_prefix)
+    following_width = max(1, width - len(continuation))
+    for chunk in chunks[1:]:
+        for part in wrap(
+            chunk,
+            width=following_width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [""]:
+            lines.append(_fit(continuation + part, width))
+    return lines
+
+
+def _card_display_status(card: ExpertCardState | None) -> str:
+    if card is None:
+        return "LOADING"
+    if card.status == "STALE" and not (card.profile and card.profile.current_state):
+        return "NEEDS REFRESH"
+    return {
+        "CURRENT": "PROFILE SYNCED",
+        "STALE": "PROFILE STALE",
+        "MISSING": "NO PROFILE",
+        "UNKNOWN": "SOURCE UNAVAILABLE",
+    }.get(card.status, card.status)
+
+
+def _safe_chat_text(value: object) -> str:
+    clean = _ANSI_ESCAPE.sub("", str(value))
+    return "".join(
+        character if character.isprintable() or character == "\n" else "�"
+        for character in clean
+    )
+
+
+def _chat_message_lines(message: AskMessage, width: int) -> list[str]:
+    label = "YOU" if message.role == "user" else "AGENT"
+    prefix = f"{label} // "
+    continuation = " " * len(prefix)
+    result: list[str] = []
+    paragraphs = _safe_chat_text(message.text).split("\n")
+    for paragraph_index, paragraph in enumerate(paragraphs):
+        line_prefix = prefix if paragraph_index == 0 else continuation
+        parts = wrap(
+            paragraph,
+            width=max(1, width - len(line_prefix)),
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [""]
+        result.extend(
+            _fit((line_prefix if index == 0 else continuation) + part, width)
+            for index, part in enumerate(parts)
+        )
+    return result
+
+
+def _ask_history_lines(
+    state: MonitorState, *, width: int, slots: int, color: bool
+) -> tuple[list[str], list[str]]:
+    entries: list[tuple[str, str]] = []
+    for index, message in enumerate(state.ask_messages):
+        if index:
+            entries.append(("blank", " " * width))
+        entries.extend(
+            (message.role, line) for line in _chat_message_lines(message, width)
+        )
+    if state.ask_pending:
+        if entries:
+            entries.append(("blank", " " * width))
+        entries.append(("status", _fit("AGENT // thinking…", width)))
+    elif state.ask_error:
+        if entries:
+            entries.append(("blank", " " * width))
+        entries.extend(
+            ("error", line)
+            for line in _wrapped_detail(f"SIDE ERROR // {state.ask_error}", width=width)
+        )
+    elif not entries:
+        empty = (
+            "Opening an ephemeral side context… You can type while it connects."
+            if state.ask_status == "opening"
+            else "Ask from this exact thread's context. Follow-ups stay in this side."
+        )
+        entries.extend(("status", line) for line in _wrapped_detail(empty, width=width))
+
+    offset = min(state.ask_scroll, max(0, len(entries) - 1))
+    end = max(0, len(entries) - offset)
+    start = max(0, end - slots)
+    visible = entries[start:end]
+    plain = [line for _role, line in visible]
+    ansi: list[str] = []
+    for role, line in visible:
+        code = {
+            "user": FG_MAGENTA,
+            "expert": "",
+            "error": FG_RED,
+            "status": DIM + FG_CYAN,
+            "blank": "",
+        }.get(role, "")
+        ansi.append(_paint(line, code, color) if code else line)
+    padding = [" " * width] * max(0, slots - len(plain))
+    return plain + padding, ansi + padding
+
+
+def _ask_input_lines(state: MonitorState, *, width: int, rows: int) -> list[str]:
+    if state.ask_pending:
+        progress = state.ask_progress
+        stage = progress.get("stage", "prepare")
+        elapsed = float(progress.get("elapsed_seconds", 0))
+        updated = float(progress.get("received_at", time.monotonic()))
+        elapsed += max(0, time.monotonic() - updated)
+        return [_fit(f"› {stage} · {elapsed:.0f}s · delivery {progress.get('delivery', 'not_sent')}", width)] + [" " * width] * max(
+            0, rows - 1
+        )
+    cursor = "█"
+    value = state.ask_input + cursor
+    logical: list[str] = []
+    for paragraph in value.split("\n"):
+        logical.extend(
+            wrap(
+                paragraph,
+                width=max(1, width - 2),
+                break_long_words=True,
+                break_on_hyphens=False,
+                replace_whitespace=False,
+                drop_whitespace=False,
+            )
+            or [""]
+        )
+    visible = logical[-rows:]
+    lines = [
+        _fit(("› " if index == len(visible) - 1 else "  ") + line, width)
+        for index, line in enumerate(visible)
+    ]
+    return ([" " * width] * max(0, rows - len(lines)) + lines)[-rows:]
+
+
+def _ask_panel_lines(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    now: float,
+    color: bool,
+) -> tuple[list[str], list[str]]:
+    target = state.ask_target or state.selected()
+    if target is None:
+        plain = [_fit("SIDE // NO TARGET", width), _fit("Esc closes this side.", width)]
+        return (
+            (plain + [" " * width] * height)[:height],
+            ([_paint(plain[0], FG_RED, color), plain[1]] + [" " * width] * height)[
+                :height
+            ],
+        )
+
+    status = {
+        "opening": f"{SPINNER[int(now * 4) % len(SPINNER)]} OPENING",
+        "asking": f"{SPINNER[int(now * 4) % len(SPINNER)]} THINKING",
+        "ready": "● READY",
+        "error": "! ERROR",
+        "closed": "○ CLOSED",
+    }.get(state.ask_status, state.ask_status.upper())
+    if state.ask_progress and state.ask_status in {"opening", "asking", "error"}:
+        elapsed = float(state.ask_progress.get("elapsed_seconds", 0))
+        if state.ask_status != "error":
+            elapsed += max(0, time.monotonic() - float(state.ask_progress.get("received_at", time.monotonic())))
+        stage = str(state.ask_progress.get("stage", "prepare")).upper()
+        status = f"{'! ' if state.ask_status == 'error' else ''}{stage} · {elapsed:.0f}s"
+    title = _line(target.display_name, status, width)
+    policy = state.ask_policy or consultation_policy(target)
+    if state.ask_confirmed:
+        receipt_text = (
+            f"SIDE RECEIPT // EPHEMERAL · parent {target.session_id[:8]} · "
+            f"{policy.label} · transcript unchanged"
+        )
+    else:
+        receipt_text = (
+            f"SIDE REQUEST // parent {target.session_id[:8]} · "
+            f"requested {policy.label} · awaiting provider confirmation"
+        )
+    receipt = _fit(receipt_text, width)
+    card = state.expert_cards.get(target.key)
+    if card and card.profile:
+        now_line = _detail_value(
+            "now",
+            card.profile.current_state or "not captured — refresh this profile",
+            width,
+        )
+        knows = _detail_value("topics", " · ".join(card.profile.topics[:3]), width)
+    else:
+        now_line = _detail_value("now", "thread profile unavailable", width)
+        knows = _detail_value("topics", "thread profile unavailable", width)
+    heading = _line(
+        "CONVERSATION",
+        f"{len(state.ask_messages)} messages · ↑↓ scroll",
+        width,
+    )
+    input_heading = _line(
+        f"ASK {target.display_name}", "PRIVATE · ONLY THIS SIDE SEES IT", width
+    )
+    input_rows = 2 if height >= 14 else 1
+    fixed = 8 + input_rows
+    history_slots = max(1, height - fixed)
+    history_plain, history_ansi = _ask_history_lines(
+        state, width=width, slots=history_slots, color=color
+    )
+    input_plain = _ask_input_lines(state, width=width, rows=input_rows)
+    help_line = _fit(
+        "Enter send · Ctrl+J newline · Ctrl+U clear · Esc close and discard",
+        width,
+    )
+    plain = [
+        title,
+        receipt,
+        now_line,
+        knows,
+        " " * width,
+        heading,
+        *history_plain,
+        input_heading,
+        *input_plain,
+        help_line,
+    ]
+    ansi = [
+        _paint(title, BOLD + FG_MAGENTA, color),
+        _paint(receipt, DIM, color),
+        _paint(now_line, FG_MAGENTA, color),
+        _paint(knows, FG_BLUE, color),
+        " " * width,
+        _paint(heading, DIM + FG_CYAN, color),
+        *history_ansi,
+        _paint(input_heading, DIM + FG_MAGENTA, color),
+        *[
+            _paint(line, REVERSE if not state.ask_pending else DIM, color)
+            for line in input_plain
+        ],
+        _paint(help_line, DIM, color),
+    ]
+    return plain[:height], ansi[:height]
+
+
+def _untrack_panel_lines(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    color: bool,
+) -> tuple[list[str], list[str]]:
+    target = state.untrack_target or state.selected()
+    if target is None:
+        plain = [_fit("STOP WATCHING // NO TARGET", width), _fit("Esc returns.", width)]
+        return (
+            (plain + [" " * width] * height)[:height],
+            ([_paint(plain[0], FG_RED, color), plain[1]] + [" " * width] * height)[
+                :height
+            ],
+        )
+    title = _line("STOP WATCHING", "CONFIRM", width)
+    identity = _detail_value(
+        "target", f"{provider_label(target.provider)} · {target.session_id[:8]}", width
+    )
+    name = _detail_value("name", target.display_name, width)
+    lines = [
+        title,
+        " " * width,
+        name,
+        identity,
+        " " * width,
+        _fit("Pika will remove this workstream from Live Operations.", width),
+        _fit("Any running agent stays running. The conversation is not archived.", width),
+        _fit("Retained expertise remains discoverable through expert lookup.", width),
+        _fit("Consultation availability is checked separately.", width),
+        " " * width,
+        _fit("Use pika NAME to watch it again.", width),
+        " " * width,
+        _fit("[x / Enter] stop watching    [Esc / q] keep watching", width),
+    ]
+    ansi = [
+        _paint(title, BOLD + FG_YELLOW, color),
+        " " * width,
+        _paint(name, BOLD, color),
+        _paint(identity, DIM, color),
+        " " * width,
+        lines[5],
+        _paint(lines[6], FG_GREEN, color),
+        _paint(lines[7], FG_BLUE, color),
+        _paint(lines[8], DIM, color),
+        " " * width,
+        _paint(lines[10], DIM, color),
+        " " * width,
+        _paint(lines[12], REVERSE, color),
+    ]
+    padding = [" " * width] * max(0, height - len(lines))
+    return (lines + padding)[:height], (ansi + padding)[:height]
+
+
+def _render_compact_ask(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    now: float,
+    color: bool,
+) -> MonitorFrame:
+    body_height = max(1, height - 1)
+    plain, ansi = _ask_panel_lines(
+        state, width=width, height=body_height, now=now, color=color
+    )
+    footer = _fit(
+        "type  Enter send  ^J newline  ^U clear  ↑↓ history  Esc close side",
+        width,
+    )
+    return MonitorFrame(
+        "\n".join([*ansi, _paint(footer, REVERSE, color)]),
+        "\n".join([*plain, footer]),
+        state.selected_key,
+    )
+
+
+def _render_compact_untrack(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    color: bool,
+) -> MonitorFrame:
+    body_height = max(1, height - 1)
+    plain, ansi = _untrack_panel_lines(
+        state, width=width, height=body_height, color=color
+    )
+    footer = _fit("x / Enter confirm  Esc / q cancel", width)
+    return MonitorFrame(
+        "\n".join([*ansi, _paint(footer, REVERSE, color)]),
+        "\n".join([*plain, footer]),
+        state.selected_key,
+    )
+
+
+def _action_error_lines(state: MonitorState, width: int, height: int) -> list[str]:
+    lines = []
+    target = state.action_error_target
+    if target is not None:
+        lines.extend(wrap(
+            f"Target: {target.display_name} · {target.provider} · {target.session_id}",
+            max(1, width), break_long_words=True,
+        ))
+        lines.append("")
+    for paragraph in (state.action_error or "No action error recorded").splitlines():
+        lines.extend(wrap(paragraph, max(1, width), break_long_words=True) or [""])
+    slots = max(1, height - 3)
+    state.action_error_offset = min(state.action_error_offset, max(0, len(lines) - slots))
+    visible = lines[state.action_error_offset : state.action_error_offset + slots]
+    result = ["OPENING PAUSED · exact recovery steps", "", *visible]
+    result.extend([""] * max(0, height - 1 - len(result)))
+    result.append("↑↓ scroll · Enter recheck · Esc return to board")
+    return [_fit(line, width) for line in result[:height]]
+
+
+def _split_right_pane(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    now: float,
+    color: bool,
+) -> tuple[list[str], list[str]]:
+    if state.mode == "action-error":
+        plain = _action_error_lines(state, width, height)
+        return plain, [_paint(line, FG_YELLOW, color) for line in plain]
+    if state.mode == "ask":
+        return _ask_panel_lines(state, width=width, height=height, now=now, color=color)
+    if state.mode == "untrack":
+        return _untrack_panel_lines(state, width=width, height=height, color=color)
+    selected = state.selected()
+    if selected is None:
+        plain = [
+            _fit("NO WORKSTREAM SELECTED", width),
+            _fit(_observation_scope(state, now), width),
+        ]
+        return (
+            (plain + [" " * width] * height)[:height],
+            ([_paint(plain[0], BOLD, color), plain[1]] + [" " * width] * height)[
+                :height
+            ],
+        )
+
+    card = state.expert_card(selected)
+    profile = card.profile if card else None
+    signal = (
+        selected.remote_error
+        if isinstance(selected, FleetSession) and selected.remote_error
+        else selected.error or selected.attention_reason or "no exception reported"
+    )
+    explanation = state.explanations.get(selected.key)
+    if explanation is None and not isinstance(selected, PendingLaunch):
+        explanation = explain_session(selected, now=now)
+    why = str(explanation["summary"]) if explanation else signal
+    status_mark = "◆" if _needs_you_group(selected) else "□"
+    public_status = (
+        "PROTECTED PAUSE"
+        if selected.home_state == "identity-error"
+        else _public_status(selected)
+    )
+    title = _line(selected.display_name, f"{status_mark} {public_status}", width)
+    active_handoff = (
+        state.handoff
+        if state.handoff and time.monotonic() < state.handoff_until
+        else None
+    )
+
+    plain: list[str] = [title]
+    ansi: list[str] = [_paint(title, BOLD, color)]
+
+    if state.refresh_error:
+        notice = _fit(f"REFRESH ERROR // {state.refresh_error}", width)
+        plain.append(notice)
+        ansi.append(_paint(notice, FG_RED, color))
+    elif state.toast and time.monotonic() < state.toast_until:
+        notice = _fit(f"NOTICE // {state.toast}", width)
+        plain.append(notice)
+        ansi.append(_paint(notice, FG_YELLOW, color))
+    elif active_handoff is not None:
+        notice = _fit(_handoff_text(active_handoff), width)
+        plain.append(notice)
+        ansi.append(_paint(notice, FG_MAGENTA, color))
+
+    scope = _fit(_observation_scope(state, now), width)
+    plain.append(scope)
+    ansi.append(_paint(scope, DIM, color))
+
+    metadata = [
+        _detail_value("WHY", why, width),
+        _detail_value(
+            "agent",
+            f"{provider_label(selected.provider)} · id {selected.session_id[:8]}",
+            width,
+        ),
+        _detail_value("path", selected.cwd or "—", width),
+        _detail_value("branch", selected.branch or "—", width),
+        _detail_value("home", _identity_text(selected), width),
+    ]
+    plain.extend(metadata)
+    ansi.extend(
+        [
+            metadata[0],
+            _paint(metadata[1], DIM, color),
+            metadata[2],
+            metadata[3],
+            _paint(
+                metadata[4],
+                FG_GREEN
+                if selected.exact_home
+                and not (isinstance(selected, FleetSession) and selected.stale)
+                else FG_MAGENTA,
+                color,
+            ),
+        ]
+    )
+
+    if explanation:
+        winning = next((item for item in explanation["evidence"] if item["winner"]), None)
+        proof = (
+            f"{winning['source']} · {_human_age_at(winning['observed_at'], now)} ago"
+            if winning else f"{signal} · {_age_phrase(selected, now)}"
+        )
+        proof_line = _detail_value("evidence", proof, width)
+        plain.append(proof_line)
+        ansi.append(_paint(proof_line, DIM, color))
+
+    plain.append(" " * width)
+    ansi.append(" " * width)
+    provenance = profile_source_label(profile) if profile is not None else ""
+    card_state_text = _card_display_status(card)
+    card_heading = _line(
+        "THREAD EXPERTISE",
+        f"{provenance} · {card_state_text}" if provenance else card_state_text,
+        width,
+    )
+    plain.append(card_heading)
+    card_color = (
+        FG_GREEN
+        if card and card.status == "CURRENT"
+        else FG_YELLOW
+        if card and card.status == "STALE"
+        else FG_MAGENTA
+    )
+    ansi.append(_paint(card_heading, BOLD + card_color, color))
+
+    if profile is not None:
+        freshness = state.expert_freshness.get(selected.key, {})
+        work_at = profile.current_state_updated_at or profile.updated_at
+        work_label = (
+            f"work published {_human_age_at(work_at, now)} ago · "
+            f"{freshness.get('current_state_status', 'UNKNOWN')}"
+        )
+        scope_lines = _wrapped_detail(
+            profile.scope,
+            width=width,
+            first_prefix="worked on  ",
+            continuation="           ",
+        )
+        now_lines = _wrapped_detail(
+            profile.current_state or "not captured — refresh this profile",
+            width=width,
+            first_prefix="now      ",
+            continuation="         ",
+        )
+        topic_lines = _wrapped_detail(
+            " · ".join(profile.topics),
+            width=width,
+            first_prefix="topics     ",
+            continuation="           ",
+        )
+        card_plain = [*scope_lines[:2], _fit(work_label, width), *now_lines[:2], *topic_lines[:2]]
+        card_ansi = [
+            *scope_lines[:2],
+            _paint(_fit(work_label, width), DIM, color),
+            *[_paint(line, FG_MAGENTA, color) for line in now_lines[:2]],
+            *[_paint(line, FG_BLUE, color) for line in topic_lines[:2]],
+        ]
+        if profile.artifacts and height >= 27:
+            artifact = _detail_value("artifact", profile.artifacts[0], width)
+            card_plain.append(artifact)
+            card_ansi.append(_paint(artifact, DIM, color))
+        plain.extend(card_plain)
+        ansi.extend(card_ansi)
+    elif card is not None:
+        message = _fit(f"{card.detail}. Pika will keep this state explicit.", width)
+        plain.append(message)
+        ansi.append(_paint(message, DIM, color))
+    else:
+        message = _fit("Loading this exact thread's expertise profile…", width)
+        plain.append(message)
+        ansi.append(_paint(message, DIM, color))
+
+    if state.show_usage:
+        plain.append(" " * width)
+        ansi.append(" " * width)
+        usage_heading = _fit(
+            f"USAGE // PROVIDER COUNTERS · API-EQUIV EST {PRICING_AS_OF}", width
+        )
+        usage = _fit(
+            (
+                f"CPU {selected.cpu_percent:.1f}%"
+                if selected.cpu_percent is not None
+                else "CPU —"
+            )
+            + (
+                f" · RAM {format_bytes(selected.rss_kb)} · "
+                f"TOKENS {format_tokens(selected.total_tokens)} · "
+                f"API-EQUIV {format_cost(selected.estimated_cost_usd)}"
+            ),
+            width,
+        )
+        plain.extend([usage_heading, usage])
+        ansi.extend([_paint(usage_heading, BOLD + FG_CYAN, color), usage])
+
+    action_heading = _fit("DO SOMETHING", width)
+    can_ask = isinstance(selected, FleetSession) or bool(selected.transcript_path)
+    if isinstance(selected, FleetSession) and selected.stale:
+        actions = "Actions paused · press r to retry this machine"
+        reassurance = (
+            "Cached metadata is visible, but Pika will not act as if it is current."
+        )
+    elif isinstance(selected, PendingLaunch):
+        actions = "[Enter] open Pika home · identity reconciliation continues"
+        reassurance = "The conversation is visible; Pika has not guessed its identity."
+    elif selected.status == Status.UNBOUND.value and selected.live:
+        actions = "[Enter] inspect recovery options"
+        reassurance = "Pika rechecks the exact conversation before offering a handoff."
+    elif selected.home_state == "identity-error":
+        ask = " · [a] ask here" if can_ask else ""
+        actions = f"[Enter] recheck exact identity{ask}"
+        reassurance = (
+            "Pika stopped here to protect the original conversation; it did not guess."
+        )
+    elif selected.home_state == "open-twice":
+        ask = " · [a] ask here" if can_ask else ""
+        actions = f"[Enter] recheck duplicate owners{ask}"
+        reassurance = (
+            "Pika caught the duplicate before another copy could be opened."
+        )
+    else:
+        open_label = (
+            "collect result"
+            if selected.status == Status.READY.value and selected.unread
+            else "open"
+        )
+        ask = " · [a] ask here" if can_ask else ""
+        actions = f"[Enter] {open_label}{ask} · [p] peek · [x] stop watching"
+        reassurance = (
+            "Inline asks are ephemeral; the parent transcript remains unchanged."
+            if can_ask
+            else "This conversation has no durable transcript available for side asks."
+        )
+    action_block = [
+        " " * width,
+        action_heading,
+        _fit(actions, width),
+        _fit(reassurance, width),
+    ]
+
+    preview_slots = height - len(plain) - len(action_block)
+    if preview_slots >= 3:
+        preview_heading = _line("LIVE PANE TAIL", "READ-ONLY · UNREAD PRESERVED", width)
+        preview_body_slots = preview_slots - 2
+        if state.preview_key == selected.key and state.preview_lines:
+            preview = state.preview_lines[-preview_body_slots:]
+        elif state.preview_key == selected.key and state.preview_error:
+            preview = [f"Preview unavailable: {state.preview_error}"]
+        elif selected.tmux_pane or selected.tmux_session:
+            preview = ["Waiting for the first selected-pane capture…"]
+        elif selected.home_state in {"identity-error", "open-twice"}:
+            preview = [
+                "No trusted pane. Opening stays blocked until identity recovers."
+            ]
+        else:
+            preview = ["No live pane. Enter restores this exact saved conversation."]
+        preview = [_fit(line, width) for line in preview[:preview_body_slots]]
+        while len(preview) < preview_body_slots:
+            preview.append(" " * width)
+        plain.extend([" " * width, preview_heading, *preview])
+        ansi.extend(
+            [
+                " " * width,
+                _paint(preview_heading, DIM + FG_CYAN, color),
+                *[_paint(line, FG_BRIGHT_BLACK, color) for line in preview],
+            ]
+        )
+    if len(plain) + len(action_block) <= height:
+        plain.extend(action_block)
+        ansi.extend(
+            [
+                " " * width,
+                _paint(action_heading, DIM + FG_MAGENTA, color),
+                _paint(_fit(actions, width), BOLD, color),
+                _paint(_fit(reassurance, width), DIM, color),
+            ]
+        )
+
+    while len(plain) < height:
+        plain.append(" " * width)
+        ansi.append(" " * width)
+    return plain[:height], ansi[:height]
+
+
+def _update_banner(state: MonitorState) -> str | None:
+    if not state.update_version:
+        return None
+    if state.update_status == "installing":
+        return f"Updating Pika to {state.update_version} · board and agents stay available"
+    if state.update_status == "done":
+        return f"Pika {state.update_version} installed · reopen pika · pika setup reviews skill changes"
+    if state.update_status == "error":
+        return "Pika update failed · U details / retry · agents left running"
+    return f"Update available: {state.update_version} · U review / install"
+
+
+def _render_update(state: MonitorState, width: int, height: int) -> MonitorFrame:
+    lines = [f"PIKA // UPDATE {state.update_version}", ""]
+    if state.update_status == "available":
+        lines += [
+            "Install this release on this machine only?",
+            "The package is verified and staged before activation.",
+            "Agents stay running; other machines and skills are not changed.",
+            "Reopen pika afterward; pika setup reviews skill changes.",
+            "", "Enter / y install    Esc / n cancel",
+        ]
+    elif state.update_status == "installing":
+        lines += ["Installing in the background. Agents stay running.",
+                  "Esc returns to the board; the update continues."]
+    else:
+        lines += [state.update_detail or "Update failed.", "",
+                  "Enter / y retry · Esc back" if state.update_status == "error" else "Esc / Enter back"]
+    controls = lines.pop()
+    wrapped = [part for line in lines for part in (wrap(terminal_text(line), width=max(1, width)) or [""])]
+    # Long installer diagnostics must never push cancellation/retry off-screen.
+    visible = (wrapped + [""] * height)[:max(0, height - 1)] + [controls]
+    plain = "\n".join(_fit(line, width) for line in visible)
+    return MonitorFrame(plain, plain, state.selected_key)
+
+
+def _render_split_monitor(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    now: float,
+    refreshing: bool,
+    color: bool,
+) -> MonitorFrame:
+    counts = _session_counts(state.sessions)
+    groups = dict(_split_groups(state.sessions))
+    expert_count = sum(card.profile is not None for card in state.expert_cards.values())
+    refresh_age = max(0.0, now - state.refresh_started_at)
+    show_refresh = refreshing and (
+        not state.last_update
+        or state.emphasize_refresh
+        or refresh_age >= SLOW_REFRESH_SECONDS
+    )
+    if state.refresh_error:
+        sync = (
+            f"STALE {max(0, int(now - state.last_update))}s"
+            if state.last_update
+            else "SCAN FAILED"
+        )
+    elif state.refresh_warning:
+        sync = "PARTIAL"
+    elif show_refresh:
+        sync = f"{SPINNER[int(now * 4) % len(SPINNER)]} SYNCING"
+    else:
+        sync = "●"
+    clock = datetime.fromtimestamp(now).strftime("%H:%M:%S")
+    summary = [
+        f"{len(groups.get('NEEDS YOU', []))} need you",
+        f"{len(groups.get('WORKING', []))} working",
+        f"{len(groups.get('READY', []))} ready",
+        f"{len(groups.get('PARKED', []))} parked",
+    ]
+    if counts["cached"]:
+        summary.append(f"{counts['cached']} cached")
+    if state.machines:
+        unavailable = sum(
+            node.status != "ready" or not node.last_seen
+            or now - node.last_seen > REMOTE_STALE_SECONDS
+            for node in state.machines
+        )
+        summary.append(
+            f"{len(state.machines) + 1} machines"
+            + (f"/{unavailable} offline" if unavailable else "")
+        )
+    if state.expert_cards_updated_at:
+        summary.append(
+            f"{expert_count} expert thread{'' if expert_count == 1 else 's'}"
+        )
+    status_clock = (
+        f"{sync} {clock}"
+        if sync == "●" or any(sync.startswith(frame) for frame in SPINNER)
+        else f"{sync} · {clock}"
+    )
+    summary.append(status_clock)
+    view = (
+        " · SIDE"
+        if state.mode == "ask"
+        else " · CONFIRM"
+        if state.mode == "untrack"
+        else " · USAGE"
+        if state.show_usage
+        else ""
+    )
+    header_plain = _line(
+        f"PIKA // LIVE OPERATIONS{view}" + (
+            f" / {state.filter_text}_" if state.mode == "filter"
+            else f" / {state.filter_text}" if state.filter_text else ""
+        ),
+        " · ".join(summary),
+        width,
+    )
+    header_ansi = _paint(header_plain, BOLD + FG_CYAN, color)
+
+    body_height = max(1, height - 3)
+    left_width = max(32, min(44, width // 3))
+    divider = " │ "
+    right_width = width - left_width - len(divider)
+    left_plain, left_ansi = _split_left_pane(
+        state, width=left_width, height=body_height, now=now, color=color
+    )
+    right_plain, right_ansi = _split_right_pane(
+        state, width=right_width, height=body_height, now=now, color=color
+    )
+    divider_ansi = _paint(divider, FG_BRIGHT_BLACK, color)
+    body_plain = [
+        left_plain[index] + divider + right_plain[index] for index in range(body_height)
+    ]
+    body_ansi = [
+        left_ansi[index] + divider_ansi + right_ansi[index]
+        for index in range(body_height)
+    ]
+
+    selected = state.selected()
+    if state.mode == "ask":
+        target = state.ask_target or selected
+        fingerprint = target.session_id[:8] if target else "—"
+        policy = state.ask_policy or (consultation_policy(target) if target else None)
+        if state.ask_confirmed:
+            playbook_text = (
+                f"SIDE RECEIPT // EPHEMERAL · parent {fingerprint} unchanged · "
+                f"{policy.label if policy else 'provider native'} · Esc discards"
+            )
+        else:
+            playbook_text = (
+                f"SIDE REQUEST // parent {fingerprint} · requested "
+                f"{policy.label if policy else 'provider native'} · awaiting confirmation"
+            )
+        playbook_plain = _fit(playbook_text, width)
+        playbook_ansi = _paint(playbook_plain, FG_MAGENTA, color)
+        footer_plain = _fit(
+            "type your question  Enter send  Ctrl+J newline  Ctrl+U clear  "
+            "↑↓ history  Esc close side",
+            width,
+        )
+    elif state.mode == "untrack":
+        playbook_plain = _fit(
+            "STOP WATCHING // process stays alive · provider history stays intact",
+            width,
+        )
+        playbook_ansi = _paint(playbook_plain, FG_YELLOW, color)
+        footer_plain = _fit("x / Enter confirm stop watching    Esc / q cancel", width)
+    else:
+        tip_index, tip_total, tip = playbook_tip(
+            now,
+            state.sessions,
+            selected=selected,
+            refresh_error=state.refresh_error,
+            compact=width < 120,
+        )
+        playbook_plain = _fit(
+            f"PIKA PLAYBOOK {tip_index + 1}/{tip_total} // {tip}", width
+        )
+        playbook_ansi = _paint(playbook_plain, FG_BLUE, color)
+        footer_plain = _fit(
+            "↑↓/jk move  / filter  Enter open  a ask here  n next needed  p peek  x stop watching  "
+            f"u {'operations' if state.show_usage else 'usage'}  r refresh  ? keys  q quit",
+            width,
+        )
+    if state.mode == "sessions" and (notice := _update_banner(state)):
+        footer_plain = _fit(notice + " | ↑↓ move  Enter open  ? keys  q quit", width)
+    footer_ansi = _paint(footer_plain, REVERSE, color)
+    plain_lines = [header_plain, *body_plain, playbook_plain, footer_plain]
+    ansi_lines = [header_ansi, *body_ansi, playbook_ansi, footer_ansi]
+    return MonitorFrame(
+        "\n".join(ansi_lines[:height]),
+        "\n".join(_fit(line, width) for line in plain_lines[:height]),
+        state.selected_key,
+    )
+
+
+def render_monitor(
+    state: MonitorState,
+    *,
+    width: int,
+    height: int,
+    now: float | None = None,
+    refreshing: bool = False,
+    color: bool = True,
+) -> MonitorFrame:
+    now = time.time() if now is None else now
+    width = max(1, width)
+    height = max(1, height)
+    selected = state.selected()
+    if state.mode == "update":
+        return _render_update(state, width, height)
+    if state.mode == "action-error" and (width < SPLIT_MIN_WIDTH or height < SPLIT_MIN_HEIGHT):
+        plain = _action_error_lines(state, width, height)
+        return MonitorFrame("\n".join(plain), "\n".join(plain), state.selected_key)
+
+    if width < MIN_WIDTH or height < MIN_HEIGHT:
+        if state.mode in {"ask", "untrack"}:
+            label = "SIDE" if state.mode == "ask" else "CONFIRM"
+            recovery = (
+                "Esc closes and discards this side"
+                if state.mode == "ask"
+                else "Esc keeps this workstream on Pika"
+            )
+            minimum = [
+                _line(f"PIKA // {label}", "PAUSED", width),
+                "─" * width,
+                _fit(f"Terminal too small · need {MIN_WIDTH}x{MIN_HEIGHT}", width),
+                _fit(f"Current viewport · {width}x{height}", width),
+                "",
+                _fit(recovery, width),
+            ]
+            minimum = (minimum + [""] * height)[:height]
+            plain = "\n".join(_fit(line, width) for line in minimum)
+            return MonitorFrame(plain, plain, state.selected_key)
+        minimum = [
+            _line(
+                "PIKA // LIVE",
+                datetime.fromtimestamp(now).strftime("%H:%M:%S"),
+                width,
+            ),
+            "─" * width,
+            _fit(f"Terminal too small · need {MIN_WIDTH}x{MIN_HEIGHT}", width),
+            _fit(f"Current viewport · {width}x{height}", width),
+            "",
+            _fit("q quit", width),
+        ]
+        minimum = (minimum + [""] * height)[:height]
+        plain = "\n".join(_fit(line, width) for line in minimum)
+        return MonitorFrame(plain, plain, state.selected_key)
+
+    if state.mode == "ask" and (width < SPLIT_MIN_WIDTH or height < SPLIT_MIN_HEIGHT):
+        return _render_compact_ask(
+            state, width=width, height=height, now=now, color=color
+        )
+
+    if state.mode == "untrack" and (
+        width < SPLIT_MIN_WIDTH or height < SPLIT_MIN_HEIGHT
+    ):
+        return _render_compact_untrack(state, width=width, height=height, color=color)
+
+    if (
+        width >= SPLIT_MIN_WIDTH
+        and height >= SPLIT_MIN_HEIGHT
+        and state.mode in {"sessions", "ask", "untrack", "action-error"}
+        and (state.sessions or state.mode in {"ask", "untrack", "action-error"})
+    ):
+        return _render_split_monitor(
+            state,
+            width=width,
+            height=height,
+            now=now,
+            refreshing=refreshing,
+            color=color,
+        )
+
+    refresh_age = max(0.0, now - state.refresh_started_at)
+    show_refresh = refreshing and (
+        not state.last_update
+        or state.emphasize_refresh
+        or refresh_age >= SLOW_REFRESH_SECONDS
+    )
+    if state.refresh_error:
+        freshness = (
+            f"! STALE · last update {max(0, int(now - state.last_update))}s ago"
+            if state.last_update
+            else "! INITIAL SCAN FAILED"
+        )
+    elif state.refresh_warning:
+        freshness = f"! PARTIAL · UPDATED {max(0, int(now - state.last_update))}s AGO"
+    elif show_refresh:
+        spinner = SPINNER[int(now * 4) % len(SPINNER)]
+        freshness = f"{spinner} {'SCANNING' if not state.last_update else 'SYNCING'}"
+    elif state.last_update:
+        freshness = f"● UPDATED {max(0, int(now - state.last_update))}s AGO"
+    else:
+        freshness = "○ WAITING FOR FIRST SCAN"
+    clock = datetime.fromtimestamp(now).strftime("%H:%M:%S")
+    view_label = " · USAGE VIEW" if state.show_usage else ""
+    if state.show_usage and width >= 112:
+        view_label += f" · PROVIDER COUNTERS · API-EQUIV EST {PRICING_AS_OF}"
+    if state.show_usage and state.usage_warning:
+        view_label += " · USAGE PARTIAL"
+    header_plain = _line(
+        f"PIKA // LIVE OPERATIONS{view_label}  " + (
+            f"FILTER /{state.filter_text}" if state.filter_text or state.mode == "filter"
+            else f"{len(state.sessions)} WORKSTREAMS"
+        ),
+        f"{freshness}  {clock}",
+        width,
+    )
+    header_ansi = _paint(header_plain, BOLD + FG_CYAN, color)
+
+    active_handoff = (
+        state.handoff
+        if state.handoff and time.monotonic() < state.handoff_until
+        else None
+    )
+    briefing_plain = _briefing_lines(
+        state.sessions,
+        width=width,
+        handoff=active_handoff,
+        initialized=bool(state.last_update or state.sessions),
+        refresh_error=state.refresh_error or ("Checking cache" if state.cached_initial else None),
+    )
+    if state.cached_initial or state.refresh_warning or any(
+        node.status != "ready" or not node.last_seen
+        or now - node.last_seen > REMOTE_STALE_SECONDS
+        for node in state.machines
+    ):
+        headline = briefing_plain[0].replace("YOU'RE CLEAR", "CURRENT OBSERVATIONS")
+        briefing_plain = (_fit(headline, width), _fit(_observation_scope(state, now), width))
+    counts = _session_counts(state.sessions)
+    has_attention = bool(
+        counts["decisions"]
+        or counts["results"]
+        or counts["errors"]
+        or counts["unbound"]
+    )
+    briefing_ansi = (
+        _paint(
+            briefing_plain[0],
+            BOLD + (FG_YELLOW if has_attention else FG_GREEN),
+            color,
+        ),
+        _paint(
+            briefing_plain[1],
+            FG_MAGENTA if active_handoff else FG_BLUE,
+            color,
+        ),
+    )
+
+    rule = "─" * width
+    columns = _columns(width, show_usage=state.show_usage)
+    table_width = 3 + sum(item.width for item in columns) + 2 * (len(columns) - 1)
+    table_header = _fit(
+        "   " + "  ".join(_fit(item.label, item.width) for item in columns),
+        width,
+    )
+
+    row_slots = max(1, height - 11)
+    ordered = state.ordered()
+    selected_index = next(
+        (index for index, item in enumerate(ordered)
+         if selected is not None and item.key == selected.key), 0
+    )
+    state.table_offset = _viewport_offset(
+        state.table_offset, selected_index, len(ordered), row_slots
+    )
+    start = state.table_offset
+    rows = ordered[start : start + row_slots]
+    table_plain: list[str] = []
+    table_ansi: list[str] = []
+
+    if state.mode == "help":
+        title = _fit("HELP // KEYS", width)
+        table_plain = [title, *_help_lines(state, width, row_slots - 1)]
+        table_ansi = [_paint(title, BOLD + FG_BLUE, color), *table_plain[1:]]
+    elif state.mode == "peek":
+        name = selected.display_name if selected else "—"
+        title = _fit(f"PEEK // {name}  ↑↓ scroll · p/Esc close · Enter open", width)
+        table_plain = [title, *_peek_view(state, width, row_slots - 1)]
+        table_ansi = [_paint(title, BOLD + FG_MAGENTA, color), *table_plain[1:]]
+    elif not ordered:
+        message = "Scanning provider state…" if refreshing else "No managed homes yet."
+        table_plain = [
+            table_header,
+            _fit("", width),
+            _fit(message, width),
+            _fit("Start one with: pika NAME", width),
+        ]
+        table_ansi = [
+            _paint(table_header, DIM, color),
+            table_plain[1],
+            _paint(table_plain[2], BOLD, color),
+            table_plain[3],
+        ]
+    else:
+        table_plain.append(table_header)
+        table_ansi.append(_paint(table_header, DIM, color))
+        for item in rows:
+            plain_row, ansi_row = _table_row(
+                item,
+                columns,
+                selected=bool(selected and item.key == selected.key),
+                color=color,
+                now=now,
+            )
+            table_plain.append(_fit(plain_row, width))
+            table_ansi.append(ansi_row + " " * max(0, width - table_width))
+        if len(ordered) > len(rows):
+            position = f"rows {start + 1}-{start + len(rows)} of {len(ordered)}"
+            table_plain[-1] = _line(table_plain[-1], position, width)
+            if not color:
+                table_ansi[-1] = table_plain[-1]
+
+    while len(table_plain) < row_slots + 1:
+        table_plain.append(" " * width)
+        table_ansi.append(" " * width)
+    table_plain = table_plain[: row_slots + 1]
+    table_ansi = table_ansi[: row_slots + 1]
+
+    if selected:
+        index = next(
+            (i for i, item in enumerate(ordered) if item.key == selected.key),
+            0,
+        )
+        selection = _line(
+            (
+                f"SELECTED // {selected.display_name}  "
+                f"{provider_label(selected.provider)} · {_public_status(selected)}"
+            ),
+            (
+                f"{index + 1}/{len(ordered)}  "
+                f"{short_path(selected.cwd, max(8, width // 4))}"
+                f"{' · ' + selected.branch if selected.branch else ''}"
+            ),
+            width,
+        )
+        identity = _identity_text(selected)
+        explanation = state.explanations.get(selected.key)
+        if explanation is None and not isinstance(selected, PendingLaunch):
+            explanation = explain_session(selected, now=now)
+        signal = str(explanation["summary"]) if explanation else (
+            selected.error or selected.attention_reason or "No exception reported"
+        )
+        if state.show_usage:
+            resources = (
+                f"CPU {selected.cpu_percent:.1f}%"
+                if selected.cpu_percent is not None
+                else "CPU —"
+            ) + (
+                f" · RAM {format_bytes(selected.rss_kb)} · "
+                f"TOKENS {format_tokens(selected.total_tokens)} · "
+                f"API-EQUIV {format_cost(selected.estimated_cost_usd)}"
+            )
+        else:
+            resources = _age_phrase(selected, now)
+        detail_plain = [
+            _fit(selection, width),
+            _fit(identity, width),
+            _line(f"WHY // {signal}", resources, width),
+        ]
+    else:
+        detail_plain = [
+            _fit("SELECTED // —", width),
+            _fit("No workstream selected", width),
+            " " * width,
+        ]
+
+    detail_ansi = [
+        _paint(detail_plain[0], BOLD, color),
+        _paint(detail_plain[1], DIM, color),
+        detail_plain[2],
+    ]
+    if state.refresh_error:
+        detail_plain[2] = _fit(f"REFRESH ERROR // {state.refresh_error}", width)
+        detail_ansi[2] = _paint(detail_plain[2], FG_RED, color)
+    elif state.toast and time.monotonic() < state.toast_until:
+        detail_plain[2] = _fit(f"NOTICE // {state.toast}", width)
+        detail_ansi[2] = _paint(detail_plain[2], FG_YELLOW, color)
+
+    exit_copy = "q close" if state.mode in {"help", "peek"} else "q quit"
+    footer_text = (
+        f"↑↓ move  ↵ open  a ask  p peek  x untrack  ? keys  {exit_copy}"
+        if width < 80
+        else (
+            "↑↓/jk move  Enter open  a ask  n next  p peek  x stop watching  "
+            f"u {'operations' if state.show_usage else 'usage'}  "
+            f"? keys  {exit_copy}"
+        )
+    )
+    if state.mode == "sessions" and (notice := _update_banner(state)):
+        footer_text = notice + " | ↑↓ move  Enter open  ? keys  q quit"
+    footer_plain = _fit(footer_text, width)
+    footer_ansi = _paint(footer_plain, REVERSE, color)
+    tip_index, tip_total, tip = playbook_tip(
+        now,
+        state.sessions,
+        selected=selected,
+        refresh_error=state.refresh_error,
+        compact=width < 90,
+    )
+    tip_label = "PIKA TIP" if width < 90 else "PIKA PLAYBOOK"
+    playbook_plain = _fit(f"{tip_label} {tip_index + 1}/{tip_total} // {tip}", width)
+    playbook_ansi = _paint(playbook_plain, FG_BLUE, color)
+
+    plain_lines = [
+        header_plain,
+        *briefing_plain,
+        rule,
+        *table_plain,
+        rule,
+        *detail_plain,
+        playbook_plain,
+        footer_plain,
+    ]
+    ansi_lines = [
+        header_ansi,
+        *briefing_ansi,
+        rule,
+        *table_ansi,
+        rule,
+        *detail_ansi,
+        playbook_ansi,
+        footer_ansi,
+    ]
+    plain_lines = [_fit(line, width) for line in plain_lines[:height]]
+    ansi_lines = ansi_lines[:height]
+    while len(plain_lines) < height:
+        plain_lines.append(" " * width)
+        ansi_lines.append(" " * width)
+    return MonitorFrame(
+        "\n".join(ansi_lines),
+        "\n".join(plain_lines),
+        state.selected_key,
+    )
+
+
+def _pop_utf8_character(buffer: bytearray) -> str | None:
+    first = buffer[0]
+    if first < 0x80:
+        return chr(buffer.pop(0))
+    length = (
+        2
+        if first & 0xE0 == 0xC0
+        else 3
+        if first & 0xF0 == 0xE0
+        else 4
+        if first & 0xF8 == 0xF0
+        else 1
+    )
+    if len(buffer) < length:
+        return None
+    raw = bytes(buffer[:length])
+    del buffer[:length]
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "�"
+
+
+def decode_keys(
+    buffer: bytearray,
+    *,
+    text_mode: bool = False,
+    flush_escape: bool = True,
+) -> list[str]:
+    keys: list[str] = []
+    while buffer:
+        mouse = _MOUSE.match(buffer)
+        if mouse:
+            button = int(mouse.group(1))
+            keys.append("up" if button == 64 else "down" if button == 65 else "mouse")
+            del buffer[: mouse.end()]
+            continue
+        if buffer[0] == 0x1B:
+            csi = _CSI_KEY.match(buffer)
+            if csi:
+                sequence = bytes(buffer[: csi.end()])
+                key = {
+                    b"\x1b[5~": "pageup",
+                    b"\x1b[6~": "pagedown",
+                }.get(sequence) or {
+                    ord("A"): "up",
+                    ord("B"): "down",
+                    ord("C"): "right",
+                    ord("D"): "left",
+                    ord("H"): "first",
+                    ord("F"): "last",
+                }.get(sequence[-1])
+                if key:
+                    keys.append(key)
+                del buffer[: csi.end()]
+                continue
+            ss3 = _SS3_KEY.match(buffer)
+            if ss3:
+                sequence = bytes(buffer[: ss3.end()])
+                key = {
+                    ord("A"): "up",
+                    ord("B"): "down",
+                    ord("C"): "right",
+                    ord("D"): "left",
+                    ord("H"): "first",
+                    ord("F"): "last",
+                }.get(sequence[-1])
+                if key:
+                    keys.append(key)
+                del buffer[: ss3.end()]
+                continue
+            if not flush_escape and (
+                len(buffer) == 1
+                or buffer.startswith(b"\x1b[")
+                or (buffer.startswith(b"\x1bO") and len(buffer) < 3)
+            ):
+                break
+            keys.append("escape")
+            del buffer[0]
+            continue
+        value = _pop_utf8_character(buffer)
+        if value is None:
+            break
+        if text_mode:
+            keys.append(
+                {
+                    "\r": "enter",
+                    "\n": "newline",
+                    "\x08": "backspace",
+                    "\x7f": "backspace",
+                    "\x15": "clear-input",
+                    "\x17": "delete-word",
+                }.get(value, value)
+            )
+            continue
+        keys.append(
+            {
+                "\r": "enter",
+                "\n": "enter",
+                "j": "down",
+                "k": "up",
+                "g": "first",
+                "G": "last",
+                "q": "quit",
+                "?": "help",
+                "p": "peek",
+                "a": "ask",
+                "A": "ask-fast",
+                "n": "next",
+                "u": "usage",
+                "r": "refresh",
+                "x": "untrack",
+                "\x0c": "refresh",
+            }.get(value, value)
+        )
+    return keys
+
+
+class _Terminal:
+    def __init__(self, input_fd: int, output_fd: int) -> None:
+        self.input_fd = input_fd
+        self.output_fd = output_fd
+        self.previous: list | None = None
+
+    def __enter__(self) -> _Terminal:
+        self.previous = termios.tcgetattr(self.input_fd)
+        tty.setcbreak(self.input_fd, termios.TCSANOW)
+        current = termios.tcgetattr(self.input_fd)
+        current[0] &= ~termios.ICRNL
+        termios.tcsetattr(self.input_fd, termios.TCSANOW, current)
+        os.write(
+            self.output_fd,
+            b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h",
+        )
+        return self
+
+    def draw(self, frame: str) -> None:
+        os.write(self.output_fd, ("\x1b[H" + frame).encode(errors="replace"))
+
+    def run_external(self, callback: Callable[[], int]) -> int:
+        """Give the native provider its terminal, restoring this board on detach."""
+        self.__exit__(None, None, None)
+        try:
+            return callback()
+        finally:
+            self.__enter__()
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        os.write(
+            self.output_fd,
+            b"\x1b[0m\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l",
+        )
+        if self.previous is not None:
+            termios.tcsetattr(self.input_fd, termios.TCSADRAIN, self.previous)
+
+
+def _open_in_terminal(
+    terminal: _Terminal, callback: Callable[[], int],
+    session: Session | FleetSession | PendingLaunch,
+) -> None:
+    result = terminal.run_external(callback)
+    if result != 0:
+        query = session.session_id
+        if isinstance(session, FleetSession):
+            query += f"@{session.node_name}"
+        elif isinstance(session, PendingLaunch) or query.startswith("unbound:"):
+            query = session.display_name
+        command = shlex.join(["pika", query])
+        raise RuntimeError(
+            f"Opening {session.display_name} failed (exit code {result}). "
+            "Successful attachment was not confirmed. "
+            "Press Esc to return to the board. To see terminal diagnostics, "
+            f"quit the board and run exactly: {command}"
+        )
+
+
+def _carry_usage(
+    sessions: list[Session | FleetSession],
+    cache: dict[tuple[str, ...], dict[str, object]],
+) -> None:
+    fields = (
+        "model",
+        "input_tokens",
+        "output_tokens",
+        "cached_input_tokens",
+        "cache_write_tokens",
+        "total_tokens",
+        "estimated_cost_usd",
+    )
+    for session in sessions:
+        values = {field: getattr(session, field) for field in fields}
+        if any(value is not None for value in values.values()):
+            previous = cache.setdefault(session.key, {})
+            previous.update(
+                {key: value for key, value in values.items() if value is not None}
+            )
+        for key, value in cache.get(session.key, {}).items():
+            if getattr(session, key) is None:
+                setattr(session, key, value)
+
+
+def _open_peek(pika: MonitorPika, state: MonitorState) -> None:
+    session = state.selected()
+    if session is None:
+        state.notify("No workstream selected")
+        return
+    target = session.tmux_pane or session.tmux_session
+    if not target and not isinstance(session, FleetSession):
+        state.notify("No surviving Pika pane to peek")
+        return
+    try:
+        capture = getattr(pika, "capture", None)
+        captured = (
+            capture(session, 300)
+            if callable(capture)
+            else pika.tmux.capture(target, 300)
+        )
+    except Exception as exc:  # noqa: BLE001 - monitor stays recoverable
+        state.notify(f"Peek failed: {exc}")
+        return
+    state.peek_lines = [
+        strip_terminal_sequences(line) for line in captured.splitlines()
+    ]
+    state.peek_offset = 0
+    state.mode = "peek"
+    if session.status == Status.READY.value and session.unread:
+        if pika.acknowledge(session):
+            session.unread = False
+            state.notify("RESULT SEEN · unread state cleared")
+
+
+def _capture_preview(
+    pika: MonitorPika, session: Session | FleetSession
+) -> tuple[tuple[str, ...], list[str], str | None]:
+    if isinstance(session, FleetSession):
+        # Remote pane tails are fetched only on explicit `p`, never every 2s.
+        return session.key, [], None
+    target = session.tmux_pane or session.tmux_session
+    if not target:
+        return session.key, [], None
+    try:
+        # Preview uses the same fresh ownership check as explicit peek; a saved
+        # pane number alone is not identity, particularly on the initial cache.
+        captured = pika.capture(session, 12)
+    except Exception as exc:  # noqa: BLE001 - preview is optional and read-only
+        return session.key, [], terminal_text(exc)
+    lines = [strip_terminal_sequences(line) for line in captured.splitlines()]
+    return session.key, lines[-12:], None
+
+
+def _capture_remote_peek(
+    pika: MonitorPika, session: FleetSession
+) -> tuple[tuple[str, ...], list[str], str | None]:
+    try:
+        captured = pika.capture(session, 300)
+    except Exception as exc:  # noqa: BLE001 - explicit remote view stays recoverable
+        return session.key, [], terminal_text(exc)
+    lines = [strip_terminal_sequences(line) for line in captured.splitlines()]
+    return session.key, lines, None
+
+
+def _next_remote_node(
+    nodes: list[FleetNode],
+    *,
+    selected_node_id: str | None,
+    now: float,
+    manual: bool,
+) -> FleetNode | None:
+    due = (
+        nodes
+        if manual
+        else [
+            node
+            for node in nodes
+            if now - node.last_attempt_at >= (15.0 if node.status == "ready" else 30.0)
+        ]
+    )
+    if not due:
+        return None
+    return min(
+        due,
+        key=lambda item: (
+            0 if manual and item.node_id == selected_node_id else 1,
+            item.last_attempt_at,
+            item.node_id,
+        ),
+    )
+
+
+def _handle_key(
+    key: str,
+    pika: MonitorPika,
+    state: MonitorState,
+) -> tuple[str, Session | FleetSession | None]:
+    if state.mode == "update":
+        if key in {"escape", "q", "n"} or (
+            state.update_status == "done" and key in {"enter", "newline"}
+        ):
+            state.mode = "sessions"
+        elif key in {"enter", "newline", "y"} and state.update_status in {"available", "error"}:
+            state.update_status = "installing"
+            state.update_detail = None
+            return "update", None
+        return "continue", None
+    if key == "U" and state.mode in {"sessions", "help"}:
+        if state.update_version:
+            state.mode = "update"
+        else:
+            state.notify("No update available. Installer-managed copies check automatically; pika update --check checks now.")
+        return "continue", None
+    if state.mode not in {"ask", "filter"}:
+        key = {
+            "j": "down", "k": "up", "g": "first", "G": "last",
+            "q": "quit", "?": "help", "p": "peek", "a": "ask",
+            "A": "ask-fast", "n": "next", "u": "usage", "r": "refresh",
+            "x": "untrack", "\x0c": "refresh", "newline": "enter",
+        }.get(key, key)
+    if state.mode == "action-error":
+        if key in {"escape", "quit"}:
+            state.action_error = None
+            state.action_error_target = None
+            state.mode = "sessions"
+        elif key == "enter":
+            target = state.action_error_target
+            current = next(
+                (item for item in state.sessions if target is not None and item.key == target.key),
+                None,
+            )
+            if current is None:
+                state.action_error = (
+                    "The original conversation is no longer in current inventory. "
+                    "Return to the board and refresh before choosing a conversation."
+                )
+                state.action_error_offset = 0
+                return "continue", None
+            if not isinstance(target, PendingLaunch) and (
+                isinstance(current, PendingLaunch)
+                or current.provider_thread_id != target.provider_thread_id
+            ):
+                state.action_error = (
+                    "The original conversation's active provider identity changed. "
+                    "Return to the board and explicitly select the intended thread."
+                )
+                state.action_error_offset = 0
+                return "continue", None
+            return "open", target
+        elif key in {"up", "pageup"}:
+            state.action_error_offset = max(0, state.action_error_offset - (8 if key == "pageup" else 1))
+        elif key in {"down", "pagedown"}:
+            state.action_error_offset += 8 if key == "pagedown" else 1
+        return "continue", None
+    if state.mode == "filter":
+        if key in {"enter", "escape"}:
+            state.mode = "sessions"
+        elif key == "backspace":
+            state.filter_text = state.filter_text[:-1]
+        elif key == "clear-input":
+            state.filter_text = ""
+        elif len(key) == 1 and key.isprintable():
+            state.filter_text += key
+        state.selected()
+        return "continue", None
+    if state.mode == "ask":
+        target = state.ask_target
+        if key == "escape":
+            state.close_ask()
+            return "ask-close", target
+        if key in {"up", "pageup"}:
+            state.ask_scroll += 8 if key == "pageup" else 1
+            return "continue", None
+        if key in {"down", "pagedown"}:
+            state.ask_scroll = max(
+                0, state.ask_scroll - (8 if key == "pagedown" else 1)
+            )
+            return "continue", None
+        if key == "enter":
+            question = state.ask_input.strip()
+            if not question or state.ask_pending:
+                return "continue", None
+            state.ask_messages.append(AskMessage("user", question))
+            state.ask_input = ""
+            state.ask_outbox = question
+            state.ask_pending = True
+            state.ask_status = "asking"
+            state.ask_error = None
+            state.ask_scroll = 0
+            return "ask-send", target
+        if key == "newline" and not state.ask_pending:
+            if len(state.ask_input) < 4000:
+                state.ask_input += "\n"
+            return "continue", None
+        if key == "backspace" and not state.ask_pending:
+            state.ask_input = state.ask_input[:-1]
+            return "continue", None
+        if key == "clear-input" and not state.ask_pending:
+            state.ask_input = ""
+            return "continue", None
+        if key == "delete-word" and not state.ask_pending:
+            stripped = state.ask_input.rstrip()
+            state.ask_input = stripped[: stripped.rfind(" ") + 1]
+            return "continue", None
+        if (
+            len(key) == 1
+            and key.isprintable()
+            and not state.ask_pending
+            and len(state.ask_input) < 4000
+        ):
+            state.ask_input += key
+        return "continue", None
+
+    if state.mode == "untrack":
+        target = state.untrack_target
+        if key in {"escape", "quit"}:
+            state.close_untrack()
+            return "continue", None
+        if key in {"enter", "untrack"}:
+            state.close_untrack()
+            return "untrack", target
+        state.notify("Confirm with x / Enter · cancel with Esc / q")
+        return "continue", None
+
+    if state.mode in {"help", "peek"} and key in {"quit", "escape"}:
+        state.mode = "sessions"
+        return "continue", None
+    if state.mode == "help":
+        if key == "help":
+            state.mode = "sessions"
+        return "continue", None
+    if state.mode == "peek":
+        if key in {"peek"}:
+            state.mode = "sessions"
+        elif key in {"up", "pageup"}:
+            state.peek_offset = min(
+                max(0, len(state.peek_lines) - 1),
+                state.peek_offset + (10 if key == "pageup" else 1),
+            )
+        elif key in {"down", "pagedown"}:
+            state.peek_offset = max(
+                0, state.peek_offset - (10 if key == "pagedown" else 1)
+            )
+        elif key == "first":
+            state.peek_offset = max(0, len(state.peek_lines) - 1)
+        elif key == "last":
+            state.peek_offset = 0
+        elif key == "enter":
+            return "open", state.selected()
+        return "continue", None
+
+    if key == "escape" and state.filter_text:
+        state.filter_text = ""
+        return "continue", None
+    if key == "quit" or key == "escape":
+        return "quit", None
+    if key == "/":
+        state.mode = "filter"
+    elif key == "up":
+        state.move(-1)
+    elif key == "down":
+        state.move(1)
+    elif key == "pageup":
+        state.move(-8)
+    elif key == "pagedown":
+        state.move(8)
+    elif key == "first":
+        state.edge(last=False)
+    elif key == "last":
+        state.edge(last=True)
+    elif key == "help":
+        state.mode = "help"
+    elif key == "peek":
+        session = state.selected()
+        if isinstance(session, FleetSession) and session.stale:
+            state.notify("Cached remote row — press r to retry its machine first")
+        elif isinstance(session, FleetSession):
+            return "peek-remote", session
+        else:
+            _open_peek(pika, state)
+    elif key == "usage":
+        state.show_usage = not state.show_usage
+        return "usage", None
+    elif key == "enter":
+        session = state.selected()
+        if isinstance(session, FleetSession) and session.stale:
+            state.notify("Cached remote row — press r to retry its machine first")
+        elif session and session.home_state == "outside-live":
+            return "enter", session
+        elif session and session.status == Status.UNBOUND.value and session.live:
+            return "enter", session
+        elif session:
+            return "open", session
+    elif key in {"ask", "ask-fast"}:
+        session = state.selected()
+        if isinstance(session, PendingLaunch):
+            state.notify("Identity is still pending — side asks require an exact provider ID")
+        elif isinstance(session, FleetSession) and session.stale:
+            state.notify("Cached remote row — press r to retry its machine first")
+        elif session and session.status == Status.UNBOUND.value and session.live:
+            state.notify("Exit the external agent; rerun pika NAME before consulting")
+        elif (
+            session
+            and not isinstance(session, FleetSession)
+            and not session.transcript_path
+        ):
+            state.notify("No durable provider transcript available for a side ask")
+        elif session:
+            try:
+                state.begin_ask(session, fast=key == "ask-fast")
+            except ConsultationError as exc:
+                state.notify(str(exc))
+            else:
+                return "ask-open", session
+    elif key == "untrack":
+        session = state.selected()
+        if isinstance(session, PendingLaunch):
+            state.notify("A starting launch cannot be hidden until identity resolves")
+        elif isinstance(session, FleetSession) and session.stale:
+            state.notify("Cached remote row — press r to retry its machine first")
+        elif session and session.session_id.startswith("unbound:"):
+            state.notify(
+                "Cannot stop watching until this process has an exact "
+                f"{provider_identity_label(session.provider)}"
+            )
+        elif session:
+            state.begin_untrack(session)
+    elif key == "next":
+        session = pika.next_attention(state.sessions)
+        if session is None:
+            state.notify("No workstream currently needs attention")
+        else:
+            return "open", session
+    elif key == "refresh":
+        state.order_keys.clear()
+        return "refresh", None
+    elif key != "mouse":
+        state.notify("Unknown key · press ? for controls")
+    return "continue", None
+
+
+def _morning_handoff(
+    pika: MonitorPika,
+    sessions: list[Session],
+    *,
+    now: float,
+) -> HandoffSummary | None:
+    try:
+        previous, counts = pika.store.claim_monitor_handoff(now)
+    except (AttributeError, OSError):
+        try:
+            previous = pika.store.claim_monitor_visit(now)
+        except (AttributeError, OSError):
+            previous = None
+        counts = {}
+    if previous is None:
+        counts = _session_counts(sessions)
+        return HandoffSummary(
+            since=now,
+            finished=counts["results"],
+            decisions=counts["decisions"],
+            errors=counts["errors"],
+            first=True,
+        )
+    snapshot = build_handoff(sessions, since=previous, now=now)
+    if snapshot is None:
+        return None
+    if not counts:
+        return snapshot
+    journal = HandoffSummary(
+        since=previous,
+        finished=int(counts.get(Status.READY.value, 0)),
+        decisions=int(counts.get(Status.NEEDS_YOU.value, 0)),
+        errors=int(counts.get(Status.ERROR.value, 0))
+        + int(counts.get(Status.OPEN_TWICE.value, 0)),
+    )
+    return journal if journal.changed or not snapshot.changed else snapshot
+
+
+class _DaemonExecutor:
+    """Tiny executor whose in-flight optional work cannot hold the TUI open."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    @staticmethod
+    def submit(callable_, *args, **kwargs):
+        future = concurrent.futures.Future()
+
+        def run() -> None:
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                result = callable_(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+        threading.Thread(
+            target=run,
+            name="pika-monitor-worker",
+            daemon=True,
+        ).start()
+        return future
+
+
+def _load_expert_cards(loader, sessions) -> tuple[list, dict]:
+    cards = loader(sessions)
+    return cards, {
+        item.session.key: profile_freshness(item.session, item.profile)
+        for item in cards
+    }
+
+
+def _refresh_inventory(pika: MonitorPika) -> tuple[list[Session], list, dict, float]:
+    """All potentially slow discovery and evidence reads run off the UI thread."""
+    local = pika.refresh(usage=False)
+    aggregator = getattr(pika, "monitor_sessions", None)
+    sessions = aggregator(local) if callable(aggregator) else local
+    evidence_loader = getattr(pika.store, "status_observations", None)
+    explanations = {}
+    for item in sessions:
+        if isinstance(item, PendingLaunch):
+            continue
+        facts = (
+            evidence_loader(item.provider, item.session_id)
+            if callable(evidence_loader) and not isinstance(item, FleetSession)
+            else ()
+        )
+        explanations[item.key] = explain_session(item, facts)
+    return local, sessions, explanations, time.time()
+
+
+def run_monitor(
+    pika: MonitorPika,
+    *,
+    input_fd: int | None = None,
+    output_fd: int | None = None,
+    refresh_seconds: float = REFRESH_SECONDS,
+) -> int:
+    input_fd = sys.stdin.fileno() if input_fd is None else input_fd
+    output_fd = sys.stdout.fileno() if output_fd is None else output_fd
+    state = MonitorState()
+    # Only local persisted metadata belongs on the first-frame path. Provider
+    # scans, tmux enumeration and SSH handshakes happen after drawing the cache.
+    initial_local: list[Session] = []
+    try:
+        loader = getattr(pika.store, "list_sessions", None)
+        if callable(loader):
+            initial_local = list(loader())
+        fleet = getattr(pika, "fleet", None)
+        cache_loader = getattr(fleet, "cached_sessions", None)
+        remote_cached = list(cache_loader()) if callable(cache_loader) else []
+        state.sessions = [*initial_local, *remote_cached]
+        node_loader = getattr(fleet, "nodes", None)
+        state.machines = list(node_loader()) if callable(node_loader) else []
+        state.cached_initial = bool(state.sessions)
+    except Exception as exc:  # noqa: BLE001 - fresh reconciliation can recover
+        state.sessions = initial_local
+        state.cached_initial = bool(initial_local)
+        state.refresh_warning = f"Initial cache unavailable: {terminal_text(exc)}"
+    usage_cache: dict[tuple[str, ...], dict[str, object]] = {}
+    input_buffer = bytearray()
+    escape_started_at: float | None = None
+    future: concurrent.futures.Future[list[Session]] | None = None
+    usage_future: concurrent.futures.Future[list[Session | FleetSession]] | None = None
+    expert_future: concurrent.futures.Future[list[ExpertCardState]] | None = None
+    fleet_future: concurrent.futures.Future[list[FleetSession]] | None = None
+    preview_future: (
+        concurrent.futures.Future[tuple[tuple[str, ...], list[str], str | None]] | None
+    ) = None
+    remote_peek_future: (
+        concurrent.futures.Future[tuple[tuple[str, ...], list[str], str | None]] | None
+    ) = None
+    remote_ack_future: concurrent.futures.Future[tuple[FleetSession, bool]] | None = (
+        None
+    )
+    remote_untrack_future: (
+        concurrent.futures.Future[tuple[FleetSession, int]] | None
+    ) = None
+    next_refresh = 0.0
+    next_usage = 0.0
+    next_expert = 0.0
+    next_fleet = 0.0
+    next_preview = 0.0
+    manual_refresh_pending = False
+    manual_fleet_refresh_pending = False
+    selected_to_open: Session | FleetSession | PendingLaunch | None = None
+    selected_to_enter: str | None = None
+    inline_ask: _InlineAskWorker | None = None
+    last_frame: str | None = None
+    color = "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+    first_scan = True
+    local_sessions: list[Session] = initial_local
+    update_check_future = None
+    update_future = None
+    next_update_check = 0.0
+
+    try:
+        with _DaemonExecutor() as executor:
+            with _Terminal(input_fd, output_fd) as terminal:
+                size = os.get_terminal_size(output_fd)
+                frame = render_monitor(
+                    state, width=size.columns, height=size.lines,
+                    refreshing=True, color=color,
+                )
+                terminal.draw(frame.ansi)
+                last_frame = frame.ansi
+                while True:
+                    monotonic = time.monotonic()
+                    if update_check_future is not None and update_check_future.done():
+                        try:
+                            version = update_check_future.result()
+                            # Never change the release currently being approved.
+                            if state.mode != "update" and state.update_status == "available":
+                                state.update_version = version
+                        except Exception:
+                            pass  # Optional offline checks never become agent errors.
+                        update_check_future = None
+                    if update_future is not None and update_future.done():
+                        try:
+                            state.update_detail = update_future.result()
+                            state.update_status = "done"
+                        except Exception as exc:
+                            state.update_detail = terminal_text(exc)
+                            state.update_status = "error"
+                        update_future = None
+                    if monotonic >= next_update_check and update_check_future is None and state.update_status == "available":
+                        update_check_future = executor.submit(installation.update_notice)
+                        next_update_check = monotonic + 3600
+                    if inline_ask is not None:
+                        for event, value in inline_ask.poll():
+                            if event == "progress":
+                                state.ask_progress = {**value, "received_at": time.monotonic()}
+                            elif event == "opened":
+                                state.ask_confirmed = True
+                                state.ask_status = (
+                                    "asking" if state.ask_pending else "ready"
+                                )
+                            elif event == "answer" and state.mode == "ask":
+                                state.ask_messages.append(
+                                    AskMessage("expert", _safe_chat_text(value))
+                                )
+                                state.ask_pending = False
+                                state.ask_status = "ready"
+                                state.ask_error = None
+                                state.ask_scroll = 0
+                            elif event == "error":
+                                detail = _safe_chat_text(value).replace("\n", " ")
+                                if state.mode == "ask":
+                                    state.ask_pending = False
+                                    state.ask_status = "error"
+                                    state.ask_error = detail
+                                else:
+                                    state.notify(detail)
+                            elif event == "closed":
+                                if state.mode == "ask" and state.ask_status != "error":
+                                    state.ask_pending = False
+                                    state.ask_status = "error"
+                                    state.ask_error = "side process closed unexpectedly"
+                        if not inline_ask.alive and state.mode != "ask":
+                            inline_ask = None
+                    if future is not None and future.done():
+                        try:
+                            sessions, inventory, explanations, observed_at = future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            state.refresh_error = terminal_text(exc)
+                        else:
+                            _carry_usage(sessions, usage_cache)
+                            local_sessions = sessions
+                            state.sessions = inventory
+                            state.explanations = explanations
+                            state.selected()
+                            # The worker may have completed long before a native
+                            # attach returns; applying its result is not a new scan.
+                            state.last_update = observed_at
+                            state.cached_initial = False
+                            state.refresh_error = None
+                            discovery_errors = getattr(pika, "discovery_errors", [])
+                            state.refresh_warning = (
+                                "; ".join(map(terminal_text, discovery_errors))
+                                if discovery_errors
+                                else None
+                            )
+                            if first_scan:
+                                state.handoff = _morning_handoff(
+                                    pika,
+                                    local_sessions,
+                                    now=state.last_update,
+                                )
+                                if state.handoff is not None:
+                                    state.handoff_until = (
+                                        monotonic + HANDOFF_DISPLAY_SECONDS
+                                    )
+                                first_scan = False
+                        future = None
+                        state.emphasize_refresh = False
+                        next_refresh = (
+                            0.0
+                            if manual_refresh_pending or (
+                                not state.refresh_error
+                                and time.time() - state.last_update >= refresh_seconds
+                            )
+                            else monotonic + refresh_seconds
+                        )
+
+                    if fleet_future is not None and fleet_future.done():
+                        try:
+                            fleet_future.result()
+                        except Exception:  # noqa: BLE001 - cache remains last-good
+                            pass
+                        cache_loader = getattr(getattr(pika, "fleet", None), "cached_sessions", None)
+                        if callable(cache_loader):
+                            state.sessions = [
+                                *local_sessions,
+                                *(item for item in state.sessions if isinstance(item, PendingLaunch)),
+                                *cache_loader(),
+                            ]
+                            state.selected()
+                        fleet_future = None
+                        # Per-node last_attempt_at enforces each node's cadence.
+                        # Do not idle while another node is already due.
+                        next_fleet = monotonic
+
+                    if usage_future is not None and usage_future.done():
+                        try:
+                            usage_sessions = usage_future.result()
+                        except Exception as exc:  # noqa: BLE001 - usage is optional
+                            state.usage_warning = terminal_text(exc)
+                        else:
+                            _carry_usage(usage_sessions, usage_cache)
+                            _carry_usage(state.sessions, usage_cache)
+                            usage_errors = getattr(pika, "usage_errors", [])
+                            state.usage_warning = (
+                                "; ".join(map(terminal_text, usage_errors))
+                                if usage_errors
+                                else None
+                            )
+                        usage_future = None
+                        next_usage = monotonic + USAGE_REFRESH_SECONDS
+
+                    if expert_future is not None and expert_future.done():
+                        try:
+                            cards, freshness = expert_future.result()
+                        except Exception:  # noqa: BLE001 - cards never block operations
+                            pass
+                        else:
+                            state.expert_cards = {
+                                item.session.key: item for item in cards
+                            }
+                            state.expert_freshness = freshness
+                            state.expert_cards_updated_at = time.time()
+                        expert_future = None
+                        next_expert = monotonic + EXPERT_CARD_REFRESH_SECONDS
+
+                    if preview_future is not None and preview_future.done():
+                        try:
+                            preview_key, preview_lines, preview_error = (
+                                preview_future.result()
+                            )
+                        except Exception:  # noqa: BLE001 - optional surface
+                            pass
+                        else:
+                            state.preview_key = preview_key
+                            state.preview_lines = preview_lines
+                            state.preview_error = preview_error
+                            state.preview_updated_at = time.time()
+                        preview_future = None
+                        next_preview = monotonic + PREVIEW_REFRESH_SECONDS
+
+                    if remote_peek_future is not None and remote_peek_future.done():
+                        try:
+                            peek_key, peek_lines, peek_error = (
+                                remote_peek_future.result()
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            state.notify(f"Remote peek failed: {exc}")
+                        else:
+                            if peek_error:
+                                state.notify(f"Remote peek failed: {peek_error}")
+                            else:
+                                state.selected_key = peek_key
+                                state.peek_lines = peek_lines
+                                state.peek_offset = 0
+                                state.mode = "peek"
+                                selected_peek = state.selected()
+                                if (
+                                    isinstance(selected_peek, FleetSession)
+                                    and selected_peek.status == Status.READY.value
+                                    and selected_peek.unread
+                                    and remote_ack_future is None
+                                ):
+                                    # Show the fetched result before starting a
+                                    # second, best-effort acknowledgement SSH.
+                                    remote_ack_future = executor.submit(
+                                        lambda item: (item, pika.acknowledge(item)),
+                                        replace(selected_peek),
+                                    )
+                        remote_peek_future = None
+
+                    if remote_ack_future is not None and remote_ack_future.done():
+                        try:
+                            acknowledged_session, acknowledged = (
+                                remote_ack_future.result()
+                            )
+                        except Exception:  # noqa: BLE001 - reconcile uncertain outcome
+                            state.notify(
+                                "Result shown · acknowledgement outcome unknown · "
+                                "press r to reconcile"
+                            )
+                        else:
+                            if acknowledged:
+                                current = next(
+                                    (
+                                        item
+                                        for item in state.sessions
+                                        if item.key == acknowledged_session.key
+                                    ),
+                                    None,
+                                )
+                                if isinstance(current, FleetSession):
+                                    current.session.unread = False
+                                state.notify(
+                                    "RESULT SEEN · unread state cleared remotely"
+                                )
+                        remote_ack_future = None
+
+                    if (
+                        remote_untrack_future is not None
+                        and remote_untrack_future.done()
+                    ):
+                        try:
+                            removed, _cleared = remote_untrack_future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            state.notify(f"Remote stop watching failed: {exc}")
+                        else:
+                            state.sessions = [
+                                item
+                                for item in state.sessions
+                                if item.key != removed.key
+                            ]
+                            state.expert_cards.pop(removed.key, None)
+                            state.selected_key = None
+                            state.selected()
+                            state.notify(
+                                f"Stopped watching {removed.display_name} · "
+                                "remote agent left running"
+                            )
+                        remote_untrack_future = None
+
+                    if future is None and monotonic >= next_refresh:
+                        state.refresh_started_at = time.time()
+                        state.emphasize_refresh = manual_refresh_pending or not bool(
+                            state.last_update
+                        )
+                        manual_refresh_pending = False
+                        future = executor.submit(_refresh_inventory, pika)
+
+                    fleet = getattr(pika, "fleet", None)
+                    node_loader = getattr(fleet, "nodes", None)
+                    remote_refresh = getattr(pika, "refresh_remote_node", None)
+                    if (
+                        fleet_future is None
+                        and callable(node_loader)
+                        and callable(remote_refresh)
+                        and monotonic >= next_fleet
+                    ):
+                        nodes = node_loader()
+                        state.machines = nodes
+                        selected_remote = state.selected()
+                        selected_node_id = (
+                            selected_remote.node_id
+                            if isinstance(selected_remote, FleetSession)
+                            else None
+                        )
+                        node = _next_remote_node(
+                            nodes,
+                            selected_node_id=selected_node_id,
+                            now=time.time(),
+                            manual=manual_fleet_refresh_pending,
+                        )
+                        if node is not None:
+                            fleet_future = executor.submit(remote_refresh, node.node_id)
+                            manual_fleet_refresh_pending = False
+                        else:
+                            next_fleet = monotonic + 5.0
+
+                    if (
+                        state.show_usage
+                        and usage_future is None
+                        and state.sessions
+                        and monotonic >= next_usage
+                    ):
+                        usage_future = executor.submit(
+                            pika.hydrate_usage,
+                            [replace(item) for item in state.sessions],
+                        )
+
+                    expert_loader = getattr(pika, "expert_card_states", None)
+                    if (
+                        callable(expert_loader)
+                        and state.sessions
+                        and expert_future is None
+                        and monotonic >= next_expert
+                    ):
+                        expert_future = executor.submit(
+                            _load_expert_cards, expert_loader,
+                            [replace(item) for item in state.sessions],
+                        )
+
+                    preview_session = state.selected()
+                    preview_target = (
+                        preview_session.tmux_pane or preview_session.tmux_session
+                        if preview_session is not None
+                        else None
+                    )
+                    if (
+                        preview_session is not None
+                        and not isinstance(preview_session, FleetSession)
+                        and preview_target
+                        and state.mode not in {"ask", "untrack"}
+                        and preview_future is None
+                        and (
+                            state.preview_key != preview_session.key
+                            or monotonic >= next_preview
+                        )
+                    ):
+                        preview_future = executor.submit(
+                            _capture_preview, pika, replace(preview_session)
+                        )
+                    elif (
+                        preview_session is not None
+                        and not preview_target
+                        and preview_future is None
+                        and state.preview_key != preview_session.key
+                    ):
+                        state.preview_key = preview_session.key
+                        state.preview_lines = []
+                        state.preview_error = None
+
+                    size = os.get_terminal_size(output_fd)
+                    frame = render_monitor(
+                        state,
+                        width=size.columns,
+                        height=size.lines,
+                        refreshing=future is not None,
+                        color=color,
+                    )
+                    if frame.ansi != last_frame:
+                        terminal.draw(frame.ansi)
+                        last_frame = frame.ansi
+
+                    poll_seconds = min(0.12, max(0.01, refresh_seconds / 2))
+                    key_now = time.monotonic()
+                    if input_buffer and input_buffer[0] == 0x1B:
+                        if escape_started_at is None:
+                            escape_started_at = key_now
+                        poll_seconds = min(
+                            poll_seconds,
+                            max(
+                                0.0,
+                                KEY_SEQUENCE_TIMEOUT_SECONDS
+                                - (key_now - escape_started_at),
+                            ),
+                        )
+                    readable, _, _ = select.select([input_fd], [], [], poll_seconds)
+                    flush_escape = False
+                    if readable:
+                        data = os.read(input_fd, 256)
+                        if not data:
+                            break
+                        input_buffer.extend(data)
+                    elif (
+                        input_buffer
+                        and input_buffer[0] == 0x1B
+                        and escape_started_at is not None
+                        and time.monotonic() - escape_started_at
+                        >= KEY_SEQUENCE_TIMEOUT_SECONDS
+                    ):
+                        flush_escape = True
+                    else:
+                        continue
+                    keys = decode_keys(
+                        input_buffer,
+                        # Interpret printable keys after each preceding key has
+                        # changed mode (e.g. a pasted /filter or inline ask).
+                        text_mode=True,
+                        flush_escape=flush_escape,
+                    )
+                    if input_buffer and input_buffer[0] == 0x1B:
+                        if escape_started_at is None:
+                            escape_started_at = time.monotonic()
+                    else:
+                        escape_started_at = None
+                    for key in keys:
+                        action, session = _handle_key(key, pika, state)
+                        if action == "update" and update_future is None and state.update_version:
+                            update_future = executor.submit(installation.board_update, state.update_version)
+                            continue
+                        if action == "quit":
+                            future = None
+                            selected_to_open = None
+                            selected_to_enter = None
+                            break
+                        if action == "open":
+                            if session is not None and not isinstance(
+                                session, PendingLaunch
+                            ):
+                                client_opener = getattr(pika, "open_on_client", None)
+                                if callable(client_opener):
+                                    try:
+                                        receipt = client_opener(session)
+                                    except Exception as exc:  # noqa: BLE001 - keep TUI safe
+                                        state.fail_action(str(exc), session)
+                                        continue
+                                    if receipt is not None:
+                                        detail = getattr(receipt, "detail", None)
+                                        state.notify(
+                                            terminal_text(
+                                                detail
+                                                or "CLIENT WINDOW LAUNCHED · exact identity"
+                                            )
+                                        )
+                                        state.mode = "sessions"
+                                        state.action_error = None
+                                        state.action_error_target = None
+                                        continue
+                            if session is not None:
+                                try:
+                                    _open_in_terminal(
+                                        terminal,
+                                        lambda: pika.open_pending(session)
+                                        if isinstance(session, PendingLaunch)
+                                        else pika.open(session),
+                                        session,
+                                    )
+                                except Exception as exc:  # noqa: BLE001 - return to board
+                                    state.fail_action(str(exc), session)
+                                else:
+                                    state.mode = "sessions"
+                                    state.action_error = None
+                                    state.action_error_target = None
+                                next_refresh = 0.0
+                                input_buffer.clear()
+                                last_frame = None
+                            continue
+                        if action == "enter" and session is not None:
+                            try:
+                                _open_in_terminal(
+                                    terminal, lambda: pika.enter(session.display_name), session,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                state.fail_action(str(exc), session)
+                            else:
+                                state.mode = "sessions"
+                                state.action_error = None
+                                state.action_error_target = None
+                            next_refresh = 0.0
+                            input_buffer.clear()
+                            last_frame = None
+                            continue
+                        if action == "ask-open" and session is not None:
+                            if inline_ask is not None:
+                                inline_ask.close()
+                            if state.ask_policy is None:
+                                state.notify(
+                                    "Side policy unavailable; reopen the consultation"
+                                )
+                                continue
+                            consultation = getattr(pika, "consultation", None)
+                            opener = (
+                                lambda session=session, policy=state.ask_policy, consultation=consultation: (
+                                    consultation(session, policy=policy)
+                                    if callable(consultation)
+                                    else consultation_for(session, policy=policy)
+                                )
+                            )
+                            inline_ask = _InlineAskWorker(
+                                session, state.ask_policy, opener
+                            )
+                            inline_ask.start()
+                        if action == "ask-send":
+                            question = state.ask_outbox
+                            state.ask_outbox = None
+                            if question and inline_ask is not None and inline_ask.alive:
+                                inline_ask.ask(question)
+                            else:
+                                state.ask_pending = False
+                                state.ask_status = "error"
+                                state.ask_error = (
+                                    "side process is unavailable; Esc closes it"
+                                )
+                        if action == "ask-close" and inline_ask is not None:
+                            inline_ask.close()
+                        if action == "peek-remote" and isinstance(
+                            session, FleetSession
+                        ):
+                            if remote_peek_future is None:
+                                state.notify(f"Fetching {session.display_name}…")
+                                remote_peek_future = executor.submit(
+                                    _capture_remote_peek, pika, replace(session)
+                                )
+                        if action == "untrack" and session is not None:
+                            if isinstance(session, FleetSession):
+                                if remote_untrack_future is None:
+                                    state.notify(
+                                        f"Stopping watch on {session.display_name}…"
+                                    )
+                                    remote_untrack_future = executor.submit(
+                                        lambda item: (item, pika.untrack(item)),
+                                        replace(session),
+                                    )
+                                continue
+                            try:
+                                pika.untrack(session)
+                            except Exception as exc:  # noqa: BLE001 - UI stays live
+                                state.notify(f"Stop watching failed: {exc}")
+                            else:
+                                state.sessions = [
+                                    item
+                                    for item in state.sessions
+                                    if item.key != session.key
+                                ]
+                                state.expert_cards.pop(session.key, None)
+                                state.selected_key = None
+                                state.selected()
+                                state.notify(
+                                    f"Stopped watching {session.display_name} · "
+                                    "agent left running"
+                                )
+                                future = None
+                                next_refresh = 0.0
+                        if action == "refresh":
+                            manual_refresh_pending = True
+                            manual_fleet_refresh_pending = True
+                            state.emphasize_refresh = True
+                            next_refresh = 0.0
+                            next_expert = 0.0
+                            next_fleet = 0.0
+                        if action == "usage" and state.show_usage:
+                            next_usage = 0.0
+                    else:
+                        continue
+                    break
+    finally:
+        if inline_ask is not None:
+            inline_ask.close()
+    if selected_to_open is not None:
+        if isinstance(selected_to_open, PendingLaunch):
+            return pika.open_pending(selected_to_open)
+        return pika.open(selected_to_open)
+    if selected_to_enter is not None:
+        return pika.enter(selected_to_enter)
+    return 0
+
+
+def _demo_sessions(now: float) -> list[Session]:
+    return [
+        Session(
+            "codex",
+            "11111111-1111-4111-8111-111111111111",
+            name="factor-history",
+            cwd="/work/sample-project",
+            branch="main",
+            transcript_path="/work/sample-project/.codex/factor-history.jsonl",
+            tmux_pane="%12",
+            status=Status.NEEDS_YOU.value,
+            unread=True,
+            attention_reason="permission",
+            last_event_at=now - 42,
+            last_activity_at=now - 42,
+            live=True,
+            home_state="exact-live",
+            cpu_percent=3.2,
+            rss_kb=241_000,
+            total_tokens=184_220,
+            estimated_cost_usd=1.42,
+        ),
+        Session(
+            "claude",
+            "22222222-2222-4222-8222-222222222222",
+            name="plugin-cleanup-with-a-deliberately-long-name",
+            cwd="/work/sample-plugin",
+            transcript_path="/work/sample-plugin/.claude/plugin-cleanup.jsonl",
+            status=Status.WORKING.value,
+            last_event_at=now - 8,
+            last_activity_at=now - 8,
+            live=True,
+            home_state="exact-live",
+            cpu_percent=8.8,
+            rss_kb=532_000,
+        ),
+        Session(
+            "codex",
+            "33333333-3333-4333-8333-333333333333",
+            name="research-paper",
+            cwd="/work/research",
+            transcript_path="/work/research/.codex/research-paper.jsonl",
+            status=Status.READY.value,
+            unread=True,
+            attention_reason="completed",
+            last_event_at=now - 3600,
+            last_activity_at=now - 3600,
+        ),
+        Session(
+            "codex",
+            "44444444-4444-4444-8444-444444444444",
+            name="older-parked",
+            cwd="/work/archive",
+            transcript_path="/work/archive/.codex/older-parked.jsonl",
+            status=Status.PARKED.value,
+            last_event_at=now - 172_800,
+            last_activity_at=now - 172_800,
+        ),
+    ]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Render a Pika monitor fixture")
+    parser.add_argument("--demo", action="store_true", required=True)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--ask", action="store_true")
+    mode.add_argument("--untrack", action="store_true")
+    parser.add_argument("--width", type=int, default=120)
+    parser.add_argument("--height", type=int, default=30)
+    args = parser.parse_args()
+    now = time.time()
+    sessions = _demo_sessions(now)
+    selected = sessions[0]
+    profile = ExpertProfile(
+        selected.provider,
+        selected.session_id,
+        "Built and verified a sample snapshot publication workflow.",
+        ("data snapshots", "publication", "idempotent reruns"),
+        ("artifacts/snapshot-history.parquet",),
+        now - 300,
+        "interview",
+        current_state=(
+            "Validating that unchanged reruns preserve every published snapshot."
+        ),
+    )
+    state = MonitorState(
+        sessions=sessions,
+        last_update=now - 1,
+        expert_cards={
+            selected.key: ExpertCardState(
+                selected, profile, "CURRENT", "matches transcript"
+            )
+        },
+        expert_cards_updated_at=now - 1,
+        refresh_started_at=now,
+        preview_key=selected.key,
+        preview_lines=[
+            "17:13:02  reading sample snapshot inputs",
+            "17:13:44  verified 38 tests",
+            "17:14:11  unchanged rerun wrote nothing",
+            "17:14:47  done · history publication is idempotent",
+        ],
+        preview_updated_at=now - 1,
+    )
+    if args.ask:
+        state.begin_ask(selected)
+        state.ask_status = "ready"
+        state.ask_messages = [
+            AskMessage("user", "Why did the unchanged rerun write nothing?"),
+            AskMessage(
+                "expert",
+                "The publication is idempotent: it compares the day's existing "
+                "snapshot and skips both monthly and consolidated writes when "
+                "the model values are unchanged.",
+            ),
+        ]
+        state.ask_input = "Does the same rule protect older snapshots?"
+    elif args.untrack:
+        state.begin_untrack(selected)
+    print(
+        render_monitor(
+            state,
+            width=args.width,
+            height=args.height,
+            now=now,
+            refreshing=True,
+            color=False,
+        ).plain
+    )
+
+
+if __name__ == "__main__":
+    main()

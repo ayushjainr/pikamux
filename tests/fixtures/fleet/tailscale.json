@@ -1,0 +1,8 @@
+{
+  "Self": {"HostName": "hub", "DNSName": "hub.example.ts.net."},
+  "Peer": {
+    "linux": {"HostName": "worker", "DNSName": "worker.example.ts.net.", "OS": "linux", "Online": true},
+    "mac": {"HostName": "laptop", "DNSName": "laptop.example.ts.net.", "OS": "macOS", "Online": true},
+    "phone": {"HostName": "phone", "DNSName": "phone.example.ts.net.", "OS": "iOS", "Online": true}
+  }
+}

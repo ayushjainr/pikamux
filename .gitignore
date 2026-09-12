@@ -1,0 +1,20 @@
+# Local reference export and disposable execution outputs.
+/reference/
+/target/
+/.toolchains/
+/.sandbox/
+/artifacts/
+/dist/
+/.venv/
+.DS_Store
+__pycache__/
+.pytest_cache/
+.env
+.env.*
+*.pem
+*.key
+*.db
+*.db-shm
+*.db-wal
+
+# This is an application: commit Cargo.lock when introduced.

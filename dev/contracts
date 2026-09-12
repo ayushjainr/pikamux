@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+run_root=$(mktemp -d "${TMPDIR:-/tmp}/pika-contracts.XXXXXX")
+cleanup() {
+    rm -rf -- "$run_root"
+}
+trap cleanup EXIT HUP INT TERM
+
+mkdir -p "$run_root/home" "$run_root/config" "$run_root/state" \
+    "$run_root/cache" "$run_root/codex" "$run_root/claude" \
+    "$run_root/opencode-data" "$run_root/opencode-config" "$run_root/tmp"
+
+export HOME="$run_root/home"
+export XDG_CONFIG_HOME="$run_root/config"
+export XDG_STATE_HOME="$run_root/state"
+export XDG_CACHE_HOME="$run_root/cache"
+export PIKA_DB_PATH="$run_root/state/pika.db"
+export PIKA_CONFIG_HOME="$run_root/config/pika"
+export PIKA_STATE_HOME="$run_root/state/pika"
+export PIKA_TMUX_SOCKET="pika-contract-$$"
+export CODEX_HOME="$run_root/codex"
+export CLAUDE_CONFIG_DIR="$run_root/claude"
+export OPENCODE_DATA_HOME="$run_root/opencode-data"
+export OPENCODE_CONFIG_DIR="$run_root/opencode-config"
+export TMPDIR="$run_root/tmp"
+unset SSH_AUTH_SOCK AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+export CARGO_HOME="$repo_dir/.toolchains/cargo"
+export RUSTUP_HOME="$repo_dir/.toolchains/rustup"
+cargo_bin="$CARGO_HOME/bin/cargo"
+cd "$repo_dir"
+
+case "${1:-all}" in
+    all)
+        "$cargo_bin" test --locked --test differential -- --nocapture
+        ;;
+    identity)
+        "$cargo_bin" test --locked --test differential \
+            fixture_identity_matches_literal_contracts -- --exact --nocapture
+        ;;
+    attention)
+        "$cargo_bin" test --locked --test differential \
+            fixture_attention_matches_literal_contracts -- --exact --nocapture
+        ;;
+    mutants|mutate)
+        "$cargo_bin" test --locked --test differential \
+            fixture_negative_mutants_are_rejected -- --exact --nocapture
+        ;;
+    *)
+        echo "usage: dev/contracts [all|identity|attention|mutants]" >&2
+        exit 2
+        ;;
+esac
