@@ -25,6 +25,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckLevel {
@@ -143,7 +145,7 @@ pub fn collect_runtime_evidence(tmux: &Tmux, config: &Config) -> RuntimeEvidence
         .map(|provider| {
             (
                 provider,
-                probe_provider(&config.executable(provider), Duration::from_secs(2)),
+                probe_provider(&config.executable(provider), PROVIDER_PROBE_TIMEOUT),
             )
         })
         .collect();
@@ -901,16 +903,17 @@ fn push_subject_check(
 }
 
 fn probe_provider(executable: &str, timeout: Duration) -> ProviderRuntime {
-    match crate::consult::run_output_bounded(Path::new(executable), &["--version"], timeout) {
-        Ok(output) => {
-            let version = clean(&output);
-            ProviderRuntime {
-                available: true,
-                version: (!version.is_empty()).then_some(version),
-            }
-        }
-        Err(_) => ProviderRuntime::default(),
-    }
+    probe_provider_result(executable, timeout).unwrap_or_default()
+}
+
+fn probe_provider_result(executable: &str, timeout: Duration) -> anyhow::Result<ProviderRuntime> {
+    let output =
+        crate::consult::run_output_bounded(Path::new(executable), &["--version"], timeout)?;
+    let version = clean(&output);
+    Ok(ProviderRuntime {
+        available: true,
+        version: (!version.is_empty()).then_some(version),
+    })
 }
 
 fn identity_reference(provider: Provider, identity: &str) -> String {
@@ -1015,10 +1018,22 @@ mod probe_tests {
         ] {
             fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-            let result = probe_provider(executable.to_str().unwrap(), Duration::from_secs(1));
-            assert_eq!(result.available, available);
+            // This checks success/failure semantics, not a tighter startup SLA
+            // than production. The separate inherited-pipe test keeps its
+            // strict 100 ms deadline even under the parallel suite.
+            let result =
+                probe_provider_result(executable.to_str().unwrap(), PROVIDER_PROBE_TIMEOUT);
+            assert_eq!(
+                result.is_ok(),
+                available,
+                "unexpected probe outcome: {result:?}"
+            );
             if available {
+                let result = result.unwrap();
+                assert!(result.available);
                 assert_eq!(result.version.as_deref(), Some("2.1.228"));
+            } else {
+                assert!(result.unwrap_err().to_string().contains("exit status: 7"));
             }
         }
     }
