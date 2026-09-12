@@ -1957,7 +1957,7 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
         &options,
         &required,
         now(),
-    );
+    )?;
     println!("\nCommissioning status");
     for provider in &commissioning.providers {
         let proof = provider.observation.as_ref().map_or_else(

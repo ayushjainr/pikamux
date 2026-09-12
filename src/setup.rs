@@ -199,7 +199,7 @@ pub fn commissioning_report(
     options: &SetupOptions,
     required: &BTreeSet<Provider>,
     at: f64,
-) -> CommissioningReport {
+) -> Result<CommissioningReport> {
     let executables = Provider::ALL.map(|provider| {
         (
             provider,
@@ -226,38 +226,33 @@ pub fn commissioning_report(
                 })
         })
     });
-    let pending = store.list_pending().unwrap_or_default();
-    let providers = Provider::ALL
-        .into_iter()
-        .enumerate()
-        .map(|(index, provider)| {
-            let home = match provider {
-                Provider::Codex => &paths.codex_home,
-                Provider::Claude => &paths.claude_home,
-                Provider::Opencode => &paths.opencode_config_home,
-            };
-            let expected_fingerprint =
-                hook_spec_fingerprint(provider, &options.pika_executable).unwrap_or_default();
-            ProviderCommissioning {
-                provider,
-                required: required.contains(&provider),
-                executable: executables[index].1.clone(),
-                runtime: runtimes[index].clone(),
-                hooks_active: hooks_installed(home, provider, &options.pika_executable),
-                expected_fingerprint,
-                observation: store.get_hook_observation(provider).ok().flatten(),
-                overdue_launches: pending
-                    .iter()
-                    .filter(|launch| {
-                        launch.provider == provider
-                            && at - launch.created_at > PENDING_LAUNCH_GRACE_SECONDS
-                    })
-                    .map(|launch| (launch.name.clone(), at - launch.created_at))
-                    .collect(),
-            }
-        })
-        .collect();
-    CommissioningReport { providers }
+    let pending = store.list_pending()?;
+    let mut providers = Vec::with_capacity(Provider::ALL.len());
+    for (index, provider) in Provider::ALL.into_iter().enumerate() {
+        let home = match provider {
+            Provider::Codex => &paths.codex_home,
+            Provider::Claude => &paths.claude_home,
+            Provider::Opencode => &paths.opencode_config_home,
+        };
+        providers.push(ProviderCommissioning {
+            provider,
+            required: required.contains(&provider),
+            executable: executables[index].1.clone(),
+            runtime: runtimes[index].clone(),
+            hooks_active: hooks_installed(home, provider, &options.pika_executable),
+            expected_fingerprint: hook_spec_fingerprint(provider, &options.pika_executable)?,
+            observation: store.get_hook_observation(provider)?,
+            overdue_launches: pending
+                .iter()
+                .filter(|launch| {
+                    launch.provider == provider
+                        && at - launch.created_at > PENDING_LAUNCH_GRACE_SECONDS
+                })
+                .map(|launch| (launch.name.clone(), at - launch.created_at))
+                .collect(),
+        });
+    }
+    Ok(CommissioningReport { providers })
 }
 
 pub fn probe_provider_executable(
