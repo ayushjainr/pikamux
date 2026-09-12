@@ -1613,7 +1613,7 @@ fn resolve_named_target(
     // A literal local name containing `@` is proven without a network call.
     // Cached remote truth is still combined to expose known collisions; only
     // a name with no local identity may trigger a fresh SSH resolution.
-    let remote_result = manager.resolve(
+    let remote_result = manager.resolve_candidates(
         name,
         fresh_remote && local.is_empty(),
         domain.includes_remote_experts(),
@@ -1623,44 +1623,58 @@ fn resolve_named_target(
         Err(error) if error.kind == FleetErrorKind::NotFound && !local.is_empty() => None,
         Err(error) => return Err(error.into()),
     };
-    if remote.is_none()
+    if remote.as_ref().is_none_or(Vec::is_empty)
         && let Some(error) = local_unavailable
     {
         return Err(error);
     }
-    let combined = combine_named_targets(name, local, remote, choose_collisions)?;
+    let combined =
+        combine_named_targets(name, local, remote.unwrap_or_default(), choose_collisions)?;
     Ok(combined)
 }
 
 fn combine_named_targets(
     name: &str,
     local: Vec<Session>,
-    remote: Option<fleet::FleetSession>,
+    remote: Vec<fleet::FleetSession>,
     choose_collisions: bool,
 ) -> Result<Option<NamedTarget>> {
-    match (local.as_slice(), remote) {
-        ([], None) => Ok(None),
-        ([session], None) => Ok(Some(NamedTarget::Local(Box::new(session.clone())))),
-        ([], Some(remote)) => Ok(Some(NamedTarget::Remote(Box::new(remote)))),
-        (local, Some(remote)) => {
+    match (local.as_slice(), remote.as_slice()) {
+        ([], []) => Ok(None),
+        ([session], []) => Ok(Some(NamedTarget::Local(Box::new(session.clone())))),
+        ([], [remote]) => Ok(Some(NamedTarget::Remote(Box::new(remote.clone())))),
+        (local, []) if choose_collisions => choose_session(
+            local.to_vec(),
+            &format!("Several conversations match {name:?}"),
+        )
+        .map(|session| Some(NamedTarget::Local(Box::new(session)))),
+        (local, []) => bail!(noninteractive_choice_message(local)),
+        ([], remote) if choose_collisions => choose_remote_session(
+            remote.to_vec(),
+            &format!("Several conversations match {name:?}"),
+        )
+        .map(|session| Some(NamedTarget::Remote(Box::new(session)))),
+        ([], remote) => bail!(noninteractive_remote_choice_message(remote)),
+        (local, remote) => {
             let local_identities = local
                 .iter()
                 .map(|session| format!("{}:{}", session.provider, session.session_id))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let remote_routes = remote
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{} {}@{}",
+                        item.session.provider, item.session.session_id, item.node_name
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             bail!(
-                "AMBIGUOUS TARGET · {name:?} matches local {local_identities} and remote {} {}@{}. Use one displayed exact identity; no action was taken.",
-                remote.session.provider,
-                remote.session.session_id,
-                remote.node_name,
+                "AMBIGUOUS TARGET · {name:?} matches local {local_identities} and remote {remote_routes}. Use one displayed exact identity; no action was taken.",
             )
         }
-        (local, None) if choose_collisions => choose_session(
-            local.to_vec(),
-            &format!("Several conversations match {name:?}"),
-        )
-        .map(|session| Some(NamedTarget::Local(Box::new(session)))),
-        (local, None) => bail!(noninteractive_choice_message(local)),
     }
 }
 
@@ -1792,6 +1806,63 @@ fn noninteractive_choice_message(sessions: &[Session]) -> String {
         "AMBIGUOUS TARGET · {} conversations match. Run interactively to choose, or use one exact identity: {identities}. No action was taken.",
         sessions.len()
     )
+}
+
+fn noninteractive_remote_choice_message(sessions: &[fleet::FleetSession]) -> String {
+    let identities = sessions
+        .iter()
+        .map(|item| {
+            format!(
+                "{} {}@{}",
+                item.session.provider, item.session.session_id, item.node_name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "AMBIGUOUS TARGET · {} remote conversations match. Run interactively to choose, or use one exact route: {identities}. No action was taken.",
+        sessions.len()
+    )
+}
+
+fn choose_remote_session(
+    mut sessions: Vec<fleet::FleetSession>,
+    prompt: &str,
+) -> Result<fleet::FleetSession> {
+    if sessions.len() == 1 {
+        return Ok(sessions.remove(0));
+    }
+    if !io::stdin().is_terminal() {
+        bail!(noninteractive_remote_choice_message(&sessions))
+    }
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let stderr = io::stderr();
+    let mut errors = stderr.lock();
+    choose_remote_session_with_io(sessions, prompt, &mut input, &mut output, &mut errors)
+}
+
+fn choose_remote_session_with_io<R: BufRead, W: Write, E: Write>(
+    sessions: Vec<fleet::FleetSession>,
+    prompt: &str,
+    input: &mut R,
+    output: &mut W,
+    errors: &mut E,
+) -> Result<fleet::FleetSession> {
+    let choices = sessions
+        .iter()
+        .map(|item| item.session.clone())
+        .collect::<Vec<_>>();
+    let selected = choose_session_with_io(choices, prompt, input, output, errors)?;
+    sessions
+        .into_iter()
+        .find(|item| {
+            item.session.provider == selected.provider
+                && item.session.session_id == selected.session_id
+        })
+        .context("The selected remote conversation disappeared before attach")
 }
 
 fn safe_choice_text(value: &str) -> String {
@@ -5255,11 +5326,11 @@ mod fleet_consultation_tests {
         };
 
         let local_only =
-            combine_named_targets("work@atlas", vec![local.clone()], None, true).unwrap();
+            combine_named_targets("work@atlas", vec![local.clone()], Vec::new(), true).unwrap();
         let wait_target = local_wait_target("work@atlas", local_only).unwrap();
         assert_eq!(wait_target.session_id, local.session_id);
         let error =
-            combine_named_targets("work@atlas", vec![local], Some(remote), true).unwrap_err();
+            combine_named_targets("work@atlas", vec![local], vec![remote], true).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("AMBIGUOUS TARGET"));
         assert!(message.contains("codex:workstream"));
@@ -5274,7 +5345,7 @@ mod fleet_consultation_tests {
         let mut second = first.clone();
         second.provider = Provider::Claude;
         second.session_id = "22222222-2222-4222-8222-222222222222".into();
-        let error = combine_named_targets("expert", vec![first, second], None, false)
+        let error = combine_named_targets("expert", vec![first, second], Vec::new(), false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("codex:workstream"));
@@ -5338,6 +5409,52 @@ mod fleet_consultation_tests {
         .unwrap_err()
         .to_string();
         assert_eq!(error, "Selection cancelled; nothing was opened.");
+    }
+
+    #[test]
+    fn remote_collision_lists_routes_and_interactive_choice_returns_exact_row() {
+        let root = tempfile::tempdir().unwrap();
+        let mut first_session = fixture_session(root.path());
+        first_session.session_id = "11111111-1111-4111-8111-111111111111".into();
+        let mut second_session = first_session.clone();
+        second_session.provider = Provider::Claude;
+        second_session.session_id = "22222222-2222-4222-8222-222222222222".into();
+        let make_remote = |session: Session| fleet::FleetSession {
+            node_id: "33333333-3333-4333-8333-333333333333".into(),
+            node_name: "atlas".into(),
+            session,
+            stale: false,
+            remote_error: None,
+            seen_at: 1.0,
+            card_status: None,
+            card_detail: None,
+            watched: true,
+            availability: Some("source-available".into()),
+            scope_updated_at: None,
+            current_state_updated_at: None,
+            current_state_status: None,
+        };
+        let first = make_remote(first_session);
+        let second = make_remote(second_session);
+
+        let message = noninteractive_remote_choice_message(&[first.clone(), second.clone()]);
+        assert!(message.contains("codex 11111111-1111-4111-8111-111111111111@atlas"));
+        assert!(message.contains("claude 22222222-2222-4222-8222-222222222222@atlas"));
+
+        let mut input = std::io::Cursor::new(b"2\n".to_vec());
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        let selected = choose_remote_session_with_io(
+            vec![first, second.clone()],
+            "Several remote conversations match",
+            &mut input,
+            &mut output,
+            &mut errors,
+        )
+        .unwrap();
+        assert_eq!(selected.session.provider, Provider::Claude);
+        assert_eq!(selected.session.session_id, second.session.session_id);
+        assert!(errors.is_empty());
     }
 
     #[test]
