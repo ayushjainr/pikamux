@@ -851,5 +851,6 @@ that model latency improved because local code became Rust.
   `tests/test_bootstrap.py`, `tests/test_installation.py`.
 
 This document was checked against those surfaces and self-reviewed for conflicting
-requirements. It has not yet received two independent reviews or owner approval;
-those are execution gates, not completed claims.
+requirements. The owner approved the implementation campaign on 2026-09-11.
+Publication, installation, live cutover and Python retirement remain separate,
+unapproved execution gates.

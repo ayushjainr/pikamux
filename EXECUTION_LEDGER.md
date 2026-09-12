@@ -47,8 +47,9 @@ Completion requires self-score and an independent adversarial score of at least
   current storage schema. It remains UUID-addressable and browseable, but its
   generated labels cannot flood setup's explicitly named screen.
 - Provider/process reconciliation is the fallback safety net every ten seconds;
-  lifecycle hooks publish attention immediately. This keeps five-minute idle CPU
-  below one percent without weakening event responsiveness.
+  lifecycle hooks commit immediately and the board consumes those commits within
+  250 ms. This keeps five-minute idle CPU below one percent without weakening
+  event responsiveness.
 - Rust 1.88 is the honest build minimum because the implementation uses stabilized
   let chains. Released users need only the native executable and tmux.
 
@@ -56,16 +57,16 @@ Completion requires self-score and an independent adversarial score of at least
 
 | Gate | Result |
 | --- | --- |
-| Native behavior suite | 309 tests pass on macOS arm64, including isolated real-tmux journeys, mixed-runtime compatibility, and the frozen-updater transition |
+| Native behavior suite | 337 tests pass on macOS arm64, including isolated real-tmux journeys, mixed-runtime compatibility, and the frozen-updater transition |
 | Mixed-runtime transition | Real Python v0.5.0a4 and Rust alternated SQLite hook writes; each consumed the other's fleet v2 envelopes |
 | Formatting/lint/MSRV | `cargo +1.88.0 fmt --check` and warnings-as-errors Clippy passed for all targets/features |
 | Dependency integrity | Locked license inventory reproduced exactly; RustSec scanned 157 locked crates with zero advisories after updating `time` to 0.3.47 |
 | Native packaging | Release archive, strict manifest, sidecar checksums, offline installer, installed version/help, and embedded skill verified in a disposable root |
-| Startup | p95 4.15 ms native versus 139.44 ms Python, 100 launches each |
-| Board | first-frame p95 9.91 ms versus 473.50 ms; input p95 0.128 ms versus 8.36 ms |
-| Hook | p95 13.89 ms versus 511.07 ms, 100 events each |
-| Reconciliation | 200-row public path p95 69.42 ms versus 2,441.08 ms, 30 runs each |
-| Warm resources | 6.92 MiB RSS p95 and 0.630% one-core mean over a five-minute native board run |
+| Startup | p95 4.54 ms native versus 145.04 ms Python, 100 launches each |
+| Board | first-frame p95 10.04 ms versus 463.34 ms; input p95 0.132 ms versus 8.46 ms |
+| Hook | p95 14.76 ms versus 489.25 ms, 100 events each |
+| Reconciliation | 200-row public path p95 70.39 ms versus 2,453.04 ms, 30 runs each |
+| Warm resources | 7.08 MiB RSS p95 and 0.553% one-core mean over a five-minute native board run |
 | Artifact | 4.27 MB executable; 2.20 MB gzip; no Python/runtime/compiler prerequisite |
 
 Full methodology and raw-boundary definitions are in `docs/PERFORMANCE.md`.

@@ -34,7 +34,7 @@ disabled. No installed Pika executable or live user state is read.
 
 ## Evidence and finding
 
-On 2026-09-11 the three mixed-runtime contracts passed on macOS arm64. The
+On 2026-09-12 the three mixed-runtime contracts passed on macOS arm64. The
 first run caught one real incompatibility: Python includes the optional
 `active_thread_id` field on ordinary sessions in an expert-directory snapshot,
 while Rust originally allowed it only on `expert_sessions`. Rust now accepts
