@@ -168,6 +168,7 @@ impl Pika {
     /// taking its write gate. Bumping this generation under that same gate lets
     /// an exact board action proceed immediately without allowing an older
     /// observation to commit after it.
+    #[cfg(any(not(windows), test))]
     pub(crate) fn invalidate_local_reconciliation(&self) {
         let _guard = self
             .local_reconcile_fence

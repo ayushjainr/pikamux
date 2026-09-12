@@ -64,6 +64,7 @@ impl std::ops::Deref for ProcessObservation {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn collect_observation(
     pids: Result<Vec<i64>, String>,
     mut read: impl FnMut(i64) -> Result<Option<ProcessRecord>, String>,
@@ -491,6 +492,11 @@ mod platform {
             .get(stat.rfind(')').ok_or("malformed stat")? + 2..)
             .ok_or("malformed stat")?;
         let fields: Vec<_> = tail.split_whitespace().collect();
+        // Exited processes can remain in /proc until their parent reaps them.
+        // They no longer own a live agent, even though their PID is reserved.
+        if matches!(fields.first(), Some(&"Z" | &"X" | &"x")) {
+            return Ok(None);
+        }
         let parsed_parent = fields
             .get(1)
             .ok_or("stat has no parent PID")?
@@ -522,6 +528,12 @@ mod platform {
         let verified_tail = verified
             .get(verified.rfind(')').ok_or("malformed verified stat")? + 2..)
             .ok_or("malformed verified stat")?;
+        if matches!(
+            verified_tail.split_whitespace().next(),
+            Some("Z" | "X" | "x")
+        ) {
+            return Ok(None);
+        }
         let verified_start: u64 = verified_tail
             .split_whitespace()
             .nth(19)

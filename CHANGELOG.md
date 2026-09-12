@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.2 — Linux process recovery
+
+- Recognize exited, unreaped Linux processes as stopped so graceful handover
+  can finish without a false timeout.
+- Keep host-board code out of the Windows client build.
+
 ## 0.6.1 — cross-platform native release
 
 - Correct platform-specific compilation for Linux hosts and the Windows client.

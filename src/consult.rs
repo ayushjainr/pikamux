@@ -1957,6 +1957,7 @@ impl OwnedChild {
         })
     }
 
+    #[cfg(unix)]
     fn id(&self) -> u32 {
         self.child.id()
     }

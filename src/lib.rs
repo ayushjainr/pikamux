@@ -14,6 +14,7 @@ pub mod experts;
 pub mod fleet;
 pub mod hooks;
 pub mod model;
+#[cfg(not(windows))]
 pub mod monitor;
 pub mod open_history;
 pub mod paths;
