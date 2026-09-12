@@ -20,9 +20,15 @@ def main() -> None:
     parser.add_argument("native", type=Path)
     parser.add_argument("python_reference", type=Path)
     parser.add_argument("--samples", type=int, default=30)
+    parser.add_argument("--rows", type=int, default=200)
+    parser.add_argument("--remote-nodes", type=int, default=1)
     args = parser.parse_args()
     if args.samples < 1:
         raise SystemExit("--samples must be positive")
+    if args.rows < 0:
+        raise SystemExit("--rows must be non-negative")
+    if not 1 <= args.remote_nodes <= 20:
+        raise SystemExit("--remote-nodes must be between 1 and 20")
     project = Path(__file__).resolve().parents[1]
     programs = {
         "native": args.native.resolve(strict=True),
@@ -33,7 +39,12 @@ def main() -> None:
         root = Path(temporary)
         environments: dict[str, dict[str, str]] = {}
         for index, label in enumerate(programs):
-            _, environment = seed(root / f"{index}-{label}", project)
+            _, environment = seed(
+                root / f"{index}-{label}",
+                project,
+                args.rows,
+                args.remote_nodes,
+            )
             environment["PIKA_TMUX_SOCKET"] = f"pika-reconcile-{uuid.uuid4()}"
             environments[label] = environment
         for index in range(args.samples):
