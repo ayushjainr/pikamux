@@ -833,10 +833,10 @@ fn snapshot_after_store_change<T>(
 #[cfg(test)]
 mod board_refresh_tests {
     use super::{
-        ensure_store_change_watcher, record_local_refresh_result, snapshot_after_store_change,
-        store_changed,
+        ensure_store_change_watcher, fleet_node_health, record_local_refresh_result,
+        snapshot_after_store_change, store_changed,
     };
-    use crate::store::Store;
+    use crate::{model::FleetNode, store::Store};
 
     #[test]
     fn local_refresh_notice_requires_consecutive_failures_and_clears_on_success() {
@@ -882,6 +882,50 @@ mod board_refresh_tests {
             store.get_meta("interleaved-hook")
         });
         assert_eq!(delivered, Some(Some("newest".into())));
+    }
+
+    #[test]
+    fn fleet_health_reports_node_errors_and_missing_cache_then_clears_on_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::at(root.path().join("state/pika.db"));
+        store.initialize().unwrap();
+        let node_id = "77777777-7777-4777-8777-777777777777";
+        let mut node = FleetNode {
+            node_id: node_id.into(),
+            alias: "atlas".into(),
+            ssh_target: "atlas".into(),
+            sources: vec!["ssh-config".into()],
+            status: "error".into(),
+            protocol_version: Some(crate::fleet::PROTOCOL_VERSION),
+            package_version: Some(crate::VERSION.into()),
+            capabilities: vec!["snapshot".into()],
+            last_seen: 0.0,
+            last_attempt_at: 1.0,
+            last_error: Some("connection refused".into()),
+            created_at: 1.0,
+            updated_at: 1.0,
+        };
+        store.upsert_fleet_node(&node).unwrap();
+        let health = fleet_node_health(&store);
+        assert_eq!(health.len(), 2);
+        assert!(
+            health
+                .iter()
+                .any(|item| item.contains("connection refused"))
+        );
+        assert!(
+            health
+                .iter()
+                .any(|item| item.contains("no cached snapshot"))
+        );
+
+        node.status = "ready".into();
+        node.last_error = None;
+        store.upsert_fleet_node(&node).unwrap();
+        store
+            .put_remote_snapshot(node_id, &serde_json::json!({"sessions": []}), 2.0)
+            .unwrap();
+        assert!(fleet_node_health(&store).is_empty());
     }
 }
 
@@ -957,7 +1001,38 @@ fn board_items_from_inventory(
         FleetManager::new(&pika.store, SshTransport::default())
             .cached_sessions_with_notices(None, false),
     );
+    fleet_health.extend(fleet_node_health(&pika.store));
     Ok((items, fleet_health))
+}
+
+fn fleet_node_health(store: &Store) -> Vec<String> {
+    let nodes = match FleetManager::new(store, SshTransport::default()).nodes() {
+        Ok(nodes) => nodes,
+        Err(error) => return vec![format!("fleet registry unavailable · {}", error.message)],
+    };
+    let mut health = Vec::new();
+    for node in nodes {
+        if let Some(error) = node
+            .last_error
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            health.push(format!("{} · {error}", node.alias));
+        } else if node.status != "ready" {
+            health.push(format!("{} · machine status {}", node.alias, node.status));
+        }
+        match store.get_remote_snapshot(&node.node_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => health.push(format!("{} · no cached snapshot yet", node.alias)),
+            Err(error) => health.push(format!(
+                "{} · cached snapshot unavailable · {error}",
+                node.alias
+            )),
+        }
+    }
+    health.sort();
+    health.dedup();
+    health
 }
 
 fn append_cached_fleet(
@@ -1206,9 +1281,11 @@ fn run_local_board_consultation(
         options.opencode_database = Some(pika.paths.opencode_data_home.join("opencode.db"));
     }
     let mut side = open_local_consultation(pika, &io.item.session, options)?;
+    let proof = side.opening_isolation_proof();
     let _ = io.events.send(ConsultationEvent::Opened {
         child_id: side.child_id().map(str::to_owned),
         policy: Some(side.policy().label()),
+        proof: Some(opening_proof_label(2, &proof)),
     });
     for command in io.commands {
         match command {
@@ -1259,13 +1336,15 @@ fn run_remote_board_consultation(
         io.cancellation.clone(),
     )
     .map_err(anyhow::Error::from)?;
+    let opening = side.opening_receipt();
     let _ = io.events.send(ConsultationEvent::Opened {
-        child_id: None,
+        child_id: opening.child_id.clone(),
         policy: Some(if policy.model.is_empty() {
             policy.consultation_mode.clone()
         } else {
             format!("{} · {}", policy.consultation_mode, policy.model)
         }),
+        proof: Some(opening.proof_label()),
     });
     for command in io.commands {
         match command {
@@ -3341,6 +3420,8 @@ fn consultation_opened_value(
         .as_object_mut()
         .expect("consultation event is an object");
     fields.insert("ephemeral".into(), serde_json::json!(true));
+    fields.insert("child_id".into(), serde_json::json!(side.child_id()));
+    fields.insert("isolation".into(), side.opening_isolation_proof());
     fields.insert("provider".into(), serde_json::json!(session.provider));
     fields.insert(
         "workstream_id".into(),
@@ -3657,12 +3738,19 @@ fn parse_consultation_cleanup(value: &str) -> Option<crate::consult::Cleanup> {
     }
 }
 
-fn remote_opened_value(run: &RemoteJsonlRun, remote: &fleet::FleetSession) -> serde_json::Value {
+fn remote_opened_value(
+    run: &RemoteJsonlRun,
+    remote: &fleet::FleetSession,
+    opening: &fleet::ConsultationOpeningReceipt,
+) -> serde_json::Value {
     let mut value = consultation_event_value("opened", &run.receipt(), &run.policy);
     let fields = value
         .as_object_mut()
         .expect("consultation event is an object");
-    fields.insert("ephemeral".into(), serde_json::json!(true));
+    fields.insert("ephemeral".into(), serde_json::json!(opening.ephemeral));
+    fields.insert("child_id".into(), serde_json::json!(opening.child_id));
+    fields.insert("isolation".into(), opening.isolation.clone());
+    fields.insert("remote_opening_receipt".into(), serde_json::json!(opening));
     fields.insert(
         "provider".into(),
         serde_json::json!(remote.session.provider),
@@ -3691,6 +3779,7 @@ mod consultation_jsonl_schema_tests {
             Cleanup, Consultation, ConsultationOptions, ConsultationPolicy, ConsultationProgress,
             ConsultationReceipt, ConsultationStage, Delivery,
         },
+        fleet,
         model::{Provider, Session, Status},
     };
     use std::{collections::BTreeSet, fs, os::unix::fs::PermissionsExt, time::Duration};
@@ -3867,7 +3956,9 @@ mod consultation_jsonl_schema_tests {
         let mut opened_keys = base();
         opened_keys.extend(policy_keys());
         opened_keys.extend([
+            "child_id",
             "ephemeral",
+            "isolation",
             "name",
             "parent_id",
             "provider",
@@ -3876,7 +3967,8 @@ mod consultation_jsonl_schema_tests {
         ]);
         let opened = consultation_opened_value(&side, &session);
         assert_eq!(keys(&opened), opened_keys);
-        assert!(opened.get("child_id").is_none());
+        assert_eq!(opened["child_id"], "22222222-2222-4222-8222-222222222222");
+        assert_eq!(opened["isolation"]["ephemeral_confirmed"], true);
 
         let remote = crate::fleet::FleetSession {
             node_id: "33333333-3333-4333-8333-333333333333".into(),
@@ -3894,9 +3986,41 @@ mod consultation_jsonl_schema_tests {
             current_state_status: None,
         };
         let remote_run = RemoteJsonlRun::new(policy());
-        let remote_opened = remote_opened_value(&remote_run, &remote);
-        assert_eq!(keys(&remote_opened), opened_keys);
+        let remote_opened = remote_opened_value(
+            &remote_run,
+            &remote,
+            &fleet::ConsultationOpeningReceipt {
+                receipt_version: 2,
+                ephemeral: true,
+                provider: Provider::Codex,
+                workstream_id: session.session_id.clone(),
+                parent_id: session.provider_thread_id().to_owned(),
+                child_id: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
+                isolation: serde_json::json!({
+                    "version":1,
+                    "mechanism":"codex_thread_fork",
+                    "evidence":"provider_confirmed",
+                    "distinct_child":true,
+                    "ephemeral_confirmed":true,
+                    "parent_turns_excluded":true,
+                    "approval_policy":"never",
+                    "sandbox":"read-only"
+                }),
+                receipt: serde_json::json!({"receipt_version":2}),
+            },
+        );
+        let mut remote_opened_keys = opened_keys.clone();
+        remote_opened_keys.insert("remote_opening_receipt");
+        assert_eq!(keys(&remote_opened), remote_opened_keys);
         assert_eq!(remote_opened["name"], "named@atlas");
+        assert_eq!(
+            remote_opened["child_id"],
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+        assert_eq!(
+            remote_opened["remote_opening_receipt"]["receipt_version"],
+            2
+        );
         assert!(remote_opened.get("machine").is_none());
         assert!(remote_opened.get("node_id").is_none());
 
@@ -4178,13 +4302,22 @@ fn require_remote_source_available(remote: &fleet::FleetSession) -> Result<()> {
     Ok(())
 }
 
+fn opening_proof_label(receipt_version: u64, isolation: &serde_json::Value) -> String {
+    let evidence = isolation
+        .get("evidence")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("verified")
+        .replace('_', " ");
+    format!("v{receipt_version} · ephemeral · {evidence}")
+}
+
 fn ask_remote_jsonl(
     side: &mut fleet::RemoteConsultation,
     remote: &fleet::FleetSession,
     initial: &str,
     run: &mut RemoteJsonlRun,
 ) -> Result<i32> {
-    let opened = remote_opened_value(run, remote);
+    let opened = remote_opened_value(run, remote, side.opening_receipt());
     run.output_ok &= emit_jsonl_value(opened);
     let mut result = 0;
     if !run.output_ok {
@@ -4582,15 +4715,18 @@ fn serve_fleet_consultation(
     inputs: mpsc::Receiver<FleetConsultationInput>,
     cancellation: &crate::consult::CancellationToken,
 ) -> Result<i32> {
+    let receipt = side.receipt();
     if !emit_jsonl_value(serde_json::json!({
         "type": "opened",
+        "receipt_version": receipt.receipt_version,
         "ephemeral": true,
         "provider": session.provider,
         "workstream_id": session.session_id,
         "parent_id": side.parent_id(),
         "child_id": side.child_id(),
         "name": session.display_name(),
-        "receipt": side.receipt(),
+        "isolation": side.opening_isolation_proof(),
+        "receipt": receipt,
         "policy": side.policy(),
         "consultation_mode": side.policy().mode,
         "model": side.policy().model.as_deref().unwrap_or(""),

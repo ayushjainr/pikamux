@@ -296,6 +296,13 @@ impl Consultation {
         self.side.child_id()
     }
 
+    /// Provider-specific evidence established before the first question is
+    /// accepted. This is intentionally concrete rather than a generic
+    /// "private" label: fleet peers can validate the mechanism they trust.
+    pub fn opening_isolation_proof(&self) -> Value {
+        self.side.opening_isolation_proof()
+    }
+
     pub fn receipt(&self) -> ConsultationReceipt {
         receipt_from_snapshot(ReceiptSnapshot {
             started: self.started,
@@ -624,6 +631,38 @@ impl Side {
             Self::Codex(side) => (!side.thread_id.is_empty()).then_some(side.thread_id.as_str()),
             Self::Claude(_) => None,
             Self::Opencode(side) => side.thread_id.as_deref(),
+        }
+    }
+
+    fn opening_isolation_proof(&self) -> Value {
+        match self {
+            Self::Codex(_) => json!({
+                "version": 1,
+                "mechanism": "codex_thread_fork",
+                "evidence": "provider_confirmed",
+                "distinct_child": true,
+                "ephemeral_confirmed": true,
+                "parent_turns_excluded": true,
+                "approval_policy": "never",
+                "sandbox": "read-only"
+            }),
+            Self::Claude(_) => json!({
+                "version": 1,
+                "mechanism": "claude_fork_process",
+                "evidence": "launch_arguments",
+                "fork_session": true,
+                "no_session_persistence": true,
+                "tools_disabled": true
+            }),
+            Self::Opencode(_) => json!({
+                "version": 1,
+                "mechanism": "opencode_session_fork",
+                "evidence": "provider_issued_child_and_isolated_runtime",
+                "distinct_child": true,
+                "ephemeral_process": true,
+                "readonly_agent": true,
+                "cleanup": "exact_child_delete"
+            }),
         }
     }
 }
@@ -1414,7 +1453,7 @@ impl OpenCodeSide {
                 Cleanup::Complete,
             ));
         }
-        Ok(Self {
+        let mut side = Self {
             parent_id: session.provider_thread_id().to_owned(),
             cwd: valid_cwd(session.cwd.as_deref()).map(Path::to_owned),
             executable: options.executable.clone(),
@@ -1430,7 +1469,22 @@ impl OpenCodeSide {
             fork_server: None,
             closed: false,
             cancellation: options.cancellation.clone(),
-        })
+        };
+        // Establish and validate the exact provider-issued child before Pika
+        // emits an opening receipt or accepts a question. This matches the
+        // Codex guarantee and prevents a remote peer from advertising a
+        // merely intended OpenCode fork as an established private side.
+        if let Err(error) = side.fork() {
+            let cleanup = if side.fork_uncertain {
+                Cleanup::Unknown
+            } else if side.close().is_ok() {
+                Cleanup::Complete
+            } else {
+                Cleanup::Failed
+            };
+            return Err(SideFailure::prepare(error, cleanup));
+        }
+        Ok(side)
     }
 
     fn fork(&mut self) -> Result<String> {
@@ -1605,19 +1659,15 @@ impl OpenCodeSide {
             ));
         }
         if self.thread_id.is_none() {
-            *delivery = Delivery::NotSent;
-            progress(*delivery);
-            if let Err(error) = self.fork() {
-                return Err(SideFailure::turn_with_cleanup(
-                    error,
-                    Delivery::NotSent,
-                    if self.fork_uncertain {
-                        Cleanup::Unknown
-                    } else {
-                        Cleanup::Pending
-                    },
-                ));
-            }
+            return Err(SideFailure::turn_with_cleanup(
+                "OpenCode side child was not established before the question",
+                Delivery::NotSent,
+                if self.fork_uncertain {
+                    Cleanup::Unknown
+                } else {
+                    Cleanup::Pending
+                },
+            ));
         }
         let target = self
             .thread_id

@@ -75,6 +75,14 @@ impl BoardItem {
     fn node_label(&self) -> Option<&str> {
         self.node_name.as_deref().or(self.node_id.as_deref())
     }
+
+    fn actionable(&self) -> bool {
+        !self.stale
+    }
+
+    fn needs_attention(&self) -> bool {
+        self.actionable() && self.session.needs_attention()
+    }
 }
 
 type BoardKey = (Option<String>, Provider, String);
@@ -158,6 +166,7 @@ pub enum ConsultationEvent {
     Opened {
         child_id: Option<String>,
         policy: Option<String>,
+        proof: Option<String>,
     },
     Progress(String),
     Answer(String),
@@ -539,6 +548,7 @@ struct ChatState {
     finish_receiver: Option<Receiver<std::result::Result<ConsultationOutcome, String>>>,
     child_id: Option<String>,
     policy: Option<String>,
+    proof: Option<String>,
     scroll: usize,
     close_requested: bool,
     cancellation: CancellationToken,
@@ -572,6 +582,7 @@ impl ChatState {
             finish_receiver: Some(finish_receiver),
             child_id: None,
             policy: None,
+            proof: None,
             scroll: 0,
             close_requested: false,
             cancellation,
@@ -596,6 +607,7 @@ impl ChatState {
             finish_receiver: None,
             child_id: None,
             policy: None,
+            proof: None,
             scroll: 0,
             close_requested: false,
             cancellation: CancellationToken::default(),
@@ -688,9 +700,14 @@ impl ChatState {
 
     fn accept(&mut self, event: ConsultationEvent) {
         match event {
-            ConsultationEvent::Opened { child_id, policy } => {
+            ConsultationEvent::Opened {
+                child_id,
+                policy,
+                proof,
+            } => {
                 self.child_id = child_id;
                 self.policy = policy;
+                self.proof = proof;
                 if !self.close_requested {
                     self.phase = ChatPhase::Ready;
                 }
@@ -1007,10 +1024,27 @@ impl Board {
                 self.filter.clear();
                 self.reselect_first();
             }
-            KeyCode::Enter => return self.selected().map(BoardAction::Open),
-            KeyCode::Char('p') => return self.selected().map(BoardAction::Peek),
-            KeyCode::Char('x') => return self.selected().map(BoardAction::Untrack),
-            KeyCode::Char('a') => self.begin_chat(driver),
+            KeyCode::Enter => {
+                return self
+                    .selected()
+                    .filter(|item| item.actionable())
+                    .map(BoardAction::Open);
+            }
+            KeyCode::Char('p') => {
+                return self
+                    .selected()
+                    .filter(|item| item.actionable())
+                    .map(BoardAction::Peek);
+            }
+            KeyCode::Char('x') => {
+                return self
+                    .selected()
+                    .filter(|item| item.actionable())
+                    .map(BoardAction::Untrack);
+            }
+            KeyCode::Char('a') if self.selected().is_some_and(|item| item.actionable()) => {
+                self.begin_chat(driver)
+            }
             KeyCode::Char('r') => return Some(BoardAction::Refresh),
             KeyCode::Char('U') => {
                 if self.update_version.is_some() {
@@ -1023,7 +1057,7 @@ impl Board {
                 return self
                     .items
                     .iter()
-                    .find(|item| item.session.needs_attention())
+                    .find(|item| item.needs_attention())
                     .cloned()
                     .map(BoardAction::Open);
             }
@@ -1451,6 +1485,10 @@ impl Board {
             (Some(policy), None) => policy.clone(),
             _ => phase_label(chat.phase).to_owned(),
         };
+        if let Some(proof) = &chat.proof {
+            metadata.push_str(" · ");
+            metadata.push_str(proof);
+        }
         if chat.history_truncated {
             metadata.push_str(" · earlier lines omitted");
         }
@@ -1996,6 +2034,27 @@ mod tests {
     }
 
     #[test]
+    fn stale_remote_attention_is_visible_but_never_actionable() {
+        let mut item = BoardItem::local(session(Status::NeedsYou));
+        item.node_id = Some("remote-node".into());
+        item.node_name = Some("atlas".into());
+        item.stale = true;
+        item.session.unread = true;
+        let mut board = Board::new(vec![item]);
+        assert_eq!(item_group(board.selected().as_ref().unwrap()), "PARKED");
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('p'),
+            KeyCode::Char('x'),
+            KeyCode::Char('a'),
+            KeyCode::Char('n'),
+        ] {
+            assert_eq!(board.key(key(code), None), None);
+        }
+        assert!(board.chat.is_none());
+    }
+
+    #[test]
     fn replacement_preserves_node_qualified_selection() {
         let base = session(Status::Working);
         let mut here = BoardItem::local(base.clone());
@@ -2057,6 +2116,7 @@ mod tests {
             io.events.send(ConsultationEvent::Opened {
                 child_id: Some("child-12345678".into()),
                 policy: Some("fast".into()),
+                proof: Some("v2 · ephemeral verified".into()),
             })?;
             for command in &io.commands {
                 match command {
@@ -2193,6 +2253,7 @@ mod tests {
             io.events.send(ConsultationEvent::Opened {
                 child_id: None,
                 policy: None,
+                proof: None,
             })?;
             let _ = io.commands.recv();
             thread::sleep(Duration::from_millis(50));
@@ -2240,6 +2301,7 @@ mod tests {
             io.events.send(ConsultationEvent::Opened {
                 child_id: Some("owned-child".into()),
                 policy: None,
+                proof: None,
             })?;
             assert!(matches!(
                 io.commands.recv()?,
@@ -2278,6 +2340,7 @@ mod tests {
             io.events.send(ConsultationEvent::Opened {
                 child_id: None,
                 policy: None,
+                proof: None,
             })?;
             assert_eq!(io.commands.recv()?, ConsultationInput::Close);
             Ok(ConsultationOutcome::discarded())
@@ -2325,6 +2388,7 @@ mod tests {
             io.events.send(ConsultationEvent::Opened {
                 child_id: Some("child".into()),
                 policy: None,
+                proof: None,
             })?;
             io.events.send(ConsultationEvent::Error {
                 message: "provider stopped after delivery".into(),

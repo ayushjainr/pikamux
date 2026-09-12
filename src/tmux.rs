@@ -7,12 +7,24 @@ use anyhow::{Context, Result, bail};
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
-    io::Read,
+    io::{Read, Write},
     process::{Command, Output, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiptDelivery {
+    TmuxClient,
+    InvokingTerminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceiptHandoff {
+    pub exit_code: i32,
+    pub delivery: Option<ReceiptDelivery>,
+}
 
 const SEPARATOR: &str = "\u{1f}";
 pub const HISTORY_LIMIT: usize = 100_000;
@@ -503,6 +515,134 @@ impl Tmux {
             true,
             move || on_started().map(Some),
         )
+    }
+
+    /// Prove the exact pane and make the continuity receipt observable before
+    /// committing attention/open history. If tmux cannot show the targeted
+    /// client message, the same invoking terminal receives an explicit
+    /// fallback. A failed fallback prevents `on_started` from running.
+    pub fn attach_exact_with_observed_receipt<F>(
+        &self,
+        pane: &Pane,
+        receipt: &str,
+        on_started: F,
+    ) -> Result<ReceiptHandoff>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.attach_exact_with_observed_receipt_mode(
+            pane,
+            receipt,
+            std::env::var_os("TMUX").is_some(),
+            on_started,
+        )
+    }
+
+    fn attach_exact_with_observed_receipt_mode<F>(
+        &self,
+        pane: &Pane,
+        receipt: &str,
+        inside_tmux: bool,
+        on_started: F,
+    ) -> Result<ReceiptHandoff>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.ensure_terminal_reply_guard();
+        self.ensure_rgb();
+        self.configure_exact_home(pane)?;
+        let condition = pane_generation_condition(pane);
+        let attach = if inside_tmux {
+            format!("switch-client -t {}", shell_words::quote(&pane.pane_id))
+        } else {
+            format!("attach-session -t {}", shell_words::quote(&pane.pane_id))
+        };
+        let mut argv = vec![self.executable.clone()];
+        if let Some(socket) = &self.socket_name {
+            argv.extend(["-L".into(), socket.clone()]);
+        }
+        argv.extend([
+            "if-shell".into(),
+            "-F".into(),
+            "-t".into(),
+            pane.pane_id.clone(),
+            condition,
+            attach,
+            "run-shell 'exit 75'".into(),
+        ]);
+        if inside_tmux {
+            let client = self
+                .output(["display-message", "-p", "#{client_name}"], false)
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .filter(|value| !value.is_empty());
+            let status =
+                bounded_output(Command::new(&argv[0]).args(&argv[1..]), COMMAND_TIMEOUT)?.status;
+            if !status.success() {
+                return Ok(ReceiptHandoff {
+                    exit_code: status.code().unwrap_or(1),
+                    delivery: None,
+                });
+            }
+            let delivery = self.deliver_receipt(client.as_deref(), receipt)?;
+            on_started()?;
+            return Ok(ReceiptHandoff {
+                exit_code: 0,
+                delivery: Some(delivery),
+            });
+        }
+
+        let attached_client = Arc::new(Mutex::new(None::<String>));
+        let proof_client = Arc::clone(&attached_client);
+        let receipt_client = Arc::clone(&attached_client);
+        let delivered = Arc::new(Mutex::new(None::<ReceiptDelivery>));
+        let delivered_callback = Arc::clone(&delivered);
+        let exit_code = terminal::run_pty_bridge_with_handoff(
+            &argv,
+            None,
+            true,
+            |client_pid| {
+                if let Some(client) = self.attached_client_name(client_pid, &pane.pane_id) {
+                    *proof_client.lock().expect("tmux client proof poisoned") = Some(client);
+                    true
+                } else {
+                    false
+                }
+            },
+            || {
+                let client = receipt_client
+                    .lock()
+                    .expect("tmux receipt target poisoned")
+                    .clone();
+                let delivery = self.deliver_receipt(client.as_deref(), receipt)?;
+                *delivered_callback
+                    .lock()
+                    .expect("tmux receipt outcome poisoned") = Some(delivery);
+                on_started()
+            },
+        )?;
+        Ok(ReceiptHandoff {
+            exit_code,
+            delivery: *delivered.lock().expect("tmux receipt outcome poisoned"),
+        })
+    }
+
+    fn deliver_receipt(&self, client: Option<&str>, receipt: &str) -> Result<ReceiptDelivery> {
+        if let Some(client) = client
+            && self
+                .output(
+                    ["display-message", "-c", client, "-d", "3000", "-l", receipt],
+                    false,
+                )
+                .is_ok_and(|output| output.status.success())
+        {
+            return Ok(ReceiptDelivery::TmuxClient);
+        }
+        let mut terminal = std::io::stderr().lock();
+        writeln!(terminal, "\r\nPIKA HANDOFF · {receipt}")?;
+        terminal.flush()?;
+        Ok(ReceiptDelivery::InvokingTerminal)
     }
 
     fn attach_exact_with_started_mode<F>(
@@ -1546,6 +1686,57 @@ mod tests {
         let trace = fs::read_to_string(trace).unwrap();
         assert!(!trace.contains("BEFORE_PROOF"));
         assert!(trace.contains("display-message -c invoking-client -d 3000 -l exact receipt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_receipt_is_delivered_before_attention_callback() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("trace");
+        let committed = temp.path().join("committed");
+        let tmux = tmux_fixture(
+            &temp,
+            &format!(
+                "printf '%s\\n' \"$*\" >> {trace}\ncase \"$*\" in\n  'display-message -p #{{client_name}}') printf '%s\\n' invoking-client;;\n  *'display-message -c invoking-client -d 3000 -l exact receipt'*) test ! -f {committed} || printf '%s\\n' COMMITTED_TOO_EARLY >> {trace};;\nesac\nexit 0",
+                trace = shell_words::quote(&trace.to_string_lossy()),
+                committed = shell_words::quote(&committed.to_string_lossy()),
+            ),
+        );
+        let handoff = tmux
+            .attach_exact_with_observed_receipt_mode(
+                &exact_test_pane(),
+                "exact receipt",
+                true,
+                || fs::write(&committed, "acknowledged").map_err(Into::into),
+            )
+            .unwrap();
+        assert_eq!(handoff.exit_code, 0);
+        assert_eq!(handoff.delivery, Some(ReceiptDelivery::TmuxClient));
+        let trace = fs::read_to_string(trace).unwrap();
+        assert!(!trace.contains("COMMITTED_TOO_EARLY"));
+        assert_eq!(fs::read_to_string(committed).unwrap(), "acknowledged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_tmux_display_uses_truthful_terminal_fallback_then_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let committed = temp.path().join("committed");
+        let tmux = tmux_fixture(
+            &temp,
+            "case \"$*\" in 'display-message -p #{client_name}') printf '%s\\n' invoking-client;; *'display-message -c invoking-client'*) exit 1;; esac\nexit 0",
+        );
+        let handoff = tmux
+            .attach_exact_with_observed_receipt_mode(
+                &exact_test_pane(),
+                "exact receipt",
+                true,
+                || fs::write(&committed, "acknowledged").map_err(Into::into),
+            )
+            .unwrap();
+        assert_eq!(handoff.exit_code, 0);
+        assert_eq!(handoff.delivery, Some(ReceiptDelivery::InvokingTerminal));
+        assert_eq!(fs::read_to_string(committed).unwrap(), "acknowledged");
     }
 
     #[cfg(unix)]

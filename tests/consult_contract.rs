@@ -514,6 +514,10 @@ fn claude_uses_one_nonpersistent_toolless_process_for_multiple_turns() {
     )
     .unwrap();
     assert_eq!(side.parent_id(), "active-leaf");
+    let proof = side.opening_isolation_proof();
+    assert_eq!(proof["fork_session"], true);
+    assert_eq!(proof["no_session_persistence"], true);
+    assert_eq!(proof["tools_disabled"], true);
     assert_eq!(side.ask("one").unwrap(), "claude-1");
     assert_eq!(side.ask("two").unwrap(), "claude-2");
     side.close().unwrap();
@@ -605,7 +609,11 @@ fn opencode_uses_one_exact_readonly_child_then_verifies_deletion() {
     options.opencode_database = Some(database.clone());
     options.timeout = Duration::from_secs(5);
     let mut side = Consultation::open(&target, options).unwrap();
-    assert_eq!(side.child_id(), None);
+    assert_eq!(side.child_id(), Some("ses_child123"));
+    assert_eq!(
+        side.opening_isolation_proof()["evidence"],
+        "provider_issued_child_and_isolated_runtime"
+    );
     assert_eq!(side.ask("one").unwrap(), "opencode-answer-1");
     assert_eq!(side.child_id(), Some("ses_child123"));
     assert_eq!(side.ask("two").unwrap(), "opencode-answer-2");
@@ -676,14 +684,10 @@ fn opencode_unknown_fork_identity_is_not_retry_safe_or_guessed_for_deletion() {
     let mut options = ConsultationOptions::new(executable);
     options.opencode_database = Some(database);
     options.timeout = Duration::from_secs(5);
-    let mut side = Consultation::open(&target, options).unwrap();
-    let error = side.ask("question").unwrap_err();
+    let error = Consultation::open(&target, options).err().unwrap();
     assert_eq!(error.receipt.delivery, Delivery::NotSent);
     assert_eq!(error.receipt.cleanup, Cleanup::Unknown);
     assert!(!error.receipt.retry_safe);
-    assert_eq!(side.child_id(), None);
-    let cleanup = side.close().unwrap_err();
-    assert!(cleanup.to_string().contains("identity is unknown"));
     let log = fs::read_to_string(log).unwrap();
     assert!(!log.contains("session delete"));
 }

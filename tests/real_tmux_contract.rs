@@ -6,7 +6,7 @@ use pikamux::{
     model::{Provider, Session, Status},
     paths::Paths,
     store::Store,
-    tmux::Tmux,
+    tmux::{ReceiptDelivery, Tmux},
 };
 use std::{
     collections::BTreeMap,
@@ -90,6 +90,95 @@ fn saved(provider: Provider, identity: &str, name: &str, cwd: &std::path::Path) 
         estimated_cost_usd: None,
         active_thread_id: None,
     }
+}
+
+#[test]
+fn real_isolated_tmux_attach_observes_receipt_before_commit() {
+    if Command::new("tmux").arg("-V").output().is_err()
+        || Command::new("script").arg("--help").output().is_err()
+    {
+        eprintln!("tmux/script unavailable; exact receipt integration not exercised");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let socket = format!("pika-rust-receipt-{}", std::process::id());
+    let _guard = IsolatedTmux(socket.clone());
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-s",
+                "pika-c-receipt",
+                "sleep 3"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let tmux = Tmux::with_executable("tmux", Some(socket.clone()));
+    let untagged = tmux.get_pane("pika-c-receipt").unwrap().unwrap();
+    tmux.tag_pane_if_unchanged(
+        &untagged,
+        Some(Provider::Codex),
+        Some("44444444-4444-4444-8444-444444444444"),
+        Some("receipt_test"),
+        None,
+    )
+    .unwrap();
+    let pane = tmux.get_pane("pika-c-receipt").unwrap().unwrap();
+    let transcript = temp.path().join("receipt.out");
+    let committed = temp.path().join("committed");
+    let output = Command::new("script")
+        .args([
+            "-q",
+            transcript.to_str().unwrap(),
+            std::env::current_exe().unwrap().to_str().unwrap(),
+            "--exact",
+            "real_isolated_tmux_receipt_helper",
+            "--nocapture",
+        ])
+        .env("TERM", "xterm-256color")
+        .env("PIKA_RECEIPT_TEST_SOCKET", &socket)
+        .env("PIKA_RECEIPT_TEST_PANE", &pane.pane_id)
+        .env("PIKA_RECEIPT_TEST_COMMITTED", &committed)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={} transcript={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&transcript).unwrap_or_default()
+    );
+    assert_eq!(fs::read_to_string(&committed).unwrap(), "after-receipt");
+    let transcript = fs::read_to_string(transcript).unwrap();
+    assert!(
+        transcript.contains("CONTINUITY PROVEN · receipt_test"),
+        "{transcript:?}"
+    );
+}
+
+#[test]
+fn real_isolated_tmux_receipt_helper() {
+    let Ok(socket) = std::env::var("PIKA_RECEIPT_TEST_SOCKET") else {
+        return;
+    };
+    let pane_id = std::env::var("PIKA_RECEIPT_TEST_PANE").unwrap();
+    let committed = std::path::PathBuf::from(std::env::var("PIKA_RECEIPT_TEST_COMMITTED").unwrap());
+    let tmux = Tmux::with_executable("tmux", Some(socket));
+    let pane = tmux.get_pane(&pane_id).unwrap().unwrap();
+    let handoff = tmux
+        .attach_exact_with_observed_receipt(
+            &pane,
+            "CONTINUITY PROVEN · receipt_test · ATTACHED LIVE",
+            || fs::write(&committed, "after-receipt").map_err(Into::into),
+        )
+        .unwrap();
+    assert_eq!(handoff.exit_code, 0);
+    assert_eq!(handoff.delivery, Some(ReceiptDelivery::TmuxClient));
 }
 
 #[test]
