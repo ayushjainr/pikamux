@@ -1884,7 +1884,11 @@ mod bounded_candidate_tests {
     fn candidate_probe_preserves_reaped_failure_status_and_both_streams() {
         let (_directory, candidate) = script("printf out\nprintf err >&2\nexit 7");
         for _ in 0..10 {
-            let output = run_candidate_bounded(&candidate, &[], Duration::from_secs(1)).unwrap();
+            // This checks status/stream preservation, not scheduler latency.
+            // Use the unchanged production budget so parallel-suite contention
+            // cannot turn it into an accidental one-second performance gate.
+            // The stalled-process regression separately verifies deadlines.
+            let output = run_candidate_bounded(&candidate, &[], CANDIDATE_PROBE_TIMEOUT).unwrap();
             assert_eq!(output.status.code(), Some(7));
             assert_eq!(output.stdout, b"out");
             assert_eq!(output.stderr, b"err");
