@@ -403,6 +403,7 @@ struct ChatLine {
 struct ChatState {
     name: String,
     input: String,
+    input_limit_reached: bool,
     lines: VecDeque<ChatLine>,
     retained_bytes: usize,
     history_truncated: bool,
@@ -418,6 +419,8 @@ struct ChatState {
 }
 
 impl ChatState {
+    const MAX_INPUT_BYTES: usize = 64 * 1024;
+
     fn opening(
         name: String,
         command_sender: mpsc::Sender<ConsultationInput>,
@@ -428,6 +431,7 @@ impl ChatState {
         Self {
             name,
             input: String::new(),
+            input_limit_reached: false,
             lines: VecDeque::from([ChatLine {
                 role: ChatRole::Pika,
                 text: "Opening a private side conversation…".into(),
@@ -450,6 +454,7 @@ impl ChatState {
         Self {
             name,
             input: String::new(),
+            input_limit_reached: false,
             lines: VecDeque::from([ChatLine {
                 role: ChatRole::Pika,
                 text: "Private consultation is unavailable in this board invocation.".into(),
@@ -468,13 +473,29 @@ impl ChatState {
         }
     }
 
-    fn send_question(&mut self) {
-        let question = self.input.trim().to_owned();
-        if question.is_empty() || self.phase != ChatPhase::Ready {
+    fn append_input(&mut self, value: char) {
+        if !matches!(
+            self.phase,
+            ChatPhase::Opening | ChatPhase::Ready | ChatPhase::Waiting
+        ) {
             return;
         }
+        if self.input.len() + value.len_utf8() > Self::MAX_INPUT_BYTES {
+            self.input_limit_reached = true;
+            return;
+        }
+        self.input.push(value);
+        self.input_limit_reached = false;
+    }
+
+    fn send_question(&mut self) {
+        if self.phase != ChatPhase::Ready || self.input.trim().is_empty() {
+            return;
+        }
+        let question = self.input.trim().to_owned();
         self.push_line(ChatRole::You, question.clone());
         self.input.clear();
+        self.input_limit_reached = false;
         self.scroll = 0;
         if self
             .command_sender
@@ -828,11 +849,12 @@ impl Board {
             match key.code {
                 KeyCode::Esc => leave = chat.request_close(),
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    chat.input.push('\n')
+                    chat.append_input('\n')
                 }
                 KeyCode::Enter => chat.send_question(),
                 KeyCode::Backspace => {
                     chat.input.pop();
+                    chat.input_limit_reached = false;
                 }
                 KeyCode::Up | KeyCode::PageUp => {
                     chat.scroll =
@@ -846,17 +868,13 @@ impl Board {
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     chat.input.clear();
+                    chat.input_limit_reached = false;
                 }
                 KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    chat.input.push('\n');
+                    chat.append_input('\n');
                 }
                 KeyCode::Char(value) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if matches!(
-                        chat.phase,
-                        ChatPhase::Opening | ChatPhase::Ready | ChatPhase::Waiting
-                    ) {
-                        chat.input.push(value);
-                    }
+                    chat.append_input(value);
                 }
                 _ => {}
             }
@@ -1303,7 +1321,14 @@ impl Board {
             output,
             MoveTo(x as u16, composer_row as u16),
             SetForegroundColor(Color::Magenta),
-            Print(fit(&format!("ASK {}", chat.name), available)),
+            Print(fit(
+                &if chat.input_limit_reached {
+                    "64 KiB draft limit · delete text to continue".to_owned()
+                } else {
+                    format!("ASK {}", chat.name)
+                },
+                available
+            )),
             MoveTo(x as u16, composer_row.saturating_add(1) as u16),
             SetForegroundColor(Color::White),
             SetAttribute(Attribute::Reverse),
@@ -1790,6 +1815,68 @@ mod tests {
         assert!(chat.retained_bytes <= 256 * 1024);
         assert!(chat.history_truncated);
         assert!(chat.lines.back().unwrap().text.starts_with("999:"));
+    }
+
+    #[test]
+    fn consultation_draft_caps_all_character_and_newline_paths_with_visible_feedback() {
+        let mut board = board(Status::Working);
+        let mut chat = ChatState::unavailable("bounded".into());
+        chat.phase = ChatPhase::Ready;
+        board.chat = Some(chat);
+        for _ in 0..ChatState::MAX_INPUT_BYTES / 4 {
+            board.chat_key(key(KeyCode::Char('🦀')));
+        }
+        for key in [
+            key(KeyCode::Char('x')),
+            key(KeyCode::Char('🦀')),
+            key(KeyCode::Char('\n')),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            board.chat_key(key);
+            let chat = board.chat.as_ref().unwrap();
+            assert_eq!(chat.input.len(), ChatState::MAX_INPUT_BYTES);
+            assert!(chat.input_limit_reached);
+        }
+        let mut rendered = Vec::new();
+        board.draw(&mut rendered, 120, 30).unwrap();
+        assert!(
+            String::from_utf8(rendered)
+                .unwrap()
+                .contains("64 KiB draft limit")
+        );
+        board.chat_key(key(KeyCode::Backspace));
+        board.chat_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(
+            board.chat.as_ref().unwrap().input.len(),
+            ChatState::MAX_INPUT_BYTES - 3
+        );
+        assert!(!board.chat.as_ref().unwrap().input_limit_reached);
+        board.chat_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(board.chat.as_ref().unwrap().input.is_empty());
+    }
+
+    #[test]
+    fn consultation_draft_never_splits_utf8_or_sends_more_than_the_cap() {
+        let (sender, receiver) = mpsc::channel();
+        let mut chat = ChatState::unavailable("bounded".into());
+        chat.phase = ChatPhase::Ready;
+        chat.command_sender = Some(sender);
+        for _ in 0..ChatState::MAX_INPUT_BYTES - 1 {
+            chat.append_input('x');
+        }
+        chat.append_input('é');
+        assert_eq!(chat.input.len(), ChatState::MAX_INPUT_BYTES - 1);
+        assert!(chat.input_limit_reached);
+        chat.append_input('y');
+        chat.send_question();
+        let ConsultationInput::Question(question) = receiver.recv().unwrap() else {
+            panic!("question expected")
+        };
+        assert_eq!(question.len(), ChatState::MAX_INPUT_BYTES);
+        assert!(question.ends_with('y'));
+        assert!(chat.input.is_empty());
+        assert!(!chat.input_limit_reached);
     }
 
     fn wait_for_phase(board: &mut Board, phase: ChatPhase) {

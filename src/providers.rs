@@ -1,5 +1,6 @@
 use crate::{
     config::Config,
+    consult::{CancellablePipe, CancellationToken, OwnedChild, terminate_child},
     model::{Candidate, Provider, Status},
     paths::Paths,
 };
@@ -196,81 +197,115 @@ impl<'a> Providers<'a> {
     /// protocol. Failure is non-destructive and callers retain a durable retry
     /// marker; this never edits Codex's SQLite state directly.
     pub fn set_codex_native_name(&self, session_id: &str, name: &str) -> bool {
-        if name.trim().is_empty() || !Self::valid_id(Provider::Codex, session_id) {
+        self.set_codex_native_name_with_timeout(session_id, name, Duration::from_millis(3500))
+    }
+
+    fn set_codex_native_name_with_timeout(
+        &self,
+        session_id: &str,
+        name: &str,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        // Bound input before JSON escaping or copying it into the I/O worker.
+        if name.len() > 64 * 1024
+            || name.trim().is_empty()
+            || !Self::valid_id(Provider::Codex, session_id)
+        {
             return false;
         }
         let executable = self.config.executable(Provider::Codex);
-        let mut child = match Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .args(["app-server", "--stdio"])
             .env("CODEX_HOME", &self.paths.codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+            .stderr(Stdio::null());
+        let mut child = match OwnedChild::spawn(&mut command) {
             Ok(child) => child,
             Err(_) => return false,
         };
-        let Some(mut input) = child.stdin.take() else {
-            let _ = child.kill();
-            return false;
-        };
-        let Some(output) = child.stdout.take() else {
-            let _ = child.kill();
-            return false;
-        };
-        let (sender, receiver) = mpsc::sync_channel(8);
-        let _reader = std::thread::spawn(move || {
-            for line in BufReader::new(output).lines().map_while(Result::ok) {
-                if let Ok(value) = serde_json::from_str::<Value>(&line)
-                    && sender.send(value).is_err()
-                {
-                    break;
-                }
-            }
-        });
-        let write = |input: &mut std::process::ChildStdin, value: &Value| {
-            serde_json::to_writer(&mut *input, value)
-                .and_then(|()| input.write_all(b"\n").map_err(serde_json::Error::io))
-                .and_then(|()| input.flush().map_err(serde_json::Error::io))
-        };
-        let initialized = serde_json::json!({
+        let stop = CancellationToken::default();
+        let named = (|| {
+            let input = CancellablePipe::new(child.stdin.take()?, stop.clone()).ok()?;
+            let output = CancellablePipe::new(child.stdout.take()?, stop.clone()).ok()?;
+            let session_id = session_id.to_owned();
+            let name = name.to_owned();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let result = codex_name_protocol(input, output, &session_id, &name);
+                let _ = sender.send(result.is_ok_and(|named| named));
+            });
+            receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .ok()
+        })()
+        .unwrap_or(false);
+        stop.cancel();
+        // The unreaped leader pins its PGID until owned descendants are killed.
+        // Never signal the caller's group or wait for a foreign pipe holder.
+        let cleaned = terminate_child(&mut child).is_ok();
+        named && cleaned
+    }
+}
+
+fn codex_name_protocol(
+    mut input: impl Write,
+    output: impl Read,
+    session_id: &str,
+    name: &str,
+) -> Result<bool> {
+    const MAX_FRAME_BYTES: usize = 64 * 1024;
+    const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+    let write = |input: &mut dyn Write, value: &Value| -> Result<()> {
+        serde_json::to_writer(&mut *input, value)?;
+        input.write_all(b"\n")?;
+        input.flush()?;
+        Ok(())
+    };
+    write(
+        &mut input,
+        &serde_json::json!({
             "method":"initialize", "id":1,
             "params":{"clientInfo":{"name":"pikamux","version":crate::VERSION},
                       "capabilities":{"experimentalApi":true}}
-        });
-        let mut named = false;
-        if write(&mut input, &initialized).is_ok() {
-            let deadline = Instant::now() + Duration::from_secs_f64(3.5);
-            let mut sent_name = false;
-            while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-                let Ok(response) = receiver.recv_timeout(remaining) else {
-                    break;
-                };
-                if response.get("id").and_then(Value::as_i64) == Some(1) && !sent_name {
-                    let _ = write(&mut input, &serde_json::json!({"method":"initialized"}));
-                    if write(
-                        &mut input,
-                        &serde_json::json!({
-                            "method":"thread/name/set", "id":2,
-                            "params":{"threadId":session_id,"name":name}
-                        }),
-                    )
-                    .is_err()
-                    {
-                        break;
-                    }
-                    sent_name = true;
-                } else if response.get("id").and_then(Value::as_i64) == Some(2) {
-                    named = response.get("result").is_some() && response.get("error").is_none();
-                    break;
-                }
-            }
+        }),
+    )?;
+    let mut output = BufReader::new(output);
+    let mut total_bytes = 0;
+    let mut sent_name = false;
+    loop {
+        let mut line = Vec::new();
+        // Take wraps the buffered reader, so even an unterminated JSON frame
+        // cannot grow a read_until allocation beyond the explicit frame bound.
+        let read = output
+            .by_ref()
+            .take((MAX_FRAME_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)?;
+        total_bytes += read;
+        if read == 0 || line.len() > MAX_FRAME_BYTES || total_bytes > MAX_OUTPUT_BYTES {
+            return Ok(false);
         }
-        drop(input);
-        let _ = child.kill();
-        let _ = child.wait();
-        named
+        let Ok(response) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if response.get("id").and_then(Value::as_i64) == Some(1) && !sent_name {
+            if response.get("error").is_some() || response.get("result").is_none() {
+                return Ok(false);
+            }
+            write(&mut input, &serde_json::json!({"method":"initialized"}))?;
+            write(
+                &mut input,
+                &serde_json::json!({
+                    "method":"thread/name/set", "id":2,
+                    "params":{"threadId":session_id,"name":name}
+                }),
+            )?;
+            sent_name = true;
+        } else if response.get("id").and_then(Value::as_i64) == Some(2) && sent_name {
+            return Ok(response.get("result").is_some() && response.get("error").is_none());
+        }
     }
 }
 
@@ -1284,6 +1319,100 @@ mod tests {
         ));
         assert!(Providers::valid_id(Provider::Opencode, "ses_abcdef12"));
         assert!(!Providers::valid_id(Provider::Opencode, "ses_bad-name"));
+    }
+
+    #[test]
+    fn native_name_protocol_bounds_unterminated_frames_and_total_output() {
+        assert!(!codex_name_protocol(Vec::new(), std::io::repeat(b'x'), "id", "name").unwrap());
+        let notification = format!(
+            "{{\"method\":\"notice\",\"params\":\"{}\"}}\n",
+            "x".repeat(1024)
+        );
+        let mut output = std::io::Cursor::new(notification.repeat(2048));
+        assert!(!codex_name_protocol(Vec::new(), &mut output, "id", "name").unwrap());
+        assert!(output.position() <= 1024 * 1024 + 64 * 1024);
+    }
+
+    #[test]
+    fn native_name_protocol_rejects_initialization_error_without_a_name_request() {
+        let mut input = Vec::new();
+        assert!(
+            !codex_name_protocol(&mut input, &b"{\"id\":1,\"error\":{}}\n"[..], "id", "name")
+                .unwrap()
+        );
+        assert!(
+            !String::from_utf8(input)
+                .unwrap()
+                .contains("thread/name/set")
+        );
+    }
+
+    #[cfg(unix)]
+    fn native_name_fixture(temp: &tempfile::TempDir, body: &str) -> (Paths, Config) {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = temp.path().join("codex-naming-fixture");
+        fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = Paths {
+            config_dir: temp.path().join("config"),
+            state_dir: temp.path().join("state"),
+            config: temp.path().join("config/config.json"),
+            database: temp.path().join("state/pika.db"),
+            codex_home: temp.path().join("codex-home"),
+            claude_home: temp.path().join("claude-home"),
+            opencode_data_home: temp.path().join("opencode-data"),
+            opencode_config_home: temp.path().join("opencode-config"),
+        };
+        let mut config = Config::default();
+        config
+            .provider_executables
+            .insert("codex".into(), executable.to_string_lossy().into_owned());
+        (paths, config)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_name_deadline_bounds_blocked_writes_and_kills_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("descendant.pid");
+        let (paths, config) = native_name_fixture(
+            &temp,
+            &format!(
+                "sleep 30 &\nprintf '%s' \"$!\" > {}\nprintf '%s\\n' '{{\"id\":1,\"result\":{{}}}}'\nwait",
+                shell_words::quote(&pid_file.to_string_lossy())
+            ),
+        );
+        let started = Instant::now();
+        assert!(
+            !Providers::new(&paths, &config).set_codex_native_name_with_timeout(
+                "11111111-1111-4111-8111-111111111111",
+                &"x".repeat(64 * 1024),
+                Duration::from_millis(300)
+            )
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        for _ in 0..100 {
+            // Signal zero only inspects our fixture child; no user process is signalled.
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("owned naming descendant survived cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_name_stdout_flood_is_rejected_before_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let (paths, config) = native_name_fixture(&temp, "exec /usr/bin/yes flood");
+        let started = Instant::now();
+        assert!(
+            !Providers::new(&paths, &config)
+                .set_codex_native_name("11111111-1111-4111-8111-111111111111", "name")
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]

@@ -1,14 +1,26 @@
 use crate::{
+    consult::{CancellablePipe, CancellationToken, OwnedChild, poll_owned_child, terminate_child},
     model::{Pane, Provider},
     terminal::{self, BACKGROUND_ENV, FOREGROUND_ENV, Palette},
 };
 use anyhow::{Context, Result, bail};
-use std::{collections::BTreeMap, ffi::OsStr, process::Command};
+use std::{
+    collections::BTreeMap,
+    ffi::OsStr,
+    io::Read,
+    process::{Command, Output, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 const SEPARATOR: &str = "\u{1f}";
 pub const HISTORY_LIMIT: usize = 100_000;
 pub const WINDOWS_TERMINAL_DA2_RESPONSE: &str = "\u{1b}[>0;10;1c";
 const TERMINAL_REPLY_KEY_OPTION: &str = "@pika_terminal_reply_key";
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const STDOUT_LIMIT: usize = 16 * 1024 * 1024;
+const STDERR_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Tmux {
@@ -46,11 +58,15 @@ impl Tmux {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let output = self
-            .command()
-            .args(args)
-            .output()
-            .context("cannot run tmux")?;
+        self.output_with_timeout(args, check, COMMAND_TIMEOUT)
+    }
+
+    fn output_with_timeout<I, S>(&self, args: I, check: bool, timeout: Duration) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = bounded_output(self.command().args(args), timeout)?;
         if check && !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             bail!(
@@ -254,11 +270,11 @@ impl Tmux {
         let mutation = [
             format!(
                 "set-option -t {} status off",
-                shell_words::quote(&pane.session_name)
+                shell_words::quote(&pane.pane_id)
             ),
             format!(
                 "set-option -t {} mouse on",
-                shell_words::quote(&pane.session_name)
+                shell_words::quote(&pane.pane_id)
             ),
             format!(
                 "set-option -w -t {} history-limit {}",
@@ -283,13 +299,15 @@ impl Tmux {
     }
 
     pub fn ensure_rgb(&self) {
-        let current = self.output(["show-options", "-s", "-v", "terminal-features"], false);
-        if current.is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-                    line.starts_with("xterm*") && line.split(':').any(|part| part == "RGB")
-                })
-        }) {
+        let Ok(current) = self.output(["show-options", "-s", "-v", "terminal-features"], false)
+        else {
+            return;
+        };
+        if current.status.success()
+            && String::from_utf8_lossy(&current.stdout)
+                .lines()
+                .any(|line| line.starts_with("xterm*") && line.split(':').any(|part| part == "RGB"))
+        {
             return;
         }
         let _ = self.output(
@@ -301,12 +319,13 @@ impl Tmux {
     /// Consume Windows Terminal's exact DA2 report only in Pika-tagged panes.
     /// User panes receive the same bytes back unchanged.
     pub fn ensure_terminal_reply_guard(&self) -> bool {
-        let marker = self
-            .output(
-                ["show-options", "-s", "-v", TERMINAL_REPLY_KEY_OPTION],
-                false,
-            )
-            .ok()
+        let Ok(marker) = self.output(
+            ["show-options", "-s", "-v", TERMINAL_REPLY_KEY_OPTION],
+            false,
+        ) else {
+            return false;
+        };
+        let marker = Some(marker)
             .filter(|output| output.status.success())
             .and_then(|output| String::from_utf8(output.stdout).ok())
             .and_then(|value| value.trim().parse::<u16>().ok());
@@ -315,18 +334,19 @@ impl Tmux {
             candidates.push(value);
         }
         candidates.extend((500..=509).filter(|value| Some(*value) != marker));
-        let bindings = self
-            .output(["list-keys", "-T", "root"], false)
-            .ok()
+        let Ok(bindings) = self.output(["list-keys", "-T", "root"], false) else {
+            return false;
+        };
+        let bindings = Some(bindings)
             .filter(|output| output.status.success())
             .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
             .unwrap_or_default();
         for value in candidates {
             let option = format!("user-keys[{value}]");
-            let current = self.output(["show-options", "-s", "-v", &option], false);
-            let existing = current
-                .as_ref()
-                .ok()
+            let Ok(current) = self.output(["show-options", "-s", "-v", &option], false) else {
+                return false;
+            };
+            let existing = Some(&current)
                 .filter(|output| output.status.success())
                 .and_then(|output| {
                     let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -348,18 +368,20 @@ impl Tmux {
                 }
                 continue;
             }
-            let option_set = self.output(
+            let Ok(option_set) = self.output(
                 ["set-option", "-s", &option, WINDOWS_TERMINAL_DA2_RESPONSE],
                 false,
-            );
-            if !option_set.is_ok_and(|output| output.status.success()) {
+            ) else {
+                return false;
+            };
+            if !option_set.status.success() {
                 continue;
             }
             let replay = format!(
                 "send-keys -l {}",
                 shell_words::quote(WINDOWS_TERMINAL_DA2_RESPONSE)
             );
-            let bound = self.output(
+            let Ok(bound) = self.output(
                 [
                     "bind-key",
                     "-T",
@@ -372,8 +394,10 @@ impl Tmux {
                     &replay,
                 ],
                 false,
-            );
-            if bound.is_ok_and(|output| output.status.success()) {
+            ) else {
+                return false;
+            };
+            if bound.status.success() {
                 let _ = self.output(
                     [
                         "set-option",
@@ -466,7 +490,8 @@ impl Tmux {
             "run-shell 'exit 75'".into(),
         ]);
         if inside_tmux {
-            let status = Command::new(&argv[0]).args(&argv[1..]).status()?;
+            let status =
+                bounded_output(Command::new(&argv[0]).args(&argv[1..]), COMMAND_TIMEOUT)?.status;
             if status.success() {
                 on_started()?;
             }
@@ -490,18 +515,12 @@ impl Tmux {
         self.ensure_rgb();
         self.configure_home(session, pane)?;
         if inside_tmux {
-            let status = self
-                .command()
-                .args(["switch-client", "-t", session])
-                .status()?;
+            let status = self.output(["switch-client", "-t", session], false)?.status;
             if status.success() {
                 if let Some(pane) = pane {
-                    let window = self
-                        .command()
-                        .args(["select-window", "-t", pane])
-                        .status()?;
+                    let window = self.output(["select-window", "-t", pane], false)?.status;
                     if window.success() {
-                        let selected = self.command().args(["select-pane", "-t", pane]).status()?;
+                        let selected = self.output(["select-pane", "-t", pane], false)?.status;
                         if selected.success() {
                             on_started()?;
                         }
@@ -744,6 +763,98 @@ pub fn is_pika_session(name: &str) -> bool {
     name.starts_with("pika-c-") || name.starts_with("pika-a-") || name.starts_with("pika-o-")
 }
 
+/// Noninteractive tmux clients are disposable, but their server and the panes
+/// it owns are not. Only this fresh client process group may be cleaned up.
+/// Pipe pumps are cancellable even when a descendant escapes that group.
+fn bounded_output(command: &mut Command, timeout: Duration) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = OwnedChild::spawn(command).context("cannot run tmux")?;
+    let stop = CancellationToken::default();
+    let result = (|| {
+        let stdout = CancellablePipe::new(
+            child.stdout.take().expect("stdout configured"),
+            stop.clone(),
+        )?;
+        let stderr = CancellablePipe::new(
+            child.stderr.take().expect("stderr configured"),
+            stop.clone(),
+        )?;
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let stdout_sender = sender.clone();
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stdout
+                .take((STDOUT_LIMIT + 1) as u64)
+                .read_to_end(&mut bytes);
+            let _ = stdout_sender.send((true, result.map(|_| bytes)));
+        });
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stderr
+                .take((STDERR_LIMIT + 1) as u64)
+                .read_to_end(&mut bytes);
+            let _ = sender.send((false, result.map(|_| bytes)));
+        });
+        let mut stdout = None;
+        let mut stderr = None;
+        let mut status = None;
+        loop {
+            while let Ok((is_stdout, result)) = receiver.try_recv() {
+                let bytes = result.context("cannot read tmux output")?;
+                let limit = if is_stdout {
+                    STDOUT_LIMIT
+                } else {
+                    STDERR_LIMIT
+                };
+                if bytes.len() > limit {
+                    bail!(
+                        "tmux {} exceeded the {limit}-byte safety limit",
+                        if is_stdout { "stdout" } else { "stderr" }
+                    );
+                }
+                if is_stdout {
+                    stdout = Some(bytes);
+                } else {
+                    stderr = Some(bytes);
+                }
+            }
+            if status.is_none() {
+                // This kills only owned descendants before reaping the group
+                // leader, so its numeric PGID cannot race with PID reuse.
+                status = poll_owned_child(&mut child)?;
+            }
+            if let (Some(status), Some(stdout), Some(stderr)) =
+                (status, stdout.as_mut(), stderr.as_mut())
+            {
+                return Ok(Output {
+                    status,
+                    stdout: std::mem::take(stdout),
+                    stderr: std::mem::take(stderr),
+                });
+            }
+            if Instant::now() >= deadline {
+                bail!("tmux timed out after {}s", timeout.as_secs_f64());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    })();
+    stop.cancel();
+    // Do not join pipe readers: cancelled nonblocking reads exit promptly and
+    // no foreign process holding a descriptor can own this caller's lifetime.
+    let cleanup = terminate_child(&mut child);
+    match result {
+        Ok(output) => {
+            cleanup?;
+            Ok(output)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn parse_pane(line: &str) -> Option<Pane> {
     let parts: Vec<_> = if line.contains(SEPARATOR) {
         line.split(SEPARATOR).collect()
@@ -788,6 +899,7 @@ fn pane_generation_condition(pane: &Pane) -> String {
     let created = pane.created.to_string();
     let fields = [
         ("#{pane_id}", pane.pane_id.as_str()),
+        ("#{session_name}", pane.session_name.as_str()),
         ("#{pane_pid}", pane_pid.as_str()),
         ("#{session_created}", created.as_str()),
         (
@@ -995,9 +1107,156 @@ mod tests {
         assert_eq!(calls.lines().count(), 1);
         assert!(calls.contains("if-shell -F -t %1"));
         assert!(calls.contains("#{@pika_session_id}"));
-        assert!(calls.contains("set-option -t pika-c-workstream status off"));
+        assert!(calls.contains("#{==:#{session_name},pika-c-workstream}"));
+        assert!(calls.contains(&format!(
+            "set-option -t {} status off",
+            shell_words::quote("%1")
+        )));
+        assert!(calls.contains(&format!(
+            "set-option -t {} mouse on",
+            shell_words::quote("%1")
+        )));
+        assert!(!calls.contains("set-option -t pika-c-workstream"));
         assert!(calls.contains("set-option -w -t"));
         assert!(calls.contains("history-limit 100000"));
+    }
+
+    #[cfg(unix)]
+    fn tmux_fixture(temp: &tempfile::TempDir, body: &str) -> Tmux {
+        let executable = temp.path().join("bounded-tmux-fixture");
+        fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        Tmux::with_executable(executable.to_string_lossy(), None)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_home_rejects_rename_even_when_old_name_now_belongs_to_a_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let mutation = temp.path().join("replacement-was-mutated");
+        // Model a server whose %1 was renamed to user-work and whose old name
+        // has been reused by a new session. All other cached fields still match.
+        // The old condition accepted this; the session-name term must reject it.
+        let tmux = tmux_fixture(
+            &temp,
+            &format!(
+                "case \"$5\" in *'#{{==:#{{session_name}},pika-c-workstream}}'*) exit 75;; esac\nprintf changed > {}",
+                shell_words::quote(&mutation.to_string_lossy())
+            ),
+        );
+        assert!(tmux.configure_exact_home(&exact_test_pane()).is_err());
+        assert!(!mutation.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noninteractive_tmux_deadline_kills_owned_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("descendant.pid");
+        let tmux = tmux_fixture(
+            &temp,
+            &format!(
+                "sleep 30 &\nprintf '%s' \"$!\" > {}\nwait",
+                shell_words::quote(&pid_file.to_string_lossy())
+            ),
+        );
+        let started = Instant::now();
+        let error = tmux
+            .output_with_timeout(["list-panes"], false, Duration::from_millis(300))
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_fixture_child_gone(&pid_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_tmux_adapter_does_not_leave_a_descendant_holding_output_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("descendant.pid");
+        let tmux = tmux_fixture(
+            &temp,
+            &format!(
+                "sleep 30 &\nprintf '%s' \"$!\" > {}\nprintf complete\nexit 0",
+                shell_words::quote(&pid_file.to_string_lossy())
+            ),
+        );
+        let started = Instant::now();
+        let output = tmux
+            .output_with_timeout(["list-panes"], true, Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(output.stdout, b"complete");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_fixture_child_gone(&pid_file);
+    }
+
+    #[cfg(unix)]
+    fn assert_fixture_child_gone(pid_file: &std::path::Path) {
+        let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        for _ in 0..100 {
+            // Signal zero is read-only and this PID came from our own fixture.
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("owned fixture descendant survived cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_stdout_and_stderr_floods_fail_closed() {
+        for (redirect, channel) in [("", "stdout"), (">&2", "stderr")] {
+            let temp = tempfile::tempdir().unwrap();
+            let tmux = tmux_fixture(&temp, &format!("exec /usr/bin/yes flood {redirect}"));
+            let started = Instant::now();
+            let error = tmux.output(["list-panes"], false).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("tmux {channel} exceeded")),
+                "{error:#}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(3));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn best_effort_terminal_setup_stops_after_adapter_io_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("calls");
+        let tmux = tmux_fixture(
+            &temp,
+            &format!(
+                "printf '%s\\n' \"$*\" >> {}\nexec /usr/bin/yes flood >&2",
+                shell_words::quote(&trace.to_string_lossy())
+            ),
+        );
+        assert!(!tmux.ensure_terminal_reply_guard());
+        tmux.ensure_rgb();
+        assert_eq!(fs::read_to_string(trace).unwrap().lines().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inside_tmux_handoff_is_bounded_and_never_acknowledges_a_stalled_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let tmux = tmux_fixture(
+            &temp,
+            "case \"$*\" in *switch-client*) sleep 30;; *) exit 0;; esac",
+        );
+        let mut started = false;
+        let before = Instant::now();
+        let error = tmux
+            .attach_exact_with_started_mode(&exact_test_pane(), true, || {
+                started = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(!started);
+        assert!(before.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(unix)]
