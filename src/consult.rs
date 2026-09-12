@@ -14,9 +14,11 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -473,7 +475,7 @@ impl Side {
 }
 
 struct JsonChild {
-    child: Child,
+    child: OwnedChild,
     writes: mpsc::Sender<WriteRequest>,
     frames: Receiver<Result<Value, String>>,
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -486,14 +488,12 @@ struct WriteRequest {
 
 impl JsonChild {
     fn spawn(mut command: Command) -> Result<Self> {
-        owned_process_group(&mut command);
         command
             .env("PIKA_EPHEMERAL", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
+        let mut child = OwnedChild::spawn(&mut command)
             .context("could not start provider side consultation")?;
         let stdin = child
             .stdin
@@ -584,7 +584,7 @@ impl JsonChild {
                 Ok(Err(message)) => bail!(message),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    let status = self.child.try_wait()?.map(|value| value.to_string());
+                    let status = poll_owned_child(&mut self.child)?.map(|value| value.to_string());
                     let detail = self.stderr_tail();
                     bail!(
                         "provider side consultation exited with status {}{}",
@@ -1173,9 +1173,9 @@ struct OpenCodeSide {
     timeout: Duration,
     thread_id: Option<String>,
     fork_uncertain: bool,
-    turn_process: Option<Child>,
+    turn_process: Option<OwnedChild>,
     turn_stderr: Option<Arc<Mutex<Vec<u8>>>>,
-    fork_server: Option<Child>,
+    fork_server: Option<OwnedChild>,
     closed: bool,
     cancellation: CancellationToken,
 }
@@ -1241,13 +1241,11 @@ impl OpenCodeSide {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        owned_process_group(&mut command);
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
-        let server = command
-            .spawn()
-            .context("OpenCode side-session server failed")?;
+        let server =
+            OwnedChild::spawn(&mut command).context("OpenCode side-session server failed")?;
         self.fork_server = Some(server);
         let base = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let health_deadline = Instant::now() + Duration::from_secs(15);
@@ -1259,12 +1257,11 @@ impl OpenCodeSide {
                 self.fork_server = None;
                 bail!("OpenCode side consultation cancelled");
             }
-            if let Some(status) = self
-                .fork_server
-                .as_mut()
-                .context("OpenCode fork server handle was lost")?
-                .try_wait()?
-            {
+            if let Some(status) = poll_owned_child(
+                self.fork_server
+                    .as_mut()
+                    .context("OpenCode fork server handle was lost")?,
+            )? {
                 bail!("OpenCode side-session server exited before becoming ready: {status}");
             }
             if http_json(
@@ -1407,13 +1404,11 @@ impl OpenCodeSide {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        owned_process_group(&mut command);
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
-        let mut child = command
-            .spawn()
-            .map_err(|error| SideFailure::turn(error, *delivery))?;
+        let mut child =
+            OwnedChild::spawn(&mut command).map_err(|error| SideFailure::turn(error, *delivery))?;
         *delivery = Delivery::Unknown;
         let stderr = Arc::new(Mutex::new(Vec::new()));
         if let Some(pipe) = child.stderr.take() {
@@ -1463,7 +1458,7 @@ impl OpenCodeSide {
             let exited = self
                 .turn_process
                 .as_mut()
-                .and_then(|process| process.try_wait().ok().flatten());
+                .and_then(|process| poll_owned_child(process).ok().flatten());
             if exited.is_some() {
                 if let Ok((seen_user, Some(answer))) = self.completed_answer(&target, checkpoint) {
                     if seen_user {
@@ -1646,30 +1641,236 @@ fn valid_cwd(value: Option<&str>) -> Option<&Path> {
     value.map(Path::new).filter(|path| path.is_dir())
 }
 
-fn terminate_child(child: &mut Child) -> Result<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
+/// An ephemeral process group whose leader remains waitable until cleanup.
+/// The cached status is essential: after reap, even waitid(old_pid) could refer
+/// to a different child of this same process if the numeric PID gets reused.
+pub(crate) struct OwnedChild {
+    child: Child,
+    status: Option<ExitStatus>,
+    pub(crate) stdin: Option<ChildStdin>,
+    pub(crate) stdout: Option<ChildStdout>,
+    pub(crate) stderr: Option<ChildStderr>,
+}
+
+impl OwnedChild {
+    pub(crate) fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        owned_process_group(command);
+        let mut child = command.spawn()?;
+        Ok(Self {
+            stdin: child.stdin.take(),
+            stdout: child.stdout.take(),
+            stderr: child.stderr.take(),
+            child,
+            status: None,
+        })
     }
-    // These are Pika-created ephemeral children only. Rust's portable API has
-    // no gentle terminate; kill is scoped to this exact owned `Child` handle.
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub(crate) fn exit_status(&self) -> ExitStatus {
+        self.status.expect("owned group cleaned and child reaped")
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        let _ = terminate_child(self);
+    }
+}
+
+// Keep the direct child waitable until group cleanup. An unreaped child reserves
+// its PID even after exit, so its PGID cannot be reused by an unrelated group.
+// None means another wait already reaped it: never signal that numeric ID again.
+#[cfg(unix)]
+fn owned_child_state(child: &OwnedChild) -> std::io::Result<Option<bool>> {
+    if child.status.is_some() {
+        return Ok(None);
+    }
+    loop {
+        // SAFETY: waitid initializes siginfo and WNOWAIT retains this child.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(Some(unsafe { info.si_pid() } != 0));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+}
+
+pub(crate) fn owned_child_exited(child: &mut OwnedChild) -> std::io::Result<bool> {
+    if child.status.is_some() {
+        return Ok(true);
+    }
     #[cfg(unix)]
     {
-        let process_group = -(child.id() as i32);
-        // SAFETY: every child passed here was spawned into a new process group
-        // by `owned_process_group`; the negative ID cannot address the parent.
-        if unsafe { libc::kill(process_group, libc::SIGKILL) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error).context("could not terminate provider side process group");
+        owned_child_state(child)?.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))
+    }
+    #[cfg(not(unix))]
+    {
+        child.status = child.child.try_wait()?;
+        Ok(child.status.is_some())
+    }
+}
+
+pub(crate) fn poll_owned_child(child: &mut OwnedChild) -> Result<Option<ExitStatus>> {
+    if !owned_child_exited(child)? {
+        return Ok(None);
+    }
+    terminate_child(child)?;
+    Ok(Some(child.exit_status()))
+}
+
+pub(crate) fn terminate_child(child: &mut OwnedChild) -> Result<()> {
+    if child.status.is_some() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        if let Some(exited) = owned_child_state(child)? {
+            // SAFETY: callers create a fresh process group before spawn and do
+            // not reap before this point. The waitable leader pins its PGID;
+            // only this operation's group is signalled, including descendants
+            // whose launcher has already exited.
+            if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH)
+                    && !exited_group_is_empty(child.id(), exited, &error)
+                {
+                    return Err(error).context("could not terminate provider side process group");
+                }
             }
         }
     }
     #[cfg(not(unix))]
-    child
-        .kill()
-        .context("could not terminate provider side child")?;
-    child.wait().context("could not reap provider side child")?;
+    if child.child.try_wait()?.is_none() {
+        child
+            .child
+            .kill()
+            .context("could not terminate provider side child")?;
+    }
+    child.status = Some(
+        child
+            .child
+            .wait()
+            .context("could not reap provider side child")?,
+    );
     Ok(())
+}
+
+#[cfg(unix)]
+fn exited_group_is_empty(id: u32, exited: bool, error: &std::io::Error) -> bool {
+    #[cfg(target_os = "macos")]
+    if exited && error.raw_os_error() == Some(libc::EPERM) {
+        // Darwin returns EPERM for a group containing only the zombie leader.
+        // Check this specific pinned group; do not suppress permission errors
+        // when any other member remains. Two slots suffice to disprove empty.
+        let mut members = [0u32; 2];
+        let capacity = std::mem::size_of_val(&members) as i32;
+        // A zero return can mean either no matches or an error, so clear and
+        // check this thread's errno instead of accepting an unknown inventory.
+        let count = unsafe {
+            *libc::__error() = 0;
+            libc::proc_listpids(
+                libproc::libproc::proc_pid::ProcType::ProcPGRPOnly as u32,
+                id,
+                members.as_mut_ptr().cast(),
+                capacity,
+            )
+        };
+        return count >= 0
+            && count <= capacity
+            && (count != 0 || std::io::Error::last_os_error().raw_os_error() == Some(0))
+            && count as usize % std::mem::size_of::<u32>() == 0
+            && members[..count as usize / std::mem::size_of::<u32>()]
+                .iter()
+                .all(|member| *member == id);
+    }
+    let _ = (id, exited, error);
+    false
+}
+
+/// The owning operation cancels these nonblocking pipe waits before joining.
+/// This also bounds cleanup when a descendant leaves the owned process group;
+/// that foreign group must not be signalled just to obtain pipe EOF.
+pub(crate) struct CancellablePipe<T> {
+    pipe: T,
+    stop: CancellationToken,
+}
+
+impl<T> CancellablePipe<T> {
+    #[cfg(unix)]
+    pub(crate) fn new(pipe: T, stop: CancellationToken) -> std::io::Result<Self>
+    where
+        T: AsRawFd,
+    {
+        let fd = pipe.as_raw_fd();
+        // SAFETY: fd is borrowed from the live pipe and only its flags change.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { pipe, stop })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn new(pipe: T, stop: CancellationToken) -> std::io::Result<Self> {
+        Ok(Self { pipe, stop })
+    }
+}
+
+impl<T: Read> Read for CancellablePipe<T> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.stop.is_cancelled() {
+                return Ok(0);
+            }
+            match self.pipe.read(output) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+impl<T: Write> Write for CancellablePipe<T> {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        loop {
+            if self.stop.is_cancelled() {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            match self.pipe.write(input) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.pipe.flush()
+    }
 }
 
 fn owned_process_group(command: &mut Command) {
@@ -1691,47 +1892,63 @@ fn run_output_bounded_cancellable(
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<String> {
+    let deadline = Instant::now() + timeout;
     let mut command = Command::new(executable);
     command.args(args);
-    owned_process_group(&mut command);
-    let mut child = command
+    command
         .env("PIKA_EPHEMERAL", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = OwnedChild::spawn(&mut command)
         .with_context(|| format!("could not run {}", executable.display()))?;
     let stdout = Arc::new(Mutex::new(Vec::new()));
     let stderr = Arc::new(Mutex::new(Vec::new()));
-    let stdout_thread = child.stdout.take().map(|pipe| {
-        let target = Arc::clone(&stdout);
-        thread::spawn(move || drain_bounded(pipe, target))
-    });
-    let stderr_thread = child.stderr.take().map(|pipe| {
-        let target = Arc::clone(&stderr);
-        thread::spawn(move || drain_bounded(pipe, target))
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if cancellation.is_cancelled() {
-            terminate_child(&mut child)?;
-            bail!("{} cancelled", executable.display());
+    let stop = CancellationToken::default();
+    let pipes = (|| -> std::io::Result<_> {
+        Ok((
+            CancellablePipe::new(
+                child.stdout.take().expect("stdout configured"),
+                stop.clone(),
+            )?,
+            CancellablePipe::new(
+                child.stderr.take().expect("stderr configured"),
+                stop.clone(),
+            )?,
+        ))
+    })();
+    let (out_pipe, err_pipe) = match pipes {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            let _ = terminate_child(&mut child);
+            return Err(error.into());
         }
-        if let Some(status) = child.try_wait()? {
-            break status;
+    };
+    let target = Arc::clone(&stdout);
+    let stdout_thread = thread::spawn(move || drain_bounded(out_pipe, target));
+    let target = Arc::clone(&stderr);
+    let stderr_thread = thread::spawn(move || drain_bounded(err_pipe, target));
+    let outcome: Result<()> = loop {
+        if cancellation.is_cancelled() {
+            break Err(anyhow::anyhow!("{} cancelled", executable.display()));
+        }
+        match owned_child_exited(&mut child) {
+            Ok(true) if stdout_thread.is_finished() && stderr_thread.is_finished() => break Ok(()),
+            Ok(_) => {}
+            Err(error) => break Err(error.into()),
         }
         if Instant::now() >= deadline {
-            terminate_child(&mut child)?;
-            bail!("{} timed out", executable.display());
+            break Err(anyhow::anyhow!("{} timed out", executable.display()));
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(2));
     };
-    if let Some(reader) = stdout_thread {
-        let _ = reader.join();
-    }
-    if let Some(reader) = stderr_thread {
-        let _ = reader.join();
-    }
+    let cleanup = terminate_child(&mut child);
+    stop.cancel();
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    cleanup?;
+    outcome?;
+    let status = child.exit_status();
     let stdout = stdout.lock().map(|value| value.clone()).unwrap_or_default();
     let stderr = stderr.lock().map(|value| value.clone()).unwrap_or_default();
     let out = String::from_utf8_lossy(&stdout).trim().to_owned();
@@ -1996,6 +2213,149 @@ fn decode_chunked(mut value: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_output_deadline_includes_exited_launcher_pipes() {
+        for _ in 0..20 {
+            let started = Instant::now();
+            let error = run_output_bounded(
+                Path::new("/bin/sh"),
+                &["-c", "sleep 5 & exit 0"],
+                Duration::from_millis(10),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("timed out"), "{error:#}");
+            assert!(started.elapsed() < Duration::from_millis(150));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_output_cancels_after_launcher_exit() {
+        let cancellation = CancellationToken::default();
+        let signal = cancellation.clone();
+        let cancel = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            signal.cancel();
+        });
+        let started = Instant::now();
+        let error = run_output_bounded_cancellable(
+            Path::new("/bin/sh"),
+            &["-c", "sleep 5 & exit 0"],
+            Duration::from_secs(1),
+            &cancellation,
+        )
+        .unwrap_err();
+        cancel.join().unwrap();
+        assert!(error.to_string().contains("cancelled"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_group_cleanup_retains_exited_leader_until_descendants_are_signalled() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 5 & exit 0"]);
+        let mut child = OwnedChild::spawn(command.stdout(Stdio::piped())).unwrap();
+        let mut pipe = child.stdout.take().unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            let _ = send.send(pipe.read_to_end(&mut Vec::new()));
+        });
+        let started = Instant::now();
+        while !owned_child_exited(&mut child).unwrap() {
+            assert!(started.elapsed() < Duration::from_millis(150));
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(owned_child_state(&child).unwrap(), Some(true));
+        terminate_child(&mut child).unwrap();
+        assert_eq!(owned_child_state(&child).unwrap(), None);
+        receive
+            .recv_timeout(Duration::from_millis(150))
+            .unwrap()
+            .unwrap();
+        reader.join().unwrap();
+        // Repeated cleanup uses the cached status, never the now-unpinned PGID.
+        terminate_child(&mut child).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_reap_never_probes_or_signals_a_reused_child_id() {
+        let mut first_command = Command::new("/bin/sh");
+        first_command.args(["-c", "exit 7"]);
+        let mut first = OwnedChild::spawn(&mut first_command).unwrap();
+        while !owned_child_exited(&mut first).unwrap() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        terminate_child(&mut first).unwrap();
+
+        let mut next_command = Command::new("/bin/sleep");
+        next_command.arg("5");
+        let mut next = OwnedChild::spawn(&mut next_command).unwrap();
+        // Deterministically model PID reuse by making the cached old handle's
+        // numeric lookup point at a new child owned by this same parent. No
+        // waitid or signal is permitted through an already-reaped handle.
+        std::mem::swap(&mut first.child, &mut next.child);
+        assert!(owned_child_exited(&mut first).unwrap());
+        terminate_child(&mut first).unwrap();
+        let still_running = first.child.try_wait().unwrap().is_none();
+        std::mem::swap(&mut first.child, &mut next.child);
+        terminate_child(&mut next).unwrap();
+        assert!(still_running, "cached cleanup signalled a reused child ID");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_pipe_workers_stop_without_peer_eof_or_available_capacity() {
+        use std::os::unix::net::UnixStream;
+        let (reader, _held_writer) = UnixStream::pair().unwrap();
+        let stop = CancellationToken::default();
+        let mut reader = CancellablePipe::new(reader, stop.clone()).unwrap();
+        let read = thread::spawn(move || reader.read(&mut [0; 1]));
+
+        let (writer, _held_reader) = UnixStream::pair().unwrap();
+        let mut writer = CancellablePipe::new(writer, stop.clone()).unwrap();
+        let write = thread::spawn(move || writer.write_all(&vec![0; 4 * 1024 * 1024]));
+        thread::sleep(Duration::from_millis(10));
+        let started = Instant::now();
+        stop.cancel();
+        assert_eq!(read.join().unwrap().unwrap(), 0);
+        assert_eq!(
+            write.join().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_output_retains_success_failure_and_size_limits() {
+        assert_eq!(
+            run_output_bounded(
+                Path::new("/bin/sh"),
+                &["-c", "printf ready"],
+                Duration::from_secs(1)
+            )
+            .unwrap(),
+            "ready"
+        );
+        let error = run_output_bounded(
+            Path::new("/bin/sh"),
+            &["-c", "printf diagnostic >&2; exit 7"],
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("diagnostic"));
+        let output = run_output_bounded(
+            Path::new("/bin/sh"),
+            &["-c", "head -c 131072 /dev/zero | tr '\\000' x"],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(output.len(), MAX_STDERR);
+    }
 
     #[test]
     fn base64_is_rfc_4648_compatible() {

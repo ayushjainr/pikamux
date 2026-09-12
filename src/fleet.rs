@@ -4,7 +4,10 @@
 //! status document may suggest addresses, but only a validated handshake and
 //! explicit persistence authorize snapshots or actions.
 
-use crate::consult::{CancellationToken, MAX_QUESTION_BYTES};
+use crate::consult::{
+    CancellablePipe, CancellationToken, MAX_QUESTION_BYTES, OwnedChild, owned_child_exited,
+    poll_owned_child, terminate_child,
+};
 use crate::experts::{CardStatus, ExpertMatch, rank_experts, remote_source_availability};
 use crate::model::{Candidate, ExpertProfile, FleetNode, Provider, Session, Status};
 use crate::store::{Store, StoredExpertProfile};
@@ -15,10 +18,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -2209,7 +2210,7 @@ pub struct RemoteConsultation {
     node: FleetNode,
     session: FleetSession,
     policy: ConsultationPolicy,
-    child: Child,
+    child: OwnedChild,
     input: Option<AsyncChildInput>,
     events: Receiver<Result<Value, FleetError>>,
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -2279,12 +2280,11 @@ impl RemoteConsultation {
             policy.effort.clone(),
         ];
         let mut command = transport.command(&node.ssh_target, &args, false)?;
-        owned_process_group(&mut command);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|error| {
+        let mut child = OwnedChild::spawn(&mut command).map_err(|error| {
             FleetError::new(
                 FleetErrorKind::Unreachable,
                 format!("Could not start remote side channel: {error}"),
@@ -2580,9 +2580,7 @@ impl RemoteConsultation {
     fn abort(&mut self) {
         self.transport_aborted = true;
         self.input.take();
-        if self.child.try_wait().ok().flatten().is_none() {
-            kill_reap(&mut self.child);
-        }
+        kill_reap(&mut self.child);
     }
 
     fn cleanup_unknown(&self, message: &str) -> FleetError {
@@ -3403,21 +3401,40 @@ fn run_bounded_command(
         ));
     }
     let deadline = Instant::now() + timeout;
-    owned_process_group(command);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
+    let mut child = OwnedChild::spawn(command)
         .map_err(|error| FleetError::new(FleetErrorKind::Unreachable, error.to_string()))?;
-    let stdout = child.stdout.take().expect("stdout configured");
-    let stderr = child.stderr.take().expect("stderr configured");
+    let stop = CancellationToken::default();
+    let pipes = (|| -> std::io::Result<_> {
+        Ok((
+            CancellablePipe::new(
+                child.stdout.take().expect("stdout configured"),
+                stop.clone(),
+            )?,
+            CancellablePipe::new(
+                child.stderr.take().expect("stderr configured"),
+                stop.clone(),
+            )?,
+            CancellablePipe::new(child.stdin.take().expect("stdin configured"), stop.clone())?,
+        ))
+    })();
+    let (stdout, stderr, mut stdin) = match pipes {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            kill_reap(&mut child);
+            return Err(FleetError::new(
+                FleetErrorKind::Unreachable,
+                error.to_string(),
+            ));
+        }
+    };
     let overflow = Arc::new(AtomicBool::new(false));
     let stdout_thread = spawn_bounded_reader(stdout, stdout_limit, overflow.clone());
     let stderr_thread = spawn_bounded_reader(stderr, stderr_limit, overflow.clone());
     let (write_sender, write_result) = mpsc::sync_channel(1);
-    let mut stdin = child.stdin.take().expect("stdin configured");
     let input = input.map(<[u8]>::to_vec);
     let writer_thread = thread::spawn(move || {
         let result = input
@@ -3431,26 +3448,18 @@ fn run_bounded_command(
         let _ = write_sender.send(result);
     });
     let mut write_complete = false;
-    let status = loop {
+    let outcome = loop {
         if !write_complete {
             match write_result.try_recv() {
                 Ok(Ok(())) => write_complete = true,
                 Ok(Err(error)) => {
-                    kill_reap(&mut child);
-                    let _ = writer_thread.join();
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.join();
-                    return Err(FleetError::new(
+                    break Err(FleetError::new(
                         FleetErrorKind::Unreachable,
                         format!("SSH input write failed: {error}"),
                     ));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    kill_reap(&mut child);
-                    let _ = writer_thread.join();
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.join();
-                    return Err(FleetError::new(
+                    break Err(FleetError::new(
                         FleetErrorKind::Unreachable,
                         "SSH input writer stopped",
                     ));
@@ -3459,33 +3468,35 @@ fn run_bounded_command(
             }
         }
         if overflow.load(Ordering::Relaxed) {
-            kill_reap(&mut child);
-            let _ = writer_thread.join();
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
-            return Err(FleetError::new(
+            break Err(FleetError::new(
                 FleetErrorKind::Incompatible,
                 "Remote Pika response exceeded the safety limit",
             ));
         }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| FleetError::new(FleetErrorKind::Unreachable, error.to_string()))?
-        {
-            break status;
+        match owned_child_exited(&mut child) {
+            Ok(true)
+                if write_complete && stdout_thread.is_finished() && stderr_thread.is_finished() =>
+            {
+                break Ok(());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                break Err(FleetError::new(
+                    FleetErrorKind::Unreachable,
+                    error.to_string(),
+                ));
+            }
         }
         if Instant::now() >= deadline {
-            kill_reap(&mut child);
-            let _ = writer_thread.join();
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
-            return Err(FleetError::new(
+            break Err(FleetError::new(
                 FleetErrorKind::Unreachable,
                 format!("SSH timed out after {}s", timeout.as_secs_f64()),
             ));
         }
         thread::sleep(Duration::from_millis(2));
     };
+    let cleanup = terminate_child(&mut child);
+    stop.cancel();
     let _ = writer_thread.join();
     let stdout = stdout_thread
         .join()
@@ -3493,6 +3504,9 @@ fn run_bounded_command(
     let stderr = stderr_thread
         .join()
         .map_err(|_| FleetError::new(FleetErrorKind::Error, "stderr reader failed"))?;
+    outcome?;
+    cleanup.map_err(|error| FleetError::new(FleetErrorKind::Unreachable, error.to_string()))?;
+    let status = child.exit_status();
     if overflow.load(Ordering::Relaxed) {
         return Err(FleetError::new(
             FleetErrorKind::Incompatible,
@@ -3506,27 +3520,8 @@ fn run_bounded_command(
     })
 }
 
-fn kill_reap(child: &mut Child) {
-    if child.try_wait().ok().flatten().is_none() {
-        #[cfg(unix)]
-        {
-            // SAFETY: run_bounded_command and RemoteConsultation put each
-            // owned transport child in a new process group before spawning.
-            let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-        }
-        #[cfg(not(unix))]
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-}
-
-fn owned_process_group(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        command.process_group(0);
-    }
-    #[cfg(not(unix))]
-    let _ = command;
+fn kill_reap(child: &mut OwnedChild) {
+    let _ = terminate_child(child);
 }
 
 fn spawn_bounded_reader<R: Read + Send + 'static>(
@@ -3616,10 +3611,10 @@ fn spawn_bounded_stderr<R: Read + Send + 'static>(
         }
     });
 }
-fn wait_child(child: &mut Child, timeout: Duration) -> bool {
+fn wait_child(child: &mut OwnedChild, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if child.try_wait().ok().flatten().is_some() {
+        if poll_owned_child(child).ok().flatten().is_some() {
             return true;
         }
         if Instant::now() >= deadline {
@@ -3901,5 +3896,61 @@ mod bounded_command_tests {
         .unwrap_err();
         assert_eq!(error.kind, FleetErrorKind::Unreachable);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bounded_io_deadline_includes_pipes_after_launcher_exit() {
+        for redirect in ["1>&2", "2>/dev/null"] {
+            let mut command = shell(&format!("sleep 5 {redirect} & exit 0"));
+            let started = Instant::now();
+            let error = run_bounded_command(&mut command, None, Duration::from_millis(40), 64, 64)
+                .unwrap_err();
+            assert!(error.message.contains("timed out"), "{error:?}");
+            assert!(started.elapsed() < Duration::from_millis(150));
+        }
+    }
+
+    #[test]
+    fn bounded_io_deadline_includes_inherited_stdin_after_launcher_exit() {
+        // fd 3 avoids the shell's implicit /dev/null stdin for background jobs.
+        let mut command = shell("exec 3<&0; sleep 5 <&3 >/dev/null 2>&1 & exit 0");
+        let started = Instant::now();
+        let error = run_bounded_command(
+            &mut command,
+            Some(&vec![b'x'; 4 * 1024 * 1024]),
+            Duration::from_millis(40),
+            64,
+            64,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("timed out"), "{error:?}");
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn bounded_io_exited_launcher_stress() {
+        for _ in 0..20 {
+            let mut command = shell("sleep 5 & exit 0");
+            let started = Instant::now();
+            let error = run_bounded_command(&mut command, None, Duration::from_millis(10), 64, 64)
+                .unwrap_err();
+            assert!(error.message.contains("timed out"), "{error:?}");
+            assert!(started.elapsed() < Duration::from_millis(150));
+        }
+    }
+
+    #[test]
+    fn bounded_io_retains_output_and_overflow_checks_after_launcher_exit() {
+        let mut command = shell("(printf complete; printf diagnostic >&2) & exit 0");
+        let output =
+            run_bounded_command(&mut command, None, Duration::from_secs(1), 64, 64).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"complete");
+        assert_eq!(output.stderr, b"diagnostic");
+
+        let mut command = shell("(printf oversized; sleep 5) & exit 0");
+        let error =
+            run_bounded_command(&mut command, None, Duration::from_secs(1), 4, 64).unwrap_err();
+        assert_eq!(error.kind, FleetErrorKind::Incompatible);
     }
 }
