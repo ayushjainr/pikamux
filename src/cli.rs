@@ -1,5 +1,6 @@
 use crate::{
     VERSION,
+    attention::{self, AttentionTarget},
     client_bridge::{self, ClientWindowOutcome, TcpClientBridgeTransport},
     config::Config,
     core::{OpenError, Pika},
@@ -9,7 +10,7 @@ use crate::{
         NodeCandidate, SshTransport,
     },
     hooks::{self, HookContext},
-    model::{Provider, Session, Status},
+    model::{Provider, Session},
     monitor::{
         self, BoardAction, BoardItem, ConsultationDriver, ConsultationEvent, ConsultationInput,
         ConsultationOutcome, ExpertAnnotation,
@@ -18,11 +19,11 @@ use crate::{
     process,
     scheduler::{self, ScheduleRequest},
     setup::{self, SetupOptions, SetupPaths},
-    skill,
+    setup_preview, skill,
     store::Store,
     terminal::{self, Palette},
     update::{self, InstallRequest, ReleaseManifest, UpdateRequest},
-    usage,
+    usage, wait as wait_contract,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -30,7 +31,7 @@ use serde::Serialize;
 use std::{
     ffi::OsString,
     fs,
-    io::{self, IsTerminal, Read, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     path::PathBuf,
     sync::{
         Arc,
@@ -568,7 +569,7 @@ fn peek_popup(pika: &Pika, a: PeekPopupArgs) -> Result<i32> {
     if session.tmux_pane.as_deref() != Some(&a.target) {
         bail!("The selected conversation's pane changed; reopen its peek")
     }
-    println!("{}", pika.tmux.capture(&a.target, a.lines)?);
+    println!("{}", pika.capture_exact(&session, a.lines)?);
     println!("\n[{}] Enter attaches; Esc or q returns.", a.name);
     if !io::stdin().is_terminal() {
         return Ok(0);
@@ -602,7 +603,10 @@ fn bare(pika: &Pika) -> Result<i32> {
         return print_sessions(inventory.sessions, true);
     }
     let cached = board_items(pika)?;
-    let (sender, receiver) = mpsc::channel();
+    // At most one unpublished snapshot is useful: the board always wants the
+    // newest complete observation, never a backlog of stale inventories.
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let (refresh_sender, refresh_receiver) = mpsc::sync_channel(1);
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
     let worker = pika.clone();
@@ -622,11 +626,9 @@ fn bare(pika: &Pika) -> Result<i32> {
             // provider/process evidence. Ten seconds keeps the fallback fresh
             // without continuously rescanning a large watched inventory;
             // lifecycle hooks still publish attention immediately.
-            for _ in 0..100 {
-                if worker_stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(100));
+            match refresh_receiver.recv_timeout(Duration::from_secs(10)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
     });
@@ -640,10 +642,11 @@ fn bare(pika: &Pika) -> Result<i32> {
                 && let Some(node) = fleet::next_remote_node(&nodes, None, now(), false)
             {
                 let _ = manager.refresh_node(&node.node_id);
-                if let Ok(items) = board_items(&remote_worker)
-                    && remote_sender.send(items).is_err()
-                {
-                    break;
+                if let Ok(items) = board_items(&remote_worker) {
+                    match remote_sender.try_send(items) {
+                        Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    }
                 }
             }
             for _ in 0..10 {
@@ -654,7 +657,7 @@ fn bare(pika: &Pika) -> Result<i32> {
             }
         }
     });
-    let (update_sender, update_receiver) = mpsc::channel();
+    let (update_sender, update_receiver) = mpsc::sync_channel(1);
     let update_executable = std::env::current_exe().ok();
     let _update_check = thread::spawn(move || {
         let notice = update_executable
@@ -662,13 +665,19 @@ fn bare(pika: &Pika) -> Result<i32> {
             .and_then(update::cached_update_notice);
         let _ = update_sender.send(notice);
     });
-    let action = monitor::run_items_dynamic_with_notice(
+    let action = monitor::run_items_dynamic_with_notice_and_refresh(
         cached,
         receiver,
         Some(board_consultation_driver(pika.clone())),
         update_receiver,
+        refresh_sender.clone(),
     );
     stop.store(true, Ordering::Relaxed);
+    // Wake and join the bounded local observer. Remote/update work has its own
+    // deadline and never owns row-action correctness; joining it here would
+    // delay Enter behind SSH, which the board explicitly forbids.
+    let _ = refresh_sender.try_send(());
+    let _ = _local_refresh.join();
     // Do not delay Enter/quit behind provider metadata or a bounded SSH
     // timeout. Exact actions revalidate independently before mutating state.
     match action? {
@@ -676,7 +685,7 @@ fn bare(pika: &Pika) -> Result<i32> {
         BoardAction::Peek(item) => peek_board_item(pika, item),
         BoardAction::Untrack(item) => untrack_board_item(pika, item),
         BoardAction::Ask(item) => ask_board_item(pika, item),
-        BoardAction::Refresh => bare(pika),
+        BoardAction::Refresh => unreachable!("interactive refresh is handled in-place"),
         BoardAction::Update(version) => update_command(UpdateArgs {
             check: version.is_none(),
             bundle: None,
@@ -771,7 +780,8 @@ fn exact_remote(pika: &Pika, item: &BoardItem) -> Result<fleet::FleetSession> {
 
 fn open_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
     if let Some(token) = item.pending_token.as_deref() {
-        return Ok(pika.open_pending(token, true)?.exit_code);
+        let receipt = pika.open_pending(token, true)?;
+        return finish_local_open(pika, &receipt);
     }
     if item.node_id.is_some() {
         let remote = exact_remote(pika, &item)?;
@@ -801,7 +811,7 @@ fn open_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
 
 fn open_local_session(pika: &Pika, session: Session) -> Result<i32> {
     match pika.open_session(session.clone(), true) {
-        Ok(receipt) => Ok(receipt.exit_code),
+        Ok(receipt) => finish_local_open(pika, &receipt),
         Err(error)
             if matches!(
                 error.downcast_ref::<OpenError>(),
@@ -837,9 +847,8 @@ fn open_local_session(pika: &Pika, session: Session) -> Result<i32> {
                         "pika: requesting a graceful stop for exact {} PID {pid}; Pika will not force-kill it.",
                         session.provider
                     );
-                    Ok(pika
-                        .clean_and_attach(session, (pid, generation), true)?
-                        .exit_code)
+                    let receipt = pika.clean_and_attach(session, (pid, generation), true)?;
+                    finish_local_open(pika, &receipt)
                 }
                 "3" | "q" | "cancel" => {
                     eprintln!("pika: Cancelled. No state changed.");
@@ -882,6 +891,9 @@ fn maybe_open_client_window(
     {
         ClientWindowOutcome::ContinueWithExistingAttach => Ok(None),
         ClientWindowOutcome::WindowLaunched(receipt) => {
+            if target_node_id == source_node_id {
+                pika.store.record_attach(provider, session_id)?;
+            }
             println!("{}", receipt.detail);
             Ok(Some(0))
         }
@@ -958,6 +970,7 @@ fn run_local_board_consultation(
 ) -> Result<ConsultationOutcome> {
     let mut options =
         crate::consult::ConsultationOptions::new(pika.config.executable(io.item.session.provider));
+    options.cancellation = io.cancellation.clone();
     if io.item.session.provider == Provider::Opencode {
         options.opencode_database = Some(pika.paths.opencode_data_home.join("opencode.db"));
     }
@@ -1008,14 +1021,17 @@ fn run_remote_board_consultation(
         .store
         .get_fleet_node(&remote.node_id)?
         .context("remote expert machine is no longer trusted")?;
-    let mut side = fleet::RemoteConsultation::open(
+    let mut side = fleet::RemoteConsultation::open_cancellable(
         &SshTransport::default(),
         node,
         remote,
         policy.clone(),
-        Duration::from_secs(30),
-        Duration::from_secs(900),
-        Duration::from_secs(30),
+        fleet::ConsultationTimeouts {
+            open: Duration::from_secs(30),
+            event: Duration::from_secs(900),
+            cleanup: Duration::from_secs(30),
+        },
+        io.cancellation.clone(),
     )
     .map_err(anyhow::Error::from)?;
     let _ = io.events.send(ConsultationEvent::Opened {
@@ -1223,7 +1239,13 @@ fn open_name(pika: &Pika, name: &str, allow_create: bool) -> Result<i32> {
         }
         return open_local_session(pika, selected);
     }
-    Ok(pika.open_name(name, true, allow_create)?.exit_code)
+    let receipt = pika.open_name(name, true, allow_create)?;
+    finish_local_open(pika, &receipt)
+}
+
+fn finish_local_open(pika: &Pika, receipt: &crate::core::OpenReceipt) -> Result<i32> {
+    let _ = pika;
+    Ok(receipt.exit_code)
 }
 
 fn choose_session(mut sessions: Vec<Session>, prompt: &str) -> Result<Session> {
@@ -1271,17 +1293,39 @@ fn repository_root(path: &std::path::Path) -> PathBuf {
         .to_path_buf()
 }
 fn next(pika: &Pika) -> Result<i32> {
-    let s = pika
-        .reconcile_local()?
-        .sessions
-        .into_iter()
-        .find(Session::needs_attention)
-        .context("No conversation needs you right now.")?;
-    let local_node_id = pika.store.ensure_local_node_id()?;
-    if let Some(code) = maybe_open_client_window(pika, &local_node_id, s.provider, &s.session_id)? {
-        return Ok(code);
+    let manager = FleetManager::new(&pika.store, SshTransport::default());
+    let selected = attention::choose(
+        pika.reconcile_local()?.sessions,
+        manager
+            .cached_sessions(None, false)
+            .map_err(anyhow::Error::from)?,
+    )
+    .context("No conversation needs you right now.")?;
+    match selected {
+        AttentionTarget::Local(session) => {
+            let local_node_id = pika.store.ensure_local_node_id()?;
+            if let Some(code) = maybe_open_client_window(
+                pika,
+                &local_node_id,
+                session.provider,
+                &session.session_id,
+            )? {
+                return Ok(code);
+            }
+            open_local_session(pika, *session)
+        }
+        AttentionTarget::Remote(remote) => {
+            if let Some(code) = maybe_open_client_window(
+                pika,
+                &remote.node_id,
+                remote.session.provider,
+                &remote.session.session_id,
+            )? {
+                return Ok(code);
+            }
+            manager.attach(&remote).map_err(anyhow::Error::from)
+        }
     }
-    open_local_session(pika, s)
 }
 fn select_one(pika: &Pika, name: &str) -> Result<Session> {
     let m = pika.resolve_local(name)?;
@@ -1326,14 +1370,9 @@ fn peek(pika: &Pika, a: PeekArgs) -> Result<i32> {
     peek_session(pika, s, a.lines, a.ack)
 }
 fn peek_session(pika: &Pika, s: Session, lines: Option<usize>, ack: bool) -> Result<i32> {
-    let pane = s
-        .tmux_pane
-        .as_deref()
-        .context("This conversation has no live Pika pane to peek.")?;
     println!(
         "{}",
-        pika.tmux
-            .capture(pane, lines.unwrap_or(pika.config.peek_lines))?
+        pika.capture_exact(&s, lines.unwrap_or(pika.config.peek_lines))?
     );
     if ack {
         pika.store
@@ -1361,13 +1400,20 @@ fn untrack(pika: &Pika, name: &str) -> Result<i32> {
 }
 fn untrack_exact(pika: &Pika, s: Session) -> Result<i32> {
     pika.store.untrack_session(s.provider, &s.session_id)?;
-    if let Some(p) = s.tmux_pane.as_deref() {
-        let _ = pika.tmux.clear_tags(p);
-    }
+    let clear_error = s
+        .tmux_pane
+        .as_deref()
+        .and_then(|_| pika.clear_exact_tags(&s).err());
     println!(
         "Stopped watching {}. The agent and its history were not stopped or archived.",
         s.display_name()
     );
+    if let Some(error) = clear_error {
+        eprintln!(
+            "pika: Watch state was removed, but pane identity changed before its Pika tags could be cleared: {error}"
+        );
+        return Ok(2);
+    }
     Ok(0)
 }
 fn wait(pika: &Pika, a: WaitArgs) -> Result<i32> {
@@ -1377,30 +1423,53 @@ fn wait(pika: &Pika, a: WaitArgs) -> Result<i32> {
             shell_words::quote(a.name.rsplit_once('@').map_or(&a.name, |(_, node)| node))
         )
     }
+    let initial = select_current_local(pika, &a.name)?;
     let start = Instant::now();
+    let mut next_reconcile = start + Duration::from_secs(5);
     loop {
-        let s = select_current_local(pika, &a.name)?;
-        let matched = match a.condition.as_str() {
-            "needs-you" => s.status == Status::NeedsYou,
-            "ready" => s.status == Status::Ready,
-            "error" => matches!(s.status, Status::Error | Status::OpenTwice),
-            _ => matches!(
-                s.status,
-                Status::NeedsYou | Status::Ready | Status::Error | Status::OpenTwice
-            ),
-        };
+        let now = Instant::now();
+        let s = if now >= next_reconcile {
+            next_reconcile = now + Duration::from_secs(5);
+            pika.reconcile_local()?
+                .sessions
+                .into_iter()
+                .find(|session| {
+                    session.provider == initial.provider && session.session_id == initial.session_id
+                })
+        } else {
+            pika.store
+                .get_session(initial.provider, &initial.session_id)?
+        }
+        .context("The tracked conversation disappeared while waiting")?;
+        let matched = wait_contract::matches(&s, &a.condition);
         if matched {
             if a.json {
                 println!("{}", serde_json::to_string(&s)?)
             } else {
-                println!("{} · {}", s.status, s.display_name())
+                let reason = s
+                    .attention_reason
+                    .as_deref()
+                    .map(|value| format!(" — {value}"))
+                    .unwrap_or_default();
+                println!("{}: {}{}", s.display_name(), s.status, reason)
             }
             return Ok(0);
         }
         if a.timeout
             .is_some_and(|v| start.elapsed().as_secs_f64() >= v)
         {
-            return Ok(2);
+            if a.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "timed_out": true,
+                        "session": s,
+                    }))?
+                );
+            } else {
+                eprintln!("Timed out waiting for {}", s.display_name());
+            }
+            return Ok(wait_contract::TIMEOUT_EXIT_CODE);
         }
         thread::sleep(Duration::from_millis(500));
     }
@@ -1412,13 +1481,12 @@ fn new(pika: &Pika, a: NewArgs) -> Result<i32> {
                 .context("new conversation directory does not exist")?,
         )?
     }
-    Ok(pika
-        .new_session(
-            &a.name,
-            a.agent.unwrap_or(pika.config.default_provider),
-            true,
-        )?
-        .exit_code)
+    let receipt = pika.new_session(
+        &a.name,
+        a.agent.unwrap_or(pika.config.default_provider),
+        true,
+    )?;
+    finish_local_open(pika, &receipt)
 }
 fn adopt(pika: &Pika, name: &str) -> Result<i32> {
     let providers = crate::providers::Providers::new(&pika.paths, &pika.config);
@@ -1821,10 +1889,7 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
     );
     let changed = changes.iter().filter(|change| change.changed()).count();
     for c in changes.iter().filter(|c| c.changed()) {
-        println!("CHANGE {}", c.path.display());
-        if let Some(notice) = &c.notice {
-            println!("       {notice}");
-        }
+        print!("{}", setup_preview::sanitized_unified_diff(c));
     }
     if a.dry_run {
         println!("Dry run only · no files changed.");
@@ -2157,9 +2222,15 @@ fn hook(a: HookArgs) -> Result<i32> {
     let mut context = HookContext::from_environment(a.provider)?;
     context.codex_worker_originators = config.codex_worker_originators.clone();
     context.opencode_worker_title_prefixes = config.opencode_worker_title_prefixes.clone();
-    let processes = process::snapshot();
+    let process_observation = process::observe();
+    let Some(processes) = complete_hook_processes(&process_observation) else {
+        if a.provider == Provider::Codex {
+            println!("{{}}")
+        }
+        return Ok(0);
+    };
     let parent = i64::from(unsafe { libc::getppid() });
-    context.owner_pid = process::provider_ancestor(parent, a.provider, &processes);
+    context.owner_pid = process::provider_ancestor(parent, a.provider, processes);
     context.owner_start_time = context
         .owner_pid
         .and_then(|pid| processes.get(&pid))
@@ -2169,14 +2240,16 @@ fn hook(a: HookArgs) -> Result<i32> {
     {
         context.pane_session = Some(pane.session_name.clone());
         context.pane_attached = pane.attached;
-        let tree = process::process_tree(pane.pane_pid, &processes);
+        let tree = process::process_tree(pane.pane_pid, processes);
         context.exact_home_verified = context.owner_pid.is_some_and(|pid| tree.contains(&pid))
             && (pane.pika_launch_token == context.launch_token
                 || (pane.pika_provider == Some(a.provider)
                     && pane.pika_session_id.as_deref() == Some(&payload.session_id)));
     }
     if let Ok(result) = hooks::handle_hook(&store, a.provider, &payload, &context) {
-        if let Some(tag) = &result.tag_request {
+        if context.exact_home_verified
+            && let Some(tag) = &result.tag_request
+        {
             let tmux = crate::tmux::Tmux::default();
             let tagged = tmux.tag_pane(
                 &tag.pane_id,
@@ -2242,6 +2315,13 @@ fn hook(a: HookArgs) -> Result<i32> {
     }
     Ok(0)
 }
+
+fn complete_hook_processes(
+    observation: &process::ProcessObservation,
+) -> Option<&std::collections::BTreeMap<i64, process::ProcessRecord>> {
+    observation.require_complete("accept hook identity").ok()
+}
+
 fn process_exit(a: ProcessExitArgs) -> Result<i32> {
     let paths = Paths::discover()?;
     hooks::handle_process_exit(
@@ -2478,10 +2558,11 @@ fn ask_remote_jsonl(
         }
     }
     if result == 0 {
-        use std::io::BufRead;
-        for line in io::stdin().lock().lines() {
-            let line = match line {
-                Ok(line) => line,
+        let mut input = io::stdin().lock();
+        loop {
+            let line = match read_bounded_jsonl_line(&mut input) {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
                 Err(error) => {
                     eprintln!("pika: remote consultation input failed: {error}");
                     result = 2;
@@ -2561,8 +2642,7 @@ fn ask_jsonl(
     session: &Session,
     initial: &str,
 ) -> Result<i32> {
-    let input = io::stdin().lock();
-    use std::io::BufRead;
+    let mut input = io::stdin().lock();
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
@@ -2609,12 +2689,13 @@ fn ask_jsonl(
             }
         }
     }
-    for line in input.lines() {
+    loop {
         if result != 0 {
             break;
         }
-        let line = match line {
-            Ok(line) => line,
+        let line = match read_bounded_jsonl_line(&mut input) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
             Err(error) => {
                 emit_jsonl_input_error(side, &format!("consultation input failed: {error}"))?;
                 result = 2;
@@ -2729,6 +2810,198 @@ fn ask_jsonl(
             "policy": side.policy(),
         }))?
     );
+    Ok(result)
+}
+
+fn read_bounded_jsonl_line(input: &mut impl io::BufRead) -> io::Result<Option<String>> {
+    const LIMIT: usize = fleet::MAX_MESSAGE_BYTES;
+    let mut bytes = Vec::with_capacity(4096);
+    input
+        .take((LIMIT + 2) as u64)
+        .read_until(b'\n', &mut bytes)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let has_newline = bytes.last() == Some(&b'\n');
+    let content_len = bytes.len().saturating_sub(usize::from(has_newline));
+    if content_len > LIMIT || (!has_newline && bytes.len() > LIMIT) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "JSONL input exceeds the 4 MiB limit",
+        ));
+    }
+    if has_newline {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "JSONL input is not UTF-8"))
+}
+
+enum FleetConsultationInput {
+    Question(String),
+    Close,
+    InputError(String),
+}
+
+fn spawn_fleet_consultation_input(
+    cancellation: crate::consult::CancellationToken,
+) -> mpsc::Receiver<FleetConsultationInput> {
+    spawn_fleet_consultation_reader(io::BufReader::new(io::stdin()), cancellation)
+}
+
+fn spawn_fleet_consultation_reader<R>(
+    mut input: R,
+    cancellation: crate::consult::CancellationToken,
+) -> mpsc::Receiver<FleetConsultationInput>
+where
+    R: io::BufRead + Send + 'static,
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        loop {
+            let line = match read_bounded_jsonl_line(&mut input) {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    cancellation.cancel();
+                    let _ = sender.try_send(FleetConsultationInput::Close);
+                    return;
+                }
+                Err(error) => {
+                    cancellation.cancel();
+                    let _ = sender.try_send(FleetConsultationInput::InputError(format!(
+                        "consultation input failed: {error}"
+                    )));
+                    return;
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value = match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(value) if value.is_object() => value,
+                Ok(_) => {
+                    cancellation.cancel();
+                    let _ = sender.try_send(FleetConsultationInput::InputError(
+                        "each --jsonl line must be a JSON object".into(),
+                    ));
+                    return;
+                }
+                Err(error) => {
+                    cancellation.cancel();
+                    let _ = sender.try_send(FleetConsultationInput::InputError(format!(
+                        "invalid JSONL question: {error}"
+                    )));
+                    return;
+                }
+            };
+            if value.get("close").and_then(serde_json::Value::as_bool) == Some(true) {
+                cancellation.cancel();
+                let _ = sender.try_send(FleetConsultationInput::Close);
+                return;
+            }
+            let Some(question) = value.get("question").and_then(serde_json::Value::as_str) else {
+                cancellation.cancel();
+                let _ = sender.try_send(FleetConsultationInput::InputError(
+                    "each --jsonl object needs a string `question` or {\"close\":true}".into(),
+                ));
+                return;
+            };
+            if sender
+                .send(FleetConsultationInput::Question(question.to_owned()))
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
+fn serve_fleet_consultation(
+    side: &mut crate::consult::Consultation,
+    session: &Session,
+    inputs: mpsc::Receiver<FleetConsultationInput>,
+    cancellation: &crate::consult::CancellationToken,
+) -> Result<i32> {
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "type": "opened",
+            "ephemeral": true,
+            "provider": session.provider,
+            "workstream_id": session.session_id,
+            "parent_id": side.parent_id(),
+            "child_id": side.child_id(),
+            "name": session.display_name(),
+            "receipt": side.receipt(),
+            "policy": side.policy(),
+            "consultation_mode": side.policy().mode,
+            "model": side.policy().model.as_deref().unwrap_or(""),
+            "effort": side.policy().effort.as_deref().unwrap_or(""),
+        }))?
+    );
+    io::stdout().flush()?;
+    let mut result = 0;
+    for input in inputs {
+        match input {
+            FleetConsultationInput::Question(question) => match side.ask(&question) {
+                Ok(answer) => println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "type":"answer", "text":answer, "receipt":side.receipt(),
+                        "policy":side.policy(),
+                    }))?
+                ),
+                Err(_error) if cancellation.is_cancelled() => break,
+                Err(error) => {
+                    let retry_safe = error.receipt.retry_safe;
+                    let receipt = &error.receipt;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "type":"error", "kind":"error", "message":error.to_string(),
+                            "stage":receipt.stage, "delivery":receipt.delivery,
+                            "cleanup":receipt.cleanup, "answers_received":receipt.answers_received,
+                            "turn":receipt.turn, "retry_safe":retry_safe, "receipt":receipt,
+                            "cleanup_error":error.cleanup_error, "policy":side.policy(),
+                        }))?
+                    );
+                    if !retry_safe {
+                        result = 2;
+                        break;
+                    }
+                }
+            },
+            FleetConsultationInput::Close => break,
+            FleetConsultationInput::InputError(message) => {
+                emit_jsonl_input_error(side, &message)?;
+                result = 2;
+                break;
+            }
+        }
+        io::stdout().flush()?;
+    }
+    let cleanup = side.close();
+    if cleanup.is_err() {
+        result = 2;
+    }
+    let receipt = side.receipt();
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "type":"closed", "receipt_version":receipt.receipt_version,
+            "discarded":cleanup.is_ok(), "cleanup":receipt.cleanup,
+            "answers_received":receipt.answers_received, "turn":receipt.turn,
+            "retry_safe":receipt.retry_safe,
+            "kind":cleanup.as_ref().err().map(|_| "outcome_unknown"),
+            "message":cleanup.as_ref().err().map(ToString::to_string),
+        }))?
+    );
+    io::stdout().flush()?;
     Ok(result)
 }
 
@@ -2976,7 +3249,8 @@ fn fleet_stdio(pika: &Pika, a: FleetInternalArgs) -> Result<i32> {
 fn fleet_open(pika: &Pika, a: FleetOpenArgs) -> Result<i32> {
     verify_local_node(pika, &a.expected_node_id)?;
     let session = exact_local_session(pika, a.provider, &a.session_id, true)?;
-    Ok(pika.open_session(session, true)?.exit_code)
+    let receipt = pika.open_session(session, true)?;
+    finish_local_open(pika, &receipt)
 }
 fn fleet_ask(pika: &Pika, a: FleetAskArgs) -> Result<i32> {
     verify_local_node(pika, &a.expected_node_id)?;
@@ -2998,12 +3272,15 @@ fn fleet_ask(pika: &Pika, a: FleetAskArgs) -> Result<i32> {
     let mut options =
         crate::consult::ConsultationOptions::new(pika.config.executable(session.provider));
     options.fast = fast;
+    let cancellation = crate::consult::CancellationToken::default();
+    let inputs = spawn_fleet_consultation_input(cancellation.clone());
+    options.cancellation = cancellation.clone();
     if session.provider == Provider::Opencode {
         options.opencode_database = Some(pika.paths.opencode_data_home.join("opencode.db"));
     }
     let mut side =
         crate::consult::Consultation::open(&session, options).map_err(consultation_error)?;
-    ask_jsonl(&mut side, &session, "")
+    serve_fleet_consultation(&mut side, &session, inputs, &cancellation)
 }
 
 fn verify_local_node(pika: &Pika, expected: &str) -> Result<()> {
@@ -3205,15 +3482,8 @@ impl FleetService for LocalFleetService<'_> {
     ) -> std::result::Result<String, FleetError> {
         let session =
             exact_local_session(self.pika, provider, session_id, true).map_err(FleetError::from)?;
-        let pane = session.tmux_pane.as_deref().ok_or_else(|| {
-            FleetError::new(
-                FleetErrorKind::NotFound,
-                "Exact conversation has no live Pika pane",
-            )
-        })?;
         self.pika
-            .tmux
-            .capture(pane, lines)
+            .capture_exact(&session, lines)
             .map_err(FleetError::from)
     }
 
@@ -3241,9 +3511,7 @@ impl FleetService for LocalFleetService<'_> {
             .store
             .untrack_session(provider, &session.session_id)?;
         let mut cleared = 0;
-        if let Some(pane) = session.tmux_pane.as_deref()
-            && self.pika.tmux.clear_tags(pane).is_ok()
-        {
+        if session.tmux_pane.is_some() && self.pika.clear_exact_tags(&session).is_ok() {
             cleared = 1;
         }
         Ok((cleared, true))
@@ -3254,4 +3522,150 @@ fn now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+#[cfg(all(test, unix))]
+mod fleet_consultation_tests {
+    use super::*;
+    use crate::consult::{Consultation, ConsultationOptions};
+    use crate::model::Status;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+
+    fn fixture_session(root: &std::path::Path) -> Session {
+        Session {
+            provider: Provider::Codex,
+            session_id: "workstream".into(),
+            name: Some("expert".into()),
+            cwd: Some(root.to_string_lossy().into_owned()),
+            branch: None,
+            transcript_path: None,
+            tmux_session: None,
+            tmux_pane: None,
+            root_pid: None,
+            status: Status::Working,
+            unread: false,
+            model: None,
+            source: "fixture".into(),
+            managed: true,
+            error: None,
+            attention_reason: None,
+            created_at: 1.0,
+            updated_at: 1.0,
+            last_event_at: 1.0,
+            last_activity_at: 1.0,
+            live: true,
+            attached: false,
+            home_state: String::new(),
+            cpu_percent: None,
+            rss_kb: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            total_tokens: None,
+            estimated_cost_usd: None,
+            active_thread_id: Some("parent-thread".into()),
+        }
+    }
+
+    fn assert_disconnect_cancels_exact_child(explicit_close: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let child_pid = root.path().join("child.pid");
+        let executable = root.path().join("codex");
+        fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
+    *'"method":"thread/fork"'*) printf '{{"id":%s,"result":{{"thread":{{"id":"side-id","ephemeral":true}},"model":"gpt-5.6-sol","reasoningEffort":"medium"}}}}\n' "$id" ;;
+    *'"method":"turn/start"'*)
+      printf '{{"id":%s,"result":{{"turn":{{"id":"turn-1"}}}}}}\n' "$id"
+      sleep 30 &
+      printf '%s' "$!" > '{}'
+      wait ;;
+  esac
+done
+"#,
+                child_pid.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let cancellation = crate::consult::CancellationToken::default();
+        let (read_end, mut write_end) = UnixStream::pair().unwrap();
+        let inputs =
+            spawn_fleet_consultation_reader(io::BufReader::new(read_end), cancellation.clone());
+        writeln!(write_end, "{{\"question\":\"why\"}}").unwrap();
+        write_end.flush().unwrap();
+
+        let mut options = ConsultationOptions::new(executable);
+        options.timeout = Duration::from_secs(30);
+        options.cancellation = cancellation.clone();
+        let mut side = Consultation::open(&fixture_session(root.path()), options).unwrap();
+        let FleetConsultationInput::Question(question) = inputs.recv().unwrap() else {
+            panic!("question was not delivered")
+        };
+        let worker = thread::spawn(move || {
+            let answer = side.ask(&question);
+            let cleanup = side.close();
+            (answer, cleanup)
+        });
+        for _ in 0..500 {
+            if child_pid.is_file() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(child_pid.is_file(), "side turn never started");
+        let cancelled_at = Instant::now();
+        if explicit_close {
+            writeln!(write_end, "{{\"close\":true}}").unwrap();
+            write_end.flush().unwrap();
+        } else {
+            drop(write_end);
+        }
+        for _ in 0..500 {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let (answer, cleanup) = worker.join().unwrap();
+        assert!(answer.unwrap_err().to_string().contains("cancelled"));
+        assert!(cleanup.is_ok());
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        let pid: i32 = fs::read_to_string(child_pid).unwrap().parse().unwrap();
+        for _ in 0..50 {
+            // SAFETY: signal zero only probes the exact fixture descendant.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("owned side descendant {pid} survived disconnect");
+    }
+
+    #[test]
+    fn explicit_close_cancels_blocked_exact_side_turn() {
+        assert_disconnect_cancels_exact_child(true);
+    }
+
+    #[test]
+    fn stdin_eof_cancels_blocked_exact_side_turn() {
+        assert_disconnect_cancels_exact_child(false);
+    }
+
+    #[test]
+    fn hook_identity_rejects_partial_process_observation() {
+        let observation = process::ProcessObservation::partial(
+            std::collections::BTreeMap::new(),
+            vec!["process changed during observation".into()],
+        );
+        assert!(complete_hook_processes(&observation).is_none());
+    }
 }

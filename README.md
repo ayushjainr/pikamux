@@ -18,6 +18,23 @@ acts. A live exact home attaches. A saved conversation resumes into tmux. A
 discoverable conversation is adopted. A genuinely new name is created and
 named. Ambiguity is shown; Pika does not guess.
 
+## Native candidate
+
+The Rust implementation supports macOS and Linux on Apple Silicon/ARM64 and
+x86-64. It is still behind its publication gates; the public installer may
+continue to deliver the Python baseline until a native release is published.
+Build and exercise this candidate without replacing an installed Pika:
+
+```sh
+cargo build --release --locked
+target/release/pika --version
+```
+
+The candidate includes a versionless bootstrap, native updater, and a one-use
+transition wheel for existing Python v0.5.0a4 installations. Their release
+artifacts are built and exercised only in disposable roots here; no native
+publication or installed-Pika cutover is claimed by this repository state.
+
 ## What is implemented
 
 - A responsive four-group board: **Needs You**, **Working**, **Ready**, and
@@ -34,7 +51,7 @@ named. Ambiguity is shown; Pika does not guess.
   boards, exact remote actions, and mixed Python/native protocol compatibility.
 - Previewable setup with preserved settings, atomic writes, backups, lifecycle
   hooks, the bundled `agent-convo` skill, and launchd/systemd expert refresh.
-- Verified native installation, updates, rollback-safe release roots, remote
+- Locally verified native installation, updates, rollback-safe release roots, remote
   upgrade bundles, checksums, and a portable Windows client/bridge artifact.
 - Evidence-based doctor, explain, activity, usage, and stale-bookkeeping repair.
 
@@ -60,8 +77,8 @@ Pika treats identity as a product promise, not a pane label.
 
 ## Build and verify
 
-Rust 1.88 or newer is required to build; released users need only the compiled
-binary and tmux on macOS/Linux.
+Rust 1.88 or newer is required to build. A future published native release will
+need only the compiled binary and tmux on macOS/Linux.
 
 ```sh
 cargo build --release --locked
@@ -84,13 +101,13 @@ the same terminal geometry; hook runs alternate Python/native order.
 
 | Contract | Native Rust | Python v0.5.0a4 |
 | --- | ---: | ---: |
-| CLI startup, p95 (100 launches) | 6.12 ms | 135.20 ms |
-| Cached board first frame, p95 (30 launches) | 11.36 ms | 452.04 ms |
-| Board input redraw, p95 (1,000 keys) | 0.115 ms | 8.37 ms |
-| Hook fast path, p95 (100 events) | 18.71 ms | 467.57 ms |
-| 200-row local reconciliation, p95 (30 runs) | 61.17 ms | 2,245.45 ms |
-| Warm board RSS, p95 | 6.73 MiB | 36.42 MiB |
-| Binary / gzip | 4.41 MB / 2.07 MB | interpreter environment required |
+| CLI startup, p95 (100 launches) | 3.92 ms | 140.23 ms |
+| Cached board first frame, p95 (30 launches) | 10.41 ms | 458.65 ms |
+| Board input redraw, p95 (1,000 keys) | 0.115 ms | 8.38 ms |
+| Hook fast path, p95 (100 events) | 18.39 ms | 473.33 ms |
+| 200-row local reconciliation, p95 (30 runs) | 60.92 ms | 2,398.79 ms |
+| Warm board RSS, p95 | 6.47 MiB | 36.42 MiB |
+| Binary / gzip | 4.17 MB / 2.15 MB | interpreter environment required |
 
 Reproduce the measurements with:
 

@@ -26,19 +26,23 @@ The POSIX archive must contain exactly one regular file named `pika`.
 
 ## One-time Python bridge
 
-The frozen Python v0.5.0a4 updater understands only schema 1 and a universal
-wheel. It cannot safely activate a schema-2 native artifact. Existing managed
-users therefore need one final Python bridge release:
+The frozen Python v0.5.0a4 updater understands only schema 1 and a PEP 440 wheel
+version. It cannot discover the current SemVer-style alpha or parse a schema-2
+native artifact. Existing managed users therefore need one final Python bridge
+release:
 
 1. Unmodified v0.5.0a4 discovers and installs a schema-1 bridge wheel.
-2. That bridge understands schema 2 and stages the exact native target.
-3. A subsequent explicit update activates native Pika in the same managed root.
+2. Its required `--version`, `--help`, and `skill show` validation probes are
+   side-effect-free.
+3. On the first ordinary Pika command, the bridge selects one exact embedded
+   Mac/Linux target, activates it in the same managed root, and executes the
+   original command natively. No second approval or manual migration is needed.
 
-The compatibility test executes the unmodified v0.5.0a4 manifest reader against
-the bridge fixture. A separate test starts from a valid schema-1 installation
-receipt and activates a schema-2 native release without moving Pika state. The
-bridge artifact itself must be built and tested before publication; it is not a
-second long-lived implementation.
+The compatibility test executes the unmodified v0.5.0a4 updater itself against
+the built wheel in a disposable managed environment, then proves first-use
+native activation. The wheel embeds all four supported Mac/Linux archives and
+fails closed on an unsupported host; it never labels one platform binary as
+universal. It remains a transition envelope, not a second implementation.
 
 ## Release assets
 
@@ -47,7 +51,9 @@ A native release contains:
 ```text
 install.sh
 pika-version
-pika-release.json
+pika-native-release.json
+pika-release.json                         # schema 1, stable/bridge releases only
+pikamux-V-py3-none-any.whl                # stable/bridge releases only
 pikamux-V-aarch64-apple-darwin.tar.gz
 pikamux-V-x86_64-apple-darwin.tar.gz
 pikamux-V-aarch64-unknown-linux-musl.tar.gz
@@ -61,6 +67,8 @@ THIRD_PARTY.md
 GitHub supplies source archives for the tag. The Windows ZIP contains only the
 experimental client/bridge executable; it is not a native tmux host.
 
+Native schema 2 uses the distinct `pika-native-release.json` name so a stable
+tag may also carry the schema-1 manifest that the frozen updater requires.
 Schema 2 is strict:
 
 ```json

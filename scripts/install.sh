@@ -95,19 +95,19 @@ fi
 
 pika_archive="pikamux-${pika_version}-${pika_target}.tar.gz"
 if [ -n "$pika_bundle" ]; then
-    [ -f "$pika_bundle/pika-release.json" ] && [ ! -L "$pika_bundle/pika-release.json" ] || fail 'The bundle has no regular pika-release.json.'
+    [ -f "$pika_bundle/pika-native-release.json" ] && [ ! -L "$pika_bundle/pika-native-release.json" ] || fail 'The bundle has no regular pika-native-release.json.'
     [ -f "$pika_bundle/$pika_archive" ] && [ ! -L "$pika_bundle/$pika_archive" ] || fail "The bundle has no regular $pika_archive."
     [ -f "$pika_bundle/$pika_archive.sha256" ] && [ ! -L "$pika_bundle/$pika_archive.sha256" ] || fail 'The bundle has no regular artifact checksum.'
-    cp "$pika_bundle/pika-release.json" "$pika_tmp/pika-release.json"
+    cp "$pika_bundle/pika-native-release.json" "$pika_tmp/pika-native-release.json"
     cp "$pika_bundle/$pika_archive" "$pika_tmp/$pika_archive"
     cp "$pika_bundle/$pika_archive.sha256" "$pika_tmp/$pika_archive.sha256"
 else
     pika_base="$PIKA_RELEASE_ROOT/download/v${pika_version}"
-    download "$pika_base/pika-release.json" "$pika_tmp/pika-release.json" 65536
+    download "$pika_base/pika-native-release.json" "$pika_tmp/pika-native-release.json" 65536
     download "$pika_base/$pika_archive" "$pika_tmp/$pika_archive" 104857600
     download "$pika_base/$pika_archive.sha256" "$pika_tmp/$pika_archive.sha256" 128
 fi
-[ "$(wc -c < "$pika_tmp/pika-release.json" | tr -d ' ')" -le 65536 ] || fail 'Release manifest exceeds 64 KiB.'
+[ "$(wc -c < "$pika_tmp/pika-native-release.json" | tr -d ' ')" -le 65536 ] || fail 'Release manifest exceeds 64 KiB.'
 
 pika_sha=$(sed -n '1p' "$pika_tmp/$pika_archive.sha256")
 [ "$(wc -l < "$pika_tmp/$pika_archive.sha256" | tr -d ' ')" = 1 ] || fail 'Invalid artifact checksum file.'
@@ -135,7 +135,7 @@ chmod 700 "$pika_tmp/extracted/pika"
 "$pika_tmp/extracted/pika" skill show >/dev/null
 install_args=(
     _install-native
-    --manifest "$pika_tmp/pika-release.json"
+    --manifest "$pika_tmp/pika-native-release.json"
     --artifact "$pika_tmp/$pika_archive"
     --candidate "$pika_tmp/extracted/pika"
     --target "$pika_target"

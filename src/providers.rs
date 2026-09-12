@@ -1040,10 +1040,10 @@ mod tests {
             .provider_executables
             .insert("codex".into(), executable.to_string_lossy().into_owned());
         let id = "11111111-1111-4111-8111-111111111111";
-        assert!(Providers::new(&paths, &config).set_codex_native_name(id, "master_quant"));
+        assert!(Providers::new(&paths, &config).set_codex_native_name(id, "research_pipeline"));
         let requests = std::fs::read_to_string(log).unwrap();
         assert!(requests.contains("thread/name/set"));
         assert!(requests.contains(id));
-        assert!(requests.contains("master_quant"));
+        assert!(requests.contains("research_pipeline"));
     }
 }

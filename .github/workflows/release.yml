@@ -13,7 +13,23 @@ env:
   MACOSX_DEPLOYMENT_TARGET: '13.0'
 
 jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+          rustup override set 1.88.0
+      - name: Verify source and transition contracts
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features
+          scripts/test-mixed-runtime.sh
+
   build:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -48,14 +64,22 @@ jobs:
       - name: Verify host binary
         if: runner.os != 'Windows'
         run: |
-          test "$(${{ matrix.executable }} --version)" = "pika ${GITHUB_REF_NAME#v}"
+          expected="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_NAME" = v0.5.0a5 ]; then
+            expected=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          fi
+          test "$(${{ matrix.executable }} --version)" = "pika $expected"
           ${{ matrix.executable }} --help >/dev/null
           ${{ matrix.executable }} skill show >/dev/null
       - name: Verify Windows client boundary
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $expected = 'pika ' + $env:GITHUB_REF_NAME.TrimStart('v')
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          if ($env:GITHUB_REF_NAME -eq 'v0.5.0a5') {
+            $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          }
+          $expected = 'pika ' + $version
           if ((& '${{ matrix.executable }}' --version) -ne $expected) { throw 'binary version mismatch' }
           $help = (& '${{ matrix.executable }}' --help | Out-String)
           if ($help -notmatch 'Native Windows agent hosting is unsupported') { throw 'missing client-only support boundary' }
@@ -81,14 +105,41 @@ jobs:
       - name: Assemble and verify immutable assets
         shell: bash
         run: |
-          chmod +x binaries/*/pika scripts/*.sh scripts/*.pl
-          PIKA_CROSS_PACKAGE=1 scripts/package-release.sh "${GITHUB_REF_NAME#v}" release \
-            aarch64-apple-darwin=binaries/binary-aarch64-apple-darwin/pika \
-            x86_64-apple-darwin=binaries/binary-x86_64-apple-darwin/pika \
-            aarch64-unknown-linux-musl=binaries/binary-aarch64-unknown-linux-musl/pika \
-            x86_64-unknown-linux-musl=binaries/binary-x86_64-unknown-linux-musl/pika \
-            x86_64-pc-windows-msvc=binaries/binary-x86_64-pc-windows-msvc/pika.exe
-          (cd release && sha256sum --check SHA256SUMS)
+          chmod +x binaries/*/pika scripts/*.sh scripts/*.pl scripts/*.py
+          native_version="${GITHUB_REF_NAME#v}"
+          native_output=release
+          if [ "$GITHUB_REF_NAME" = v0.5.0a5 ]; then
+            native_version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+            native_output=transition-native
+          fi
+          PIKA_CROSS_PACKAGE=1 scripts/package-release.sh "$native_version" "$native_output" \
+              aarch64-apple-darwin=binaries/binary-aarch64-apple-darwin/pika \
+              x86_64-apple-darwin=binaries/binary-x86_64-apple-darwin/pika \
+              aarch64-unknown-linux-musl=binaries/binary-aarch64-unknown-linux-musl/pika \
+              x86_64-unknown-linux-musl=binaries/binary-x86_64-unknown-linux-musl/pika \
+              x86_64-pc-windows-msvc=binaries/binary-x86_64-pc-windows-msvc/pika.exe
+          release_version="${GITHUB_REF_NAME#v}"
+          case "$release_version" in
+            0.5.0a5)
+              mkdir release
+              python3 scripts/package-python-bridge.py "$release_version" "$native_version" \
+                "release/pikamux-$release_version-py3-none-any.whl" \
+                aarch64-apple-darwin="$native_output/pikamux-$native_version-aarch64-apple-darwin.tar.gz" \
+                x86_64-apple-darwin="$native_output/pikamux-$native_version-x86_64-apple-darwin.tar.gz" \
+                aarch64-unknown-linux-musl="$native_output/pikamux-$native_version-aarch64-unknown-linux-musl.tar.gz" \
+                x86_64-unknown-linux-musl="$native_output/pikamux-$native_version-x86_64-unknown-linux-musl.tar.gz"
+              ;;
+            *[!0-9.]*|'') ;;
+            *)
+              python3 scripts/package-python-bridge.py "$release_version" "$native_version" \
+                "release/pikamux-$release_version-py3-none-any.whl" \
+                aarch64-apple-darwin="release/pikamux-$native_version-aarch64-apple-darwin.tar.gz" \
+                x86_64-apple-darwin="release/pikamux-$native_version-x86_64-apple-darwin.tar.gz" \
+                aarch64-unknown-linux-musl="release/pikamux-$native_version-aarch64-unknown-linux-musl.tar.gz" \
+                x86_64-unknown-linux-musl="release/pikamux-$native_version-x86_64-unknown-linux-musl.tar.gz"
+              ;;
+          esac
+          scripts/verify-release.sh release
           {
             echo '### Native release checksums'
             echo '```text'

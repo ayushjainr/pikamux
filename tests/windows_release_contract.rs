@@ -25,7 +25,8 @@ fn release_packager_emits_a_single_executable_windows_client_zip() {
     );
 
     let manifest =
-        ReleaseManifest::parse(&fs::read(output.join("pika-release.json")).unwrap()).unwrap();
+        ReleaseManifest::parse(&fs::read(output.join("pika-native-release.json")).unwrap())
+            .unwrap();
     let artifact = manifest.artifact_for(WINDOWS_TARGET).unwrap();
     assert!(artifact.file.ends_with(".zip"));
     assert_eq!(

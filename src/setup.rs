@@ -808,10 +808,10 @@ fn top_level_key_order(content: &str) -> Vec<String> {
                     while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
                         probe += 1;
                     }
-                    if bytes.get(probe) == Some(&b':') {
-                        if let Ok(key) = serde_json::from_str::<String>(token) {
-                            keys.push(key);
-                        }
+                    if bytes.get(probe) == Some(&b':')
+                        && let Ok(key) = serde_json::from_str::<String>(token)
+                    {
+                        keys.push(key);
                     }
                 }
             }

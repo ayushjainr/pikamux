@@ -73,8 +73,8 @@ impl HookContext {
             pane_attached: false,
             exact_home_verified: false,
             hook_fingerprint: "native-v1".into(),
-            codex_worker_originators: vec!["agentic_fund".into(), "quant_agent_autonomy".into()],
-            opencode_worker_title_prefixes: vec!["agentic-fund:".into(), "quant-agent:".into()],
+            codex_worker_originators: Vec::new(),
+            opencode_worker_title_prefixes: Vec::new(),
         }
     }
 
@@ -983,16 +983,16 @@ fn validate_launch(
     {
         token = None;
     }
-    if let Some(pending) = &pending {
-        if let Some(mismatch) = launch_mismatch(pending, provider, payload, context) {
-            if payload.hook_event_name != "SessionEnd" {
-                store.set_meta(
-                    &format!("launch_binding_error:{}", pending.launch_token),
-                    &format!("refused launch hook: {mismatch}"),
-                )?;
-            }
-            return Ok(LaunchDecision::Ignore(mismatch));
+    if let Some(pending) = &pending
+        && let Some(mismatch) = launch_mismatch(pending, provider, payload, context)
+    {
+        if payload.hook_event_name != "SessionEnd" {
+            store.set_meta(
+                &format!("launch_binding_error:{}", pending.launch_token),
+                &format!("refused launch hook: {mismatch}"),
+            )?;
         }
+        return Ok(LaunchDecision::Ignore(mismatch));
     }
     if let Some(value) = token.as_deref() {
         if let Some((bound_provider, bound_id)) = store.get_launch_binding(value)? {

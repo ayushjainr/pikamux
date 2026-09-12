@@ -29,8 +29,8 @@ impl Default for Config {
             provider_executables: BTreeMap::new(),
             provider_runtime_path: None,
             client_bridges: Vec::new(),
-            codex_worker_originators: vec!["agentic_fund".into(), "quant_agent_autonomy".into()],
-            opencode_worker_title_prefixes: vec!["agentic-fund:".into(), "quant-agent:".into()],
+            codex_worker_originators: Vec::new(),
+            opencode_worker_title_prefixes: Vec::new(),
             additional: BTreeMap::new(),
         }
     }
@@ -114,5 +114,12 @@ mod tests {
         assert_eq!(config.additional["future"]["enabled"], true);
         let encoded = serde_json::to_value(config).unwrap();
         assert_eq!(encoded["future"]["enabled"], true);
+    }
+
+    #[test]
+    fn defaults_do_not_encode_one_users_automation_names() {
+        let config = Config::default();
+        assert!(config.codex_worker_originators.is_empty());
+        assert!(config.opencode_worker_title_prefixes.is_empty());
     }
 }

@@ -970,8 +970,8 @@ fn validate_cards(value: Option<&Value>) -> Result<Vec<Value>, FleetError> {
                 "Remote watched flag is invalid",
             ));
         }
-        if let Some(value) = object.get("availability") {
-            if !matches!(
+        if let Some(value) = object.get("availability")
+            && !matches!(
                 value.as_str(),
                 Some(
                     "source-available"
@@ -982,23 +982,23 @@ fn validate_cards(value: Option<&Value>) -> Result<Vec<Value>, FleetError> {
                         | "excluded-worker"
                         | "requires-reconciliation"
                 )
-            ) {
-                return Err(FleetError::new(
-                    FleetErrorKind::Incompatible,
-                    "Remote expert availability is invalid",
-                ));
-            }
+            )
+        {
+            return Err(FleetError::new(
+                FleetErrorKind::Incompatible,
+                "Remote expert availability is invalid",
+            ));
         }
-        if let Some(value) = object.get("current_state_status") {
-            if !matches!(
+        if let Some(value) = object.get("current_state_status")
+            && !matches!(
                 value.as_str(),
                 Some("CURRENT" | "STALE" | "MISSING" | "UNKNOWN")
-            ) {
-                return Err(FleetError::new(
-                    FleetErrorKind::Incompatible,
-                    "Remote work freshness is invalid",
-                ));
-            }
+            )
+        {
+            return Err(FleetError::new(
+                FleetErrorKind::Incompatible,
+                "Remote work freshness is invalid",
+            ));
         }
     }
     Ok(values.clone())
@@ -2294,18 +2294,17 @@ impl RemoteConsultation {
                 self.cleanup_unknown("Remote cleanup is unconfirmed after the connection closed")
             );
         }
-        if let Some(input) = self.input.take() {
-            if input
+        if let Some(input) = self.input.take()
+            && input
                 .send(
                     b"{\"close\":true}\n".to_vec(),
                     Instant::now() + self.cleanup_timeout,
                     &CancellationToken::default(),
                 )
                 .is_err()
-            {
-                self.abort();
-                return Err(self.cleanup_unknown("Remote cleanup could not be requested"));
-            }
+        {
+            self.abort();
+            return Err(self.cleanup_unknown("Remote cleanup could not be requested"));
         }
         let deadline = Instant::now() + self.cleanup_timeout;
         loop {

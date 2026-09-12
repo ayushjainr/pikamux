@@ -163,7 +163,7 @@ fn tombstone_survives_worker_and_lifecycle_hooks() {
         .unwrap();
     store.untrack_session(Provider::Codex, "ignored").unwrap();
     let mut worker = event(Provider::Codex, "ignored", "Stop");
-    worker.originator = Some("agentic_fund".into());
+    worker.originator = Some("automation_worker".into());
     let result = handle_hook(&store, Provider::Codex, &worker, &HookContext::at(11.0)).unwrap();
     assert_eq!(result.disposition, HookDisposition::Ignored);
     assert!(store.is_untracked(Provider::Codex, "ignored").unwrap());

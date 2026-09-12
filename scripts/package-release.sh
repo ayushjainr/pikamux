@@ -98,7 +98,7 @@ esac
     printf '{\n  "schema": 2,\n  "package": "pikamux",\n'
     printf '  "version": "%s",\n  "channel": "%s",\n  "artifacts": {%s\n  }\n}\n' \
         "$pika_version" "$pika_channel" "$pika_rows"
-} > "$pika_stage/pika-release.json"
+} > "$pika_stage/pika-native-release.json"
 printf '%s\n' "$pika_version" > "$pika_stage/pika-version"
 cp "$pika_script_dir/install.sh" "$pika_stage/install.sh"
 cp "$pika_repo_dir/LICENSE" "$pika_stage/LICENSE"

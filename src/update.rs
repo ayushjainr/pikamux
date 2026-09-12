@@ -12,16 +12,21 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
 pub const MANIFEST_SCHEMA: u32 = 2;
+pub const NATIVE_MANIFEST_FILE: &str = "pika-native-release.json";
 pub const ROOT_MARKER: &str = "pikamux-installer-v1\n";
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 pub const MAX_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_RELEASE_LIST_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_CANDIDATE_OUTPUT_BYTES: usize = 1024 * 1024;
+const CANDIDATE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RELEASE_API: &str =
     "https://api.github.com/repos/ayushjainr/pikamux/releases?per_page=100";
 pub const RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/ayushjainr/pikamux/releases/download";
@@ -479,7 +484,7 @@ pub fn select_latest_release(bytes: &[u8], current: &str, target: &str) -> Resul
             continue;
         };
         let expected = [
-            "pika-release.json".to_owned(),
+            NATIVE_MANIFEST_FILE.to_owned(),
             artifact.clone(),
             format!("{artifact}.sha256"),
         ];
@@ -564,7 +569,7 @@ pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
 
     let (manifest, artifact_path) = if let Some(bundle) = request.bundle {
         let bundle = checked_bundle(bundle)?;
-        let manifest_path = bundle.join("pika-release.json");
+        let manifest_path = bundle.join(NATIVE_MANIFEST_FILE);
         let manifest = read_manifest_file(&manifest_path)?;
         if let Some(release) = request.release
             && manifest.version != release
@@ -605,9 +610,9 @@ pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
             return Ok(already_current(&managed));
         }
         let base = format!("{RELEASE_DOWNLOAD_ROOT}/v{selected}");
-        let manifest_path = scratch.path.join("pika-release.json");
+        let manifest_path = scratch.path.join(NATIVE_MANIFEST_FILE);
         download(
-            &format!("{base}/pika-release.json"),
+            &format!("{base}/{NATIVE_MANIFEST_FILE}"),
             &manifest_path,
             MAX_MANIFEST_BYTES as u64,
             30,
@@ -761,7 +766,7 @@ pub fn prepare_remote_install_bundle(
     expected_version: Option<&str>,
 ) -> Result<RemoteInstallBundle> {
     let bundle = checked_bundle(bundle)?;
-    let manifest = read_manifest_file(&bundle.join("pika-release.json"))?;
+    let manifest = read_manifest_file(&bundle.join(NATIVE_MANIFEST_FILE))?;
     if expected_version.is_some_and(|expected| expected != manifest.version) {
         return Err(UpdateError::Safety(
             "remote bundle does not match the coordinator's pinned version".into(),
@@ -792,7 +797,7 @@ pub fn prepare_remote_install_bundle(
     let names = [
         "install.sh".to_owned(),
         "pika-version".to_owned(),
-        "pika-release.json".to_owned(),
+        NATIVE_MANIFEST_FILE.to_owned(),
         artifact.file.clone(),
         format!("{}.sha256", artifact.file),
     ];
@@ -1230,7 +1235,7 @@ fn prepare_release(
     fs::set_permissions(&bundled_artifact, fs::Permissions::from_mode(0o600))?;
     let manifest_bytes = serde_json::to_vec_pretty(request.manifest)
         .map_err(|error| UpdateError::Manifest(error.to_string()))?;
-    write_new_file(&bundle.join("pika-release.json"), &manifest_bytes, 0o600)?;
+    write_new_file(&bundle.join(NATIVE_MANIFEST_FILE), &manifest_bytes, 0o600)?;
     write_new_file(
         &bundle.join(format!("{}.sha256", artifact.file)),
         format!("{}\n", artifact.sha256).as_bytes(),
@@ -1294,7 +1299,7 @@ fn validate_existing_release(
             "release bundle path is not a managed directory".into(),
         ));
     }
-    let bundled_manifest = read_manifest_file(&bundle.join("pika-release.json"))?;
+    let bundled_manifest = read_manifest_file(&bundle.join(NATIVE_MANIFEST_FILE))?;
     if &bundled_manifest != request.manifest {
         return Err(UpdateError::Safety(
             "existing release bundle has a different manifest".into(),
@@ -1329,10 +1334,7 @@ fn validate_candidate(candidate: &Path, version: &str) -> Result<()> {
 }
 
 fn run_candidate(candidate: &Path, arguments: &[&str]) -> Result<String> {
-    let output = Command::new(candidate)
-        .args(arguments)
-        .output()
-        .map_err(|error| UpdateError::Candidate(error.to_string()))?;
+    let output = run_candidate_bounded(candidate, arguments, CANDIDATE_PROBE_TIMEOUT)?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
         return Err(UpdateError::Candidate(format!(
@@ -1344,6 +1346,137 @@ fn run_candidate(candidate: &Path, arguments: &[&str]) -> Result<String> {
     }
     String::from_utf8(output.stdout)
         .map_err(|error| UpdateError::Candidate(format!("non-UTF-8 output: {error}")))
+}
+
+fn run_candidate_bounded(
+    candidate: &Path,
+    arguments: &[&str],
+    timeout: Duration,
+) -> Result<Output> {
+    let mut command = Command::new(candidate);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| UpdateError::Candidate(error.to_string()))?;
+    let Some(stdout) = child.stdout.take() else {
+        terminate_candidate_tree(&mut child);
+        return Err(UpdateError::Candidate(
+            "candidate stdout was unavailable".into(),
+        ));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        terminate_candidate_tree(&mut child);
+        return Err(UpdateError::Candidate(
+            "candidate stderr was unavailable".into(),
+        ));
+    };
+    let (sender, receiver) = mpsc::sync_channel(2);
+    fn drain_candidate_output<R: Read + Send + 'static>(
+        is_stdout: bool,
+        mut stream: R,
+        sender: mpsc::SyncSender<(bool, io::Result<Vec<u8>>)>,
+    ) {
+        let sender = sender.clone();
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stream
+                .by_ref()
+                .take((MAX_CANDIDATE_OUTPUT_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = sender.send((is_stdout, result));
+        });
+    }
+    drain_candidate_output(true, stdout, sender.clone());
+    drain_candidate_output(false, stderr, sender.clone());
+    drop(sender);
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                terminate_candidate_tree(&mut child);
+                return Err(UpdateError::Candidate(format!(
+                    "{} exceeded its {} second deadline",
+                    arguments.join(" "),
+                    timeout.as_secs_f64()
+                )));
+            }
+            Err(error) => {
+                terminate_candidate_tree(&mut child);
+                return Err(UpdateError::Candidate(format!(
+                    "candidate wait failed: {error}"
+                )));
+            }
+        }
+    };
+    // A validation probe has no reason to leave descendants behind. Closing
+    // the process group also guarantees inherited output pipes reach EOF.
+    terminate_candidate_tree(&mut child);
+
+    // Pipe closure is part of the same advertised probe deadline. Reuse the
+    // original deadline rather than a short post-exit grace that becomes
+    // flaky under linker/CI contention.
+    let output_deadline = deadline;
+    let mut stdout = None;
+    let mut stderr = None;
+    while stdout.is_none() || stderr.is_none() {
+        let remaining = output_deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| UpdateError::Candidate("candidate output did not close".into()))?;
+        let (is_stdout, result) = receiver
+            .recv_timeout(remaining)
+            .map_err(|_| UpdateError::Candidate("candidate output did not close".into()))?;
+        let bytes = result.map_err(|error| UpdateError::Candidate(error.to_string()))?;
+        if bytes.len() > MAX_CANDIDATE_OUTPUT_BYTES {
+            return Err(UpdateError::Candidate(
+                "candidate output exceeds 1 MiB".into(),
+            ));
+        }
+        if is_stdout {
+            stdout = Some(bytes);
+        } else {
+            stderr = Some(bytes);
+        }
+    }
+    Ok(Output {
+        status,
+        stdout: stdout.unwrap_or_default(),
+        stderr: stderr.unwrap_or_default(),
+    })
+}
+
+fn terminate_candidate_tree(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        // `run_candidate_bounded` creates this child as its own process-group
+        // leader, so the negative PID cannot target Pika's process group.
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        // Keep the owned root bounded on the experimental client target. The
+        // release probe itself is not allowed to delegate validation work.
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn validate_install_paths(root: &Path, bin_dir: &Path) -> Result<()> {
@@ -1710,4 +1843,52 @@ fn number(value: &str) -> Result<u64> {
     value
         .parse()
         .map_err(|_| UpdateError::Manifest("version number is too large".into()))
+}
+
+#[cfg(all(test, unix))]
+mod bounded_candidate_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn script(body: &str) -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("candidate");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        (directory, path)
+    }
+
+    #[test]
+    fn candidate_probe_deadline_includes_a_stalled_process() {
+        let (_directory, candidate) = script("printf 'started\\n'\nsleep 30");
+        let started = Instant::now();
+        let error = run_candidate_bounded(&candidate, &["--version"], Duration::from_millis(150))
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn candidate_probe_reaps_descendants_holding_output_open() {
+        // Replacing the shell makes the root process exit immediately while
+        // the background child deliberately retains both inherited pipes.
+        // Falling off the end of a non-interactive shell is not portable: some
+        // shells wait for background jobs and would test the root deadline
+        // instead of descendant cleanup.
+        let (_directory, candidate) =
+            script("sleep 30 &\nprintf 'pika 0.0.0\\n'\nexec /usr/bin/true");
+        let started = Instant::now();
+        let output =
+            run_candidate_bounded(&candidate, &["--version"], Duration::from_secs(1)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "pika 0.0.0\n");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn candidate_probe_rejects_unbounded_output() {
+        let (_directory, candidate) = script("dd if=/dev/zero bs=1048577 count=1 2>/dev/null");
+        let error = run_candidate_bounded(&candidate, &[], Duration::from_secs(2)).unwrap_err();
+        assert!(error.to_string().contains("exceeds 1 MiB"));
+    }
 }

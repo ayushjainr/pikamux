@@ -91,7 +91,7 @@ fn release_bundle(temp: &Path, version: &str) -> PathBuf {
         )]),
     };
     fs::write(
-        bundle.join("pika-release.json"),
+        bundle.join("pika-native-release.json"),
         serde_json::to_vec_pretty(&manifest).unwrap(),
     )
     .unwrap();
@@ -279,7 +279,7 @@ fn staged_install_is_atomic_idempotent_and_retains_previous_release() {
     assert!(
         outcome
             .release_dir
-            .join("bundle/pika-release.json")
+            .join("bundle/pika-native-release.json")
             .is_file()
     );
     assert!(
@@ -293,7 +293,7 @@ fn staged_install_is_atomic_idempotent_and_retains_previous_release() {
     );
     assert_eq!(
         ReleaseManifest::parse(
-            &fs::read(outcome.release_dir.join("bundle/pika-release.json")).unwrap()
+            &fs::read(outcome.release_dir.join("bundle/pika-native-release.json")).unwrap()
         )
         .unwrap(),
         first
@@ -422,7 +422,7 @@ fn latest_selection_requires_a_complete_channel_compatible_release() {
     let assets = |version: &str| {
         let artifact = artifact_name(version, target).unwrap();
         serde_json::json!([
-            {"name":"pika-release.json","state":"uploaded"},
+            {"name":"pika-native-release.json","state":"uploaded"},
             {"name":artifact,"state":"uploaded"},
             {"name":format!("{artifact}.sha256"),"state":"uploaded"}
         ])
@@ -431,7 +431,7 @@ fn latest_selection_requires_a_complete_channel_compatible_release() {
         {"tag_name":"v9.0.0","draft":true,"prerelease":false,"assets":assets("9.0.0")},
         {"tag_name":"v0.7.0-alpha.2","draft":false,"prerelease":true,"assets":assets("0.7.0-alpha.2")},
         {"tag_name":"v0.6.1","draft":false,"prerelease":false,"assets":assets("0.6.1")},
-        {"tag_name":"v0.8.0","draft":false,"prerelease":false,"assets":[{"name":"pika-release.json","state":"uploaded"}]},
+        {"tag_name":"v0.8.0","draft":false,"prerelease":false,"assets":[{"name":"pika-native-release.json","state":"uploaded"}]},
         {"tag_name":"v0.7.0","draft":false,"prerelease":true,"assets":assets("0.7.0")}
     ]);
     let bytes = serde_json::to_vec(&listing).unwrap();
@@ -658,7 +658,7 @@ fn shell_bootstrap_uses_an_offline_bundle_and_forwards_only_fixed_paths() {
     )
     .unwrap();
     fs::write(bundle.join("pika-version"), format!("{version}\n")).unwrap();
-    fs::write(bundle.join("pika-release.json"), "{}\n").unwrap();
+    fs::write(bundle.join("pika-native-release.json"), "{}\n").unwrap();
 
     let output = Command::new("bash")
         .arg("scripts/install.sh")
@@ -768,7 +768,8 @@ fn release_packager_emits_a_strict_manifest_and_refuses_replacement() {
         String::from_utf8_lossy(&result.stderr)
     );
     let manifest =
-        ReleaseManifest::parse(&fs::read(output.join("pika-release.json")).unwrap()).unwrap();
+        ReleaseManifest::parse(&fs::read(output.join("pika-native-release.json")).unwrap())
+            .unwrap();
     let artifact = manifest.artifact_for(target).unwrap();
     assert_eq!(
         sha256_file(&output.join(&artifact.file)).unwrap(),
@@ -887,7 +888,7 @@ fn remote_payload_is_version_pinned_allowlisted_and_installer_verified() {
     let artifact = artifact_name(version, target).unwrap();
     let mut expected = vec![
         "install.sh".to_owned(),
-        "pika-release.json".to_owned(),
+        "pika-native-release.json".to_owned(),
         "pika-version".to_owned(),
         artifact.clone(),
         format!("{artifact}.sha256"),

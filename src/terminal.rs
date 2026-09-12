@@ -10,6 +10,7 @@ pub const FOREGROUND_ENV: &str = "PIKA_TERMINAL_FOREGROUND";
 pub const BACKGROUND_ENV: &str = "PIKA_TERMINAL_BACKGROUND";
 pub const WINDOWS_TERMINAL_DA2: &[u8] = b"\x1b[>0;10;1c";
 const PALETTE_QUERY: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
+const ATTACH_READY_GRACE: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Palette {
@@ -288,16 +289,41 @@ pub fn run_pty_bridge(
     palette: Option<Palette>,
     suppress_da2: bool,
 ) -> Result<i32> {
+    run_pty_bridge_with_started(argv, palette, suppress_da2, || Ok(()))
+}
+
+/// Run an interactive child and invoke `on_started` exactly once after it
+/// survives the short attach-readiness window, before waiting for it to exit.
+/// Spawn and early-exit failures never invoke the callback; callback failures
+/// reap the child.
+#[cfg(unix)]
+pub fn run_pty_bridge_with_started<F>(
+    argv: &[String],
+    palette: Option<Palette>,
+    suppress_da2: bool,
+    on_started: F,
+) -> Result<i32>
+where
+    F: FnOnce() -> Result<()>,
+{
     use std::os::unix::process::CommandExt;
     if argv.is_empty() {
         bail!("missing terminal bridge command");
     }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Ok(Command::new(&argv[0])
-            .args(&argv[1..])
-            .status()?
-            .code()
-            .unwrap_or(1));
+        let mut child = Command::new(&argv[0]).args(&argv[1..]).spawn()?;
+        if let Some(status) = wait_for_child_readiness(&mut child, ATTACH_READY_GRACE)? {
+            if status.success() {
+                on_started()?;
+            }
+            return Ok(status.code().unwrap_or(1));
+        }
+        if let Err(error) = on_started() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        return Ok(child.wait()?.code().unwrap_or(1));
     }
     let mut master = 0;
     let child = unsafe {
@@ -316,6 +342,23 @@ pub fn run_pty_bridge(
         eprintln!("pika: cannot start {}: {error}", argv[0]);
         unsafe { libc::_exit(127) };
     }
+    if let Some(status) = wait_for_pty_readiness(child, ATTACH_READY_GRACE)? {
+        drain_finished_pty(master);
+        unsafe { libc::close(master) };
+        let code = wait_exit_code(status);
+        if code == 0 {
+            on_started()?;
+        }
+        return Ok(code);
+    }
+    if let Err(error) = on_started() {
+        unsafe {
+            libc::kill(child, libc::SIGTERM);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+            libc::close(master);
+        }
+        return Err(error);
+    }
     bridge_parent(child, master, palette, suppress_da2)
 }
 
@@ -325,14 +368,92 @@ pub fn run_pty_bridge(
     _palette: Option<Palette>,
     _suppress_da2: bool,
 ) -> Result<i32> {
+    run_pty_bridge_with_started(argv, None, false, || Ok(()))
+}
+
+#[cfg(not(unix))]
+pub fn run_pty_bridge_with_started<F>(
+    argv: &[String],
+    _palette: Option<Palette>,
+    _suppress_da2: bool,
+    on_started: F,
+) -> Result<i32>
+where
+    F: FnOnce() -> Result<()>,
+{
     if argv.is_empty() {
         bail!("missing terminal bridge command");
     }
-    Ok(Command::new(&argv[0])
-        .args(&argv[1..])
-        .status()?
-        .code()
-        .unwrap_or(1))
+    let mut child = Command::new(&argv[0]).args(&argv[1..]).spawn()?;
+    if let Some(status) = wait_for_child_readiness(&mut child, ATTACH_READY_GRACE)? {
+        if status.success() {
+            on_started()?;
+        }
+        return Ok(status.code().unwrap_or(1));
+    }
+    if let Err(error) = on_started() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(child.wait()?.code().unwrap_or(1))
+}
+
+fn wait_for_child_readiness(
+    child: &mut std::process::Child,
+    grace: Duration,
+) -> Result<Option<std::process::ExitStatus>> {
+    let deadline = Instant::now() + grace;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_pty_readiness(child: libc::pid_t, grace: Duration) -> Result<Option<libc::c_int>> {
+    let deadline = Instant::now() + grace;
+    loop {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+        if waited == child {
+            return Ok(Some(status));
+        }
+        if waited < 0 {
+            return Err(io::Error::last_os_error()).context("cannot observe terminal child");
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+fn drain_finished_pty(master: libc::c_int) {
+    loop {
+        let mut descriptor = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut descriptor, 1, 0) } <= 0
+            || descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0
+        {
+            break;
+        }
+        let mut buffer = [0_u8; 4096];
+        let count = unsafe { libc::read(master, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if count <= 0 {
+            break;
+        }
+        let _ = write_fd(libc::STDOUT_FILENO, &buffer[..count as usize]);
+    }
 }
 
 #[cfg(unix)]
@@ -513,5 +634,44 @@ mod tests {
             b"beforemiddleafter"
         );
         assert_eq!(replies.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_callback_rejects_early_failure_but_records_a_later_interruption() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let failed_calls = Arc::new(AtomicUsize::new(0));
+        let failed_counter = Arc::clone(&failed_calls);
+        let failed = run_pty_bridge_with_started(
+            &["sh".into(), "-c".into(), "exit 17".into()],
+            None,
+            false,
+            move || {
+                failed_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(failed, 17);
+        assert_eq!(failed_calls.load(Ordering::SeqCst), 0);
+
+        let interrupted_calls = Arc::new(AtomicUsize::new(0));
+        let interrupted_counter = Arc::clone(&interrupted_calls);
+        let interrupted = run_pty_bridge_with_started(
+            &["sh".into(), "-c".into(), "sleep 0.25; exit 130".into()],
+            None,
+            false,
+            move || {
+                interrupted_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(interrupted, 130);
+        assert_eq!(interrupted_calls.load(Ordering::SeqCst), 1);
     }
 }

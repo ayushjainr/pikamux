@@ -93,7 +93,7 @@ fn codex_excludes_archived_and_proven_workers_but_preserves_fork_identity() {
     let worker = "55555555-5555-4555-8555-555555555555";
     let subagent = "66666666-6666-4666-8666-666666666666";
     for (id, name, payload, hidden, updated) in [
-        (named, Some("master_quant"), serde_json::json!({}), 0, 10),
+        (named, Some("research_thread"), serde_json::json!({}), 0, 10),
         (
             fork,
             Some("returns_tracker"),
@@ -105,7 +105,7 @@ fn codex_excludes_archived_and_proven_workers_but_preserves_fork_identity() {
         (
             worker,
             Some("codex-generated"),
-            serde_json::json!({"originator":"agentic_fund"}),
+            serde_json::json!({"originator":"automation_worker"}),
             0,
             40,
         ),
@@ -130,7 +130,10 @@ fn codex_excludes_archived_and_proven_workers_but_preserves_fork_identity() {
     }
     drop(db);
 
-    let config = Config::default();
+    let config = Config {
+        codex_worker_originators: vec!["automation_worker".into()],
+        ..Config::default()
+    };
     let providers = Providers::new(&paths, &config);
     let records = providers.discover(Provider::Codex);
     assert_eq!(
@@ -156,7 +159,7 @@ fn claude_first_screen_requires_explicit_name_and_exact_uuid_still_resolves() {
     let sessions = paths.claude_home.join("sessions");
     fs::create_dir_all(&sessions).unwrap();
     for (id, name, source) in [
-        (custom, "qes_plugin", "custom"),
+        (custom, "data_plugin", "custom"),
         (derived, "Generated title", "derived"),
         (worker, "Inherited worker name", "custom"),
     ] {
@@ -199,7 +202,7 @@ fn claude_first_screen_requires_explicit_name_and_exact_uuid_still_resolves() {
             .iter()
             .map(|item| item.name.as_deref().unwrap())
             .collect::<std::collections::BTreeSet<_>>(),
-        ["qes_plugin", "durable_expert"].into_iter().collect()
+        ["data_plugin", "durable_expert"].into_iter().collect()
     );
     assert!(
         providers
@@ -229,7 +232,7 @@ fn opencode_never_claims_title_provenance_and_projects_child_lifecycle() {
     for row in [
         (
             "ses_root0001",
-            "oc_qes_style",
+            "oc_house_style",
             "/project",
             None,
             1,
@@ -256,7 +259,7 @@ fn opencode_never_claims_title_provenance_and_projects_child_lifecycle() {
         ),
         (
             "ses_auto000",
-            "agentic-fund: worker",
+            "automation: worker",
             "/tmp/opencode-runtime/run",
             None,
             1,
@@ -286,7 +289,10 @@ fn opencode_never_claims_title_provenance_and_projects_child_lifecycle() {
     .unwrap();
     drop(db);
 
-    let config = Config::default();
+    let config = Config {
+        opencode_worker_title_prefixes: vec!["automation:".into()],
+        ..Config::default()
+    };
     let providers = Providers::new(&paths, &config);
     assert!(providers.discover(Provider::Opencode).is_empty());
     let browse = providers.browse(Provider::Opencode);

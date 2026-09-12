@@ -365,10 +365,42 @@ impl Tmux {
     }
 
     pub fn attach(&self, session: &str, pane: Option<&str>) -> Result<i32> {
+        self.attach_with_started(session, pane, || Ok(()))
+    }
+
+    /// Attach to an already verified home and report the successful handoff
+    /// before waiting for the interactive client to exit.
+    pub fn attach_with_started<F>(
+        &self,
+        session: &str,
+        pane: Option<&str>,
+        on_started: F,
+    ) -> Result<i32>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.attach_with_started_mode(
+            session,
+            pane,
+            std::env::var_os("TMUX").is_some(),
+            on_started,
+        )
+    }
+
+    fn attach_with_started_mode<F>(
+        &self,
+        session: &str,
+        pane: Option<&str>,
+        inside_tmux: bool,
+        on_started: F,
+    ) -> Result<i32>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         self.ensure_terminal_reply_guard();
         self.ensure_rgb();
         self.configure_home(session, pane)?;
-        if std::env::var_os("TMUX").is_some() {
+        if inside_tmux {
             let status = self
                 .command()
                 .args(["switch-client", "-t", session])
@@ -380,15 +412,15 @@ impl Tmux {
                         .args(["select-window", "-t", pane])
                         .status()?;
                     if window.success() {
-                        return Ok(self
-                            .command()
-                            .args(["select-pane", "-t", pane])
-                            .status()?
-                            .code()
-                            .unwrap_or(1));
+                        let selected = self.command().args(["select-pane", "-t", pane]).status()?;
+                        if selected.success() {
+                            on_started()?;
+                        }
+                        return Ok(selected.code().unwrap_or(1));
                     }
                     return Ok(window.code().unwrap_or(1));
                 } else {
+                    on_started()?;
                     return Ok(0);
                 }
             }
@@ -404,7 +436,7 @@ impl Tmux {
                 "-t".into(),
                 pane.unwrap_or(session).into(),
             ]);
-            terminal::run_pty_bridge(&argv, None, true)
+            terminal::run_pty_bridge_with_started(&argv, None, true, on_started)
         }
     }
 
@@ -740,18 +772,18 @@ fn agent_wrapper(
             foreground,
             background,
         });
-    if provider == Provider::Codex {
-        if let Some(palette) = palette {
-            launch.extend([
-                pika.clone(),
-                "_terminal-bridge".into(),
-                "--foreground".into(),
-                terminal::encode_color(palette.foreground),
-                "--background".into(),
-                terminal::encode_color(palette.background),
-                "--".into(),
-            ]);
-        }
+    if provider == Provider::Codex
+        && let Some(palette) = palette
+    {
+        launch.extend([
+            pika.clone(),
+            "_terminal-bridge".into(),
+            "--foreground".into(),
+            terminal::encode_color(palette.foreground),
+            "--background".into(),
+            terminal::encode_color(palette.background),
+            "--".into(),
+        ]);
     }
     launch.extend(agent_argv.iter().cloned());
 
@@ -782,6 +814,9 @@ fn agent_wrapper(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     #[test]
     fn inventory_parser_keeps_raw_names() {
@@ -816,5 +851,54 @@ mod tests {
             Tmux::internal_name(Provider::Codex, "abcd-efgh-ijkl"),
             "pika-c-abcdefghij"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_handoff_runs_callback_before_interrupted_client_exits() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("tmux-fixture");
+        fs::write(
+            &executable,
+            "#!/bin/sh\ncase \"$*\" in *attach-session*) sleep 0.25; exit 130;; *) exit 0;; esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let tmux = Tmux::with_executable(executable.to_string_lossy(), None);
+        let mut started = false;
+        let code = tmux
+            .attach_with_started_mode("pika-c-workstream", Some("%1"), false, || {
+                started = true;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(code, 130);
+        assert!(
+            started,
+            "attach history must survive Ctrl-C/detach exit codes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_attach_before_handoff_does_not_run_callback() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("tmux-fixture");
+        fs::write(
+            &executable,
+            "#!/bin/sh\ncase \"$*\" in *attach-session*) exit 127;; *) exit 0;; esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let tmux = Tmux::with_executable(executable.to_string_lossy(), None);
+        let mut started = false;
+        let code = tmux
+            .attach_with_started_mode("pika-c-workstream", Some("%1"), false, || {
+                started = true;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(code, 127);
+        assert!(!started, "failed pre-attach must not change open history");
     }
 }

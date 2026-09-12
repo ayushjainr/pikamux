@@ -1,6 +1,6 @@
 # Native performance evidence
 
-Measurements below were captured on 2026-09-12 on an Apple M1 Pro running
+Measurements below were captured on 2026-09-11 on an Apple M1 Pro running
 macOS 26.6.2. Both implementations used isolated HOME, XDG, provider, database,
 temporary, and tmux-socket paths. The board fixture contained 200 synthetic
 conversations at 150×35 cells. No provider model, remote machine, user database,
@@ -13,21 +13,21 @@ Python v0.5.0a4 reference recorded in `REFERENCE.md`.
 
 | Contract | Samples | Native Rust | Python v0.5.0a4 | Gate |
 | --- | ---: | ---: | ---: | ---: |
-| CLI startup p95 | 100 each | 6.12 ms | 135.20 ms | ≤30 ms |
-| Cached board first-frame p95 | 30 each | 11.36 ms | 452.04 ms | ≤200 ms |
-| Board input redraw p95 / p99 | 1,000 each | 0.115 / 0.132 ms | 8.37 / 8.64 ms | ≤50 / 100 ms |
-| Hook fast-path p95 | 100 each | 18.71 ms | 467.57 ms | ≤75 ms |
-| Full 200-row local reconciliation p95 | 30 each | 61.17 ms | 2,245.45 ms | ≤500 ms |
-| Warm board RSS p95 | 300 s native / 60 s Python | 6.73 MiB | 36.42 MiB | ≤40 MiB |
-| Native idle board CPU mean | 300 s | 0.833% of one core | — | ≤1% |
-| Executable / gzip | one release build | 4.41 / 2.07 MB | interpreter environment required | ≤50 / 20 MiB |
+| CLI startup p95 | 100 each | 3.92 ms | 140.23 ms | ≤30 ms |
+| Cached board first-frame p95 | 30 each | 10.41 ms | 458.65 ms | ≤200 ms |
+| Board input redraw p95 / p99 | 1,000 each | 0.115 / 0.132 ms | 8.38 / 9.51 ms | ≤50 / 100 ms |
+| Hook fast-path p95 | 100 each | 18.39 ms | 473.33 ms | ≤75 ms |
+| Full 200-row local reconciliation p95 | 30 each | 60.92 ms | 2,398.79 ms | ≤500 ms |
+| Warm board RSS p95 | 300 s native / 60 s Python | 6.47 MiB | 36.42 MiB | ≤40 MiB |
+| Native idle board CPU mean | 300 s | 0.774% of one core | — | ≤1% |
+| Executable / gzip | one release build | 4.17 / 2.15 MB | interpreter environment required | ≤50 / 20 MiB |
 
-The 100-launch native startup run had one 397.87 ms outlier immediately after a
-release build; its p50 was 3.75 ms and p95 was 6.12 ms. The dedicated board run
-had an 18.33 ms maximum. The five-minute CPU run repainted the clock once per
+The 100-launch native startup run had one 362.43 ms outlier immediately after a
+release build; its p50 was 3.76 ms and p95 was 3.92 ms. The dedicated board run
+had an 11.06 ms maximum. The five-minute CPU run repainted the clock once per
 second and performed the fallback provider/process reconciliation every ten
 seconds; lifecycle hooks remain immediate. Its process-tree RSS maximum was
-6.73 MiB and its second-half CPU mean was 0.789%.
+8.50 MiB, RSS p95 was 6.47 MiB, and its second-half CPU mean was 0.609%.
 
 `measure_reconcile.py` invokes the public `pika list --no-usage` boundary, so its
 numbers include process startup, process enumeration, provider metadata reads,

@@ -1,6 +1,7 @@
 use crate::{
     config::Config,
     model::{Candidate, ObservationKind, Pane, Provider, Session, Status},
+    open_history,
     paths::Paths,
     process::{self, ProcessObservation, ProcessRecord},
     providers::Providers,
@@ -767,8 +768,17 @@ impl Pika {
             let binding = self.exact_pane_binding(&session, session.tmux_pane.as_deref())?;
             let event = session.last_event_at;
             let code = if attach {
-                self.tmux
-                    .attach(&binding.pane.session_name, Some(&binding.pane.pane_id))?
+                self.tmux.attach_with_started(
+                    &binding.pane.session_name,
+                    Some(&binding.pane.pane_id),
+                    || {
+                        open_history::record_session(
+                            &self.store,
+                            session.provider,
+                            &session.session_id,
+                        )
+                    },
+                )?
             } else {
                 0
             };
@@ -944,7 +954,10 @@ impl Pika {
             bail!("Pika refused a pending home whose exact launch identity changed")
         }
         let code = if attach {
-            self.tmux.attach(&pane.session_name, Some(&pane.pane_id))?
+            self.tmux
+                .attach_with_started(&pane.session_name, Some(&pane.pane_id), || {
+                    open_history::record_pending(&self.store, &pending)
+                })?
         } else {
             0
         };
@@ -1034,8 +1047,17 @@ impl Pika {
                 let binding = self.exact_pane_binding(&session, None)?;
                 self.store.delete_pending(&token)?;
                 let code = if attach {
-                    self.tmux
-                        .attach(&binding.pane.session_name, Some(&binding.pane.pane_id))?
+                    self.tmux.attach_with_started(
+                        &binding.pane.session_name,
+                        Some(&binding.pane.pane_id),
+                        || {
+                            open_history::record_session(
+                                &self.store,
+                                session.provider,
+                                &session.session_id,
+                            )
+                        },
+                    )?
                 } else {
                     0
                 };
@@ -1158,7 +1180,14 @@ impl Pika {
                 bail!("the launched provider generation could not be certified")
             }
             let code = if attach {
-                self.tmux.attach(&pane.session_name, Some(&pane.pane_id))?
+                self.tmux
+                    .attach_with_started(&pane.session_name, Some(&pane.pane_id), || {
+                        open_history::record_session(
+                            &self.store,
+                            session.provider,
+                            &session.session_id,
+                        )
+                    })?
             } else {
                 0
             };
@@ -1354,7 +1383,10 @@ impl Pika {
                     ..pending.clone()
                 });
             let code = if attach {
-                self.tmux.attach(&pane.session_name, Some(&pane.pane_id))?
+                self.tmux
+                    .attach_with_started(&pane.session_name, Some(&pane.pane_id), || {
+                        open_history::record_pending(&self.store, &current)
+                    })?
             } else {
                 0
             };
@@ -1747,7 +1779,7 @@ mod tests {
         session_from_candidate(&Candidate {
             provider: Provider::Codex,
             session_id: identity.to_owned(),
-            name: Some("master_hf".into()),
+            name: Some("portfolio_review".into()),
             cwd: Some("/tmp".into()),
             branch: None,
             transcript_path: None,
@@ -1785,7 +1817,7 @@ mod tests {
             created: 1.0,
             pika_provider: Some(Provider::Codex),
             pika_session_id: Some(identity.into()),
-            pika_name: Some("master_hf".into()),
+            pika_name: Some("portfolio_review".into()),
             pika_launch_token: None,
         }
     }
@@ -1794,7 +1826,7 @@ mod tests {
         Candidate {
             provider: Provider::Codex,
             session_id: identity.into(),
-            name: Some("master_hf".into()),
+            name: Some("portfolio_review".into()),
             cwd: Some("/tmp".into()),
             branch: None,
             transcript_path: None,
