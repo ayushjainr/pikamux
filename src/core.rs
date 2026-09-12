@@ -865,7 +865,7 @@ impl Pika {
         }
         let availability =
             crate::experts::local_source_availability(&self.paths, &self.config, &session);
-        if !availability.permits_consultation() {
+        if !availability.permits_resume() {
             let display_name = session.display_name();
             let quoted_name = shell_words::quote(&display_name);
             if availability == crate::experts::SourceAvailability::Archived

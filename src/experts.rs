@@ -158,6 +158,13 @@ impl SourceAvailability {
     pub fn permits_consultation(self) -> bool {
         self == Self::SourceAvailable
     }
+
+    /// An exact provider resume can safely ask the provider to resolve an
+    /// immutable ID when metadata is temporarily unreadable. Confirmed
+    /// archive/deletion or an unresolved identity failure must still block.
+    pub fn permits_resume(self) -> bool {
+        matches!(self, Self::SourceAvailable | Self::SourceUnavailable)
+    }
 }
 
 /// Capability produced after the lifecycle layer proves the calling pane.
