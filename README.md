@@ -101,13 +101,13 @@ the same terminal geometry; hook runs alternate Python/native order.
 
 | Contract | Native Rust | Python v0.5.0a4 |
 | --- | ---: | ---: |
-| CLI startup, p95 (100 launches) | 3.92 ms | 140.23 ms |
-| Cached board first frame, p95 (30 launches) | 10.41 ms | 458.65 ms |
-| Board input redraw, p95 (1,000 keys) | 0.115 ms | 8.38 ms |
-| Hook fast path, p95 (100 events) | 18.39 ms | 473.33 ms |
-| 200-row local reconciliation, p95 (30 runs) | 60.92 ms | 2,398.79 ms |
-| Warm board RSS, p95 | 6.47 MiB | 36.42 MiB |
-| Binary / gzip | 4.17 MB / 2.15 MB | interpreter environment required |
+| CLI startup, p95 (100 launches) | 6.29 ms | 154.94 ms |
+| Cached board first frame, p95 (30 launches) | 12.61 ms | 490.47 ms |
+| Board input redraw, p95 (1,000 keys) | 0.118 ms | 8.58 ms |
+| Hook fast path, p95 (100 events) | 25.04 ms | 515.52 ms |
+| 200-row local reconciliation, p95 (30 runs) | 68.63 ms | 2,785.48 ms |
+| Warm board RSS, p95 | 7.03 MiB | 36.42 MiB |
+| Binary / gzip | 4.61 MB / 2.15 MB | interpreter environment required |
 
 Reproduce the measurements with:
 
