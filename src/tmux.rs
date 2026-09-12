@@ -9,7 +9,11 @@ use std::{
     ffi::OsStr,
     io::Read,
     process::{Command, Output, Stdio},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicI32, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -471,6 +475,20 @@ impl Tmux {
         self.attach_exact_with_started_mode(pane, std::env::var_os("TMUX").is_some(), on_started)
     }
 
+    /// Attach to an exact pane, commit the caller's proof, then show the
+    /// resulting receipt to only the client that invoked this handoff.
+    pub fn attach_exact_with_receipt<F>(&self, pane: &Pane, on_started: F) -> Result<i32>
+    where
+        F: FnOnce() -> Result<String>,
+    {
+        self.attach_exact_with_started_mode_inner(
+            pane,
+            std::env::var_os("TMUX").is_some(),
+            true,
+            move || on_started().map(Some),
+        )
+    }
+
     fn attach_exact_with_started_mode<F>(
         &self,
         pane: &Pane,
@@ -479,6 +497,22 @@ impl Tmux {
     ) -> Result<i32>
     where
         F: FnOnce() -> Result<()>,
+    {
+        self.attach_exact_with_started_mode_inner(pane, inside_tmux, false, move || {
+            on_started()?;
+            Ok(None)
+        })
+    }
+
+    fn attach_exact_with_started_mode_inner<F>(
+        &self,
+        pane: &Pane,
+        inside_tmux: bool,
+        wants_receipt: bool,
+        on_started: F,
+    ) -> Result<i32>
+    where
+        F: FnOnce() -> Result<Option<String>>,
     {
         self.ensure_terminal_reply_guard();
         self.ensure_rgb();
@@ -503,20 +537,79 @@ impl Tmux {
             "run-shell 'exit 75'".into(),
         ]);
         if inside_tmux {
+            // Capture the invoking client before switch-client changes its
+            // selected pane. A receipt must never leak to every tmux client.
+            let client_name = wants_receipt
+                .then(|| {
+                    self.output(["display-message", "-p", "#{client_name}"], false)
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                        .filter(|value| !value.is_empty())
+                })
+                .flatten();
             let status =
                 bounded_output(Command::new(&argv[0]).args(&argv[1..]), COMMAND_TIMEOUT)?.status;
             if status.success() {
-                on_started()?;
+                if let Some(receipt) = on_started()? {
+                    let mut args = vec!["display-message"];
+                    if let Some(client) = client_name.as_deref() {
+                        args.extend(["-c", client]);
+                    }
+                    args.extend(["-d", "3000", "-l", &receipt]);
+                    let _ = self.output(args, false);
+                }
             }
             Ok(status.code().unwrap_or(1))
         } else {
+            let attached_pid = Arc::new(AtomicI32::new(0));
+            let proof_pid = Arc::clone(&attached_pid);
+            let receipt_pid = Arc::clone(&attached_pid);
             terminal::run_pty_bridge_with_handoff(
                 &argv,
                 None,
                 true,
-                |client_pid| self.client_is_attached_to_pane(client_pid, &pane.pane_id),
-                on_started,
+                |client_pid| {
+                    let proven = self.client_is_attached_to_pane(client_pid, &pane.pane_id);
+                    if proven {
+                        proof_pid.store(client_pid, Ordering::Relaxed);
+                    }
+                    proven
+                },
+                || {
+                    if let Some(receipt) = on_started()? {
+                        let client_pid = receipt_pid.load(Ordering::Relaxed);
+                        if client_pid > 0 {
+                            self.display_to_client_pid(client_pid, &receipt);
+                        }
+                    }
+                    Ok(())
+                },
             )
+        }
+    }
+
+    fn display_to_client_pid(&self, client_pid: i32, message: &str) {
+        let Ok(output) = self.output(
+            ["list-clients", "-F", "#{client_name}\t#{client_pid}"],
+            false,
+        ) else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Some((client, pid)) = line.split_once('\t') else {
+                continue;
+            };
+            if pid.parse::<i32>() == Ok(client_pid) && !client.is_empty() {
+                let _ = self.output(
+                    ["display-message", "-c", client, "-d", "3000", "-l", message],
+                    false,
+                );
+                return;
+            }
         }
     }
 
@@ -1409,6 +1502,67 @@ mod tests {
         assert_eq!(code, 0);
         assert!(started);
         assert_eq!(fs::read_to_string(release).unwrap(), "attached");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inside_handoff_targets_receipt_after_proof_callback() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("trace");
+        let proof = temp.path().join("proof");
+        let tmux = tmux_fixture(
+            &temp,
+            &format!(
+                "printf '%s\\n' \"$*\" >> {trace}\ncase \"$*\" in\n  'display-message -p #{{client_name}}') printf '%s\\n' invoking-client;;\n  *'display-message -c invoking-client -d 3000 -l exact receipt'*) test -f {proof} || printf '%s\\n' BEFORE_PROOF >> {trace};;\nesac\nexit 0",
+                trace = shell_words::quote(&trace.to_string_lossy()),
+                proof = shell_words::quote(&proof.to_string_lossy()),
+            ),
+        );
+        let code = tmux
+            .attach_exact_with_started_mode_inner(&exact_test_pane(), true, true, || {
+                fs::write(&proof, "proved")?;
+                Ok(Some("exact receipt".into()))
+            })
+            .unwrap();
+        assert_eq!(code, 0);
+        let trace = fs::read_to_string(trace).unwrap();
+        assert!(!trace.contains("BEFORE_PROOF"));
+        assert!(trace.contains("display-message -c invoking-client -d 3000 -l exact receipt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outside_handoff_sends_receipt_only_to_proven_client_before_return() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("trace");
+        let pid_file = temp.path().join("client.pid");
+        let release = temp.path().join("release");
+        let proof = temp.path().join("proof");
+        let executable = temp.path().join("tmux-fixture");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {trace}\ncase \"$*\" in\n  *'list-clients -F #{{client_pid}}'*) test -f {pid} && printf '%s\\t%%1\\n' \"$(cat {pid})\"; exit 0;;\n  *'list-clients -F #{{client_name}}'*) test -f {pid} && printf 'other\\t999\\ninvoking-client\\t%s\\n' \"$(cat {pid})\"; exit 0;;\n  *'display-message -c invoking-client -d 3000 -l exact receipt'*) test -f {proof} || printf '%s\\n' BEFORE_PROOF >> {trace}; touch {release}; exit 0;;\n  *attach-session*) printf '%s' \"$$\" > {pid}; n=0; while test ! -f {release} && test \"$n\" -lt 200; do n=$((n + 1)); sleep 0.01; done; test -f {release}; exit;;\nesac\nexit 0\n",
+                trace = shell_words::quote(&trace.to_string_lossy()),
+                pid = shell_words::quote(&pid_file.to_string_lossy()),
+                release = shell_words::quote(&release.to_string_lossy()),
+                proof = shell_words::quote(&proof.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let tmux = Tmux::with_executable(executable.to_string_lossy(), None);
+        let code = tmux
+            .attach_exact_with_started_mode_inner(&exact_test_pane(), false, true, || {
+                fs::write(&proof, "proved")?;
+                Ok(Some("exact receipt".into()))
+            })
+            .unwrap();
+        assert_eq!(code, 0);
+        let trace = fs::read_to_string(trace).unwrap();
+        assert!(!trace.contains("BEFORE_PROOF"));
+        assert!(trace.contains("display-message -c invoking-client -d 3000 -l exact receipt"));
+        assert!(!trace.contains("display-message -c other"));
     }
 
     #[cfg(unix)]

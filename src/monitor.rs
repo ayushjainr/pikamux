@@ -242,6 +242,8 @@ pub fn run(sessions: Vec<Session>) -> Result<BoardAction> {
         None,
         None,
         None,
+        Vec::new(),
+        None,
     )
 }
 
@@ -266,6 +268,8 @@ pub fn run_dynamic(sessions: Vec<Session>, updates: Receiver<Vec<Session>>) -> R
         None,
         None,
         None,
+        Vec::new(),
+        None,
     )
 }
 
@@ -284,6 +288,8 @@ pub fn run_items_dynamic(
         None,
         None,
         None,
+        Vec::new(),
+        None,
     )
 }
 
@@ -301,6 +307,8 @@ pub fn run_items_dynamic_with_notice(
         driver,
         Some(update_notice),
         None,
+        None,
+        Vec::new(),
         None,
     )
 }
@@ -321,6 +329,8 @@ pub fn run_items_dynamic_with_notice_and_refresh(
         Some(update_notice),
         Some(refresh_request),
         None,
+        Vec::new(),
+        None,
     )
 }
 
@@ -333,6 +343,8 @@ pub(crate) fn run_items_dynamic_with_local_health(
     update_notice: Receiver<Option<String>>,
     refresh_request: SyncSender<()>,
     local_refresh_delayed: Arc<AtomicBool>,
+    initial_fleet_health: Vec<String>,
+    fleet_health_updates: LatestReceiver<Vec<String>>,
 ) -> Result<BoardAction> {
     run_loop(
         items,
@@ -341,6 +353,8 @@ pub(crate) fn run_items_dynamic_with_local_health(
         Some(update_notice),
         Some(refresh_request),
         Some(local_refresh_delayed),
+        initial_fleet_health,
+        Some(fleet_health_updates),
     )
 }
 
@@ -351,9 +365,12 @@ fn run_loop(
     update_notice: Option<Receiver<Option<String>>>,
     refresh_request: Option<SyncSender<()>>,
     local_refresh_delayed: Option<Arc<AtomicBool>>,
+    initial_fleet_health: Vec<String>,
+    fleet_health_updates: Option<LatestReceiver<Vec<String>>>,
 ) -> Result<BoardAction> {
     let _terminal = TerminalGuard::enter()?;
     let mut board = Board::new(items);
+    board.fleet_health = initial_fleet_health;
     let mut stdout = io::stdout().lock();
     let mut dirty = true;
     let mut last_draw = Instant::now()
@@ -387,6 +404,11 @@ fn run_loop(
         }
         if let Some(delayed) = &local_refresh_delayed {
             dirty |= board.observe_local_refresh(delayed);
+        }
+        if let Some(updates) = &fleet_health_updates
+            && let Some(health) = updates.take()
+        {
+            dirty |= board.replace_fleet_health(health);
         }
         dirty |= board.drain_consultation();
         if board.quit_when_chat_closes && board.chat.is_none() {
@@ -745,6 +767,7 @@ struct Board {
     update_version: Option<String>,
     update_prompt: bool,
     local_refresh_delayed: bool,
+    fleet_health: Vec<String>,
 }
 
 impl Board {
@@ -762,6 +785,7 @@ impl Board {
             update_version: None,
             update_prompt: false,
             local_refresh_delayed: false,
+            fleet_health: Vec::new(),
         }
     }
 
@@ -770,6 +794,43 @@ impl Board {
         let changed = self.local_refresh_delayed != delayed;
         self.local_refresh_delayed = delayed;
         changed
+    }
+
+    fn replace_fleet_health(&mut self, mut health: Vec<String>) -> bool {
+        health.sort();
+        health.dedup();
+        let changed = self.fleet_health != health;
+        self.fleet_health = health;
+        changed
+    }
+
+    fn health_line(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.local_refresh_delayed {
+            parts.push("local refresh delayed".to_owned());
+        }
+        if let Some(first) = self.fleet_health.first() {
+            let first = first
+                .chars()
+                .map(|character| {
+                    if character.is_control() {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .collect::<String>();
+            let more = self.fleet_health.len().saturating_sub(1);
+            parts.push(if more == 0 {
+                format!("fleet visibility limited · {first}")
+            } else {
+                format!(
+                    "fleet visibility limited ({}) · {first} · +{more} more",
+                    self.fleet_health.len()
+                )
+            });
+        }
+        (!parts.is_empty()).then(|| format!("{} · r retry", parts.join(" · ")))
     }
 
     fn visible(&self) -> Vec<&BoardItem> {
@@ -1174,12 +1235,14 @@ impl Board {
                 ))
             )?;
         }
-        if self.local_refresh_delayed && height > 1 {
+        if let Some(health) = self.health_line()
+            && height > 1
+        {
             queue!(
                 output,
                 MoveTo(0, height - 1),
                 SetForegroundColor(Color::DarkYellow),
-                Print(fit("local refresh delayed · r retry", width))
+                Print(fit(&health, width))
             )?;
         }
         queue!(output, ResetColor)?;
@@ -1902,6 +1965,28 @@ mod tests {
                 .contains("local refresh delayed")
         );
         assert_eq!(board.selected().unwrap(), hook_update);
+    }
+
+    #[test]
+    fn fleet_health_is_visible_without_becoming_an_actionable_row() {
+        let mut board = board(Status::Working);
+        let original = board.selected().unwrap();
+        assert!(board.replace_fleet_health(vec![
+            "atlas · 3 cached conversations not shown".into(),
+            "atlas · 3 cached conversations not shown".into(),
+        ]));
+        assert_eq!(board.items.len(), 1);
+        assert_eq!(board.selected().unwrap(), original);
+        assert_eq!(
+            board.key(key(KeyCode::Enter), None),
+            Some(BoardAction::Open(original))
+        );
+        let mut rendered = Vec::new();
+        board.draw(&mut rendered, 120, 20).unwrap();
+        let rendered = String::from_utf8(rendered).unwrap();
+        assert!(rendered.contains("fleet visibility limited"));
+        assert!(rendered.contains("atlas · 3 cached conversations not shown"));
+        assert!(!rendered.contains("Fleet cache unavailable"));
     }
 
     #[test]
