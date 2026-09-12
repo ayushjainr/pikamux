@@ -669,8 +669,8 @@ fn transition_wheel_is_reproducible_and_carries_notices_for_wheel_and_native_ins
 }
 
 #[test]
-fn transition_verifier_rejects_extra_python_and_zip_bomb_members_before_reads() {
-    for mode in ["extra", "bomb"] {
+fn transition_verifier_rejects_extra_bomb_and_rehashed_source_mutant_members() {
+    for mode in ["extra", "bomb", "source-mutant"] {
         let temp = tempfile::tempdir().unwrap();
         let release = transition_release(temp.path());
         let baseline = Command::new("bash")
@@ -688,15 +688,29 @@ fn transition_verifier_rejects_extra_python_and_zip_bomb_members_before_reads() 
         let mutator = temp.path().join("mutate-wheel.py");
         fs::write(
             &mutator,
-            r#"import pathlib, sys, zipfile
+            r#"import base64, hashlib, pathlib, sys, zipfile
 wheel = pathlib.Path(sys.argv[1])
 mode = sys.argv[2]
 temporary = wheel.with_suffix('.new')
-with zipfile.ZipFile(wheel, 'r') as source, zipfile.ZipFile(temporary, 'w') as target:
-    for info in source.infolist():
-        data = source.read(info.filename)
-        if mode == 'bomb' and info.filename == 'pikamux_bridge/cli.py':
-            data = b'0' * (3 * 1024 * 1024)
+with zipfile.ZipFile(wheel, 'r') as source:
+    infos = source.infolist()
+    files = {info.filename: source.read(info.filename) for info in infos}
+if mode == 'bomb':
+    files['pikamux_bridge/cli.py'] = b'0' * (3 * 1024 * 1024)
+if mode == 'source-mutant':
+    files['pikamux_bridge/cli.py'] += b'\n# recomputed-hash mutant\n'
+    record = next(name for name in files if name.endswith('.dist-info/RECORD'))
+    rows = []
+    for name, data in sorted(files.items()):
+        if name == record:
+            continue
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()
+        rows.append(f'{name},sha256={digest},{len(data)}')
+    rows.append(f'{record},,')
+    files[record] = ('\n'.join(rows) + '\n').encode()
+with zipfile.ZipFile(temporary, 'w') as target:
+    for info in infos:
+        data = files[info.filename]
         target.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
     if mode == 'extra':
         info = zipfile.ZipInfo('pika_bootstrap.pth', (2020, 1, 1, 0, 0, 0))
@@ -727,10 +741,104 @@ temporary.replace(wheel)
         let stderr = String::from_utf8_lossy(&rejected.stderr);
         if mode == "extra" {
             assert!(stderr.contains("member allowlist mismatch"), "{stderr}");
-        } else {
+        } else if mode == "bomb" {
             assert!(stderr.contains("member exceeds its size limit"), "{stderr}");
+        } else {
+            assert!(stderr.contains("differs from audited source"), "{stderr}");
         }
     }
+}
+
+#[test]
+fn install_rejects_permissive_managed_directories_before_writes_and_creates_private_ones() {
+    let temp = tempfile::tempdir().unwrap();
+    let (manifest, archive, binary) = direct_fixture(temp.path(), "0.6.0-alpha.1");
+
+    let permissive_root = temp.path().join("permissive-root");
+    fs::create_dir(&permissive_root).unwrap();
+    fs::set_permissions(&permissive_root, fs::Permissions::from_mode(0o777)).unwrap();
+    let error = install_staged(InstallRequest {
+        manifest: &manifest,
+        target: native_target().unwrap(),
+        artifact: &archive,
+        candidate: &binary,
+        root: &permissive_root,
+        bin_dir: &temp.path().join("safe-bin"),
+    })
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("group/other-writable"),
+        "{error}"
+    );
+    assert!(fs::read_dir(&permissive_root).unwrap().next().is_none());
+
+    fs::set_permissions(&permissive_root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir(&permissive_root).unwrap();
+    let permissive_bin = temp.path().join("permissive-bin");
+    fs::create_dir(&permissive_bin).unwrap();
+    fs::set_permissions(&permissive_bin, fs::Permissions::from_mode(0o777)).unwrap();
+    let fresh_root = temp.path().join("fresh-root");
+    let error = install_staged(InstallRequest {
+        manifest: &manifest,
+        target: native_target().unwrap(),
+        artifact: &archive,
+        candidate: &binary,
+        root: &fresh_root,
+        bin_dir: &permissive_bin,
+    })
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("group/other-writable"),
+        "{error}"
+    );
+    assert!(
+        !fresh_root.exists(),
+        "root was written before bin ownership proof"
+    );
+
+    fs::set_permissions(&permissive_bin, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir(&permissive_bin).unwrap();
+    let private_root = temp.path().join("private-root");
+    let private_bin = temp.path().join("private-bin");
+    let installed = install_direct(&manifest, &archive, &binary, &private_root, &private_bin);
+    for directory in [
+        private_root.clone(),
+        private_root.join("releases"),
+        installed.release_dir.clone(),
+        installed.release_dir.join("bin"),
+        installed.release_dir.join("bundle"),
+        private_bin.clone(),
+    ] {
+        assert_eq!(
+            fs::symlink_metadata(&directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "{} was not created private",
+            directory.display()
+        );
+    }
+
+    fs::set_permissions(
+        private_root.join("releases"),
+        fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    let error = install_staged(InstallRequest {
+        manifest: &manifest,
+        target: native_target().unwrap(),
+        artifact: &archive,
+        candidate: &binary,
+        root: &private_root,
+        bin_dir: &private_bin,
+    })
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("group/other-writable"),
+        "{error}"
+    );
 }
 
 #[test]

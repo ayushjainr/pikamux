@@ -1423,14 +1423,14 @@ impl ScratchDirectory {
     fn new(prefix: &str) -> Result<Self> {
         for _ in 0..8 {
             let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
-            match fs::create_dir(&path) {
+            match create_private_leaf(&path) {
                 Ok(()) => {
-                    #[cfg(unix)]
-                    set_private_directory(&path)?;
                     return Ok(Self { path });
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
+                Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
         }
         Err(UpdateError::Io(io::Error::new(
@@ -1552,6 +1552,8 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
     };
 
     validate_install_paths(request.root, request.bin_dir)?;
+    validate_directory_destination(request.root)?;
+    validate_directory_destination(request.bin_dir)?;
     if request.root.exists() {
         initialize_or_validate_root(request.root, true)?;
     }
@@ -1563,8 +1565,7 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
 
     let root_existed = request.root.exists();
     if !root_existed {
-        fs::create_dir_all(request.root)?;
-        set_private_directory(request.root)?;
+        create_private_directory_tree(request.root)?;
     }
     if let Err(error) = initialize_or_validate_root(request.root, root_existed) {
         if !root_existed {
@@ -1587,8 +1588,11 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
 
     let releases = request.root.join("releases");
     reject_symlink(&releases)?;
-    fs::create_dir_all(&releases)?;
-    set_private_directory(&releases)?;
+    if releases.exists() {
+        validate_secure_directory(&releases)?;
+    } else {
+        create_private_leaf(&releases)?;
+    }
     sync_directory(&releases)?;
     sync_directory(request.root)?;
     let current = request.root.join("current");
@@ -1643,8 +1647,7 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
         validate_existing_release(&release_dir, request, release_artifact, &notices)?;
     } else {
         let stage = releases.join(format!(".stage-{}", Uuid::new_v4()));
-        fs::create_dir(&stage)?;
-        set_private_directory(&stage)?;
+        create_private_leaf(&stage)?;
         let prepared = prepare_release(&stage, request, release_artifact, &notices);
         if let Err(error) = prepared {
             let _ = fs::remove_dir_all(&stage);
@@ -1698,8 +1701,7 @@ fn prepare_release(
     notices: &ReleaseNotices,
 ) -> Result<()> {
     let bin = stage.join("bin");
-    fs::create_dir(&bin)?;
-    set_private_directory(&bin)?;
+    create_private_leaf(&bin)?;
     let installed = bin.join("pika");
     fs::copy(request.candidate, &installed)?;
     use std::os::unix::fs::PermissionsExt;
@@ -1726,8 +1728,7 @@ fn prepare_release(
     // Retain this exact verified package for explicit, version-pinned fleet
     // installation without a second public download.
     let bundle = stage.join("bundle");
-    fs::create_dir(&bundle)?;
-    set_private_directory(&bundle)?;
+    create_private_leaf(&bundle)?;
     let bundled_artifact = bundle.join(&artifact.file);
     fs::copy(request.artifact, &bundled_artifact)?;
     fs::set_permissions(&bundled_artifact, fs::Permissions::from_mode(0o600))?;
@@ -1772,7 +1773,7 @@ fn validate_existing_release(
             "release path is not a managed directory".into(),
         ));
     }
-    validate_metadata_owner(&metadata, release_dir)?;
+    validate_secure_directory_metadata(&metadata, release_dir)?;
     let bin_dir = release_dir.join("bin");
     let bin_metadata = fs::symlink_metadata(&bin_dir)?;
     if !bin_metadata.file_type().is_dir() {
@@ -1780,7 +1781,7 @@ fn validate_existing_release(
             "release bin path is not a managed directory".into(),
         ));
     }
-    validate_metadata_owner(&bin_metadata, &bin_dir)?;
+    validate_secure_directory_metadata(&bin_metadata, &bin_dir)?;
     let receipt_path = release_dir.join(".pika-install.json");
     let receipt_metadata = fs::symlink_metadata(&receipt_path)?;
     if !receipt_metadata.file_type().is_file() {
@@ -1825,7 +1826,7 @@ fn validate_existing_release(
             "release bundle path is not a managed directory".into(),
         ));
     }
-    validate_metadata_owner(&bundle_metadata, &bundle)?;
+    validate_secure_directory_metadata(&bundle_metadata, &bundle)?;
     let bundled_manifest = read_manifest_file(&bundle.join(NATIVE_MANIFEST_FILE))?;
     validate_path_owner(&bundle.join(NATIVE_MANIFEST_FILE))?;
     if &bundled_manifest != request.manifest {
@@ -2221,6 +2222,27 @@ fn validate_install_paths(root: &Path, bin_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Validate the directory that exists now, or the exact existing parent from
+/// which a private directory chain would be created. This happens before any
+/// managed path is written, so an attacker cannot turn a permissive 0777
+/// parent into an installation boundary.
+#[cfg(unix)]
+fn validate_directory_destination(path: &Path) -> Result<()> {
+    let mut existing = path;
+    while fs::symlink_metadata(existing).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    {
+        existing = existing.parent().ok_or_else(|| {
+            UpdateError::Safety("installation path has no existing parent".into())
+        })?;
+    }
+    validate_secure_directory(existing)
+}
+
+#[cfg(not(unix))]
+fn validate_directory_destination(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn normalized_install_path(path: &Path, reject_final_symlink: bool) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -2334,6 +2356,36 @@ fn validate_metadata_owner(metadata: &fs::Metadata, path: &Path) -> Result<()> {
     validate_uid(metadata.uid(), unsafe { libc::geteuid() }, path)
 }
 
+#[cfg(unix)]
+fn validate_secure_directory_metadata(metadata: &fs::Metadata, path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if !metadata.file_type().is_dir() {
+        return Err(UpdateError::Safety(format!(
+            "managed installation component is not a directory: {}",
+            path.display()
+        )));
+    }
+    validate_metadata_owner(metadata, path)?;
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(UpdateError::Safety(format!(
+            "managed installation directory is group/other-writable: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_secure_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    validate_secure_directory_metadata(&metadata, path)
+}
+
+#[cfg(not(unix))]
+fn validate_secure_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn validate_metadata_owner(_metadata: &fs::Metadata, _path: &Path) -> Result<()> {
     Ok(())
@@ -2351,7 +2403,20 @@ fn validate_uid(actual: u32, expected: u32, path: &Path) -> Result<()> {
 
 fn validate_path_owner(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    validate_metadata_owner(&metadata, path)
+    validate_metadata_owner(&metadata, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.file_type().is_dir() {
+            validate_secure_directory_metadata(&metadata, path)?;
+        } else if metadata.file_type().is_file() && metadata.permissions().mode() & 0o022 != 0 {
+            return Err(UpdateError::Safety(format!(
+                "managed installation file is group/other-writable: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2365,6 +2430,13 @@ fn open_lock(path: &Path) -> Result<File> {
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)?;
     validate_metadata_owner(&file.metadata()?, path)?;
+    use std::os::unix::fs::PermissionsExt as _;
+    if file.metadata()?.permissions().mode() & 0o022 != 0 {
+        return Err(UpdateError::Safety(format!(
+            "managed installation lock is group/other-writable: {}",
+            path.display()
+        )));
+    }
     Ok(file)
 }
 
@@ -2476,7 +2548,8 @@ fn ensure_launcher(launcher: &Path, expected: &Path) -> Result<bool> {
     let parent = launcher
         .parent()
         .ok_or_else(|| UpdateError::Safety("launcher has no parent directory".into()))?;
-    fs::create_dir_all(parent)?;
+    create_private_directory_tree(parent)?;
+    validate_secure_directory(parent)?;
     use std::os::unix::fs::symlink;
     symlink(expected, launcher)?;
     sync_directory(parent)?;
@@ -2492,7 +2565,8 @@ fn stage_launcher(launcher: &Path, expected: &Path) -> Result<Option<PathBuf>> {
     let parent = launcher
         .parent()
         .ok_or_else(|| UpdateError::Safety("launcher has no parent directory".into()))?;
-    fs::create_dir_all(parent)?;
+    create_private_directory_tree(parent)?;
+    validate_secure_directory(parent)?;
     let staged = parent.join(format!(".pika-launcher-{}", Uuid::new_v4()));
     use std::os::unix::fs::symlink;
     symlink(expected, &staged)?;
@@ -2577,9 +2651,40 @@ fn atomic_symlink_with_sync(
 }
 
 #[cfg(unix)]
-fn set_private_directory(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+fn create_private_leaf(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path)?;
+    validate_secure_directory(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_leaf(path: &Path) -> Result<()> {
+    fs::create_dir(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_directory_tree(path: &Path) -> Result<()> {
+    if path.exists() {
+        return validate_secure_directory(path);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| UpdateError::Safety("installation directory has no parent".into()))?;
+    create_private_directory_tree(parent)?;
+    match create_private_leaf(path) {
+        Ok(()) => Ok(()),
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+            validate_secure_directory(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private_directory_tree(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
     Ok(())
 }
 
@@ -2604,14 +2709,13 @@ fn sync_file(path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_dir() {
-        return Err(UpdateError::Safety(format!(
-            "durability boundary is not a directory: {}",
-            path.display()
-        )));
-    }
-    File::open(path)?.sync_all()?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    validate_secure_directory_metadata(&directory.metadata()?, path)?;
+    directory.sync_all()?;
     Ok(())
 }
 

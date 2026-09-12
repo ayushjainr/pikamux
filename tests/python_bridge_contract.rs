@@ -5,7 +5,8 @@ use pikamux::store::{Store, StoredExpertProfile};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
@@ -275,6 +276,7 @@ fn bridge_cancels_and_reaps_its_process_group_and_reports_the_current_link() {
     let temp = tempfile::tempdir().unwrap();
     let script = r#"
 from pathlib import Path
+import os
 import signal
 import subprocess
 import sys
@@ -310,8 +312,8 @@ class InterruptedProcess:
         return -9
 
 interrupted = InterruptedProcess()
-cli._start_activation = lambda _command: (interrupted, -1)
-def interrupted_wait(_process, _receipt, _timeout):
+cli._start_activation = lambda _command: (interrupted, -1, -1)
+def interrupted_wait(_process, _receipt, _timeout, _interrupts):
     point_to(native)
     raise KeyboardInterrupt()
 cli._wait_activation_receipt = interrupted_wait
@@ -333,8 +335,8 @@ class TimeoutProcess:
 
 point_to(bridge)
 timed_out = TimeoutProcess()
-cli._start_activation = lambda _command: (timed_out, -1)
-cli._wait_activation_receipt = lambda _process, _receipt, timeout: (_ for _ in ()).throw(
+cli._start_activation = lambda _command: (timed_out, -1, -1)
+cli._wait_activation_receipt = lambda _process, _receipt, timeout, _interrupts: (_ for _ in ()).throw(
     subprocess.TimeoutExpired("install", timeout)
 )
 try:
@@ -350,8 +352,8 @@ class FailedProcess:
         return 7
 
 failed = FailedProcess()
-cli._start_activation = lambda _command: (failed, -1)
-def failed_wait(_process, _receipt, _timeout):
+cli._start_activation = lambda _command: (failed, -1, -1)
+def failed_wait(_process, _receipt, _timeout, _interrupts):
     point_to(native)
     return 7
 cli._wait_activation_receipt = failed_wait
@@ -362,6 +364,22 @@ except cli.BridgeError as error:
 else:
     raise AssertionError("failed activation was accepted")
 assert kills[-2:] == [(4444, signal.SIGTERM), (4444, signal.SIGKILL)]
+
+class PendingSignalProcess:
+    pid = 4545
+    def wait(self, timeout=None):
+        return -9
+
+pending = PendingSignalProcess()
+def signal_during_spawn(_command):
+    # The handler is already installed before this production spawn boundary.
+    os.kill(os.getpid(), signal.SIGTERM)
+    return pending, -1, -1
+cli._start_activation = signal_during_spawn
+cli._wait_activation_receipt = lambda _process, _receipt, _timeout, interrupts: interrupts.check()
+point_to(bridge)
+assert cli.main(["ordinary-command"]) == 143
+assert kills[-2:] == [(4545, signal.SIGTERM), (4545, signal.SIGKILL)]
 "#;
     let output = Command::new("python3")
         .args(["-c", script])
@@ -438,6 +456,99 @@ else:
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn bridge_signals_and_parent_death_reap_the_exact_activation_group() {
+    for (signal, expected) in [
+        (libc::SIGINT, Some(130)),
+        (libc::SIGTERM, Some(143)),
+        (libc::SIGKILL, None),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle");
+        let bridge = temp.path().join("managed/releases/bridge");
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::create_dir_all(&bridge).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let installer = bundle.join("install.sh");
+        fs::write(
+            &installer,
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$PIKA_TEST_INSTALLER_PID\"\nsleep 300 &\nprintf '%s\\n' \"$!\" > \"$PIKA_TEST_DESCENDANT_PID\"\nwait\n",
+        )
+        .unwrap();
+        let runner = temp.path().join("runner.py");
+        fs::write(
+            &runner,
+            r#"import pathlib, sys
+import pikamux_bridge.cli as cli
+base = pathlib.Path(sys.argv[1])
+root = base / 'managed'
+bridge = root / 'releases/bridge'
+bundle = base / 'bundle'
+bin_dir = base / 'bin'
+root.mkdir(exist_ok=True)
+(root / 'current').symlink_to(bridge, target_is_directory=True)
+cli.sys.prefix = str(bridge)
+cli._managed_receipt = lambda: (root, bin_dir)
+cli._native_bundle = lambda: bundle
+original = cli._start_activation
+def start(command):
+    result = original(command)
+    (base / 'supervisor.pid').write_text(str(result[0].pid))
+    return result
+cli._start_activation = start
+raise SystemExit(cli.main(['ordinary-command']))
+"#,
+        )
+        .unwrap();
+        let installer_pid = temp.path().join("installer.pid");
+        let descendant_pid = temp.path().join("descendant.pid");
+        let supervisor_pid = temp.path().join("supervisor.pid");
+        let process = Command::new("python3")
+            .arg(&runner)
+            .arg(temp.path())
+            .env(
+                "PYTHONPATH",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("bridge"),
+            )
+            .env("PIKA_TEST_INSTALLER_PID", &installer_pid)
+            .env("PIKA_TEST_DESCENDANT_PID", &descendant_pid)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let appeared = Instant::now() + Duration::from_secs(5);
+        while (!installer_pid.exists() || !descendant_pid.exists() || !supervisor_pid.exists())
+            && Instant::now() < appeared
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(installer_pid.exists() && descendant_pid.exists() && supervisor_pid.exists());
+        let owned: Vec<i32> = [&supervisor_pid, &installer_pid, &descendant_pid]
+            .into_iter()
+            .map(|path| fs::read_to_string(path).unwrap().trim().parse().unwrap())
+            .collect();
+        assert_eq!(unsafe { libc::kill(process.id() as i32, signal) }, 0);
+        let output = process.wait_with_output().unwrap();
+        if let Some(code) = expected {
+            assert_eq!(output.status.code(), Some(code), "{:?}", output.status);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("interrupted by SIG"), "{stderr}");
+        }
+        let gone = Instant::now() + Duration::from_secs(5);
+        for pid in owned {
+            while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < gone {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "activation process {pid} survived signal {signal}"
+            );
+        }
+    }
 }
 
 #[test]

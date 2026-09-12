@@ -301,6 +301,47 @@ if bridge.is_file():
             if expanded_total > 96 * 1024 * 1024:
                 fail("bridge wheel expands beyond 96 MiB")
 
+            source_init = (source / "bridge/pikamux_bridge/__init__.py").read_text()
+            expected_init, substitutions = re.subn(
+                r'__version__ = "[^"]+"',
+                f'__version__ = "{version}"',
+                source_init,
+                count=1,
+            )
+            if substitutions != 1:
+                fail("audited bridge version source marker is missing or ambiguous")
+            generated_members = {
+                "pikamux_bridge/__init__.py": expected_init.encode(),
+                "pikamux_bridge/cli.py": (
+                    source / "bridge/pikamux_bridge/cli.py"
+                ).read_bytes(),
+                "pikamux_bridge/agent-convo/SKILL.md": (
+                    source / "assets/agent-convo/SKILL.md"
+                ).read_bytes(),
+                embedded + "install.sh": (source / "scripts/install.sh").read_bytes(),
+                embedded + "pika-version": (wheel_native_version + "\n").encode(),
+                f"{dist}/METADATA": (
+                    "Metadata-Version: 2.1\n"
+                    "Name: pikamux\n"
+                    f"Version: {version}\n"
+                    "Summary: One-use Pika native transition bridge\n"
+                    "License: MIT\n"
+                    "Requires-Python: >=3.9\n\n"
+                ).encode(),
+                f"{dist}/WHEEL": (
+                    "Wheel-Version: 1.0\n"
+                    "Generator: pika-native-transition\n"
+                    "Root-Is-Purelib: true\n"
+                    "Tag: py3-none-any\n"
+                ).encode(),
+                f"{dist}/entry_points.txt": (
+                    b"[console_scripts]\npika = pikamux_bridge.cli:main\n"
+                ),
+            }
+            for name, expected in generated_members.items():
+                if wheel.read(name) != expected:
+                    fail(f"bridge wheel member differs from audited source: {name}")
+
             for name in ("LICENSE", "THIRD_PARTY.md"):
                 expected_notice = (source / name).read_bytes()
                 if wheel.read(embedded + name) != expected_notice:

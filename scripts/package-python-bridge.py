@@ -72,9 +72,14 @@ def main(argv: list[str]) -> int:
         "artifacts": {},
     }
     bridge_init = (package / "__init__.py").read_text()
-    bridge_init = re.sub(
-        r'__version__ = "[^"]+"', f'__version__ = "{bridge_version}"', bridge_init
+    bridge_init, substitutions = re.subn(
+        r'__version__ = "[^"]+"',
+        f'__version__ = "{bridge_version}"',
+        bridge_init,
+        count=1,
     )
+    if substitutions != 1:
+        fail("bridge version source marker is missing or ambiguous")
     files: dict[str, bytes] = {
         "pikamux_bridge/__init__.py": bridge_init.encode(),
         "pikamux_bridge/cli.py": (package / "cli.py").read_bytes(),

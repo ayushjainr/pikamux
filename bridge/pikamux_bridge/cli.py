@@ -12,6 +12,7 @@ import select
 import signal
 import subprocess
 import sys
+import time
 
 from . import __version__
 
@@ -31,6 +32,20 @@ SUPPORTED_TARGETS = {
 
 class BridgeError(RuntimeError):
     pass
+
+
+class BridgeInterrupted(BridgeError):
+    def __init__(
+        self, signum: int, outcome: str | None = None, cleanup: str | None = None
+    ):
+        self.signum = signum
+        self.exit_code = 128 + signum
+        detail = f"Native activation was interrupted by {signal.Signals(signum).name}"
+        if outcome:
+            detail += f"; {outcome}."
+        if cleanup:
+            detail += f" Installer cleanup could not be verified ({cleanup})."
+        super().__init__(detail)
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -170,55 +185,152 @@ def _activation_outcome(root: Path, bridge_prefix: Path) -> str:
 
 _ACTIVATION_SUPERVISOR = r"""
 import os
+import select
 import signal
 import subprocess
 import sys
+import time
 
 receipt = int(sys.argv[1])
+parent = int(sys.argv[2])
+stop = False
+
+def stopping(_signum, _frame):
+    global stop
+    stop = True
+
 try:
-    installer = subprocess.Popen(sys.argv[2:])
+    readable, _, _ = select.select([parent], [], [], 0)
+    if readable and not os.read(parent, 1):
+        raise SystemExit(125)
+    installer = subprocess.Popen(sys.argv[3:])
+    # Install this only after spawning: the installer and every descendant
+    # retain the default TERM disposition, while this session leader stays
+    # alive to pin the exact process-group identity through cleanup.
+    signal.signal(signal.SIGTERM, stopping)
+    signal.signal(signal.SIGINT, stopping)
+    while installer.poll() is None and not stop:
+        readable, _, _ = select.select([parent], [], [], 0.05)
+        if readable and not os.read(parent, 1):
+            stop = True
+    if stop:
+        os.killpg(os.getpgrp(), signal.SIGTERM)
+        time.sleep(0.2)
+        os.killpg(os.getpgrp(), signal.SIGKILL)
     code = installer.wait()
 except BaseException:
     code = 125
 try:
     os.write(receipt, (str(code) + "\n").encode("ascii"))
+except OSError:
+    # The bridge disappeared; the liveness pipe below drives cleanup.
+    pass
 finally:
     os.close(receipt)
-# Keep the session leader alive so its PID continues to pin the exact process
-# group until the bridge has cleaned every same-group descendant.
-while True:
-    signal.pause()
+# Keep the session leader alive so its PID continues to pin the exact group
+# until the bridge explicitly closes its liveness writer. EOF also makes a
+# SIGKILLed bridge self-cleaning instead of leaving an immortal watchdog.
+while not stop:
+    readable, _, _ = select.select([parent], [], [], 0.25)
+    if readable and not os.read(parent, 1):
+        stop = True
+if stop:
+    os.killpg(os.getpgrp(), signal.SIGTERM)
+    time.sleep(0.2)
+    os.killpg(os.getpgrp(), signal.SIGKILL)
 """
 
 
-def _start_activation(command: list[str]) -> tuple[subprocess.Popen[bytes], int]:
+def _start_activation(command: list[str]) -> tuple[subprocess.Popen[bytes], int, int]:
     receipt_read, receipt_write = os.pipe()
+    liveness_read, liveness_write = os.pipe()
     try:
         process = subprocess.Popen(
-            [sys.executable, "-c", _ACTIVATION_SUPERVISOR, str(receipt_write), *command],
+            [
+                sys.executable,
+                "-c",
+                _ACTIVATION_SUPERVISOR,
+                str(receipt_write),
+                str(liveness_read),
+                *command,
+            ],
             start_new_session=True,
-            pass_fds=(receipt_write,),
+            pass_fds=(receipt_write, liveness_read),
         )
     except BaseException:
         os.close(receipt_read)
+        os.close(liveness_write)
         raise
     finally:
         os.close(receipt_write)
-    return process, receipt_read
+        os.close(liveness_read)
+    return process, receipt_read, liveness_write
 
 
-def _wait_activation_receipt(process: subprocess.Popen[bytes], receipt: int, timeout: float) -> int:
+class _ScopedSignals:
+    """Latch INT/TERM before spawn and wake receipt waits without handler work."""
+
+    def __init__(self) -> None:
+        self.read, self.write = os.pipe()
+        os.set_blocking(self.read, False)
+        os.set_blocking(self.write, False)
+        self.received: int | None = None
+        self.previous: dict[int, object] = {}
+
+    def __enter__(self) -> "_ScopedSignals":
+        def latch(signum: int, _frame: object) -> None:
+            if self.received is None:
+                self.received = signum
+            try:
+                os.write(self.write, bytes((signum,)))
+            except OSError:
+                pass
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            self.previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, latch)
+        return self
+
+    def check(self) -> None:
+        if self.received is not None:
+            raise BridgeInterrupted(self.received)
+
+    def __exit__(self, _kind: object, _value: object, _traceback: object) -> None:
+        for signum, handler in self.previous.items():
+            signal.signal(signum, handler)
+        os.close(self.read)
+        os.close(self.write)
+
+
+def _wait_activation_receipt(
+    process: subprocess.Popen[bytes],
+    receipt: int,
+    timeout: float,
+    interrupts: _ScopedSignals | None = None,
+) -> int:
     """Read one bounded installer status while the supervisor pins the PGID."""
-    ready, _, _ = select.select([receipt], [], [], timeout)
-    if not ready:
-        raise subprocess.TimeoutExpired(process.args, timeout)
+    deadline = time.monotonic() + timeout
+    while True:
+        if interrupts is not None:
+            interrupts.check()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        watched = [receipt]
+        if interrupts is not None:
+            watched.append(interrupts.read)
+        ready, _, _ = select.select(watched, [], [], remaining)
+        if interrupts is not None and interrupts.read in ready:
+            interrupts.check()
+        if receipt in ready:
+            break
     value = os.read(receipt, 32)
     if not re.fullmatch(rb"-?[0-9]+\n", value):
         raise BridgeError("Native activation returned an invalid status receipt.")
     return int(value)
 
 
-def _stop_activation(process: subprocess.Popen[bytes]) -> str | None:
+def _stop_activation(process: subprocess.Popen[bytes], liveness: int = -1) -> str | None:
     """Terminate the owned group while its live supervisor pins the PGID."""
     failures: list[str] = []
     previous_interrupt = None
@@ -257,6 +369,11 @@ def _stop_activation(process: subprocess.Popen[bytes]) -> str | None:
         except OSError as exc:
             failures.append(f"reap failed: {exc}")
     finally:
+        if liveness >= 0:
+            try:
+                os.close(liveness)
+            except OSError:
+                pass
         if previous_interrupt is not None:
             signal.signal(signal.SIGINT, previous_interrupt)
     return "; ".join(failures) or None
@@ -284,40 +401,51 @@ def _activate_and_exec(arguments: list[str]) -> None:
         str(bin_dir),
         "--no-setup",
     ]
-    try:
-        process, receipt = _start_activation(command)
-    except OSError as exc:
-        raise _activation_error(
-            f"Cannot start the verified native installer ({exc})",
-            root,
-            bridge_prefix,
-            None,
-        ) from exc
-    try:
+    with _ScopedSignals() as interrupts:
+        interrupts.check()
         try:
-            return_code = _wait_activation_receipt(process, receipt, 600)
-        finally:
-            if receipt >= 0:
-                os.close(receipt)
-    except subprocess.TimeoutExpired as exc:
-        cleanup = _stop_activation(process)
-        raise _activation_error(
-            "Native activation timed out", root, bridge_prefix, cleanup
-        ) from exc
-    except KeyboardInterrupt as exc:
-        cleanup = _stop_activation(process)
-        raise _activation_error(
-            "Native activation was interrupted", root, bridge_prefix, cleanup
-        ) from exc
-    except BaseException as exc:
-        cleanup = _stop_activation(process)
-        raise _activation_error(
-            f"Native activation stopped unexpectedly ({type(exc).__name__})",
-            root,
-            bridge_prefix,
-            cleanup,
-        ) from exc
-    cleanup = _stop_activation(process)
+            process, receipt, liveness = _start_activation(command)
+        except OSError as exc:
+            raise _activation_error(
+                f"Cannot start the verified native installer ({exc})",
+                root,
+                bridge_prefix,
+                None,
+            ) from exc
+        try:
+            try:
+                return_code = _wait_activation_receipt(
+                    process, receipt, 600, interrupts
+                )
+            finally:
+                if receipt >= 0:
+                    os.close(receipt)
+        except (subprocess.TimeoutExpired, BridgeInterrupted, KeyboardInterrupt) as exc:
+            cleanup = _stop_activation(process, liveness)
+            if isinstance(exc, (BridgeInterrupted, KeyboardInterrupt)):
+                interrupted = (
+                    exc
+                    if isinstance(exc, BridgeInterrupted)
+                    else BridgeInterrupted(signal.SIGINT)
+                )
+                raise BridgeInterrupted(
+                    interrupted.signum,
+                    _activation_outcome(root, bridge_prefix),
+                    cleanup,
+                ) from exc
+            raise _activation_error(
+                "Native activation timed out", root, bridge_prefix, cleanup
+            ) from exc
+        except BaseException as exc:
+            cleanup = _stop_activation(process, liveness)
+            raise _activation_error(
+                f"Native activation stopped unexpectedly ({type(exc).__name__})",
+                root,
+                bridge_prefix,
+                cleanup,
+            ) from exc
+        cleanup = _stop_activation(process, liveness)
+        interrupts.check()
     if cleanup:
         raise _activation_error(
             "Native activation cleanup was not verified", root, bridge_prefix, cleanup
@@ -356,6 +484,9 @@ def main(arguments: list[str] | None = None) -> int:
             return 0
         try:
             _activate_and_exec(arguments)
+        except BridgeInterrupted as exc:
+            print(f"pika: {exc}", file=sys.stderr)
+            return exc.exit_code
         except BridgeError as exc:
             print(f"pika: {exc}", file=sys.stderr)
             return 1
@@ -365,6 +496,9 @@ def main(arguments: list[str] | None = None) -> int:
         return 0
     try:
         _activate_and_exec(arguments)
+    except BridgeInterrupted as exc:
+        print(f"pika: {exc}", file=sys.stderr)
+        return exc.exit_code
     except BridgeError as exc:
         print(f"pika: {exc}", file=sys.stderr)
         return 1

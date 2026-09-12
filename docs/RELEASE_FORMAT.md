@@ -63,6 +63,12 @@ Publication accepts only the exact generated wheel member set. Member count,
 type, encryption and compression flags, per-member compressed/expanded sizes,
 and aggregate expansion are checked before any member is read; extra Python,
 `.pth`, duplicate, link, and high-ratio payloads fail closed.
+Every generated non-native member is also compared byte-for-byte with its
+audited source or deterministic metadata recipe. Recomputing the wheel RECORD,
+outer manifest, and release checksums cannot bless modified bridge code. The
+first-use supervisor latches INT/TERM before spawn, returns 130/143 after exact
+group cleanup, and uses a parent-liveness pipe so a killed bridge cannot leave
+the installer or its watchdog behind.
 
 ## Release assets
 
@@ -164,6 +170,9 @@ refused. Old releases remain available for running callbacks and rollback.
 Every existing component Pika trusts beneath the managed root, plus its public
 launcher symlink, must be owned by the current effective user; foreign-owned
 components are rejected before validation, activation, or rollback.
+Managed directories and launcher parents must also be non-group/other-writable;
+new directory components are created atomically with mode 0700. Pika rejects a
+permissive existing root or release directory before writing to it.
 
 Managed native activation and `pika update` do not open Pika's state database,
 scan provider histories, modify hooks or skills, run setup, restart agents, or
