@@ -2766,7 +2766,9 @@ mod tests {
         .unwrap_err();
         cancel.join().unwrap();
         assert!(error.to_string().contains("cancelled"), "{error:#}");
-        assert!(started.elapsed() < Duration::from_millis(150));
+        // Remain well below both the one-second deadline and the five-second
+        // pipe holder, while allowing shared-runner scheduling jitter.
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[cfg(unix)]

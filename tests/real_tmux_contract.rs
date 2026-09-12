@@ -148,6 +148,18 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
     .unwrap();
     let pane = tmux.get_pane("pika-c-receipt").unwrap().unwrap();
     let transcript = temp.path().join("receipt.out");
+    let trace = temp.path().join("tmux.trace");
+    let adapter = temp.path().join("tmux-receipt-adapter");
+    fs::write(
+        &adapter,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$ $*\" >> {trace}\ncase \"$*\" in *list-clients*) tmux \"$@\" > {output}; status=$?; cat {output}; cat {output} >> {trace}; exit $status;; *) exec tmux \"$@\";; esac\n",
+            trace = shell_words::quote(trace.to_str().unwrap()),
+            output = shell_words::quote(temp.path().join("clients.out").to_str().unwrap()),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
     let output = recorded_terminal(
         &transcript,
         &[
@@ -161,14 +173,16 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
     .env("PIKA_RECEIPT_TEST_SOCKET", &socket)
     .env("PIKA_RECEIPT_TEST_PANE", &pane.pane_id)
     .env("PIKA_RECEIPT_TEST_COMMITTED", &committed)
+    .env("PIKA_RECEIPT_TEST_TMUX", &adapter)
     .output()
     .unwrap();
     assert!(
         output.status.success(),
-        "stdout={} stderr={} transcript={}",
+        "stdout={} stderr={} transcript={} trace={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
-        fs::read_to_string(&transcript).unwrap_or_default()
+        fs::read_to_string(&transcript).unwrap_or_default(),
+        fs::read_to_string(&trace).unwrap_or_default()
     );
     assert_eq!(fs::read_to_string(&committed).unwrap(), "after-receipt");
     let transcript = fs::read_to_string(transcript).unwrap();
@@ -185,7 +199,8 @@ fn real_isolated_tmux_receipt_helper() {
     };
     let pane_id = std::env::var("PIKA_RECEIPT_TEST_PANE").unwrap();
     let committed = std::path::PathBuf::from(std::env::var("PIKA_RECEIPT_TEST_COMMITTED").unwrap());
-    let tmux = Tmux::with_executable("tmux", Some(socket));
+    let adapter = std::env::var("PIKA_RECEIPT_TEST_TMUX").unwrap();
+    let tmux = Tmux::with_executable(adapter, Some(socket));
     let pane = tmux.get_pane(&pane_id).unwrap().unwrap();
     let handoff = tmux
         .attach_exact_with_observed_receipt(
