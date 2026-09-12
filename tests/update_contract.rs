@@ -37,6 +37,36 @@ fn candidate(path: &Path, version: &str, valid: bool) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+fn command_location(name: &str) -> Option<PathBuf> {
+    let output = Command::new("/bin/sh")
+        .args(["-c", "command -v \"$1\"", "sh", name])
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    path.is_absolute().then_some(path)
+}
+
+fn curl_free_installer_path(root: &Path) -> PathBuf {
+    let output = root.join("installer-tools");
+    fs::create_dir(&output).unwrap();
+    for name in [
+        "gzip", "head", "tar", "mktemp", "sed", "tr", "wc", "find", "cut", "cp", "mkdir", "chmod",
+        "rm", "sleep", "uname",
+    ] {
+        symlink(command_location(name).unwrap(), output.join(name)).unwrap();
+    }
+    let digest = ["sha256sum", "shasum"]
+        .into_iter()
+        .find_map(|name| command_location(name).map(|path| (name, path)))
+        .unwrap();
+    symlink(digest.1, output.join(digest.0)).unwrap();
+    assert!(!output.join("curl").exists());
+    output
+}
+
 fn fixture(temp: &Path, version: &str, payload: &[u8]) -> (ReleaseManifest, PathBuf, PathBuf) {
     let target = native_target().unwrap();
     let archive = temp.join(artifact_name(version, target).unwrap());
@@ -842,8 +872,9 @@ fn shell_bootstrap_uses_an_offline_bundle_and_forwards_only_fixed_paths() {
     .unwrap();
     fs::write(bundle.join("pika-version"), format!("{version}\n")).unwrap();
     fs::write(bundle.join("pika-native-release.json"), "{}\n").unwrap();
+    let installer_path = curl_free_installer_path(temp.path());
 
-    let output = Command::new("bash")
+    let output = Command::new("/bin/bash")
         .arg("scripts/install.sh")
         .arg("--bundle")
         .arg(&bundle)
@@ -854,6 +885,7 @@ fn shell_bootstrap_uses_an_offline_bundle_and_forwards_only_fixed_paths() {
         .arg("--no-setup")
         .env("PIKA_TEST_VERSION", version)
         .env("PIKA_TEST_TRACE", &trace)
+        .env("PATH", installer_path)
         .output()
         .unwrap();
     assert!(
@@ -865,6 +897,94 @@ fn shell_bootstrap_uses_an_offline_bundle_and_forwards_only_fixed_paths() {
     assert!(forwarded.contains("_install-native\n"));
     assert!(forwarded.contains("root with spaces"));
     assert!(forwarded.contains("--no-setup"));
+}
+
+#[test]
+fn shell_bootstrap_bounds_candidate_probes_and_kills_the_probe_group() {
+    let temp = tempfile::tempdir().unwrap();
+    let bundle = temp.path().join("bundle");
+    let payload = temp.path().join("payload");
+    fs::create_dir(&bundle).unwrap();
+    fs::create_dir(&payload).unwrap();
+    let version = env!("CARGO_PKG_VERSION");
+    let target = native_target().unwrap();
+    let child_pid = temp.path().join("probe-child-pid");
+    let fake = payload.join("pika");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+case "$*" in
+  --version) echo "pika $PIKA_TEST_VERSION" ;;
+  --help) sleep 30 & echo "$!" > "$PIKA_TEST_CHILD_PID"; wait ;;
+  'skill show') exit 0 ;;
+  *) exit 2 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    let archive_name = artifact_name(version, target).unwrap();
+    let archive = bundle.join(&archive_name);
+    assert!(
+        Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .args(["-C"])
+            .arg(&payload)
+            .arg("pika")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let checksum = sha256_file(&archive).unwrap();
+    fs::write(
+        bundle.join(format!("{archive_name}.sha256")),
+        format!("{checksum}\n"),
+    )
+    .unwrap();
+    fs::write(bundle.join("pika-version"), format!("{version}\n")).unwrap();
+    fs::write(bundle.join("pika-native-release.json"), "{}\n").unwrap();
+
+    let started = std::time::Instant::now();
+    let output = Command::new("/bin/bash")
+        .arg("scripts/install.sh")
+        .arg("--bundle")
+        .arg(&bundle)
+        .arg("--root")
+        .arg(temp.path().join("managed"))
+        .arg("--bin-dir")
+        .arg(temp.path().join("bin"))
+        .arg("--no-setup")
+        .env("PIKA_TEST_VERSION", version)
+        .env("PIKA_TEST_CHILD_PID", &child_pid)
+        .env("PIKA_INSTALL_PROBE_TIMEOUT_SECONDS", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "candidate probe took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("help probe timed out after 1s"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pid: i32 = fs::read_to_string(child_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let reap_deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < reap_deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "probe child {pid} survived"
+    );
 }
 
 #[test]

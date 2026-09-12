@@ -217,7 +217,176 @@ else:
 }
 
 #[test]
-fn unmodified_v050a4_updater_installs_bridge_then_first_use_execs_native() {
+fn bridge_rejects_duplicate_json_and_streams_native_artifacts_to_a_hard_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = r#"
+from pathlib import Path
+import sys
+from pikamux_bridge.cli import MAX_NATIVE_ARCHIVE_BYTES, _sha256_bounded, _strict_json
+
+root = Path(sys.argv[1])
+duplicate = root / "duplicate.json"
+duplicate.write_text('{"schema":1,"schema":2}\n')
+try:
+    _strict_json(duplicate)
+except ValueError as error:
+    assert "duplicate JSON key" in str(error)
+else:
+    raise AssertionError("duplicate JSON key was accepted")
+
+oversized_json = root / "oversized.json"
+oversized_json.write_bytes(b" " * (64 * 1024 + 1))
+try:
+    _strict_json(oversized_json)
+except ValueError as error:
+    assert "exceeds" in str(error)
+else:
+    raise AssertionError("oversized JSON was accepted")
+
+archive = root / "archive.tar.gz"
+with archive.open("wb") as stream:
+    stream.seek(MAX_NATIVE_ARCHIVE_BYTES)
+    stream.write(b"x")
+try:
+    _sha256_bounded(archive, limit=MAX_NATIVE_ARCHIVE_BYTES)
+except ValueError as error:
+    assert "exceeds" in str(error)
+else:
+    raise AssertionError("oversized native archive was accepted")
+"#;
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .arg(temp.path())
+        .env(
+            "PYTHONPATH",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("bridge"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn bridge_cancels_and_reaps_its_process_group_and_reports_the_current_link() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = r#"
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import pikamux_bridge.cli as cli
+
+root = Path(sys.argv[1]) / "managed"
+releases = root / "releases"
+bridge = releases / "bridge"
+native = releases / "native"
+bundle = Path(sys.argv[1]) / "bundle"
+bin_dir = Path(sys.argv[1]) / "bin"
+for path in (bridge, native, bundle, bin_dir):
+    path.mkdir(parents=True, exist_ok=True)
+current = root / "current"
+
+def point_to(path):
+    current.unlink(missing_ok=True)
+    current.symlink_to(path, target_is_directory=True)
+
+point_to(bridge)
+cli.sys.prefix = str(bridge)
+cli._managed_receipt = lambda: (root, bin_dir)
+cli._native_bundle = lambda: bundle
+kills = []
+cli.os.killpg = lambda pid, sig: kills.append((pid, sig))
+
+class InterruptedProcess:
+    pid = 4242
+    def __init__(self):
+        self.calls = 0
+        self.reaped = False
+    def poll(self):
+        return -9 if self.reaped else None
+    def wait(self, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            point_to(native)
+            raise KeyboardInterrupt()
+        if self.calls == 2:
+            raise subprocess.TimeoutExpired("install", timeout)
+        self.reaped = True
+        return -9
+
+interrupted = InterruptedProcess()
+def interrupted_popen(_command, **options):
+    assert options == {"start_new_session": True}
+    return interrupted
+cli.subprocess.Popen = interrupted_popen
+try:
+    cli._activate_and_exec([])
+except cli.BridgeError as error:
+    detail = str(error)
+    assert "interrupted" in detail
+    assert "managed release 'native' is now current" in detail
+else:
+    raise AssertionError("KeyboardInterrupt escaped bridge cleanup")
+assert interrupted.reaped
+assert kills == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
+
+class TimeoutProcess:
+    pid = 4343
+    def __init__(self): self.calls = 0
+    def poll(self): return None if self.calls < 2 else -15
+    def wait(self, timeout=None):
+        self.calls += 1
+        if self.calls == 1: raise subprocess.TimeoutExpired("install", timeout)
+        return -15
+
+point_to(bridge)
+timed_out = TimeoutProcess()
+cli.subprocess.Popen = lambda *_args, **_kwargs: timed_out
+try:
+    cli._activate_and_exec([])
+except cli.BridgeError as error:
+    assert "timed out; the Python bridge remains current" in str(error)
+else:
+    raise AssertionError("activation timeout was accepted")
+
+class FailedProcess:
+    pid = 4444
+    def poll(self): return 7
+    def wait(self, timeout=None):
+        point_to(native)
+        return 7
+
+failed = FailedProcess()
+cli.subprocess.Popen = lambda *_args, **_kwargs: failed
+try:
+    cli._activate_and_exec([])
+except cli.BridgeError as error:
+    assert "exited 7; managed release 'native' is now current" in str(error)
+else:
+    raise AssertionError("failed activation was accepted")
+"#;
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .arg(temp.path())
+        .env(
+            "PYTHONPATH",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("bridge"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn unmodified_v050a4_default_update_discovers_bridge_then_first_use_execs_native() {
     let temp = tempfile::tempdir().unwrap();
     let native = native_bundle(temp.path());
     let bridge = bridge_bundle(temp.path(), &native);
@@ -240,10 +409,54 @@ fn unmodified_v050a4_updater_installs_bridge_then_first_use_execs_native() {
         "{}",
         String::from_utf8_lossy(&created.stderr)
     );
+    let old_site = python_site(&old);
     copy_tree(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python-v0.5.0a4/pikamux"),
-        &python_site(&old).join("pikamux"),
+        &old_site.join("pikamux"),
     );
+    fs::write(
+        old_site.join("sitecustomize.py"),
+        r#"import io
+import json
+import os
+from pathlib import Path
+import urllib.request
+
+class _OfflineRelease:
+    def __init__(self, url, payload):
+        self.url = url
+        self._payload = io.BytesIO(payload)
+    def __enter__(self): return self
+    def __exit__(self, *_args): return False
+    def read(self, size=-1): return self._payload.read(size)
+
+def _offline_urlopen(url, timeout=None):
+    release = Path(os.environ["PIKA_TEST_RELEASE_DIR"])
+    trace = Path(os.environ["PIKA_TEST_RELEASE_TRACE"])
+    with trace.open("a") as output:
+        output.write(str(url) + "\n")
+    if str(url).startswith("https://api.github.com/"):
+        version = "0.5.0a5"
+        payload = [{
+            "draft": False,
+            "prerelease": True,
+            "tag_name": "v" + version,
+            "assets": [
+                {"name": "pika-release.json"},
+                {"name": f"pikamux-{version}-py3-none-any.whl"},
+            ],
+        }]
+        return _OfflineRelease(str(url), json.dumps(payload).encode())
+    name = str(url).rsplit("/", 1)[-1]
+    asset = release / name
+    if not asset.is_file():
+        raise OSError(f"offline fixture has no {name}")
+    return _OfflineRelease(str(url), asset.read_bytes())
+
+urllib.request.urlopen = _offline_urlopen
+"#,
+    )
+    .unwrap();
     executable(
         &old.join("bin/pika"),
         "#!/bin/sh\nexec \"$(dirname \"$0\")/python\" -m pikamux \"$@\"\n",
@@ -294,13 +507,12 @@ esac
 "#,
     );
 
-    let update = Command::new(old.join("bin/python"))
-        .args([
-            "-c",
-            "from pathlib import Path; import sys; from pikamux.installation import update; update(bundle=Path(sys.argv[1]))",
-        ])
-        .arg(&bridge)
+    let release_trace = temp.path().join("release-requests");
+    let update = Command::new(old.join("bin/pika"))
+        .arg("update")
         .env("HOME", &home)
+        .env("PIKA_TEST_RELEASE_DIR", &bridge)
+        .env("PIKA_TEST_RELEASE_TRACE", &release_trace)
         .output()
         .unwrap();
     assert!(
@@ -309,6 +521,12 @@ esac
         String::from_utf8_lossy(&update.stdout),
         String::from_utf8_lossy(&update.stderr)
     );
+    let requests = fs::read_to_string(&release_trace).unwrap();
+    let requests: Vec<_> = requests.lines().collect();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert!(requests[0].starts_with("https://api.github.com/"));
+    assert!(requests[1].ends_with("/v0.5.0a5/pika-release.json"));
+    assert!(requests[2].ends_with("/v0.5.0a5/pikamux-0.5.0a5-py3-none-any.whl"));
     let bridge_prefix = root.join("current").canonicalize().unwrap();
     assert_ne!(bridge_prefix, old.canonicalize().unwrap());
     assert_eq!(

@@ -53,9 +53,12 @@ case "$(uname -s):$(uname -m)" in
     *) fail 'Native Pika supports macOS/Linux on arm64 or x86_64.' ;;
 esac
 
-for pika_command in curl gzip head tar mktemp sed tr wc find cut; do
+for pika_command in gzip head tar mktemp sed tr wc find cut cp mkdir chmod rm sleep uname; do
     command -v "$pika_command" >/dev/null 2>&1 || fail "Required command missing: $pika_command."
 done
+if [ -z "$pika_bundle" ]; then
+    command -v curl >/dev/null 2>&1 || fail 'Required command missing: curl.'
+fi
 if command -v sha256sum >/dev/null 2>&1; then
     digest() { sha256sum "$1" | cut -d ' ' -f 1; }
 elif command -v shasum >/dev/null 2>&1; then
@@ -142,10 +145,61 @@ tar -xzf "$pika_tmp/$pika_archive" -C "$pika_tmp/extracted"
 [ "$(wc -c < "$pika_tmp/extracted/pika" | tr -d ' ')" -le 52428800 ] || fail 'Native executable exceeds the 50 MiB size limit.'
 chmod 700 "$pika_tmp/extracted/pika"
 
-[ "$("$pika_tmp/extracted/pika" --version)" = "pika $pika_version" ] || \
+pika_probe_timeout=${PIKA_INSTALL_PROBE_TIMEOUT_SECONDS:-10}
+case "$pika_probe_timeout" in *[!0-9]*|'') fail 'Invalid candidate probe timeout.' ;; esac
+[ "$pika_probe_timeout" -ge 1 ] && [ "$pika_probe_timeout" -le 60 ] || \
+    fail 'Candidate probe timeout must be between 1 and 60 seconds.'
+pika_probe_index=0
+pika_probe_output=''
+candidate_probe() {
+    local pika_probe_label=$1
+    shift
+    pika_probe_index=$((pika_probe_index + 1))
+    local pika_probe_stdout="$pika_tmp/probe-$pika_probe_index.stdout"
+    local pika_probe_stderr="$pika_tmp/probe-$pika_probe_index.stderr"
+    local pika_probe_timed_out="$pika_tmp/probe-$pika_probe_index.timed-out"
+    # A file-size limit prevents a diagnostic probe from filling the staging
+    # filesystem before its wall-clock deadline. Monitor mode gives the
+    # candidate an isolated process group so the watchdog also reaps work it
+    # spawned; the group leader itself is always waited below.
+    set -m
+    (
+        ulimit -f 1024 2>/dev/null || :
+        exec "$@"
+    ) >"$pika_probe_stdout" 2>"$pika_probe_stderr" &
+    local pika_probe_pid=$!
+    set +m
+    set -m
+    (
+        sleep "$pika_probe_timeout"
+        if kill -0 "$pika_probe_pid" 2>/dev/null; then
+            : >"$pika_probe_timed_out"
+            kill -TERM -- "-$pika_probe_pid" 2>/dev/null || :
+            sleep 1
+            kill -KILL -- "-$pika_probe_pid" 2>/dev/null || :
+        fi
+    ) &
+    local pika_watchdog_pid=$!
+    set +m
+    local pika_probe_status=0
+    wait "$pika_probe_pid" || pika_probe_status=$?
+    kill -TERM -- "-$pika_watchdog_pid" 2>/dev/null || :
+    wait "$pika_watchdog_pid" 2>/dev/null || :
+    [ ! -e "$pika_probe_timed_out" ] || \
+        fail "Native executable $pika_probe_label timed out after ${pika_probe_timeout}s."
+    [ "$(wc -c < "$pika_probe_stdout" | tr -d ' ')" -le 1048576 ] && \
+        [ "$(wc -c < "$pika_probe_stderr" | tr -d ' ')" -le 1048576 ] || \
+        fail "Native executable $pika_probe_label exceeded the output limit."
+    [ "$pika_probe_status" -eq 0 ] || \
+        fail "Native executable $pika_probe_label failed (exit $pika_probe_status)."
+    pika_probe_output=$(<"$pika_probe_stdout")
+}
+
+candidate_probe 'version probe' "$pika_tmp/extracted/pika" --version
+[ "$pika_probe_output" = "pika $pika_version" ] || \
     fail 'Native executable version does not match the selected release.'
-"$pika_tmp/extracted/pika" --help >/dev/null
-"$pika_tmp/extracted/pika" skill show >/dev/null
+candidate_probe 'help probe' "$pika_tmp/extracted/pika" --help
+candidate_probe 'skill probe' "$pika_tmp/extracted/pika" skill show
 install_args=(
     _install-native
     --manifest "$pika_tmp/pika-native-release.json"

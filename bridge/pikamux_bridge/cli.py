@@ -15,6 +15,9 @@ import sys
 from . import __version__
 
 ROOT_MARKER = "pikamux-installer-v1\n"
+MAX_JSON_BYTES = 64 * 1024
+MAX_NATIVE_ARCHIVE_BYTES = 20 * 1024 * 1024
+CHECKSUM_CHUNK_BYTES = 1024 * 1024
 SUPPORTED_TARGETS = {
     ("Darwin", "arm64"): "aarch64-apple-darwin",
     ("Darwin", "aarch64"): "aarch64-apple-darwin",
@@ -27,6 +30,45 @@ SUPPORTED_TARGETS = {
 
 class BridgeError(RuntimeError):
     pass
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _strict_json(path: Path, *, limit: int = MAX_JSON_BYTES) -> object:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"not a regular JSON file: {path.name}")
+    with path.open("rb") as stream:
+        payload = stream.read(limit + 1)
+    if len(payload) > limit:
+        raise ValueError(f"JSON file exceeds {limit} bytes: {path.name}")
+    return json.loads(payload, object_pairs_hook=_unique_object)
+
+
+def _bounded_text(path: Path, *, limit: int) -> str:
+    with path.open("rb") as stream:
+        payload = stream.read(limit + 1)
+    if len(payload) > limit:
+        raise ValueError(f"file exceeds {limit} bytes: {path.name}")
+    return payload.decode("utf-8")
+
+
+def _sha256_bounded(path: Path, *, limit: int) -> tuple[int, str]:
+    checksum = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(CHECKSUM_CHUNK_BYTES):
+            size += len(chunk)
+            if size > limit:
+                raise ValueError(f"file exceeds {limit} bytes: {path.name}")
+            checksum.update(chunk)
+    return size, checksum.hexdigest()
 
 
 def native_target(system: str | None = None, machine: str | None = None) -> str:
@@ -42,7 +84,7 @@ def native_target(system: str | None = None, machine: str | None = None) -> str:
 def _managed_receipt() -> tuple[Path, Path]:
     receipt_path = Path(sys.prefix) / ".pika-install.json"
     try:
-        value = json.loads(receipt_path.read_text())
+        value = _strict_json(receipt_path)
         root = Path(value["root"])
         bin_dir = Path(value["bin_dir"])
         if value["schema"] != 1 or not root.is_absolute() or not bin_dir.is_absolute():
@@ -66,7 +108,7 @@ def _native_bundle() -> Path:
     target = native_target()
     manifest_path = bundle / "pika-native-release.json"
     try:
-        manifest = json.loads(manifest_path.read_text())
+        manifest = _strict_json(manifest_path)
         if set(manifest) != {"schema", "package", "version", "channel", "artifacts"}:
             raise ValueError("unexpected native manifest fields")
         if manifest["schema"] != 2 or manifest["package"] != "pikamux":
@@ -83,7 +125,11 @@ def _native_bundle() -> Path:
         artifact = f"pikamux-{version}-{target}.tar.gz"
         if set(row) != {"file", "sha256", "bytes"} or row["file"] != artifact:
             raise ValueError("invalid selected native artifact")
-        if not isinstance(row["bytes"], int) or not 0 < row["bytes"] <= 100 * 1024 * 1024:
+        if (
+            isinstance(row["bytes"], bool)
+            or not isinstance(row["bytes"], int)
+            or not 0 < row["bytes"] <= MAX_NATIVE_ARCHIVE_BYTES
+        ):
             raise ValueError("invalid selected native artifact size")
         if not isinstance(row["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"]):
             raise ValueError("invalid selected native artifact checksum")
@@ -91,19 +137,93 @@ def _native_bundle() -> Path:
             if not path.is_file() or path.is_symlink():
                 raise ValueError(f"missing native bridge asset: {path.name}")
         archive = bundle / artifact
-        if archive.stat().st_size != row["bytes"]:
+        archive_size, checksum = _sha256_bounded(
+            archive, limit=MAX_NATIVE_ARCHIVE_BYTES
+        )
+        if archive_size != row["bytes"]:
             raise ValueError("selected native artifact size differs")
-        checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
-        if checksum != row["sha256"] or (bundle / f"{artifact}.sha256").read_text() != checksum + "\n":
+        if checksum != row["sha256"] or _bounded_text(
+            bundle / f"{artifact}.sha256", limit=128
+        ) != checksum + "\n":
             raise ValueError("selected native artifact checksum differs")
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise BridgeError("The verified native transition payload is incomplete; nothing changed.") from exc
     return bundle
 
 
+def _activation_outcome(root: Path, bridge_prefix: Path) -> str:
+    current = root / "current"
+    try:
+        if not current.is_symlink():
+            raise OSError("current is not a symbolic link")
+        active = current.resolve(strict=True)
+        bridge = bridge_prefix.resolve(strict=True)
+        releases = (root / "releases").resolve(strict=True)
+        active.relative_to(releases)
+    except (OSError, ValueError):
+        return "the managed current release cannot be verified"
+    if active == bridge:
+        return "the Python bridge remains current"
+    return f"managed release {active.name!r} is now current"
+
+
+def _stop_activation(process: subprocess.Popen[bytes]) -> str | None:
+    """Terminate the session-owned process group and reap its leader."""
+    failures: list[str] = []
+    previous_interrupt = None
+    try:
+        previous_interrupt = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except ValueError:
+        # Activation runs on the main thread; retain safe cleanup if an embedder
+        # invokes it elsewhere.
+        pass
+    try:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                failures.append(f"SIGTERM failed: {exc}")
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError as exc:
+                    failures.append(f"SIGKILL failed: {exc}")
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    failures.append("process group did not exit after SIGKILL")
+                except OSError as exc:
+                    failures.append(f"reap failed: {exc}")
+            except OSError as exc:
+                failures.append(f"reap failed: {exc}")
+        else:
+            try:
+                process.wait()
+            except OSError as exc:
+                failures.append(f"reap failed: {exc}")
+    finally:
+        if previous_interrupt is not None:
+            signal.signal(signal.SIGINT, previous_interrupt)
+    return "; ".join(failures) or None
+
+
+def _activation_error(reason: str, root: Path, bridge_prefix: Path, cleanup: str | None) -> BridgeError:
+    detail = f"{reason}; {_activation_outcome(root, bridge_prefix)}."
+    if cleanup:
+        detail += f" Installer cleanup could not be verified ({cleanup})."
+    return BridgeError(detail)
+
+
 def _activate_and_exec(arguments: list[str]) -> None:
     root, bin_dir = _managed_receipt()
     bundle = _native_bundle()
+    bridge_prefix = Path(sys.prefix)
     command = [
         "/bin/bash",
         str(bundle / "install.sh"),
@@ -117,25 +237,40 @@ def _activate_and_exec(arguments: list[str]) -> None:
     ]
     try:
         process = subprocess.Popen(command, start_new_session=True)
-        try:
-            return_code = process.wait(timeout=600)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-            raise BridgeError("Native activation timed out; the Python bridge remains current.")
     except OSError as exc:
-        raise BridgeError(f"Cannot start the verified native installer: {exc}") from exc
+        raise _activation_error(
+            f"Cannot start the verified native installer ({exc})",
+            root,
+            bridge_prefix,
+            None,
+        ) from exc
+    try:
+        return_code = process.wait(timeout=600)
+    except subprocess.TimeoutExpired as exc:
+        cleanup = _stop_activation(process)
+        raise _activation_error(
+            "Native activation timed out", root, bridge_prefix, cleanup
+        ) from exc
+    except KeyboardInterrupt as exc:
+        cleanup = _stop_activation(process)
+        raise _activation_error(
+            "Native activation was interrupted", root, bridge_prefix, cleanup
+        ) from exc
+    except BaseException as exc:
+        cleanup = _stop_activation(process)
+        raise _activation_error(
+            f"Native activation stopped unexpectedly ({type(exc).__name__})",
+            root,
+            bridge_prefix,
+            cleanup,
+        ) from exc
     if return_code:
-        raise BridgeError(
-            "Native activation failed; the Python bridge remains current and no agent was restarted."
+        raise _activation_error(
+            f"Native activation exited {return_code}", root, bridge_prefix, None
         )
     launcher = bin_dir / "pika"
     try:
-        if (root / "current").resolve() == Path(sys.prefix).resolve():
+        if (root / "current").resolve() == bridge_prefix.resolve():
             raise BridgeError("Native activation did not switch the managed release.")
         os.execv(launcher, [str(launcher), *arguments])
     except OSError as exc:
