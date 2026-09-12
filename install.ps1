@@ -240,8 +240,8 @@ param(
         }
         Write-Host "Pika installed - $destination\pika.exe"
         Write-Host 'Windows client for agents hosted on macOS or Linux.'
-        Write-Host 'Next: pika setup YOUR_SSH_HOST'
-        Write-Host 'Use the same SSH host name you already connect to. Pairing remains experimental.'
+        Write-Host 'Next: pika'
+        Write-Host 'Choose your Mac or Linux host once; Pika remembers it.'
     } finally {
         if ($lock) { $lock.Dispose() }
         if ($stage -and (Test-Path -LiteralPath $stage)) { [IO.Directory]::Delete($stage, $true) }

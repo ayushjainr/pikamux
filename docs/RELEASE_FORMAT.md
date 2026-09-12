@@ -168,4 +168,6 @@ and probes the verified executable before activation. Versioned directories unde
 `%LOCALAPPDATA%\Pika\Client\releases` avoid replacing an executable used by a
 running bridge. The per-user PATH selects the installed version. Re-running the
 installer updates it; downgrades and changed bytes for an installed version are
-refused. Pairing and SSH configuration remain separate, explicit steps.
+refused. Installation does not pair machines. Interactive `pika` then offers a
+host chooser and manages pairing, the client bridge, and its SSH forward without
+editing SSH configuration.

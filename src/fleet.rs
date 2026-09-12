@@ -58,6 +58,7 @@ pub const CAPABILITIES: &[&str] = &[
     "expert-directory-v1",
     "expert-directory-notices-v1",
     "setup-explicit-names-v1",
+    "client-board-v1",
 ];
 const REQUIRED_CAPABILITIES: &[&str] = &[
     "inventory",

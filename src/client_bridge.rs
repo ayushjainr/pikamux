@@ -94,6 +94,8 @@ pub struct ClientNode {
     pub ssh_target: String,
     pub token: String,
     pub remote_port: Option<u16>,
+    /// Locally selected board host may route its trusted fleet through itself.
+    pub allow_fleet_relay: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +103,7 @@ pub struct ClientConfig {
     pub version: u32,
     pub client_id: String,
     pub nodes: BTreeMap<String, ClientNode>,
+    pub default_node_id: Option<String>,
 }
 
 impl ClientConfig {
@@ -109,6 +112,7 @@ impl ClientConfig {
             version: CLIENT_CONFIG_VERSION,
             client_id: Uuid::new_v4().to_string(),
             nodes: BTreeMap::new(),
+            default_node_id: None,
         }
     }
 
@@ -137,10 +141,21 @@ impl ClientConfig {
             let node = parse_client_node(&node_id, raw_node)?;
             nodes.insert(node_id, node);
         }
+        let default_node_id = match object.get("default_node_id") {
+            None | Some(Value::Null) => None,
+            value => {
+                let id = canonical_uuid(value, "Invalid default machine identity")?;
+                if !nodes.contains_key(&id) {
+                    return Err(ClientBridgeError::invalid("Default machine is not paired"));
+                }
+                Some(id)
+            }
+        };
         Ok(Self {
             version: CLIENT_CONFIG_VERSION,
             client_id,
             nodes,
+            default_node_id,
         })
     }
 
@@ -153,6 +168,7 @@ impl ClientConfig {
                     "alias": node.alias,
                     "ssh_target": node.ssh_target,
                     "token": node.token,
+                    "allow_fleet_relay": node.allow_fleet_relay,
                 });
                 if let Some(port) = node.remote_port {
                     value
@@ -167,6 +183,7 @@ impl ClientConfig {
             "version": CLIENT_CONFIG_VERSION,
             "client_id": self.client_id,
             "nodes": nodes,
+            "default_node_id": self.default_node_id,
         })
     }
 }
@@ -579,6 +596,7 @@ pub fn install_client_pairing(
     let node_id = canonical_uuid_str(node_id, "Invalid node identity")?;
     validate_pair_receipt(raw_receipt, &node_id, &config.client_id, remote_port)?;
     let node = ClientNode {
+        allow_fleet_relay: false,
         node_id: node_id.clone(),
         alias: client_alias(alias)?,
         ssh_target: ssh_target_value(ssh_target)?,
@@ -681,6 +699,39 @@ pub fn windows_terminal_command(
         "--session-id".to_owned(),
         exact_session_id,
     ])
+}
+
+/// Reuse only the locally trusted coordinator's SSH target. The destination
+/// remains an exact UUID and is resolved against that coordinator's registry,
+/// never against a hostname or command supplied in a bridge request.
+pub fn windows_fleet_terminal_command(
+    source: &ClientNode,
+    target_node_id: &str,
+    provider: Provider,
+    session_id: &str,
+    terminal_executable: &str,
+    ssh_executable: &str,
+) -> Result<Vec<String>, ClientBridgeError> {
+    if !source.allow_fleet_relay {
+        return Err(ClientBridgeError::rejected(
+            "Fleet routing is not enabled for this board",
+        ));
+    }
+    let target = canonical_uuid_str(target_node_id, "Invalid target node identity")?;
+    let mut command = windows_terminal_command(
+        source,
+        provider,
+        session_id,
+        terminal_executable,
+        ssh_executable,
+    )?;
+    let endpoint = command
+        .iter_mut()
+        .find(|arg| arg.as_str() == "_fleet-open")
+        .expect("fixed command endpoint");
+    *endpoint = "_client-fleet-open".into();
+    command.extend(["--target-node-id".into(), target]);
+    Ok(command)
 }
 
 pub trait WindowLauncher {
@@ -825,9 +876,12 @@ impl<L: WindowLauncher> ClientLaunchBridge<L> {
                 "Source Pika node is not paired with this bridge",
             ));
         }
-        let target = self.nodes.get(&request.target_node_id).ok_or_else(|| {
-            ClientBridgeError::rejected("Target Pika node is not paired on this client")
-        })?;
+        let target = self.nodes.get(&request.target_node_id);
+        if target.is_none() && !source.allow_fleet_relay {
+            return Err(ClientBridgeError::rejected(
+                "Target Pika node is not paired on this client",
+            ));
+        }
 
         self.receipts.retain(|_, receipt| {
             now.saturating_duration_since(receipt.created_at) < RECEIPT_CACHE_TTL
@@ -842,25 +896,41 @@ impl<L: WindowLauncher> ClientLaunchBridge<L> {
                 .map_err(|error| ClientBridgeError::io(error.to_string()));
         }
 
-        let command = windows_terminal_command(
-            target,
-            request.provider,
-            &request.session_id,
-            &self.terminal_executable,
-            &self.ssh_executable,
-        )?;
+        let command = match target {
+            Some(target) => windows_terminal_command(
+                target,
+                request.provider,
+                &request.session_id,
+                &self.terminal_executable,
+                &self.ssh_executable,
+            )?,
+            None => windows_fleet_terminal_command(
+                source,
+                &request.target_node_id,
+                request.provider,
+                &request.session_id,
+                &self.terminal_executable,
+                &self.ssh_executable,
+            )?,
+        };
         self.launcher.launch(&command)?;
         let receipt = ClientLaunchReceipt {
             message_type: "launched".to_owned(),
             protocol: BRIDGE_PROTOCOL.to_owned(),
             version: BRIDGE_VERSION,
             request_id: request.request_id.clone(),
-            target_node_id: target.node_id.clone(),
+            target_node_id: request.target_node_id.clone(),
             provider: request.provider,
             session_id: request.session_id.clone(),
             detail: format!(
                 "WINDOW LAUNCHED · {} · id {}",
-                target.alias,
+                target
+                    .map(|node| node.alias.clone())
+                    .unwrap_or_else(|| format!(
+                        "{} via {}",
+                        prefix(&request.target_node_id, 8),
+                        source.alias
+                    )),
                 prefix(&request.session_id, 8)
             ),
         };
@@ -1273,6 +1343,11 @@ fn parse_client_node(node_id: &str, value: &Value) -> Result<ClientNode, ClientB
         alias: client_alias_value(object.get("alias"))?,
         ssh_target: ssh_target(object.get("ssh_target"))?,
         token: bridge_token(object.get("token"))?,
+        allow_fleet_relay: match object.get("allow_fleet_relay") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            _ => return Err(ClientBridgeError::invalid("Invalid fleet relay permission")),
+        },
         remote_port: match object.get("remote_port") {
             None | Some(Value::Null) => None,
             value => Some(optional_port(

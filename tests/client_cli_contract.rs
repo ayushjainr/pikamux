@@ -1,6 +1,6 @@
 use anyhow::Result;
 use pikamux::client_bridge::{
-    BRIDGE_PROTOCOL, BRIDGE_VERSION, ClientConfig, LoopbackEndpoint, PairRequest,
+    BRIDGE_PROTOCOL, BRIDGE_VERSION, ClientConfig, ClientNode, LoopbackEndpoint, PairRequest,
 };
 use pikamux::client_cli::{ClientBridgeOptions, ClientCliRuntime, run_with as run_client_cli};
 use pikamux::fleet::{CAPABILITIES, PROTOCOL_NAME, PROTOCOL_VERSION};
@@ -105,6 +105,12 @@ struct SshCall {
 }
 
 struct FakeRuntime {
+    interactive: bool,
+    hosts: Vec<String>,
+    choices: std::collections::VecDeque<String>,
+    opened: Vec<ClientNode>,
+    wrong_hello_node: bool,
+    old_host: bool,
     config: ClientConfig,
     saved: Vec<ClientConfig>,
     ssh_calls: Vec<SshCall>,
@@ -120,6 +126,12 @@ impl Default for FakeRuntime {
         let mut config = ClientConfig::empty();
         config.client_id = CLIENT_ID.to_owned();
         Self {
+            interactive: false,
+            hosts: Vec::new(),
+            choices: Default::default(),
+            opened: Vec::new(),
+            wrong_hello_node: false,
+            old_host: false,
             config,
             saved: Vec::new(),
             ssh_calls: Vec::new(),
@@ -133,6 +145,19 @@ impl Default for FakeRuntime {
 }
 
 impl ClientCliRuntime for FakeRuntime {
+    fn interactive(&self) -> bool {
+        self.interactive
+    }
+    fn discover_hosts(&mut self) -> Result<Vec<String>> {
+        Ok(self.hosts.clone())
+    }
+    fn read_choice(&mut self) -> Result<Option<String>> {
+        Ok(self.choices.pop_front())
+    }
+    fn open_board(&mut self, node: &ClientNode) -> Result<i32> {
+        self.opened.push(node.clone());
+        Ok(0)
+    }
     fn load_config(&mut self) -> Result<ClientConfig> {
         Ok(self.config.clone())
     }
@@ -171,10 +196,10 @@ impl ClientCliRuntime for FakeRuntime {
                 "type": "hello",
                 "protocol": PROTOCOL_NAME,
                 "version": PROTOCOL_VERSION,
-                "node_id": NODE_ID,
+                "node_id": if self.wrong_hello_node { WRONG_NODE_ID } else { NODE_ID },
                 "machine": "devbox",
                 "package_version": "0.6.0-alpha.1",
-                "capabilities": CAPABILITIES,
+                "capabilities": CAPABILITIES.iter().filter(|cap| !self.old_host || **cap != "client-board-v1").collect::<Vec<_>>(),
             }));
         }
         let pair: PairRequest = serde_json::from_value(payload.clone())?;
@@ -295,8 +320,9 @@ fn setup_uses_fleet_v2_two_receipts_and_saves_the_exact_secret_once() {
     assert_eq!(saved.remote_port, Some(49_000));
     assert!(runtime.starts.is_empty());
     assert!(output.contains("PAIRED · workstation"));
-    assert!(output.contains("RemoteForward 127.0.0.1:49000 127.0.0.1:47653"));
-    assert!(output.contains("does not confirm the later attach"));
+    assert!(!output.contains("RemoteForward"));
+    assert!(output.contains("Run `pika` to open your board"));
+    assert_eq!(runtime.config.default_node_id.as_deref(), Some(NODE_ID));
 }
 
 #[test]
@@ -382,5 +408,199 @@ fn setup_starts_only_the_client_bridge_after_pairing_when_requested() {
     assert_eq!(runtime.saved.len(), 1);
     assert_eq!(runtime.starts.len(), 1);
     assert!(output.contains("CLIENT BRIDGE STARTED"));
-    assert!(output.contains("exact local Windows Terminal window"));
+    assert!(output.contains("local window routing are automatic"));
+}
+
+#[test]
+fn first_bare_run_selects_pairs_remembers_and_opens_without_manual_commands() {
+    let mut runtime = FakeRuntime {
+        interactive: true,
+        hosts: vec!["devbox".into(), "unselected".into()],
+        choices: ["1".into()].into(),
+        ..FakeRuntime::default()
+    };
+    let (_, output, _) = run(&["pika"], &mut runtime).unwrap();
+    assert_eq!(runtime.opened.len(), 1);
+    assert!(runtime.config.nodes[NODE_ID].allow_fleet_relay);
+    assert_eq!(runtime.opened[0].node_id, NODE_ID);
+    assert_eq!(runtime.config.default_node_id.as_deref(), Some(NODE_ID));
+    assert_eq!(runtime.starts.len(), 1);
+    assert!(runtime.ssh_calls.iter().all(|call| call.target == "devbox"));
+    assert!(!output.contains("RemoteForward"));
+    let count = runtime.ssh_calls.len();
+    let saved = runtime.saved.len();
+    run(&["pika"], &mut runtime).unwrap();
+    assert_eq!(
+        runtime.ssh_calls.len(),
+        count + 1,
+        "one identity check, no repeated pairing"
+    );
+    assert_eq!(runtime.saved.len(), saved);
+    assert_eq!(runtime.starts.len(), 1, "reuse ready bridge");
+    assert_eq!(runtime.opened.len(), 2);
+    let count = runtime.ssh_calls.len();
+    run(&["pika", "status"], &mut runtime).unwrap();
+    assert_eq!(
+        runtime.ssh_calls.len(),
+        count,
+        "explicit status remains read-only even on a terminal"
+    );
+}
+
+#[test]
+fn older_pairing_without_default_opens_its_only_known_machine() {
+    let mut runtime = FakeRuntime::default();
+    run(&["pika", "setup", "devbox", "--no-start"], &mut runtime).unwrap();
+    runtime.config.default_node_id = None;
+    runtime.interactive = true;
+    runtime.hosts = vec!["other-machine".into()];
+    run(&["pika"], &mut runtime).unwrap();
+    assert_eq!(runtime.opened[0].node_id, NODE_ID);
+    assert_eq!(runtime.config.default_node_id.as_deref(), Some(NODE_ID));
+    assert!(runtime.ssh_calls.iter().all(|call| call.target == "devbox"));
+}
+
+#[test]
+fn multiple_legacy_pairings_do_not_guess_a_default() {
+    let mut runtime = FakeRuntime::default();
+    run(&["pika", "setup", "devbox", "--no-start"], &mut runtime).unwrap();
+    let mut second = runtime.config.nodes[NODE_ID].clone();
+    second.node_id = WRONG_NODE_ID.into();
+    second.alias = "another".into();
+    second.ssh_target = "another".into();
+    runtime.config.nodes.insert(WRONG_NODE_ID.into(), second);
+    runtime.config.default_node_id = None;
+    runtime.interactive = true;
+    runtime.choices.push_back("".into());
+    let count = runtime.ssh_calls.len();
+    let (_, output, _) = run(&["pika"], &mut runtime).unwrap();
+    assert!(output.contains("1. another · paired"));
+    assert_eq!(runtime.ssh_calls.len(), count);
+    assert!(runtime.opened.is_empty());
+    assert!(runtime.config.default_node_id.is_none());
+}
+
+#[test]
+fn first_run_cancellation_and_invalid_choices_never_contact_candidates() {
+    let mut runtime = FakeRuntime {
+        interactive: true,
+        hosts: vec!["devbox".into()],
+        choices: ["0".into(), "999".into(), "-evil".into(), "".into()].into(),
+        ..FakeRuntime::default()
+    };
+    run(&["pika"], &mut runtime).unwrap();
+    assert!(runtime.ssh_calls.is_empty());
+    assert!(runtime.saved.is_empty());
+    assert!(runtime.opened.is_empty());
+    assert!(runtime.starts.is_empty());
+}
+
+#[test]
+fn manual_host_and_setup_chooser_work_without_ssh_config() {
+    let mut runtime = FakeRuntime {
+        interactive: true,
+        choices: ["user@personal-mac".into()].into(),
+        ..FakeRuntime::default()
+    };
+    run(&["pika", "setup"], &mut runtime).unwrap();
+    assert_eq!(runtime.opened[0].ssh_target, "user@personal-mac");
+    runtime.choices.push_back("".into());
+    let count = runtime.ssh_calls.len();
+    run(&["pika", "setup"], &mut runtime).unwrap();
+    assert_eq!(
+        runtime.ssh_calls.len(),
+        count,
+        "cancel keeps remembered host"
+    );
+    assert_eq!(runtime.config.default_node_id.as_deref(), Some(NODE_ID));
+}
+
+#[test]
+fn changed_node_and_older_host_fail_before_bridge_or_board() {
+    let mut runtime = FakeRuntime::default();
+    run(&["pika", "setup", "devbox", "--no-start"], &mut runtime).unwrap();
+    runtime.interactive = true;
+    runtime.wrong_hello_node = true;
+    let saved = runtime.saved.len();
+    assert!(
+        run(&["pika"], &mut runtime)
+            .unwrap_err()
+            .to_string()
+            .contains("identity changed")
+    );
+    runtime.wrong_hello_node = false;
+    runtime.old_host = true;
+    assert!(
+        run(&["pika"], &mut runtime)
+            .unwrap_err()
+            .to_string()
+            .contains("ssh devbox pika update")
+    );
+    assert_eq!(runtime.saved.len(), saved);
+    assert!(runtime.starts.is_empty());
+    assert!(runtime.opened.is_empty());
+}
+
+#[test]
+fn first_run_old_host_is_not_paired_or_remembered() {
+    let mut runtime = FakeRuntime {
+        interactive: true,
+        old_host: true,
+        choices: ["devbox".into()].into(),
+        ..FakeRuntime::default()
+    };
+    assert!(
+        run(&["pika"], &mut runtime)
+            .unwrap_err()
+            .to_string()
+            .contains("ssh devbox pika update")
+    );
+    assert_eq!(runtime.ssh_calls.len(), 1);
+    assert!(runtime.saved.is_empty());
+    assert!(runtime.starts.is_empty());
+    assert!(runtime.opened.is_empty());
+}
+
+#[test]
+fn board_connection_owns_its_forward_and_binds_exact_machine_without_shell_text() {
+    let mut runtime = FakeRuntime::default();
+    run(
+        &["pika", "setup", "user@devbox", "--no-start"],
+        &mut runtime,
+    )
+    .unwrap();
+    let node = &runtime.config.nodes[NODE_ID];
+    let args = pikamux::client_cli::board_ssh_arguments(node).unwrap();
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["-R", "127.0.0.1:47654:127.0.0.1:47653"])
+    );
+    assert!(args.windows(2).any(|pair| pair == ["-S", "none"]));
+    assert!(args.contains(&"ExitOnForwardFailure=yes".into()));
+    assert!(args.ends_with(&[
+        "user@devbox".into(),
+        "pika".into(),
+        "_client-board".into(),
+        "--expected-node-id".into(),
+        NODE_ID.into()
+    ]));
+    assert!(!args.iter().any(|arg| arg.contains(TOKEN)));
+    let mut bad = node.clone();
+    bad.node_id = "x; echo unsafe".into();
+    assert!(pikamux::client_cli::board_ssh_arguments(&bad).is_err());
+}
+
+#[test]
+fn remembered_machine_config_roundtrips_and_rejects_unpaired_default() {
+    let mut runtime = FakeRuntime::default();
+    run(&["pika", "setup", "devbox", "--no-start"], &mut runtime).unwrap();
+    let mut value = runtime.config.to_value();
+    assert_eq!(ClientConfig::from_value(&value).unwrap(), runtime.config);
+    value["default_node_id"] = json!(WRONG_NODE_ID);
+    assert!(ClientConfig::from_value(&value).is_err());
+    value.as_object_mut().unwrap().remove("default_node_id");
+    assert_eq!(
+        ClientConfig::from_value(&value).unwrap().default_node_id,
+        None
+    );
 }

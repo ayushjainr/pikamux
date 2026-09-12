@@ -116,6 +116,10 @@ enum Command {
     PeekPopup(PeekPopupArgs),
     #[command(name = "_client-pair", hide = true)]
     ClientPair(ClientPairArgs),
+    #[command(name = "_client-board", hide = true)]
+    ClientBoard(ClientBoardArgs),
+    #[command(name = "_client-fleet-open", hide = true)]
+    ClientFleetOpen(ClientFleetOpenArgs),
     #[command(name = "_enter", hide = true)]
     Enter(NameArg),
     #[command(external_subcommand)]
@@ -493,6 +497,22 @@ struct FleetOpenArgs {
     session_id: String,
 }
 #[derive(Args, Debug)]
+struct ClientBoardArgs {
+    #[arg(long)]
+    expected_node_id: String,
+}
+#[derive(Args, Debug)]
+struct ClientFleetOpenArgs {
+    #[arg(long)]
+    expected_node_id: String,
+    #[arg(long)]
+    target_node_id: String,
+    #[arg(long)]
+    provider: Provider,
+    #[arg(long)]
+    session_id: String,
+}
+#[derive(Args, Debug)]
 struct FleetAskArgs {
     #[arg(long)]
     expected_node_id: String,
@@ -528,6 +548,17 @@ where
 fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
     match command {
         None => bare(pika),
+        Some(Command::ClientBoard(a)) => {
+            verify_local_node(pika, &a.expected_node_id)?;
+            if !monitor::interactive_terminal() {
+                return bare(pika);
+            }
+            drive_client_board(
+                || observe_board(pika),
+                |action| finish_board_action(pika, action),
+            )
+        }
+        Some(Command::ClientFleetOpen(a)) => client_fleet_open(pika, a),
         Some(Command::List(a)) => list(pika, a),
         Some(Command::Next) => next(pika),
         Some(Command::Peek(a)) => peek(pika, a),
@@ -614,6 +645,26 @@ fn bare(pika: &Pika) -> Result<i32> {
         );
         return print_sessions(inventory.sessions, true);
     }
+    finish_board_action(pika, observe_board(pika)?)
+}
+
+// The Windows board connection owns the reverse forward. Keep it alive after
+// an exact open (a new window, or an attach that has since detached); q exits.
+fn drive_client_board(
+    mut observe: impl FnMut() -> Result<BoardAction>,
+    mut apply: impl FnMut(BoardAction) -> Result<i32>,
+) -> Result<i32> {
+    loop {
+        let action = observe()?;
+        let reopen = matches!(&action, BoardAction::Open(_));
+        let code = apply(action)?;
+        if !reopen || code != 0 {
+            return Ok(code);
+        }
+    }
+}
+
+fn observe_board(pika: &Pika) -> Result<BoardAction> {
     // Paint all bounded durable state immediately, including offline fleet
     // rows. No provider, process, tmux, or SSH observation belongs here.
     let (cached, initial_fleet_health) = board_items(pika)?;
@@ -762,7 +813,11 @@ fn bare(pika: &Pika) -> Result<i32> {
     finish_board_observer(&stop, &refresh_sender, &local_done_receiver, local_refresh);
     // Do not delay Enter/quit behind provider metadata or a bounded SSH
     // timeout. Exact actions revalidate independently before mutating state.
-    match action? {
+    action
+}
+
+fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
+    match action {
         BoardAction::Open(item) => open_board_item(pika, item),
         BoardAction::Peek(item) => peek_board_item(pika, item),
         BoardAction::Untrack(item) => untrack_board_item(pika, item),
@@ -5070,6 +5125,41 @@ fn fleet_open(pika: &Pika, a: FleetOpenArgs) -> Result<i32> {
     let receipt = pika.open_session(session, true)?;
     finish_local_open(pika, &receipt)
 }
+fn client_fleet_open(pika: &Pika, a: ClientFleetOpenArgs) -> Result<i32> {
+    verify_local_node(pika, &a.expected_node_id)?;
+    if a.target_node_id == a.expected_node_id {
+        return fleet_open(
+            pika,
+            FleetOpenArgs {
+                expected_node_id: a.expected_node_id,
+                provider: a.provider,
+                session_id: a.session_id,
+            },
+        );
+    }
+    // This is not discovery: only an already trusted node and exact cached
+    // conversation may proceed. attach refreshes that node, checks the route
+    // again, and verifies its UUID on the destination before resuming.
+    pika.store
+        .get_fleet_node(&a.target_node_id)?
+        .context("Target machine is not in this board's trusted fleet; nothing was opened")?;
+    let manager = FleetManager::new(&pika.store, SshTransport::default());
+    let matches = manager
+        .cached_sessions(Some(&a.target_node_id), false)?
+        .into_iter()
+        .filter(|remote| {
+            remote.node_id == a.target_node_id
+                && remote.session.provider == a.provider
+                && remote.session.session_id == a.session_id
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [remote] => manager.attach(remote).map_err(Into::into),
+        _ => bail!(
+            "The exact conversation is not available on this board. Refresh the board and select it again; nothing was opened."
+        ),
+    }
+}
 fn fleet_ask(pika: &Pika, a: FleetAskArgs) -> Result<i32> {
     verify_local_node(pika, &a.expected_node_id)?;
     let session = exact_local_session(pika, a.provider, &a.session_id, true)?;
@@ -5359,6 +5449,48 @@ mod fleet_consultation_tests {
     use crate::model::Status;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn windows_board_remains_connected_after_multiple_opens_and_exits_on_quit() {
+        let root = tempfile::tempdir().unwrap();
+        let item = BoardItem::local(fixture_session(root.path()));
+        let mut actions = std::collections::VecDeque::from([
+            BoardAction::Open(item.clone()),
+            BoardAction::Open(item),
+            BoardAction::Quit,
+        ]);
+        let mut opens = 0;
+        let code = drive_client_board(
+            || Ok(actions.pop_front().expect("quit must stop")),
+            |action| {
+                if matches!(action, BoardAction::Open(_)) {
+                    opens += 1;
+                }
+                Ok(0)
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(opens, 2);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn windows_board_never_retries_a_failed_or_uncertain_open() {
+        let root = tempfile::tempdir().unwrap();
+        let item = BoardItem::local(fixture_session(root.path()));
+        let mut observed = 0;
+        let error = drive_client_board(
+            || {
+                observed += 1;
+                Ok(BoardAction::Open(item.clone()))
+            },
+            |_| bail!("launch outcome unknown"),
+        )
+        .unwrap_err();
+        assert_eq!(observed, 1);
+        assert!(error.to_string().contains("outcome unknown"));
+    }
 
     fn fixture_session(root: &std::path::Path) -> Session {
         Session {
@@ -5792,6 +5924,48 @@ done
         assert_eq!(items[0], local);
         assert_eq!(health.len(), 1);
         assert!(health[0].contains("safety limit"));
+    }
+
+    #[test]
+    fn client_board_combines_local_and_multiple_servers_without_name_deduplication() {
+        let root = tempfile::tempdir().unwrap();
+        let session = fixture_session(root.path());
+        let mut items = vec![BoardItem::local(session.clone())];
+        let mut health = Vec::new();
+        let sessions = [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        ]
+        .into_iter()
+        .map(|node_id| fleet::FleetSession {
+            node_id: node_id.into(),
+            node_name: node_id[..8].into(),
+            session: session.clone(),
+            stale: false,
+            remote_error: None,
+            seen_at: 1.0,
+            card_status: None,
+            card_detail: None,
+            watched: true,
+            availability: Some("source-available".into()),
+            scope_updated_at: None,
+            current_state_updated_at: None,
+            current_state_status: None,
+        })
+        .collect();
+        append_cached_fleet(
+            &mut items,
+            &mut health,
+            Ok(fleet::CachedFleetSessions {
+                sessions,
+                notices: Vec::new(),
+            }),
+        );
+        assert_eq!(items.len(), 3);
+        assert!(items[0].node_id.is_none());
+        assert_ne!(items[1].node_id, items[2].node_id);
+        assert!(items.iter().all(|item| item.session.name == session.name));
+        assert!(health.is_empty());
     }
 
     #[test]

@@ -106,12 +106,17 @@ Run in a local PowerShell window, not inside SSH:
 
 ```powershell
 irm https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.ps1 | iex
-pika setup YOUR_SSH_HOST
+pika
 ```
 
-Replace `YOUR_SSH_HOST` with your existing SSH host name. Pika must already be
-installed on that host. Pairing prints the reverse-forward setting needed to
-open exact conversations in Windows Terminal.
+Choose the Mac or Linux machine whose board you want to use. Pika lists your
+existing SSH hosts, or you can enter a host name directly. That host needs Pika
+installed and working SSH access. Pika remembers your choice, starts local window
+routing, and opens the board over SSH. No SSH configuration edits are needed.
+The board combines that machine's threads with all its configured remote
+servers. Opening those threads can route through the board machine; separate
+Windows pairing for each server is not required. Choose your existing Mac board
+to see the same fleet there and on Windows. Use `pika setup` to choose another board.
 
 The installer requires 64-bit Windows and PowerShell 5.1 or newer. It verifies
 the release manifest, checksum and ZIP contents before running the client,

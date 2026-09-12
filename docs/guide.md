@@ -203,28 +203,25 @@ nodes own provider processes, exact identity reconciliation, and tmux homes. The
 Windows client owns only local window creation; a remote process is never given
 permission to execute an arbitrary client-side command.
 
-Install the Windows client, then pair each server whose agents may be
-opened locally:
+Install the Windows client and open Pika:
 
 ```powershell
 irm https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.ps1 | iex
-pika setup devbox
+pika
 ```
 
-Run these commands in local PowerShell, outside SSH. Replace `devbox` with the
-SSH host name you already use. Installation needs no administrator access.
+Run these commands in local PowerShell, outside SSH. Choose your Mac or Linux
+host from the SSH host list, or enter its SSH name. Only your selected host is
+contacted. Installation needs no administrator access.
 
 Pairing performs two SSH identity receipts, stores a different random secret for
 that exact Pika node on each side, and starts the loopback-only client bridge.
-It prints one line to add to the matching `Host devbox` block in the local
-OpenSSH configuration:
+Pika remembers that machine, connects with its own reverse SSH forward, and
+opens the board. Subsequent `pika` launches go straight there. The host identity
+is checked again on the board's actual connection; changing an SSH alias cannot
+silently open another machine. No SSH configuration edits are required.
 
-```sshconfig
-RemoteForward 127.0.0.1:47654 127.0.0.1:47653
-```
-
-Reconnect that SSH session after adding the forward. Thereafter, Enter on an
-exact row in the remote `pika` monitor asks the paired client to launch:
+Enter on an exact row in the remote monitor asks the paired client to launch:
 
 ```text
 wt.exe -w new ... ssh.exe -tt -o ClearAllForwardings=yes devbox pika _fleet-open \
@@ -248,16 +245,27 @@ identity fails closed and leaves the monitor open with the exact reason.
 Useful client commands:
 
 ```text
-pika setup SSH_HOST       pair one exact Pika node and start the bridge
-pika                      show paired client nodes
+pika                      open your remembered machine's board
+pika setup                choose a different board machine
+pika setup SSH_HOST       pair a specific host and make it the default
+pika status               show paired client nodes without connecting
 pika bridge status        show paired client nodes
 pika bridge start         start the loopback bridge in the background
 pika bridge serve         run it in the foreground for diagnosis
 ```
 
-Pair every target machine you want a fleet board to open directly. A board on
-one paired server may then request a window for another paired node using only
-that target's immutable node UUID. The bridge cannot route to an unpaired node.
+The board shows its local conversations and all its configured remote servers
+together. For a directly paired destination, Windows connects there directly.
+Otherwise, the selected board host relays the exact open through its own trusted
+fleet. You do not need to pair every server separately on Windows. The relay
+revalidates the board host, requires the destination in its trusted registry,
+refreshes the exact conversation, and checks the destination UUID before attach.
+Unknown or removed servers are refused, never discovered or trusted by opening a row.
+
+Closing the board closes its SSH forward, not the agents. A forwarding conflict
+does not kill or take over another connection. Close your other board connection
+to the same host and run `pika` again. If the host needs the newer board endpoint,
+Pika shows its exact update command rather than changing that machine silently.
 
 ## Multiple machines
 

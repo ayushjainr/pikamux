@@ -2,6 +2,50 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 #[cfg(unix)]
+#[test]
+fn client_board_rejects_changed_machine_before_opening_inventory() {
+    let (_temp, mut command) = wait_command(false);
+    command
+        .args([
+            "_client-board",
+            "--expected-node-id",
+            "11111111-1111-4111-8111-111111111111",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("NODE IDENTITY CHANGED"));
+}
+
+#[cfg(unix)]
+#[test]
+fn client_fleet_open_rejects_unknown_destination_without_ssh() {
+    let (temp, mut command) = wait_command(false);
+    let node = Store::at(temp.path().join("state/pika.db"))
+        .ensure_local_node_id()
+        .unwrap();
+    let ssh = temp.path().join("bin/ssh");
+    std::fs::write(&ssh, "#!/bin/sh\nexit 91\n").unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    command
+        .args([
+            "_client-fleet-open",
+            "--expected-node-id",
+            &node,
+            "--target-node-id",
+            "11111111-1111-4111-8111-111111111111",
+            "--provider",
+            "codex",
+            "--session-id",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "not in this board's trusted fleet",
+        ));
+}
+
+#[cfg(unix)]
 use pikamux::{
     model::{Provider, Session, Status},
     paths::Paths,

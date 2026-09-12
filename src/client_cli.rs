@@ -7,7 +7,7 @@
 
 use crate::VERSION;
 use crate::client_bridge::{
-    ClientConfig, ClientLaunchBridge, LoopbackEndpoint, ProcessWindowLauncher,
+    ClientConfig, ClientLaunchBridge, ClientNode, LoopbackEndpoint, ProcessWindowLauncher,
     TcpClientBridgeTransport, bind_client_bridge, client_bridge_running,
     default_client_config_path, generate_pairing_token, install_client_pairing, load_client_config,
     make_pair_request, serve_client_bridge_once_reloading, validate_client_ssh_target,
@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -34,7 +34,7 @@ const MAX_PAIR_STDERR_BYTES: usize = 64 * 1024;
 #[command(
     name = "pika",
     version = VERSION,
-    about = "Pika experimental Windows client and secure local-window bridge.",
+    about = "Open your Pika board from Windows.",
     after_help = "This client opens exact conversations hosted by paired macOS/Linux machines. Native Windows agent hosting is unsupported."
 )]
 struct WindowsClientCli {
@@ -46,7 +46,7 @@ struct WindowsClientCli {
 enum WindowsClientCommand {
     /// Show paired machines and local bridge readiness.
     Status,
-    /// Pair this client with one trusted Pika machine over SSH.
+    /// Choose your board's machine, or pair a specific SSH host.
     Setup(ClientSetupArgs),
     /// Inspect or run the loopback-only window bridge.
     Bridge(ClientBridgeArgs),
@@ -54,7 +54,7 @@ enum WindowsClientCommand {
 
 #[derive(Args, Debug)]
 struct ClientSetupArgs {
-    ssh_target: String,
+    ssh_target: Option<String>,
     #[arg(long)]
     alias: Option<String>,
     #[arg(long, default_value = "ssh.exe")]
@@ -107,6 +107,18 @@ impl Default for ClientBridgeOptions {
 
 /// OS/process boundary for deterministic Windows-client workflow tests.
 pub trait ClientCliRuntime {
+    fn interactive(&self) -> bool {
+        false
+    }
+    fn discover_hosts(&mut self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    fn read_choice(&mut self) -> Result<Option<String>> {
+        Ok(None)
+    }
+    fn open_board(&mut self, _node: &ClientNode) -> Result<i32> {
+        bail!("Interactive board connection is unavailable")
+    }
     fn load_config(&mut self) -> Result<ClientConfig>;
     fn save_config(&mut self, config: &ClientConfig) -> Result<()>;
     fn client_label(&mut self) -> Result<String>;
@@ -137,6 +149,48 @@ impl SystemClientRuntime {
 }
 
 impl ClientCliRuntime for SystemClientRuntime {
+    fn interactive(&self) -> bool {
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    }
+
+    fn discover_hosts(&mut self) -> Result<Vec<String>> {
+        let home = directories::BaseDirs::new().context("Cannot find your SSH configuration")?;
+        Ok(
+            crate::fleet::discover_ssh_candidates(&home.home_dir().join(".ssh"))
+                .into_iter()
+                .map(|candidate| candidate.ssh_target)
+                .collect(),
+        )
+    }
+
+    fn read_choice(&mut self) -> Result<Option<String>> {
+        let mut line = Vec::new();
+        std::io::stdin()
+            .lock()
+            .take(1025)
+            .read_until(b'\n', &mut line)?;
+        if line.len() > 1024 {
+            bail!("Machine selection is too long");
+        }
+        if line.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8(line)?.trim().to_owned()))
+    }
+
+    fn open_board(&mut self, node: &ClientNode) -> Result<i32> {
+        let arguments = board_ssh_arguments(node)?;
+        let status = Command::new("ssh.exe").args(arguments)
+            .stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit())
+            .status().context("Cannot start SSH. Check that `ssh` works in this PowerShell window, then run `pika` again.")?;
+        if status.code() == Some(255) {
+            bail!(
+                "SSH could not open the board. See its message above. If the forwarding port is in use, close your other Pika board connection to this machine and run `pika` again. No agents were stopped."
+            );
+        }
+        Ok(status.code().unwrap_or(1))
+    }
+
     fn load_config(&mut self) -> Result<ClientConfig> {
         load_client_config(&self.config_path).map_err(Into::into)
     }
@@ -182,7 +236,15 @@ impl ClientCliRuntime for SystemClientRuntime {
         }
         let mut command = Command::new(ssh_executable);
         command
-            .args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
+            .args([
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=8",
+                "-o",
+                "ClearAllForwardings=yes",
+            ])
             .arg(target)
             .arg("pika")
             .args(remote_arguments)
@@ -406,8 +468,12 @@ where
 {
     let cli = WindowsClientCli::try_parse_from(args)?;
     match cli.command {
+        None if runtime.interactive() => home(runtime, output, false),
         None | Some(WindowsClientCommand::Status) => status(runtime, output),
-        Some(WindowsClientCommand::Setup(arguments)) => setup(runtime, output, arguments),
+        Some(WindowsClientCommand::Setup(arguments)) if arguments.ssh_target.is_none() => {
+            home(runtime, output, true)
+        }
+        Some(WindowsClientCommand::Setup(arguments)) => setup(runtime, output, arguments, false),
         Some(WindowsClientCommand::Bridge(arguments)) => match arguments.command {
             None | Some(ClientBridgeCommand::Status) => status(runtime, output),
             Some(ClientBridgeCommand::Serve(options)) => {
@@ -427,6 +493,183 @@ where
             }
         },
     }
+}
+
+fn home<R: ClientCliRuntime, W: Write>(
+    runtime: &mut R,
+    output: &mut W,
+    choose: bool,
+) -> Result<i32> {
+    if !runtime.interactive() {
+        bail!(
+            "Run `pika setup` in an interactive PowerShell window, or use `pika setup SSH_HOST`."
+        );
+    }
+    let mut config = runtime.load_config()?;
+    let remembered = config
+        .default_node_id
+        .as_ref()
+        .and_then(|id| config.nodes.get(id))
+        .cloned()
+        .or_else(|| {
+            (config.nodes.len() == 1).then(|| config.nodes.values().next().unwrap().clone())
+        });
+    let node = if let Some(node) = remembered.filter(|_| !choose) {
+        node
+    } else {
+        let mut targets = config
+            .nodes
+            .values()
+            .map(|node| node.ssh_target.clone())
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|target| target.to_lowercase());
+        for target in runtime.discover_hosts()? {
+            if validate_client_ssh_target(&target).is_ok()
+                && !targets
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&target))
+            {
+                targets.push(target);
+            }
+        }
+        writeln!(
+            output,
+            "Where is your Pika board?\nIts threads and selected servers appear together. Only this host is contacted for pairing."
+        )?;
+        for (index, target) in targets.iter().enumerate() {
+            let paired = if config.nodes.values().any(|node| node.ssh_target == *target) {
+                " · paired"
+            } else {
+                ""
+            };
+            writeln!(output, "  {}. {target}{paired}", index + 1)?;
+        }
+        let target = loop {
+            write!(output, "Machine number or SSH host (Enter to cancel): ")?;
+            output.flush()?;
+            let Some(choice) = runtime.read_choice()?.filter(|value| !value.is_empty()) else {
+                return Ok(0);
+            };
+            if let Ok(number) = choice.parse::<usize>() {
+                if let Some(target) = number.checked_sub(1).and_then(|index| targets.get(index)) {
+                    break target.clone();
+                }
+            } else if validate_client_ssh_target(&choice).is_ok() {
+                break choice;
+            }
+            writeln!(output, "Choose a listed number or an SSH host name.")?;
+        };
+        if let Some(node) = config
+            .nodes
+            .values()
+            .find(|node| node.ssh_target == target)
+            .cloned()
+        {
+            node
+        } else {
+            setup(
+                runtime,
+                output,
+                ClientSetupArgs {
+                    ssh_target: Some(target.clone()),
+                    alias: None,
+                    ssh_executable: "ssh.exe".into(),
+                    remote_port: crate::client_bridge::DEFAULT_REMOTE_PORT,
+                    no_start: true,
+                },
+                true,
+            )?;
+            config = runtime.load_config()?;
+            config
+                .nodes
+                .values()
+                .find(|node| node.ssh_target == target)
+                .cloned()
+                .context("Pairing was not saved")?
+        }
+    };
+    // Revalidate before starting a bridge or remembering a changed selection.
+    // The remote board checks this UUID again on its actual SSH connection.
+    let hello = runtime.ssh_json(&node.ssh_target, &["_fleet".into(), "--stdio".into()],
+        &json!({"op":"hello", "protocol":FLEET_PROTOCOL, "version":FLEET_VERSION}),
+        "ssh.exe", Duration::from_secs(20))
+        .with_context(|| format!("Cannot reach {}. Check `ssh {}` connects and Pika is installed there, then run `pika` again", node.ssh_target, node.ssh_target))?;
+    if validate_pairing_hello(&hello)?.node_id != node.node_id {
+        bail!(
+            "Machine identity changed for {}. Pika has not opened another machine or replaced your pairing.",
+            node.ssh_target
+        );
+    }
+    require_board_capability(&hello, &node.ssh_target)?;
+    if config.default_node_id.as_deref() != Some(node.node_id.as_str()) || !node.allow_fleet_relay {
+        config.default_node_id = Some(node.node_id.clone());
+        config
+            .nodes
+            .get_mut(&node.node_id)
+            .context("Board machine pairing disappeared")?
+            .allow_fleet_relay = true;
+        runtime.save_config(&config)?;
+    }
+    start_bridge(runtime, output, &ClientBridgeOptions::default())?;
+    writeln!(
+        output,
+        "Opening {} · threads across all its selected servers · close the board to return here",
+        node.alias
+    )?;
+    output.flush()?;
+    runtime.open_board(&node)
+}
+
+fn require_board_capability(hello: &Value, target: &str) -> Result<()> {
+    if !hello
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value == "client-board-v1"))
+    {
+        bail!(
+            "Pika on {target} needs an update. Run `ssh {target} pika update`, then run `pika` here again."
+        );
+    }
+    Ok(())
+}
+
+/// No caller-supplied shell text; the host checks its UUID on this connection.
+pub fn board_ssh_arguments(node: &ClientNode) -> Result<Vec<String>> {
+    validate_client_ssh_target(&node.ssh_target)?;
+    if uuid::Uuid::parse_str(&node.node_id).is_err() {
+        bail!("Invalid board machine identity");
+    }
+    let port = node
+        .remote_port
+        .unwrap_or(crate::client_bridge::DEFAULT_REMOTE_PORT);
+    if port < 1024 {
+        bail!("Invalid reverse bridge port");
+    }
+    Ok(vec![
+        "-tt".into(),
+        "-S".into(),
+        "none".into(),
+        "-o".into(),
+        "ControlMaster=no".into(),
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=8".into(),
+        "-o".into(),
+        "ServerAliveInterval=15".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
+        "-R".into(),
+        format!(
+            "127.0.0.1:{port}:127.0.0.1:{}",
+            crate::client_bridge::DEFAULT_LOCAL_PORT
+        ),
+        node.ssh_target.clone(),
+        "pika".into(),
+        "_client-board".into(),
+        "--expected-node-id".into(),
+        node.node_id.clone(),
+    ])
 }
 
 fn status<R: ClientCliRuntime, W: Write>(runtime: &mut R, output: &mut W) -> Result<i32> {
@@ -454,11 +697,14 @@ fn status<R: ClientCliRuntime, W: Write>(runtime: &mut R, output: &mut W) -> Res
         )?;
     }
     if config.nodes.is_empty() {
-        writeln!(output, "Pair one with `pika setup SSH_HOST`.")?;
+        writeln!(
+            output,
+            "Run `pika` in an interactive terminal to choose your machine."
+        )?;
     } else {
         writeln!(
             output,
-            "Start local window routing with `pika bridge start`."
+            "Run `pika` to open your board. Use `pika setup` to choose another machine."
         )?;
     }
     writeln!(
@@ -472,8 +718,13 @@ fn setup<R: ClientCliRuntime, W: Write>(
     runtime: &mut R,
     output: &mut W,
     arguments: ClientSetupArgs,
+    opening: bool,
 ) -> Result<i32> {
-    validate_client_ssh_target(&arguments.ssh_target)?;
+    let ssh_target = arguments
+        .ssh_target
+        .as_deref()
+        .context("Choose a machine with `pika`")?;
+    validate_client_ssh_target(ssh_target)?;
     if arguments.remote_port < 1024 {
         bail!("Reverse bridge port must be between 1024 and 65535");
     }
@@ -484,13 +735,17 @@ fn setup<R: ClientCliRuntime, W: Write>(
         "version": FLEET_VERSION,
     });
     let hello = runtime.ssh_json(
-        &arguments.ssh_target,
+        ssh_target,
         &["_fleet".to_owned(), "--stdio".to_owned()],
         &hello_request,
         &arguments.ssh_executable,
         Duration::from_secs(20),
     )?;
-    let hello = validate_pairing_hello(&hello)?;
+    let validated = validate_pairing_hello(&hello)?;
+    if opening {
+        require_board_capability(&hello, ssh_target)?;
+    }
+    let hello = validated;
     let token = runtime.pairing_token()?;
     let pair = make_pair_request(
         &hello.node_id,
@@ -501,7 +756,7 @@ fn setup<R: ClientCliRuntime, W: Write>(
     )?;
     let pair_value = serde_json::to_value(&pair)?;
     let receipt = runtime.ssh_json(
-        &arguments.ssh_target,
+        ssh_target,
         &["_client-pair".to_owned(), "--stdio".to_owned()],
         &pair_value,
         &arguments.ssh_executable,
@@ -511,11 +766,12 @@ fn setup<R: ClientCliRuntime, W: Write>(
         &mut config,
         &hello.node_id,
         arguments.alias.as_deref().unwrap_or(&hello.machine),
-        &arguments.ssh_target,
+        ssh_target,
         &token,
         arguments.remote_port,
         &receipt,
     )?;
+    config.default_node_id = Some(hello.node_id.clone());
     runtime.save_config(&config)?;
     let node = &config.nodes[&hello.node_id];
     writeln!(
@@ -524,12 +780,6 @@ fn setup<R: ClientCliRuntime, W: Write>(
         node.alias,
         &node.node_id[..8]
     )?;
-    writeln!(
-        output,
-        "\nAdd this to the matching Host block in your local SSH config:\n  RemoteForward 127.0.0.1:{} 127.0.0.1:{}",
-        arguments.remote_port,
-        crate::client_bridge::DEFAULT_LOCAL_PORT
-    )?;
     if !arguments.no_start {
         let options = ClientBridgeOptions {
             ssh_executable: arguments.ssh_executable,
@@ -537,10 +787,12 @@ fn setup<R: ClientCliRuntime, W: Write>(
         };
         start_bridge(runtime, output, &options)?;
     }
-    writeln!(
-        output,
-        "Reconnect SSH after adding the forward. Enter on the remote board will launch an exact local Windows Terminal window; the bridge does not confirm the later attach."
-    )?;
+    if !opening {
+        writeln!(
+            output,
+            "Run `pika` to open your board. The connection and local window routing are automatic."
+        )?;
+    }
     Ok(0)
 }
 

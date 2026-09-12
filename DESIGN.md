@@ -165,6 +165,22 @@ the monitor itself remains open.
 Server federation adds no daemon and no listener. The optional laptop
 new-window bridge is a separate client-side process bound only to loopback; it
 is reached from a paired server solely through the user's reverse SSH forward.
+On Windows, interactive bare `pika` owns that SSH connection and its forward:
+first run offers passive SSH-config discovery and manual host entry, contacts
+only the chosen host, pairs it, and remembers its immutable node UUID. Later
+launches revalidate that node, reuse or start the loopback bridge, and open the
+remote board through an identity-checked endpoint. `pika setup` changes the
+selection; redirected bare output and `pika status` remain finite and read-only.
+Pika does not edit SSH configuration, bypass SSH authentication, auto-upgrade a
+host, or terminate an existing connection when its forwarding port is occupied.
+The selected board is its normal federated board, not a host-only inventory.
+Windows marks that locally selected coordinator as allowed to relay fleet opens.
+A destination paired directly on Windows uses its local SSH mapping; otherwise,
+the client launches only the trusted coordinator with exact destination and
+conversation UUID arguments. The coordinator requires an existing trusted fleet
+entry and exact cached row, then uses the normal fresh, UUID-checked attach path.
+Legacy pairings do not implicitly acquire relay permission until selected as a
+board. A bridge request cannot grant this permission or supply a new SSH target.
 Passive discovery reads existing SSH
 configuration and Tailscale's local status document without probing candidates.
 The monitor's local two-second reconciliation never performs SSH. It keeps at
@@ -220,8 +236,9 @@ The optional client bridge is intentionally narrower than fleet federation:
   per-node secret on both ends;
 - requests contain source node UUID, target node UUID, provider, and exact
   conversation UUID, never a display name or command string;
-- the client maps the target UUID to its own trusted SSH target and constructs
-  `wt.exe` plus `_fleet-open` arguments locally;
+- the client maps a paired target UUID to its own trusted SSH target, or uses
+  its locally selected coordinator's fleet relay, and constructs `wt.exe` and
+  fixed internal endpoint arguments locally;
 - spawned attaches clear inherited SSH forwards, leaving the dashboard
   connection as the sole owner of its reverse bridge port;
 - `_fleet-open` revalidates the target node UUID and tracked conversation;

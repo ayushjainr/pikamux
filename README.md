@@ -47,10 +47,11 @@ Use the Windows client to open agents running on a Mac or Linux host. In PowerSh
 
 ```powershell
 irm https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.ps1 | iex
-pika setup YOUR_SSH_HOST
+pika
 ```
 
-Replace `YOUR_SSH_HOST` with a host you already connect to over SSH.
+Choose where your Pika board lives once. Pika remembers it and shows threads
+across all servers configured on that board, not just that machine.
 The native client is experimental; local agent hosting requires WSL.
 See [Windows setup](docs/installing.md#windows).
 

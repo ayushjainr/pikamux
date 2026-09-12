@@ -232,6 +232,115 @@ fn terminal_command_is_argv_only_and_pins_node_provider_and_conversation() {
 }
 
 #[test]
+fn chosen_board_routes_multiple_unpaired_servers_through_its_trusted_ssh_target() {
+    let (client_id, source_id, target_id, session_id) = ids();
+    let mut config = config(&client_id, &source_id, &target_id);
+    config.nodes.remove(&target_id);
+    config.nodes.get_mut(&source_id).unwrap().allow_fleet_relay = true;
+    let launcher = FakeLauncher::default();
+    let launched = launcher.launched.clone();
+    let mut bridge =
+        ClientLaunchBridge::new(config.clone(), launcher, "wt.exe", "ssh.exe").unwrap();
+    for target in [&target_id, &Uuid::new_v4().to_string()] {
+        let request = make_launch_request(
+            &client_id,
+            SOURCE_TOKEN,
+            &source_id,
+            target,
+            Provider::Codex,
+            &session_id,
+            None,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&request).unwrap();
+        let receipt = bridge.handle(&value).unwrap();
+        assert_eq!(receipt["target_node_id"], *target);
+        assert_eq!(
+            bridge.handle(&value).unwrap(),
+            receipt,
+            "relay receipt is deduplicated"
+        );
+        let commands = launched.lock().unwrap();
+        let args = commands.last().unwrap();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--expected-node-id", &source_id])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--target-node-id", target])
+        );
+        assert!(args.contains(&"developer@devbox".into()));
+        assert!(args.contains(&"_client-fleet-open".into()));
+        assert!(args.contains(&session_id));
+        assert!(!args.iter().any(|arg| arg.contains(SOURCE_TOKEN)));
+    }
+    assert_eq!(launched.lock().unwrap().len(), 2);
+    config.nodes.get_mut(&source_id).unwrap().allow_fleet_relay = false;
+    bridge.reload(config).unwrap();
+    let request = make_launch_request(
+        &client_id,
+        SOURCE_TOKEN,
+        &source_id,
+        &target_id,
+        Provider::Codex,
+        &session_id,
+        None,
+    )
+    .unwrap();
+    assert!(
+        bridge
+            .handle(&serde_json::to_value(request).unwrap())
+            .is_err()
+    );
+    assert_eq!(
+        launched.lock().unwrap().len(),
+        2,
+        "revoked relay does not launch"
+    );
+}
+
+#[test]
+fn fleet_relay_still_authenticates_source_and_rejects_injected_targets() {
+    let (client_id, source_id, target_id, session_id) = ids();
+    let mut config = config(&client_id, &source_id, &target_id);
+    config.nodes.remove(&target_id);
+    config.nodes.get_mut(&source_id).unwrap().allow_fleet_relay = true;
+    let launcher = FakeLauncher::default();
+    let launched = launcher.launched.clone();
+    let mut bridge = ClientLaunchBridge::new(config, launcher, "wt.exe", "ssh.exe").unwrap();
+    let request = make_launch_request(
+        &client_id,
+        TARGET_TOKEN,
+        &source_id,
+        &target_id,
+        Provider::Codex,
+        &session_id,
+        None,
+    )
+    .unwrap();
+    assert!(
+        bridge
+            .handle(&serde_json::to_value(request).unwrap())
+            .is_err()
+    );
+    let request = make_launch_request(
+        &client_id,
+        SOURCE_TOKEN,
+        &source_id,
+        &target_id,
+        Provider::Codex,
+        &session_id,
+        None,
+    )
+    .unwrap();
+    let mut value = serde_json::to_value(request).unwrap();
+    value["target_node_id"] = json!("target; execute-something");
+    assert!(bridge.handle(&value).is_err());
+    assert!(launched.lock().unwrap().is_empty());
+}
+
+#[test]
 fn authenticated_launch_is_deduplicated_and_request_id_is_identity_bound() {
     let (client_id, source_id, target_id, session_id) = ids();
     let launcher = FakeLauncher::default();

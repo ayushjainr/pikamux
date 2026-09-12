@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.6 — One Windows command, your whole fleet
+
+- Open the remote board directly from `pika` on Windows. Choose an SSH host
+  once; Pika remembers it and manages pairing, local window routing, and the
+  board connection without SSH configuration edits.
+- Revalidate the selected machine on the actual board connection. Preserve
+  existing connections and fail visibly on forwarding conflicts or changed
+  identities.
+- Keep the Windows board's full fleet visible and open destinations through
+  its trusted board host without requiring separate Windows pairing per server.
+- Keep the Windows board connection open after launching a conversation.
+
 ## 0.6.5 — Pika in Rust
 
 - Ship a small native executable for macOS and Linux, with prebuilt downloads
