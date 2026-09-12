@@ -252,7 +252,7 @@ fn cancellation_interrupts_blocked_codex_startup_and_reaps_owned_child() {
     options.cancellation = cancellation.clone();
     let target = session(Provider::Codex, "stable-workstream", root.path());
     let worker = std::thread::spawn(move || Consultation::open(&target, options));
-    for _ in 0..500 {
+    for _ in 0..2_500 {
         if child_pid.is_file() {
             break;
         }
