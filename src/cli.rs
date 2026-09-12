@@ -11,7 +11,7 @@ use crate::{
         NodeCandidate, SshTransport,
     },
     hooks::{self, HookContext},
-    model::{Provider, Session, Status},
+    model::{Provider, Session},
     monitor::{
         self, BoardAction, BoardItem, ConsultationDriver, ConsultationEvent, ConsultationInput,
         ConsultationOutcome, ExpertAnnotation,
@@ -24,7 +24,7 @@ use crate::{
     setup_preview, skill,
     store::{Store, StoreChangeWatcher},
     terminal::{self, Palette},
-    update::{self, InstallRequest, ReleaseManifest, UpdateRequest},
+    update::{self, InstallRequest, UpdateRequest},
     usage, wait as wait_contract,
 };
 use anyhow::{Context, Result, bail};
@@ -616,10 +616,11 @@ fn bare(pika: &Pika) -> Result<i32> {
     }
     // Paint all bounded durable state immediately, including offline fleet
     // rows. No provider, process, tmux, or SSH observation belongs here.
-    let cached = board_items(pika)?;
+    let (cached, initial_fleet_health) = board_items(pika)?;
     // At most one unpublished snapshot is useful: the board always wants the
     // newest complete observation, never a backlog of stale inventories.
     let (sender, receiver) = monitor::latest_channel();
+    let (fleet_health_sender, fleet_health_receiver) = monitor::latest_channel();
     let (refresh_sender, refresh_receiver) = mpsc::sync_channel(1);
     let stop = Arc::new(AtomicBool::new(false));
     let local_refresh_delayed = Arc::new(AtomicBool::new(false));
@@ -642,17 +643,19 @@ fn bare(pika: &Pika) -> Result<i32> {
                     record_local_refresh_result(&mut consecutive_failures, refresh.is_ok()),
                     Ordering::Relaxed,
                 );
-                if let Ok(items) = refresh {
+                if let Ok((items, fleet_health)) = refresh {
                     local_sender.publish(items);
+                    fleet_health_sender.publish(fleet_health);
                     // Never consume a coalesced reconcile/hook commit without
                     // re-reading the cache. If this creates the first watcher,
                     // the read also closes the database-creation race window.
-                    if let Some(items) =
+                    if let Some((items, fleet_health)) =
                         snapshot_after_store_change(&worker.store, &mut store_changes, || {
                             board_items(&worker)
                         })
                     {
                         local_sender.publish(items);
+                        fleet_health_sender.publish(fleet_health);
                     }
                 }
                 // Hooks and store notifications carry normal lifecycle changes
@@ -666,12 +669,13 @@ fn bare(pika: &Pika) -> Result<i32> {
             match refresh_receiver.recv_timeout(wait) {
                 Ok(()) => next_reconcile = Instant::now(),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(items) =
+                    if let Some((items, fleet_health)) =
                         snapshot_after_store_change(&worker.store, &mut store_changes, || {
                             board_items(&worker)
                         })
                     {
                         local_sender.publish(items);
+                        fleet_health_sender.publish(fleet_health);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -738,6 +742,7 @@ fn bare(pika: &Pika) -> Result<i32> {
         update_receiver,
         refresh_sender.clone(),
         local_refresh_delayed,
+        monitor::FleetHealthFeed::new(initial_fleet_health, fleet_health_receiver),
     );
     // Once the board has returned an action, no observation that began for its
     // old frame may write identity state after that action. The fence waits
@@ -897,14 +902,14 @@ fn finish_board_observer(
     }
 }
 
-fn board_items(pika: &Pika) -> Result<Vec<BoardItem>> {
+fn board_items(pika: &Pika) -> Result<(Vec<BoardItem>, Vec<String>)> {
     board_items_from_inventory(pika, pika.cached_inventory()?)
 }
 
 fn board_items_from_inventory(
     pika: &Pika,
     inventory: crate::core::Inventory,
-) -> Result<Vec<BoardItem>> {
+) -> Result<(Vec<BoardItem>, Vec<String>)> {
     let mut inventory = inventory;
     let _ = usage::hydrate_cached_sessions(&pika.store, &mut inventory.sessions);
     let profiles = pika
@@ -945,16 +950,19 @@ fn board_items_from_inventory(
         pending_token: Some(pending.launch_token),
         expert: None,
     }));
+    let mut fleet_health = Vec::new();
     append_cached_fleet(
         &mut items,
+        &mut fleet_health,
         FleetManager::new(&pika.store, SshTransport::default())
             .cached_sessions_with_notices(None, false),
     );
-    Ok(items)
+    Ok((items, fleet_health))
 }
 
 fn append_cached_fleet(
     items: &mut Vec<BoardItem>,
+    health: &mut Vec<String>,
     cached: std::result::Result<fleet::CachedFleetSessions, fleet::FleetError>,
 ) {
     match cached {
@@ -974,99 +982,15 @@ fn append_cached_fleet(
                     }),
                 });
             }
-            items.extend(cached.notices.iter().map(fleet_cache_truncation_notice));
+            health.extend(
+                cached
+                    .notices
+                    .into_iter()
+                    .map(|notice| format!("{} · {}", notice.node_name, notice.message)),
+            );
         }
-        Err(error) => items.push(fleet_cache_notice(&error)),
+        Err(error) => health.push(error.message),
     }
-}
-
-const FLEET_CACHE_NOTICE_SOURCE: &str = "fleet-cache-safety-notice";
-
-fn fleet_cache_notice(error: &fleet::FleetError) -> BoardItem {
-    BoardItem::local(Session {
-        provider: Provider::Codex,
-        session_id: "fleet-cache-safety-limit".into(),
-        name: Some("Fleet cache unavailable".into()),
-        cwd: None,
-        branch: None,
-        transcript_path: None,
-        tmux_session: None,
-        tmux_pane: None,
-        root_pid: None,
-        status: Status::Error,
-        unread: true,
-        model: None,
-        source: FLEET_CACHE_NOTICE_SOURCE.into(),
-        managed: false,
-        error: Some(error.message.clone()),
-        attention_reason: Some("cached fleet exceeded a safety limit".into()),
-        created_at: now(),
-        updated_at: now(),
-        last_event_at: now(),
-        last_activity_at: now(),
-        live: false,
-        attached: false,
-        home_state: "unavailable".into(),
-        cpu_percent: None,
-        rss_kb: None,
-        input_tokens: None,
-        output_tokens: None,
-        cached_input_tokens: None,
-        cache_write_tokens: None,
-        total_tokens: None,
-        estimated_cost_usd: None,
-        active_thread_id: None,
-    })
-}
-
-fn fleet_cache_truncation_notice(notice: &fleet::FleetCacheNotice) -> BoardItem {
-    BoardItem::local(Session {
-        provider: Provider::Codex,
-        session_id: format!("fleet-cache-truncated:{}:{}", notice.node_id, notice.kind),
-        name: Some(format!("{} cache limited", notice.node_name)),
-        cwd: None,
-        branch: None,
-        transcript_path: None,
-        tmux_session: None,
-        tmux_pane: None,
-        root_pid: None,
-        status: Status::Parked,
-        unread: false,
-        model: None,
-        source: FLEET_CACHE_NOTICE_SOURCE.into(),
-        managed: false,
-        error: Some(notice.message.clone()),
-        attention_reason: None,
-        created_at: now(),
-        updated_at: now(),
-        last_event_at: now(),
-        last_activity_at: now(),
-        live: false,
-        attached: false,
-        home_state: "unavailable".into(),
-        cpu_percent: None,
-        rss_kb: None,
-        input_tokens: None,
-        output_tokens: None,
-        cached_input_tokens: None,
-        cache_write_tokens: None,
-        total_tokens: None,
-        estimated_cost_usd: None,
-        active_thread_id: None,
-    })
-}
-
-fn reject_fleet_cache_notice(item: &BoardItem) -> Result<()> {
-    if item.session.source == FLEET_CACHE_NOTICE_SOURCE {
-        bail!(
-            "{}",
-            item.session
-                .error
-                .as_deref()
-                .unwrap_or("Cached fleet is unavailable")
-        );
-    }
-    Ok(())
 }
 
 fn exact_remote(pika: &Pika, item: &BoardItem) -> Result<fleet::FleetSession> {
@@ -1086,7 +1010,6 @@ fn exact_remote(pika: &Pika, item: &BoardItem) -> Result<fleet::FleetSession> {
 }
 
 fn open_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
-    reject_fleet_cache_notice(&item)?;
     if let Some(token) = item.pending_token.as_deref() {
         let receipt = pika.open_pending(token, true)?;
         return finish_local_open(pika, &receipt);
@@ -1209,7 +1132,6 @@ fn maybe_open_client_window(
 }
 
 fn peek_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
-    reject_fleet_cache_notice(&item)?;
     if item.pending_token.is_some() {
         bail!("This conversation is still starting; open it to see provider output.")
     }
@@ -1227,7 +1149,6 @@ fn peek_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
 }
 
 fn untrack_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
-    reject_fleet_cache_notice(&item)?;
     if item.pending_token.is_some() {
         bail!("A starting conversation cannot be unwatched until its exact identity is known.")
     }
@@ -1246,7 +1167,6 @@ fn untrack_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
 }
 
 fn ask_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
-    reject_fleet_cache_notice(&item)?;
     if item.node_id.is_some() {
         return ask_remote(
             pika,
@@ -1265,7 +1185,6 @@ fn ask_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
 
 fn board_consultation_driver(pika: Pika) -> ConsultationDriver {
     ConsultationDriver::new(move |io| {
-        reject_fleet_cache_notice(&io.item)?;
         if io.item.pending_token.is_some() {
             bail!("the conversation is still starting")
         }
@@ -1777,7 +1696,33 @@ fn open_name(pika: &Pika, name: &str, allow_create: bool) -> Result<i32> {
 
 fn finish_local_open(pika: &Pika, receipt: &crate::core::OpenReceipt) -> Result<i32> {
     let _ = pika;
+    if receipt.exit_code == 0 && std::env::var_os("TMUX").is_none() {
+        let name = match &receipt.target {
+            crate::core::OpenTarget::Session(session) => session.display_name(),
+            crate::core::OpenTarget::Pending(pending) => pending.name.clone(),
+        };
+        println!("{}", return_guidance(&name));
+    }
     Ok(receipt.exit_code)
+}
+
+fn return_guidance(name: &str) -> String {
+    let display = name
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(120)
+        .collect::<String>();
+    format!(
+        "Left {} running in Pika tmux · return with: pika {}",
+        display.trim(),
+        shell_words::quote(name)
+    )
 }
 
 fn choose_session(mut sessions: Vec<Session>, prompt: &str) -> Result<Session> {
@@ -3252,15 +3197,19 @@ fn terminal_bridge(a: TerminalBridgeArgs) -> Result<i32> {
     )
 }
 fn install_native(a: InstallNativeArgs) -> Result<i32> {
-    let manifest = ReleaseManifest::parse(&fs::read(&a.manifest)?)?;
-    let outcome = update::install_staged(InstallRequest {
+    update::verify_running_install_candidate(&a.candidate)?;
+    let manifest = update::read_release_manifest(&a.manifest)?;
+    let outcome = match update::install_staged(InstallRequest {
         manifest: &manifest,
         target: &a.target,
         artifact: &a.artifact,
         candidate: &a.candidate,
         root: &a.root,
         bin_dir: &a.bin_dir,
-    })?;
+    }) {
+        Err(update::UpdateError::Interrupted(code)) => return Ok(code),
+        result => result?,
+    };
     println!(
         "Pika {} · {}",
         if outcome.activated {
@@ -3283,16 +3232,22 @@ fn update_command(a: UpdateArgs) -> Result<i32> {
             bail!("use --rollback by itself or with one retained VERSION");
         }
         let outcome =
-            update::rollback_managed(&executable, (!version.is_empty()).then_some(version))?;
+            match update::rollback_managed(&executable, (!version.is_empty()).then_some(version)) {
+                Err(update::UpdateError::Interrupted(code)) => return Ok(code),
+                result => result?,
+            };
         println!("{}", outcome.message());
         return Ok(0);
     }
-    let outcome = update::update_managed(UpdateRequest {
+    let outcome = match update::update_managed(UpdateRequest {
         executable: &executable,
         bundle: a.bundle.as_deref(),
         release: a.release.as_deref(),
         check: a.check,
-    })?;
+    }) {
+        Err(update::UpdateError::Interrupted(code)) => return Ok(code),
+        result => result?,
+    };
     println!("{}", outcome.message());
     Ok(0)
 }
@@ -5682,35 +5637,30 @@ done
         let root = tempfile::tempdir().unwrap();
         let local = BoardItem::local(fixture_session(root.path()));
         let mut items = vec![local.clone()];
+        let mut health = Vec::new();
         append_cached_fleet(
             &mut items,
+            &mut health,
             Err(fleet::FleetError::new(
                 FleetErrorKind::Incompatible,
                 "Cached fleet exceeds the 8000-row board safety limit",
             )),
         );
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 1);
         assert_eq!(items[0], local);
-        assert_eq!(items[1].session.source, FLEET_CACHE_NOTICE_SOURCE);
-        assert_eq!(items[1].session.status, Status::Error);
-        assert!(
-            items[1]
-                .session
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("safety limit")
-        );
-        assert!(reject_fleet_cache_notice(&items[1]).is_err());
+        assert_eq!(health.len(), 1);
+        assert!(health[0].contains("safety limit"));
     }
 
     #[test]
-    fn scoped_fleet_truncation_notice_is_parked_and_non_actionable() {
+    fn scoped_fleet_truncation_is_health_not_a_conversation() {
         let root = tempfile::tempdir().unwrap();
         let local = BoardItem::local(fixture_session(root.path()));
         let mut items = vec![local.clone()];
+        let mut health = Vec::new();
         append_cached_fleet(
             &mut items,
+            &mut health,
             Ok(fleet::CachedFleetSessions {
                 sessions: Vec::new(),
                 notices: vec![fleet::FleetCacheNotice {
@@ -5722,16 +5672,20 @@ done
                 }],
             }),
         );
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 1);
         assert_eq!(items[0], local);
         assert_eq!(
-            items[1].session.name.as_deref(),
-            Some("atlas cache limited")
+            health,
+            vec!["atlas · 3 cached conversations on atlas not shown"]
         );
-        assert_eq!(items[1].session.status, Status::Parked);
-        assert!(!items[1].session.unread);
-        assert_eq!(items[1].session.source, FLEET_CACHE_NOTICE_SOURCE);
-        assert!(reject_fleet_cache_notice(&items[1]).is_err());
+    }
+
+    #[test]
+    fn return_guidance_is_exact_and_shell_safe() {
+        assert_eq!(
+            return_guidance("strategy dashboard's review"),
+            "Left strategy dashboard's review running in Pika tmux · return with: pika 'strategy dashboard'\\''s review'"
+        );
     }
 
     #[test]

@@ -9,9 +9,7 @@ use std::{
     ffi::OsStr,
     io::Read,
     process::{Command, Output, Stdio},
-    sync::{
-        Arc, Mutex, mpsc,
-    },
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -259,25 +257,21 @@ impl Tmux {
     fn attached_client_name(&self, client_pid: i32, pane_id: &str) -> Option<String> {
         let format = format!("#{{client_name}}{SEPARATOR}#{{client_pid}}{SEPARATOR}#{{pane_id}}");
         let output = self.output(["list-clients", "-F", &format], false).ok()?;
-        output
-            .status
-            .success()
-            .then_some(())
-            .and_then(|_| {
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .find_map(|line| {
-                        let mut fields = line.split(SEPARATOR);
-                        let client = fields.next()?;
-                        let pid = fields.next()?;
-                        let pane = fields.next()?;
-                        (fields.next().is_none()
-                            && !client.is_empty()
-                            && pid.parse::<i32>() == Ok(client_pid)
-                            && pane == pane_id)
-                            .then(|| client.to_owned())
-                    })
-            })
+        output.status.success().then_some(()).and_then(|_| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| {
+                    let mut fields = line.split(SEPARATOR);
+                    let client = fields.next()?;
+                    let pid = fields.next()?;
+                    let pane = fields.next()?;
+                    (fields.next().is_none()
+                        && !client.is_empty()
+                        && pid.parse::<i32>() == Ok(client_pid)
+                        && pane == pane_id)
+                        .then(|| client.to_owned())
+                })
+        })
     }
 
     pub fn configure_home(&self, session: &str, pane: Option<&str>) -> Result<()> {
@@ -596,10 +590,17 @@ impl Tmux {
                     if let Some(client) = client {
                         *proof_client.lock().expect("tmux client proof poisoned") = Some(client);
                         true
+                    } else if wants_receipt {
+                        // PID + pane proves the handoff for legacy adapters, but
+                        // it cannot identify the one tmux client allowed to see
+                        // a receipt. Wait for the stronger proof instead of
+                        // consuming the callback in the startup race between
+                        // those two observations.
+                        false
                     } else {
                         // Compatibility for older/fake tmux adapters that
                         // prove only PID + pane. Real tmux supplies the client
-                        // name above, which is required for targeted display.
+                        // name above.
                         self.client_is_attached_to_pane(client_pid, &pane.pane_id)
                     }
                 },
@@ -1501,7 +1502,7 @@ mod tests {
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\ncase \"$1\" in\n  list-clients) if test -f {pid}; then printf '%s\\t%%1\\n' \"$(cat {pid})\"; fi; exit 0;;\nesac\ncase \"$*\" in\n  *attach-session*) printf '%s' \"$$\" > {pid}; n=0; while test ! -f {release} && test \"$n\" -lt 200; do n=$((n + 1)); sleep 0.01; done; test -f {release};;\n  *) exit 0;;\nesac\n",
+                "#!/bin/sh\ncase \"$1\" in\n  list-clients) if test -f {pid}; then printf '%s\\t%%1\\n' \"$(cat {pid})\"; fi; exit 0;;\nesac\ncase \"$*\" in\n  *attach-session*) printf '%s' \"$$\" > {pid}; n=0; while test ! -f {release} && test \"$n\" -lt 1000; do n=$((n + 1)); sleep 0.01; done; test -f {release};;\n  *) exit 0;;\nesac\n",
                 pid = shell_words::quote(&pid_file.to_string_lossy()),
                 release = shell_words::quote(&release.to_string_lossy()),
             ),
@@ -1565,11 +1566,7 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("identity changed"));
-        assert!(
-            !fs::read_to_string(trace)
-                .unwrap()
-                .contains("-d 3000 -l")
-        );
+        assert!(!fs::read_to_string(trace).unwrap().contains("-d 3000 -l"));
     }
 
     #[cfg(unix)]
@@ -1584,7 +1581,7 @@ mod tests {
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {trace}\ncase \"$*\" in\n  *'list-clients -F #{{client_name}}'*) test -f {pid} && printf 'other\\037999\\037%%2\\ninvoking-client\\037%s\\037%%1\\n' \"$(cat {pid})\"; exit 0;;\n  *'list-clients -F #{{client_pid}}'*) test -f {pid} && printf '%s\\t%%1\\n' \"$(cat {pid})\"; exit 0;;\n  *'display-message -c invoking-client -d 3000 -l exact receipt'*) test -f {proof} || printf '%s\\n' BEFORE_PROOF >> {trace}; touch {release}; exit 0;;\n  *attach-session*) printf '%s' \"$$\" > {pid}; n=0; while test ! -f {release} && test \"$n\" -lt 200; do n=$((n + 1)); sleep 0.01; done; test -f {release}; exit;;\nesac\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {trace}\ncase \"$*\" in\n  *'list-clients -F #{{client_name}}'*) test -f {pid} && printf 'other\\037999\\037%%2\\ninvoking-client\\037%s\\037%%1\\n' \"$(cat {pid})\"; exit 0;;\n  *'list-clients -F #{{client_pid}}'*) test -f {pid} && printf '%s\\t%%1\\n' \"$(cat {pid})\"; exit 0;;\n  *'display-message -c invoking-client -d 3000 -l exact receipt'*) test -f {proof} || printf '%s\\n' BEFORE_PROOF >> {trace}; touch {release}; exit 0;;\n  *attach-session*) printf '%s' \"$$\" > {pid}; n=0; while test ! -f {release} && test \"$n\" -lt 1000; do n=$((n + 1)); sleep 0.01; done; test -f {release}; exit;;\nesac\nexit 0\n",
                 trace = shell_words::quote(&trace.to_string_lossy()),
                 pid = shell_words::quote(&pid_file.to_string_lossy()),
                 release = shell_words::quote(&release.to_string_lossy()),
@@ -1600,7 +1597,12 @@ mod tests {
                 Ok(Some("exact receipt".into()))
             })
             .unwrap();
-        assert_eq!(code, 0);
+        assert_eq!(
+            code,
+            0,
+            "tmux fixture trace:\n{}",
+            fs::read_to_string(&trace).unwrap_or_default()
+        );
         let trace = fs::read_to_string(trace).unwrap();
         assert!(!trace.contains("BEFORE_PROOF"));
         assert!(trace.contains("display-message -c invoking-client -d 3000 -l exact receipt"));

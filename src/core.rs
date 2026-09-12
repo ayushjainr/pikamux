@@ -251,20 +251,13 @@ impl Pika {
         stored.retain(|session| {
             !removed_keys.contains(&(session.provider, session.session_id.clone()))
         });
-        // Match the frozen durable-state contract: provider-proven archive or
-        // deletion removes the row from daily observation. Pane tags are cleared
-        // only through a generation-guarded mutation and remain best effort.
-        self.reconciled_write(reconcile_generation, &mut store_reconcile, |_ledger| {
-            for session in &removed {
-                for pane in panes.iter().filter(|pane| {
-                    pane.pika_provider == Some(session.provider)
-                        && pane.pika_session_id.as_deref() == Some(&session.session_id)
-                }) {
-                    let _ = self.tmux.clear_tags_if_unchanged(pane);
-                }
-            }
-            Ok(())
-        })?;
+        // Provider-proven archive or deletion removes the row from daily
+        // observation. Retain any exact pane tag as dormant recovery evidence:
+        // reconciliation must never hold SQLite's writer lock across tmux I/O,
+        // and clearing an observed tag after commit would race an exact reopen
+        // in another process. If the provider restores the conversation, the
+        // next observation revalidates this tag against live process identity;
+        // otherwise no exact action can attach through the hidden row.
         let mut wanted = BTreeMap::<Provider, BTreeMap<String, f64>>::new();
         for session in &stored {
             let activity = wanted.entry(session.provider).or_default();
@@ -1012,8 +1005,9 @@ impl Pika {
             let binding = self.exact_pane_binding(&session, session.tmux_pane.as_deref())?;
             let event = session.last_event_at;
             let code = if attach {
-                self.tmux.attach_exact_with_started(&binding.pane, || {
-                    self.record_exact_handoff(&session, &binding, event)
+                self.tmux.attach_exact_with_receipt(&binding.pane, || {
+                    self.record_exact_handoff(&session, &binding, event)?;
+                    Ok(continuity_receipt(&session, "ATTACHED LIVE"))
                 })?
             } else {
                 0
@@ -1201,8 +1195,9 @@ impl Pika {
             bail!("Pika refused a pending home whose exact launch identity changed")
         }
         let code = if attach {
-            self.tmux.attach_exact_with_started(&pane, || {
-                open_history::record_pending(&self.store, &pending)
+            self.tmux.attach_exact_with_receipt(&pane, || {
+                open_history::record_pending(&self.store, &pending)?;
+                Ok(pending_receipt(&pending, "ATTACHED STARTING"))
             })?
         } else {
             0
@@ -1301,8 +1296,9 @@ impl Pika {
                 let binding = self.exact_pane_binding(&session, None)?;
                 self.store.delete_pending(&token)?;
                 let code = if attach {
-                    self.tmux.attach_exact_with_started(&binding.pane, || {
-                        self.record_exact_handoff(&session, &binding, selected_event)
+                    self.tmux.attach_exact_with_receipt(&binding.pane, || {
+                        self.record_exact_handoff(&session, &binding, selected_event)?;
+                        Ok(continuity_receipt(&session, "ATTACHED LIVE"))
                     })?
                 } else {
                     0
@@ -1419,8 +1415,9 @@ impl Pika {
                 bail!("the launched provider generation could not be certified")
             }
             let code = if attach {
-                self.tmux.attach_exact_with_started(&binding.pane, || {
-                    self.record_exact_handoff(&session, &binding, selected_event)
+                self.tmux.attach_exact_with_receipt(&binding.pane, || {
+                    self.record_exact_handoff(&session, &binding, selected_event)?;
+                    Ok(continuity_receipt(&session, "RESUMED EXACT"))
                 })?
             } else {
                 0
@@ -1550,6 +1547,7 @@ impl Pika {
                 name,
                 &token,
             )?;
+            let mut exact_new_home = None;
             if let Some(session_id) = reserved.as_deref() {
                 let mut provisional = Session {
                     provider,
@@ -1602,6 +1600,7 @@ impl Pika {
                         binding.provider_pid,
                         start_time,
                     )?;
+                    exact_new_home = Some((provisional, binding));
                 }
             }
             let current = self
@@ -1616,9 +1615,17 @@ impl Pika {
                     ..pending.clone()
                 });
             let code = if attach {
-                self.tmux.attach_exact_with_started(&pane, || {
-                    open_history::record_pending(&self.store, &current)
-                })?
+                if let Some((session, binding)) = exact_new_home.as_ref() {
+                    self.tmux.attach_exact_with_receipt(&binding.pane, || {
+                        self.record_exact_handoff(session, binding, session.last_event_at)?;
+                        Ok(continuity_receipt(session, "NEW HOME"))
+                    })?
+                } else {
+                    self.tmux.attach_exact_with_receipt(&pane, || {
+                        open_history::record_pending(&self.store, &current)?;
+                        Ok(pending_receipt(&current, "NEW HOME"))
+                    })?
+                }
             } else {
                 0
             };
@@ -1973,6 +1980,64 @@ fn existing_cwd(value: Option<&str>) -> Result<&str> {
         .context("the conversation's saved working directory no longer exists")
 }
 
+fn receipt_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(120)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn fingerprint(value: &str) -> String {
+    value.chars().take(8).collect()
+}
+
+fn continuity_receipt(session: &Session, kind: &str) -> String {
+    let meaning = match kind {
+        "ATTACHED LIVE" => "same live home",
+        "RESUMED EXACT" => "same conversation resumed",
+        "NEW HOME" => "same conversation · protected new home",
+        _ => "exact conversation",
+    };
+    let provider_id = session.provider_thread_id();
+    let mut parts = vec![
+        "CONTINUITY PROVEN".to_owned(),
+        receipt_text(&session.display_name()),
+        kind.to_owned(),
+        meaning.to_owned(),
+        session.provider.to_string(),
+        format!("exact id {}", fingerprint(provider_id)),
+    ];
+    if provider_id != session.session_id {
+        parts.push(format!("home {}", fingerprint(&session.session_id)));
+    }
+    parts.join(" · ")
+}
+
+fn pending_receipt(pending: &PendingLaunch, kind: &str) -> String {
+    let mut parts = vec![
+        "PIKA HOME READY".to_owned(),
+        receipt_text(&pending.name),
+        kind.to_owned(),
+        "identity pending".to_owned(),
+        pending.provider.to_string(),
+    ];
+    if let Some(expected) = pending.expected_session_id.as_deref() {
+        parts.push(format!("expected id {}", fingerprint(expected)));
+    } else {
+        parts.push(format!("launch {}", fingerprint(&pending.launch_token)));
+    }
+    parts.join(" · ")
+}
+
 fn split_provider_query(query: &str) -> (Option<Provider>, &str) {
     let Some((prefix, value)) = query.split_once(':') else {
         return (None, query);
@@ -2085,6 +2150,20 @@ mod tests {
             created_at: 1.0,
             lifecycle_status: Some(Status::Working),
         })
+    }
+
+    #[test]
+    fn continuity_receipt_names_kind_provider_and_both_distinct_identities() {
+        let mut session = test_session("11111111-1111-4111-8111-111111111111");
+        session.active_thread_id = Some("22222222-2222-4222-8222-222222222222".into());
+        assert_eq!(
+            continuity_receipt(&session, "RESUMED EXACT"),
+            "CONTINUITY PROVEN · portfolio_review · RESUMED EXACT · same conversation resumed · codex · exact id 22222222 · home 11111111"
+        );
+        session.active_thread_id = None;
+        let same = continuity_receipt(&session, "ATTACHED LIVE");
+        assert!(same.contains("ATTACHED LIVE · same live home · codex · exact id 11111111"));
+        assert!(!same.contains(" · home "));
     }
 
     fn record(pid: i64, parent_pid: Option<i64>, start_time: u64, argv: &[&str]) -> ProcessRecord {
@@ -2853,7 +2932,7 @@ mod tests {
         pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
         let identity = "88888888-8888-4888-8888-888888888888";
         let archived = root.path().join("archived_sessions/thread.jsonl");
-        let tag_cleanup = root.path().join("tag-cleanup");
+        let tag_cleanup = root.path().join("unexpected-tag-cleanup");
         let tmux_fixture = root.path().join("tmux-fixture");
         let pane_line = [
             "pika-c-archived",
@@ -2950,22 +3029,215 @@ mod tests {
                 .contains("archived")
         );
         assert!(pika.store.list_pending().unwrap().is_empty());
-        let cleanup = std::fs::read_to_string(tag_cleanup).unwrap();
-        assert!(cleanup.contains("if-shell -F -t %9"));
         assert!(
-            cleanup.contains("set-option -p -u -t '%9' @pika_session_id"),
-            "{cleanup}"
+            !tag_cleanup.exists(),
+            "archive reconciliation must not race an exact reopen through tmux mutation"
         );
 
         db.execute("UPDATE threads SET archived=0 WHERE id=?1", [identity])
             .unwrap();
-        assert_eq!(pika.reconcile_local().unwrap().sessions.len(), 1);
+        let restored = pika.reconcile_local().unwrap().sessions;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].tmux_pane.as_deref(), Some("%9"));
         assert!(pika.store.list_untracked_sessions().unwrap().is_empty());
         assert!(
             pika.store
                 .get_stored_expert_profile(Provider::Codex, identity)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archived_pane_cleanup_never_holds_the_store_or_local_action_gate() {
+        let (root, mut pika) = test_pika();
+        pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
+        let panes_path = root.path().join("panes");
+        let listed_path = root.path().join("panes-listed");
+        let cleanup_path = root.path().join("unexpected-cleanup");
+        let tmux_fixture = root.path().join("tmux-stalled-cleanup");
+        std::fs::create_dir_all(&pika.paths.codex_home).unwrap();
+        let db =
+            rusqlite::Connection::open(pika.paths.codex_home.join("state_archive.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,name TEXT,cwd TEXT,rollout_path TEXT,updated_at INTEGER,archived INTEGER)").unwrap();
+
+        let mut pane_lines = Vec::new();
+        for index in 0..128 {
+            let identity = format!("00000000-0000-4000-8001-{index:012x}");
+            let transcript = root.path().join(format!("archive-{index}.jsonl"));
+            std::fs::write(&transcript, b"history\n").unwrap();
+            db.execute(
+                "INSERT INTO threads VALUES(?1,?2,'/tmp',?3,10,1)",
+                rusqlite::params![
+                    identity,
+                    format!("archived-{index}"),
+                    transcript.display().to_string()
+                ],
+            )
+            .unwrap();
+            let mut session = test_session(&identity);
+            session.name = Some(format!("archived-{index}"));
+            session.live = false;
+            session.root_pid = None;
+            session.tmux_session = Some(format!("pika-c-{index}"));
+            session.tmux_pane = Some(format!("%{index}"));
+            session.transcript_path = Some(transcript.display().to_string());
+            pika.store.upsert_session(&session, false).unwrap();
+            pane_lines.push(
+                [
+                    format!("pika-c-{index}"),
+                    format!("%{index}"),
+                    format!("{}", index + 10),
+                    "/tmp".into(),
+                    "sh".into(),
+                    "0".into(),
+                    "1".into(),
+                    "1".into(),
+                    "0".into(),
+                    String::new(),
+                    "10".into(),
+                    "9".into(),
+                    "codex".into(),
+                    identity,
+                    format!("archived-{index}"),
+                    String::new(),
+                ]
+                .join("\u{1f}"),
+            );
+        }
+        std::fs::write(&panes_path, pane_lines.join("\n")).unwrap();
+        std::fs::write(
+            &tmux_fixture,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *list-panes*) : > {}; cat {};;\n  *if-shell*) : > {}; sleep 5;;\nesac\n",
+                shell_words::quote(&listed_path.to_string_lossy()),
+                shell_words::quote(&panes_path.to_string_lossy()),
+                shell_words::quote(&cleanup_path.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&tmux_fixture).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+        std::fs::set_permissions(&tmux_fixture, permissions).unwrap();
+        pika.tmux = Tmux::with_executable(tmux_fixture.to_string_lossy(), None);
+        let hook_id = "99999999-9999-4999-8999-999999999999";
+        let mut hook_session = test_session(hook_id);
+        hook_session.live = false;
+        hook_session.root_pid = None;
+        pika.store.upsert_session(&hook_session, false).unwrap();
+
+        let worker = pika.clone();
+        let reconcile = std::thread::spawn(move || worker.reconcile_local());
+        for _ in 0..500 {
+            if listed_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            listed_path.exists(),
+            "reconciliation never observed the panes"
+        );
+
+        let invalidated_at = std::time::Instant::now();
+        pika.invalidate_local_reconciliation();
+        assert!(invalidated_at.elapsed() < Duration::from_millis(500));
+
+        let payload = parse_hook_payload(
+            serde_json::to_vec(&serde_json::json!({
+                "session_id":hook_id,
+                "hook_event_name":"Stop",
+                "cwd":"/tmp",
+            }))
+            .unwrap()
+            .as_slice(),
+            Provider::Codex,
+        )
+        .unwrap();
+        let hook_at = std::time::Instant::now();
+        handle_hook(
+            &pika.store,
+            Provider::Codex,
+            &payload,
+            &HookContext::at(20_000.0),
+        )
+        .unwrap();
+        assert!(hook_at.elapsed() < Duration::from_millis(500));
+        let _ = reconcile.join().unwrap();
+        assert!(
+            !cleanup_path.exists(),
+            "reconciliation invoked external tmux cleanup"
+        );
+        assert_eq!(
+            pika.store
+                .get_session(Provider::Codex, hook_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::Ready
+        );
+    }
+
+    #[test]
+    fn concurrent_exact_reopen_supersedes_archive_hiding_without_losing_binding() {
+        let (root, mut pika) = test_pika();
+        let identity = "77777777-7777-4777-8777-777777777770";
+        let transcript = root.path().join("archived-reopen.jsonl");
+        std::fs::write(&transcript, b"history\n").unwrap();
+        std::fs::create_dir_all(&pika.paths.codex_home).unwrap();
+        let db =
+            rusqlite::Connection::open(pika.paths.codex_home.join("state_archive.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,name TEXT,cwd TEXT,rollout_path TEXT,updated_at INTEGER,archived INTEGER)").unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES(?1,'archived-reopen','/tmp',?2,10,1)",
+            rusqlite::params![identity, transcript.display().to_string()],
+        )
+        .unwrap();
+        let mut stale = test_session(identity);
+        stale.name = Some("archived-reopen".into());
+        stale.live = false;
+        stale.root_pid = None;
+        stale.tmux_session = Some("pika-c-old".into());
+        stale.tmux_pane = Some("%1".into());
+        stale.transcript_path = Some(transcript.display().to_string());
+        pika.store.upsert_session(&stale, false).unwrap();
+
+        let observed = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_observed = Arc::clone(&observed);
+        let worker_release = Arc::clone(&release);
+        pika.process_observer = Arc::new(move || {
+            worker_observed.wait();
+            worker_release.wait();
+            ProcessObservation::complete(BTreeMap::new())
+        });
+        let worker = pika.clone();
+        let reconcile = std::thread::spawn(move || worker.reconcile_local());
+        observed.wait();
+
+        let other = Store::from_paths(&pika.paths);
+        let mut reopened = stale;
+        reopened.live = true;
+        reopened.root_pid = Some(44_444);
+        reopened.tmux_session = Some("pika-c-reopened".into());
+        reopened.tmux_pane = Some("%44".into());
+        other.upsert_session(&reopened, false).unwrap();
+        release.wait();
+
+        let error = reconcile.join().unwrap().unwrap_err().to_string();
+        assert!(error.contains("superseded"));
+        let preserved = pika
+            .store
+            .get_session(Provider::Codex, identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.root_pid, Some(44_444));
+        assert_eq!(preserved.tmux_session.as_deref(), Some("pika-c-reopened"));
+        assert_eq!(preserved.tmux_pane.as_deref(), Some("%44"));
+        assert!(
+            !pika.store.is_untracked(Provider::Codex, identity).unwrap(),
+            "stale archive observation hid the concurrently reopened exact row"
         );
     }
 
@@ -3110,7 +3382,7 @@ mod tests {
         std::fs::write(
             &executable,
             format!(
-                "#!/bin/sh\ncase \"$*\" in\n  *list-panes*) printf '%s\\n' '{row}' ;;\n  *list-clients*) if [ -f {client_pid} ]; then touch {handoff_seen}; printf '%s\\t%%1\\n' \"$(cat {client_pid})\"; fi ;;\n  *if-shell*attach-session*) printf '%s' \"$$\" > {client_pid}; sleep 0.25; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/bin/sh\ncase \"$*\" in\n  *list-panes*) printf '%s\\n' '{row}' ;;\n  *'list-clients -F #{{client_name}}'*) if [ -f {client_pid} ]; then touch {handoff_seen}; printf 'invoking-client\\037%s\\037%%1\\n' \"$(cat {client_pid})\"; fi ;;\n  *list-clients*) if [ -f {client_pid} ]; then touch {handoff_seen}; printf '%s\\t%%1\\n' \"$(cat {client_pid})\"; fi ;;\n  *if-shell*attach-session*) printf '%s' \"$$\" > {client_pid}; sleep 0.25; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 client_pid = shell_words::quote(&client_pid.to_string_lossy()),
                 handoff_seen = shell_words::quote(&handoff_seen.to_string_lossy()),
             ),

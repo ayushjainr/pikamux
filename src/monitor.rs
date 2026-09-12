@@ -121,6 +121,17 @@ enum ItemUpdates {
     Latest(LatestReceiver<Vec<BoardItem>>),
 }
 
+pub(crate) struct FleetHealthFeed {
+    initial: Vec<String>,
+    updates: LatestReceiver<Vec<String>>,
+}
+
+impl FleetHealthFeed {
+    pub(crate) fn new(initial: Vec<String>, updates: LatestReceiver<Vec<String>>) -> Self {
+        Self { initial, updates }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum BoardAction {
     Open(BoardItem),
@@ -242,7 +253,6 @@ pub fn run(sessions: Vec<Session>) -> Result<BoardAction> {
         None,
         None,
         None,
-        Vec::new(),
         None,
     )
 }
@@ -268,7 +278,6 @@ pub fn run_dynamic(sessions: Vec<Session>, updates: Receiver<Vec<Session>>) -> R
         None,
         None,
         None,
-        Vec::new(),
         None,
     )
 }
@@ -288,7 +297,6 @@ pub fn run_items_dynamic(
         None,
         None,
         None,
-        Vec::new(),
         None,
     )
 }
@@ -308,7 +316,6 @@ pub fn run_items_dynamic_with_notice(
         Some(update_notice),
         None,
         None,
-        Vec::new(),
         None,
     )
 }
@@ -329,7 +336,6 @@ pub fn run_items_dynamic_with_notice_and_refresh(
         Some(update_notice),
         Some(refresh_request),
         None,
-        Vec::new(),
         None,
     )
 }
@@ -343,8 +349,7 @@ pub(crate) fn run_items_dynamic_with_local_health(
     update_notice: Receiver<Option<String>>,
     refresh_request: SyncSender<()>,
     local_refresh_delayed: Arc<AtomicBool>,
-    initial_fleet_health: Vec<String>,
-    fleet_health_updates: LatestReceiver<Vec<String>>,
+    fleet_health: FleetHealthFeed,
 ) -> Result<BoardAction> {
     run_loop(
         items,
@@ -353,8 +358,7 @@ pub(crate) fn run_items_dynamic_with_local_health(
         Some(update_notice),
         Some(refresh_request),
         Some(local_refresh_delayed),
-        initial_fleet_health,
-        Some(fleet_health_updates),
+        Some(fleet_health),
     )
 }
 
@@ -365,12 +369,14 @@ fn run_loop(
     update_notice: Option<Receiver<Option<String>>>,
     refresh_request: Option<SyncSender<()>>,
     local_refresh_delayed: Option<Arc<AtomicBool>>,
-    initial_fleet_health: Vec<String>,
-    fleet_health_updates: Option<LatestReceiver<Vec<String>>>,
+    fleet_health: Option<FleetHealthFeed>,
 ) -> Result<BoardAction> {
     let _terminal = TerminalGuard::enter()?;
     let mut board = Board::new(items);
-    board.fleet_health = initial_fleet_health;
+    board.fleet_health = fleet_health
+        .as_ref()
+        .map(|feed| feed.initial.clone())
+        .unwrap_or_default();
     let mut stdout = io::stdout().lock();
     let mut dirty = true;
     let mut last_draw = Instant::now()
@@ -405,8 +411,8 @@ fn run_loop(
         if let Some(delayed) = &local_refresh_delayed {
             dirty |= board.observe_local_refresh(delayed);
         }
-        if let Some(updates) = &fleet_health_updates
-            && let Some(health) = updates.take()
+        if let Some(feed) = &fleet_health
+            && let Some(health) = feed.updates.take()
         {
             dirty |= board.replace_fleet_health(health);
         }

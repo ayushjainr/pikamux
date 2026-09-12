@@ -1917,6 +1917,14 @@ pub fn verify_running_install_candidate(candidate: &Path) -> Result<()> {
     compare_candidate_bytes(&running, candidate)
 }
 
+#[cfg(not(unix))]
+pub fn verify_running_install_candidate(_candidate: &Path) -> Result<()> {
+    Err(UpdateError::UnsupportedTarget(format!(
+        "installation identity proof is not available on {}",
+        std::env::consts::OS
+    )))
+}
+
 fn validate_notice_file(path: &Path, expected: &[u8]) -> Result<()> {
     if read_notice_file(path)? != expected {
         return Err(UpdateError::Safety(format!(
