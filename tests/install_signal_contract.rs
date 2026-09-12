@@ -33,6 +33,8 @@ esac
     )
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::copy("LICENSE", payload.join("LICENSE")).unwrap();
+    fs::copy("THIRD_PARTY.md", payload.join("THIRD_PARTY.md")).unwrap();
 
     let archive_name = artifact_name(version, target).unwrap();
     let archive = bundle.join(&archive_name);
@@ -42,7 +44,7 @@ esac
             .arg(&archive)
             .args(["-C"])
             .arg(&payload)
-            .arg("pika")
+            .args(["LICENSE", "THIRD_PARTY.md", "pika"])
             .status()
             .unwrap()
             .success()

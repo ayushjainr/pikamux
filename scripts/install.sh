@@ -136,30 +136,53 @@ case "$pika_sha" in *[!0-9a-f]*|'') fail 'Invalid artifact checksum.' ;; esac
 [ "$(digest "$pika_tmp/$pika_archive")" = "$pika_sha" ] || fail 'Pika checksum mismatch. Downloaded code was not executed.'
 [ "$(wc -c < "$pika_tmp/$pika_archive" | tr -d ' ')" -le 20971520 ] || fail 'Native archive exceeds the compressed size limit.'
 
-# The current POSIX archive format intentionally contains one regular file.
-# Bound decompression before any archive parser or filesystem write. Ignoring
-# the upstream SIGPIPE here is intentional: head closes the stream at the
-# first byte over the complete-tar budget, so a compression bomb cannot make
-# tar scan or extract an unbounded payload.
-pika_stream_limit=53477376
+# The POSIX archive contains one executable and the two notices distributed
+# with it. Bound their combined expansion before any archive parser or
+# filesystem write. Ignoring the upstream SIGPIPE here is intentional: head
+# closes the stream at the first byte over the complete-tar budget, so a
+# compression bomb cannot make tar scan or extract an unbounded payload.
+pika_stream_limit=57671680
 pika_stream_bytes=$(
     set +o pipefail
     gzip -dc -- "$pika_tmp/$pika_archive" 2>/dev/null |
         head -c $((pika_stream_limit + 1)) |
         wc -c | tr -d ' '
 )
-[ "$pika_stream_bytes" -le "$pika_stream_limit" ] || fail 'Native archive expands beyond the 51 MiB safety limit.'
-# Exact listing validation makes traversal, duplicate-name and link payloads
-# unnecessary; post-extraction checks still reject a link or extra entry.
-pika_listing=$(tar -tzf "$pika_tmp/$pika_archive")
-[ "$pika_listing" = 'pika' ] || fail 'Native archive contains an unexpected path.'
-pika_verbose=$(LC_ALL=C tar -tvzf "$pika_tmp/$pika_archive")
-case "$pika_verbose" in -*) ;; *) fail 'Native archive executable is not a regular file.' ;; esac
+[ "$pika_stream_bytes" -le "$pika_stream_limit" ] || fail 'Native archive expands beyond the 55 MiB safety limit.'
+# Validate the exact three-name set independently of member order. Listing
+# output is file-limited before Bash reads it, and every verbose row must be a
+# regular file; traversal, links, duplicates and surprise payloads fail closed.
+pika_listing_file="$pika_tmp/archive-listing"
+(ulimit -f 8 2>/dev/null || :; tar -tzf "$pika_tmp/$pika_archive") > "$pika_listing_file" || \
+    fail 'Native archive listing is invalid or exceeds 4 KiB.'
+pika_seen_license=''
+pika_seen_third_party=''
+pika_seen_executable=''
+while IFS= read -r pika_member; do
+    case "$pika_member" in
+        LICENSE) [ -z "$pika_seen_license" ] || fail 'Native archive contains a duplicate LICENSE.'; pika_seen_license=1 ;;
+        THIRD_PARTY.md) [ -z "$pika_seen_third_party" ] || fail 'Native archive contains a duplicate THIRD_PARTY.md.'; pika_seen_third_party=1 ;;
+        pika) [ -z "$pika_seen_executable" ] || fail 'Native archive contains a duplicate pika executable.'; pika_seen_executable=1 ;;
+        *) fail 'Native archive contains an unexpected path.' ;;
+    esac
+done < "$pika_listing_file"
+[ -n "$pika_seen_license" ] && [ -n "$pika_seen_third_party" ] && [ -n "$pika_seen_executable" ] || \
+    fail 'Native archive must contain exactly LICENSE, THIRD_PARTY.md, and pika.'
+pika_verbose_file="$pika_tmp/archive-verbose"
+(ulimit -f 128 2>/dev/null || :; LC_ALL=C tar -tvzf "$pika_tmp/$pika_archive") > "$pika_verbose_file" || \
+    fail 'Native archive metadata is invalid or exceeds 64 KiB.'
+while IFS= read -r pika_member; do
+    case "$pika_member" in -*) ;; *) fail 'Native archive contains a non-regular member.' ;; esac
+done < "$pika_verbose_file"
 mkdir "$pika_tmp/extracted"
-tar -xzf "$pika_tmp/$pika_archive" -C "$pika_tmp/extracted"
+tar -xzf "$pika_tmp/$pika_archive" -C "$pika_tmp/extracted" LICENSE THIRD_PARTY.md pika
 [ -f "$pika_tmp/extracted/pika" ] && [ ! -L "$pika_tmp/extracted/pika" ] || fail 'Native archive has no regular Pika executable.'
-[ "$(find "$pika_tmp/extracted" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 1 ] || fail 'Native archive extracted unexpected entries.'
+[ -f "$pika_tmp/extracted/LICENSE" ] && [ ! -L "$pika_tmp/extracted/LICENSE" ] || fail 'Native archive has no regular LICENSE.'
+[ -f "$pika_tmp/extracted/THIRD_PARTY.md" ] && [ ! -L "$pika_tmp/extracted/THIRD_PARTY.md" ] || fail 'Native archive has no regular THIRD_PARTY.md.'
+[ "$(find "$pika_tmp/extracted" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 3 ] || fail 'Native archive extracted unexpected entries.'
 [ "$(wc -c < "$pika_tmp/extracted/pika" | tr -d ' ')" -le 52428800 ] || fail 'Native executable exceeds the 50 MiB size limit.'
+[ "$(wc -c < "$pika_tmp/extracted/LICENSE" | tr -d ' ')" -le 2097152 ] || fail 'Native LICENSE exceeds the 2 MiB size limit.'
+[ "$(wc -c < "$pika_tmp/extracted/THIRD_PARTY.md" | tr -d ' ')" -le 2097152 ] || fail 'Native THIRD_PARTY.md exceeds the 2 MiB size limit.'
 chmod 700 "$pika_tmp/extracted/pika"
 
 pika_probe_timeout=${PIKA_INSTALL_PROBE_TIMEOUT_SECONDS:-10}

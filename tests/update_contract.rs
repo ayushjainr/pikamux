@@ -25,6 +25,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn copy_release_notices(directory: &Path) {
+    fs::copy("LICENSE", directory.join("LICENSE")).unwrap();
+    fs::copy("THIRD_PARTY.md", directory.join("THIRD_PARTY.md")).unwrap();
+}
+
 fn candidate(path: &Path, version: &str, valid: bool) {
     let reported = if valid { version } else { "9.9.9" };
     fs::write(
@@ -35,6 +40,7 @@ fn candidate(path: &Path, version: &str, valid: bool) {
     )
     .unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    copy_release_notices(path.parent().unwrap());
 }
 
 fn command_location(name: &str) -> Option<PathBuf> {
@@ -102,7 +108,7 @@ fn release_bundle(temp: &Path, version: &str) -> PathBuf {
         .arg(&archive)
         .args(["-C"])
         .arg(&payload)
-        .arg("pika")
+        .args(["LICENSE", "THIRD_PARTY.md", "pika"])
         .status()
         .unwrap();
     assert!(status.success());
@@ -133,6 +139,7 @@ fn release_bundle(temp: &Path, version: &str) -> PathBuf {
     .unwrap();
     fs::write(bundle.join("pika-version"), format!("{version}\n")).unwrap();
     fs::copy("scripts/install.sh", bundle.join("install.sh")).unwrap();
+    copy_release_notices(&bundle);
     bundle
 }
 
@@ -865,6 +872,7 @@ fn shell_bootstrap_uses_an_offline_bundle_and_forwards_only_fixed_paths() {
     )
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    copy_release_notices(&payload);
     let archive_name = artifact_name(version, target).unwrap();
     let archive = bundle.join(&archive_name);
     let status = Command::new("tar")
@@ -872,7 +880,7 @@ fn shell_bootstrap_uses_an_offline_bundle_and_forwards_only_fixed_paths() {
         .arg(&archive)
         .args(["-C"])
         .arg(&payload)
-        .arg("pika")
+        .args(["LICENSE", "THIRD_PARTY.md", "pika"])
         .status()
         .unwrap();
     assert!(status.success());
@@ -935,6 +943,7 @@ esac
     )
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    copy_release_notices(&payload);
     let archive_name = artifact_name(version, target).unwrap();
     let archive = bundle.join(&archive_name);
     assert!(
@@ -943,7 +952,7 @@ esac
             .arg(&archive)
             .args(["-C"])
             .arg(&payload)
-            .arg("pika")
+            .args(["LICENSE", "THIRD_PARTY.md", "pika"])
             .status()
             .unwrap()
             .success()
@@ -1351,7 +1360,7 @@ fn bootstrap_rejects_a_compression_bomb_before_filesystem_extraction() {
     fs::create_dir(&bundle).unwrap();
     fs::create_dir(&payload).unwrap();
     let candidate = payload.join("pika");
-    fs::write(&candidate, vec![0_u8; 52 * 1024 * 1024]).unwrap();
+    fs::write(&candidate, vec![0_u8; 56 * 1024 * 1024]).unwrap();
     fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
     let version = env!("CARGO_PKG_VERSION");
     let target = native_target().unwrap();
@@ -1597,8 +1606,9 @@ fn release_verifier_bounds_archive_expansion_before_parsing_tar_members() {
 
     fs::create_dir(&payload).unwrap();
     let candidate = payload.join("pika");
-    fs::write(&candidate, vec![0_u8; 52 * 1024 * 1024]).unwrap();
+    fs::write(&candidate, vec![0_u8; 54 * 1024 * 1024]).unwrap();
     fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+    copy_release_notices(&payload);
     let target = "aarch64-unknown-linux-musl";
     let manifest_path = bundle.join("pika-native-release.json");
     let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
@@ -1612,7 +1622,7 @@ fn release_verifier_bounds_archive_expansion_before_parsing_tar_members() {
             .arg(bundle.join(&name))
             .args(["-C"])
             .arg(&payload)
-            .arg("pika")
+            .args(["LICENSE", "THIRD_PARTY.md", "pika"])
             .status()
             .unwrap()
             .success()
@@ -1681,6 +1691,8 @@ fn remote_payload_is_version_pinned_allowlisted_and_installer_verified() {
     names.sort();
     let artifact = artifact_name(version, target).unwrap();
     let mut expected = vec![
+        "LICENSE".to_owned(),
+        "THIRD_PARTY.md".to_owned(),
         "install.sh".to_owned(),
         "pika-native-release.json".to_owned(),
         "pika-version".to_owned(),
