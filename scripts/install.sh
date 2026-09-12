@@ -53,7 +53,7 @@ case "$(uname -s):$(uname -m)" in
     *) fail 'Native Pika supports macOS/Linux on arm64 or x86_64.' ;;
 esac
 
-for pika_command in gzip head tar mktemp sed tr wc find cut cp mkdir chmod rm sleep uname; do
+for pika_command in gzip head tar mktemp mkfifo sed tr wc find cut cp mkdir chmod rm sleep uname; do
     command -v "$pika_command" >/dev/null 2>&1 || fail "Required command missing: $pika_command."
 done
 if [ -z "$pika_bundle" ]; then
@@ -157,49 +157,40 @@ candidate_probe() {
     pika_probe_index=$((pika_probe_index + 1))
     local pika_probe_stdout="$pika_tmp/probe-$pika_probe_index.stdout"
     local pika_probe_stderr="$pika_tmp/probe-$pika_probe_index.stderr"
-    local pika_probe_status_file="$pika_tmp/probe-$pika_probe_index.status"
+    local pika_probe_completion="$pika_tmp/probe-$pika_probe_index.completion"
     # A file-size limit prevents a diagnostic probe from filling the staging
     # filesystem before its wall-clock deadline. Monitor mode gives the
-    # candidate an isolated process group. The wrapper deliberately remains
-    # alive after recording the candidate's status, pinning ownership of the
-    # PGID until the parent has terminated every inherited descendant.
+    # candidate an isolated process group. A pre-opened FIFO lets Bash wait for
+    # completion without polling or mistaking an exited-but-unreaped process
+    # for a live one. The wrapper remains alive after sending status, pinning
+    # ownership of the PGID until every inherited descendant is terminated.
+    mkfifo "$pika_probe_completion"
+    exec 9<>"$pika_probe_completion"
     set -m
     (
         ulimit -f 1024 2>/dev/null || :
         set +e
         "$@"
         pika_wrapped_status=$?
-        printf '%s\n' "$pika_wrapped_status" >"$pika_probe_status_file"
+        printf '%s\n' "$pika_wrapped_status" >&9
         while :; do sleep 60; done
     ) >"$pika_probe_stdout" 2>"$pika_probe_stderr" &
     local pika_probe_pid=$!
     set +m
-    local pika_probe_tick=0
-    local pika_probe_tick_limit=$((pika_probe_timeout * 10))
-    while [ ! -e "$pika_probe_status_file" ] && \
-        kill -0 "$pika_probe_pid" 2>/dev/null && \
-        [ "$pika_probe_tick" -lt "$pika_probe_tick_limit" ]; do
-        sleep 0.1
-        pika_probe_tick=$((pika_probe_tick + 1))
-    done
-    local pika_probe_timed_out=0
-    if [ ! -e "$pika_probe_status_file" ] && \
-        kill -0 "$pika_probe_pid" 2>/dev/null && \
-        [ "$pika_probe_tick" -ge "$pika_probe_tick_limit" ]; then
-        pika_probe_timed_out=1
+    local pika_probe_status=''
+    local pika_probe_completed=0
+    if IFS= read -r -t "$pika_probe_timeout" pika_probe_status <&9; then
+        pika_probe_completed=1
     fi
+    exec 9>&-
     # Clean the exact pinned group on success and failure. This closes output
     # files held by descendants before validation continues.
     kill -TERM -- "-$pika_probe_pid" 2>/dev/null || :
     sleep 0.1
     kill -KILL -- "-$pika_probe_pid" 2>/dev/null || :
     wait "$pika_probe_pid" 2>/dev/null || :
-    [ "$pika_probe_timed_out" -eq 0 ] || \
+    [ "$pika_probe_completed" -eq 1 ] || \
         fail "Native executable $pika_probe_label timed out after ${pika_probe_timeout}s."
-    [ -e "$pika_probe_status_file" ] || \
-        fail "Native executable $pika_probe_label stopped without a status receipt."
-    local pika_probe_status
-    pika_probe_status=$(<"$pika_probe_status_file")
     case "$pika_probe_status" in *[!0-9]*|'') \
         fail "Native executable $pika_probe_label returned an invalid status receipt." ;; esac
     [ "$(wc -c < "$pika_probe_stdout" | tr -d ' ')" -le 1048576 ] && \

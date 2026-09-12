@@ -53,8 +53,8 @@ fn curl_free_installer_path(root: &Path) -> PathBuf {
     let output = root.join("installer-tools");
     fs::create_dir(&output).unwrap();
     for name in [
-        "gzip", "head", "tar", "mktemp", "sed", "tr", "wc", "find", "cut", "cp", "mkdir", "chmod",
-        "rm", "sleep", "uname",
+        "gzip", "head", "tar", "mktemp", "mkfifo", "sed", "tr", "wc", "find", "cut", "cp", "mkdir",
+        "chmod", "rm", "sleep", "uname",
     ] {
         symlink(command_location(name).unwrap(), output.join(name)).unwrap();
     }
@@ -957,17 +957,20 @@ esac
         .arg("--no-setup")
         .env("PIKA_TEST_VERSION", version)
         .env("PIKA_TEST_CHILD_PID", &child_pid)
-        .env("PIKA_INSTALL_PROBE_TIMEOUT_SECONDS", "1")
+        // This test runs beside archive-expansion and packaging contracts.
+        // Two seconds remains an aggressive bound without requiring a fresh
+        // shell process to win a one-second scheduler race under full load.
+        .env("PIKA_INSTALL_PROBE_TIMEOUT_SECONDS", "2")
         .output()
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(6),
         "candidate probe took {:?}",
         started.elapsed()
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("help probe timed out after 1s"),
+        String::from_utf8_lossy(&output.stderr).contains("help probe timed out after 2s"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
