@@ -19,6 +19,7 @@ use std::{
     io::{self, IsTerminal, Write},
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
     thread,
@@ -197,6 +198,7 @@ pub fn run(sessions: Vec<Session>) -> Result<BoardAction> {
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -220,6 +222,7 @@ pub fn run_dynamic(sessions: Vec<Session>, updates: Receiver<Vec<Session>>) -> R
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -231,7 +234,7 @@ pub fn run_items_dynamic(
     updates: Receiver<Vec<BoardItem>>,
     driver: Option<ConsultationDriver>,
 ) -> Result<BoardAction> {
-    run_loop(items, Some(updates), driver, None, None)
+    run_loop(items, Some(updates), driver, None, None, None)
 }
 
 /// Dynamic board plus a single best-effort background update notice. The
@@ -242,7 +245,14 @@ pub fn run_items_dynamic_with_notice(
     driver: Option<ConsultationDriver>,
     update_notice: Receiver<Option<String>>,
 ) -> Result<BoardAction> {
-    run_loop(items, Some(updates), driver, Some(update_notice), None)
+    run_loop(
+        items,
+        Some(updates),
+        driver,
+        Some(update_notice),
+        None,
+        None,
+    )
 }
 
 /// Dynamic board with a coalescing in-place refresh trigger. One render loop
@@ -260,6 +270,27 @@ pub fn run_items_dynamic_with_notice_and_refresh(
         driver,
         Some(update_notice),
         Some(refresh_request),
+        None,
+    )
+}
+
+/// Local observation health is separate from conversation status and cached
+/// item updates. A latest-value flag cannot queue a stale warning after recovery.
+pub fn run_items_dynamic_with_local_health(
+    items: Vec<BoardItem>,
+    updates: Receiver<Vec<BoardItem>>,
+    driver: Option<ConsultationDriver>,
+    update_notice: Receiver<Option<String>>,
+    refresh_request: SyncSender<()>,
+    local_refresh_delayed: Arc<AtomicBool>,
+) -> Result<BoardAction> {
+    run_loop(
+        items,
+        Some(updates),
+        driver,
+        Some(update_notice),
+        Some(refresh_request),
+        Some(local_refresh_delayed),
     )
 }
 
@@ -269,6 +300,7 @@ fn run_loop(
     driver: Option<ConsultationDriver>,
     update_notice: Option<Receiver<Option<String>>>,
     refresh_request: Option<SyncSender<()>>,
+    local_refresh_delayed: Option<Arc<AtomicBool>>,
 ) -> Result<BoardAction> {
     let _terminal = TerminalGuard::enter()?;
     let mut board = Board::new(items);
@@ -298,6 +330,9 @@ fn run_loop(
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
             }
+        }
+        if let Some(delayed) = &local_refresh_delayed {
+            dirty |= board.observe_local_refresh(delayed);
         }
         dirty |= board.drain_consultation();
         if board.quit_when_chat_closes && board.chat.is_none() {
@@ -630,6 +665,7 @@ struct Board {
     quit_when_chat_closes: bool,
     update_version: Option<String>,
     update_prompt: bool,
+    local_refresh_delayed: bool,
 }
 
 impl Board {
@@ -646,7 +682,15 @@ impl Board {
             quit_when_chat_closes: false,
             update_version: None,
             update_prompt: false,
+            local_refresh_delayed: false,
         }
+    }
+
+    fn observe_local_refresh(&mut self, delayed: &AtomicBool) -> bool {
+        let delayed = delayed.load(Ordering::Relaxed);
+        let changed = self.local_refresh_delayed != delayed;
+        self.local_refresh_delayed = delayed;
+        changed
     }
 
     fn visible(&self) -> Vec<&BoardItem> {
@@ -1049,6 +1093,14 @@ impl Board {
                     "↑↓ move · enter open · p peek · a ask · x stop watching · / filter · r refresh · U update · q leave",
                     width
                 ))
+            )?;
+        }
+        if self.local_refresh_delayed && height > 1 {
+            queue!(
+                output,
+                MoveTo(0, height - 1),
+                SetForegroundColor(Color::DarkYellow),
+                Print(fit("local refresh delayed · r retry", width))
             )?;
         }
         queue!(output, ResetColor)?;
@@ -1696,6 +1748,53 @@ mod tests {
             route_board_action(BoardAction::Quit, Some(&sender)),
             Some(BoardAction::Quit)
         );
+    }
+
+    #[test]
+    fn delayed_local_refresh_notice_preserves_rows_cached_updates_and_retry() {
+        let mut board = board(Status::Working);
+        let original = board.selected().unwrap();
+        let delayed = AtomicBool::new(true);
+        assert!(board.observe_local_refresh(&delayed));
+        assert!(!board.observe_local_refresh(&delayed));
+        assert_eq!(board.selected().unwrap(), original);
+        assert_eq!(item_group(&board.selected().unwrap()), "WORKING");
+        for width in [40, 72, 120] {
+            let mut rendered = Vec::new();
+            board.draw(&mut rendered, width, 20).unwrap();
+            let rendered = String::from_utf8(rendered).unwrap();
+            assert!(rendered.contains("local refresh delayed · r retry"));
+            assert!(!rendered.contains("ERROR"));
+        }
+
+        // A fresh hook publication updates the row immediately, without
+        // pretending that the full local observation has recovered.
+        let mut hook_update = original;
+        hook_update.session.status = Status::Ready;
+        hook_update.session.unread = true;
+        board.replace_items(vec![hook_update.clone()]);
+        assert_eq!(board.selected().unwrap(), hook_update);
+        assert!(board.local_refresh_delayed);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let retry = board.key(key(KeyCode::Char('r')), None).unwrap();
+        assert_eq!(route_board_action(retry, Some(&sender)), None);
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert!(
+            board.local_refresh_delayed,
+            "retry is not proof of recovery"
+        );
+
+        delayed.store(false, Ordering::Relaxed);
+        assert!(board.observe_local_refresh(&delayed));
+        assert!(!board.observe_local_refresh(&delayed));
+        let mut rendered = Vec::new();
+        board.draw(&mut rendered, 72, 20).unwrap();
+        assert!(
+            !String::from_utf8(rendered)
+                .unwrap()
+                .contains("local refresh delayed")
+        );
+        assert_eq!(board.selected().unwrap(), hook_update);
     }
 
     #[test]

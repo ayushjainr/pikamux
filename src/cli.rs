@@ -609,6 +609,8 @@ fn bare(pika: &Pika) -> Result<i32> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let (refresh_sender, refresh_receiver) = mpsc::sync_channel(1);
     let stop = Arc::new(AtomicBool::new(false));
+    let local_refresh_delayed = Arc::new(AtomicBool::new(false));
+    let worker_refresh_delayed = Arc::clone(&local_refresh_delayed);
     let worker_stop = Arc::clone(&stop);
     let worker = pika.clone();
     let local_sender = sender.clone();
@@ -616,25 +618,32 @@ fn bare(pika: &Pika) -> Result<i32> {
     let local_refresh = thread::spawn(move || {
         let mut store_changes = worker.store.change_watcher().ok();
         let mut next_reconcile = Instant::now();
+        let mut consecutive_failures = 0;
         while !worker_stop.load(Ordering::Relaxed) {
             if Instant::now() >= next_reconcile {
-                if let Ok(mut inventory) = worker.reconcile_local() {
+                let refresh = worker.reconcile_local().and_then(|mut inventory| {
                     let _ = usage::hydrate_sessions(
                         &worker.paths,
                         &worker.store,
                         &mut inventory.sessions,
                     );
-                    if let Ok(items) = board_items_from_inventory(&worker, inventory) {
-                        match local_sender.try_send(items) {
-                            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                            Err(mpsc::TrySendError::Disconnected(_)) => break,
-                        }
+                    board_items_from_inventory(&worker, inventory)
+                });
+                worker_refresh_delayed.store(
+                    record_local_refresh_result(&mut consecutive_failures, refresh.is_ok()),
+                    Ordering::Relaxed,
+                );
+                if let Ok(items) = refresh {
+                    match local_sender.try_send(items) {
+                        Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
                     }
-                }
-                // Consume commits made by reconciliation itself. Subsequent
-                // changes are hook/provider publications from other writers.
-                if let Some(watcher) = &mut store_changes {
-                    let _ = watcher.changed();
+                    // Consume reconciliation's own commits only after a
+                    // successful observation. On failure, leave hook commits
+                    // visible to the independent cached-update path below.
+                    if let Some(watcher) = &mut store_changes {
+                        let _ = watcher.changed();
+                    }
                 }
                 next_reconcile = Instant::now() + Duration::from_secs(10);
             }
@@ -693,12 +702,13 @@ fn bare(pika: &Pika) -> Result<i32> {
             .and_then(update::cached_update_notice);
         let _ = update_sender.send(notice);
     });
-    let action = monitor::run_items_dynamic_with_notice_and_refresh(
+    let action = monitor::run_items_dynamic_with_local_health(
         cached,
         receiver,
         Some(board_consultation_driver(pika.clone())),
         update_receiver,
         refresh_sender.clone(),
+        local_refresh_delayed,
     );
     finish_board_observer(&stop, &refresh_sender, &local_done_receiver, local_refresh);
     // Do not delay Enter/quit behind provider metadata or a bounded SSH
@@ -715,6 +725,34 @@ fn bare(pika: &Pika) -> Result<i32> {
             release: version,
         }),
         BoardAction::Quit => Ok(0),
+    }
+}
+
+fn record_local_refresh_result(consecutive_failures: &mut u8, succeeded: bool) -> bool {
+    *consecutive_failures = if succeeded {
+        0
+    } else {
+        consecutive_failures.saturating_add(1)
+    };
+    *consecutive_failures >= 2
+}
+
+#[cfg(test)]
+mod board_refresh_tests {
+    use super::record_local_refresh_result;
+
+    #[test]
+    fn local_refresh_notice_requires_consecutive_failures_and_clears_on_success() {
+        let mut failures = 0;
+        assert!(!record_local_refresh_result(&mut failures, false));
+        assert!(record_local_refresh_result(&mut failures, false));
+        for _ in 0..1_000 {
+            assert!(record_local_refresh_result(&mut failures, false));
+        }
+        assert!(!record_local_refresh_result(&mut failures, true));
+        assert!(!record_local_refresh_result(&mut failures, false));
+        assert!(!record_local_refresh_result(&mut failures, true));
+        assert!(!record_local_refresh_result(&mut failures, false));
     }
 }
 
