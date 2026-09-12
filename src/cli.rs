@@ -1498,20 +1498,12 @@ fn resolve_structural_local(
                 .map(|provider| (Some(provider), query))
         })
         .unwrap_or((None, name));
-    let mut matches = pika
+    let mut sessions = pika
         .store
         .list_sessions()?
         .into_iter()
         .chain(pika.store.list_untracked_sessions()?)
         .filter(|session| provider.is_none_or(|value| session.provider == value))
-        .filter(|session| {
-            session.session_id == query
-                || session.provider_thread_id() == query
-                || session
-                    .name
-                    .as_deref()
-                    .is_some_and(|value| value.eq_ignore_ascii_case(query))
-        })
         .collect::<Vec<_>>();
     if include_provider_candidates {
         let providers = crate::providers::Providers::new(&pika.paths, &pika.config);
@@ -1527,19 +1519,69 @@ fn resolve_structural_local(
                         .is_some_and(|value| value.eq_ignore_ascii_case(query))
             })
         {
-            if !matches.iter().any(|session| {
+            if !sessions.iter().any(|session| {
                 session.provider == candidate.provider
                     && (session.session_id == candidate.session_id
                         || session.provider_thread_id() == candidate.session_id)
             }) {
-                matches.push(crate::core::session_from_candidate(&candidate));
+                sessions.push(crate::core::session_from_candidate(&candidate));
             }
         }
     }
-    Ok(matches)
+    let exact = sessions
+        .iter()
+        .filter(|session| session.session_id == query || session.provider_thread_id() == query)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !exact.is_empty() {
+        return Ok(exact);
+    }
+    let named = sessions
+        .iter()
+        .filter(|session| {
+            session
+                .name
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(query))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !named.is_empty() {
+        return Ok(named);
+    }
+    Ok(sessions
+        .into_iter()
+        .filter(|session| {
+            session.session_id.starts_with(query) || session.provider_thread_id().starts_with(query)
+        })
+        .collect())
 }
 
 fn resolve_expert_local(pika: &Pika, name: &str) -> Result<Vec<Session>> {
+    if name == "-" {
+        let Some((provider, session_id)) = pika.store.previous_attached()? else {
+            bail!("No previous Pika conversation has been recorded yet")
+        };
+        return Ok(pika
+            .store
+            .get_session(provider, &session_id)?
+            .into_iter()
+            .collect());
+    }
+    if name == "." {
+        let current = std::env::current_dir()?.canonicalize()?;
+        let root = repository_root(&current);
+        let mut sessions = pika.store.list_sessions()?;
+        sessions.extend(pika.store.list_untracked_sessions()?);
+        sessions.retain(|session| {
+            session
+                .cwd
+                .as_deref()
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .is_some_and(|path| path == current || repository_root(&path) == root)
+        });
+        return Ok(sessions);
+    }
     resolve_structural_local(pika, name, false)
 }
 
@@ -1551,6 +1593,7 @@ fn resolve_named_target(
     name: &str,
     fresh_remote: bool,
     domain: LocalTargetDomain,
+    choose_collisions: bool,
 ) -> Result<Option<NamedTarget>> {
     let manager = FleetManager::new(&pika.store, SshTransport::default());
     let local_result = match domain {
@@ -1585,7 +1628,7 @@ fn resolve_named_target(
     {
         return Err(error);
     }
-    let combined = combine_named_targets(name, local, remote)?;
+    let combined = combine_named_targets(name, local, remote, choose_collisions)?;
     Ok(combined)
 }
 
@@ -1593,6 +1636,7 @@ fn combine_named_targets(
     name: &str,
     local: Vec<Session>,
     remote: Option<fleet::FleetSession>,
+    choose_collisions: bool,
 ) -> Result<Option<NamedTarget>> {
     match (local.as_slice(), remote) {
         ([], None) => Ok(None),
@@ -1605,14 +1649,18 @@ fn combine_named_targets(
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "AMBIGUOUS TARGET · {name:?} matches local {local_identities} and remote {}. Use the exact local UUID or exact UUID@machine; no action was taken.",
-                remote.qualified_name()
+                "AMBIGUOUS TARGET · {name:?} matches local {local_identities} and remote {} {}@{}. Use one displayed exact identity; no action was taken.",
+                remote.session.provider,
+                remote.session.session_id,
+                remote.node_name,
             )
         }
-        (local, None) => bail!(
-            "AMBIGUOUS TARGET · {name:?} matches {} local conversations. Use PROVIDER:NAME or the exact UUID; no action was taken.",
-            local.len()
-        ),
+        (local, None) if choose_collisions => choose_session(
+            local.to_vec(),
+            &format!("Several conversations match {name:?}"),
+        )
+        .map(|session| Some(NamedTarget::Local(Box::new(session)))),
+        (local, None) => bail!(noninteractive_choice_message(local)),
     }
 }
 
@@ -1681,7 +1729,7 @@ fn open_name(pika: &Pika, name: &str, allow_create: bool) -> Result<i32> {
         }
         return open_local_session(pika, selected);
     }
-    match resolve_named_target(pika, name, false, LocalTargetDomain::Daily)? {
+    match resolve_named_target(pika, name, false, LocalTargetDomain::Daily, true)? {
         Some(NamedTarget::Remote(remote)) => {
             if let Some(code) = maybe_open_client_window(
                 pika,
@@ -1723,37 +1771,115 @@ fn choose_session(mut sessions: Vec<Session>, prompt: &str) -> Result<Session> {
         return Ok(sessions.remove(0));
     }
     if !io::stdin().is_terminal() {
-        bail!(
-            "{} conversations match; use PROVIDER:NAME or the exact UUID.",
-            sessions.len()
-        )
+        bail!(noninteractive_choice_message(&sessions))
     }
-    println!("{prompt}:");
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let stderr = io::stderr();
+    let mut errors = stderr.lock();
+    choose_session_with_io(sessions, prompt, &mut input, &mut output, &mut errors)
+}
+
+fn noninteractive_choice_message(sessions: &[Session]) -> String {
+    let identities = sessions
+        .iter()
+        .map(|session| format!("{}:{}", session.provider, session.session_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "AMBIGUOUS TARGET · {} conversations match. Run interactively to choose, or use one exact identity: {identities}. No action was taken.",
+        sessions.len()
+    )
+}
+
+fn safe_choice_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn short_choice_path(value: &str) -> String {
+    const LIMIT: usize = 42;
+    let characters = safe_choice_text(value).chars().collect::<Vec<_>>();
+    if characters.len() <= LIMIT {
+        return characters.into_iter().collect();
+    }
+    format!(
+        "…{}",
+        characters[characters.len() - (LIMIT - 1)..]
+            .iter()
+            .collect::<String>()
+    )
+}
+
+fn choose_session_with_io<R: BufRead, W: Write, E: Write>(
+    mut sessions: Vec<Session>,
+    prompt: &str,
+    input: &mut R,
+    output: &mut W,
+    errors: &mut E,
+) -> Result<Session> {
+    sessions.sort_by(|left, right| {
+        left.status
+            .attention_order()
+            .cmp(&right.status.attention_order())
+            .then_with(|| right.last_activity_at.total_cmp(&left.last_activity_at))
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    writeln!(output, "{}; Pika will not guess:", safe_choice_text(prompt))?;
     for (index, session) in sessions.iter().enumerate() {
-        println!(
-            "  {}. {:<8} {} · {} · {}",
+        let branch = session
+            .branch
+            .as_deref()
+            .map(safe_choice_text)
+            .map(|value| format!(" [{value}]"))
+            .unwrap_or_default();
+        writeln!(
+            output,
+            "  {}. {:<8} {} · id {} · {}{} · {} ago · {}",
             index + 1,
             session.provider,
-            session.display_name(),
-            session.cwd.as_deref().unwrap_or("directory unavailable"),
-            session.session_id.chars().take(8).collect::<String>()
-        );
+            safe_choice_text(&session.display_name()),
+            session.session_id.chars().take(8).collect::<String>(),
+            session
+                .cwd
+                .as_deref()
+                .map(short_choice_path)
+                .unwrap_or_else(|| "directory unavailable".to_owned()),
+            branch,
+            short_age(session.last_activity_at),
+            session.status,
+        )?;
     }
-    print!("Enter a number, or press Enter to cancel: ");
-    io::stdout().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    if answer.trim().is_empty() {
-        bail!("No conversation opened.")
+    loop {
+        write!(output, "Enter 1-{}, or q to cancel: ", sessions.len())?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            bail!("Selection cancelled; nothing was opened.")
+        }
+        let answer = answer.trim();
+        if answer.eq_ignore_ascii_case("q") || answer == "\u{1b}" || answer.is_empty() {
+            bail!("Selection cancelled; nothing was opened.")
+        }
+        if let Ok(index) = answer.parse::<usize>()
+            && (1..=sessions.len()).contains(&index)
+        {
+            return Ok(sessions[index - 1].clone());
+        }
+        writeln!(errors, "Please enter one of the displayed numbers.")?;
+        errors.flush()?;
     }
-    let index = answer
-        .trim()
-        .parse::<usize>()
-        .context("enter one listed conversation number")?;
-    sessions
-        .get(index.saturating_sub(1))
-        .cloned()
-        .context("conversation choice is out of range")
 }
 
 fn repository_root(path: &std::path::Path) -> PathBuf {
@@ -1798,7 +1924,7 @@ fn next(pika: &Pika) -> Result<i32> {
     }
 }
 fn peek(pika: &Pika, a: PeekArgs) -> Result<i32> {
-    match resolve_named_target(pika, &a.name, true, LocalTargetDomain::Daily)? {
+    match resolve_named_target(pika, &a.name, true, LocalTargetDomain::Daily, true)? {
         Some(NamedTarget::Remote(remote)) => {
             let manager = FleetManager::new(&pika.store, SshTransport::default());
             println!(
@@ -1857,7 +1983,7 @@ mod peek_ack_tests {
     }
 }
 fn untrack(pika: &Pika, name: &str) -> Result<i32> {
-    match resolve_named_target(pika, name, true, LocalTargetDomain::Daily)? {
+    match resolve_named_target(pika, name, true, LocalTargetDomain::Daily, true)? {
         Some(NamedTarget::Remote(remote)) => {
             FleetManager::new(&pika.store, SshTransport::default())
                 .untrack(&remote, None)
@@ -1893,7 +2019,7 @@ fn untrack_exact(pika: &Pika, s: Session) -> Result<i32> {
 fn wait(pika: &Pika, a: WaitArgs) -> Result<i32> {
     let selected = local_wait_target(
         &a.name,
-        resolve_named_target(pika, &a.name, true, LocalTargetDomain::Daily)?,
+        resolve_named_target(pika, &a.name, true, LocalTargetDomain::Daily, true)?,
     )?;
     let initial = pika
         .reconcile_local()?
@@ -2317,7 +2443,7 @@ fn expert(pika: &Pika, a: ExpertArgs) -> Result<i32> {
 }
 
 fn select_expert_target(pika: &Pika, name: &str) -> Result<Session> {
-    match resolve_named_target(pika, name, false, LocalTargetDomain::Expert)? {
+    match resolve_named_target(pika, name, false, LocalTargetDomain::Expert, true)? {
         Some(NamedTarget::Remote(remote)) => {
             let node = pika
                 .store
@@ -2346,7 +2472,7 @@ fn split_values(v: Vec<String>) -> Vec<String> {
         .collect()
 }
 fn explain(pika: &Pika, a: ExplainArgs) -> Result<i32> {
-    let target = resolve_named_target(pika, &a.name, false, LocalTargetDomain::Daily)?
+    let target = resolve_named_target(pika, &a.name, false, LocalTargetDomain::Daily, !a.json)?
         .with_context(|| format!("No exact conversation named {:?}.", a.name))?;
     let (s, remote) = match target {
         NamedTarget::Remote(remote) => (remote.session.clone(), Some(remote)),
@@ -3758,7 +3884,13 @@ mod consultation_jsonl_schema_tests {
 }
 
 fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
-    let resolved = match resolve_named_target(pika, &a.name, false, LocalTargetDomain::Expert) {
+    let resolved = match resolve_named_target(
+        pika,
+        &a.name,
+        false,
+        LocalTargetDomain::Expert,
+        !a.json && !a.jsonl,
+    ) {
         Ok(target) => target,
         Err(error) if a.jsonl => {
             return Ok(jsonl_preparation_failure(
@@ -5103,6 +5235,7 @@ mod fleet_consultation_tests {
         let mut local = fixture_session(root.path());
         local.name = Some("work@atlas".into());
         let mut remote_session = fixture_session(root.path());
+        remote_session.provider = Provider::Claude;
         remote_session.name = Some("work".into());
         remote_session.session_id = "22222222-2222-4222-8222-222222222222".into();
         let remote = fleet::FleetSession {
@@ -5121,14 +5254,90 @@ mod fleet_consultation_tests {
             current_state_status: None,
         };
 
-        let local_only = combine_named_targets("work@atlas", vec![local.clone()], None).unwrap();
+        let local_only =
+            combine_named_targets("work@atlas", vec![local.clone()], None, true).unwrap();
         let wait_target = local_wait_target("work@atlas", local_only).unwrap();
         assert_eq!(wait_target.session_id, local.session_id);
-        let error = combine_named_targets("work@atlas", vec![local], Some(remote)).unwrap_err();
+        let error =
+            combine_named_targets("work@atlas", vec![local], Some(remote), true).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("AMBIGUOUS TARGET"));
-        assert!(message.contains("exact local UUID"));
+        assert!(message.contains("codex:workstream"));
+        assert!(message.contains("claude 22222222-2222-4222-8222-222222222222@atlas"));
         assert!(message.contains("no action was taken"));
+    }
+
+    #[test]
+    fn local_collision_lists_exact_identities_without_a_terminal() {
+        let root = tempfile::tempdir().unwrap();
+        let first = fixture_session(root.path());
+        let mut second = first.clone();
+        second.provider = Provider::Claude;
+        second.session_id = "22222222-2222-4222-8222-222222222222".into();
+        let error = combine_named_targets("expert", vec![first, second], None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("codex:workstream"));
+        assert!(error.contains("claude:22222222-2222-4222-8222-222222222222"));
+        assert!(error.contains("No action was taken"));
+    }
+
+    #[test]
+    fn interactive_collision_retries_shows_evidence_and_selects_exact_row() {
+        let root = tempfile::tempdir().unwrap();
+        let mut first = fixture_session(root.path());
+        first.session_id = "11111111-1111-4111-8111-111111111111".into();
+        first.branch = Some("main".into());
+        first.status = Status::NeedsYou;
+        first.last_activity_at = now() - 120.0;
+        let mut second = first.clone();
+        second.provider = Provider::Claude;
+        second.session_id = "22222222-2222-4222-8222-222222222222".into();
+        second.status = Status::Working;
+        let mut input = std::io::Cursor::new(b"not-a-number\n9\n2\n".to_vec());
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        let selected = choose_session_with_io(
+            vec![second.clone(), first],
+            "Several conversations match \"expert\"",
+            &mut input,
+            &mut output,
+            &mut errors,
+        )
+        .unwrap();
+        assert_eq!(selected.provider, Provider::Claude);
+        assert_eq!(selected.session_id, second.session_id);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("id 11111111"));
+        assert!(output.contains("id 22222222"));
+        assert!(output.contains("[main]"));
+        assert!(output.contains("NEEDS YOU"));
+        assert!(output.contains("WORKING"));
+        assert_eq!(
+            String::from_utf8(errors).unwrap(),
+            "Please enter one of the displayed numbers.\nPlease enter one of the displayed numbers.\n"
+        );
+    }
+
+    #[test]
+    fn interactive_collision_cancels_without_a_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let first = fixture_session(root.path());
+        let mut second = first.clone();
+        second.session_id = "22222222-2222-4222-8222-222222222222".into();
+        let mut input = std::io::Cursor::new(b"q\n".to_vec());
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        let error = choose_session_with_io(
+            vec![first, second],
+            "Choose",
+            &mut input,
+            &mut output,
+            &mut errors,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "Selection cancelled; nothing was opened.");
     }
 
     #[test]
@@ -5180,7 +5389,8 @@ mod fleet_consultation_tests {
         );
 
         let selected =
-            resolve_named_target(&pika, "work@atlas", true, LocalTargetDomain::Daily).unwrap();
+            resolve_named_target(&pika, "work@atlas", true, LocalTargetDomain::Daily, true)
+                .unwrap();
         assert!(matches!(selected, Some(NamedTarget::Local(_))));
     }
 
@@ -5218,6 +5428,9 @@ mod fleet_consultation_tests {
         let matches = resolve_expert_local(&pika, "unwatched_expert").unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].session_id, session.session_id);
+        let prefix = resolve_expert_local(&pika, "11111111-1111").unwrap();
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(prefix[0].session_id, session.session_id);
         assert!(
             pika.store
                 .is_untracked(session.provider, &session.session_id)
