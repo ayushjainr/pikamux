@@ -1,28 +1,6 @@
 # Changelog
 
-## 0.6.4 — consistent fleet snapshots
-
-- Preserve timestamp precision across JSON and SQLite so valid remote snapshots
-  are not rejected after a round trip.
-- Exercise terminal attachment with the native recorder on both Linux and macOS.
-
-## 0.6.3 — native distribution
-
-- Validate installation archives using executables without development symbols.
-- Publish native downloads for macOS, Linux, and the Windows client.
-
-## 0.6.2 — Linux process recovery
-
-- Recognize exited, unreaped Linux processes as stopped so graceful handover
-  can finish without a false timeout.
-- Keep host-board code out of the Windows client build.
-
-## 0.6.1 — cross-platform native release
-
-- Correct platform-specific compilation for Linux hosts and the Windows client.
-- Keep release validation aligned with the published version and dependency notices.
-
-## 0.6.0 — Pika in Rust
+## 0.6.5 — Pika in Rust
 
 - Ship a small native executable for macOS and Linux, with prebuilt downloads
   ready to run.
@@ -31,6 +9,9 @@
 - Reduce board startup, redraw latency, background CPU, and memory use. See
   [measured performance](docs/PERFORMANCE.md) for the benchmark details.
 - Preserve existing conversation identities, expert cards, and local state.
+- Preserve timestamp precision in fleet snapshots and recognize exited Linux
+  processes without false recovery errors.
+- Verify attached clients across tmux versions that encode terminal fields differently.
 - Verify native release downloads before activation and retain prior native
   releases for `pika update --rollback`.
 - Include an experimental native Windows client for pairing with a Pika host.

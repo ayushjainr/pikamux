@@ -274,7 +274,7 @@ impl Tmux {
             String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .find_map(|line| {
-                    let mut fields = line.split(SEPARATOR);
+                    let mut fields = tmux_fields(line);
                     let client = fields.next()?;
                     let pid = fields.next()?;
                     let pane = fields.next()?;
@@ -1126,12 +1126,18 @@ fn bounded_output(command: &mut Command, timeout: Duration) -> Result<Output> {
     }
 }
 
-fn parse_pane(line: &str) -> Option<Pane> {
-    let parts: Vec<_> = if line.contains(SEPARATOR) {
-        line.split(SEPARATOR).collect()
+fn tmux_fields(line: &str) -> impl Iterator<Item = &str> {
+    // Some tmux versions escape the control separator when writing formats.
+    // Inventory and attachment proof must decode the same wire representation.
+    line.split(if line.contains(SEPARATOR) {
+        SEPARATOR
     } else {
-        line.split(r"\037").collect()
-    };
+        r"\037"
+    })
+}
+
+fn parse_pane(line: &str) -> Option<Pane> {
+    let parts: Vec<_> = tmux_fields(line).collect();
     if parts.len() != 16 {
         return None;
     }
@@ -1355,6 +1361,25 @@ mod tests {
             .join(SEPARATOR),
         )
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attached_client_accepts_raw_and_escaped_fields_but_requires_exact_identity() {
+        for separator in [SEPARATOR, r"\037"] {
+            let temp = tempfile::tempdir().unwrap();
+            let row = ["/dev/pts/2", "10783", "%0"].join(separator);
+            let tmux = tmux_fixture(
+                &temp,
+                &format!("printf '%s\\n' {}", shell_words::quote(&row)),
+            );
+            assert_eq!(
+                tmux.attached_client_name(10783, "%0").as_deref(),
+                Some("/dev/pts/2")
+            );
+            assert_eq!(tmux.attached_client_name(10784, "%0"), None);
+            assert_eq!(tmux.attached_client_name(10783, "%1"), None);
+        }
     }
 
     #[cfg(unix)]
