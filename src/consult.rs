@@ -633,6 +633,7 @@ struct JsonChild {
     writes: Option<mpsc::Sender<WriteRequest>>,
     frames: Option<Receiver<Result<Value, String>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    pipe_stop: CancellationToken,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -662,6 +663,21 @@ impl JsonChild {
             .stderr
             .take()
             .context("provider stderr was unavailable")?;
+        let pipe_stop = CancellationToken::default();
+        let pipes = (|| -> std::io::Result<_> {
+            Ok((
+                CancellablePipe::new(stdin, pipe_stop.clone())?,
+                CancellablePipe::new(stdout, pipe_stop.clone())?,
+                CancellablePipe::new(stderr_pipe, pipe_stop.clone())?,
+            ))
+        })();
+        let (stdin, stdout, stderr_pipe) = match pipes {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                let _ = terminate_child(&mut child);
+                return Err(error).context("could not prepare cancellable provider pipes");
+            }
+        };
         let (sender, frames) = mpsc::sync_channel(1);
         let frame_worker = thread::spawn(move || read_json_frames(stdout, sender));
         let stderr = Arc::new(Mutex::new(Vec::new()));
@@ -674,6 +690,7 @@ impl JsonChild {
             writes: Some(writes),
             frames: Some(frames),
             stderr,
+            pipe_stop,
             workers: vec![frame_worker, stderr_worker, write_worker],
         })
     }
@@ -771,10 +788,11 @@ impl JsonChild {
 
     fn terminate(&mut self) -> Result<()> {
         let result = terminate_child(&mut self.child);
-        // Closing both channel ends releases readers blocked on a full frame
-        // queue and the stdin writer blocked waiting for its next request.
-        // The killed process closes the OS pipes, so all three owned helpers
-        // can be joined instead of silently outliving the consultation.
+        // Never depend on process-group termination to close inherited pipe
+        // descriptors: a provider helper may have deliberately moved into a
+        // foreign group which Pika must not signal. Cancel the nonblocking pipe
+        // loops before joining every helper owned by this consultation.
+        self.pipe_stop.cancel();
         self.writes.take();
         self.frames.take();
         for worker in self.workers.drain(..) {
@@ -784,7 +802,7 @@ impl JsonChild {
     }
 }
 
-fn write_requests_loop(mut stdin: ChildStdin, requests: Receiver<WriteRequest>) {
+fn write_requests_loop(mut stdin: impl Write, requests: Receiver<WriteRequest>) {
     for request in requests {
         let result = stdin
             .write_all(&request.bytes)
@@ -1368,6 +1386,8 @@ struct OpenCodeSide {
     fork_uncertain: bool,
     turn_process: Option<OwnedChild>,
     turn_stderr: Option<Arc<Mutex<Vec<u8>>>>,
+    turn_pipe_stop: Option<CancellationToken>,
+    turn_pipe_worker: Option<thread::JoinHandle<()>>,
     fork_server: Option<OwnedChild>,
     closed: bool,
     cancellation: CancellationToken,
@@ -1405,6 +1425,8 @@ impl OpenCodeSide {
             fork_uncertain: false,
             turn_process: None,
             turn_stderr: None,
+            turn_pipe_stop: None,
+            turn_pipe_worker: None,
             fork_server: None,
             closed: false,
             cancellation: options.cancellation.clone(),
@@ -1543,6 +1565,33 @@ impl OpenCodeSide {
         Ok(id.to_owned())
     }
 
+    fn stop_turn_pipes(&mut self) {
+        if let Some(stop) = self.turn_pipe_stop.take() {
+            stop.cancel();
+        }
+        if let Some(worker) = self.turn_pipe_worker.take() {
+            let _ = worker.join();
+        }
+    }
+
+    /// Stop only the process group created for this side turn, then release its
+    /// pipe worker cooperatively. A descendant which escaped that group is
+    /// foreign: it may retain stderr, but Pika neither signals nor waits for it.
+    fn terminate_turn(&mut self) -> Result<String> {
+        let result = self.turn_process.as_mut().map_or(Ok(()), terminate_child);
+        self.stop_turn_pipes();
+        let detail = self
+            .turn_stderr
+            .as_ref()
+            .map(stderr_tail)
+            .unwrap_or_default();
+        self.turn_stderr = None;
+        if result.is_ok() {
+            self.turn_process = None;
+        }
+        result.map(|()| detail)
+    }
+
     fn ask(
         &mut self,
         question: &str,
@@ -1611,23 +1660,33 @@ impl OpenCodeSide {
         *delivery = Delivery::Unknown;
         progress(*delivery);
         let stderr = Arc::new(Mutex::new(Vec::new()));
-        if let Some(pipe) = child.stderr.take() {
-            let stderr_copy = Arc::clone(&stderr);
-            let _ = thread::spawn(move || drain_bounded(pipe, stderr_copy));
-        }
+        let pipe_stop = CancellationToken::default();
+        let pipe = child.stderr.take().expect("stderr configured");
+        let pipe = match CancellablePipe::new(pipe, pipe_stop.clone()) {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                let cleanup = if terminate_child(&mut child).is_ok() {
+                    Cleanup::Pending
+                } else {
+                    Cleanup::Failed
+                };
+                return Err(SideFailure::turn_with_cleanup(
+                    format!("could not prepare cancellable OpenCode stderr: {error}"),
+                    *delivery,
+                    cleanup,
+                ));
+            }
+        };
+        let stderr_copy = Arc::clone(&stderr);
+        let pipe_worker = thread::spawn(move || drain_bounded(pipe, stderr_copy));
         self.turn_process = Some(child);
         self.turn_stderr = Some(stderr);
+        self.turn_pipe_stop = Some(pipe_stop);
+        self.turn_pipe_worker = Some(pipe_worker);
         let deadline = Instant::now() + self.timeout;
         loop {
             if self.cancellation.is_cancelled() {
-                let mut terminated = true;
-                if let Some(process) = &mut self.turn_process {
-                    terminated = terminate_child(process).is_ok();
-                }
-                if terminated {
-                    self.turn_process = None;
-                    self.turn_stderr = None;
-                }
+                let terminated = self.terminate_turn().is_ok();
                 return Err(SideFailure::turn_with_cleanup(
                     "OpenCode side consultation cancelled",
                     *delivery,
@@ -1642,14 +1701,7 @@ impl OpenCodeSide {
                 Ok((_seen_user, Some(answer))) => {
                     *delivery = Delivery::Confirmed;
                     progress(*delivery);
-                    let mut terminated = true;
-                    if let Some(process) = &mut self.turn_process {
-                        terminated = terminate_child(process).is_ok();
-                    }
-                    if terminated {
-                        self.turn_process = None;
-                        self.turn_stderr = None;
-                    }
+                    let _ = self.terminate_turn();
                     return Ok(answer);
                 }
                 Ok((true, None)) => {
@@ -1664,20 +1716,15 @@ impl OpenCodeSide {
                 .as_mut()
                 .and_then(|process| poll_owned_child(process).ok().flatten());
             if exited.is_some() {
-                if let Ok((seen_user, Some(answer))) = self.completed_answer(&target, checkpoint) {
+                let completed = self.completed_answer(&target, checkpoint);
+                let detail = self.terminate_turn().unwrap_or_default();
+                if let Ok((seen_user, Some(answer))) = completed {
                     if seen_user {
                         *delivery = Delivery::Confirmed;
                         progress(*delivery);
                     }
-                    self.turn_process = None;
                     return Ok(answer);
                 }
-                let detail = self
-                    .turn_stderr
-                    .as_ref()
-                    .map(stderr_tail)
-                    .unwrap_or_default();
-                self.turn_process = None;
                 return Err(SideFailure::turn(
                     format!(
                         "OpenCode side turn exited before a completed answer{}",
@@ -1691,14 +1738,7 @@ impl OpenCodeSide {
                 ));
             }
             if Instant::now() >= deadline {
-                let mut terminated = true;
-                if let Some(process) = &mut self.turn_process {
-                    terminated = terminate_child(process).is_ok();
-                }
-                if terminated {
-                    self.turn_process = None;
-                    self.turn_stderr = None;
-                }
+                let _ = self.terminate_turn();
                 return Err(SideFailure::turn(
                     "OpenCode side consultation timed out",
                     *delivery,
@@ -1769,10 +1809,7 @@ impl OpenCodeSide {
             terminate_child(server)?;
         }
         self.fork_server = None;
-        if let Some(process) = &mut self.turn_process {
-            terminate_child(process)?;
-        }
-        self.turn_process = None;
+        self.terminate_turn()?;
         let Some(thread_id) = self.thread_id.as_deref() else {
             if self.fork_uncertain {
                 bail!(
@@ -2441,7 +2478,115 @@ fn decode_chunked(mut value: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Cursor;
+
+    #[cfg(unix)]
+    struct EscapedPipeHolder {
+        pid_path: PathBuf,
+        release_path: PathBuf,
+        done_path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl EscapedPipeHolder {
+        fn new(root: &Path) -> Self {
+            Self {
+                pid_path: root.join("escaped.pid"),
+                release_path: root.join("release"),
+                done_path: root.join("escaped.done"),
+            }
+        }
+
+        fn command(&self) -> Command {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "consult::tests::escaped_pipe_holder_fixture",
+                    "--nocapture",
+                ])
+                .env("PIKA_TEST_ESCAPED_PID", &self.pid_path)
+                .env("PIKA_TEST_ESCAPED_RELEASE", &self.release_path)
+                .env("PIKA_TEST_ESCAPED_DONE", &self.done_path);
+            command
+        }
+
+        fn wait_until_started(&self) -> i32 {
+            for _ in 0..500 {
+                if let Ok(value) = fs::read_to_string(&self.pid_path) {
+                    return value.parse().unwrap();
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            panic!("escaped pipe holder did not start");
+        }
+
+        fn release(&self) {
+            fs::write(&self.release_path, b"release").unwrap();
+            for _ in 0..500 {
+                if self.done_path.is_file() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            panic!("escaped pipe holder did not stop");
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EscapedPipeHolder {
+        fn drop(&mut self) {
+            if !self.release_path.exists() {
+                let _ = fs::write(&self.release_path, b"release");
+            }
+        }
+    }
+
+    /// Re-enter this test binary as the owned launcher, then move its child to a
+    /// different process group while retaining the launcher's standard pipes.
+    /// The parent tests below own the fixture lifetime; Pika must not signal it.
+    #[cfg(unix)]
+    #[test]
+    fn escaped_pipe_holder_fixture() {
+        let (Ok(pid_path), Ok(release_path), Ok(done_path)) = (
+            std::env::var("PIKA_TEST_ESCAPED_PID"),
+            std::env::var("PIKA_TEST_ESCAPED_RELEASE"),
+            std::env::var("PIKA_TEST_ESCAPED_DONE"),
+        ) else {
+            return;
+        };
+        let mut holder = Command::new("/bin/sh");
+        holder
+            .args([
+                "-c",
+                "while [ ! -e \"$1\" ]; do sleep 0.01; done; printf done > \"$2\"",
+                "pika-escaped-holder",
+                &release_path,
+                &done_path,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .process_group(0);
+        let child = holder.spawn().unwrap();
+        let child_pid = child.id();
+        // This helper deliberately exits without reaping: the parent test
+        // owns the escaped fixture through its release/done files.
+        std::mem::forget(child);
+        fs::write(pid_path, child_pid.to_string()).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn wait_for_launcher_exit(child: &mut OwnedChild) {
+        for _ in 0..500 {
+            if owned_child_exited(child).unwrap() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("fixture launcher did not exit");
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2463,7 +2608,76 @@ mod tests {
         assert!(child.workers.is_empty());
         assert!(child.frames.is_none());
         assert!(child.writes.is_none());
+        assert!(child.pipe_stop.is_cancelled());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_child_cleanup_does_not_wait_for_or_signal_escaped_pipe_holder() {
+        let root = tempfile::tempdir().unwrap();
+        let holder = EscapedPipeHolder::new(root.path());
+        let mut child = JsonChild::spawn(holder.command()).unwrap();
+        let holder_pid = holder.wait_until_started();
+        wait_for_launcher_exit(&mut child.child);
+
+        let started = Instant::now();
+        child.terminate().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.workers.is_empty());
+        // SAFETY: signal zero only probes the fixture process and cannot alter it.
+        assert_eq!(unsafe { libc::kill(holder_pid, 0) }, 0);
+        holder.release();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_turn_cleanup_joins_stderr_without_signalling_escaped_holder() {
+        let root = tempfile::tempdir().unwrap();
+        let holder = EscapedPipeHolder::new(root.path());
+        let mut command = holder.command();
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut process = OwnedChild::spawn(&mut command).unwrap();
+        let pipe_stop = CancellationToken::default();
+        let pipe = CancellablePipe::new(
+            process.stderr.take().expect("stderr configured"),
+            pipe_stop.clone(),
+        )
+        .unwrap();
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr_copy = Arc::clone(&stderr);
+        let pipe_worker = thread::spawn(move || drain_bounded(pipe, stderr_copy));
+        let holder_pid = holder.wait_until_started();
+        wait_for_launcher_exit(&mut process);
+
+        let mut side = OpenCodeSide {
+            parent_id: "ses_parent".into(),
+            cwd: None,
+            executable: PathBuf::from("/bin/false"),
+            database: root.path().join("unused.db"),
+            model: None,
+            timeout: Duration::from_secs(1),
+            thread_id: None,
+            fork_uncertain: false,
+            turn_process: Some(process),
+            turn_stderr: Some(stderr),
+            turn_pipe_stop: Some(pipe_stop),
+            turn_pipe_worker: Some(pipe_worker),
+            fork_server: None,
+            closed: false,
+            cancellation: CancellationToken::default(),
+        };
+        let started = Instant::now();
+        side.terminate_turn().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(side.turn_process.is_none());
+        assert!(side.turn_pipe_worker.is_none());
+        // SAFETY: signal zero only probes the fixture process and cannot alter it.
+        assert_eq!(unsafe { libc::kill(holder_pid, 0) }, 0);
+        holder.release();
     }
 
     #[cfg(unix)]
