@@ -1,10 +1,11 @@
 use pikamux::consult::CancellationToken;
 use pikamux::fleet::{
     CAPABILITIES, ConsultationPolicy, ConsultationTimeouts, FleetError, FleetErrorKind,
-    FleetManager, FleetService, FleetSession, FleetTransport, MAX_CACHED_FLEET_ROWS,
-    MAX_SNAPSHOT_SESSIONS, NodeCandidate, PROTOCOL_NAME, PROTOCOL_VERSION, RemoteConsultation,
-    SshTransport, bound_snapshot_for_transport, discover_node_candidates, discover_ssh_candidates,
-    handle_fleet_stdio, next_remote_node, session_to_wire, validate_snapshot,
+    FleetManager, FleetService, FleetSession, FleetTransport, MAX_CACHED_FLEET_BYTES,
+    MAX_CACHED_FLEET_ROWS, MAX_SNAPSHOT_SESSIONS, NodeCandidate, PROTOCOL_NAME, PROTOCOL_VERSION,
+    RemoteConsultation, SshTransport, bound_snapshot_for_transport, discover_node_candidates,
+    discover_ssh_candidates, handle_fleet_stdio, next_remote_node, session_to_wire,
+    validate_snapshot,
 };
 use pikamux::model::{Candidate, FleetNode, Provider, Session, Status};
 use pikamux::store::Store;
@@ -14,7 +15,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -487,6 +488,123 @@ fn cached_fleet_accepts_twenty_small_nodes_and_fairly_slices_aggregate_rows() {
         rows_per_node,
         "exact-machine reads must not inherit the aggregate slice"
     );
+}
+
+#[test]
+fn cached_fleet_twenty_heavy_nodes_parses_only_the_fair_prepaint_projection() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "twenty-heavy.db");
+    let mut node_ids = Vec::new();
+    for node_index in 0..20 {
+        let node_id = Uuid::new_v4().to_string();
+        node_ids.push(node_id.clone());
+        store
+            .upsert_fleet_node(&node(&node_id, &format!("heavy-{node_index}")))
+            .unwrap();
+        let sessions = (0..MAX_SNAPSHOT_SESSIONS)
+            .map(|row_index| {
+                let sequence = node_index * MAX_SNAPSHOT_SESSIONS + row_index;
+                let session_id = format!("00000000-0000-4000-8000-{sequence:012x}");
+                session_to_wire(
+                    &session(
+                        Provider::Codex,
+                        &session_id,
+                        &format!("heavy-{node_index}-{}", "x".repeat(768)),
+                    ),
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let captured_at = now();
+        let payload = json!({
+            "type":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+            "node_id":node_id, "machine":format!("heavy-{node_index}"),
+            "captured_at":captured_at, "sessions":sessions, "profiles":[], "cards":[]
+        });
+        store
+            .put_remote_snapshot(&node_id, &payload, captured_at)
+            .unwrap();
+    }
+
+    let per_node_bytes = MAX_CACHED_FLEET_BYTES / node_ids.len();
+    let per_node_rows = MAX_CACHED_FLEET_ROWS / node_ids.len();
+    let mut parsed_projection_bytes = 0_usize;
+    let mut authoritative_snapshot_bytes = 0_usize;
+    for node_id in &node_ids {
+        let projection = store
+            .get_remote_board_projection(node_id, per_node_bytes, per_node_rows)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.rows.len(), per_node_rows);
+        parsed_projection_bytes += projection.input_bytes;
+        authoritative_snapshot_bytes += projection.source_encoded_bytes;
+    }
+    assert!(authoritative_snapshot_bytes > MAX_CACHED_FLEET_BYTES);
+    assert!(parsed_projection_bytes <= MAX_CACHED_FLEET_BYTES);
+
+    let fake = FakeTransport::default();
+    let manager = FleetManager::new(&store, &fake);
+    let started = Instant::now();
+    let cached = manager.cached_sessions_with_notices(None, false).unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(cached.sessions.len(), MAX_CACHED_FLEET_ROWS);
+    assert_eq!(cached.notices.len(), node_ids.len());
+    for node_index in 0..20 {
+        let alias = format!("heavy-{node_index}");
+        assert_eq!(
+            cached
+                .sessions
+                .iter()
+                .filter(|session| session.node_name == alias)
+                .count(),
+            per_node_rows
+        );
+    }
+    eprintln!(
+        "20-heavy-node cached board parsed {parsed_projection_bytes} of {authoritative_snapshot_bytes} source bytes in {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "bounded cached first frame took {elapsed:?}"
+    );
+}
+
+#[test]
+fn remote_name_resolution_exposes_exact_candidates_and_error_routes() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "resolve-candidates.db");
+    let node_id = Uuid::new_v4().to_string();
+    store.upsert_fleet_node(&node(&node_id, "atlas")).unwrap();
+    let mut payload = snapshot(&node_id, CODEX_THREAD_ID);
+    payload["sessions"] = json!([
+        session_to_wire(
+            &session(Provider::Codex, CODEX_THREAD_ID, "same-name"),
+            false
+        ),
+        session_to_wire(
+            &session(Provider::Claude, CLAUDE_THREAD_ID, "same-name"),
+            false
+        ),
+    ]);
+    store
+        .put_remote_snapshot(&node_id, &payload, now())
+        .unwrap();
+    let fake = FakeTransport::default();
+    let manager = FleetManager::new(&store, &fake);
+
+    let candidates = manager
+        .resolve_candidates("same-name@atlas", false, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidates.len(), 2);
+    let error = manager
+        .resolve("same-name@atlas", false, false)
+        .unwrap_err();
+    assert_eq!(error.kind, FleetErrorKind::InvalidRequest);
+    assert!(error.message.contains(&format!("{CODEX_THREAD_ID}@atlas")));
+    assert!(error.message.contains(&format!("{CLAUDE_THREAD_ID}@atlas")));
+    assert!(!error.message.contains("codex:"));
+    assert!(!error.message.contains("claude:"));
 }
 
 #[test]

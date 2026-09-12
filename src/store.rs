@@ -7,6 +7,7 @@ use fs2::FileExt;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -26,6 +27,11 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 // report the lock explicitly instead of freezing a hook or board action.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(500);
 pub const MAX_REMOTE_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+const REMOTE_BOARD_CACHE_SCHEMA: u32 = 1;
+const REMOTE_BOARD_CACHE_CHUNK_BYTES: usize = 256 * 1024;
+const MAX_REMOTE_BOARD_CACHE_HEADER_BYTES: usize = 256 * 1024;
+const MAX_REMOTE_BOARD_CACHE_BYTES: usize = MAX_REMOTE_SNAPSHOT_BYTES + 512 * 1024;
+const MAX_REMOTE_BOARD_CACHE_CHUNKS: usize = 64;
 
 const SCHEMA: &str = r#"
 CREATE TABLE sessions (
@@ -350,6 +356,66 @@ pub struct RemoteSnapshot {
     pub payload: Value,
     pub captured_at: f64,
     pub encoded_bytes: usize,
+}
+
+/// A bounded board-only projection of one retained remote snapshot.
+///
+/// The complete protocol snapshot remains authoritative for exact actions and
+/// expert search. Aggregate board reads consume only these small chunks, so a
+/// fleet-sized cache cannot multiply pre-paint JSON parsing by every node's
+/// full four-megabyte wire allowance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoteBoardProjection {
+    pub rows: Vec<Value>,
+    pub protocol: String,
+    pub version: i64,
+    pub source_sessions: usize,
+    pub source_captured_at: f64,
+    pub remote_captured_at: f64,
+    pub source_encoded_bytes: usize,
+    pub input_bytes: usize,
+    pub directory_notices: Vec<Value>,
+}
+
+/// Result of a size-gated full-snapshot read. When `snapshot` is `None`, SQLite
+/// returned only metadata and never materialized or parsed the oversized JSON.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundedRemoteSnapshot {
+    pub snapshot: Option<RemoteSnapshot>,
+    pub captured_at: f64,
+    pub encoded_bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteBoardCacheHeader {
+    schema: u32,
+    node_id: String,
+    protocol: String,
+    version: i64,
+    source_captured_at: f64,
+    remote_captured_at: f64,
+    source_encoded_bytes: usize,
+    source_sessions: usize,
+    chunks: Vec<RemoteBoardCacheChunk>,
+    directory_notices: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteBoardCacheChunk {
+    bytes: usize,
+    rows: usize,
+}
+
+struct PreparedRemoteSnapshot {
+    encoded: String,
+    board_cache: Option<PreparedRemoteBoardCache>,
+}
+
+struct PreparedRemoteBoardCache {
+    header: String,
+    chunks: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1825,10 +1891,11 @@ impl Store {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM remote_snapshots WHERE node_id=?", [node_id])?;
         tx.execute(
-            "DELETE FROM meta WHERE key LIKE ? OR key LIKE ? OR key=?",
+            "DELETE FROM meta WHERE key LIKE ? OR key LIKE ? OR key LIKE ? OR key=?",
             params![
                 format!("fleet:pending-adopt:{node_id}:%"),
                 format!("fleet:pending-untrack:{node_id}:%"),
+                remote_board_cache_pattern(node_id),
                 fleet_refresh_generation_key(node_id),
             ],
         )?;
@@ -1993,13 +2060,7 @@ impl Store {
         payload: &Value,
         captured_at: f64,
     ) -> Result<()> {
-        if !payload.is_object() {
-            bail!("remote snapshot must be a JSON object");
-        }
-        let encoded = serde_json::to_string(payload)?;
-        if encoded.len() > MAX_REMOTE_SNAPSHOT_BYTES {
-            bail!("remote snapshot exceeds the 4 MiB safety limit");
-        }
+        let prepared = prepare_remote_snapshot(node_id, payload, captured_at)?;
         let mut db = self.open_write()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let trusted = tx
@@ -2013,10 +2074,7 @@ impl Store {
         if !trusted {
             bail!("remote snapshot requires an adopted fleet node");
         }
-        tx.execute(
-            "INSERT INTO remote_snapshots(node_id,payload_json,captured_at) VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET payload_json=excluded.payload_json,captured_at=excluded.captured_at",
-            params![node_id, encoded, captured_at],
-        )?;
+        write_remote_snapshot_tx(&tx, node_id, &prepared, captured_at)?;
         tx.execute(
             "UPDATE fleet_nodes SET status='ready',last_seen=?,last_error=NULL,last_attempt_at=?,updated_at=? WHERE node_id=?",
             params![captured_at, captured_at, now(), node_id],
@@ -2036,13 +2094,7 @@ impl Store {
         generation: u64,
     ) -> Result<bool> {
         Uuid::parse_str(&node.node_id).context("fleet node_id is not a UUID")?;
-        if !payload.is_object() {
-            bail!("remote snapshot must be a JSON object");
-        }
-        let encoded = serde_json::to_string(payload)?;
-        if encoded.len() > MAX_REMOTE_SNAPSHOT_BYTES {
-            bail!("remote snapshot exceeds the 4 MiB safety limit");
-        }
+        let prepared = prepare_remote_snapshot(&node.node_id, payload, captured_at)?;
         let mut db = self.open_write()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !fleet_refresh_is_current(&tx, &node.node_id, generation)? {
@@ -2093,10 +2145,7 @@ impl Store {
             last_error=excluded.last_error,updated_at=excluded.updated_at"#,
             params![node.node_id, node.alias, node.ssh_target, sources, node.status, node.protocol_version, node.package_version, capabilities, last_seen, last_attempt_at, node.last_error, created_at, updated_at],
         )?;
-        tx.execute(
-            "INSERT INTO remote_snapshots(node_id,payload_json,captured_at) VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET payload_json=excluded.payload_json,captured_at=excluded.captured_at",
-            params![node.node_id, encoded, captured_at],
-        )?;
+        write_remote_snapshot_tx(&tx, &node.node_id, &prepared, captured_at)?;
         tx.execute(
             "UPDATE fleet_nodes SET status='ready',last_seen=?,last_error=NULL,last_attempt_at=?,updated_at=? WHERE node_id=?",
             params![captured_at, captured_at, timestamp, node.node_id],
@@ -2115,13 +2164,7 @@ impl Store {
         captured_at: f64,
         generation: u64,
     ) -> Result<bool> {
-        if !payload.is_object() {
-            bail!("remote snapshot must be a JSON object");
-        }
-        let encoded = serde_json::to_string(payload)?;
-        if encoded.len() > MAX_REMOTE_SNAPSHOT_BYTES {
-            bail!("remote snapshot exceeds the 4 MiB safety limit");
-        }
+        let prepared = prepare_remote_snapshot(node_id, payload, captured_at)?;
         let mut db = self.open_write()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !fleet_refresh_is_current(&tx, node_id, generation)? {
@@ -2139,10 +2182,7 @@ impl Store {
         if !trusted {
             bail!("remote snapshot requires an adopted fleet node");
         }
-        tx.execute(
-            "INSERT INTO remote_snapshots(node_id,payload_json,captured_at) VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET payload_json=excluded.payload_json,captured_at=excluded.captured_at",
-            params![node_id, encoded, captured_at],
-        )?;
+        write_remote_snapshot_tx(&tx, node_id, &prepared, captured_at)?;
         tx.execute(
             "UPDATE fleet_nodes SET status='ready',last_seen=?,last_error=NULL,last_attempt_at=?,updated_at=? WHERE node_id=?",
             params![captured_at, captured_at, now(), node_id],
@@ -2190,6 +2230,160 @@ impl Store {
             )
             .optional()?;
         Ok(snapshot)
+    }
+
+    /// Read a complete snapshot only when SQLite can prove its encoded payload
+    /// fits the caller's budget. The CASE expression prevents an oversized TEXT
+    /// value from crossing the SQLite/Rust boundary merely to be rejected.
+    pub fn get_remote_snapshot_bounded(
+        &self,
+        node_id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<BoundedRemoteSnapshot>> {
+        if !self.exists() {
+            return Ok(None);
+        }
+        let db = self.open_read()?;
+        let gate = max_bytes.min(MAX_REMOTE_SNAPSHOT_BYTES);
+        let row = db
+            .query_row(
+                "SELECT CASE WHEN length(CAST(payload_json AS BLOB))<=? THEN payload_json ELSE NULL END,captured_at,length(CAST(payload_json AS BLOB)) FROM remote_snapshots WHERE node_id=?",
+                params![i64::try_from(gate)?, node_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((encoded, captured_at, encoded_bytes)) = row else {
+            return Ok(None);
+        };
+        let encoded_bytes =
+            usize::try_from(encoded_bytes).context("stored remote snapshot has a negative size")?;
+        let snapshot = encoded
+            .map(|encoded| -> Result<RemoteSnapshot> {
+                let payload: Value = serde_json::from_str(&encoded)?;
+                if !payload.is_object() {
+                    bail!("stored remote snapshot is not an object");
+                }
+                Ok(RemoteSnapshot {
+                    node_id: node_id.to_owned(),
+                    payload,
+                    captured_at,
+                    encoded_bytes,
+                })
+            })
+            .transpose()?;
+        Ok(Some(BoundedRemoteSnapshot {
+            snapshot,
+            captured_at,
+            encoded_bytes,
+        }))
+    }
+
+    /// Load only complete, prevalidated board-cache chunks which fit the
+    /// caller's per-node row and byte slice. Full remote snapshots remain in
+    /// `remote_snapshots` for exact actions and expert discovery.
+    pub fn get_remote_board_projection(
+        &self,
+        node_id: &str,
+        max_bytes: usize,
+        max_rows: usize,
+    ) -> Result<Option<RemoteBoardProjection>> {
+        if !self.exists() {
+            return Ok(None);
+        }
+        let mut db = self.open_read()?;
+        let tx = db.transaction()?;
+        let source = tx
+            .query_row(
+                "SELECT captured_at,length(CAST(payload_json AS BLOB)) FROM remote_snapshots WHERE node_id=?",
+                [node_id],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((source_captured_at, source_encoded_bytes)) = source else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let source_encoded_bytes = usize::try_from(source_encoded_bytes)
+            .context("stored remote snapshot has a negative size")?;
+        let header_key = remote_board_cache_header_key(node_id);
+        let header = tx
+            .query_row(
+                "SELECT CASE WHEN length(CAST(value AS BLOB))<=? THEN value ELSE NULL END,length(CAST(value AS BLOB)) FROM meta WHERE key=?",
+                params![MAX_REMOTE_BOARD_CACHE_HEADER_BYTES as i64, header_key],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((Some(encoded_header), header_bytes)) = header else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let header_bytes = usize::try_from(header_bytes)
+            .context("stored remote board cache header has a negative size")?;
+        if header_bytes > max_bytes {
+            bail!("stored remote board cache header exceeds its per-node input budget");
+        }
+        let header: RemoteBoardCacheHeader = serde_json::from_str(&encoded_header)
+            .context("stored remote board cache header is malformed")?;
+        if header.schema != REMOTE_BOARD_CACHE_SCHEMA
+            || header.node_id != node_id
+            || header.source_captured_at != source_captured_at
+            || header.source_encoded_bytes != source_encoded_bytes
+            || header.chunks.len() > MAX_REMOTE_BOARD_CACHE_CHUNKS
+            || header.source_sessions > 2_000
+        {
+            bail!("stored remote board cache does not match its source snapshot");
+        }
+        let mut input_bytes = header_bytes;
+        let mut rows = Vec::new();
+        for (index, chunk) in header.chunks.iter().enumerate() {
+            if chunk.bytes == 0
+                || chunk.bytes > MAX_REMOTE_BOARD_CACHE_BYTES
+                || chunk.rows == 0
+                || chunk.rows > 2_000
+            {
+                bail!("stored remote board cache chunk metadata is invalid");
+            }
+            if rows.len() >= max_rows || chunk.bytes > max_bytes.saturating_sub(input_bytes) {
+                break;
+            }
+            let key = remote_board_cache_chunk_key(node_id, index);
+            let encoded = tx
+                .query_row(
+                    "SELECT CASE WHEN length(CAST(value AS BLOB))=? THEN value ELSE NULL END FROM meta WHERE key=?",
+                    params![i64::try_from(chunk.bytes)?, key],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+                .context("stored remote board cache chunk is missing or changed")?;
+            let mut values: Vec<Value> = serde_json::from_str(&encoded)
+                .context("stored remote board cache chunk is malformed")?;
+            if values.len() != chunk.rows {
+                bail!("stored remote board cache chunk row count changed");
+            }
+            input_bytes += chunk.bytes;
+            let remaining_rows = max_rows.saturating_sub(rows.len());
+            values.truncate(remaining_rows);
+            rows.extend(values);
+        }
+        tx.commit()?;
+        Ok(Some(RemoteBoardProjection {
+            rows,
+            protocol: header.protocol,
+            version: header.version,
+            source_sessions: header.source_sessions,
+            source_captured_at,
+            remote_captured_at: header.remote_captured_at,
+            source_encoded_bytes,
+            input_bytes,
+            directory_notices: header.directory_notices,
+        }))
     }
 
     pub fn ignore_node_candidate(&self, candidate_key: &str, ignored_at: f64) -> Result<()> {
@@ -3255,6 +3449,192 @@ fn live_owner_from_row(row: &Row<'_>) -> rusqlite::Result<LiveOwner> {
 
 fn fleet_refresh_generation_key(node_id: &str) -> String {
     format!("fleet:refresh-generation:{node_id}")
+}
+
+fn remote_board_cache_prefix(node_id: &str) -> String {
+    format!("fleet:board-cache:{node_id}:")
+}
+
+fn remote_board_cache_pattern(node_id: &str) -> String {
+    format!("{}%", remote_board_cache_prefix(node_id))
+}
+
+fn remote_board_cache_header_key(node_id: &str) -> String {
+    format!("{}header", remote_board_cache_prefix(node_id))
+}
+
+fn remote_board_cache_chunk_key(node_id: &str, index: usize) -> String {
+    format!("{}chunk:{index:04}", remote_board_cache_prefix(node_id))
+}
+
+fn prepare_remote_snapshot(
+    node_id: &str,
+    payload: &Value,
+    captured_at: f64,
+) -> Result<PreparedRemoteSnapshot> {
+    let object = payload
+        .as_object()
+        .context("remote snapshot must be a JSON object")?;
+    let encoded = serde_json::to_string(payload)?;
+    if encoded.len() > MAX_REMOTE_SNAPSHOT_BYTES {
+        bail!("remote snapshot exceeds the 4 MiB safety limit");
+    }
+    let board_cache = prepare_remote_board_cache(node_id, object, captured_at, encoded.len())?;
+    Ok(PreparedRemoteSnapshot {
+        encoded,
+        board_cache,
+    })
+}
+
+fn prepare_remote_board_cache(
+    node_id: &str,
+    object: &serde_json::Map<String, Value>,
+    captured_at: f64,
+    source_encoded_bytes: usize,
+) -> Result<Option<PreparedRemoteBoardCache>> {
+    let Some(source_node_id) = object.get("node_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(protocol) = object.get("protocol").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(version) = object.get("version").and_then(Value::as_i64) else {
+        return Ok(None);
+    };
+    let Some(remote_captured_at) = object.get("captured_at").and_then(Value::as_f64) else {
+        return Ok(None);
+    };
+    let Some(sessions) = object.get("sessions").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    if source_node_id != node_id || sessions.len() > 2_000 {
+        return Ok(None);
+    }
+    let keyed = |field: &str| {
+        object
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| {
+                let row = value.as_object()?;
+                Some((
+                    (
+                        row.get("provider")?.as_str()?.to_owned(),
+                        row.get("session_id")?.as_str()?.to_owned(),
+                    ),
+                    value,
+                ))
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let profiles = keyed("profiles");
+    let cards = keyed("cards");
+    let mut chunk_rows = Vec::<String>::new();
+    let mut chunk_content_bytes = 0_usize;
+    let mut chunks = Vec::<String>::new();
+    let mut chunk_metadata = Vec::<RemoteBoardCacheChunk>::new();
+    let flush = |rows: &mut Vec<String>,
+                 chunks: &mut Vec<String>,
+                 metadata: &mut Vec<RemoteBoardCacheChunk>| {
+        if rows.is_empty() {
+            return;
+        }
+        let encoded = format!("[{}]", rows.join(","));
+        metadata.push(RemoteBoardCacheChunk {
+            bytes: encoded.len(),
+            rows: rows.len(),
+        });
+        chunks.push(encoded);
+        rows.clear();
+    };
+    for session in sessions {
+        let Some(session_object) = session.as_object() else {
+            return Ok(None);
+        };
+        let Some(key) = session_object
+            .get("provider")
+            .and_then(Value::as_str)
+            .zip(session_object.get("session_id").and_then(Value::as_str))
+            .map(|(provider, session_id)| (provider.to_owned(), session_id.to_owned()))
+        else {
+            return Ok(None);
+        };
+        let row = serde_json::json!({
+            "session": session,
+            "profile": profiles.get(&key).map(|value| (*value).clone()).unwrap_or(Value::Null),
+            "card": cards.get(&key).map(|value| (*value).clone()).unwrap_or(Value::Null),
+        });
+        let encoded_row = serde_json::to_string(&row)?;
+        let next_bytes = 2 + chunk_content_bytes + chunk_rows.len() + encoded_row.len();
+        if !chunk_rows.is_empty() && next_bytes > REMOTE_BOARD_CACHE_CHUNK_BYTES {
+            flush(&mut chunk_rows, &mut chunks, &mut chunk_metadata);
+            chunk_content_bytes = 0;
+        }
+        chunk_content_bytes = chunk_content_bytes
+            .checked_add(encoded_row.len())
+            .context("remote board cache size overflowed")?;
+        chunk_rows.push(encoded_row);
+    }
+    flush(&mut chunk_rows, &mut chunks, &mut chunk_metadata);
+    if chunk_metadata.len() > MAX_REMOTE_BOARD_CACHE_CHUNKS
+        || chunks.iter().map(String::len).sum::<usize>() > MAX_REMOTE_BOARD_CACHE_BYTES
+    {
+        return Ok(None);
+    }
+    let directory_notices = object
+        .get("directory_notices")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let header = serde_json::to_string(&RemoteBoardCacheHeader {
+        schema: REMOTE_BOARD_CACHE_SCHEMA,
+        node_id: node_id.to_owned(),
+        protocol: protocol.to_owned(),
+        version,
+        source_captured_at: captured_at,
+        remote_captured_at,
+        source_encoded_bytes,
+        source_sessions: sessions.len(),
+        chunks: chunk_metadata,
+        directory_notices,
+    })?;
+    if header.len() > MAX_REMOTE_BOARD_CACHE_HEADER_BYTES
+        || header.len() + chunks.iter().map(String::len).sum::<usize>()
+            > MAX_REMOTE_BOARD_CACHE_BYTES
+    {
+        return Ok(None);
+    }
+    Ok(Some(PreparedRemoteBoardCache { header, chunks }))
+}
+
+fn write_remote_snapshot_tx(
+    tx: &Transaction<'_>,
+    node_id: &str,
+    prepared: &PreparedRemoteSnapshot,
+    captured_at: f64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO remote_snapshots(node_id,payload_json,captured_at) VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET payload_json=excluded.payload_json,captured_at=excluded.captured_at",
+        params![node_id, &prepared.encoded, captured_at],
+    )?;
+    tx.execute(
+        "DELETE FROM meta WHERE key LIKE ?",
+        [remote_board_cache_pattern(node_id)],
+    )?;
+    if let Some(cache) = &prepared.board_cache {
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES (?,?)",
+            params![remote_board_cache_header_key(node_id), &cache.header],
+        )?;
+        for (index, chunk) in cache.chunks.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO meta(key,value) VALUES (?,?)",
+                params![remote_board_cache_chunk_key(node_id, index), chunk],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn fleet_refresh_is_current(tx: &Transaction<'_>, node_id: &str, generation: u64) -> Result<bool> {

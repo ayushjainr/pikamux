@@ -2061,8 +2061,150 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
             if node_id.is_some_and(|expected| expected != node.node_id) {
                 continue;
             }
-            let Some(stored) = self.store.get_remote_snapshot(&node.node_id)? else {
-                continue;
+            if aggregate && !include_experts {
+                match self
+                    .store
+                    .get_remote_board_projection(&node.node_id, byte_slice, row_slice)
+                {
+                    Ok(Some(projection)) => {
+                        if projection.protocol != PROTOCOL_NAME
+                            || projection.version != PROTOCOL_VERSION
+                        {
+                            notices.push(cache_input_notice(
+                                &node,
+                                "cache-incompatible",
+                                "cached board projection uses an incompatible fleet protocol",
+                            ));
+                            continue;
+                        }
+                        notices.extend(cache_notices_from_values(
+                            &projection.directory_notices,
+                            &node,
+                        ));
+                        let projected = projection
+                            .rows
+                            .into_iter()
+                            .map(|row| {
+                                let object = row.as_object().ok_or_else(|| {
+                                    FleetError::new(
+                                        FleetErrorKind::Incompatible,
+                                        "cached board projection row is not an object",
+                                    )
+                                })?;
+                                if object.len() != 3
+                                    || !object.contains_key("session")
+                                    || !object.contains_key("card")
+                                    || !object.contains_key("profile")
+                                {
+                                    return Err(FleetError::new(
+                                        FleetErrorKind::Incompatible,
+                                        "cached board projection row has unexpected fields",
+                                    ));
+                                }
+                                let raw = object["session"].clone();
+                                let session = session_from_wire(&raw)?;
+                                Ok((
+                                    raw,
+                                    session,
+                                    object["card"].clone(),
+                                    object["profile"].clone(),
+                                ))
+                            })
+                            .collect::<Result<Vec<_>, FleetError>>();
+                        let Ok(projected) = projected else {
+                            notices.push(cache_input_notice(
+                                &node,
+                                "cache-invalid",
+                                "cached board projection failed validation",
+                            ));
+                            continue;
+                        };
+                        let stale = node.status != "ready"
+                            || projection.source_captured_at > timestamp
+                            || timestamp - projection.source_captured_at > REMOTE_STALE_SECONDS;
+                        let node_wire = json!({
+                            "node_id": node.node_id,
+                            "node_name": node.alias,
+                            "remote_error": node.last_error,
+                        });
+                        let mut retained_rows = 0_usize;
+                        let mut retained_bytes = 0_usize;
+                        for (raw, session, card_value, profile_value) in projected {
+                            let encoded_bytes = [&raw, &card_value, &profile_value, &node_wire]
+                                .into_iter()
+                                .try_fold(0_usize, |total, value| {
+                                    serde_json::to_vec(value)
+                                        .map_err(|error| FleetError::new(FleetErrorKind::Error, error.to_string()))?
+                                        .len()
+                                        .checked_add(total)
+                                        .ok_or_else(|| FleetError::new(FleetErrorKind::Incompatible, "Cached fleet row size overflowed its safety counter"))
+                                })?;
+                            if retained_bytes
+                                .checked_add(encoded_bytes)
+                                .is_none_or(|bytes| bytes > byte_slice)
+                            {
+                                break;
+                            }
+                            result.push(cached_fleet_session(
+                                &node,
+                                session,
+                                stale,
+                                projection.source_captured_at,
+                                projection.remote_captured_at,
+                                card_value.as_object(),
+                                profile_value.as_object(),
+                            ));
+                            retained_rows += 1;
+                            retained_bytes += encoded_bytes;
+                        }
+                        let omitted_rows = projection.source_sessions.saturating_sub(retained_rows);
+                        if omitted_rows > 0 {
+                            notices.push(FleetCacheNotice {
+                                node_id: node.node_id.clone(),
+                                node_name: node.alias.clone(),
+                                kind: "aggregate-truncated".to_owned(),
+                                omitted_rows,
+                                message: format!(
+                                    "{omitted_rows} cached conversation(s) on {} not shown · fair aggregate limit is {row_slice} rows and {} KiB for this machine",
+                                    node.alias,
+                                    byte_slice / 1024,
+                                ),
+                            });
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        notices.push(cache_input_notice(
+                            &node,
+                            "cache-invalid",
+                            "cached board projection failed validation",
+                        ));
+                        continue;
+                    }
+                    Ok(None) => {}
+                }
+            }
+            let stored = if aggregate {
+                let Some(bounded) = self
+                    .store
+                    .get_remote_snapshot_bounded(&node.node_id, byte_slice)?
+                else {
+                    continue;
+                };
+                let Some(snapshot) = bounded.snapshot else {
+                    notices.push(cache_input_notice(
+                        &node,
+                        "aggregate-input-limited",
+                        "cached snapshot exceeds this machine's fair pre-paint budget; it will reappear after its next refresh",
+                    ));
+                    continue;
+                };
+                snapshot
+            } else {
+                let Some(snapshot) = self.store.get_remote_snapshot(&node.node_id)? else {
+                    continue;
+                };
+                snapshot
             };
             let Ok(snapshot) = validate_snapshot(&stored.payload, Some(&node.node_id)) else {
                 continue;
@@ -2385,6 +2527,40 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
         fresh: bool,
         include_experts: bool,
     ) -> Result<Option<FleetSession>, FleetError> {
+        let Some(mut matches) = self.resolve_candidates(query, fresh, include_experts)? else {
+            return Ok(None);
+        };
+        match matches.len() {
+            0 => Err(FleetError::new(
+                FleetErrorKind::NotFound,
+                format!("NOT FOUND ON FRESH LOOKUP: {query}"),
+            )),
+            1 => Ok(matches.pop()),
+            _ => {
+                let routes = matches
+                    .iter()
+                    .map(|item| format!("{}@{}", item.session.session_id, item.node_name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(FleetError::new(
+                    FleetErrorKind::InvalidRequest,
+                    format!(
+                        "Multiple conversations match {query:?}; choose one exact route: {routes}"
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// Return every usable match for a qualified remote query. Interactive
+    /// callers can present these immutable rows without reimplementing cache
+    /// freshness, exact UUID, name, and UUID-prefix precedence.
+    pub fn resolve_candidates(
+        &self,
+        query: &str,
+        fresh: bool,
+        include_experts: bool,
+    ) -> Result<Option<Vec<FleetSession>>, FleetError> {
         let Some((thread, alias)) = query.rsplit_once('@') else {
             return Ok(None);
         };
@@ -2423,19 +2599,7 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 .filter(|item| item.session.session_id.starts_with(thread))
                 .collect();
         }
-        match matches.len() {
-            0 => Err(FleetError::new(
-                FleetErrorKind::NotFound,
-                format!("NOT FOUND ON FRESH LOOKUP: {query}"),
-            )),
-            1 => Ok(matches.pop()),
-            _ => Err(FleetError::new(
-                FleetErrorKind::InvalidRequest,
-                format!(
-                    "Multiple providers have {thread:?} on {alias}; select provider and exact UUID"
-                ),
-            )),
-        }
+        Ok(Some(matches))
     }
 
     pub fn attach(&self, session: &FleetSession) -> Result<i32, FleetError> {
@@ -4146,11 +4310,19 @@ fn keyed_values(value: Option<&Value>) -> BTreeMap<(String, String), Value> {
 }
 
 fn snapshot_cache_notices(snapshot: &Value, node: &FleetNode) -> Vec<FleetCacheNotice> {
-    snapshot
-        .get("directory_notices")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+    cache_notices_from_values(
+        snapshot
+            .get("directory_notices")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+        node,
+    )
+}
+
+fn cache_notices_from_values(notices: &[Value], node: &FleetNode) -> Vec<FleetCacheNotice> {
+    notices
+        .iter()
         .filter_map(|notice| {
             Some(FleetCacheNotice {
                 node_id: node.node_id.clone(),
@@ -4161,6 +4333,16 @@ fn snapshot_cache_notices(snapshot: &Value, node: &FleetNode) -> Vec<FleetCacheN
             })
         })
         .collect()
+}
+
+fn cache_input_notice(node: &FleetNode, kind: &str, detail: &str) -> FleetCacheNotice {
+    FleetCacheNotice {
+        node_id: node.node_id.clone(),
+        node_name: node.alias.clone(),
+        kind: kind.to_owned(),
+        omitted_rows: 0,
+        message: format!("{} · {detail}", node.alias),
+    }
 }
 
 fn cached_fleet_session(
