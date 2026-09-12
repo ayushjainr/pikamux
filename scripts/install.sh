@@ -68,9 +68,26 @@ else
 fi
 
 pika_tmp=$(mktemp -d "${TMPDIR:-/tmp}/pika-install.XXXXXXXX")
+pika_active_probe_pgid=''
+terminate_active_probe() {
+    local pika_probe_pgid=${pika_active_probe_pgid:-}
+    [ -n "$pika_probe_pgid" ] || return 0
+    # Clear ownership before signalling so cleanup stays idempotent. The
+    # monitor-mode wrapper is both process-group leader and the child Bash can
+    # reap; it deliberately remains alive until this exact cleanup path runs.
+    pika_active_probe_pgid=''
+    kill -TERM -- "-$pika_probe_pgid" 2>/dev/null || :
+    sleep 0.1
+    kill -KILL -- "-$pika_probe_pgid" 2>/dev/null || :
+    wait "$pika_probe_pgid" 2>/dev/null || :
+}
 cleanup() {
     local pika_status=$?
     trap - EXIT
+    # Do not let a repeated interrupt strand the group while cleanup is in
+    # progress. Preserve the first signal's conventional exit status.
+    trap '' INT TERM
+    terminate_active_probe
     [ -z "${pika_tmp:-}" ] || rm -rf -- "$pika_tmp"
     exit "$pika_status"
 }
@@ -166,6 +183,12 @@ candidate_probe() {
     # ownership of the PGID until every inherited descendant is terminated.
     mkfifo "$pika_probe_completion"
     exec 9<>"$pika_probe_completion"
+    # Defer an interrupt only across the tiny spawn-to-PGID-publication window.
+    # Once the group identity is recorded, restore the normal exit traps and
+    # replay the first pending exit through the shared cleanup path.
+    local pika_probe_signal_status=''
+    trap 'pika_probe_signal_status=130' INT
+    trap 'pika_probe_signal_status=143' TERM
     set -m
     (
         ulimit -f 1024 2>/dev/null || :
@@ -175,8 +198,11 @@ candidate_probe() {
         printf '%s\n' "$pika_wrapped_status" >&9
         while :; do sleep 60; done
     ) >"$pika_probe_stdout" 2>"$pika_probe_stderr" &
-    local pika_probe_pid=$!
+    pika_active_probe_pgid=$!
     set +m
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    [ -z "$pika_probe_signal_status" ] || exit "$pika_probe_signal_status"
     local pika_probe_status=''
     local pika_probe_completed=0
     if IFS= read -r -t "$pika_probe_timeout" pika_probe_status <&9; then
@@ -185,10 +211,7 @@ candidate_probe() {
     exec 9>&-
     # Clean the exact pinned group on success and failure. This closes output
     # files held by descendants before validation continues.
-    kill -TERM -- "-$pika_probe_pid" 2>/dev/null || :
-    sleep 0.1
-    kill -KILL -- "-$pika_probe_pid" 2>/dev/null || :
-    wait "$pika_probe_pid" 2>/dev/null || :
+    terminate_active_probe
     [ "$pika_probe_completed" -eq 1 ] || \
         fail "Native executable $pika_probe_label timed out after ${pika_probe_timeout}s."
     case "$pika_probe_status" in *[!0-9]*|'') \
