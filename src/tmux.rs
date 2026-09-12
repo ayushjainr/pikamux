@@ -1546,6 +1546,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn failed_proof_callback_never_displays_a_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("trace");
+        let tmux = tmux_fixture(
+            &temp,
+            &format!(
+                "printf '%s\\n' \"$*\" >> {}\ncase \"$*\" in 'display-message -p #{{client_name}}') printf '%s\\n' invoking-client;; esac\nexit 0",
+                shell_words::quote(&trace.to_string_lossy()),
+            ),
+        );
+        let error = tmux
+            .attach_exact_with_started_mode_inner(&exact_test_pane(), true, true, || {
+                anyhow::bail!("identity changed during callback")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
+        assert!(
+            !fs::read_to_string(trace)
+                .unwrap()
+                .contains("-d 3000 -l")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn outside_handoff_sends_receipt_only_to_proven_client_before_return() {
         let temp = tempfile::tempdir().unwrap();
         let trace = temp.path().join("trace");
