@@ -15,6 +15,7 @@ env:
 
 jobs:
   test:
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -31,7 +32,7 @@ jobs:
       - name: Lint
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
-        run: cargo test --locked --all-targets -- --test-threads=1
+        run: cargo test --locked --all-targets --no-fail-fast -- --test-threads=1
       - name: Dependency license inventory
         shell: bash
         run: |
@@ -56,6 +57,7 @@ jobs:
           if-no-files-found: error
 
   windows-client:
+    timeout-minutes: 15
     name: Windows x86_64 client/bridge only
     runs-on: windows-2022
     steps:
