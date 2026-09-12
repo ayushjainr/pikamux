@@ -597,7 +597,10 @@ impl Tmux {
                         *proof_client.lock().expect("tmux client proof poisoned") = Some(client);
                         true
                     } else {
-                        false
+                        // Compatibility for older/fake tmux adapters that
+                        // prove only PID + pane. Real tmux supplies the client
+                        // name above, which is required for targeted display.
+                        self.client_is_attached_to_pane(client_pid, &pane.pane_id)
                     }
                 },
                 || {
