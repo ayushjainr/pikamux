@@ -13,6 +13,9 @@ use crate::client_bridge::{
     make_pair_request, serve_client_bridge_once_reloading, validate_client_ssh_target,
     validate_pairing_hello, write_client_config,
 };
+use crate::consult::{
+    CancellablePipe, CancellationToken, OwnedChild, poll_owned_child, terminate_child,
+};
 use crate::fleet::{PROTOCOL_NAME as FLEET_PROTOCOL, PROTOCOL_VERSION as FLEET_VERSION};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -21,6 +24,7 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -165,9 +169,16 @@ impl ClientCliRuntime for SystemClientRuntime {
         ssh_executable: &str,
         timeout: Duration,
     ) -> Result<Value> {
+        let deadline = Instant::now() + timeout;
         let target = validate_client_ssh_target(ssh_target)?;
         if ssh_executable.is_empty() {
             bail!("SSH executable is missing");
+        }
+        // Reject oversized requests before starting SSH or exposing a token.
+        let mut encoded = serde_json::to_vec(payload)?;
+        encoded.push(b'\n');
+        if encoded.len() > crate::client_bridge::MAX_BRIDGE_MESSAGE_BYTES {
+            bail!("SSH pairing request exceeded the safety limit");
         }
         let mut command = Command::new(ssh_executable);
         command
@@ -178,56 +189,101 @@ impl ClientCliRuntime for SystemClientRuntime {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
+        let mut child = OwnedChild::spawn(&mut command)
             .with_context(|| format!("SSH pairing could not start {ssh_executable}"))?;
-        let mut encoded = serde_json::to_vec(payload)?;
-        encoded.push(b'\n');
-        if encoded.len() > crate::client_bridge::MAX_BRIDGE_MESSAGE_BYTES {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("SSH pairing request exceeded the safety limit");
+        let stop = CancellationToken::default();
+        let stdin = CancellablePipe::new(
+            child
+                .stdin
+                .take()
+                .context("SSH pairing has no input pipe")?,
+            stop.clone(),
+        )?;
+        let stdout = CancellablePipe::new(
+            child
+                .stdout
+                .take()
+                .context("SSH pairing has no output pipe")?,
+            stop.clone(),
+        )?;
+        let stderr = CancellablePipe::new(
+            child
+                .stderr
+                .take()
+                .context("SSH pairing has no error pipe")?,
+            stop.clone(),
+        )?;
+        enum Stream {
+            Input,
+            Output,
+            Error,
         }
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("SSH pairing has no input pipe")?;
-        stdin
-            .write_all(&encoded)
-            .context("SSH pairing write failed")?;
-        drop(stdin);
-        let stdout = child
-            .stdout
-            .take()
-            .context("SSH pairing has no output pipe")?;
-        let stderr = child
-            .stderr
-            .take()
-            .context("SSH pairing has no error pipe")?;
-        let output_reader = thread::spawn(move || {
-            read_limited(stdout, crate::client_bridge::MAX_BRIDGE_MESSAGE_BYTES)
+        let (sender, receiver) = mpsc::sync_channel(3);
+        let input_sender = sender.clone();
+        let input_writer = thread::spawn(move || {
+            let result = write_pairing_request(stdin, &encoded).map(|()| Vec::new());
+            let _ = input_sender.send((Stream::Input, result));
         });
-        let error_reader = thread::spawn(move || read_limited(stderr, MAX_PAIR_STDERR_BYTES));
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            if let Some(status) = child.try_wait().context("SSH pairing wait failed")? {
-                break status;
+        let output_sender = sender.clone();
+        let output_reader = thread::spawn(move || {
+            let result = read_limited(stdout, crate::client_bridge::MAX_BRIDGE_MESSAGE_BYTES);
+            let _ = output_sender.send((Stream::Output, result));
+        });
+        let error_reader = thread::spawn(move || {
+            let result = read_limited(stderr, MAX_PAIR_STDERR_BYTES);
+            let _ = sender.send((Stream::Error, result));
+        });
+        let outcome = (|| {
+            let mut input_written = false;
+            let mut stdout = None;
+            let mut stderr = None;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    bail!("SSH pairing timed out");
+                }
+                // Observing exit must not release the leader's PID before
+                // inherited-pipe descendants in its group have been stopped.
+                let status = poll_owned_child(&mut child).context("SSH pairing wait failed")?;
+                let io_complete = input_written && stdout.is_some() && stderr.is_some();
+                if io_complete {
+                    if let Some(status) = status {
+                        return Ok((status, stdout.unwrap(), stderr.unwrap()));
+                    }
+                    thread::sleep(remaining.min(Duration::from_millis(10)));
+                    continue;
+                }
+                match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                    Ok((stream, result)) => match stream {
+                        Stream::Input => {
+                            result?;
+                            input_written = true;
+                        }
+                        Stream::Output => stdout = Some(result?),
+                        Stream::Error => stderr = Some(result?),
+                    },
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        bail!("SSH pairing I/O worker failed");
+                    }
+                }
             }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = output_reader.join();
-                let _ = error_reader.join();
-                bail!("SSH pairing timed out");
+        })();
+        let cleanup = terminate_child(&mut child);
+        stop.cancel();
+        for worker in [input_writer, output_reader, error_reader] {
+            // Unix pipes are nonblocking and cancellation bounds these joins.
+            // The experimental Windows client lacks cancellable OS pipe I/O:
+            // detach unfinished workers there instead of hanging the caller.
+            #[cfg(unix)]
+            let _ = worker.join();
+            #[cfg(not(unix))]
+            if worker.is_finished() {
+                let _ = worker.join();
             }
-            thread::sleep(Duration::from_millis(10));
-        };
-        let stdout = output_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("SSH pairing output reader failed"))??;
-        let stderr = error_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("SSH pairing error reader failed"))??;
+        }
+        cleanup.context("SSH pairing cleanup failed")?;
+        let (status, stdout, stderr) = outcome?;
         if !status.success() {
             let detail = String::from_utf8_lossy(if stderr.is_empty() { &stdout } else { &stderr });
             let detail = detail.trim();
@@ -516,6 +572,10 @@ fn client_endpoint(options: &ClientBridgeOptions) -> Result<LoopbackEndpoint> {
         .map_err(Into::into)
 }
 
+fn write_pairing_request(mut stdin: impl Write, encoded: &[u8]) -> Result<()> {
+    stdin.write_all(encoded).context("SSH pairing write failed")
+}
+
 fn read_limited<R: Read>(input: R, limit: usize) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     input.take((limit + 1) as u64).read_to_end(&mut output)?;
@@ -523,4 +583,44 @@ fn read_limited<R: Read>(input: R, limit: usize) -> Result<Vec<u8>> {
         bail!("SSH pairing output exceeded the safety limit");
     }
     Ok(output)
+}
+
+#[cfg(all(test, unix))]
+mod pairing_pipe_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn cancelled_pairing_writer_does_not_wait_for_input_capacity() {
+        let (writer, _held_reader) = UnixStream::pair().unwrap();
+        let stop = CancellationToken::default();
+        let writer = CancellablePipe::new(writer, stop.clone()).unwrap();
+        // Exercise the worker below the request-size gate with more bytes
+        // than the socket can buffer. The peer deliberately never reads.
+        let worker =
+            thread::spawn(move || write_pairing_request(writer, &vec![b'x'; 4 * 1024 * 1024]));
+        thread::sleep(Duration::from_millis(30));
+        assert!(!worker.is_finished());
+        let started = Instant::now();
+        stop.cancel();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("write failed"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cancelled_pairing_reader_does_not_wait_for_inherited_pipe_eof() {
+        let (reader, mut held_writer) = UnixStream::pair().unwrap();
+        held_writer.write_all(b"partial").unwrap();
+        let stop = CancellationToken::default();
+        let reader = CancellablePipe::new(reader, stop.clone()).unwrap();
+        let worker = thread::spawn(move || read_limited(reader, MAX_PAIR_STDERR_BYTES));
+        thread::sleep(Duration::from_millis(30));
+        assert!(!worker.is_finished());
+        let started = Instant::now();
+        stop.cancel();
+        assert_eq!(worker.join().unwrap().unwrap(), b"partial");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held_writer);
+    }
 }

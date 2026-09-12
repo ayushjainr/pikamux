@@ -7,6 +7,89 @@ use pikamux::fleet::{CAPABILITIES, PROTOCOL_NAME, PROTOCOL_VERSION};
 use serde_json::{Value, json};
 use std::time::Duration;
 
+#[cfg(unix)]
+mod system_ssh_pairing {
+    use super::*;
+    use pikamux::client_cli::SystemClientRuntime;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn fixture(body: &str) -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake-ssh");
+        fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        (directory, executable)
+    }
+
+    fn request(executable: &std::path::Path, payload: &Value, timeout: Duration) -> Result<Value> {
+        SystemClientRuntime::discover()?.ssh_json(
+            "fixture.invalid",
+            &["_client-pair".into(), "--stdio".into()],
+            payload,
+            executable.to_str().unwrap(),
+            timeout,
+        )
+    }
+
+    #[test]
+    fn ssh_pairing_deadline_includes_a_peer_that_never_reads_input() {
+        let (_directory, executable) = fixture("exec /bin/sleep 5");
+        let started = Instant::now();
+        let error = request(
+            &executable,
+            &json!({"padding":"x".repeat(16_000)}),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn ssh_pairing_cleans_exited_launcher_descendants_holding_both_pipes() {
+        let (_directory, executable) = fixture(
+            "IFS= read -r request\nprintf '{\"paired\":true}\\n'\nprintf diagnostic >&2\n/bin/sleep 10 &\nexec /usr/bin/true",
+        );
+        let started = Instant::now();
+        let output = request(&executable, &json!({}), Duration::from_secs(2)).unwrap();
+        assert_eq!(output, json!({"paired":true}));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn ssh_pairing_preserves_failed_exit_diagnostics() {
+        let (_directory, executable) =
+            fixture("IFS= read -r request\nprintf 'pairing rejected' >&2\nexit 7");
+        let error = request(&executable, &json!({}), Duration::from_secs(2)).unwrap_err();
+        assert_eq!(error.to_string(), "pairing rejected");
+    }
+
+    #[test]
+    fn oversized_pairing_request_is_rejected_before_ssh_starts() {
+        let (directory, executable) = fixture("exit 99");
+        let marker = directory.path().join("started");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf started > '{}'\nexit 99\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let error = request(
+            &executable,
+            &json!({"padding":"x".repeat(16 * 1024)}),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("request exceeded"));
+        assert!(!marker.exists());
+    }
+}
+
 const CLIENT_ID: &str = "10000000-0000-4000-8000-000000000001";
 const NODE_ID: &str = "20000000-0000-4000-8000-000000000002";
 const WRONG_NODE_ID: &str = "30000000-0000-4000-8000-000000000003";
