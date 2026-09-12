@@ -411,7 +411,20 @@ fn handle_hook_transaction(
 
     if provider == Provider::Opencode && payload.hook_event_name == "SessionEnd" && payload.deleted
     {
-        store.delete_live_owners(provider, &canonical_id, None, None)?;
+        store.delete_live_owners_observed_through(
+            provider,
+            &canonical_id,
+            None,
+            None,
+            context.now,
+        )?;
+        if !store.live_owners(provider, &canonical_id)?.is_empty() {
+            return Ok(HookResult::ignored(
+                provider,
+                Some(canonical_id),
+                "stale session deletion",
+            ));
+        }
         store.delete_recovery_owner(provider, &canonical_id)?;
         store.delete_session(provider, &canonical_id, false)?;
         return Ok(HookResult {
@@ -446,6 +459,8 @@ fn handle_hook_transaction(
     };
 
     update_owner(store, provider, &canonical_id, payload, context)?;
+    let session_live = payload.hook_event_name != "SessionEnd"
+        || !store.live_owners(provider, &canonical_id)?.is_empty();
     if provider == Provider::Opencode && payload.hook_event_name == "SessionHeartbeat" {
         return Ok(HookResult {
             disposition: HookDisposition::OwnerOnly,
@@ -558,11 +573,16 @@ fn handle_hook_transaction(
     }
     store.record_status_observation(provider, &canonical_id, &observation)?;
     if payload.hook_event_name != "SessionEnd" {
-        store.clear_status_observation(provider, &canonical_id, ObservationKind::Runtime)?;
+        store.clear_status_observation_observed_through(
+            provider,
+            &canonical_id,
+            ObservationKind::Runtime,
+            context.now,
+        )?;
     }
     let projection = project_status(
         &store.status_observations(provider, &canonical_id)?,
-        payload.hook_event_name != "SessionEnd",
+        session_live,
         "unknown",
         ProjectionFallback {
             status: observation.status,
@@ -620,7 +640,7 @@ fn handle_hook_transaction(
         updated_at: timestamp,
         last_event_at: projection.observed_at,
         last_activity_at: timestamp,
-        live: payload.hook_event_name != "SessionEnd",
+        live: session_live,
         attached: context.pane_attached,
         home_state: "unknown".into(),
         cpu_percent: None,
@@ -1217,7 +1237,13 @@ fn update_owner(
         return Ok(());
     };
     if payload.hook_event_name == "SessionEnd" {
-        store.delete_live_owners(provider, session_id, Some(pid), owner_token(context))?;
+        store.delete_live_owners_observed_through(
+            provider,
+            session_id,
+            Some(pid),
+            owner_token(context),
+            context.now,
+        )?;
     } else {
         if provider == Provider::Opencode {
             store.delete_other_live_owner_sessions(provider, pid, session_id)?;

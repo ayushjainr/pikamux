@@ -388,6 +388,130 @@ fn session_end_preserves_an_unread_completion_and_its_event_time() {
 }
 
 #[test]
+fn older_session_end_preserves_a_newer_exact_owner_and_live_projection() {
+    let (_temp, store) = store();
+    let mut context = HookContext::at(20.0);
+    context.desired_name = Some("work".into());
+    context.owner_pid = Some(42);
+    context.owner_start_time = Some(7);
+    context.owner_token = "client".into();
+    handle_hook(
+        &store,
+        Provider::Codex,
+        &event(Provider::Codex, "exact", "UserPromptSubmit"),
+        &context,
+    )
+    .unwrap();
+
+    context.now = 10.0;
+    let result = handle_hook(
+        &store,
+        Provider::Codex,
+        &event(Provider::Codex, "exact", "SessionEnd"),
+        &context,
+    )
+    .unwrap();
+
+    assert_eq!(
+        (result.status, result.unread),
+        (Some(Status::Working), false)
+    );
+    let owners = store.live_owners(Provider::Codex, "exact").unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0].last_seen, 20.0);
+    assert_eq!(
+        store
+            .get_hook_observation(Provider::Codex)
+            .unwrap()
+            .unwrap()
+            .event_name,
+        "UserPromptSubmit"
+    );
+}
+
+#[test]
+fn older_ordinary_hook_preserves_newer_runtime_evidence() {
+    let (_temp, store) = store();
+    let mut context = HookContext::at(10.0);
+    context.desired_name = Some("work".into());
+    handle_hook(
+        &store,
+        Provider::Codex,
+        &event(Provider::Codex, "exact", "UserPromptSubmit"),
+        &context,
+    )
+    .unwrap();
+    store
+        .record_status_observation(
+            Provider::Codex,
+            "exact",
+            &StatusObservation {
+                kind: ObservationKind::Runtime,
+                status: Status::Error,
+                unread: true,
+                attention_reason: Some("exited".into()),
+                error: Some("newer process failure".into()),
+                observed_at: 30.0,
+                source: "process-exit".into(),
+            },
+        )
+        .unwrap();
+
+    context.now = 20.0;
+    handle_hook(
+        &store,
+        Provider::Codex,
+        &event(Provider::Codex, "exact", "PostToolUse"),
+        &context,
+    )
+    .unwrap();
+
+    let runtime = store
+        .status_observations(Provider::Codex, "exact")
+        .unwrap()
+        .into_iter()
+        .find(|observation| observation.kind == ObservationKind::Runtime)
+        .unwrap();
+    assert_eq!(runtime.observed_at, 30.0);
+    assert_eq!(runtime.error.as_deref(), Some("newer process failure"));
+}
+
+#[test]
+fn older_opencode_deletion_preserves_a_newer_live_session() {
+    let (_temp, store) = store();
+    let mut context = HookContext::at(20.0);
+    context.desired_name = Some("work".into());
+    context.owner_pid = Some(42);
+    context.owner_start_time = Some(7);
+    context.owner_token = "client".into();
+    handle_hook(
+        &store,
+        Provider::Opencode,
+        &event(Provider::Opencode, "exact", "SessionStart"),
+        &context,
+    )
+    .unwrap();
+
+    let mut deletion = event(Provider::Opencode, "exact", "SessionEnd");
+    deletion.deleted = true;
+    context.now = 10.0;
+    let result = handle_hook(&store, Provider::Opencode, &deletion, &context).unwrap();
+
+    assert_eq!(result.disposition, HookDisposition::Ignored);
+    assert_eq!(result.reason.as_deref(), Some("stale session deletion"));
+    assert!(
+        store
+            .get_session(Provider::Opencode, "exact")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store.live_owners(Provider::Opencode, "exact").unwrap()[0].last_seen,
+        20.0
+    );
+}
+
+#[test]
 fn unnamed_external_hook_records_only_an_exact_owner_lease() {
     let (_temp, store) = store();
     let mut context = HookContext::at(10.0);

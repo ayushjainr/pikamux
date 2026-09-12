@@ -2644,10 +2644,11 @@ impl ReconcileLedger<'_> {
         if is_untracked_connection(db, owner.provider, &owner.session_id)? {
             return Ok(false);
         }
-        db.execute(
+        Ok(db.execute(
             r#"INSERT INTO live_owners(provider,session_id,pid,start_time,owner_token,last_seen)
             VALUES (?,?,?,?,?,?) ON CONFLICT(provider,session_id,pid,owner_token) DO UPDATE SET
-            start_time=excluded.start_time,last_seen=excluded.last_seen"#,
+            start_time=excluded.start_time,last_seen=excluded.last_seen
+            WHERE excluded.last_seen>=live_owners.last_seen"#,
             params![
                 owner.provider.as_str(),
                 owner.session_id,
@@ -2656,8 +2657,7 @@ impl ReconcileLedger<'_> {
                 owner.owner_token,
                 owner.last_seen
             ],
-        )?;
-        Ok(true)
+        )? == 1)
     }
 
     pub(crate) fn delete_live_owners(
@@ -2684,6 +2684,36 @@ impl ReconcileLedger<'_> {
             (Some(pid), Some(token)) => db.execute(
                 "DELETE FROM live_owners WHERE provider=? AND session_id=? AND pid=? AND owner_token=?",
                 params![provider.as_str(), session_id, pid, token],
+            )?,
+        };
+        Ok(deleted)
+    }
+
+    pub(crate) fn delete_live_owners_observed_through(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        pid: Option<i64>,
+        owner_token: Option<&str>,
+        observed_at: f64,
+    ) -> Result<usize> {
+        let db = self.tx;
+        let deleted = match (pid, owner_token) {
+            (None, None) => db.execute(
+                "DELETE FROM live_owners WHERE provider=? AND session_id=? AND last_seen<=?",
+                params![provider.as_str(), session_id, observed_at],
+            )?,
+            (Some(pid), None) => db.execute(
+                "DELETE FROM live_owners WHERE provider=? AND session_id=? AND pid=? AND last_seen<=?",
+                params![provider.as_str(), session_id, pid, observed_at],
+            )?,
+            (None, Some(token)) => db.execute(
+                "DELETE FROM live_owners WHERE provider=? AND session_id=? AND owner_token=? AND last_seen<=?",
+                params![provider.as_str(), session_id, token, observed_at],
+            )?,
+            (Some(pid), Some(token)) => db.execute(
+                "DELETE FROM live_owners WHERE provider=? AND session_id=? AND pid=? AND owner_token=? AND last_seen<=?",
+                params![provider.as_str(), session_id, pid, token, observed_at],
             )?,
         };
         Ok(deleted)
@@ -2740,7 +2770,8 @@ impl ReconcileLedger<'_> {
             VALUES (?,?,?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET
             fingerprint=excluded.fingerprint,event_name=excluded.event_name,
             session_id=excluded.session_id,observed_at=excluded.observed_at,
-            source=excluded.source,managed=excluded.managed"#,
+            source=excluded.source,managed=excluded.managed
+            WHERE excluded.observed_at>=hook_observations.observed_at"#,
             params![observation.provider.as_str(), observation.fingerprint, observation.event_name, observation.session_id, observation.observed_at, observation.source, bool_i64(observation.managed)],
         )?;
         Ok(())
@@ -2887,6 +2918,24 @@ impl ReconcileLedger<'_> {
         Ok(self.tx.execute(
             "DELETE FROM session_status_observations WHERE provider=? AND session_id=? AND kind=?",
             params![provider.as_str(), session_id, observation_kind_str(kind)],
+        )? == 1)
+    }
+
+    pub(crate) fn clear_status_observation_observed_through(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        kind: ObservationKind,
+        observed_at: f64,
+    ) -> Result<bool> {
+        Ok(self.tx.execute(
+            "DELETE FROM session_status_observations WHERE provider=? AND session_id=? AND kind=? AND observed_at<=?",
+            params![
+                provider.as_str(),
+                session_id,
+                observation_kind_str(kind),
+                observed_at
+            ],
         )? == 1)
     }
 

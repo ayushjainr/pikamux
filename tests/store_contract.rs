@@ -470,6 +470,59 @@ fn fleet_cache_and_hook_records_round_trip_strictly() {
 }
 
 #[test]
+fn owner_and_hook_observation_upserts_reject_older_writes() {
+    let (_temp, store) = store_fixture();
+    let newer_owner = LiveOwner {
+        provider: Provider::Codex,
+        session_id: "monotonic".into(),
+        pid: 42,
+        start_time: Some(200),
+        owner_token: "client".into(),
+        last_seen: 20.0,
+    };
+    assert!(store.set_live_owner(&newer_owner).unwrap());
+    assert!(
+        !store
+            .set_live_owner(&LiveOwner {
+                start_time: Some(100),
+                last_seen: 10.0,
+                ..newer_owner.clone()
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        store.live_owners(Provider::Codex, "monotonic").unwrap(),
+        vec![newer_owner]
+    );
+
+    let newer_hook = HookObservation {
+        provider: Provider::Codex,
+        fingerprint: "new".into(),
+        event_name: "Stop".into(),
+        session_id: "newer-session".into(),
+        observed_at: 20.0,
+        source: Some("newer".into()),
+        managed: true,
+    };
+    store.record_hook_observation(&newer_hook).unwrap();
+    store
+        .record_hook_observation(&HookObservation {
+            fingerprint: "old".into(),
+            event_name: "SessionStart".into(),
+            session_id: "older-session".into(),
+            observed_at: 10.0,
+            source: Some("older".into()),
+            managed: false,
+            ..newer_hook.clone()
+        })
+        .unwrap();
+    assert_eq!(
+        store.get_hook_observation(Provider::Codex).unwrap(),
+        Some(newer_hook)
+    );
+}
+
+#[test]
 fn fleet_refresh_generation_makes_last_started_request_win() {
     let (_temp, store) = store_fixture();
     let node = FleetNode {

@@ -69,7 +69,7 @@ impl BridgeSignalGuard {
             libc::SIGCONT,
         ] {
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-            action.sa_sigaction = bridge_signal_handler as usize;
+            action.sa_sigaction = bridge_signal_handler as *const () as usize;
             unsafe { libc::sigemptyset(&mut action.sa_mask) };
             let mut previous = std::mem::MaybeUninit::<libc::sigaction>::uninit();
             if unsafe { libc::sigaction(signal, &action, previous.as_mut_ptr()) } != 0 {
