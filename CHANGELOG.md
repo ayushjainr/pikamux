@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.4 — consistent fleet snapshots
+
+- Preserve timestamp precision across JSON and SQLite so valid remote snapshots
+  are not rejected after a round trip.
+- Exercise terminal attachment with the native recorder on both Linux and macOS.
+
 ## 0.6.3 — native distribution
 
 - Validate installation archives using executables without development symbols.

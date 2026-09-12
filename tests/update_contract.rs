@@ -1175,7 +1175,9 @@ fn public_cli_installs_and_checks_a_native_bundle_end_to_end() {
         format!("Pika {version} is already current.")
     );
 
-    let newer_version = "0.6.0-alpha.2";
+    let (prefix, patch) = version.split('-').next().unwrap().rsplit_once('.').unwrap();
+    let newer_version = format!("{prefix}.{}", patch.parse::<u64>().unwrap() + 1);
+    let newer_version = newer_version.as_str();
     let newer = release_bundle(temp.path(), newer_version);
     let newer_manifest = newer.join("pika-native-release.json");
     let newer_artifact = artifact_name(newer_version, target).unwrap();
@@ -1185,7 +1187,7 @@ fn public_cli_installs_and_checks_a_native_bundle_end_to_end() {
         serde_json::to_vec(&json!([{
             "tag_name":format!("v{newer_version}"),
             "draft":false,
-            "prerelease":true,
+            "prerelease":false,
             "assets":[
                 {"name":"pika-native-release.json","state":"uploaded"},
                 {"name":newer_artifact,"state":"uploaded"},

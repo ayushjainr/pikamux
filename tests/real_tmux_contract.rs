@@ -19,6 +19,17 @@ use std::{
 
 struct IsolatedTmux(String);
 
+fn recorded_terminal(transcript: &std::path::Path, args: &[&str]) -> Command {
+    let mut command = Command::new("script");
+    #[cfg(target_os = "linux")]
+    command
+        .args(["-q", "-e", "-c", &shell_words::join(args)])
+        .arg(transcript);
+    #[cfg(not(target_os = "linux"))]
+    command.arg("-q").arg(transcript).args(args);
+    command
+}
+
 impl Drop for IsolatedTmux {
     fn drop(&mut self) {
         let _ = Command::new("tmux")
@@ -131,21 +142,21 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
     let pane = tmux.get_pane("pika-c-receipt").unwrap().unwrap();
     let transcript = temp.path().join("receipt.out");
     let committed = temp.path().join("committed");
-    let output = Command::new("script")
-        .args([
-            "-q",
-            transcript.to_str().unwrap(),
+    let output = recorded_terminal(
+        &transcript,
+        &[
             std::env::current_exe().unwrap().to_str().unwrap(),
             "--exact",
             "real_isolated_tmux_receipt_helper",
             "--nocapture",
-        ])
-        .env("TERM", "xterm-256color")
-        .env("PIKA_RECEIPT_TEST_SOCKET", &socket)
-        .env("PIKA_RECEIPT_TEST_PANE", &pane.pane_id)
-        .env("PIKA_RECEIPT_TEST_COMMITTED", &committed)
-        .output()
-        .unwrap();
+        ],
+    )
+    .env("TERM", "xterm-256color")
+    .env("PIKA_RECEIPT_TEST_SOCKET", &socket)
+    .env("PIKA_RECEIPT_TEST_PANE", &pane.pane_id)
+    .env("PIKA_RECEIPT_TEST_COMMITTED", &committed)
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "stdout={} stderr={} transcript={}",
@@ -221,22 +232,15 @@ fn real_isolated_tmux_list_clients_proves_the_exact_selected_pane() {
     let pane = String::from_utf8(pane.stdout).unwrap().trim().to_owned();
 
     let transcript = temp.path().join("script.out");
-    let child = match Command::new("script")
-        .args([
-            "-q",
-            transcript.to_str().unwrap(),
-            "tmux",
-            "-L",
-            &socket,
-            "attach-session",
-            "-t",
-            &pane,
-        ])
-        .env("TERM", "xterm-256color")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    let child = match recorded_terminal(
+        &transcript,
+        &["tmux", "-L", &socket, "attach-session", "-t", &pane],
+    )
+    .env("TERM", "xterm-256color")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
     {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
