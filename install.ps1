@@ -140,7 +140,7 @@ param(
         }
         $archive = Receive-File $archiveName "$base/$archiveName" 20971520
         $sidecar = Receive-File "$archiveName.sha256" "$base/$archiveName.sha256" 256
-        $expectedSidecar = $artifact.sha256 + '  ' + $archiveName
+        $expectedSidecar = $artifact.sha256
         if ([IO.File]::ReadAllText($sidecar).Trim() -cne $expectedSidecar -or
             (Get-Item -LiteralPath $archive).Length -ne $artifact.bytes -or
             (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $artifact.sha256) {

@@ -4,7 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
-    paths-ignore: ['**/*.md', 'media/**']
+    # The Windows bootstrap has its own real-PowerShell contract workflow.
+    paths-ignore: ['**/*.md', 'media/**', 'install.ps1', 'tests/windows-installer.ps1', '.github/workflows/windows-installer.yml']
 
 permissions:
   contents: read

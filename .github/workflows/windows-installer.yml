@@ -15,12 +15,11 @@ jobs:
   installer:
     runs-on: windows-2022
     timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        shell: [powershell, pwsh]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Installer safety and activation contracts
-        shell: ${{ matrix.shell }}
+      - name: Windows PowerShell 5.1 installer contracts
+        shell: powershell
+        run: ./tests/windows-installer.ps1
+      - name: PowerShell 7 installer contracts
+        shell: pwsh
         run: ./tests/windows-installer.ps1

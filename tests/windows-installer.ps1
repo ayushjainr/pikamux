@@ -71,7 +71,7 @@ try {
     $manifest.artifacts.'x86_64-pc-windows-msvc'.sha256 = $hash
     $manifest.artifacts.'x86_64-pc-windows-msvc'.bytes = (Get-Item $archivePath).Length
     [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 10), $utf8)
-    [IO.File]::WriteAllText((Join-Path $bad "$name.sha256"), "$hash  $name`n", $utf8)
+    [IO.File]::WriteAllText((Join-Path $bad "$name.sha256"), "$hash`n", $utf8)
     $originalLocal = $env:LOCALAPPDATA
     $env:LOCALAPPDATA = Join-Path $testRoot 'traversal-user'
     [void][IO.Directory]::CreateDirectory($env:LOCALAPPDATA)
