@@ -8,7 +8,7 @@ use crate::{
     resolve::{EvidenceState, NameCandidate, NameResolutionError, SelectionEvidence, resolve_name},
     status::{ProjectionFallback, project_status},
     store::{PendingLaunch, ReconcileLedger, ReconcileSession, Store},
-    tmux::Tmux,
+    tmux::{ReceiptDelivery, Tmux},
 };
 use anyhow::{Context, Result, bail};
 use std::{
@@ -48,6 +48,10 @@ pub struct OpenReceipt {
     pub target: OpenTarget,
     pub kind: &'static str,
     pub exit_code: i32,
+    /// Where the post-proof continuity receipt was observed. `None` means no
+    /// interactive attach was requested; `Failed` preserves a cosmetic
+    /// delivery failure without undoing an already-proven exact handoff.
+    pub receipt_delivery: Option<ReceiptDelivery>,
 }
 
 #[derive(Clone, Debug)]
@@ -1021,18 +1025,22 @@ impl Pika {
         if session.has_exact_home() {
             let binding = self.exact_pane_binding(&session, session.tmux_pane.as_deref())?;
             let event = session.last_event_at;
-            let code = if attach {
-                self.tmux.attach_exact_with_receipt(&binding.pane, || {
-                    self.record_exact_handoff(&session, &binding, event)?;
-                    Ok(continuity_receipt(&session, "ATTACHED LIVE"))
-                })?
+            let (code, receipt_delivery) = if attach {
+                let receipt = continuity_receipt(&session, "ATTACHED LIVE");
+                let handoff = self.tmux.attach_exact_with_observed_receipt(
+                    &binding.pane,
+                    &receipt,
+                    || self.record_exact_handoff(&session, &binding, event),
+                )?;
+                (handoff.exit_code, handoff.delivery)
             } else {
-                0
+                (0, None)
             };
             return Ok(OpenReceipt {
                 target: OpenTarget::Session(Box::new(session)),
                 kind: "ATTACHED LIVE",
                 exit_code: code,
+                receipt_delivery,
             });
         }
 
@@ -1211,18 +1219,22 @@ impl Pika {
         {
             bail!("Pika refused a pending home whose exact launch identity changed")
         }
-        let code = if attach {
-            self.tmux.attach_exact_with_receipt(&pane, || {
-                open_history::record_pending(&self.store, &pending)?;
-                Ok(pending_receipt(&pending, "ATTACHED STARTING"))
-            })?
+        let (code, receipt_delivery) = if attach {
+            let receipt = pending_receipt(&pending, "ATTACHED STARTING");
+            let handoff = self
+                .tmux
+                .attach_exact_with_observed_receipt(&pane, &receipt, || {
+                    open_history::record_pending(&self.store, &pending)
+                })?;
+            (handoff.exit_code, handoff.delivery)
         } else {
-            0
+            (0, None)
         };
         Ok(OpenReceipt {
             target: OpenTarget::Pending(Box::new(pending)),
             kind: "ATTACHED STARTING",
             exit_code: code,
+            receipt_delivery,
         })
     }
 
@@ -1312,18 +1324,22 @@ impl Pika {
             if !exact_pids.is_empty() {
                 let binding = self.exact_pane_binding(&session, None)?;
                 self.store.delete_pending(&token)?;
-                let code = if attach {
-                    self.tmux.attach_exact_with_receipt(&binding.pane, || {
-                        self.record_exact_handoff(&session, &binding, selected_event)?;
-                        Ok(continuity_receipt(&session, "ATTACHED LIVE"))
-                    })?
+                let (code, receipt_delivery) = if attach {
+                    let receipt = continuity_receipt(&session, "ATTACHED LIVE");
+                    let handoff = self.tmux.attach_exact_with_observed_receipt(
+                        &binding.pane,
+                        &receipt,
+                        || self.record_exact_handoff(&session, &binding, selected_event),
+                    )?;
+                    (handoff.exit_code, handoff.delivery)
                 } else {
-                    0
+                    (0, None)
                 };
                 return Ok(OpenReceipt {
                     target: OpenTarget::Session(Box::new(session.clone())),
                     kind: "ATTACHED LIVE",
                     exit_code: code,
+                    receipt_delivery,
                 });
             }
             let providers = Providers::new(&self.paths, &self.config);
@@ -1431,18 +1447,22 @@ impl Pika {
             {
                 bail!("the launched provider generation could not be certified")
             }
-            let code = if attach {
-                self.tmux.attach_exact_with_receipt(&binding.pane, || {
-                    self.record_exact_handoff(&session, &binding, selected_event)?;
-                    Ok(continuity_receipt(&session, "RESUMED EXACT"))
-                })?
+            let (code, receipt_delivery) = if attach {
+                let receipt = continuity_receipt(&session, "RESUMED EXACT");
+                let handoff = self.tmux.attach_exact_with_observed_receipt(
+                    &binding.pane,
+                    &receipt,
+                    || self.record_exact_handoff(&session, &binding, selected_event),
+                )?;
+                (handoff.exit_code, handoff.delivery)
             } else {
-                0
+                (0, None)
             };
             Ok(OpenReceipt {
                 target: OpenTarget::Session(Box::new(session.clone())),
                 kind: "RESUMED EXACT",
                 exit_code: code,
+                receipt_delivery,
             })
         })();
         self.store
@@ -1631,25 +1651,32 @@ impl Pika {
                         .and_then(|value| i64::try_from(value).ok()),
                     ..pending.clone()
                 });
-            let code = if attach {
+            let (code, receipt_delivery) = if attach {
                 if let Some((session, binding)) = exact_new_home.as_ref() {
-                    self.tmux.attach_exact_with_receipt(&binding.pane, || {
-                        self.record_exact_handoff(session, binding, session.last_event_at)?;
-                        Ok(continuity_receipt(session, "NEW HOME"))
-                    })?
+                    let receipt = continuity_receipt(session, "NEW HOME");
+                    let handoff = self.tmux.attach_exact_with_observed_receipt(
+                        &binding.pane,
+                        &receipt,
+                        || self.record_exact_handoff(session, binding, session.last_event_at),
+                    )?;
+                    (handoff.exit_code, handoff.delivery)
                 } else {
-                    self.tmux.attach_exact_with_receipt(&pane, || {
-                        open_history::record_pending(&self.store, &current)?;
-                        Ok(pending_receipt(&current, "NEW HOME"))
-                    })?
+                    let receipt = pending_receipt(&current, "NEW HOME");
+                    let handoff =
+                        self.tmux
+                            .attach_exact_with_observed_receipt(&pane, &receipt, || {
+                                open_history::record_pending(&self.store, &current)
+                            })?;
+                    (handoff.exit_code, handoff.delivery)
                 }
             } else {
-                0
+                (0, None)
             };
             Ok(OpenReceipt {
                 target: OpenTarget::Pending(Box::new(current)),
                 kind: "NEW HOME",
                 exit_code: code,
+                receipt_delivery,
             })
         })()
     }

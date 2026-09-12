@@ -93,7 +93,7 @@ fn saved(provider: Provider, identity: &str, name: &str, cwd: &std::path::Path) 
 }
 
 #[test]
-fn real_isolated_tmux_attach_observes_receipt_before_commit() {
+fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
     if Command::new("tmux").arg("-V").output().is_err()
         || Command::new("script").arg("--help").output().is_err()
     {

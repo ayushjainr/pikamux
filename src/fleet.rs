@@ -169,6 +169,33 @@ pub struct ConsultationReceipt {
     pub retry_safe: Option<bool>,
 }
 
+/// The exact, provider-specific opening proof accepted from a trusted peer.
+/// Keeping it lets every caller forward what the remote provider actually
+/// proved instead of reconstructing a stronger-looking local claim.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ConsultationOpeningReceipt {
+    pub receipt_version: u64,
+    pub ephemeral: bool,
+    pub provider: Provider,
+    pub workstream_id: String,
+    pub parent_id: String,
+    pub child_id: Option<String>,
+    pub isolation: Value,
+    pub receipt: Value,
+}
+
+impl ConsultationOpeningReceipt {
+    pub fn proof_label(&self) -> String {
+        let evidence = self
+            .isolation
+            .get("evidence")
+            .and_then(Value::as_str)
+            .unwrap_or("verified")
+            .replace('_', " ");
+        format!("v{} · ephemeral · {evidence}", self.receipt_version)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FleetError {
     pub kind: FleetErrorKind,
@@ -2343,78 +2370,144 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
             MAX_CACHED_FLEET_BYTES / nodes.len()
         };
         for node in nodes {
-            let Some(stored) = self.store.get_remote_snapshot(&node.node_id)? else {
-                continue;
-            };
-            let Ok(snapshot) = validate_snapshot(&stored.payload, Some(&node.node_id)) else {
-                continue;
-            };
+            let (rows, source_experts, captured_at, remote_captured_at, directory_notices) =
+                match self
+                    .store
+                    .get_remote_expert_projection(&node.node_id, byte_slice, row_slice)
+                {
+                    Ok(Some(projection))
+                        if projection.protocol == PROTOCOL_NAME
+                            && projection.version == PROTOCOL_VERSION =>
+                    {
+                        (
+                            projection.rows,
+                            projection.source_experts,
+                            projection.source_captured_at,
+                            projection.remote_captured_at,
+                            projection.directory_notices,
+                        )
+                    }
+                    Ok(Some(_)) | Err(_) => {
+                        notices.push(cache_input_notice(
+                            &node,
+                            "expert-cache-invalid",
+                            "cached expert projection failed validation",
+                        ));
+                        continue;
+                    }
+                    Ok(None) => {
+                        // Compatibility with snapshots written by the frozen
+                        // Python runtime: admit the complete legacy payload
+                        // only when it already fits this node's fair budget.
+                        let Some(bounded) = self
+                            .store
+                            .get_remote_snapshot_bounded(&node.node_id, byte_slice)?
+                        else {
+                            continue;
+                        };
+                        let Some(stored) = bounded.snapshot else {
+                            notices.push(cache_input_notice(
+                                &node,
+                                "expert-input-limited",
+                                "legacy expert snapshot exceeds this machine's fair search budget; refresh it with native Pika",
+                            ));
+                            continue;
+                        };
+                        let Ok(snapshot) = validate_snapshot(&stored.payload, Some(&node.node_id))
+                        else {
+                            continue;
+                        };
+                        let profiles = keyed_values(snapshot.get("profiles"));
+                        let cards = keyed_values(snapshot.get("cards"));
+                        let mut seen = BTreeSet::new();
+                        let mut rows = Vec::new();
+                        for session in snapshot
+                            .get("expert_sessions")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .chain(
+                                snapshot
+                                    .get("sessions")
+                                    .and_then(Value::as_array)
+                                    .into_iter()
+                                    .flatten(),
+                            )
+                        {
+                            let Some(key) = wire_value_key(session) else {
+                                continue;
+                            };
+                            let Some(profile) = profiles.get(&key) else {
+                                continue;
+                            };
+                            if !seen.insert(key.clone()) {
+                                continue;
+                            }
+                            rows.push(json!({
+                                "session":session,
+                                "profile":(*profile).clone(),
+                                "card":cards.get(&key).map(|value| (*value).clone()).unwrap_or(Value::Null),
+                            }));
+                        }
+                        let source_experts = rows.len();
+                        let remote_captured_at = snapshot
+                            .get("captured_at")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(stored.captured_at);
+                        let directory_notices = snapshot
+                            .get("directory_notices")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        (
+                            rows,
+                            source_experts,
+                            stored.captured_at,
+                            remote_captured_at,
+                            directory_notices,
+                        )
+                    }
+                };
             notices.extend(
-                snapshot_cache_notices(&snapshot, &node)
+                cache_notices_from_values(&directory_notices, &node)
                     .into_iter()
                     .filter(|notice| notice.kind == "expert-directory-incomplete"),
             );
-            let remote_captured_at = snapshot
-                .get("captured_at")
-                .and_then(Value::as_f64)
-                .unwrap_or(stored.captured_at);
             let stale = node.status != "ready"
-                || stored.captured_at > timestamp
-                || timestamp - stored.captured_at > REMOTE_STALE_SECONDS;
-            let cards = keyed_values(snapshot.get("cards"));
-            let profile_values = keyed_values(snapshot.get("profiles"));
+                || captured_at > timestamp
+                || timestamp - captured_at > REMOTE_STALE_SECONDS;
             let mut sessions = Vec::new();
-            for raw in snapshot
-                .get("expert_sessions")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .chain(
-                    snapshot
-                        .get("sessions")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten(),
-                )
-            {
-                let session = session_from_wire(raw)?;
-                let key = (
-                    session.provider.as_str().to_owned(),
-                    session.session_id.clone(),
-                );
-                let Some(profile_value) = profile_values.get(&key) else {
+            let mut profiles = Vec::new();
+            for row in rows {
+                let Some(row) = row.as_object() else {
                     continue;
                 };
+                let session = session_from_wire(&row["session"])?;
+                let profile_value = &row["profile"];
                 sessions.push(cached_fleet_session(
                     &node,
                     session,
                     stale,
-                    stored.captured_at,
+                    captured_at,
                     remote_captured_at,
-                    cards.get(&key).and_then(Value::as_object),
+                    row["card"].as_object(),
                     profile_value.as_object(),
                 ));
+                profiles.push(profile_from_wire(profile_value)?);
             }
-            let mut profiles = snapshot
-                .get("profiles")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .map(profile_from_wire)
-                .collect::<Result<Vec<_>, _>>()?;
             for profile in &mut profiles {
                 profile.profile.updated_at = receiver_clock_timestamp(
-                    stored.captured_at,
+                    captured_at,
                     remote_captured_at,
                     profile.profile.updated_at,
                 );
                 profile.profile.scope_updated_at = receiver_clock_timestamp(
-                    stored.captured_at,
+                    captured_at,
                     remote_captured_at,
                     profile.profile.scope_updated_at,
                 );
                 profile.profile.current_state_updated_at = receiver_clock_timestamp(
-                    stored.captured_at,
+                    captured_at,
                     remote_captured_at,
                     profile.profile.current_state_updated_at,
                 );
@@ -2482,7 +2575,9 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 retained_matches += 1;
                 retained_bytes += encoded_bytes;
             }
-            let omitted_rows = available_matches.saturating_sub(retained_matches);
+            let omitted_rows = available_matches
+                .saturating_sub(retained_matches)
+                .saturating_add(source_experts.saturating_sub(profiles.len()));
             if omitted_rows > 0 {
                 notices.push(FleetCacheNotice {
                     node_id: node.node_id.clone(),
@@ -3129,6 +3224,7 @@ pub struct RemoteConsultation {
     event_timeout: Duration,
     cleanup_timeout: Duration,
     cancellation: CancellationToken,
+    opening: Option<ConsultationOpeningReceipt>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3252,6 +3348,7 @@ impl RemoteConsultation {
             event_timeout: timeouts.event,
             cleanup_timeout: timeouts.cleanup,
             cancellation,
+            opening: None,
         };
         let opened = match side.read_nonprogress(timeouts.open) {
             Ok(value) => value,
@@ -3260,11 +3357,21 @@ impl RemoteConsultation {
                 return Err(error);
             }
         };
-        if let Err(error) = side.validate_opened(&opened) {
-            side.abort();
-            return Err(error);
-        }
+        let opening = match side.validate_opened(&opened) {
+            Ok(opening) => opening,
+            Err(error) => {
+                side.abort();
+                return Err(error);
+            }
+        };
+        side.opening = Some(opening);
         Ok(side)
+    }
+
+    pub fn opening_receipt(&self) -> &ConsultationOpeningReceipt {
+        self.opening
+            .as_ref()
+            .expect("a returned remote consultation has a validated opening receipt")
     }
 
     pub fn ask(&mut self, question: &str) -> Result<String, FleetError> {
@@ -3442,27 +3549,62 @@ impl RemoteConsultation {
         ))
     }
 
-    fn validate_opened(&self, value: &Value) -> Result<(), FleetError> {
+    fn validate_opened(&self, value: &Value) -> Result<ConsultationOpeningReceipt, FleetError> {
         let object = object(
             value,
             "Remote side channel returned an invalid opening receipt",
         )?;
         let expected_parent = self.session.session.provider_thread_id();
-        let workstream = object
-            .get("workstream_id")
-            .and_then(Value::as_str)
-            .or_else(|| object.get("parent_id").and_then(Value::as_str));
+        let workstream = object.get("workstream_id").and_then(Value::as_str);
+        let child_id = object.get("child_id").and_then(Value::as_str);
+        let receipt = object.get("receipt").and_then(Value::as_object);
+        let receipt_valid = receipt.is_some_and(|receipt| {
+            receipt.get("receipt_version").and_then(Value::as_u64) == Some(2)
+                && receipt.get("stage").and_then(Value::as_str) == Some("prepare")
+                && receipt.get("delivery").and_then(Value::as_str) == Some("not_sent")
+                && receipt.get("cleanup").and_then(Value::as_str) == Some("pending")
+                && receipt.get("turn").and_then(Value::as_u64) == Some(0)
+                && receipt.get("answers_received").and_then(Value::as_u64) == Some(0)
+        });
+        let child_valid = match self.session.session.provider {
+            Provider::Codex | Provider::Opencode => child_id.is_some_and(|child| {
+                Providers::valid_id(self.session.session.provider, child)
+                    && child != expected_parent
+                    && child != self.session.session.session_id
+            }),
+            Provider::Claude => child_id.is_none(),
+        };
+        let isolation = object.get("isolation");
         let valid = object.get("type").and_then(Value::as_str) == Some("opened")
+            && object.get("receipt_version").and_then(Value::as_u64) == Some(2)
+            && object.get("ephemeral").and_then(Value::as_bool) == Some(true)
             && object.get("provider").and_then(Value::as_str)
                 == Some(self.session.session.provider.as_str())
             && object.get("parent_id").and_then(Value::as_str) == Some(expected_parent)
             && workstream == Some(&self.session.session.session_id)
+            && child_valid
+            && isolation.is_some_and(|value| {
+                validate_opening_isolation(self.session.session.provider, value)
+            })
+            && receipt_valid
             && object.get("consultation_mode").and_then(Value::as_str)
                 == Some(&self.policy.consultation_mode)
             && object.get("model").and_then(Value::as_str) == Some(&self.policy.model)
             && object.get("effort").and_then(Value::as_str) == Some(&self.policy.effort);
         if valid {
-            Ok(())
+            Ok(ConsultationOpeningReceipt {
+                receipt_version: 2,
+                ephemeral: true,
+                provider: self.session.session.provider,
+                workstream_id: self.session.session.session_id.clone(),
+                parent_id: expected_parent.to_owned(),
+                child_id: child_id.map(str::to_owned),
+                isolation: isolation.cloned().expect("validated isolation proof"),
+                receipt: object
+                    .get("receipt")
+                    .cloned()
+                    .expect("validated opening receipt"),
+            })
         } else {
             Err(FleetError::new(
                 FleetErrorKind::Quarantined,
@@ -3615,6 +3757,43 @@ impl Drop for RemoteConsultation {
     fn drop(&mut self) {
         if !self.cleanup_confirmed {
             self.abort();
+        }
+    }
+}
+
+fn validate_opening_isolation(provider: Provider, value: &Value) -> bool {
+    let Some(proof) = value.as_object() else {
+        return false;
+    };
+    if proof.get("version").and_then(Value::as_u64) != Some(1) {
+        return false;
+    }
+    let flag = |name: &str| proof.get(name).and_then(Value::as_bool) == Some(true);
+    match provider {
+        Provider::Codex => {
+            proof.get("mechanism").and_then(Value::as_str) == Some("codex_thread_fork")
+                && proof.get("evidence").and_then(Value::as_str) == Some("provider_confirmed")
+                && flag("distinct_child")
+                && flag("ephemeral_confirmed")
+                && flag("parent_turns_excluded")
+                && proof.get("approval_policy").and_then(Value::as_str) == Some("never")
+                && proof.get("sandbox").and_then(Value::as_str) == Some("read-only")
+        }
+        Provider::Claude => {
+            proof.get("mechanism").and_then(Value::as_str) == Some("claude_fork_process")
+                && proof.get("evidence").and_then(Value::as_str) == Some("launch_arguments")
+                && flag("fork_session")
+                && flag("no_session_persistence")
+                && flag("tools_disabled")
+        }
+        Provider::Opencode => {
+            proof.get("mechanism").and_then(Value::as_str) == Some("opencode_session_fork")
+                && proof.get("evidence").and_then(Value::as_str)
+                    == Some("provider_issued_child_and_isolated_runtime")
+                && flag("distinct_child")
+                && flag("ephemeral_process")
+                && flag("readonly_agent")
+                && proof.get("cleanup").and_then(Value::as_str) == Some("exact_child_delete")
         }
     }
 }
@@ -4374,9 +4553,30 @@ mod receiver_clock_tests {
     fn opened_fixture() -> String {
         json!({
             "type":"opened",
+            "receipt_version":2,
+            "ephemeral":true,
             "provider":"codex",
             "parent_id":"22222222-2222-4222-8222-222222222222",
             "workstream_id":"22222222-2222-4222-8222-222222222222",
+            "child_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "isolation":{
+                "version":1,
+                "mechanism":"codex_thread_fork",
+                "evidence":"provider_confirmed",
+                "distinct_child":true,
+                "ephemeral_confirmed":true,
+                "parent_turns_excluded":true,
+                "approval_policy":"never",
+                "sandbox":"read-only"
+            },
+            "receipt":{
+                "receipt_version":2,
+                "stage":"prepare",
+                "delivery":"not_sent",
+                "cleanup":"pending",
+                "turn":0,
+                "answers_received":0
+            },
             "consultation_mode":"default",
             "model":"gpt-test",
             "effort":"low"

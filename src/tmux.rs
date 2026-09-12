@@ -18,6 +18,7 @@ use std::{
 pub enum ReceiptDelivery {
     TmuxClient,
     InvokingTerminal,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,24 +504,10 @@ impl Tmux {
         self.attach_exact_with_started_mode(pane, std::env::var_os("TMUX").is_some(), on_started)
     }
 
-    /// Attach to an exact pane, commit the caller's proof, then show the
-    /// resulting receipt to only the client that invoked this handoff.
-    pub fn attach_exact_with_receipt<F>(&self, pane: &Pane, on_started: F) -> Result<i32>
-    where
-        F: FnOnce() -> Result<String>,
-    {
-        self.attach_exact_with_started_mode_inner(
-            pane,
-            std::env::var_os("TMUX").is_some(),
-            true,
-            move || on_started().map(Some),
-        )
-    }
-
-    /// Prove the exact pane and make the continuity receipt observable before
-    /// committing attention/open history. If tmux cannot show the targeted
-    /// client message, the same invoking terminal receives an explicit
-    /// fallback. A failed fallback prevents `on_started` from running.
+    /// Prove the exact pane, commit the caller's identity/attention update, and
+    /// make the continuity receipt observable. If tmux cannot show the targeted
+    /// client message, the same invoking terminal receives an explicit fallback.
+    /// Delivery is retained as a distinct outcome and never kills a proven client.
     pub fn attach_exact_with_observed_receipt<F>(
         &self,
         pane: &Pane,
@@ -585,8 +572,8 @@ impl Tmux {
                     delivery: None,
                 });
             }
-            let delivery = self.deliver_receipt(client.as_deref(), receipt)?;
             on_started()?;
+            let delivery = self.deliver_receipt(client.as_deref(), receipt);
             return Ok(ReceiptHandoff {
                 exit_code: 0,
                 delivery: Some(delivery),
@@ -615,11 +602,12 @@ impl Tmux {
                     .lock()
                     .expect("tmux receipt target poisoned")
                     .clone();
-                let delivery = self.deliver_receipt(client.as_deref(), receipt)?;
+                on_started()?;
+                let delivery = self.deliver_receipt(client.as_deref(), receipt);
                 *delivered_callback
                     .lock()
                     .expect("tmux receipt outcome poisoned") = Some(delivery);
-                on_started()
+                Ok(())
             },
         )?;
         Ok(ReceiptHandoff {
@@ -628,7 +616,7 @@ impl Tmux {
         })
     }
 
-    fn deliver_receipt(&self, client: Option<&str>, receipt: &str) -> Result<ReceiptDelivery> {
+    fn deliver_receipt(&self, client: Option<&str>, receipt: &str) -> ReceiptDelivery {
         if let Some(client) = client
             && self
                 .output(
@@ -637,12 +625,14 @@ impl Tmux {
                 )
                 .is_ok_and(|output| output.status.success())
         {
-            return Ok(ReceiptDelivery::TmuxClient);
+            return ReceiptDelivery::TmuxClient;
         }
         let mut terminal = std::io::stderr().lock();
-        writeln!(terminal, "\r\nPIKA HANDOFF · {receipt}")?;
-        terminal.flush()?;
-        Ok(ReceiptDelivery::InvokingTerminal)
+        if writeln!(terminal, "\r\nPIKA HANDOFF · {receipt}").is_ok() && terminal.flush().is_ok() {
+            ReceiptDelivery::InvokingTerminal
+        } else {
+            ReceiptDelivery::Failed
+        }
     }
 
     fn attach_exact_with_started_mode<F>(
@@ -1690,14 +1680,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn observed_receipt_is_delivered_before_attention_callback() {
+    fn observed_receipt_is_delivered_only_after_attention_callback_proves_identity() {
         let temp = tempfile::tempdir().unwrap();
         let trace = temp.path().join("trace");
         let committed = temp.path().join("committed");
         let tmux = tmux_fixture(
             &temp,
             &format!(
-                "printf '%s\\n' \"$*\" >> {trace}\ncase \"$*\" in\n  'display-message -p #{{client_name}}') printf '%s\\n' invoking-client;;\n  *'display-message -c invoking-client -d 3000 -l exact receipt'*) test ! -f {committed} || printf '%s\\n' COMMITTED_TOO_EARLY >> {trace};;\nesac\nexit 0",
+                "printf '%s\\n' \"$*\" >> {trace}\ncase \"$*\" in\n  'display-message -p #{{client_name}}') printf '%s\\n' invoking-client;;\n  *'display-message -c invoking-client -d 3000 -l exact receipt'*) test -f {committed} || printf '%s\\n' RECEIPT_BEFORE_PROOF >> {trace};;\nesac\nexit 0",
                 trace = shell_words::quote(&trace.to_string_lossy()),
                 committed = shell_words::quote(&committed.to_string_lossy()),
             ),
@@ -1713,13 +1703,13 @@ mod tests {
         assert_eq!(handoff.exit_code, 0);
         assert_eq!(handoff.delivery, Some(ReceiptDelivery::TmuxClient));
         let trace = fs::read_to_string(trace).unwrap();
-        assert!(!trace.contains("COMMITTED_TOO_EARLY"));
+        assert!(!trace.contains("RECEIPT_BEFORE_PROOF"));
         assert_eq!(fs::read_to_string(committed).unwrap(), "acknowledged");
     }
 
     #[cfg(unix)]
     #[test]
-    fn failed_tmux_display_uses_truthful_terminal_fallback_then_commits() {
+    fn failed_tmux_display_uses_truthful_terminal_fallback_after_commit() {
         let temp = tempfile::tempdir().unwrap();
         let committed = temp.path().join("committed");
         let tmux = tmux_fixture(
@@ -1752,9 +1742,12 @@ mod tests {
             ),
         );
         let error = tmux
-            .attach_exact_with_started_mode_inner(&exact_test_pane(), true, true, || {
-                anyhow::bail!("identity changed during callback")
-            })
+            .attach_exact_with_observed_receipt_mode(
+                &exact_test_pane(),
+                "exact receipt",
+                true,
+                || anyhow::bail!("identity changed during callback"),
+            )
             .unwrap_err();
         assert!(error.to_string().contains("identity changed"));
         assert!(!fs::read_to_string(trace).unwrap().contains("-d 3000 -l"));

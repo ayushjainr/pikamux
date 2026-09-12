@@ -1775,6 +1775,12 @@ fn open_name(pika: &Pika, name: &str, allow_create: bool) -> Result<i32> {
 
 fn finish_local_open(pika: &Pika, receipt: &crate::core::OpenReceipt) -> Result<i32> {
     let _ = pika;
+    if receipt.receipt_delivery == Some(crate::tmux::ReceiptDelivery::Failed) {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "pika: the exact handoff was recorded, but its continuity receipt could not be displayed"
+        );
+    }
     if receipt.exit_code == 0 && std::env::var_os("TMUX").is_none() {
         let name = match &receipt.target {
             crate::core::OpenTarget::Session(session) => session.display_name(),

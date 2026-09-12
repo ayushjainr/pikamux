@@ -2,10 +2,10 @@ use pikamux::consult::CancellationToken;
 use pikamux::fleet::{
     CAPABILITIES, ConsultationPolicy, ConsultationTimeouts, FleetError, FleetErrorKind,
     FleetManager, FleetService, FleetSession, FleetTransport, MAX_CACHED_FLEET_BYTES,
-    MAX_CACHED_FLEET_ROWS, MAX_SNAPSHOT_SESSIONS, NodeCandidate, PROTOCOL_NAME, PROTOCOL_VERSION,
-    RemoteConsultation, SshTransport, bound_snapshot_for_transport, discover_node_candidates,
-    discover_ssh_candidates, handle_fleet_stdio, next_remote_node, session_to_wire,
-    validate_snapshot,
+    MAX_CACHED_FLEET_NODES, MAX_CACHED_FLEET_ROWS, MAX_SNAPSHOT_SESSIONS, NodeCandidate,
+    PROTOCOL_NAME, PROTOCOL_VERSION, RemoteConsultation, SshTransport,
+    bound_snapshot_for_transport, discover_node_candidates, discover_ssh_candidates,
+    handle_fleet_stdio, next_remote_node, session_to_wire, validate_snapshot,
 };
 use pikamux::model::{Candidate, FleetNode, Provider, Session, Status};
 use pikamux::store::Store;
@@ -23,6 +23,7 @@ const CODEX_THREAD_ID: &str = "11111111-1111-4111-8111-111111111111";
 const CODEX_PARENT_ID: &str = "22222222-2222-4222-8222-222222222222";
 const CODEX_ACTIVE_ID: &str = "33333333-3333-4333-8333-333333333333";
 const CODEX_OTHER_ID: &str = "44444444-4444-4444-8444-444444444444";
+const CODEX_CHILD_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const CLAUDE_THREAD_ID: &str = "55555555-5555-4555-8555-555555555555";
 
 #[cfg(unix)]
@@ -90,6 +91,56 @@ fn node(id: &str, alias: &str) -> FleetNode {
         created_at: 1.0,
         updated_at: 1.0,
     }
+}
+
+fn opened_receipt(parent_id: &str, workstream_id: &str) -> Value {
+    json!({
+        "type":"opened", "receipt_version":2, "ephemeral":true,
+        "provider":"codex", "parent_id":parent_id, "workstream_id":workstream_id,
+        "child_id":CODEX_CHILD_ID,
+        "isolation":{
+            "version":1, "mechanism":"codex_thread_fork", "evidence":"provider_confirmed",
+            "distinct_child":true, "ephemeral_confirmed":true,
+            "parent_turns_excluded":true, "approval_policy":"never", "sandbox":"read-only"
+        },
+        "receipt":{
+            "receipt_version":2, "stage":"prepare", "delivery":"not_sent",
+            "cleanup":"pending", "turn":0, "answers_received":0
+        },
+        "consultation_mode":"default", "model":"gpt-test", "effort":"low"
+    })
+}
+
+fn provider_opened_receipt(
+    provider: Provider,
+    parent_id: &str,
+    workstream_id: &str,
+    child_id: Option<&str>,
+) -> Value {
+    let isolation = match provider {
+        Provider::Codex => opened_receipt(parent_id, workstream_id)["isolation"].clone(),
+        Provider::Claude => json!({
+            "version":1, "mechanism":"claude_fork_process", "evidence":"launch_arguments",
+            "fork_session":true, "no_session_persistence":true, "tools_disabled":true
+        }),
+        Provider::Opencode => json!({
+            "version":1, "mechanism":"opencode_session_fork",
+            "evidence":"provider_issued_child_and_isolated_runtime", "distinct_child":true,
+            "ephemeral_process":true, "readonly_agent":true, "cleanup":"exact_child_delete"
+        }),
+    };
+    json!({
+        "type":"opened", "receipt_version":2, "ephemeral":true,
+        "provider":provider, "parent_id":parent_id, "workstream_id":workstream_id,
+        "child_id":child_id, "isolation":isolation,
+        "receipt":{
+            "receipt_version":2, "stage":"prepare", "delivery":"not_sent",
+            "cleanup":"pending", "turn":0, "answers_received":0
+        },
+        "consultation_mode": if provider == Provider::Codex { "default" } else { "provider-native" },
+        "model": if provider == Provider::Codex { "gpt-test" } else { "" },
+        "effort": if provider == Provider::Codex { "low" } else { "" }
+    })
 }
 
 fn snapshot(id: &str, session_id: &str) -> Value {
@@ -567,6 +618,85 @@ fn cached_fleet_twenty_heavy_nodes_parses_only_the_fair_prepaint_projection() {
         elapsed < Duration::from_secs(2),
         "bounded cached first frame took {elapsed:?}"
     );
+}
+
+#[test]
+fn sixty_four_dense_nodes_each_contribute_with_bounded_board_and_expert_input() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "sixty-four-dense.db");
+    let captured_at = now();
+    let mut node_ids = Vec::new();
+    for node_index in 0..MAX_CACHED_FLEET_NODES {
+        let node_id = Uuid::new_v4().to_string();
+        node_ids.push(node_id.clone());
+        store
+            .upsert_fleet_node(&node(&node_id, &format!("dense-{node_index}")))
+            .unwrap();
+        let mut sessions = Vec::with_capacity(MAX_SNAPSHOT_SESSIONS);
+        let mut profiles = Vec::with_capacity(MAX_SNAPSHOT_SESSIONS);
+        for row_index in 0..MAX_SNAPSHOT_SESSIONS {
+            let sequence = node_index * MAX_SNAPSHOT_SESSIONS + row_index;
+            let identity = format!("00000000-0000-4000-8000-{sequence:012x}");
+            sessions.push(session_to_wire(
+                &session(Provider::Codex, &identity, "dense-worker"),
+                false,
+            ));
+            profiles.push(json!({
+                "provider":"codex", "session_id":identity,
+                "scope":"needle", "current_state":"working",
+                "topics":[], "artifacts":[], "updated_at":captured_at,
+                "source":"fixture", "scope_updated_at":captured_at,
+                "current_state_updated_at":captured_at
+            }));
+        }
+        let payload = json!({
+            "type":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+            "node_id":node_id, "machine":format!("dense-{node_index}"),
+            "captured_at":captured_at, "sessions":sessions,
+            "profiles":profiles, "cards":[]
+        });
+        store
+            .put_remote_snapshot(&node_id, &payload, captured_at)
+            .unwrap();
+    }
+
+    let per_node_bytes = MAX_CACHED_FLEET_BYTES / MAX_CACHED_FLEET_NODES;
+    let per_node_rows = MAX_CACHED_FLEET_ROWS / MAX_CACHED_FLEET_NODES;
+    let mut board_input = 0_usize;
+    let mut expert_input = 0_usize;
+    for node_id in &node_ids {
+        let board = store
+            .get_remote_board_projection(node_id, per_node_bytes, per_node_rows)
+            .unwrap()
+            .unwrap();
+        let expert = store
+            .get_remote_expert_projection(node_id, per_node_bytes, per_node_rows)
+            .unwrap()
+            .unwrap();
+        assert!(!board.rows.is_empty());
+        assert!(!expert.rows.is_empty());
+        board_input += board.input_bytes;
+        expert_input += expert.input_bytes;
+    }
+    assert!(board_input <= MAX_CACHED_FLEET_BYTES);
+    assert!(expert_input <= MAX_CACHED_FLEET_BYTES);
+
+    let transport = FakeTransport::default();
+    let manager = FleetManager::new(&store, &transport);
+    let started = Instant::now();
+    let board = manager.cached_sessions_with_notices(None, false).unwrap();
+    let experts = manager.expert_directory("needle").unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    for node_index in 0..MAX_CACHED_FLEET_NODES {
+        let alias = format!("dense-{node_index}");
+        assert!(board.sessions.iter().any(|row| row.node_name == alias));
+        assert!(
+            experts
+                .matches
+                .iter()
+                .any(|row| row.machine.as_deref() == Some(alias.as_str()))
+        );
+    }
 }
 
 #[test]
@@ -1294,8 +1424,7 @@ fn remote_consultation_reuses_one_connection_and_requires_v2_cleanup() {
     let _process = fake_process_guard();
     let temp = TempDir::new().unwrap();
     let fake = temp.path().join("ssh");
-    let opened = json!({"type":"opened", "provider":"codex", "parent_id":CODEX_PARENT_ID,
-        "workstream_id":CODEX_PARENT_ID, "consultation_mode":"default", "model":"gpt-test", "effort":"low"});
+    let opened = opened_receipt(CODEX_PARENT_ID, CODEX_PARENT_ID);
     let body = format!(
         "printf '%s\\n' '{opened}'\nwhile IFS= read -r line; do\n case \"$line\" in\n *\\\"close\\\"*) printf '%s\\n' '{{\"type\":\"closed\",\"receipt_version\":2,\"discarded\":true,\"cleanup\":\"complete\"}}'; exit 0 ;;\n *) printf '%s\\n' '{{\"type\":\"answer\",\"text\":\"from remote expert\"}}' ;;\n esac\ndone"
     );
@@ -1333,11 +1462,137 @@ fn remote_consultation_reuses_one_connection_and_requires_v2_cleanup() {
         Duration::from_secs(1),
     )
     .unwrap();
+    assert_eq!(side.opening_receipt().receipt_version, 2);
+    assert!(side.opening_receipt().ephemeral);
+    assert_eq!(
+        side.opening_receipt().child_id.as_deref(),
+        Some(CODEX_CHILD_ID)
+    );
     assert_eq!(side.ask("first").unwrap(), "from remote expert");
     assert_eq!(side.ask("follow up").unwrap(), "from remote expert");
     let receipt = side.close().unwrap();
     assert_eq!(receipt.answers_received, Some(2));
     assert_eq!(receipt.cleanup.as_deref(), Some("complete"));
+}
+
+#[test]
+fn remote_opening_requires_v2_ephemeral_exact_child_and_provider_isolation() {
+    let _process = fake_process_guard();
+    let temp = TempDir::new().unwrap();
+    let node_id = Uuid::new_v4().to_string();
+    let remote = FleetSession {
+        node_id: node_id.clone(),
+        node_name: "atlas".into(),
+        session: session(Provider::Codex, CODEX_PARENT_ID, "expert"),
+        stale: false,
+        remote_error: None,
+        seen_at: now(),
+        card_status: None,
+        card_detail: None,
+        watched: true,
+        availability: Some("source-available".into()),
+        scope_updated_at: None,
+        current_state_updated_at: None,
+        current_state_status: None,
+    };
+    let mut invalid = Vec::new();
+    let mut old = opened_receipt(CODEX_PARENT_ID, CODEX_PARENT_ID);
+    old["receipt_version"] = json!(1);
+    invalid.push(old);
+    let mut persistent = opened_receipt(CODEX_PARENT_ID, CODEX_PARENT_ID);
+    persistent["ephemeral"] = json!(false);
+    invalid.push(persistent);
+    let mut same_child = opened_receipt(CODEX_PARENT_ID, CODEX_PARENT_ID);
+    same_child["child_id"] = json!(CODEX_PARENT_ID);
+    invalid.push(same_child);
+    let mut weak = opened_receipt(CODEX_PARENT_ID, CODEX_PARENT_ID);
+    weak["isolation"]["sandbox"] = json!("workspace-write");
+    invalid.push(weak);
+
+    for (index, opened) in invalid.into_iter().enumerate() {
+        let fake = temp.path().join(format!("invalid-open-{index}"));
+        executable(&fake, &format!("printf '%s\\n' '{opened}'\nsleep 5"));
+        let error = RemoteConsultation::open(
+            &SshTransport::new(&fake, Duration::from_secs(1), Duration::from_secs(1)),
+            node(&node_id, "atlas"),
+            remote.clone(),
+            ConsultationPolicy {
+                consultation_mode: "default".into(),
+                model: "gpt-test".into(),
+                effort: "low".into(),
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .err()
+        .expect("unproved opening must be quarantined");
+        assert_eq!(error.kind, FleetErrorKind::Quarantined);
+        assert!(error.message.contains("no question was sent"));
+    }
+}
+
+#[test]
+fn remote_opening_validates_claude_flags_and_opencode_exact_child() {
+    let _process = fake_process_guard();
+    let temp = TempDir::new().unwrap();
+    for (index, provider, parent, workstream, child) in [
+        (
+            0,
+            Provider::Claude,
+            CLAUDE_THREAD_ID,
+            CLAUDE_THREAD_ID,
+            None,
+        ),
+        (
+            1,
+            Provider::Opencode,
+            "ses_parent123",
+            "ses_parent123",
+            Some("ses_child123"),
+        ),
+    ] {
+        let node_id = Uuid::new_v4().to_string();
+        let fake = temp.path().join(format!("provider-open-{index}"));
+        let opened = provider_opened_receipt(provider, parent, workstream, child);
+        executable(
+            &fake,
+            &format!(
+                "printf '%s\\n' '{opened}'\nIFS= read -r line\nprintf '%s\\n' '{{\"type\":\"closed\",\"receipt_version\":2,\"discarded\":true,\"cleanup\":\"complete\"}}'"
+            ),
+        );
+        let remote = FleetSession {
+            node_id: node_id.clone(),
+            node_name: "atlas".into(),
+            session: session(provider, workstream, "expert"),
+            stale: false,
+            remote_error: None,
+            seen_at: now(),
+            card_status: None,
+            card_detail: None,
+            watched: true,
+            availability: Some("source-available".into()),
+            scope_updated_at: None,
+            current_state_updated_at: None,
+            current_state_status: None,
+        };
+        let mut side = RemoteConsultation::open(
+            &SshTransport::new(&fake, Duration::from_secs(1), Duration::from_secs(1)),
+            node(&node_id, "atlas"),
+            remote,
+            ConsultationPolicy {
+                consultation_mode: "provider-native".into(),
+                model: String::new(),
+                effort: String::new(),
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(side.opening_receipt().child_id.as_deref(), child);
+        side.close().unwrap();
+    }
 }
 
 #[test]
@@ -1349,7 +1604,8 @@ fn remote_consultation_cancellation_kills_owned_transport_promptly() {
     executable(
         &fake,
         &format!(
-            "printf '%s\\n' '{{\"type\":\"opened\",\"provider\":\"codex\",\"parent_id\":\"{CODEX_PARENT_ID}\",\"workstream_id\":\"{CODEX_PARENT_ID}\",\"consultation_mode\":\"default\",\"model\":\"gpt-test\",\"effort\":\"low\"}}'\nIFS= read -r line\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nwait",
+            "printf '%s\\n' '{}'\nIFS= read -r line\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nwait",
+            opened_receipt(CODEX_PARENT_ID, CODEX_PARENT_ID),
             owned_pid.display()
         ),
     );
@@ -1428,7 +1684,8 @@ fn remote_consultation_refuses_wrong_leaf_before_sending_question() {
     executable(
         &fake,
         &format!(
-            "printf '%s\\n' '{{\"type\":\"opened\",\"provider\":\"codex\",\"parent_id\":\"{CODEX_OTHER_ID}\",\"consultation_mode\":\"default\",\"model\":\"gpt-test\",\"effort\":\"low\"}}'; sleep 2"
+            "printf '%s\\n' '{}'",
+            opened_receipt(CODEX_OTHER_ID, CODEX_PARENT_ID)
         ),
     );
     let node_id = Uuid::new_v4().to_string();
@@ -1461,7 +1718,7 @@ fn remote_consultation_refuses_wrong_leaf_before_sending_question() {
         trusted,
         remote,
         policy,
-        Duration::from_secs(1),
+        Duration::from_secs(3),
         Duration::from_secs(1),
         Duration::from_secs(1),
     )
@@ -1514,8 +1771,7 @@ fn remote_consultation_rejects_partial_frames_and_unverified_cleanup() {
     assert!(error.message.contains("partial JSONL"));
 
     let bad_cleanup = temp.path().join("bad-cleanup-ssh");
-    let opened = json!({"type":"opened", "provider":"codex", "parent_id":CODEX_PARENT_ID,
-        "workstream_id":CODEX_PARENT_ID, "consultation_mode":"default", "model":"gpt-test", "effort":"low"});
+    let opened = opened_receipt(CODEX_PARENT_ID, CODEX_PARENT_ID);
     let body = format!(
         "printf '%s\\n' '{opened}'\nwhile IFS= read -r line; do\n case \"$line\" in\n *\\\"close\\\"*) printf '%s\\n' '{{\"type\":\"closed\",\"discarded\":true}}'; exit 0 ;;\n *) printf '%s\\n' '{{\"type\":\"answer\",\"text\":\"useful\"}}' ;;\n esac\ndone"
     );
