@@ -4,7 +4,10 @@
 //! fingerprint is metadata used only to describe whether the published current
 //! work still matches the provider source.
 
+use crate::config::Config;
 use crate::model::{ExpertProfile, Provider, Session, Status};
+use crate::paths::Paths;
+use crate::providers::{ProviderSourceState, Providers};
 use crate::store::{Store, StoredExpertProfile};
 use anyhow::{Context, Result, bail};
 use regex::Regex;
@@ -57,7 +60,7 @@ pub struct Freshness {
 pub struct ExpertMatch {
     pub provider: Provider,
     pub session_id: String,
-    pub name: String,
+    pub name: Option<String>,
     pub project: Option<String>,
     pub branch: Option<String>,
     pub status: Status,
@@ -75,8 +78,86 @@ pub struct ExpertMatch {
     pub watched: bool,
     pub discoverable: bool,
     pub availability: String,
+    /// Exact argument accepted by `pika ask`: UUID locally, UUID@machine remotely.
+    pub qualified_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_stale: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_seen_at: Option<f64>,
     #[serde(flatten)]
     pub freshness: Freshness,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SourceAvailability {
+    SourceAvailable,
+    SourceUnavailable,
+    Archived,
+    Deleted,
+    RequiresReconciliation,
+}
+
+pub struct LocalSourceIndex {
+    states: BTreeMap<(Provider, String), ProviderSourceState>,
+}
+
+impl LocalSourceIndex {
+    pub fn read(paths: &Paths, config: &Config, sessions: &[Session]) -> Self {
+        let providers = Providers::new(paths, config);
+        let mut states = BTreeMap::new();
+        for session in sessions {
+            let identity = session.provider_thread_id().to_owned();
+            let state = providers.source_state(
+                session.provider,
+                &identity,
+                session.transcript_path.as_deref(),
+            );
+            states.insert((session.provider, identity), state);
+        }
+        Self { states }
+    }
+
+    pub fn availability(&self, session: &Session) -> SourceAvailability {
+        let saved = source_availability(session, transcript_fingerprint(session).ok().flatten());
+        if matches!(
+            saved,
+            SourceAvailability::Archived | SourceAvailability::RequiresReconciliation
+        ) {
+            return saved;
+        }
+        match self
+            .states
+            .get(&(session.provider, session.provider_thread_id().to_owned()))
+            .copied()
+            .unwrap_or(ProviderSourceState::Unknown)
+        {
+            ProviderSourceState::Present => saved,
+            ProviderSourceState::Archived => SourceAvailability::Archived,
+            ProviderSourceState::Deleted => SourceAvailability::Deleted,
+            ProviderSourceState::Unknown => SourceAvailability::SourceUnavailable,
+        }
+    }
+}
+
+impl SourceAvailability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceAvailable => "source-available",
+            Self::SourceUnavailable => "source-unavailable",
+            Self::Archived => "archived",
+            Self::Deleted => "deleted",
+            Self::RequiresReconciliation => "requires-reconciliation",
+        }
+    }
+
+    pub fn permits_consultation(self) -> bool {
+        self == Self::SourceAvailable
+    }
 }
 
 /// Capability produced after the lifecycle layer proves the calling pane.
@@ -272,7 +353,7 @@ pub fn rank_experts(
         matches.push(ExpertMatch {
             provider: session.provider,
             session_id: session.session_id.clone(),
-            name: session.display_name(),
+            name: session.name.clone(),
             project: session.cwd.clone(),
             branch: session.branch.clone(),
             status: session.status,
@@ -290,6 +371,11 @@ pub fn rank_experts(
             watched: !untracked.contains(&(session.provider, session.session_id.clone())),
             discoverable: true,
             availability: expert_availability(session, fingerprint).to_owned(),
+            qualified_name: session.session_id.clone(),
+            machine: None,
+            node_id: None,
+            snapshot_stale: None,
+            snapshot_seen_at: None,
             freshness: profile_freshness_from_fingerprint(stored, fingerprint, now()),
         });
     }
@@ -454,20 +540,52 @@ pub fn expert_availability(
     session: &Session,
     fingerprint: Option<TranscriptFingerprint>,
 ) -> &'static str {
+    source_availability(session, fingerprint).as_str()
+}
+
+pub fn source_availability(
+    session: &Session,
+    fingerprint: Option<TranscriptFingerprint>,
+) -> SourceAvailability {
     if session
         .transcript_path
         .as_deref()
         .is_some_and(is_archived_path)
     {
-        return "archived";
+        return SourceAvailability::Archived;
     }
     if matches!(session.status, Status::Error | Status::OpenTwice) {
-        return "requires-reconciliation";
+        return SourceAvailability::RequiresReconciliation;
     }
     if fingerprint.is_none() {
-        return "source-unavailable";
+        return SourceAvailability::SourceUnavailable;
     }
-    "source-available"
+    SourceAvailability::SourceAvailable
+}
+
+/// Revalidate the provider-owned source before any local consultation starts.
+///
+/// A saved transcript path alone is not authority: the provider's current
+/// metadata must still expose the exact active conversation and that source
+/// must remain readable. Provider read failures collapse to unavailable.
+pub fn local_source_availability(
+    paths: &Paths,
+    config: &Config,
+    session: &Session,
+) -> SourceAvailability {
+    LocalSourceIndex::read(paths, config, std::slice::from_ref(session)).availability(session)
+}
+
+pub fn remote_source_availability(stale: bool, availability: Option<&str>) -> &str {
+    if stale {
+        "machine-unreachable"
+    } else {
+        availability.unwrap_or("remote-unverified")
+    }
+}
+
+pub fn source_is_available(availability: &str) -> bool {
+    availability == SourceAvailability::SourceAvailable.as_str()
 }
 
 fn is_archived_path(value: &str) -> bool {

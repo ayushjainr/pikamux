@@ -15,6 +15,9 @@ Run `pika experts QUERY --json`. Prefer a current, exact card whose durable scop
 topics, working directory, and artifacts fit the question. If several experts are
 materially relevant, tell the user which ones you chose and why. Use
 `pika explain NAME --json` when identity, status, or freshness is ambiguous.
+Use the returned `qualified_name` verbatim for `pika ask`; it is the immutable
+conversation ID locally and the same ID qualified by machine remotely. Consult
+only when `availability` is `source-available`.
 
 ## Consult privately
 

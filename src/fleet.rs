@@ -5,8 +5,9 @@
 //! explicit persistence authorize snapshots or actions.
 
 use crate::consult::{CancellationToken, MAX_QUESTION_BYTES};
+use crate::experts::{CardStatus, ExpertMatch, rank_experts, remote_source_availability};
 use crate::model::{Candidate, ExpertProfile, FleetNode, Provider, Session, Status};
-use crate::store::Store;
+use crate::store::{Store, StoredExpertProfile};
 use crate::update::RemoteInstallBundle;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -263,6 +264,25 @@ impl FleetSession {
     }
     pub fn needs_attention(&self) -> bool {
         !self.stale && self.session.needs_attention()
+    }
+
+    pub fn source_availability(&self) -> &str {
+        remote_source_availability(self.stale, self.availability.as_deref())
+    }
+
+    fn require_consultable(&self) -> Result<(), FleetError> {
+        let availability = self.source_availability();
+        if crate::experts::source_is_available(availability) {
+            Ok(())
+        } else {
+            Err(FleetError::new(
+                FleetErrorKind::InvalidRequest,
+                format!(
+                    "Cannot consult {}: {availability}. No question was sent; watching is unchanged.",
+                    self.qualified_name()
+                ),
+            ))
+        }
     }
 }
 
@@ -878,12 +898,12 @@ fn validate_profiles(value: Option<&Value>) -> Result<Vec<Value>, FleetError> {
                 "Remote expert profile is duplicated",
             ));
         }
-        required_text(
+        expert_text(
             object.get("scope"),
             "Remote expert scope has the wrong type or size",
             MAX_TEXT_CHARS,
         )?;
-        required_text(
+        expert_text(
             object.get("current_state"),
             "Remote expert current state has the wrong type or size",
             MAX_TEXT_CHARS,
@@ -908,7 +928,7 @@ fn validate_profiles(value: Option<&Value>) -> Result<Vec<Value>, FleetError> {
         if let Some(value) = object.get("current_state_updated_at") {
             finite_nonnegative(Some(value), "Remote expert clock is invalid")?;
         }
-        required_text(
+        expert_text(
             object.get("source"),
             "Remote expert source has the wrong type or size",
             MAX_TEXT_CHARS,
@@ -1599,6 +1619,97 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
         Ok(result)
     }
 
+    /// Merge retained remote expert cards without contacting any machine.
+    ///
+    /// Ranking happens independently per immutable node so an equal provider
+    /// UUID on two machines cannot overwrite or borrow another node's profile.
+    pub fn expert_matches(&self, query: &str) -> Result<Vec<ExpertMatch>, FleetError> {
+        let sessions = self.cached_sessions(None, true)?;
+        let mut by_node = BTreeMap::<String, Vec<FleetSession>>::new();
+        for session in sessions {
+            by_node
+                .entry(session.node_id.clone())
+                .or_default()
+                .push(session);
+        }
+
+        let timestamp = now();
+        let mut matches = Vec::new();
+        for (node_id, sessions) in by_node {
+            let Some(stored) = self.store.get_remote_snapshot(&node_id)? else {
+                continue;
+            };
+            let Ok(snapshot) = validate_snapshot(&stored.payload, Some(&node_id)) else {
+                continue;
+            };
+            let profiles = snapshot
+                .get("profiles")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(profile_from_wire)
+                .collect::<Result<Vec<_>, _>>()?;
+            let local_sessions = sessions
+                .iter()
+                .map(|item| item.session.clone())
+                .collect::<Vec<_>>();
+            let wrappers = sessions
+                .into_iter()
+                .map(|item| {
+                    (
+                        (item.session.provider, item.session.session_id.clone()),
+                        item,
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            for mut found in rank_experts(&profiles, &local_sessions, query, &BTreeSet::new()) {
+                let Some(remote) = wrappers.get(&(found.provider, found.session_id.clone())) else {
+                    continue;
+                };
+                found.watched = remote.watched;
+                found.availability = remote.source_availability().to_owned();
+                found.qualified_name = format!("{}@{}", found.session_id, remote.node_name);
+                found.machine = Some(remote.node_name.clone());
+                found.node_id = Some(remote.node_id.clone());
+                found.snapshot_stale = Some(remote.stale);
+                found.snapshot_seen_at = Some(remote.seen_at);
+                if let Some(status) = remote.card_status.as_deref().and_then(parse_card_status) {
+                    found.card_status = status;
+                }
+                found.freshness.scope_updated_at = remote.scope_updated_at;
+                found.freshness.scope_age_seconds = remote
+                    .scope_updated_at
+                    .map(|value| (timestamp - value).max(0.0));
+                found.freshness.current_state_updated_at = remote.current_state_updated_at;
+                found.freshness.current_state_age_seconds = remote
+                    .current_state_updated_at
+                    .map(|value| (timestamp - value).max(0.0));
+                found.freshness.current_state_status = if remote.stale {
+                    CardStatus::Unknown
+                } else {
+                    remote
+                        .current_state_status
+                        .as_deref()
+                        .and_then(parse_card_status)
+                        .unwrap_or(CardStatus::Unknown)
+                };
+                matches.push(found);
+            }
+        }
+        matches.sort_by(|left, right| {
+            let left_fresh = left.snapshot_stale != Some(true);
+            let right_fresh = right.snapshot_stale != Some(true);
+            right_fresh
+                .cmp(&left_fresh)
+                .then_with(|| right.score.cmp(&left.score))
+                .then_with(|| right.live.cmp(&left.live))
+                .then_with(|| right.profile_updated_at.total_cmp(&left.profile_updated_at))
+                .then_with(|| right.node_id.cmp(&left.node_id))
+                .then_with(|| right.session_id.cmp(&left.session_id))
+        });
+        Ok(matches)
+    }
+
     pub fn resolve(
         &self,
         query: &str,
@@ -2151,6 +2262,7 @@ impl RemoteConsultation {
         cancellation: CancellationToken,
     ) -> Result<Self, FleetError> {
         validate_exact_route(&node, &session)?;
+        session.require_consultable()?;
         let args = vec![
             "_fleet-ask".to_owned(),
             "--expected-node-id".to_owned(),
@@ -3048,6 +3160,14 @@ fn required_text(value: Option<&Value>, message: &str, max: usize) -> Result<Str
         _ => Err(FleetError::new(FleetErrorKind::Incompatible, message)),
     }
 }
+fn expert_text(value: Option<&Value>, message: &str, max: usize) -> Result<String, FleetError> {
+    match value {
+        Some(Value::String(value)) if value.chars().count() <= max => {
+            Ok(sanitize_terminal_text(value))
+        }
+        _ => Err(FleetError::new(FleetErrorKind::Incompatible, message)),
+    }
+}
 fn string_array(
     value: Option<&Value>,
     message: &str,
@@ -3160,6 +3280,73 @@ fn keyed_values(value: Option<&Value>) -> BTreeMap<(String, String), Value> {
         })
         .collect()
 }
+
+fn profile_from_wire(value: &Value) -> Result<StoredExpertProfile, FleetError> {
+    let object = object(value, "Remote expert profile is malformed")?;
+    Ok(StoredExpertProfile {
+        profile: ExpertProfile {
+            provider: parse_provider(object.get("provider"))?,
+            session_id: valid_session_id(
+                object.get("session_id"),
+                "Remote expert profile has an invalid conversation identity",
+            )?,
+            summary: expert_text(
+                object.get("scope"),
+                "Remote expert scope has the wrong type or size",
+                MAX_TEXT_CHARS,
+            )?,
+            current_state: expert_text(
+                object.get("current_state"),
+                "Remote expert current state has the wrong type or size",
+                MAX_TEXT_CHARS,
+            )?,
+            topics: string_array(
+                object.get("topics"),
+                "Remote expert topics are malformed",
+                MAX_EXPERT_ITEMS,
+            )?,
+            artifacts: string_array(
+                object.get("artifacts"),
+                "Remote expert artifacts are malformed",
+                MAX_EXPERT_ITEMS,
+            )?,
+            source: expert_text(
+                object.get("source"),
+                "Remote expert source has the wrong type or size",
+                MAX_TEXT_CHARS,
+            )?,
+            updated_at: finite_nonnegative(
+                object.get("updated_at"),
+                "Remote expert profile has an invalid timestamp",
+            )?,
+            scope_updated_at: object
+                .get("scope_updated_at")
+                .map(|value| finite_nonnegative(Some(value), "Remote expert clock is invalid"))
+                .transpose()?
+                .unwrap_or(0.0),
+            current_state_updated_at: object
+                .get("current_state_updated_at")
+                .map(|value| finite_nonnegative(Some(value), "Remote expert clock is invalid"))
+                .transpose()?
+                .unwrap_or(0.0),
+        },
+        transcript_mtime_ns: None,
+        transcript_size: None,
+        current_state_mtime_ns: None,
+        current_state_size: None,
+    })
+}
+
+fn parse_card_status(value: &str) -> Option<CardStatus> {
+    match value {
+        "CURRENT" => Some(CardStatus::Current),
+        "STALE" => Some(CardStatus::Stale),
+        "MISSING" => Some(CardStatus::Missing),
+        "UNKNOWN" => Some(CardStatus::Unknown),
+        _ => None,
+    }
+}
+
 fn parse_error_kind(value: Option<&str>) -> FleetErrorKind {
     match value {
         Some("invalid_request") => FleetErrorKind::InvalidRequest,

@@ -975,8 +975,7 @@ fn run_local_board_consultation(
     if io.item.session.provider == Provider::Opencode {
         options.opencode_database = Some(pika.paths.opencode_data_home.join("opencode.db"));
     }
-    let mut side = crate::consult::Consultation::open(&io.item.session, options)
-        .map_err(consultation_error)?;
+    let mut side = open_local_consultation(pika, &io.item.session, options)?;
     let _ = io.events.send(ConsultationEvent::Opened {
         child_id: side.child_id().map(str::to_owned),
         policy: Some(side.policy().label()),
@@ -1006,12 +1005,7 @@ fn run_remote_board_consultation(
     io: monitor::ConsultationIo,
 ) -> Result<ConsultationOutcome> {
     let remote = exact_remote(pika, &io.item)?;
-    if remote.stale {
-        bail!(
-            "remote metadata is stale; run `pika sync {}`",
-            remote.node_name
-        )
-    }
+    require_remote_source_available(&remote)?;
     let local_policy = crate::consult::consultation_policy(remote.session.provider, false)?;
     let policy = fleet::ConsultationPolicy {
         consultation_mode: local_policy.mode,
@@ -1519,14 +1513,43 @@ fn experts(pika: &Pika, a: QueryArgs) -> Result<i32> {
         .collect();
     tracked.extend(unwatched);
     let profiles = pika.store.list_stored_expert_profiles()?;
-    let found = crate::experts::rank_experts(&profiles, &tracked, &a.query.join(" "), &untracked);
+    let query = a.query.join(" ");
+    let source_index = crate::experts::LocalSourceIndex::read(&pika.paths, &pika.config, &tracked);
+    let mut found = crate::experts::rank_experts(&profiles, &tracked, &query, &untracked);
+    for item in &mut found {
+        if let Some(session) = tracked.iter().find(|session| {
+            session.provider == item.provider && session.session_id == item.session_id
+        }) {
+            item.availability = source_index.availability(session).as_str().to_owned();
+        }
+    }
+    found.retain(|item| item.availability != "archived");
+    found.extend(
+        FleetManager::new(&pika.store, SshTransport::default())
+            .expert_matches(&query)
+            .map_err(anyhow::Error::from)?,
+    );
+    found.sort_by(|left, right| {
+        let left_fresh = left.snapshot_stale != Some(true);
+        let right_fresh = right.snapshot_stale != Some(true);
+        right_fresh
+            .cmp(&left_fresh)
+            .then_with(|| right.score.cmp(&left.score))
+            .then_with(|| right.live.cmp(&left.live))
+            .then_with(|| right.profile_updated_at.total_cmp(&left.profile_updated_at))
+            .then_with(|| right.node_id.cmp(&left.node_id))
+            .then_with(|| right.session_id.cmp(&left.session_id))
+    });
     if a.json {
         println!("{}", serde_json::to_string(&found)?)
     } else if found.is_empty() {
         println!("No expert cards match.")
     } else {
         for x in found {
-            println!("{} {:<24} · {}", x.provider, x.name, x.scope)
+            println!(
+                "{} {:<45} · {} · {}",
+                x.provider, x.qualified_name, x.availability, x.scope
+            )
         }
     }
     Ok(0)
@@ -2496,20 +2519,13 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
         return ask_remote(pika, remote, a);
     }
     let session = select_one(pika, &a.name)?;
-    if session.transcript_path.is_none() {
-        bail!(
-            "{} has no durable provider transcript to consult",
-            session.display_name()
-        );
-    }
     let mut options =
         crate::consult::ConsultationOptions::new(pika.config.executable(session.provider));
     options.fast = a.fast;
     if session.provider == Provider::Opencode {
         options.opencode_database = Some(pika.paths.opencode_data_home.join("opencode.db"));
     }
-    let mut side =
-        crate::consult::Consultation::open(&session, options).map_err(consultation_error)?;
+    let mut side = open_local_consultation(pika, &session, options)?;
     if a.jsonl {
         return ask_jsonl(&mut side, &session, &a.question.join(" "));
     }
@@ -2551,24 +2567,7 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
 }
 
 fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i32> {
-    if remote.stale {
-        bail!(
-            "{} is stale. Run exactly: `pika sync {}` before asking it.",
-            remote.qualified_name(),
-            shell_words::quote(&remote.node_name)
-        )
-    }
-    if remote.availability.as_deref().is_some_and(|value| {
-        matches!(
-            value,
-            "archived" | "deleted" | "provider-unavailable" | "source-unavailable"
-        )
-    }) {
-        bail!(
-            "{} is not currently available for consultation",
-            remote.qualified_name()
-        )
-    }
+    require_remote_source_available(&remote)?;
     let local_policy = crate::consult::consultation_policy(remote.session.provider, a.fast)?;
     let policy = fleet::ConsultationPolicy {
         consultation_mode: local_policy.mode.clone(),
@@ -2625,6 +2624,24 @@ fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i3
         }
     }
     Ok(0)
+}
+
+fn require_remote_source_available(remote: &fleet::FleetSession) -> Result<()> {
+    let availability = remote.source_availability();
+    if availability == "machine-unreachable" {
+        bail!(
+            "{} is stale. Run exactly: `pika sync {}` before asking it.",
+            remote.qualified_name(),
+            shell_words::quote(&remote.node_name)
+        )
+    }
+    if !crate::experts::source_is_available(availability) {
+        bail!(
+            "Cannot consult {}: {availability}. No question was sent; watching is unchanged.",
+            remote.qualified_name(),
+        )
+    }
+    Ok(())
 }
 
 fn ask_remote_jsonl(
@@ -3134,6 +3151,24 @@ fn consultation_error(error: crate::consult::ConsultationError) -> anyhow::Error
         error.receipt.retry_safe
     )
 }
+
+fn open_local_consultation(
+    pika: &Pika,
+    session: &Session,
+    options: crate::consult::ConsultationOptions,
+) -> Result<crate::consult::Consultation> {
+    let availability =
+        crate::experts::local_source_availability(&pika.paths, &pika.config, session);
+    if !availability.permits_consultation() {
+        bail!(
+            "Cannot consult {}: {}. No question was sent; watching is unchanged.",
+            session.display_name(),
+            availability.as_str(),
+        )
+    }
+    crate::consult::Consultation::open(session, options).map_err(consultation_error)
+}
+
 fn ask_interactive(pika: &Pika, s: Session) -> Result<i32> {
     print!("Ask {} › ", s.display_name());
     io::stdout().flush()?;
@@ -3382,8 +3417,7 @@ fn fleet_ask(pika: &Pika, a: FleetAskArgs) -> Result<i32> {
     if session.provider == Provider::Opencode {
         options.opencode_database = Some(pika.paths.opencode_data_home.join("opencode.db"));
     }
-    let mut side =
-        crate::consult::Consultation::open(&session, options).map_err(consultation_error)?;
+    let mut side = open_local_consultation(pika, &session, options)?;
     serve_fleet_consultation(&mut side, &session, inputs, &cancellation)
 }
 
@@ -3465,6 +3499,19 @@ impl FleetService for LocalFleetService<'_> {
                 }
             }
         }
+        let source_sessions = sessions
+            .iter()
+            .chain(expert_sessions.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let source_index = crate::experts::LocalSourceIndex::read(
+            &self.pika.paths,
+            &self.pika.config,
+            &source_sessions,
+        );
+        expert_sessions.retain(|session| {
+            source_index.availability(session) != crate::experts::SourceAvailability::Archived
+        });
         let identities: std::collections::BTreeSet<_> = sessions
             .iter()
             .chain(expert_sessions.iter())
@@ -3495,16 +3542,13 @@ impl FleetService for LocalFleetService<'_> {
                 .copied();
             let state = crate::experts::card_state(session, stored);
             let freshness = crate::experts::profile_freshness(session, stored, now());
-            let fingerprint = crate::experts::transcript_fingerprint(session)
-                .ok()
-                .flatten();
             cards.push(serde_json::json!({
                 "provider": session.provider,
                 "session_id": session.session_id,
                 "status": state.status,
                 "detail": state.detail,
                 "watched": watched.contains(&(session.provider, session.session_id.clone())),
-                "availability": crate::experts::expert_availability(session, fingerprint),
+                "availability": source_index.availability(session).as_str(),
                 "current_state_status": freshness.current_state_status,
             }));
         }
@@ -3771,5 +3815,181 @@ done
             vec!["process changed during observation".into()],
         );
         assert!(complete_hook_processes(&observation).is_none());
+    }
+
+    #[test]
+    fn board_local_ask_refuses_unavailable_source_before_provider_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("provider-called");
+        let executable = root.path().join("codex");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf called > '{}'\nexit 91\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let transcript = root.path().join("saved.jsonl");
+        fs::write(&transcript, "saved\n").unwrap();
+        let mut session = fixture_session(root.path());
+        session.session_id = "11111111-1111-4111-8111-111111111111".into();
+        session.active_thread_id = None;
+        session.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        let config_dir = root.path().join("config");
+        let state_dir = root.path().join("state");
+        let paths = crate::paths::Paths {
+            config: config_dir.join("config.json"),
+            database: state_dir.join("pika.db"),
+            config_dir,
+            state_dir,
+            codex_home: root.path().join("codex-home"),
+            claude_home: root.path().join("claude-home"),
+            opencode_data_home: root.path().join("opencode-data"),
+            opencode_config_home: root.path().join("opencode-config"),
+        };
+        fs::create_dir_all(&paths.codex_home).unwrap();
+        fs::write(paths.codex_home.join("state_corrupt.sqlite"), "not sqlite").unwrap();
+        let mut config = crate::config::Config::default();
+        config.provider_executables.insert(
+            Provider::Codex.as_str().to_owned(),
+            executable.to_string_lossy().into_owned(),
+        );
+        let store = Store::at(&paths.database);
+        let pika = Pika::with_components(
+            paths,
+            config,
+            store,
+            crate::tmux::Tmux::with_executable("fixture-tmux", Some("isolated".into())),
+        );
+        let (_commands, command_receiver) = mpsc::channel();
+        let (event_sender, _events) = mpsc::sync_channel(1);
+        let error = run_local_board_consultation(
+            &pika,
+            monitor::ConsultationIo {
+                item: BoardItem::local(session),
+                commands: command_receiver,
+                events: event_sender,
+                cancellation: crate::consult::CancellationToken::default(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("source-unavailable"));
+        assert!(error.to_string().contains("No question was sent"));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn remote_cli_and_board_refuse_unavailable_source_before_transport() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        let state_dir = root.path().join("state");
+        let paths = crate::paths::Paths {
+            config: config_dir.join("config.json"),
+            database: state_dir.join("pika.db"),
+            config_dir,
+            state_dir,
+            codex_home: root.path().join("codex-home"),
+            claude_home: root.path().join("claude-home"),
+            opencode_data_home: root.path().join("opencode-data"),
+            opencode_config_home: root.path().join("opencode-config"),
+        };
+        let store = Store::at(&paths.database);
+        let node_id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert_fleet_node(&crate::model::FleetNode {
+                node_id: node_id.clone(),
+                alias: "atlas".into(),
+                ssh_target: "transport-must-not-run".into(),
+                sources: vec!["explicit".into()],
+                status: "ready".into(),
+                protocol_version: Some(fleet::PROTOCOL_VERSION),
+                package_version: Some("test".into()),
+                capabilities: fleet::CAPABILITIES
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                last_seen: now(),
+                last_attempt_at: now(),
+                last_error: None,
+                created_at: now(),
+                updated_at: now(),
+            })
+            .unwrap();
+        let mut session = fixture_session(root.path());
+        session.session_id = "22222222-2222-4222-8222-222222222222".into();
+        session.active_thread_id = None;
+        session.home_state = "exact".into();
+        let captured_at = now();
+        let snapshot = serde_json::json!({
+            "type":"snapshot",
+            "protocol":fleet::PROTOCOL_NAME,
+            "version":fleet::PROTOCOL_VERSION,
+            "node_id":node_id,
+            "machine":"atlas",
+            "captured_at":captured_at,
+            "sessions":[fleet::session_to_wire(&session, false)],
+            "profiles":[],
+            "cards":[{
+                "provider":"codex",
+                "session_id":session.session_id,
+                "status":"UNKNOWN",
+                "detail":"provider source is unavailable",
+                "watched":true,
+                "availability":"source-unavailable",
+                "current_state_status":"UNKNOWN"
+            }]
+        });
+        store
+            .put_remote_snapshot(&node_id, &snapshot, captured_at)
+            .unwrap();
+        let pika = Pika::with_components(
+            paths,
+            crate::config::Config::default(),
+            store,
+            crate::tmux::Tmux::with_executable("fixture-tmux", Some("isolated".into())),
+        );
+        let remote = FleetManager::new(&pika.store, SshTransport::default())
+            .cached_sessions(Some(&node_id), false)
+            .unwrap()
+            .remove(0);
+        let cli_error = ask_remote(
+            &pika,
+            remote.clone(),
+            AskArgs {
+                name: remote.qualified_name(),
+                question: vec!["question".into()],
+                jsonl: false,
+                json: false,
+                fast: false,
+            },
+        )
+        .unwrap_err();
+        assert!(cli_error.to_string().contains("source-unavailable"));
+        assert!(cli_error.to_string().contains("No question was sent"));
+
+        let (_commands, command_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::sync_channel(1);
+        let board_error = run_remote_board_consultation(
+            &pika,
+            monitor::ConsultationIo {
+                item: BoardItem {
+                    session,
+                    node_id: Some(node_id),
+                    node_name: Some("atlas".into()),
+                    stale: false,
+                    pending_token: None,
+                    expert: None,
+                },
+                commands: command_receiver,
+                events: event_sender,
+                cancellation: crate::consult::CancellationToken::default(),
+            },
+        )
+        .unwrap_err();
+        assert!(board_error.to_string().contains("source-unavailable"));
+        assert!(board_error.to_string().contains("No question was sent"));
+        assert!(event_receiver.try_recv().is_err());
     }
 }

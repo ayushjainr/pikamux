@@ -24,6 +24,19 @@ pub struct Providers<'a> {
     config: &'a Config,
 }
 
+/// Provider-owned durable metadata state for one immutable conversation ID.
+///
+/// This deliberately avoids transcript contents and process discovery. It is
+/// safe to use as the final source-access gate immediately before a private
+/// consultation starts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderSourceState {
+    Present,
+    Archived,
+    Deleted,
+    Unknown,
+}
+
 impl<'a> Providers<'a> {
     pub fn new(paths: &'a Paths, config: &'a Config) -> Self {
         Self { paths, config }
@@ -114,6 +127,27 @@ impl<'a> Providers<'a> {
                 }
                 records
             }
+        }
+    }
+
+    pub fn source_state(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        transcript_path: Option<&str>,
+    ) -> ProviderSourceState {
+        match provider {
+            Provider::Codex => {
+                codex_source_state(&self.paths.codex_home, session_id, transcript_path)
+            }
+            Provider::Claude => {
+                if transcript_path.map(Path::new).is_some_and(Path::is_file) {
+                    ProviderSourceState::Present
+                } else {
+                    ProviderSourceState::Unknown
+                }
+            }
+            Provider::Opencode => opencode_source_state(&self.paths.opencode_data_home, session_id),
         }
     }
 
@@ -991,6 +1025,87 @@ fn opencode_model(raw: &str) -> Option<String> {
         |provider| format!("{provider}/{model}"),
     );
     Some(variant.map_or(label.clone(), |variant| format!("{label}[{variant}]")))
+}
+
+fn codex_source_state(
+    home: &Path,
+    session_id: &str,
+    transcript_path: Option<&str>,
+) -> ProviderSourceState {
+    let transcript_exists = transcript_path.map(Path::new).is_some_and(Path::is_file);
+    let Some(database) = newest_matching(home, "state_", ".sqlite") else {
+        return if transcript_exists {
+            ProviderSourceState::Present
+        } else {
+            ProviderSourceState::Unknown
+        };
+    };
+    let Ok(db) = readonly(&database) else {
+        return ProviderSourceState::Unknown;
+    };
+    let Ok(columns) = columns(&db, "threads") else {
+        return ProviderSourceState::Unknown;
+    };
+    if !columns.contains("id") {
+        return ProviderSourceState::Unknown;
+    }
+    let archived = if columns.contains("archived") {
+        db.query_row(
+            "SELECT COALESCE(archived,0) FROM threads WHERE id=?1 LIMIT 1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+    } else {
+        db.query_row(
+            "SELECT 0 FROM threads WHERE id=?1 LIMIT 1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+    };
+    match archived {
+        Some(value) if value != 0 => ProviderSourceState::Archived,
+        Some(_) if transcript_exists => ProviderSourceState::Present,
+        Some(_) => ProviderSourceState::Unknown,
+        // Older Codex stores and migrated conversations can retain a valid
+        // rollout without a row in the newest state DB.
+        None if transcript_exists => ProviderSourceState::Present,
+        None => ProviderSourceState::Deleted,
+    }
+}
+
+fn opencode_source_state(home: &Path, session_id: &str) -> ProviderSourceState {
+    let database = home.join("opencode.db");
+    let Ok(db) = readonly(&database) else {
+        return ProviderSourceState::Unknown;
+    };
+    let Ok(columns) = columns(&db, "session") else {
+        return ProviderSourceState::Unknown;
+    };
+    if !columns.contains("id") {
+        return ProviderSourceState::Unknown;
+    }
+    let archived = if columns.contains("time_archived") {
+        db.query_row(
+            "SELECT time_archived IS NOT NULL FROM session WHERE id=?1 LIMIT 1",
+            [session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .ok()
+    } else {
+        db.query_row(
+            "SELECT 0 FROM session WHERE id=?1 LIMIT 1",
+            [session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .ok()
+    };
+    match archived {
+        Some(true) => ProviderSourceState::Archived,
+        Some(false) => ProviderSourceState::Present,
+        None => ProviderSourceState::Deleted,
+    }
 }
 
 fn readonly(path: &Path) -> Result<Connection> {
