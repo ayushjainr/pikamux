@@ -27,6 +27,9 @@ jobs:
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-targets --all-features
           scripts/test-mixed-runtime.sh
+          cargo fetch --locked
+          scripts/generate-third-party.sh /tmp/THIRD_PARTY.md
+          diff -u THIRD_PARTY.md /tmp/THIRD_PARTY.md
 
   build:
     needs: verify

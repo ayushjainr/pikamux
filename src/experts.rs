@@ -73,6 +73,8 @@ pub struct ExpertMatch {
     pub profile_updated_at: f64,
     pub profile_source: String,
     pub card_status: CardStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_detail: Option<String>,
     pub score: i64,
     pub matched_on: Vec<String>,
     pub watched: bool,
@@ -373,6 +375,7 @@ pub fn rank_experts(
             profile_updated_at: profile.updated_at,
             profile_source: profile.source.clone(),
             card_status: card_state_from_fingerprint(stored, fingerprint).status,
+            card_detail: None,
             score,
             matched_on,
             watched: !untracked.contains(&(session.provider, session.session_id.clone())),

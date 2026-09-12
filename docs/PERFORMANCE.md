@@ -13,22 +13,28 @@ Python v0.5.0a4 reference recorded in `REFERENCE.md`.
 
 | Contract | Samples | Native Rust | Python v0.5.0a4 | Gate |
 | --- | ---: | ---: | ---: | ---: |
-| CLI startup p95 | 100 each | 4.67 ms | 146.30 ms | ≤30 ms |
-| Cached board first-frame p95 | 30 each | 11.41 ms | 487.15 ms | ≤200 ms |
-| Board input redraw p95 / p99 | 1,000 each | 0.143 / 0.172 ms | 8.57 / 8.72 ms | ≤50 / 100 ms |
-| Hook fast-path p95 | 100 each | 14.43 ms | 498.39 ms | ≤75 ms |
-| Full 200-row local reconciliation p95 | 30 each | 72.40 ms | 2,564.50 ms | ≤500 ms |
-| Warm board RSS p95 | 300 s native / 60 s Python | 6.84 MiB | 36.42 MiB | ≤40 MiB |
-| Native idle board CPU mean | 300 s | 0.372% of one core | — | ≤1% |
-| Executable / gzip | one release build | 4.27 / 2.21 MB | interpreter environment required | ≤50 / 20 MiB |
+| CLI startup p95 | 100 each | 5.33 ms | 147.85 ms | ≤30 ms |
+| Cached board first-frame p95 | 30 each | 11.16 ms | 484.27 ms | ≤200 ms |
+| Board input redraw p95 / p99 | 1,000 each | 0.123 / 0.142 ms | 8.56 / 8.75 ms | ≤50 / 100 ms |
+| Hook fast-path p95 | 100 each | 15.46 ms | 505.63 ms | ≤75 ms |
+| Full 200-row local reconciliation p95 | 30 each | 73.34 ms | 2,563.51 ms | ≤500 ms |
+| Warm board RSS p95 | 300 s native / 60 s Python | 7.06 MiB | 36.42 MiB | ≤40 MiB |
+| Native idle board CPU mean | 300 s | 0.654% of one core | — | ≤1% |
+| Executable / gzip | one release build | 4.39 / 2.26 MB | interpreter environment required | ≤50 / 20 MiB |
 
-The 100-launch native startup run had a 4.03 ms p50 and one 360.65 ms scheduler
-outlier; its p95 remained 4.67 ms. The dedicated board run had an 11.65 ms
+The 100-launch native startup run had a 4.27 ms p50 and one 384 ms scheduler
+outlier; its p95 remained 5.33 ms. The dedicated board run had an 11.50 ms
 maximum. The five-minute CPU run repainted
 the clock once per second, consumed hook-backed SQLite commits within 250 ms,
 and performed the fallback provider/process reconciliation every ten seconds.
-Its process-tree RSS maximum and p95 were 6.84 MiB, and its second-half CPU mean
-was 0.442%.
+Its process-tree RSS maximum/p95 were 7.67/7.06 MiB, and its second-half CPU mean
+was 0.683%.
+
+Provider scaling is separately regression-tested with 2,000 watched Codex rows,
+2,000 Claude transcripts, and 2,000 OpenCode roots. Codex/Claude healing advances
+at most 16 changed transcript records per cycle under aggregate byte limits;
+OpenCode projects descendant activity and lifecycle with two batched recursive
+queries rather than per-row queries. Hooks remain the immediate status path.
 
 `measure_reconcile.py` invokes the public `pika list --no-usage` boundary, so its
 numbers include process startup, process enumeration, provider metadata reads,

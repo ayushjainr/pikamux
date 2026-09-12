@@ -1,6 +1,7 @@
 # Pika Native — phased Rust migration PRD
 
-Status: proposed execution contract; implementation has not started.
+Status: native implementation complete through the local CP7.1 candidate gate;
+publication, live cutover, and retirement remain separately authorized operations.
 Owner: Ayush Jain. Prepared: 2026-09-11.
 Baseline: public Python v0.5.0a4, commit `36de1b1eed1a182ed4e608d47f95d362f15d571a`.
 Repository inspection: `c63d026792b9ce13f349c949e9143bb859fb6d17` (subsequent video-only update).
@@ -107,16 +108,16 @@ indicator, not a Rust line-count target. The v0.5.0a4 release was verified with
 passed on Linux Python 3.10/3.13, macOS, and the Windows client smoke job.
 Existing tests are useful evidence, not proof of complete behavioural coverage.
 
-Two earlier `pika --version` observations on the maintainer Mac were 100–120 ms
-with approximately 36 MB peak RSS. They are illustrative, not a benchmark
-baseline. Board RSS, total installed footprint, steady CPU, and provider-stage
-latency have not yet been measured under a common fixture.
+The executed same-machine comparison and exact fixture boundaries are recorded in
+`docs/PERFORMANCE.md`. The native candidate now has measured startup, cached-board,
+input, hook, reconciliation, five-minute CPU/RSS, and artifact evidence against the
+frozen Python reference; provider inference speed remains deliberately excluded.
 
-### Proposed release gates
+### Release gates
 
-These are target budgets, not achieved results. Phase 0 must measure the Python
-baseline and freeze the fixture/environment. If a budget is infeasible, change
-the approved plan with evidence; do not silently weaken a gate after seeing Rust.
+These budgets were fixed before implementation. Achieved local macOS-arm64 results
+are recorded separately in `docs/PERFORMANCE.md`; cross-platform publication still
+depends on the protected CI/release workflow and a separately authorized release.
 
 | ID | Metric | Proposed gate | Measurement boundary |
 | --- | --- | --- | --- |

@@ -18,6 +18,11 @@ compatible with the current channel. `--check` downloads metadata only;
 installation never selects a prerelease. A preview installation may select a
 newer preview or stable release.
 
+`pika update --rollback` revalidates retained receipts, manifests, archives,
+checksums, executable bytes, and the managed launcher before atomically selecting
+the newest older release. `pika update --rollback VERSION` selects one exact
+retained version. Tampered or foreign release directories are never activated.
+
 The updater downloads only constructed URLs beneath the Pika GitHub release
 path. API-provided URLs and manifest-provided paths are ignored. Manifests,
 release listings and artifacts have hard size bounds. Target, filename, declared
@@ -96,7 +101,15 @@ are accepted only for the transition.
 each runnable binary's version/help/embedded skill, creates fresh archives, and
 writes checksums over the final bytes. Cross-target assembly may set the internal
 `PIKA_CROSS_PACKAGE=1` flag only after every matrix job has run those checks on
-the matching native runner.
+the matching native runner. `scripts/generate-third-party.sh` deterministically
+rebuilds `THIRD_PARTY.md` from `Cargo.lock` and the checksummed Cargo crate
+archives. The shipped file covers normal and build dependencies for every native
+host target and the Windows client target, records package checksums and declared
+authors, reproduces the source license/notice texts, and identifies the
+public-domain SQLite amalgamation compiled by the `bundled` feature. CI rejects
+stale generated output. The same bundle reproduces the pinned Rust toolchain's
+complete standard-library copyright report because that runtime is statically
+linked into Pika.
 
 ## Managed installation
 

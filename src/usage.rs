@@ -19,14 +19,16 @@ use std::{
     collections::BTreeSet,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 pub const PRICING_AS_OF: &str = "2026-08-12";
 const MAX_CODEX_TAIL_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CLAUDE_INITIAL_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_CLAUDE_INCREMENT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CLAUDE_INITIAL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CLAUDE_INCREMENT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_USAGE_RECORD_BYTES: u64 = 1024 * 1024;
+const NO_USAGE_MODEL: &str = "__pika_no_usage__";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -103,6 +105,137 @@ pub fn hydrate_sessions(paths: &Paths, store: &Store, sessions: &mut [Session]) 
     report
 }
 
+/// Apply the latest durable counters without touching provider transcripts.
+/// Stale values are acceptable orientation on the board and are replaced by
+/// the separately budgeted refresher after a source fingerprint changes.
+pub fn hydrate_cached_sessions(store: &Store, sessions: &mut [Session]) -> UsageReport {
+    let mut report = UsageReport::default();
+    let cached = match store.list_cached_usage() {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| ((row.provider, row.session_id.clone()), row))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        Err(error) => {
+            report.errors.push(error.to_string());
+            return report;
+        }
+    };
+    for session in sessions {
+        let Some(row) = cached.get(&(session.provider, session.session_id.clone())) else {
+            report.unavailable += 1;
+            continue;
+        };
+        if row.model.as_deref() == Some(NO_USAGE_MODEL) {
+            report.unavailable += 1;
+            continue;
+        }
+        apply_usage(
+            session,
+            from_cache(
+                row.clone(),
+                if session.provider == Provider::Opencode {
+                    CostBasis::ProviderReported
+                } else {
+                    CostBasis::ApiEquivalent
+                },
+                session.provider == Provider::Codex,
+            ),
+        );
+        report.hydrated += 1;
+    }
+    report
+}
+
+/// Refresh at most one changed source. This bounds each board tick to one
+/// provider read; unchanged misses and parse failures are fingerprint-cached.
+pub fn refresh_one_due(paths: &Paths, store: &Store, sessions: &[Session]) -> UsageReport {
+    let mut report = UsageReport::default();
+    let cached = store
+        .list_cached_usage()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| ((row.provider, row.session_id.clone()), row))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut due = sessions
+        .iter()
+        .filter_map(|session| {
+            let path = usage_source(paths, session)?;
+            let current = fingerprint(&path).ok()?;
+            let row = cached.get(&(session.provider, session.session_id.clone()));
+            let unchanged = row.is_some_and(|row| {
+                row.source_path == path.to_string_lossy()
+                    && row.source_mtime_ns == current.mtime_ns
+                    && row.source_size == current.size
+            });
+            (!unchanged).then_some((
+                row.map_or(0.0, |row| row.updated_at),
+                session,
+                path,
+                current,
+            ))
+        })
+        .collect::<Vec<_>>();
+    due.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let Some((_, session, path, current)) = due.into_iter().next() else {
+        return report;
+    };
+    match usage_for_session(paths, store, session) {
+        Ok(Some(_)) => report.hydrated = 1,
+        Ok(None) => {
+            let _ = cache_no_usage(store, session, &path, current);
+            report.unavailable = 1;
+        }
+        Err(error) => {
+            let _ = cache_no_usage(store, session, &path, current);
+            report.errors.push(format!(
+                "{}:{}: {error}",
+                session.provider, session.session_id
+            ));
+        }
+    }
+    report
+}
+
+fn usage_source(paths: &Paths, session: &Session) -> Option<std::path::PathBuf> {
+    match session.provider {
+        Provider::Codex | Provider::Claude => session.transcript_path.as_deref().map(PathBuf::from),
+        Provider::Opencode => Some(paths.opencode_data_home.join("opencode.db")),
+    }
+}
+
+fn cache_no_usage(
+    store: &Store,
+    session: &Session,
+    path: &Path,
+    fingerprint: Fingerprint,
+) -> Result<()> {
+    store.put_cached_usage(&UsageCacheRecord {
+        provider: session.provider,
+        session_id: session.session_id.clone(),
+        source_path: path.to_string_lossy().into_owned(),
+        source_mtime_ns: fingerprint.mtime_ns,
+        source_size: fingerprint.size,
+        model: Some(NO_USAGE_MODEL.into()),
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_write_tokens: 0,
+        total_tokens: 0,
+        estimated_cost_usd: None,
+        updated_at: now(),
+    })
+}
+
+fn apply_usage(session: &mut Session, usage: UsageMetrics) {
+    session.model = usage.model.or_else(|| session.model.clone());
+    session.input_tokens = Some(usage.input_tokens);
+    session.output_tokens = Some(usage.output_tokens);
+    session.cached_input_tokens = Some(usage.cached_input_tokens);
+    session.cache_write_tokens = Some(usage.cache_write_tokens);
+    session.total_tokens = Some(usage.total_tokens);
+    session.estimated_cost_usd = usage.estimated_cost_usd;
+}
+
 pub fn usage_for_session(
     paths: &Paths,
     store: &Store,
@@ -111,7 +244,7 @@ pub fn usage_for_session(
     match session.provider {
         Provider::Codex => codex_usage(store, session),
         Provider::Claude => claude_usage(store, session),
-        Provider::Opencode => opencode_usage(&paths.opencode_data_home, session),
+        Provider::Opencode => opencode_usage(&paths.opencode_data_home, store, session),
     }
 }
 
@@ -127,6 +260,9 @@ fn codex_usage(store: &Store, session: &Session) -> Result<Option<UsageMetrics>>
         fingerprint.mtime_ns,
         fingerprint.size,
     )? {
+        if cached.model.as_deref() == Some(NO_USAGE_MODEL) {
+            return Ok(None);
+        }
         return Ok(Some(from_cache(cached, CostBasis::ApiEquivalent, true)));
     }
 
@@ -167,6 +303,7 @@ fn codex_usage(store: &Store, session: &Session) -> Result<Option<UsageMetrics>>
         }
     }
     let Some((input, output, cached, total)) = counters else {
+        cache_no_usage(store, session, path, fingerprint)?;
         return Ok(None);
     };
     let mut usage = UsageMetrics {
@@ -202,6 +339,9 @@ fn claude_usage(store: &Store, session: &Session) -> Result<Option<UsageMetrics>
         current.mtime_ns,
         current.size,
     )? {
+        if cached.model.as_deref() == Some(NO_USAGE_MODEL) {
+            return Ok(None);
+        }
         return Ok(Some(from_cache(cached, CostBasis::ApiEquivalent, false)));
     }
 
@@ -252,6 +392,7 @@ fn claude_usage(store: &Store, session: &Session) -> Result<Option<UsageMetrics>
         Ok(())
     })?;
     if !found && start == 0 {
+        cache_no_usage(store, session, path, current)?;
         return Ok(None);
     }
     usage.total_tokens = [
@@ -278,10 +419,24 @@ fn claude_usage(store: &Store, session: &Session) -> Result<Option<UsageMetrics>
     Ok(Some(usage))
 }
 
-fn opencode_usage(home: &Path, session: &Session) -> Result<Option<UsageMetrics>> {
+fn opencode_usage(home: &Path, store: &Store, session: &Session) -> Result<Option<UsageMetrics>> {
     let database = home.join("opencode.db");
     if !database.is_file() {
         return Ok(None);
+    }
+    let current = fingerprint(&database)?;
+    let source = database.to_string_lossy();
+    if let Some(cached) = store.get_cached_usage(
+        Provider::Opencode,
+        &session.session_id,
+        &source,
+        current.mtime_ns,
+        current.size,
+    )? {
+        if cached.model.as_deref() == Some(NO_USAGE_MODEL) {
+            return Ok(None);
+        }
+        return Ok(Some(from_cache(cached, CostBasis::ProviderReported, false)));
     }
     let uri = format!("file:{}?mode=ro", database.to_string_lossy());
     let db = Connection::open_with_flags(
@@ -350,6 +505,7 @@ fn opencode_usage(home: &Path, session: &Session) -> Result<Option<UsageMetrics>
         ))
     })?;
     if row.0 == 0 {
+        cache_no_usage(store, session, &database, current)?;
         return Ok(None);
     }
     if [row.3, row.4, row.5, row.6, row.7]
@@ -365,7 +521,7 @@ fn opencode_usage(home: &Path, session: &Session) -> Result<Option<UsageMetrics>
         .into_iter()
         .try_fold(0_i64, |sum, value| sum.checked_add(value))
         .context("OpenCode token total exceeds supported range")?;
-    Ok(Some(UsageMetrics {
+    let usage = UsageMetrics {
         model: row
             .1
             .as_deref()
@@ -379,7 +535,15 @@ fn opencode_usage(home: &Path, session: &Session) -> Result<Option<UsageMetrics>
         estimated_cost_usd: row.2,
         cost_basis: row.2.map(|_| CostBasis::ProviderReported),
         pricing_as_of: None,
-    }))
+    };
+    store.put_cached_usage(&to_cache(
+        Provider::Opencode,
+        &session.session_id,
+        &database,
+        current,
+        &usage,
+    ))?;
+    Ok(Some(usage))
 }
 
 #[derive(Clone, Copy)]
@@ -430,9 +594,15 @@ where
     let mut parsed_end = start;
     loop {
         let mut bytes = Vec::new();
-        let read = reader.read_until(b'\n', &mut bytes)?;
+        let read = reader
+            .by_ref()
+            .take(MAX_USAGE_RECORD_BYTES + 1)
+            .read_until(b'\n', &mut bytes)?;
         if read == 0 {
             break;
+        }
+        if bytes.len() as u64 > MAX_USAGE_RECORD_BYTES {
+            bail!("usage record exceeds the 1 MiB safety limit")
         }
         position += read as u64;
         let terminated = bytes.last() == Some(&b'\n');

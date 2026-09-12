@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     consult::{CancellablePipe, CancellationToken, OwnedChild, terminate_child},
-    model::{Candidate, Provider, Status},
+    model::{Candidate, Provider, Session, Status},
     paths::Paths,
 };
 use anyhow::{Context, Result};
@@ -21,6 +21,17 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use walkdir::WalkDir;
 
 const MAX_PROVIDER_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_PROVIDER_RESULTS: usize = 2_000;
+const MAX_CODEX_RECONCILE_NAMED: usize = 128;
+const MAX_CODEX_METADATA_LINE_BYTES: u64 = 64 * 1024;
+const MAX_CODEX_METADATA_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CODEX_LIFECYCLE_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_CODEX_LIFECYCLE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CODEX_LIFECYCLE_RECORDS: usize = 16;
+const MAX_CLAUDE_DISCOVERY_FILES: usize = 1_000;
+const MAX_CLAUDE_METADATA_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CLAUDE_TITLE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CLAUDE_CHANGED_TITLES: usize = 16;
 
 pub struct Providers<'a> {
     paths: &'a Paths,
@@ -77,17 +88,27 @@ impl<'a> Providers<'a> {
         match provider {
             // Claude's generated title is orientation, not a stable name.
             // Exact UUID lookup remains available even for an unnamed record.
-            Provider::Claude => claude_records(&self.paths.claude_home, Some(query), true, None),
+            Provider::Claude => {
+                claude_records(&self.paths.claude_home, Some(query), true, None, None)
+            }
             _ => self.records(provider, Some(query), false),
         }
     }
 
     fn records(&self, provider: Provider, query: Option<&str>, named_only: bool) -> Vec<Candidate> {
         match provider {
-            Provider::Codex => {
-                codex_records(&self.paths.codex_home, self.config, query, named_only, None)
+            Provider::Codex => codex_records(
+                &self.paths.codex_home,
+                self.config,
+                query,
+                named_only,
+                None,
+                false,
+                None,
+            ),
+            Provider::Claude => {
+                claude_records(&self.paths.claude_home, query, named_only, None, None)
             }
-            Provider::Claude => claude_records(&self.paths.claude_home, query, named_only, None),
             Provider::Opencode => opencode_records(
                 &self.paths.opencode_data_home,
                 self.config,
@@ -111,9 +132,11 @@ impl<'a> Providers<'a> {
                 None,
                 false,
                 Some(identities),
+                false,
+                None,
             ),
             Provider::Claude => {
-                claude_records(&self.paths.claude_home, None, true, Some(identities))
+                claude_records(&self.paths.claude_home, None, true, Some(identities), None)
             }
             Provider::Opencode => {
                 let mut records = opencode_records(
@@ -130,6 +153,36 @@ impl<'a> Providers<'a> {
                 }
                 records
             }
+        }
+    }
+
+    /// One reconciliation pass per provider. Codex includes a bounded recent
+    /// set of named rows so renamed forks can be imported without reopening
+    /// and rescanning its database and index a second time.
+    pub fn reconcile_records(
+        &self,
+        provider: Provider,
+        activity: &BTreeMap<String, f64>,
+    ) -> Vec<Candidate> {
+        let identities = activity.keys().cloned().collect::<BTreeSet<_>>();
+        match provider {
+            Provider::Codex => codex_records(
+                &self.paths.codex_home,
+                self.config,
+                None,
+                false,
+                Some(&identities),
+                true,
+                Some(activity),
+            ),
+            Provider::Claude => claude_records(
+                &self.paths.claude_home,
+                None,
+                true,
+                Some(&identities),
+                Some(activity),
+            ),
+            Provider::Opencode => self.tracked(provider, &identities),
         }
     }
 
@@ -152,6 +205,49 @@ impl<'a> Providers<'a> {
             }
             Provider::Opencode => opencode_source_state(&self.paths.opencode_data_home, session_id),
         }
+    }
+
+    /// Resolve durable source state with at most one metadata connection per
+    /// provider. The returned key is Pika's stable conversation identity even
+    /// when a provider's active leaf differs.
+    pub fn source_states(
+        &self,
+        sessions: &[Session],
+    ) -> BTreeMap<(Provider, String), ProviderSourceState> {
+        let mut states = BTreeMap::new();
+        for provider in Provider::ALL {
+            let provider_sessions = sessions
+                .iter()
+                .filter(|session| session.provider == provider)
+                .collect::<Vec<_>>();
+            match provider {
+                Provider::Codex => codex_source_states(&self.paths.codex_home, &provider_sessions),
+                Provider::Claude => provider_sessions
+                    .iter()
+                    .map(|session| {
+                        let state = if session
+                            .transcript_path
+                            .as_deref()
+                            .map(Path::new)
+                            .is_some_and(Path::is_file)
+                        {
+                            ProviderSourceState::Present
+                        } else {
+                            ProviderSourceState::Unknown
+                        };
+                        ((provider, session.session_id.clone()), state)
+                    })
+                    .collect(),
+                Provider::Opencode => {
+                    opencode_source_states(&self.paths.opencode_data_home, &provider_sessions)
+                }
+            }
+            .into_iter()
+            .for_each(|(key, state)| {
+                states.insert(key, state);
+            });
+        }
+        states
     }
 
     pub fn new_argv(
@@ -331,16 +427,26 @@ fn codex_records(
     query: Option<&str>,
     named_only: bool,
     identities: Option<&BTreeSet<String>>,
+    include_named_with_identities: bool,
+    reconcile_activity: Option<&BTreeMap<String, f64>>,
 ) -> Vec<Candidate> {
     let index_records = codex_index_records(home);
     let Some(database) = newest_matching(home, "state_", ".sqlite") else {
-        return filter_codex_index(
+        let mut records = filter_codex_index(
             index_records,
             query,
             named_only,
-            identities,
+            if include_named_with_identities {
+                None
+            } else {
+                identities
+            },
             &BTreeSet::new(),
         );
+        if include_named_with_identities {
+            retain_reconciliation_index(&mut records, identities.expect("identities supplied"));
+        }
+        return records;
     };
     let Ok(db) = readonly(&database) else {
         return Vec::new();
@@ -384,18 +490,20 @@ fn codex_records(
                             .is_some_and(|name| name.eq_ignore_ascii_case(needle))
                 })
                 .map(|candidate| candidate.session_id.clone())
+                .take(MAX_PROVIDER_RESULTS)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     let mut parameters = query.into_iter().map(str::to_owned).collect::<Vec<_>>();
     if query.is_some() {
-        let marks = (2..2 + index_matches.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>();
-        let indexed = if marks.is_empty() {
+        let indexed = if index_matches.is_empty() {
             String::new()
         } else {
-            format!(" OR id IN ({})", marks.join(","))
+            parameters.push(serde_json::to_string(&index_matches).unwrap_or_else(|_| "[]".into()));
+            format!(
+                " OR id IN (SELECT value FROM json_each(?{}))",
+                parameters.len()
+            )
         };
         let native_name = if columns.contains("name") {
             " OR lower(name)=lower(?1)"
@@ -403,31 +511,58 @@ fn codex_records(
             ""
         };
         conditions.push(format!("(id=?1{native_name}{indexed})"));
-        parameters.extend(index_matches);
     }
+    let mut identity_marks = String::new();
     if let Some(identities) = identities {
-        let first = parameters.len() + 1;
-        let marks = (first..first + identities.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        conditions.push(format!("id IN ({marks})"));
-        parameters.extend(identities.iter().cloned());
+        parameters.push(
+            serde_json::to_string(&identities.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|_| "[]".into()),
+        );
+        identity_marks = format!("SELECT value FROM json_each(?{})", parameters.len());
+        if include_named_with_identities && columns.contains("name") {
+            conditions.push(format!(
+                "(id IN ({identity_marks}) OR (name IS NOT NULL AND trim(name) != ''))"
+            ));
+        } else {
+            conditions.push(format!("id IN ({identity_marks})"));
+        }
     }
-    let sql = format!(
+    let mut sql = format!(
         "SELECT {fields} FROM threads WHERE {}",
         conditions.join(" AND ")
     );
+    if include_named_with_identities {
+        let updated = if columns.contains("updated_at_ms") {
+            "COALESCE(updated_at_ms,0)"
+        } else if columns.contains("updated_at") {
+            "COALESCE(updated_at,0)"
+        } else {
+            "0"
+        };
+        sql.push_str(&format!(
+            " ORDER BY CASE WHEN id IN ({identity_marks}) THEN 0 ELSE 1 END,{updated} DESC LIMIT {}",
+            identities.map_or(MAX_PROVIDER_RESULTS, |values| values
+                .len()
+                .saturating_add(MAX_CODEX_RECONCILE_NAMED))
+        ));
+    } else {
+        let updated = if columns.contains("updated_at_ms") {
+            "COALESCE(updated_at_ms,0)"
+        } else if columns.contains("updated_at") {
+            "COALESCE(updated_at,0)"
+        } else {
+            "0"
+        };
+        sql.push_str(&format!(
+            " ORDER BY {updated} DESC LIMIT {MAX_PROVIDER_RESULTS}"
+        ));
+    }
     let Ok(mut statement) = db.prepare(&sql) else {
         return Vec::new();
     };
     let mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Candidate> {
         let session_id: String = row.get(0)?;
         let transcript: Option<String> = row.get(4)?;
-        let metadata = transcript
-            .as_deref()
-            .and_then(read_first_json)
-            .unwrap_or(Value::Null);
         let created_ms = timestamp_sql(row.get_ref(7)?);
         let created = timestamp_sql(row.get_ref(6)?);
         let updated_ms = timestamp_sql(row.get_ref(9)?);
@@ -453,11 +588,8 @@ fn codex_records(
             live: false,
             pid: None,
             source: "codex-state".into(),
-            parent_session_id: metadata
-                .pointer("/payload/forked_from_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            lifecycle_status: transcript.as_deref().and_then(codex_lifecycle),
+            parent_session_id: None,
+            lifecycle_status: None,
         })
     };
     let rows = statement.query_map(rusqlite::params_from_iter(parameters), mapper);
@@ -475,22 +607,57 @@ fn codex_records(
     } else {
         BTreeSet::new()
     };
-    let database_rows = rows.flatten().collect::<Vec<_>>();
-    let worker_ids = database_rows
-        .iter()
-        .filter(|candidate| codex_worker(candidate, config))
-        .map(|candidate| candidate.session_id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut output = database_rows
-        .into_iter()
-        .filter(|candidate| !worker_ids.contains(&candidate.session_id))
-        .collect::<Vec<_>>();
+    let tracked = identities.cloned().unwrap_or_default();
+    let broad_scan = query.is_none() && identities.is_none();
+    let mut metadata_budget = MAX_CODEX_METADATA_TOTAL_BYTES;
+    let mut worker_ids = BTreeSet::new();
+    let mut output = Vec::new();
+    for mut candidate in rows.flatten() {
+        let Some(path) = candidate.transcript_path.as_deref() else {
+            output.push(candidate);
+            continue;
+        };
+        match read_first_json_budgeted(path, &mut metadata_budget) {
+            Some(metadata) => {
+                candidate.parent_session_id = metadata
+                    .pointer("/payload/forked_from_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if codex_worker_metadata(&metadata, config) {
+                    worker_ids.insert(candidate.session_id);
+                } else {
+                    output.push(candidate);
+                }
+            }
+            // A broad inventory cannot safely advertise an unclassified
+            // transcript after its aggregate metadata budget is exhausted.
+            // Existing watched identities remain visible and fail closed.
+            None if query.is_none() && (broad_scan || !tracked.contains(&candidate.session_id)) => {
+            }
+            None => output.push(candidate),
+        }
+    }
     let mut positions = output
         .iter()
         .enumerate()
         .map(|(index, candidate)| (candidate.session_id.clone(), index))
         .collect::<BTreeMap<_, _>>();
-    for indexed in filter_codex_index(index_records, query, named_only, identities, &archived_ids) {
+    let mut indexed_records = filter_codex_index(
+        index_records,
+        query,
+        named_only,
+        if include_named_with_identities {
+            None
+        } else {
+            identities
+        },
+        &archived_ids,
+    );
+    if include_named_with_identities {
+        let identities = identities.expect("reconciliation identities supplied");
+        retain_reconciliation_index(&mut indexed_records, identities);
+    }
+    for indexed in indexed_records {
         if let Some(position) = positions.get(&indexed.session_id).copied() {
             output[position].name = indexed.name;
             output[position].updated_at = output[position].updated_at.max(indexed.updated_at);
@@ -508,7 +675,28 @@ fn codex_records(
         });
     }
     output.sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at));
+    hydrate_codex_lifecycle(&mut output, reconcile_activity);
     output
+}
+
+fn retain_reconciliation_index(records: &mut Vec<Candidate>, identities: &BTreeSet<String>) {
+    records.sort_by(|left, right| right.updated_at.total_cmp(&left.updated_at));
+    let mut named_extras = 0_usize;
+    records.retain(|candidate| {
+        if identities.contains(&candidate.session_id) {
+            return true;
+        }
+        let named = candidate
+            .name
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty());
+        if named && named_extras < MAX_CODEX_RECONCILE_NAMED {
+            named_extras += 1;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 fn codex_index_records(home: &Path) -> Vec<Candidate> {
@@ -592,13 +780,7 @@ fn filter_codex_index(
         .collect()
 }
 
-fn codex_worker(candidate: &Candidate, config: &Config) -> bool {
-    let Some(path) = candidate.transcript_path.as_deref() else {
-        return false;
-    };
-    let Some(value) = read_first_json(path) else {
-        return false;
-    };
+fn codex_worker_metadata(value: &Value, config: &Config) -> bool {
     if value.get("type").and_then(Value::as_str) != Some("session_meta") {
         return false;
     }
@@ -629,8 +811,78 @@ fn codex_worker(candidate: &Candidate, config: &Config) -> bool {
         })
 }
 
-fn codex_lifecycle(path: &str) -> Option<Status> {
-    reverse_lines(Path::new(path)).into_iter().find_map(|line| {
+fn hydrate_codex_lifecycle(
+    records: &mut [Candidate],
+    reconcile_activity: Option<&BTreeMap<String, f64>>,
+) {
+    let identities = reconcile_activity
+        .map(|activity| activity.keys().map(String::as_str).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let mut due = records
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.transcript_path.is_some()
+                && reconcile_activity.is_none_or(|activity| {
+                    candidate.updated_at
+                        > activity.get(&candidate.session_id).copied().unwrap_or(0.0)
+                })
+        })
+        .map(|(index, candidate)| {
+            let tracked = identities.contains(candidate.session_id.as_str());
+            let related = candidate
+                .parent_session_id
+                .as_deref()
+                .is_some_and(|parent| identities.contains(parent));
+            (index, tracked, related, candidate.updated_at)
+        })
+        .collect::<Vec<_>>();
+    due.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| right.3.total_cmp(&left.3))
+    });
+    let selected = due
+        .iter()
+        .take(MAX_CODEX_LIFECYCLE_RECORDS)
+        .map(|(index, _, _, _)| *index)
+        .collect::<BTreeSet<_>>();
+    let mut byte_budget = MAX_CODEX_LIFECYCLE_TOTAL_BYTES;
+    for (index, candidate) in records.iter_mut().enumerate() {
+        if selected.contains(&index) {
+            if let Some(path) = candidate.transcript_path.as_deref() {
+                candidate.lifecycle_status = codex_lifecycle(path, &mut byte_budget);
+            }
+        } else if let Some(activity) = reconcile_activity
+            && let Some(previous) = activity.get(&candidate.session_id)
+            && candidate.updated_at > *previous
+        {
+            // Do not advance the reconciliation cursor for a changed watched
+            // row whose transcript did not fit this cycle's fixed budget.
+            candidate.updated_at = *previous;
+        } else if reconcile_activity.is_some()
+            && candidate
+                .parent_session_id
+                .as_deref()
+                .is_some_and(|parent| identities.contains(parent))
+        {
+            // A newly discovered related fork becomes watched with a zero
+            // cursor, so the next cycle prioritizes its lifecycle evidence.
+            candidate.updated_at = 0.0;
+        }
+    }
+}
+
+fn codex_lifecycle(path: &str, byte_budget: &mut u64) -> Option<Status> {
+    reverse_lines_bounded(
+        Path::new(path),
+        MAX_CODEX_LIFECYCLE_FILE_BYTES.min(*byte_budget),
+        byte_budget,
+    )
+    .into_iter()
+    .find_map(|line| {
         if !line.contains("\"event_msg\"") {
             return None;
         }
@@ -648,6 +900,7 @@ fn claude_records(
     query: Option<&str>,
     explicit_only: bool,
     identities: Option<&BTreeSet<String>>,
+    reconcile_activity: Option<&BTreeMap<String, f64>>,
 ) -> Vec<Candidate> {
     // Inventory once: the live registry and historical lookup share these
     // exact paths instead of walking the entire projects tree for every row.
@@ -660,20 +913,44 @@ fn claude_records(
             entry.file_type().is_file() && entry.path().extension() == Some(OsStr::new("jsonl"))
         })
         .map(|entry| entry.into_path())
+        .take(10_000)
         .collect();
     let transcript_paths = transcripts
         .iter()
         .filter_map(|path| Some((path.file_stem()?.to_str()?.to_owned(), path.clone())))
         .collect::<BTreeMap<_, _>>();
     let mut records: BTreeMap<String, Candidate> = BTreeMap::new();
-    for path in fs::read_dir(home.join("sessions"))
+    let mut session_paths = fs::read_dir(home.join("sessions"))
         .into_iter()
         .flatten()
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension() == Some(OsStr::new("json")))
-    {
-        let Some(value) = read_bounded_json(&path) else {
+        .collect::<Vec<_>>();
+    session_paths.sort_by_key(|path| {
+        let identity = path.file_stem().and_then(OsStr::to_str).unwrap_or("");
+        (
+            std::cmp::Reverse(
+                identities.is_some_and(|wanted| wanted.contains(identity))
+                    || query.is_some_and(|needle| needle == identity),
+            ),
+            std::cmp::Reverse(modified(path).to_bits()),
+        )
+    });
+    if identities.is_none() {
+        session_paths.truncate(MAX_CLAUDE_DISCOVERY_FILES);
+    } else {
+        session_paths.retain(|path| {
+            path.file_stem()
+                .and_then(OsStr::to_str)
+                .is_some_and(|identity| identities.is_some_and(|wanted| wanted.contains(identity)))
+        });
+    }
+    let mut metadata_budget = MAX_CLAUDE_METADATA_TOTAL_BYTES;
+    let mut worker_budget = MAX_CLAUDE_METADATA_TOTAL_BYTES;
+    let mut worker_states = BTreeMap::<String, Option<bool>>::new();
+    for path in session_paths {
+        let Some(value) = read_bounded_json_budgeted(&path, &mut metadata_budget) else {
             continue;
         };
         if value.get("kind").and_then(Value::as_str) != Some("interactive") {
@@ -691,10 +968,13 @@ fn claude_records(
         }
         let visible_name = value.get("name").and_then(Value::as_str);
         let transcript = transcript_paths.get(identity).cloned();
-        if transcript
-            .as_ref()
-            .is_some_and(|path| claude_worker(path, identity))
-        {
+        let exact_identity =
+            query == Some(identity) || identities.is_some_and(|wanted| wanted.contains(identity));
+        let worker = transcript.as_ref().map_or(Some(false), |path| {
+            claude_worker_bounded(path, identity, &mut worker_budget)
+        });
+        worker_states.insert(identity.to_owned(), worker);
+        if worker == Some(true) || (worker.is_none() && !exact_identity) {
             continue;
         }
         let name = if value.get("nameSource").and_then(Value::as_str) == Some("derived") {
@@ -731,6 +1011,8 @@ fn claude_records(
     }
 
     transcripts.sort_by_key(|path| std::cmp::Reverse(modified(path).to_bits()));
+    let mut title_budget = MAX_CLAUDE_TITLE_TOTAL_BYTES;
+    let mut changed_titles = 0_usize;
     for (index, path) in transcripts.into_iter().enumerate() {
         let Some(identity) = path.file_stem().and_then(OsStr::to_str).map(str::to_owned) else {
             continue;
@@ -745,7 +1027,20 @@ fn claude_records(
         if index >= 1000 && !exact_identity {
             continue;
         }
-        let title = transcript_title(&path, explicit_only);
+        let source_updated_at = modified(&path);
+        let previous_activity = reconcile_activity
+            .and_then(|activity| activity.get(&identity))
+            .copied()
+            .unwrap_or(0.0);
+        let changed = reconcile_activity.is_none() || source_updated_at > previous_activity;
+        let scan_title =
+            reconcile_activity.is_none() || (changed && changed_titles < MAX_CLAUDE_CHANGED_TITLES);
+        let title = if scan_title {
+            changed_titles += usize::from(reconcile_activity.is_some());
+            transcript_title(&path, explicit_only, &mut title_budget)
+        } else {
+            None
+        };
         if query.is_some_and(|needle| {
             identity != needle
                 && !title
@@ -754,10 +1049,20 @@ fn claude_records(
         }) {
             continue;
         }
-        if claude_worker(&path, &identity) || (explicit_only && title.is_none() && !exact_identity)
+        let worker = worker_states
+            .entry(identity.clone())
+            .or_insert_with(|| claude_worker_bounded(&path, &identity, &mut worker_budget));
+        if *worker == Some(true)
+            || (worker.is_none() && !exact_identity)
+            || (explicit_only && title.is_none() && !exact_identity)
         {
             continue;
         }
+        let effective_updated_at = if reconcile_activity.is_some() && changed && !scan_title {
+            previous_activity
+        } else {
+            source_updated_at
+        };
         records
             .entry(identity.clone())
             .and_modify(|existing| {
@@ -765,7 +1070,7 @@ fn claude_records(
                     existing.name = title.clone();
                 }
                 existing.transcript_path = Some(path.to_string_lossy().into_owned());
-                existing.updated_at = existing.updated_at.max(modified(&path));
+                existing.updated_at = existing.updated_at.max(effective_updated_at);
                 existing.source = if explicit_only {
                     "claude-live+explicit-history".into()
                 } else {
@@ -780,7 +1085,7 @@ fn claude_records(
                 branch: None,
                 transcript_path: Some(path.to_string_lossy().into_owned()),
                 model: None,
-                updated_at: modified(&path),
+                updated_at: effective_updated_at,
                 live: false,
                 pid: None,
                 source: "claude-history".into(),
@@ -818,18 +1123,23 @@ fn claude_records(
     output
 }
 
-fn transcript_title(path: &Path, explicit_only: bool) -> Option<String> {
+fn transcript_title(path: &Path, explicit_only: bool, byte_budget: &mut u64) -> Option<String> {
     const MAX_BYTES: u64 = 2 * 1024 * 1024;
     const MAX_LINES: usize = 16_384;
     const MAX_LINE_BYTES: usize = 64 * 1024;
     let deadline = Instant::now() + Duration::from_millis(100);
+    if *byte_budget == 0 {
+        return None;
+    }
     let mut file = File::open(path).ok()?;
+    let limit = MAX_BYTES.min(*byte_budget);
     // Provider title events are append-only; inspect a bounded recent window.
     // An unavailable title is not authority to rename an existing Pika row.
-    let offset = file.metadata().ok()?.len().saturating_sub(MAX_BYTES);
+    let offset = file.metadata().ok()?.len().saturating_sub(limit);
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut bytes = Vec::new();
-    file.take(MAX_BYTES).read_to_end(&mut bytes).ok()?;
+    file.take(limit).read_to_end(&mut bytes).ok()?;
+    *byte_budget = byte_budget.saturating_sub(bytes.len() as u64);
     // Skip the first incomplete record when the window starts mid-file.
     let start = if offset > 0 {
         bytes
@@ -880,15 +1190,21 @@ fn transcript_title(path: &Path, explicit_only: bool) -> Option<String> {
     explicit.or(generated)
 }
 
-fn claude_worker(path: &Path, identity: &str) -> bool {
-    let Ok(file) = File::open(path) else {
-        return false;
-    };
-    let mut bytes = Vec::new();
-    if file.take(1024 * 1024).read_to_end(&mut bytes).is_err() {
-        return false;
+fn claude_worker_bounded(path: &Path, identity: &str, byte_budget: &mut u64) -> Option<bool> {
+    if *byte_budget == 0 {
+        return None;
     }
-    bytes
+    let Ok(file) = File::open(path) else {
+        return None;
+    };
+    let source_size = file.metadata().ok()?.len();
+    let mut bytes = Vec::new();
+    let limit = MAX_PROVIDER_METADATA_BYTES.min(*byte_budget);
+    if file.take(limit).read_to_end(&mut bytes).is_err() {
+        return None;
+    }
+    *byte_budget = byte_budget.saturating_sub(bytes.len() as u64);
+    let entrypoint = bytes
         .split(|byte| *byte == b'\n')
         .take(128)
         .filter(|line| line.len() <= 64 * 1024)
@@ -903,8 +1219,12 @@ fn claude_worker(path: &Path, identity: &str) -> bool {
                 .get("entrypoint")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
-        })
-        .is_some_and(|entrypoint| entrypoint == "sdk-cli")
+        });
+    match entrypoint {
+        Some(value) => Some(value == "sdk-cli"),
+        None if source_size > bytes.len() as u64 => None,
+        None => Some(false),
+    }
 }
 
 fn opencode_records(
@@ -951,22 +1271,22 @@ fn opencode_records(
     }
     let mut parameters = query.into_iter().map(str::to_owned).collect::<Vec<_>>();
     if let Some(identities) = identities {
-        let first = parameters.len() + 1;
-        let marks = (first..first + identities.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        conditions.push(format!("id IN ({marks})"));
-        parameters.extend(identities.iter().cloned());
+        parameters.push(
+            serde_json::to_string(&identities.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|_| "[]".into()),
+        );
+        conditions.push(format!(
+            "id IN (SELECT value FROM json_each(?{}))",
+            parameters.len()
+        ));
     }
     let sql = format!(
-        "SELECT {fields} FROM session WHERE {}",
+        "SELECT {fields} FROM session WHERE {} ORDER BY COALESCE(time_updated,0) DESC LIMIT {MAX_PROVIDER_RESULTS}",
         conditions.join(" AND ")
     );
     let Ok(mut statement) = db.prepare(&sql) else {
         return Vec::new();
     };
-    let has_archived = columns.contains("time_archived");
     let mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Candidate> {
         let model: Option<String> = row.get(6)?;
         let session_id: String = row.get(0)?;
@@ -978,14 +1298,13 @@ fn opencode_records(
             branch: None,
             transcript_path: Some(database.to_string_lossy().into_owned()),
             model: model.and_then(|value| opencode_model(&value)),
-            updated_at: opencode_tree_updated(&db, &session_id, has_archived)
-                .unwrap_or_else(|| timestamp_sql(row.get_ref(5).unwrap_or(ValueRef::Null))),
+            updated_at: timestamp_sql(row.get_ref(5).unwrap_or(ValueRef::Null)),
             created_at: timestamp_sql(row.get_ref(4)?),
             live: false,
             pid: None,
             source: "opencode-state".into(),
             parent_session_id: None,
-            lifecycle_status: opencode_lifecycle(&db, &session_id, has_archived),
+            lifecycle_status: None,
         })
     };
     let rows = statement.query_map(rusqlite::params_from_iter(parameters), mapper);
@@ -997,81 +1316,123 @@ fn opencode_records(
         .filter(|item| !named_only || !opencode_placeholder(item.name.as_deref()))
         .filter(|item| !opencode_automation(item, config))
         .collect();
+    let roots = output
+        .iter()
+        .map(|candidate| candidate.session_id.clone())
+        .collect::<Vec<_>>();
+    let has_archived = columns.contains("time_archived");
+    let updated = opencode_tree_updated_batch(&db, &roots, has_archived);
+    let lifecycle = opencode_lifecycle_batch(&db, &roots, has_archived);
+    for candidate in &mut output {
+        if let Some(value) = updated.get(&candidate.session_id) {
+            candidate.updated_at = candidate.updated_at.max(*value);
+        }
+        candidate.lifecycle_status = lifecycle.get(&candidate.session_id).copied().flatten();
+    }
     output.sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at));
     output
 }
 
-fn opencode_tree_ids(db: &Connection, session_id: &str, has_archived: bool) -> Vec<String> {
+fn opencode_tree_updated_batch(
+    db: &Connection,
+    roots: &[String],
+    has_archived: bool,
+) -> BTreeMap<String, f64> {
+    if roots.is_empty() {
+        return BTreeMap::new();
+    }
     let archive_clause = if has_archived {
         " AND time_archived IS NULL"
     } else {
         ""
     };
     let sql = format!(
-        "WITH RECURSIVE tree(id) AS (\
-         SELECT id FROM session WHERE id=?1{archive_clause} \
-         UNION ALL \
-         SELECT child.id FROM session AS child JOIN tree ON child.parent_id=tree.id \
+        "WITH RECURSIVE tree(root_id,id) AS (\
+         SELECT id,id FROM session WHERE id IN (SELECT value FROM json_each(?1)){archive_clause} \
+         UNION \
+         SELECT tree.root_id,child.id FROM session AS child JOIN tree ON child.parent_id=tree.id \
          WHERE 1=1{archive_clause}\
-         ) SELECT id FROM tree"
+         ) SELECT tree.root_id,MAX(session.time_updated) \
+         FROM tree JOIN session ON session.id=tree.id GROUP BY tree.root_id"
     );
-    db.prepare(&sql)
-        .and_then(|mut statement| {
-            statement
-                .query_map([session_id], |row| row.get::<_, String>(0))
-                .map(|rows| rows.flatten().collect())
+    let encoded = serde_json::to_string(roots).unwrap_or_else(|_| "[]".into());
+    let Ok(mut statement) = db.prepare(&sql) else {
+        return BTreeMap::new();
+    };
+    statement
+        .query_map([encoded], |row| {
+            Ok((row.get::<_, String>(0)?, timestamp_sql(row.get_ref(1)?)))
         })
+        .map(|rows| rows.flatten().collect())
         .unwrap_or_default()
 }
 
-fn opencode_tree_updated(db: &Connection, session_id: &str, has_archived: bool) -> Option<f64> {
-    let identities = opencode_tree_ids(db, session_id, has_archived);
-    if identities.is_empty() {
-        return None;
+fn opencode_lifecycle_batch(
+    db: &Connection,
+    roots: &[String],
+    has_archived: bool,
+) -> BTreeMap<String, Option<Status>> {
+    if roots.is_empty() {
+        return BTreeMap::new();
     }
-    let marks = std::iter::repeat_n("?", identities.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!("SELECT MAX(time_updated) FROM session WHERE id IN ({marks})");
-    let mut statement = db.prepare(&sql).ok()?;
-    statement
-        .query_row(rusqlite::params_from_iter(identities), |row| {
-            Ok(timestamp_sql(row.get_ref(0)?))
-        })
-        .ok()
-}
-
-fn opencode_lifecycle(db: &Connection, session_id: &str, has_archived: bool) -> Option<Status> {
     if !columns(db, "message").ok().is_some_and(|value| {
         ["id", "session_id", "time_created", "data"]
             .iter()
             .all(|column| value.contains(*column))
     }) {
-        return None;
+        return BTreeMap::new();
     }
-    let mut completed = false;
-    for identity in opencode_tree_ids(db, session_id, has_archived) {
-        let data: Option<String> = db
-            .query_row(
-                "SELECT data FROM message WHERE session_id=?1 \
-                 ORDER BY time_created DESC, id DESC LIMIT 1",
-                [&identity],
-                |row| row.get(0),
-            )
-            .ok();
-        let Some(value) = data.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()) else {
-            continue;
-        };
-        let role = value.get("role").and_then(Value::as_str);
-        let turn_completed = value
-            .pointer("/time/completed")
-            .is_some_and(|value| !value.is_null() && value.as_bool() != Some(false));
-        if role == Some("user") || (role == Some("assistant") && !turn_completed) {
-            return Some(Status::Working);
-        }
-        completed |= role == Some("assistant") && turn_completed;
+    let archive_clause = if has_archived {
+        " AND time_archived IS NULL"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "WITH RECURSIVE tree(root_id,id) AS (\
+         SELECT id,id FROM session WHERE id IN (SELECT value FROM json_each(?1)){archive_clause} \
+         UNION \
+         SELECT tree.root_id,child.id FROM session AS child JOIN tree ON child.parent_id=tree.id \
+         WHERE 1=1{archive_clause}\
+         ), latest AS (\
+         SELECT tree.root_id,message.session_id,message.data,\
+         ROW_NUMBER() OVER (PARTITION BY tree.root_id,message.session_id ORDER BY message.time_created DESC,message.id DESC) AS position \
+         FROM tree JOIN message ON message.session_id=tree.id\
+         ), scored AS (\
+         SELECT root_id,CASE \
+           WHEN length(data)>?2 OR NOT json_valid(data) THEN 0 \
+           WHEN json_extract(data,'$.role')='user' THEN 2 \
+           WHEN json_extract(data,'$.role')='assistant' AND (\
+             json_type(data,'$.time.completed') IS NULL OR \
+             json_type(data,'$.time.completed')='null' OR \
+             json_extract(data,'$.time.completed')=0\
+           ) THEN 2 \
+           WHEN json_extract(data,'$.role')='assistant' THEN 1 \
+           ELSE 0 END AS lifecycle \
+         FROM latest WHERE position=1\
+         ) SELECT root_id,MAX(lifecycle) FROM scored GROUP BY root_id"
+    );
+    let encoded = serde_json::to_string(roots).unwrap_or_else(|_| "[]".into());
+    let Ok(mut statement) = db.prepare(&sql) else {
+        return BTreeMap::new();
+    };
+    let Ok(rows) = statement.query_map(
+        rusqlite::params![encoded, MAX_PROVIDER_METADATA_BYTES as i64],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    ) else {
+        return BTreeMap::new();
+    };
+    let mut output = BTreeMap::new();
+    for (root, lifecycle) in rows.flatten() {
+        output.insert(
+            root,
+            match lifecycle {
+                2 => Some(Status::Working),
+                1 => Some(Status::Ready),
+                _ => None,
+            },
+        );
     }
-    completed.then_some(Status::Ready)
+    output
 }
 
 fn opencode_placeholder(value: Option<&str>) -> bool {
@@ -1164,6 +1525,104 @@ fn codex_source_state(
     }
 }
 
+fn codex_source_states(
+    home: &Path,
+    sessions: &[&Session],
+) -> BTreeMap<(Provider, String), ProviderSourceState> {
+    let mut indexed = BTreeMap::new();
+    let Some(database) = newest_matching(home, "state_", ".sqlite") else {
+        for session in sessions {
+            let present = session
+                .transcript_path
+                .as_deref()
+                .map(Path::new)
+                .is_some_and(Path::is_file);
+            indexed.insert(
+                (Provider::Codex, session.session_id.clone()),
+                if present {
+                    ProviderSourceState::Present
+                } else {
+                    ProviderSourceState::Unknown
+                },
+            );
+        }
+        return indexed;
+    };
+    let Ok(db) = readonly(&database) else {
+        return sessions
+            .iter()
+            .map(|session| {
+                (
+                    (Provider::Codex, session.session_id.clone()),
+                    ProviderSourceState::Unknown,
+                )
+            })
+            .collect();
+    };
+    let Ok(columns) = columns(&db, "threads") else {
+        return sessions
+            .iter()
+            .map(|session| {
+                (
+                    (Provider::Codex, session.session_id.clone()),
+                    ProviderSourceState::Unknown,
+                )
+            })
+            .collect();
+    };
+    if !columns.contains("id") {
+        return sessions
+            .iter()
+            .map(|session| {
+                (
+                    (Provider::Codex, session.session_id.clone()),
+                    ProviderSourceState::Unknown,
+                )
+            })
+            .collect();
+    }
+    let identities = sessions
+        .iter()
+        .map(|session| session.provider_thread_id().to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut rows = BTreeMap::<String, bool>::new();
+    for chunk in identities.iter().collect::<Vec<_>>().chunks(500) {
+        let marks = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let archived = if columns.contains("archived") {
+            "COALESCE(archived,0) != 0"
+        } else {
+            "0"
+        };
+        let sql = format!("SELECT id,{archived} FROM threads WHERE id IN ({marks})");
+        let parameters = chunk.iter().map(|identity| identity.as_str());
+        if let Ok(mut statement) = db.prepare(&sql)
+            && let Ok(found) = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+        {
+            rows.extend(found.flatten());
+        }
+    }
+    for session in sessions {
+        let transcript_exists = session
+            .transcript_path
+            .as_deref()
+            .map(Path::new)
+            .is_some_and(Path::is_file);
+        let state = match rows.get(session.provider_thread_id()) {
+            Some(true) => ProviderSourceState::Archived,
+            Some(false) if transcript_exists => ProviderSourceState::Present,
+            Some(false) => ProviderSourceState::Unknown,
+            None if transcript_exists => ProviderSourceState::Present,
+            None => ProviderSourceState::Deleted,
+        };
+        indexed.insert((Provider::Codex, session.session_id.clone()), state);
+    }
+    indexed
+}
+
 fn opencode_source_state(home: &Path, session_id: &str) -> ProviderSourceState {
     let database = home.join("opencode.db");
     let Ok(db) = readonly(&database) else {
@@ -1195,6 +1654,68 @@ fn opencode_source_state(home: &Path, session_id: &str) -> ProviderSourceState {
         Some(false) => ProviderSourceState::Present,
         None => ProviderSourceState::Deleted,
     }
+}
+
+fn opencode_source_states(
+    home: &Path,
+    sessions: &[&Session],
+) -> BTreeMap<(Provider, String), ProviderSourceState> {
+    let unknown = || {
+        sessions
+            .iter()
+            .map(|session| {
+                (
+                    (Provider::Opencode, session.session_id.clone()),
+                    ProviderSourceState::Unknown,
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let database = home.join("opencode.db");
+    let Ok(db) = readonly(&database) else {
+        return unknown();
+    };
+    let Ok(columns) = columns(&db, "session") else {
+        return unknown();
+    };
+    if !columns.contains("id") {
+        return unknown();
+    }
+    let identities = sessions
+        .iter()
+        .map(|session| session.provider_thread_id().to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut rows = BTreeMap::<String, bool>::new();
+    for chunk in identities.iter().collect::<Vec<_>>().chunks(500) {
+        let marks = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let archived = if columns.contains("time_archived") {
+            "time_archived IS NOT NULL"
+        } else {
+            "0"
+        };
+        let sql = format!("SELECT id,{archived} FROM session WHERE id IN ({marks})");
+        let parameters = chunk.iter().map(|identity| identity.as_str());
+        if let Ok(mut statement) = db.prepare(&sql)
+            && let Ok(found) = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+        {
+            rows.extend(found.flatten());
+        }
+    }
+    sessions
+        .iter()
+        .map(|session| {
+            let state = match rows.get(session.provider_thread_id()) {
+                Some(true) => ProviderSourceState::Archived,
+                Some(false) => ProviderSourceState::Present,
+                None => ProviderSourceState::Deleted,
+            };
+            ((Provider::Opencode, session.session_id.clone()), state)
+        })
+        .collect()
 }
 
 fn readonly(path: &Path) -> Result<Connection> {
@@ -1289,33 +1810,45 @@ fn normalize_timestamp(value: f64) -> f64 {
     }
 }
 
-fn read_first_json(path: impl AsRef<Path>) -> Option<Value> {
+fn read_first_json_budgeted(path: impl AsRef<Path>, budget: &mut u64) -> Option<Value> {
+    if *budget == 0 {
+        return None;
+    }
+    let limit = MAX_CODEX_METADATA_LINE_BYTES.min(*budget);
     let mut line = Vec::new();
-    BufReader::new(File::open(path).ok()?)
-        .take(MAX_PROVIDER_METADATA_BYTES + 1)
+    let read = BufReader::new(File::open(path).ok()?)
+        .take(limit + 1)
         .read_until(b'\n', &mut line)
         .ok()?;
-    if line.len() as u64 > MAX_PROVIDER_METADATA_BYTES {
+    *budget = budget.saturating_sub(read as u64);
+    if line.len() as u64 > limit {
         return None;
     }
     serde_json::from_slice(&line).ok()
 }
 
-fn read_bounded_json(path: &Path) -> Option<Value> {
+fn read_bounded_json_budgeted(path: &Path, budget: &mut u64) -> Option<Value> {
+    if *budget == 0 {
+        return None;
+    }
+    let limit = MAX_CODEX_METADATA_LINE_BYTES.min(*budget);
     let mut bytes = Vec::new();
     File::open(path)
         .ok()?
-        .take(MAX_PROVIDER_METADATA_BYTES + 1)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
         .ok()?;
-    if bytes.len() as u64 > MAX_PROVIDER_METADATA_BYTES {
+    *budget = budget.saturating_sub(bytes.len() as u64);
+    if bytes.len() as u64 > limit {
         return None;
     }
     serde_json::from_slice(&bytes).ok()
 }
 
-fn reverse_lines(path: &Path) -> Vec<String> {
-    const MAX_TAIL_BYTES: u64 = 8 * 1024 * 1024;
+fn reverse_lines_bounded(path: &Path, limit: u64, budget: &mut u64) -> Vec<String> {
+    if limit == 0 || *budget == 0 {
+        return Vec::new();
+    }
     let Ok(mut file) = File::open(path) else {
         return Vec::new();
     };
@@ -1325,15 +1858,17 @@ fn reverse_lines(path: &Path) -> Vec<String> {
     let mut remainder = Vec::new();
     let mut output = Vec::new();
     let mut scanned = 0_u64;
-    while position > 0 && scanned < MAX_TAIL_BYTES {
+    while position > 0 && scanned < limit && *budget > 0 {
         let size = usize::try_from(
             position
                 .min(65_536)
-                .min(MAX_TAIL_BYTES.saturating_sub(scanned)),
+                .min(limit.saturating_sub(scanned))
+                .min(*budget),
         )
         .unwrap_or(65_536);
         position -= size as u64;
         scanned += size as u64;
+        *budget = budget.saturating_sub(size as u64);
         if file.seek(SeekFrom::Start(position)).is_err() {
             break;
         }
@@ -1401,7 +1936,8 @@ mod tests {
             format!("{{\"padding\":\"{}\"}}\n{{}}\n", "x".repeat(1024 * 1024)),
         )
         .unwrap();
-        assert!(read_first_json(&first_line).is_none());
+        let mut budget = MAX_CODEX_METADATA_TOTAL_BYTES;
+        assert!(read_first_json_budgeted(&first_line, &mut budget).is_none());
 
         let document = temp.path().join("session.json");
         fs::write(
@@ -1409,10 +1945,76 @@ mod tests {
             format!("{{\"padding\":\"{}\"}}", "x".repeat(1024 * 1024)),
         )
         .unwrap();
-        assert!(read_bounded_json(&document).is_none());
+        let mut document_budget = MAX_CLAUDE_METADATA_TOTAL_BYTES;
+        assert!(read_bounded_json_budgeted(&document, &mut document_budget).is_none());
 
         fs::write(&document, br#"{"kind":"interactive"}"#).unwrap();
-        assert_eq!(read_bounded_json(&document).unwrap()["kind"], "interactive");
+        let mut document_budget = MAX_CLAUDE_METADATA_TOTAL_BYTES;
+        assert_eq!(
+            read_bounded_json_budgeted(&document, &mut document_budget).unwrap()["kind"],
+            "interactive"
+        );
+    }
+
+    #[test]
+    fn codex_lifecycle_healing_is_incremental_under_a_fixed_cycle_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut original = Vec::new();
+        let mut first_activity = BTreeMap::new();
+        for index in 0..20 {
+            let id = format!("00000000-0000-4000-8000-{index:012}");
+            let transcript = temp.path().join(format!("{index}.jsonl"));
+            fs::write(
+                &transcript,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({"type":"session_meta","payload":{}}),
+                    serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}})
+                ),
+            )
+            .unwrap();
+            first_activity.insert(id.clone(), 0.0);
+            original.push(Candidate {
+                provider: Provider::Codex,
+                session_id: id,
+                name: Some(format!("thread-{index}")),
+                cwd: None,
+                branch: None,
+                transcript_path: Some(transcript.to_string_lossy().into_owned()),
+                model: None,
+                updated_at: (index + 1) as f64,
+                live: false,
+                pid: None,
+                source: "fixture".into(),
+                parent_session_id: None,
+                created_at: 1.0,
+                lifecycle_status: None,
+            });
+        }
+
+        let mut first = original.clone();
+        hydrate_codex_lifecycle(&mut first, Some(&first_activity));
+        assert_eq!(
+            first
+                .iter()
+                .filter(|candidate| candidate.lifecycle_status == Some(Status::Ready))
+                .count(),
+            MAX_CODEX_LIFECYCLE_RECORDS
+        );
+        let second_activity = first
+            .iter()
+            .map(|candidate| (candidate.session_id.clone(), candidate.updated_at))
+            .collect::<BTreeMap<_, _>>();
+        let mut second = original;
+        hydrate_codex_lifecycle(&mut second, Some(&second_activity));
+        assert_eq!(
+            second
+                .iter()
+                .filter(|candidate| candidate.lifecycle_status == Some(Status::Ready))
+                .count(),
+            20 - MAX_CODEX_LIFECYCLE_RECORDS
+        );
+        assert!(second.iter().all(|candidate| candidate.updated_at > 0.0));
     }
 
     #[test]

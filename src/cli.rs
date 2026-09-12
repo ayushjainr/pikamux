@@ -280,6 +280,9 @@ struct UpdateArgs {
     /// Install one exact compatible version.
     #[arg(long)]
     release: Option<String>,
+    /// Revalidate and activate the prior retained release, or one exact retained VERSION.
+    #[arg(long, value_name = "VERSION", num_args = 0..=1, default_missing_value = "")]
+    rollback: Option<String>,
 }
 #[derive(Args, Debug)]
 struct HookArgs {
@@ -604,7 +607,9 @@ fn bare(pika: &Pika) -> Result<i32> {
         );
         return print_sessions(inventory.sessions, true);
     }
-    let cached = board_items(pika)?;
+    // Paint local durable state immediately. Fleet cache parsing and provider
+    // observation stay behind the first frame.
+    let cached = board_items_local(pika)?;
     // At most one unpublished snapshot is useful: the board always wants the
     // newest complete observation, never a backlog of stale inventories.
     let (sender, receiver) = monitor::latest_channel();
@@ -614,7 +619,10 @@ fn bare(pika: &Pika) -> Result<i32> {
     let worker_refresh_delayed = Arc::clone(&local_refresh_delayed);
     let worker_stop = Arc::clone(&stop);
     let worker = pika.clone();
-    let local_sender = sender.clone();
+    // Transfer the only publisher into the store-driven observer. Remote and
+    // usage workers can only commit to SQLite; Rust ownership prevents either
+    // worker from racing a complete board snapshot into the render channel.
+    let local_sender = sender;
     let (local_done_sender, local_done_receiver) = mpsc::sync_channel(1);
     let local_refresh = thread::spawn(move || {
         let mut store_changes = worker.store.change_watcher().ok();
@@ -622,14 +630,9 @@ fn bare(pika: &Pika) -> Result<i32> {
         let mut consecutive_failures = 0;
         while !worker_stop.load(Ordering::Relaxed) {
             if Instant::now() >= next_reconcile {
-                let refresh = worker.reconcile_local().and_then(|mut inventory| {
-                    let _ = usage::hydrate_sessions(
-                        &worker.paths,
-                        &worker.store,
-                        &mut inventory.sessions,
-                    );
-                    board_items_from_inventory(&worker, inventory)
-                });
+                let refresh = worker
+                    .reconcile_local()
+                    .and_then(|inventory| board_items_from_inventory(&worker, inventory));
                 worker_refresh_delayed.store(
                     record_local_refresh_result(&mut consecutive_failures, refresh.is_ok()),
                     Ordering::Relaxed,
@@ -670,20 +673,35 @@ fn bare(pika: &Pika) -> Result<i32> {
     });
     let remote_stop = Arc::clone(&stop);
     let remote_worker = pika.clone();
-    let remote_sender = sender;
     let _remote_refresh = thread::spawn(move || {
         while !remote_stop.load(Ordering::Relaxed) {
             let manager = FleetManager::new(&remote_worker.store, SshTransport::default());
             if let Ok(nodes) = manager.nodes()
                 && let Some(node) = fleet::next_remote_node(&nodes, None, now(), false)
             {
+                // refresh_node commits its snapshot to the store. The sole
+                // store-driven local publisher observes that commit and builds
+                // the next complete board, preventing an older remote read
+                // from overwriting a newer local hook state.
                 let _ = manager.refresh_node(&node.node_id);
-                if let Ok(items) = board_items(&remote_worker) {
-                    remote_sender.publish(items);
-                }
             }
             for _ in 0..10 {
                 if remote_stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
+    let usage_stop = Arc::clone(&stop);
+    let usage_worker = pika.clone();
+    let _usage_refresh = thread::spawn(move || {
+        while !usage_stop.load(Ordering::Relaxed) {
+            if let Ok(sessions) = usage_worker.store.list_sessions() {
+                let _ = usage::refresh_one_due(&usage_worker.paths, &usage_worker.store, &sessions);
+            }
+            for _ in 0..20 {
+                if usage_stop.load(Ordering::Relaxed) {
                     return;
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -719,6 +737,7 @@ fn bare(pika: &Pika) -> Result<i32> {
             check: version.is_none(),
             bundle: None,
             release: version,
+            rollback: None,
         }),
         BoardAction::Quit => Ok(0),
     }
@@ -852,10 +871,23 @@ fn board_items(pika: &Pika) -> Result<Vec<BoardItem>> {
     board_items_from_inventory(pika, pika.cached_inventory()?)
 }
 
+fn board_items_local(pika: &Pika) -> Result<Vec<BoardItem>> {
+    board_items_from_inventory_inner(pika, pika.cached_inventory()?, false)
+}
+
 fn board_items_from_inventory(
     pika: &Pika,
     inventory: crate::core::Inventory,
 ) -> Result<Vec<BoardItem>> {
+    board_items_from_inventory_inner(pika, inventory, true)
+}
+
+fn board_items_from_inventory_inner(
+    pika: &Pika,
+    mut inventory: crate::core::Inventory,
+    include_remote: bool,
+) -> Result<Vec<BoardItem>> {
+    let _ = usage::hydrate_cached_sessions(&pika.store, &mut inventory.sessions);
     let profiles = pika
         .store
         .list_stored_expert_profiles()?
@@ -894,23 +926,25 @@ fn board_items_from_inventory(
         pending_token: Some(pending.launch_token),
         expert: None,
     }));
-    for remote in FleetManager::new(&pika.store, SshTransport::default())
-        .cached_sessions(None, false)
-        .map_err(anyhow::Error::from)?
-    {
-        items.push(BoardItem {
-            session: remote.session,
-            node_id: Some(remote.node_id),
-            node_name: Some(remote.node_name),
-            stale: remote.stale,
-            pending_token: None,
-            expert: remote.card_detail.map(|detail| ExpertAnnotation {
-                scope: Some(detail),
-                current_work: None,
-                topics: Vec::new(),
-                freshness: remote.card_status,
-            }),
-        });
+    if include_remote {
+        for remote in FleetManager::new(&pika.store, SshTransport::default())
+            .cached_sessions(None, false)
+            .map_err(anyhow::Error::from)?
+        {
+            items.push(BoardItem {
+                session: remote.session,
+                node_id: Some(remote.node_id),
+                node_name: Some(remote.node_name),
+                stale: remote.stale,
+                pending_token: None,
+                expert: remote.card_detail.map(|detail| ExpertAnnotation {
+                    scope: Some(detail),
+                    current_work: None,
+                    topics: Vec::new(),
+                    freshness: remote.card_status,
+                }),
+            });
+        }
     }
     Ok(items)
 }
@@ -1394,32 +1428,40 @@ fn resolve_named_target(
     domain: LocalTargetDomain,
 ) -> Result<Option<NamedTarget>> {
     let manager = FleetManager::new(&pika.store, SshTransport::default());
-    let remote_result = manager.resolve(name, fresh_remote, domain.includes_remote_experts());
     let local_result = match domain {
         LocalTargetDomain::Daily => pika.resolve_local(name),
         LocalTargetDomain::Expert => resolve_expert_local(pika, name),
     };
-    let local = match local_result {
-        Ok(local) => local,
+    let (local, local_unavailable) = match local_result {
+        Ok(local) => (local, None),
         Err(error)
-            if remote_result.as_ref().is_ok_and(Option::is_some)
-                && error.downcast_ref::<NameResolutionError>()
-                    == Some(&NameResolutionError::SavedUnavailable) =>
+            if error.downcast_ref::<NameResolutionError>()
+                == Some(&NameResolutionError::SavedUnavailable) =>
         {
-            // A source-health failure must not let a remote route silently
-            // win over a literal persisted local `name@alias`. Recover only
-            // the structural local identity so combination below can report
-            // the collision; the local action itself remains unavailable.
-            resolve_structural_local(pika, name, true)?
+            (resolve_structural_local(pika, name, true)?, Some(error))
         }
         Err(error) => return Err(error),
     };
+    // A literal local name containing `@` is proven without a network call.
+    // Cached remote truth is still combined to expose known collisions; only
+    // a name with no local identity may trigger a fresh SSH resolution.
+    let remote_result = manager.resolve(
+        name,
+        fresh_remote && local.is_empty(),
+        domain.includes_remote_experts(),
+    );
     let remote = match remote_result {
         Ok(remote) => remote,
         Err(error) if error.kind == FleetErrorKind::NotFound && !local.is_empty() => None,
         Err(error) => return Err(error.into()),
     };
-    combine_named_targets(name, local, remote)
+    if remote.is_none()
+        && let Some(error) = local_unavailable
+    {
+        return Err(error);
+    }
+    let combined = combine_named_targets(name, local, remote)?;
+    Ok(combined)
 }
 
 fn combine_named_targets(
@@ -1811,7 +1853,7 @@ fn experts(pika: &Pika, a: QueryArgs) -> Result<i32> {
             item.availability = source_index.availability(session).as_str().to_owned();
         }
     }
-    found.retain(|item| item.availability != "archived");
+    found.retain(|item| !matches!(item.availability.as_str(), "archived" | "deleted"));
     found.extend(
         FleetManager::new(&pika.store, SshTransport::default())
             .expert_matches(&query)
@@ -1901,21 +1943,120 @@ fn expert(pika: &Pika, a: ExpertArgs) -> Result<i32> {
             println!("Cleared the expert card for {}.", s.display_name())
         }
         ExpertCommand::Status { json } => {
-            let mut values = Vec::new();
-            for s in pika.store.list_sessions()? {
-                let stored = pika
-                    .store
-                    .get_stored_expert_profile(s.provider, &s.session_id)?;
-                values.push((
-                    s.display_name(),
-                    crate::experts::card_state(&s, stored.as_ref()),
-                ))
+            let mut sessions = pika.store.list_sessions()?;
+            let unwatched = pika.store.list_untracked_sessions()?;
+            let untracked = unwatched
+                .iter()
+                .map(|session| (session.provider, session.session_id.clone()))
+                .collect::<std::collections::BTreeSet<_>>();
+            sessions.extend(unwatched);
+            sessions.retain(|session| !session.session_id.starts_with("unbound:"));
+            let profiles = pika
+                .store
+                .list_stored_expert_profiles()?
+                .into_iter()
+                .map(|profile| {
+                    (
+                        (profile.profile.provider, profile.profile.session_id.clone()),
+                        profile,
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            sessions.retain(|session| {
+                let key = (session.provider, session.session_id.clone());
+                !session.session_id.starts_with("unbound:")
+                    && (!untracked.contains(&key) || profiles.contains_key(&key))
+            });
+            let source_index =
+                crate::experts::LocalSourceIndex::read(&pika.paths, &pika.config, &sessions);
+            let mut values = sessions
+                .into_iter()
+                .filter_map(|session| {
+                    let key = (session.provider, session.session_id.clone());
+                    let profile = profiles.get(&key);
+                    let state = crate::experts::card_state(&session, profile);
+                    let profile = profile.map(|stored| &stored.profile);
+                    let availability = source_index.availability(&session).as_str();
+                    if matches!(availability, "archived" | "deleted") {
+                        return None;
+                    }
+                    Some(serde_json::json!({
+                        "provider": session.provider,
+                        "session_id": session.session_id,
+                        "name": session.name,
+                        "project": session.cwd,
+                        "branch": session.branch,
+                        "watched": !untracked.contains(&key),
+                        "availability": availability,
+                        "status": state.status,
+                        "detail": state.detail,
+                        "scope": profile.map_or("", |profile| profile.summary.as_str()),
+                        "current_work": profile.map_or("", |profile| profile.current_state.as_str()),
+                        "topics": profile.map_or(&[][..], |profile| profile.topics.as_slice()),
+                        "artifacts": profile.map_or(&[][..], |profile| profile.artifacts.as_slice()),
+                        "profile_updated_at": profile.map(|profile| profile.updated_at),
+                        "profile_source": profile.map(|profile| profile.source.as_str()),
+                        "machine": serde_json::Value::Null,
+                        "node_id": serde_json::Value::Null,
+                        "snapshot_stale": serde_json::Value::Null,
+                        "snapshot_seen_at": serde_json::Value::Null,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            let manager = FleetManager::new(&pika.store, SshTransport::default());
+            for remote in manager
+                .expert_matches("")
+                .map_err(anyhow::Error::from)?
+                .into_iter()
+                .filter(|item| !matches!(item.availability.as_str(), "archived" | "deleted"))
+            {
+                values.push(serde_json::json!({
+                    "provider": remote.provider,
+                    "session_id": remote.session_id,
+                    "name": remote.name,
+                    "project": remote.project,
+                    "branch": remote.branch,
+                    "watched": remote.watched,
+                    "availability": remote.availability,
+                    "status": remote.card_status,
+                    "detail": remote.card_detail.unwrap_or_else(|| "cached remote expert card".into()),
+                    "scope": remote.scope,
+                    "current_work": remote.current_state,
+                    "topics": remote.topics,
+                    "artifacts": remote.artifacts,
+                    "profile_updated_at": remote.profile_updated_at,
+                    "profile_source": remote.profile_source,
+                    "machine": remote.machine,
+                    "node_id": remote.node_id,
+                    "snapshot_stale": remote.snapshot_stale,
+                    "snapshot_seen_at": remote.snapshot_seen_at,
+                }));
             }
+            values.sort_by(|left, right| {
+                left["machine"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(right["machine"].as_str().unwrap_or(""))
+                    .then_with(|| {
+                        left["name"]
+                            .as_str()
+                            .unwrap_or("")
+                            .cmp(right["name"].as_str().unwrap_or(""))
+                    })
+            });
             if json {
                 println!("{}", serde_json::to_string(&values)?)
             } else {
-                for (name, state) in values {
-                    println!("{name:<28} {:?} · {}", state.status, state.detail)
+                for value in values {
+                    println!(
+                        "{:<28} {} · {} · {}",
+                        value["name"]
+                            .as_str()
+                            .unwrap_or_else(|| value["session_id"].as_str().unwrap_or("unknown")),
+                        value["status"].as_str().unwrap_or("unknown"),
+                        value["availability"].as_str().unwrap_or("unknown"),
+                        value["detail"].as_str().unwrap_or_default(),
+                    )
                 }
             }
         }
@@ -2754,6 +2895,15 @@ fn install_native(a: InstallNativeArgs) -> Result<i32> {
 fn update_command(a: UpdateArgs) -> Result<i32> {
     let executable =
         std::env::current_exe().context("cannot locate the running Pika executable")?;
+    if let Some(version) = a.rollback.as_deref() {
+        if a.check || a.bundle.is_some() || a.release.is_some() {
+            bail!("use --rollback by itself or with one retained VERSION");
+        }
+        let outcome =
+            update::rollback_managed(&executable, (!version.is_empty()).then_some(version))?;
+        println!("{}", outcome.message());
+        return Ok(0);
+    }
     let outcome = update::update_managed(UpdateRequest {
         executable: &executable,
         bundle: a.bundle.as_deref(),
@@ -3992,6 +4142,59 @@ mod fleet_consultation_tests {
         assert!(message.contains("AMBIGUOUS TARGET"));
         assert!(message.contains("exact local UUID"));
         assert!(message.contains("no action was taken"));
+    }
+
+    #[test]
+    fn fresh_actions_resolve_a_literal_local_at_name_without_ssh() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        let state_dir = root.path().join("state");
+        let paths = crate::paths::Paths {
+            config: config_dir.join("config.json"),
+            database: state_dir.join("pika.db"),
+            config_dir,
+            state_dir,
+            codex_home: root.path().join("codex-home"),
+            claude_home: root.path().join("claude-home"),
+            opencode_data_home: root.path().join("opencode-data"),
+            opencode_config_home: root.path().join("opencode-config"),
+        };
+        let store = Store::at(&paths.database);
+        let mut local = fixture_session(root.path());
+        local.session_id = "11111111-1111-4111-8111-111111111111".into();
+        local.active_thread_id = None;
+        local.name = Some("work@atlas".into());
+        store.upsert_session(&local, false).unwrap();
+        store
+            .upsert_fleet_node(&crate::model::FleetNode {
+                node_id: "22222222-2222-4222-8222-222222222222".into(),
+                alias: "atlas".into(),
+                ssh_target: "must-not-connect.invalid".into(),
+                sources: vec!["fixture".into()],
+                status: "ready".into(),
+                protocol_version: Some(fleet::PROTOCOL_VERSION),
+                package_version: Some(env!("CARGO_PKG_VERSION").into()),
+                capabilities: fleet::CAPABILITIES
+                    .iter()
+                    .map(|value| (*value).into())
+                    .collect(),
+                last_seen: 0.0,
+                last_attempt_at: 0.0,
+                last_error: None,
+                created_at: 1.0,
+                updated_at: 1.0,
+            })
+            .unwrap();
+        let pika = Pika::with_components(
+            paths,
+            crate::config::Config::default(),
+            store,
+            crate::tmux::Tmux::with_executable("fixture-tmux", Some("isolated".into())),
+        );
+
+        let selected =
+            resolve_named_target(&pika, "work@atlas", true, LocalTargetDomain::Daily).unwrap();
+        assert!(matches!(selected, Some(NamedTarget::Local(_))));
     }
 
     #[test]

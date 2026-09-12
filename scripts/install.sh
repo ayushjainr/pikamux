@@ -53,7 +53,7 @@ case "$(uname -s):$(uname -m)" in
     *) fail 'Native Pika supports macOS/Linux on arm64 or x86_64.' ;;
 esac
 
-for pika_command in curl tar mktemp sed tr wc find cut; do
+for pika_command in curl gzip head tar mktemp sed tr wc find cut; do
     command -v "$pika_command" >/dev/null 2>&1 || fail "Required command missing: $pika_command."
 done
 if command -v sha256sum >/dev/null 2>&1; then
@@ -104,7 +104,7 @@ if [ -n "$pika_bundle" ]; then
 else
     pika_base="$PIKA_RELEASE_ROOT/download/v${pika_version}"
     download "$pika_base/pika-native-release.json" "$pika_tmp/pika-native-release.json" 65536
-    download "$pika_base/$pika_archive" "$pika_tmp/$pika_archive" 104857600
+    download "$pika_base/$pika_archive" "$pika_tmp/$pika_archive" 20971520
     download "$pika_base/$pika_archive.sha256" "$pika_tmp/$pika_archive.sha256" 128
 fi
 [ "$(wc -c < "$pika_tmp/pika-native-release.json" | tr -d ' ')" -le 65536 ] || fail 'Release manifest exceeds 64 KiB.'
@@ -114,8 +114,21 @@ pika_sha=$(sed -n '1p' "$pika_tmp/$pika_archive.sha256")
 [ "${#pika_sha}" = 64 ] || fail 'Invalid artifact checksum.'
 case "$pika_sha" in *[!0-9a-f]*|'') fail 'Invalid artifact checksum.' ;; esac
 [ "$(digest "$pika_tmp/$pika_archive")" = "$pika_sha" ] || fail 'Pika checksum mismatch. Downloaded code was not executed.'
+[ "$(wc -c < "$pika_tmp/$pika_archive" | tr -d ' ')" -le 20971520 ] || fail 'Native archive exceeds the compressed size limit.'
 
 # The current POSIX archive format intentionally contains one regular file.
+# Bound decompression before any archive parser or filesystem write. Ignoring
+# the upstream SIGPIPE here is intentional: head closes the stream at the
+# first byte over the complete-tar budget, so a compression bomb cannot make
+# tar scan or extract an unbounded payload.
+pika_stream_limit=53477376
+pika_stream_bytes=$(
+    set +o pipefail
+    gzip -dc -- "$pika_tmp/$pika_archive" 2>/dev/null |
+        head -c $((pika_stream_limit + 1)) |
+        wc -c | tr -d ' '
+)
+[ "$pika_stream_bytes" -le "$pika_stream_limit" ] || fail 'Native archive expands beyond the 51 MiB safety limit.'
 # Exact listing validation makes traversal, duplicate-name and link payloads
 # unnecessary; post-extraction checks still reject a link or extra entry.
 pika_listing=$(tar -tzf "$pika_tmp/$pika_archive")
@@ -126,7 +139,7 @@ mkdir "$pika_tmp/extracted"
 tar -xzf "$pika_tmp/$pika_archive" -C "$pika_tmp/extracted"
 [ -f "$pika_tmp/extracted/pika" ] && [ ! -L "$pika_tmp/extracted/pika" ] || fail 'Native archive has no regular Pika executable.'
 [ "$(find "$pika_tmp/extracted" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 1 ] || fail 'Native archive extracted unexpected entries.'
-[ "$(wc -c < "$pika_tmp/extracted/pika" | tr -d ' ')" -le 104857600 ] || fail 'Native executable exceeds the size limit.'
+[ "$(wc -c < "$pika_tmp/extracted/pika" | tr -d ' ')" -le 52428800 ] || fail 'Native executable exceeds the 50 MiB size limit.'
 chmod 700 "$pika_tmp/extracted/pika"
 
 [ "$("$pika_tmp/extracted/pika" --version)" = "pika $pika_version" ] || \
@@ -147,7 +160,15 @@ install_args=(
 
 if [ -z "$pika_no_setup" ]; then
     pika_launcher="$pika_bin_dir/pika"
-    "$pika_launcher" skill install
+    if ! pika_skill_detail=$("$pika_launcher" skill install 2>&1); then
+        printf '%s\n' \
+            "Pika $pika_version is installed at $pika_launcher." \
+            "Agent consultation is not configured because skill installation failed: $pika_skill_detail"
+        printf 'After correcting the path, run exactly: %q skill install\n' "$pika_launcher"
+        printf 'Then run exactly: %q setup\n' "$pika_launcher"
+        exit 0
+    fi
+    [ -z "$pika_skill_detail" ] || printf '%s\n' "$pika_skill_detail"
     if ! command -v tmux >/dev/null 2>&1; then
         printf '%s\n' \
             'tmux is missing. Pika is installed; Pika needs tmux to host agents.' \

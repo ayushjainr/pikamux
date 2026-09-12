@@ -3,7 +3,8 @@ use pikamux::{
     paths::Paths,
     store::Store,
     usage::{
-        CostBasis, PRICING_AS_OF, format_cost, format_tokens, hydrate_sessions, usage_for_session,
+        CostBasis, PRICING_AS_OF, format_cost, format_tokens, hydrate_cached_sessions,
+        hydrate_sessions, refresh_one_due, usage_for_session,
     },
 };
 use rusqlite::Connection;
@@ -413,4 +414,54 @@ fn hydration_is_best_effort_across_sessions() {
     assert_eq!(report.errors.len(), 1);
     assert_eq!(sessions[0].total_tokens, Some(3));
     assert_eq!(sessions[1].total_tokens, None);
+}
+
+#[test]
+fn board_usage_refreshes_one_changed_source_and_caches_unchanged_misses() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths(temp.path());
+    let store = Store::from_paths(&paths);
+    store.initialize().unwrap();
+    let mut sessions = Vec::new();
+    for index in 0..3 {
+        let transcript = temp.path().join(format!("codex-{index}.jsonl"));
+        fs::write(&transcript, "structured metadata without accounting\n").unwrap();
+        sessions.push(session(
+            Provider::Codex,
+            &format!("session-{index}"),
+            Some(&transcript),
+        ));
+    }
+
+    assert_eq!(refresh_one_due(&paths, &store, &sessions).unavailable, 1);
+    assert_eq!(store.list_cached_usage().unwrap().len(), 1);
+    assert_eq!(refresh_one_due(&paths, &store, &sessions).unavailable, 1);
+    assert_eq!(store.list_cached_usage().unwrap().len(), 2);
+    assert_eq!(refresh_one_due(&paths, &store, &sessions).unavailable, 1);
+    assert_eq!(store.list_cached_usage().unwrap().len(), 3);
+    let mut rendered = sessions.clone();
+    let report = hydrate_cached_sessions(&store, &mut rendered);
+    assert_eq!(report.unavailable, 3);
+    assert!(
+        rendered
+            .iter()
+            .all(|session| session.total_tokens.is_none())
+    );
+    assert_eq!(refresh_one_due(&paths, &store, &sessions).unavailable, 0);
+}
+
+#[test]
+fn claude_usage_rejects_an_unbounded_single_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths(temp.path());
+    let store = Store::from_paths(&paths);
+    let transcript = temp.path().join("claude.jsonl");
+    fs::write(&transcript, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    let error = usage_for_session(
+        &paths,
+        &store,
+        &session(Provider::Claude, "large-line", Some(&transcript)),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("record exceeds"));
 }

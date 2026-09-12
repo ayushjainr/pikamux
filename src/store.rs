@@ -21,7 +21,10 @@ use uuid::Uuid;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// Lifecycle hooks are latency-sensitive. Reconciliation transactions contain
+// no provider/process I/O, so a writer held for longer than this is abnormal;
+// report the lock explicitly instead of freezing a hook or board action.
+const BUSY_TIMEOUT: Duration = Duration::from_millis(500);
 
 const SCHEMA: &str = r#"
 CREATE TABLE sessions (
@@ -609,6 +612,19 @@ impl Store {
         self.list_sessions_query(true)
     }
 
+    pub fn list_provider_hidden_sessions(&self) -> Result<Vec<Session>> {
+        if !self.exists() {
+            return Ok(Vec::new());
+        }
+        let db = self.open_read()?;
+        let mut statement = db.prepare(
+            "SELECT sessions.* FROM sessions JOIN meta ON meta.key=('provider-hidden:' || sessions.provider || ':' || sessions.session_id)",
+        )?;
+        Ok(statement
+            .query_map([], session_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     fn list_sessions_query(&self, untracked: bool) -> Result<Vec<Session>> {
         if !self.exists() {
             return Ok(Vec::new());
@@ -670,6 +686,10 @@ impl Store {
             "INSERT INTO untracked_sessions(provider,session_id,untracked_at) VALUES (?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET untracked_at=excluded.untracked_at",
             params![provider.as_str(), session_id, now()],
         )?;
+        tx.execute(
+            "DELETE FROM meta WHERE key=?",
+            [provider_hidden_key(provider, session_id)],
+        )?;
         for table in [
             "usage_cache",
             "session_events",
@@ -698,11 +718,18 @@ impl Store {
     }
 
     pub fn restore_tracking(&self, provider: Provider, session_id: &str) -> Result<bool> {
-        let db = self.open_write()?;
-        Ok(db.execute(
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let restored = tx.execute(
             "DELETE FROM untracked_sessions WHERE provider=? AND session_id=?",
             params![provider.as_str(), session_id],
-        )? == 1)
+        )? == 1;
+        tx.execute(
+            "DELETE FROM meta WHERE key=?",
+            [provider_hidden_key(provider, session_id)],
+        )?;
+        tx.commit()?;
+        Ok(restored)
     }
 
     pub fn delete_session(
@@ -1977,6 +2004,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn list_cached_usage(&self) -> Result<Vec<UsageCacheRecord>> {
+        if !self.exists() {
+            return Ok(Vec::new());
+        }
+        let db = self.open_read()?;
+        let mut statement = db.prepare(
+            "SELECT provider,session_id,source_path,source_mtime_ns,source_size,model,input_tokens,output_tokens,cached_input_tokens,cache_write_tokens,total_tokens,estimated_cost_usd,updated_at FROM usage_cache ORDER BY updated_at",
+        )?;
+        Ok(statement
+            .query_map([], usage_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn get_cached_usage(
         &self,
         provider: Provider,
@@ -2042,11 +2082,71 @@ fn launch_phase_key(launch_token: &str) -> String {
     format!("launch_phase:{launch_token}")
 }
 
+fn provider_hidden_key(provider: Provider, session_id: &str) -> String {
+    format!("provider-hidden:{}:{session_id}", provider.as_str())
+}
+
 fn nonzero_or(value: f64, fallback: f64) -> f64 {
     if value == 0.0 { fallback } else { value }
 }
 
 impl ReconcileLedger<'_> {
+    pub(crate) fn hide_provider_session(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        state: &str,
+    ) -> Result<()> {
+        self.tx.execute(
+            "INSERT INTO untracked_sessions(provider,session_id,untracked_at) VALUES (?,?,?) ON CONFLICT(provider,session_id) DO UPDATE SET untracked_at=excluded.untracked_at",
+            params![provider.as_str(), session_id, now()],
+        )?;
+        self.tx.execute(
+            "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![provider_hidden_key(provider, session_id), state],
+        )?;
+        for table in [
+            "usage_cache",
+            "session_events",
+            "session_status_observations",
+            "identity_interruptions",
+            "expert_refresh_attempts",
+            "live_owners",
+            "recovery_owners",
+            "launch_reservations",
+        ] {
+            self.tx.execute(
+                &format!("DELETE FROM {table} WHERE provider=? AND session_id=?"),
+                params![provider.as_str(), session_id],
+            )?;
+        }
+        self.tx.execute(
+            "DELETE FROM launch_bindings WHERE provider=? AND session_id=?",
+            params![provider.as_str(), session_id],
+        )?;
+        self.tx.execute(
+            "UPDATE sessions SET tmux_session=NULL,tmux_pane=NULL,root_pid=NULL,status='PARKED',unread=0,error=NULL,attention_reason=NULL,updated_at=? WHERE provider=? AND session_id=?",
+            params![now(), provider.as_str(), session_id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn restore_provider_session(
+        &self,
+        provider: Provider,
+        session_id: &str,
+    ) -> Result<bool> {
+        let key = provider_hidden_key(provider, session_id);
+        if self.tx.execute("DELETE FROM meta WHERE key=?", [&key])? != 1 {
+            return Ok(false);
+        }
+        self.tx.execute(
+            "DELETE FROM untracked_sessions WHERE provider=? AND session_id=?",
+            params![provider.as_str(), session_id],
+        )?;
+        Ok(true)
+    }
+
     pub(crate) fn delete_session(
         &self,
         provider: Provider,

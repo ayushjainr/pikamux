@@ -36,6 +36,7 @@ jobs:
       - name: Dependency license inventory
         shell: bash
         run: |
+          cargo fetch --locked
           scripts/generate-third-party.sh /tmp/THIRD_PARTY.md
           diff -u THIRD_PARTY.md /tmp/THIRD_PARTY.md
       - name: RustSec dependency audit

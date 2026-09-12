@@ -159,18 +159,27 @@ impl Pika {
         };
         let providers = Providers::new(&self.paths, &self.config);
         let mut stored = self.store.list_sessions()?;
+        let provider_hidden = self.store.list_provider_hidden_sessions()?;
+        let provider_hidden_keys = provider_hidden
+            .iter()
+            .map(|session| (session.provider, session.session_id.clone()))
+            .collect::<BTreeSet<_>>();
+        stored.extend(provider_hidden);
+        let source_states = providers.source_states(&stored);
         let removed = stored
             .iter()
             .filter(|session| {
-                matches!(
-                    providers.source_state(
-                        session.provider,
-                        session.provider_thread_id(),
-                        session.transcript_path.as_deref(),
-                    ),
-                    crate::providers::ProviderSourceState::Archived
-                        | crate::providers::ProviderSourceState::Deleted
-                )
+                let key = (session.provider, session.session_id.clone());
+                provider_hidden_keys.contains(&key)
+                    && source_states.get(&key)
+                        != Some(&crate::providers::ProviderSourceState::Present)
+                    || matches!(
+                        source_states.get(&key),
+                        Some(
+                            crate::providers::ProviderSourceState::Archived
+                                | crate::providers::ProviderSourceState::Deleted
+                        )
+                    )
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -192,30 +201,24 @@ impl Pika {
                 let _ = self.tmux.clear_tags_if_unchanged(pane);
             }
         }
-        let mut wanted = BTreeMap::<Provider, BTreeSet<String>>::new();
+        let mut wanted = BTreeMap::<Provider, BTreeMap<String, f64>>::new();
         for session in &stored {
-            wanted
-                .entry(session.provider)
-                .or_default()
-                .extend(identity_strings(session).into_iter().map(str::to_owned));
+            let activity = wanted.entry(session.provider).or_default();
+            for identity in identity_strings(session) {
+                activity
+                    .entry(identity.to_owned())
+                    .and_modify(|value| *value = value.max(session.last_activity_at))
+                    .or_insert(session.last_activity_at);
+            }
         }
         let mut candidate_map = BTreeMap::new();
-        for (provider, identities) in &wanted {
-            for candidate in providers.tracked(*provider, identities) {
+        for (provider, activity) in &wanted {
+            for candidate in providers.reconcile_records(*provider, activity) {
                 candidate_map.insert(
                     (candidate.provider, candidate.session_id.clone()),
                     candidate,
                 );
             }
-        }
-        // Codex exposes explicit fork lineage only in rollout metadata. One
-        // bounded named pass lets a renamed independent fork become its own
-        // row while a same-pane continuation keeps the parent's stable home.
-        for candidate in providers.discover(Provider::Codex) {
-            candidate_map.insert(
-                (candidate.provider, candidate.session_id.clone()),
-                candidate,
-            );
         }
         let known: BTreeSet<_> = stored
             .iter()
@@ -274,7 +277,22 @@ impl Pika {
         let sessions = self.store.reconcile_transaction(|ledger| {
             let mut sessions = Vec::with_capacity(stored.len() + fork_imports.len());
             for session in &removed {
-                ledger.delete_session(session.provider, &session.session_id, false)?;
+                let state = match source_states.get(&(session.provider, session.session_id.clone()))
+                {
+                    Some(crate::providers::ProviderSourceState::Archived) => "archived",
+                    Some(crate::providers::ProviderSourceState::Deleted) => "deleted",
+                    _ => "source-unavailable",
+                };
+                ledger.hide_provider_session(session.provider, &session.session_id, state)?;
+            }
+            for session in &stored {
+                let key = (session.provider, session.session_id.clone());
+                if provider_hidden_keys.contains(&key)
+                    && source_states.get(&key)
+                        == Some(&crate::providers::ProviderSourceState::Present)
+                {
+                    ledger.restore_provider_session(session.provider, &session.session_id)?;
+                }
             }
             for mut session in stored {
                 let (candidate, continuation_conflicts) =
@@ -1896,7 +1914,10 @@ fn now() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::LiveOwner;
+    use crate::{
+        model::ExpertProfile,
+        store::{LiveOwner, StoredExpertProfile},
+    };
     fn test_pika() -> (tempfile::TempDir, Pika) {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths {
@@ -2623,6 +2644,26 @@ mod tests {
         session.tmux_pane = Some("%9".into());
         session.transcript_path = Some(archived.display().to_string());
         pika.store.upsert_session(&session, false).unwrap();
+        pika.store
+            .put_expert_profile(&StoredExpertProfile {
+                profile: ExpertProfile {
+                    provider: Provider::Codex,
+                    session_id: identity.into(),
+                    summary: "knows archived work".into(),
+                    current_state: "complete".into(),
+                    topics: vec!["archive".into()],
+                    artifacts: vec!["result.md".into()],
+                    source: "fixture".into(),
+                    updated_at: 10.0,
+                    scope_updated_at: 10.0,
+                    current_state_updated_at: 10.0,
+                },
+                transcript_mtime_ns: Some(1),
+                transcript_size: Some(1),
+                current_state_mtime_ns: Some(1),
+                current_state_size: Some(1),
+            })
+            .unwrap();
         std::fs::create_dir_all(&pika.paths.codex_home).unwrap();
         let db =
             rusqlite::Connection::open(pika.paths.codex_home.join("state_archive.sqlite")).unwrap();
@@ -2639,16 +2680,38 @@ mod tests {
             pika.store
                 .get_session(Provider::Codex, identity)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
-        assert!(pika.resolve_local("archived_work").unwrap().is_empty());
-        assert!(pika.resolve_local(identity).unwrap().is_empty());
+        assert_eq!(pika.store.list_untracked_sessions().unwrap().len(), 1);
+        assert!(
+            pika.store
+                .get_stored_expert_profile(Provider::Codex, identity)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            pika.resolve_local("archived_work")
+                .unwrap_err()
+                .to_string()
+                .contains("archived")
+        );
         assert!(pika.store.list_pending().unwrap().is_empty());
         let cleanup = std::fs::read_to_string(tag_cleanup).unwrap();
         assert!(cleanup.contains("if-shell -F -t %9"));
         assert!(
             cleanup.contains("set-option -p -u -t '%9' @pika_session_id"),
             "{cleanup}"
+        );
+
+        db.execute("UPDATE threads SET archived=0 WHERE id=?1", [identity])
+            .unwrap();
+        assert_eq!(pika.reconcile_local().unwrap().sessions.len(), 1);
+        assert!(pika.store.list_untracked_sessions().unwrap().is_empty());
+        assert!(
+            pika.store
+                .get_stored_expert_profile(Provider::Codex, identity)
+                .unwrap()
+                .is_some()
         );
     }
 

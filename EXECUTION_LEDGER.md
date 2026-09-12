@@ -25,8 +25,8 @@ Completion requires self-score and an independent adversarial score of at least
 ## Current phase
 
 - CP0.1 through CP6.3: implemented and locally fixture-verified.
-- CP7.1 release candidate: the full repaired local gate passes; two independent
-  final adversarial re-reviews are pending.
+- CP7.1 release candidate: the full repaired local gate passes and is ready for
+  exact-commit clean-room validation and independent adversarial review.
 - CP7.2 through CP7.4: deliberately not executed. They require a separately
   authorized live pilot, publication, launcher cutover, and Python retirement.
 - Rust MSRV: exactly 1.88.0, verified with formatting and warnings-as-errors Clippy.
@@ -57,17 +57,17 @@ Completion requires self-score and an independent adversarial score of at least
 
 | Gate | Result |
 | --- | --- |
-| Native behavior suite | 363 tests pass in the macOS arm64 implementation worktree, including isolated real-tmux journeys, mixed-runtime compatibility, and the frozen-updater transition; clean-checkout rerun follows the repair commit |
+| Native behavior suite | 379 tests pass in the macOS arm64 implementation worktree, including isolated real-tmux journeys, mixed-runtime compatibility, bounded 2,000-record provider fixtures, and the frozen-updater transition; clean-checkout rerun follows the repair commit |
 | Mixed-runtime transition | Real Python v0.5.0a4 and Rust alternated SQLite hook writes; hello/snapshot/peek/untrack interoperate, while acknowledgement deliberately fails closed because the v0.5 wire cannot bind an event |
 | Formatting/lint/MSRV | `cargo +1.88.0 fmt --check` and warnings-as-errors Clippy passed for all targets/features |
 | Dependency integrity | Locked license inventory reproduced exactly; RustSec scanned 157 locked crates with zero advisories after updating `time` to 0.3.47 |
 | Native packaging | The macOS arm64 release archive, strict manifest, sidecar, offline install, version/help, and embedded skill pass in a disposable root; relative-output structural assembly verifies all five target archive/checksum layouts |
-| Startup | p95 4.67 ms native versus 146.30 ms Python, 100 launches each |
-| Board | first-frame p95 11.41 ms versus 487.15 ms; input p95 0.143 ms versus 8.57 ms |
-| Hook | p95 14.43 ms versus 498.39 ms, 100 events each |
-| Reconciliation | 200-row public path p95 72.40 ms versus 2,564.50 ms, 30 runs each |
-| Warm resources | 6.84 MiB RSS p95 and 0.372% one-core mean over a five-minute native board run |
-| Artifact | 4.27 MB executable; 2.21 MB gzip; no Python/runtime/compiler prerequisite |
+| Startup | p95 5.33 ms native versus 147.85 ms Python, 100 launches each |
+| Board | first-frame p95 11.16 ms versus 484.27 ms; input p95/p99 0.123/0.142 ms versus 8.56/8.75 ms |
+| Hook | p95 15.46 ms versus 505.63 ms, 100 events each |
+| Reconciliation | 200-row public path p95 73.34 ms versus 2,563.51 ms, 30 runs each |
+| Warm resources | 7.06 MiB RSS p95 and 0.654% one-core mean over a five-minute native board run |
+| Artifact | 4.39 MB executable; 2.26 MB gzip; no Python/runtime/compiler prerequisite |
 
 Full methodology and raw-boundary definitions are in `docs/PERFORMANCE.md`.
 
@@ -83,7 +83,7 @@ Full methodology and raw-boundary definitions are in `docs/PERFORMANCE.md`.
 | CP4 expert network | complete | cards, freshness, quota gates, multi-turn isolation and failure-stage receipts for all providers | No setup-time interviews |
 | CP5 federation/client | complete | strict fleet v2, mixed runtimes, remote consults, Windows loopback bridge | Windows hosting remains out of scope |
 | CP6 distribution/setup | local contract complete | preview/backup/idempotence, launchd/systemd, native install/update, bridge and remote bundle contracts | External platform CI pending |
-| CP7.1 candidate | final review | full exact-MSRV suite, mixed runtime, package/install smoke, security audit, and performance gates pass locally | Two independent final adversarial re-reviews |
+| CP7.1 candidate | exact review | full exact-MSRV suite, mixed runtime, package/install smoke, security audit, and performance gates pass locally | Clean-room rerun and independent adversarial review |
 | CP7.2–CP7.4 | not authorized | no live pilot, tag, upload, cutover, or runtime retirement performed | Owner decision after candidate review |
 
 Update this ledger at checkpoint boundaries and when a long-running command changes

@@ -47,5 +47,5 @@ if sys.platform == "darwin" and importlib.util.find_spec("psutil") is None:
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "reference" / "python" / "src"))
+sys.path.insert(0, str(ROOT / "tests" / "fixtures" / "python-v0.5.0a4"))
 runpy.run_module("pikamux", run_name="__main__")

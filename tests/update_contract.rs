@@ -3,8 +3,8 @@
 use pikamux::update::{
     InstallRequest, ReleaseArtifact, ReleaseManifest, UpdateDisposition, UpdateError,
     UpdateRequest, artifact_name, cached_update_notice, install_staged, native_target,
-    prepare_remote_install_bundle, select_latest_release, sha256_file, update_managed,
-    validate_archive_members,
+    prepare_remote_install_bundle, rollback_managed, select_latest_release, sha256_file,
+    update_managed, validate_archive_members,
 };
 use pikamux::{
     fleet::{
@@ -17,6 +17,7 @@ use pikamux::{
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -103,6 +104,97 @@ fn release_bundle(temp: &Path, version: &str) -> PathBuf {
     fs::write(bundle.join("pika-version"), format!("{version}\n")).unwrap();
     fs::copy("scripts/install.sh", bundle.join("install.sh")).unwrap();
     bundle
+}
+
+fn install_release_bundle(
+    bundle: &Path,
+    root: &Path,
+    bin_dir: &Path,
+) -> pikamux::update::InstallOutcome {
+    let manifest =
+        ReleaseManifest::parse(&fs::read(bundle.join("pika-native-release.json")).unwrap())
+            .unwrap();
+    let target = native_target().unwrap();
+    let artifact = manifest.artifact_for(target).unwrap();
+    let extracted = bundle
+        .parent()
+        .unwrap()
+        .join(format!("extracted-{}", manifest.version));
+    fs::create_dir(&extracted).unwrap();
+    assert!(
+        Command::new("tar")
+            .args(["-xzf"])
+            .arg(bundle.join(&artifact.file))
+            .args(["-C"])
+            .arg(&extracted)
+            .status()
+            .unwrap()
+            .success()
+    );
+    install_staged(InstallRequest {
+        manifest: &manifest,
+        target,
+        artifact: &bundle.join(&artifact.file),
+        candidate: &extracted.join("pika"),
+        root,
+        bin_dir,
+    })
+    .unwrap()
+}
+
+fn shaped_cross_binary(temp: &Path, target: &str) -> PathBuf {
+    let path = temp.join(format!("pika-{target}"));
+    let mut bytes = vec![0_u8; 512 * 1024];
+    let mut state = 0x9e37_79b9_u32;
+    for byte in &mut bytes {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        *byte = state as u8;
+    }
+    match target {
+        "aarch64-apple-darwin" => {
+            bytes[..4].copy_from_slice(b"\xcf\xfa\xed\xfe");
+            bytes[4..8].copy_from_slice(&0x0100_000c_u32.to_le_bytes());
+        }
+        "x86_64-apple-darwin" => {
+            bytes[..4].copy_from_slice(b"\xcf\xfa\xed\xfe");
+            bytes[4..8].copy_from_slice(&0x0100_0007_u32.to_le_bytes());
+        }
+        "aarch64-unknown-linux-musl" | "x86_64-unknown-linux-musl" => {
+            bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
+            let machine = if target.starts_with("aarch64") {
+                183
+            } else {
+                62
+            };
+            bytes[18..20].copy_from_slice(&u16::to_le_bytes(machine));
+        }
+        "x86_64-pc-windows-msvc" => {
+            bytes[..2].copy_from_slice(b"MZ");
+            bytes[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+            bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+            bytes[0x84..0x86].copy_from_slice(&0x8664_u16.to_le_bytes());
+        }
+        _ => panic!("unsupported test target"),
+    }
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+fn rewrite_release_checksums(bundle: &Path) {
+    let mut names: Vec<_> = fs::read_dir(bundle)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name != "SHA256SUMS")
+        .collect();
+    names.sort();
+    let rows = names
+        .into_iter()
+        .map(|name| format!("{}  {name}\n", sha256_file(&bundle.join(&name)).unwrap()))
+        .collect::<String>();
+    fs::write(bundle.join("SHA256SUMS"), rows).unwrap();
 }
 
 #[test]
@@ -502,6 +594,60 @@ fn public_offline_update_checks_then_installs_without_python() {
             .unwrap()
             .stdout,
         b"pika 0.6.0-alpha.2\n"
+    );
+}
+
+#[test]
+fn rollback_revalidates_and_atomically_activates_the_prior_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("managed");
+    let bin = temp.path().join("bin");
+    let first = release_bundle(temp.path(), "0.6.0-alpha.1");
+    let first = install_release_bundle(&first, &root, &bin);
+    let second = release_bundle(temp.path(), "0.6.0-alpha.2");
+    let second = install_release_bundle(&second, &root, &bin);
+    assert_ne!(first.release_dir, second.release_dir);
+
+    let outcome = rollback_managed(&second.release_dir.join("bin/pika"), None).unwrap();
+    assert_eq!(outcome.disposition, UpdateDisposition::RolledBack);
+    assert_eq!(outcome.previous_version, "0.6.0-alpha.2");
+    assert_eq!(outcome.version, "0.6.0-alpha.1");
+    assert_eq!(
+        root.join("current").canonicalize().unwrap(),
+        first.release_dir
+    );
+    assert_eq!(
+        Command::new(bin.join("pika"))
+            .arg("--version")
+            .output()
+            .unwrap()
+            .stdout,
+        b"pika 0.6.0-alpha.1\n"
+    );
+}
+
+#[test]
+fn rollback_refuses_a_tampered_retained_executable_without_changing_current() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("managed");
+    let bin = temp.path().join("bin");
+    let first = release_bundle(temp.path(), "0.6.0-alpha.1");
+    let first = install_release_bundle(&first, &root, &bin);
+    let second = release_bundle(temp.path(), "0.6.0-alpha.2");
+    let second = install_release_bundle(&second, &root, &bin);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(first.release_dir.join("bin/pika"))
+        .unwrap()
+        .write_all(b"# changed\n")
+        .unwrap();
+
+    let error =
+        rollback_managed(&second.release_dir.join("bin/pika"), Some("0.6.0-alpha.1")).unwrap_err();
+    assert!(error.to_string().contains("failed validation"));
+    assert_eq!(
+        root.join("current").canonicalize().unwrap(),
+        second.release_dir
     );
 }
 
@@ -938,11 +1084,141 @@ fn default_shell_bootstrap_succeeds_without_a_controlling_tty() {
 }
 
 #[test]
+fn bootstrap_reports_successful_activation_and_exact_skill_remediation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let temp = temporary.path().canonicalize().unwrap();
+    let bundle = temp.join("release");
+    let root = temp.join("managed");
+    let bin = temp.join("bin with space");
+    let home = temp.join("home");
+    let codex_home = temp.join("codex");
+    let external = temp.join("external-skill");
+    fs::create_dir_all(codex_home.join("skills")).unwrap();
+    fs::create_dir(&external).unwrap();
+    fs::write(external.join("SKILL.md"), "keep\n").unwrap();
+    symlink(&external, codex_home.join("skills/agent-convo")).unwrap();
+
+    let version = env!("CARGO_PKG_VERSION");
+    let target = native_target().unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_pika"));
+    assert!(
+        Command::new("bash")
+            .arg("scripts/package-release.sh")
+            .arg(version)
+            .arg(&bundle)
+            .arg(format!("{target}={}", binary.display()))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            "import os,sys; os.setsid(); os.execv('/bin/bash', ['bash', *sys.argv[1:]])",
+        ])
+        .arg(bundle.join("install.sh"))
+        .arg("--bundle")
+        .arg(&bundle)
+        .arg("--root")
+        .arg(&root)
+        .arg("--bin-dir")
+        .arg(&bin)
+        .env("HOME", &home)
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(&format!("Pika {version} is installed")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Agent consultation is not configured because skill installation failed"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("bin\\ with\\ space/pika skill install"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("bin\\ with\\ space/pika setup"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(external.join("SKILL.md")).unwrap(),
+        "keep\n"
+    );
+    assert_eq!(
+        Command::new(bin.join("pika"))
+            .arg("--version")
+            .output()
+            .unwrap()
+            .stdout,
+        format!("pika {version}\n").as_bytes()
+    );
+}
+
+#[test]
+fn bootstrap_rejects_a_compression_bomb_before_filesystem_extraction() {
+    let temp = tempfile::tempdir().unwrap();
+    let bundle = temp.path().join("bundle");
+    let payload = temp.path().join("payload");
+    fs::create_dir(&bundle).unwrap();
+    fs::create_dir(&payload).unwrap();
+    let candidate = payload.join("pika");
+    fs::write(&candidate, vec![0_u8; 52 * 1024 * 1024]).unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+    let version = env!("CARGO_PKG_VERSION");
+    let target = native_target().unwrap();
+    let name = artifact_name(version, target).unwrap();
+    assert!(
+        Command::new("tar")
+            .args(["-czf"])
+            .arg(bundle.join(&name))
+            .args(["-C"])
+            .arg(&payload)
+            .arg("pika")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let checksum = sha256_file(&bundle.join(&name)).unwrap();
+    fs::write(
+        bundle.join(format!("{name}.sha256")),
+        format!("{checksum}\n"),
+    )
+    .unwrap();
+    fs::write(bundle.join("pika-version"), format!("{version}\n")).unwrap();
+    fs::write(bundle.join("pika-native-release.json"), "{}\n").unwrap();
+    let root = temp.path().join("managed");
+    let output = Command::new("bash")
+        .arg("scripts/install.sh")
+        .arg("--bundle")
+        .arg(&bundle)
+        .arg("--root")
+        .arg(&root)
+        .arg("--bin-dir")
+        .arg(temp.path().join("bin"))
+        .arg("--no-setup")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("expands beyond"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.exists());
+}
+
+#[test]
 fn release_verifier_rejects_unexpected_top_level_regular_files() {
     let temp = tempfile::tempdir().unwrap();
     let bundle = temp.path().join("release");
     let version = env!("CARGO_PKG_VERSION");
-    let binary = Path::new(env!("CARGO_BIN_EXE_pika"));
     let targets = [
         "aarch64-apple-darwin",
         "x86_64-apple-darwin",
@@ -957,7 +1233,10 @@ fn release_verifier_rejects_unexpected_top_level_regular_files() {
         .arg(&bundle)
         .env("PIKA_CROSS_PACKAGE", "1");
     for target in targets {
-        package.arg(format!("{target}={}", binary.display()));
+        package.arg(format!(
+            "{target}={}",
+            shaped_cross_binary(temp.path(), target).display()
+        ));
     }
     let packaged = package.output().unwrap();
     assert!(
@@ -986,6 +1265,145 @@ fn release_verifier_rejects_unexpected_top_level_regular_files() {
     assert!(
         String::from_utf8_lossy(&rejected.stderr)
             .contains("unexpected top-level file(s): unexpected.txt"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn release_verifier_rejects_self_consistent_non_archives() {
+    let temp = tempfile::tempdir().unwrap();
+    let bundle = temp.path().join("release");
+    let version = env!("CARGO_PKG_VERSION");
+    let targets = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-musl",
+        "x86_64-unknown-linux-musl",
+        "x86_64-pc-windows-msvc",
+    ];
+    let mut package = Command::new("bash");
+    package
+        .arg("scripts/package-release.sh")
+        .arg(version)
+        .arg(&bundle)
+        .env("PIKA_CROSS_PACKAGE", "1");
+    for target in targets {
+        package.arg(format!(
+            "{target}={}",
+            shaped_cross_binary(temp.path(), target).display()
+        ));
+    }
+    assert!(package.status().unwrap().success());
+
+    let manifest_path = bundle.join("pika-native-release.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let target = "aarch64-unknown-linux-musl";
+    let name = manifest["artifacts"][target]["file"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fs::write(bundle.join(&name), b"not an archive\n").unwrap();
+    let checksum = sha256_file(&bundle.join(&name)).unwrap();
+    manifest["artifacts"][target]["sha256"] = json!(checksum);
+    manifest["artifacts"][target]["bytes"] = json!(15);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        bundle.join(format!("{name}.sha256")),
+        format!("{checksum}\n"),
+    )
+    .unwrap();
+    rewrite_release_checksums(&bundle);
+
+    let rejected = Command::new("bash")
+        .arg("scripts/verify-release.sh")
+        .arg(&bundle)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("not a tar.gz file"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn release_verifier_bounds_archive_expansion_before_parsing_tar_members() {
+    let temp = tempfile::tempdir().unwrap();
+    let bundle = temp.path().join("release");
+    let payload = temp.path().join("payload");
+    let version = env!("CARGO_PKG_VERSION");
+    let targets = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-musl",
+        "x86_64-unknown-linux-musl",
+        "x86_64-pc-windows-msvc",
+    ];
+    let mut package = Command::new("bash");
+    package
+        .arg("scripts/package-release.sh")
+        .arg(version)
+        .arg(&bundle)
+        .env("PIKA_CROSS_PACKAGE", "1");
+    for target in targets {
+        package.arg(format!(
+            "{target}={}",
+            shaped_cross_binary(temp.path(), target).display()
+        ));
+    }
+    assert!(package.status().unwrap().success());
+
+    fs::create_dir(&payload).unwrap();
+    let candidate = payload.join("pika");
+    fs::write(&candidate, vec![0_u8; 52 * 1024 * 1024]).unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+    let target = "aarch64-unknown-linux-musl";
+    let manifest_path = bundle.join("pika-native-release.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let name = manifest["artifacts"][target]["file"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        Command::new("tar")
+            .args(["-czf"])
+            .arg(bundle.join(&name))
+            .args(["-C"])
+            .arg(&payload)
+            .arg("pika")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let checksum = sha256_file(&bundle.join(&name)).unwrap();
+    manifest["artifacts"][target]["sha256"] = json!(checksum);
+    manifest["artifacts"][target]["bytes"] = json!(fs::metadata(bundle.join(&name)).unwrap().len());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        bundle.join(format!("{name}.sha256")),
+        format!("{checksum}\n"),
+    )
+    .unwrap();
+    rewrite_release_checksums(&bundle);
+
+    let rejected = Command::new("bash")
+        .arg("scripts/verify-release.sh")
+        .arg(&bundle)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("expands beyond its safety limit"),
         "{}",
         String::from_utf8_lossy(&rejected.stderr)
     );
@@ -1271,7 +1689,10 @@ fn remote_upgrade_same_connection_accepts_a_verified_node_and_preserves_archive_
         prepare_remote_install_bundle(&bundle, native_target().unwrap(), Some(version)).unwrap();
     let expected = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let ssh = isolated_install_ssh(temp.path(), expected, expected);
-    let transport = SshTransport::new(ssh, Duration::from_secs(1), Duration::from_secs(5));
+    // This path competes with compression-heavy release tests in the same
+    // integration binary. Give its success fixture scheduling margin;
+    // deadline behavior has dedicated short tests.
+    let transport = SshTransport::new(ssh, Duration::from_secs(1), Duration::from_secs(15));
     assert_eq!(
         transport
             .install_bundle("research-node.example", &remote, Some(expected))

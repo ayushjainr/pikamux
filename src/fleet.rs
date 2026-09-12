@@ -1760,6 +1760,7 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 if let Some(status) = remote.card_status.as_deref().and_then(parse_card_status) {
                     found.card_status = status;
                 }
+                found.card_detail = remote.card_detail.clone();
                 found.freshness.scope_updated_at = remote.scope_updated_at;
                 found.freshness.scope_age_seconds = remote
                     .scope_updated_at

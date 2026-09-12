@@ -7,6 +7,7 @@ use pikamux::store::{
 };
 use rusqlite::Connection;
 use serde_json::json;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 #[cfg(unix)]
@@ -117,6 +118,36 @@ fn initialization_is_current_wal_and_private() {
             0o600
         );
     }
+}
+
+#[test]
+fn a_held_writer_fails_a_hook_write_explicitly_and_within_the_latency_bound() {
+    let (_temp, store) = store_fixture();
+    store.initialize().unwrap();
+    let mut blocker = Connection::open(store.path()).unwrap();
+    let transaction = blocker
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let started = Instant::now();
+    let error = store
+        .record_hook_observation(&HookObservation {
+            provider: Provider::Codex,
+            fingerprint: "bounded-lock".into(),
+            event_name: "stop".into(),
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+            observed_at: 1.0,
+            source: Some("fixture".into()),
+            managed: true,
+        })
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(350), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    assert!(
+        error.to_string().to_lowercase().contains("locked"),
+        "{error:#}"
+    );
+    drop(transaction);
 }
 
 #[test]

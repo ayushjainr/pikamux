@@ -364,7 +364,13 @@ fn experts_cli_merges_local_and_cached_remote_with_exact_json_and_no_ssh() {
         expected_common
     );
     let mut expected_remote = expected_common;
-    expected_remote.extend(["machine", "node_id", "snapshot_seen_at", "snapshot_stale"]);
+    expected_remote.extend([
+        "card_detail",
+        "machine",
+        "node_id",
+        "snapshot_seen_at",
+        "snapshot_stale",
+    ]);
     assert_eq!(
         remote_json
             .as_object()
@@ -374,6 +380,76 @@ fn experts_cli_merges_local_and_cached_remote_with_exact_json_and_no_ssh() {
             .collect::<BTreeSet<_>>(),
         expected_remote
     );
+}
+
+#[test]
+fn expert_status_includes_unwatched_local_and_cached_remote_cards_without_ssh() {
+    let root = TempDir::new().unwrap();
+    let paths = isolated_paths(root.path());
+    let marker = root.path().join("ssh-called");
+    let transcript = root.path().join("local.jsonl");
+    fs::write(&transcript, "fixture\n").unwrap();
+    let local = session(THREAD_ID, "local_pricing", Some(&transcript));
+    seed_codex_source(&paths, &local);
+    let store = Store::at(&paths.database);
+    store.upsert_session(&local, true).unwrap();
+    let fingerprint = pikamux::experts::transcript_fingerprint(&local)
+        .unwrap()
+        .unwrap();
+    store
+        .put_expert_profile(&StoredExpertProfile {
+            profile: profile(THREAD_ID, "Owns local pricing", now()),
+            transcript_mtime_ns: Some(fingerprint.checkpoint),
+            transcript_size: Some(fingerprint.size),
+            current_state_mtime_ns: Some(fingerprint.checkpoint),
+            current_state_size: Some(fingerprint.size),
+        })
+        .unwrap();
+    store.untrack_session(Provider::Codex, THREAD_ID).unwrap();
+
+    let remote_thread = "22222222-2222-4222-8222-222222222222";
+    let remote_id = Uuid::new_v4().to_string();
+    let mut remote_snapshot = snapshot(
+        &remote_id,
+        "atlas",
+        "Owns remote pricing",
+        "source-available",
+    );
+    for collection in ["expert_sessions", "profiles", "cards"] {
+        remote_snapshot[collection][0]["session_id"] = json!(remote_thread);
+    }
+    store.upsert_fleet_node(&node(&remote_id, "atlas")).unwrap();
+    store
+        .put_remote_snapshot(&remote_id, &remote_snapshot, now())
+        .unwrap();
+
+    let output = command(root.path(), &marker)
+        .args(["expert", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!marker.exists(), "cached expert status must not start SSH");
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let values = payload.as_array().unwrap();
+    assert_eq!(values.len(), 2);
+    let local = values
+        .iter()
+        .find(|item| item["session_id"] == THREAD_ID)
+        .unwrap();
+    assert_eq!(local["watched"], false);
+    assert_eq!(local["scope"], "Owns local pricing");
+    let remote = values
+        .iter()
+        .find(|item| item["session_id"] == remote_thread)
+        .unwrap();
+    assert_eq!(remote["machine"], "atlas");
+    assert_eq!(remote["node_id"], remote_id);
+    assert_eq!(remote["scope"], "Owns remote pricing");
+    assert_eq!(remote["detail"], "matches remote source");
 }
 
 #[test]

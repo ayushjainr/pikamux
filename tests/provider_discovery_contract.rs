@@ -8,6 +8,7 @@ use pikamux::{
     tmux::Tmux,
 };
 use rusqlite::{Connection, params};
+use std::collections::BTreeMap;
 use std::{fs, path::Path};
 
 fn paths(root: &Path) -> Paths {
@@ -540,4 +541,163 @@ fn renamed_independent_codex_fork_becomes_a_distinct_watched_row() {
     assert!(rows.iter().any(|row| {
         row.session_id == fork_id && row.name.as_deref() == Some("strategy_dashboard")
     }));
+}
+
+#[test]
+fn codex_reconciliation_handles_two_thousand_watched_rows_in_one_bounded_pass() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    fs::create_dir_all(&paths.codex_home).unwrap();
+    let mut db = Connection::open(paths.codex_home.join("state_1.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(
+            id TEXT PRIMARY KEY, name TEXT, cwd TEXT, rollout_path TEXT,
+            created_at INTEGER, updated_at INTEGER, archived INTEGER
+         );",
+    )
+    .unwrap();
+    let transcript = paths.codex_home.join("shared.jsonl");
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}})
+        ),
+    )
+    .unwrap();
+    let transaction = db.transaction().unwrap();
+    let mut activity = BTreeMap::new();
+    for index in 0..2_000 {
+        let id = format!("00000000-0000-4000-8000-{index:012}");
+        transaction
+            .execute(
+                "INSERT INTO threads VALUES(?1,?2,'/project',?3,1,?4,0)",
+                params![
+                    id,
+                    format!("thread-{index}"),
+                    transcript.to_string_lossy(),
+                    index as i64 + 1
+                ],
+            )
+            .unwrap();
+        activity.insert(id, 0.0);
+    }
+    transaction.commit().unwrap();
+    drop(db);
+
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let records = providers.reconcile_records(Provider::Codex, &activity);
+    assert_eq!(records.len(), 2_000);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|candidate| candidate.lifecycle_status == Some(Status::Ready))
+            .count(),
+        16
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|candidate| candidate.updated_at == 0.0)
+            .count(),
+        2_000 - 16
+    );
+}
+
+#[test]
+fn opencode_reconciliation_batches_two_thousand_roots_and_their_lifecycle() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    fs::create_dir_all(&paths.opencode_data_home).unwrap();
+    let mut db = Connection::open(paths.opencode_data_home.join("opencode.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session(
+            id TEXT PRIMARY KEY, title TEXT, directory TEXT, parent_id TEXT,
+            time_created INTEGER, time_updated INTEGER, time_archived INTEGER, model TEXT
+         );
+         CREATE TABLE message(
+            id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT
+         );",
+    )
+    .unwrap();
+    let transaction = db.transaction().unwrap();
+    let mut activity = BTreeMap::new();
+    for index in 0..2_000 {
+        let id = format!("ses_{index:012}");
+        transaction
+            .execute(
+                "INSERT INTO session VALUES(?1,?2,'/project',NULL,1,?3,NULL,NULL)",
+                params![id, format!("thread-{index}"), index as i64 + 1],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO message VALUES(?1,?2,?3,?4)",
+                params![
+                    format!("msg-{index}"),
+                    id,
+                    index as i64 + 1,
+                    serde_json::json!({"role":"assistant","time":{"completed":true}}).to_string()
+                ],
+            )
+            .unwrap();
+        activity.insert(id, 0.0);
+    }
+    transaction.commit().unwrap();
+    drop(db);
+
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let records = providers.reconcile_records(Provider::Opencode, &activity);
+    assert_eq!(records.len(), 2_000);
+    assert!(
+        records
+            .iter()
+            .all(|candidate| candidate.lifecycle_status == Some(Status::Ready))
+    );
+}
+
+#[test]
+fn claude_reconciliation_defers_changed_titles_beyond_its_cycle_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let transcripts = paths.claude_home.join("projects/p");
+    fs::create_dir_all(&transcripts).unwrap();
+    let mut activity = BTreeMap::new();
+    for index in 0..2_000 {
+        let id = format!("00000000-0000-4000-8000-{index:012}");
+        fs::write(
+            transcripts.join(format!("{id}.jsonl")),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "sessionId":id,"isSidechain":false,"entrypoint":"cli",
+                    "type":"custom-title","customTitle":format!("thread-{index}")
+                })
+            ),
+        )
+        .unwrap();
+        activity.insert(id, 0.0);
+    }
+
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let records = providers.reconcile_records(Provider::Claude, &activity);
+    assert_eq!(records.len(), 2_000);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|candidate| candidate.name.is_some() && candidate.updated_at > 0.0)
+            .count(),
+        16
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|candidate| candidate.updated_at == 0.0)
+            .count(),
+        2_000 - 16
+    );
 }

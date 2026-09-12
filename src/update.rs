@@ -26,7 +26,8 @@ pub const MANIFEST_SCHEMA: u32 = 2;
 pub const NATIVE_MANIFEST_FILE: &str = "pika-native-release.json";
 pub const ROOT_MARKER: &str = "pikamux-installer-v1\n";
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
-pub const MAX_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
+pub const MAX_ARTIFACT_BYTES: u64 = 20 * 1024 * 1024;
+pub const MAX_EXECUTABLE_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_RELEASE_LIST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CANDIDATE_OUTPUT_BYTES: usize = 1024 * 1024;
 const CANDIDATE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -297,6 +298,7 @@ pub enum UpdateDisposition {
     AlreadyCurrent,
     Available,
     Installed,
+    RolledBack,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -438,6 +440,10 @@ impl UpdateOutcome {
             ),
             UpdateDisposition::Installed => format!(
                 "Updated Pika {} → {}. Reopen the board when convenient; running agents were not restarted.",
+                self.previous_version, self.version
+            ),
+            UpdateDisposition::RolledBack => format!(
+                "Rolled Pika back {} → {}. Reopen the board when convenient; running agents were not restarted.",
                 self.previous_version, self.version
             ),
         }
@@ -681,6 +687,147 @@ pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
     })
 }
 
+/// Atomically activate an already retained, fully revalidated native release.
+/// With no version, the newest validated release older than the current one is
+/// selected. Rollback never downloads, extracts, or guesses from directory
+/// names; the immutable receipt, bundle, checksum, and executable are proven
+/// again while the installation lock is held.
+#[cfg(unix)]
+pub fn rollback_managed(executable: &Path, requested: Option<&str>) -> Result<UpdateOutcome> {
+    if let Some(version) = requested {
+        parse_version(version)?;
+    }
+    let managed = discover_managed_install(executable)?;
+    let target = native_target()?;
+    let lock_path = managed.root.join(".install.lock");
+    reject_symlink(&lock_path)?;
+    let lock = open_lock(&lock_path)?;
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            UpdateError::Busy
+        } else {
+            UpdateError::Io(error)
+        }
+    })?;
+
+    initialize_or_validate_root(&managed.root, true)?;
+    let releases = managed.root.join("releases");
+    let current = managed.root.join("current");
+    validate_current(&current, &releases)?;
+    if current.canonicalize()? != managed.release_dir {
+        return Err(UpdateError::Safety(
+            "active release changed while rollback was starting; retry explicitly".into(),
+        ));
+    }
+    validate_launcher(&managed.bin_dir.join("pika"), &current.join("bin/pika"))?;
+
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&releases)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_dir() || path == managed.release_dir {
+            continue;
+        }
+        let Ok((version, release)) =
+            validate_retained_release(&path, &managed.root, &managed.bin_dir, target)
+        else {
+            continue;
+        };
+        if compare_versions(&version, &managed.version)? != Ordering::Less {
+            continue;
+        }
+        if requested.is_none_or(|wanted| wanted == version) {
+            candidates.push((parse_version(&version)?, version, release));
+        }
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    let Some((_, version, release_dir)) = candidates.pop() else {
+        let detail = requested.map_or_else(
+            || "no prior validated native release is retained".to_owned(),
+            |version| format!("retained release {version} is absent or failed validation"),
+        );
+        return Err(UpdateError::Safety(format!("{detail}; nothing activated")));
+    };
+    atomic_symlink(&release_dir, &current)?;
+    validate_launcher(&managed.bin_dir.join("pika"), &current.join("bin/pika"))?;
+    Ok(UpdateOutcome {
+        disposition: UpdateDisposition::RolledBack,
+        previous_version: managed.version,
+        version,
+        launcher: managed.bin_dir.join("pika"),
+    })
+}
+
+#[cfg(not(unix))]
+pub fn rollback_managed(_executable: &Path, _requested: Option<&str>) -> Result<UpdateOutcome> {
+    Err(UpdateError::UnsupportedTarget(
+        "managed native rollback is not implemented on this platform".into(),
+    ))
+}
+
+#[cfg(unix)]
+fn validate_retained_release(
+    release_dir: &Path,
+    root: &Path,
+    bin_dir: &Path,
+    target: &str,
+) -> Result<(String, PathBuf)> {
+    let canonical = release_dir.canonicalize()?;
+    if canonical.parent() != Some(root.join("releases").canonicalize()?.as_path()) {
+        return Err(UpdateError::Safety(
+            "retained release escapes the managed release directory".into(),
+        ));
+    }
+    let receipt_path = canonical.join(".pika-install.json");
+    let receipt = read_receipt(&receipt_path)?;
+    if receipt.schema != MANIFEST_SCHEMA
+        || receipt.kind != "native"
+        || receipt.root != root
+        || receipt.bin_dir != bin_dir
+        || receipt.target != target
+    {
+        return Err(UpdateError::Safety(
+            "retained release receipt does not own this installation".into(),
+        ));
+    }
+    let bundle = canonical.join("bundle");
+    let manifest = read_manifest_file(&bundle.join(NATIVE_MANIFEST_FILE))?;
+    if manifest.version != receipt.version {
+        return Err(UpdateError::Safety(
+            "retained release manifest and receipt differ".into(),
+        ));
+    }
+    let artifact = manifest.artifact_for(target)?;
+    if artifact.file != receipt.artifact || artifact.sha256 != receipt.sha256 {
+        return Err(UpdateError::Safety(
+            "retained release artifact and receipt differ".into(),
+        ));
+    }
+    validate_existing_release(
+        &canonical,
+        InstallRequest {
+            manifest: &manifest,
+            target,
+            artifact: &bundle.join(&artifact.file),
+            candidate: &canonical.join("bin/pika"),
+            root,
+            bin_dir,
+        },
+        artifact,
+    )?;
+    let scratch = ScratchDirectory::new("pika-rollback")?;
+    extract_candidate(&bundle.join(&artifact.file), target, &scratch.path)?;
+    let archived_candidate = scratch.path.join("pika");
+    validate_candidate(&archived_candidate, &receipt.version)?;
+    if sha256_file(&archived_candidate)? != sha256_file(&canonical.join("bin/pika"))? {
+        return Err(UpdateError::Safety(
+            "retained executable differs from its verified archive".into(),
+        ));
+    }
+    Ok((receipt.version, canonical))
+}
+
 fn metadata_update_outcome(
     managed: &ManagedInstallation,
     manifest: &ReleaseManifest,
@@ -913,6 +1060,10 @@ fn extract_candidate(archive: &Path, target: &str, destination: &Path) -> Result
     if target == "x86_64-pc-windows-msvc" {
         return Err(UpdateError::UnsupportedTarget(target.into()));
     }
+    // Prove the only payload is bounded before any filesystem extraction.
+    // This reader closes at the first byte over the limit and the owned child
+    // group is then reaped, so a high-ratio archive cannot fill the disk.
+    validate_archive_expanded_size(archive, MAX_EXECUTABLE_BYTES as usize)?;
     let mut command = Command::new("tar");
     command.args(["-tzf"]).arg(archive);
     let listing = run_command_bounded(
@@ -950,7 +1101,6 @@ fn extract_candidate(archive: &Path, target: &str, destination: &Path) -> Result
             "pika is not a regular archive member".into(),
         ));
     }
-    validate_archive_expanded_size(archive, MAX_ARTIFACT_BYTES as usize)?;
     let mut command = Command::new("tar");
     command
         .args(["-xzf"])
@@ -968,7 +1118,7 @@ fn extract_candidate(archive: &Path, target: &str, destination: &Path) -> Result
     let candidate_path = destination.join("pika");
     let candidate = checked_regular_file(&candidate_path)?;
     let metadata = fs::metadata(candidate)?;
-    if metadata.len() == 0 || metadata.len() > MAX_ARTIFACT_BYTES {
+    if metadata.len() == 0 || metadata.len() > MAX_EXECUTABLE_BYTES {
         return Err(UpdateError::Candidate(
             "native executable has an invalid size".into(),
         ));

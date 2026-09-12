@@ -501,9 +501,13 @@ mod platform {
             .checked_mul(1_000_000)
             .and_then(|value| value.checked_add(info.pbi_start_tvusec))
             .ok_or_else(|| "invalid process start time".to_owned())?;
-        let argv = match process_arguments(pid32) {
-            Some(argv) => argv,
-            None => match pidinfo::<BSDInfo>(pid32, 0) {
+        let mut argv = None;
+        for attempt in 0..3 {
+            if let Some(arguments) = process_arguments(pid32) {
+                argv = Some(arguments);
+                break;
+            }
+            match pidinfo::<BSDInfo>(pid32, 0) {
                 Err(error) if process_info_error_is_missing(&error) => return Ok(None),
                 Err(_) if !process_exists(pid32) => return Ok(None),
                 Err(error) => {
@@ -526,9 +530,11 @@ mod platform {
                 {
                     return Ok(None);
                 }
-                Ok(_) => return Err("cannot read process command line".into()),
-            },
-        };
+                Ok(_) if attempt < 2 => std::thread::sleep(std::time::Duration::from_millis(2)),
+                Ok(_) => return Err("cannot read process command line after bounded retry".into()),
+            }
+        }
+        let argv = argv.ok_or_else(|| "cannot read process command line".to_owned())?;
         // Re-read after argv so exit/reuse during observation fails closed.
         let verified = match pidinfo::<BSDInfo>(pid32, 0) {
             Ok(info) => info,
