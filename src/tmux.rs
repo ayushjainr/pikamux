@@ -10,9 +10,7 @@ use std::{
     io::Read,
     process::{Command, Output, Stdio},
     sync::{
-        Arc,
-        atomic::{AtomicI32, Ordering},
-        mpsc,
+        Arc, Mutex, mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -255,6 +253,30 @@ impl Tmux {
                 line.split_once('\t').is_some_and(|(pid, pane)| {
                     pid.parse::<i32>() == Ok(client_pid) && pane == pane_id
                 })
+            })
+    }
+
+    fn attached_client_name(&self, client_pid: i32, pane_id: &str) -> Option<String> {
+        let format = format!("#{{client_name}}{SEPARATOR}#{{client_pid}}{SEPARATOR}#{{pane_id}}");
+        let output = self.output(["list-clients", "-F", &format], false).ok()?;
+        output
+            .status
+            .success()
+            .then_some(())
+            .and_then(|_| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .find_map(|line| {
+                        let mut fields = line.split(SEPARATOR);
+                        let client = fields.next()?;
+                        let pid = fields.next()?;
+                        let pane = fields.next()?;
+                        (fields.next().is_none()
+                            && !client.is_empty()
+                            && pid.parse::<i32>() == Ok(client_pid)
+                            && pane == pane_id)
+                            .then(|| client.to_owned())
+                    })
             })
     }
 
@@ -562,54 +584,46 @@ impl Tmux {
             }
             Ok(status.code().unwrap_or(1))
         } else {
-            let attached_pid = Arc::new(AtomicI32::new(0));
-            let proof_pid = Arc::clone(&attached_pid);
-            let receipt_pid = Arc::clone(&attached_pid);
+            let attached_client = Arc::new(Mutex::new(None::<String>));
+            let proof_client = Arc::clone(&attached_client);
+            let receipt_client = Arc::clone(&attached_client);
             terminal::run_pty_bridge_with_handoff(
                 &argv,
                 None,
                 true,
                 |client_pid| {
-                    let proven = self.client_is_attached_to_pane(client_pid, &pane.pane_id);
-                    if proven {
-                        proof_pid.store(client_pid, Ordering::Relaxed);
+                    let client = self.attached_client_name(client_pid, &pane.pane_id);
+                    if let Some(client) = client {
+                        *proof_client.lock().expect("tmux client proof poisoned") = Some(client);
+                        true
+                    } else {
+                        false
                     }
-                    proven
                 },
                 || {
                     if let Some(receipt) = on_started()? {
-                        let client_pid = receipt_pid.load(Ordering::Relaxed);
-                        if client_pid > 0 {
-                            self.display_to_client_pid(client_pid, &receipt);
+                        if let Some(client) = receipt_client
+                            .lock()
+                            .expect("tmux receipt target poisoned")
+                            .as_deref()
+                        {
+                            let _ = self.output(
+                                [
+                                    "display-message",
+                                    "-c",
+                                    client,
+                                    "-d",
+                                    "3000",
+                                    "-l",
+                                    &receipt,
+                                ],
+                                false,
+                            );
                         }
                     }
                     Ok(())
                 },
             )
-        }
-    }
-
-    fn display_to_client_pid(&self, client_pid: i32, message: &str) {
-        let Ok(output) = self.output(
-            ["list-clients", "-F", "#{client_name}\t#{client_pid}"],
-            false,
-        ) else {
-            return;
-        };
-        if !output.status.success() {
-            return;
-        }
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let Some((client, pid)) = line.split_once('\t') else {
-                continue;
-            };
-            if pid.parse::<i32>() == Ok(client_pid) && !client.is_empty() {
-                let _ = self.output(
-                    ["display-message", "-c", client, "-d", "3000", "-l", message],
-                    false,
-                );
-                return;
-            }
         }
     }
 
@@ -1542,7 +1556,7 @@ mod tests {
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {trace}\ncase \"$*\" in\n  *'list-clients -F #{{client_pid}}'*) test -f {pid} && printf '%s\\t%%1\\n' \"$(cat {pid})\"; exit 0;;\n  *'list-clients -F #{{client_name}}'*) test -f {pid} && printf 'other\\t999\\ninvoking-client\\t%s\\n' \"$(cat {pid})\"; exit 0;;\n  *'display-message -c invoking-client -d 3000 -l exact receipt'*) test -f {proof} || printf '%s\\n' BEFORE_PROOF >> {trace}; touch {release}; exit 0;;\n  *attach-session*) printf '%s' \"$$\" > {pid}; n=0; while test ! -f {release} && test \"$n\" -lt 200; do n=$((n + 1)); sleep 0.01; done; test -f {release}; exit;;\nesac\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {trace}\ncase \"$*\" in\n  *'list-clients -F #{{client_name}}'*) test -f {pid} && printf 'other\\037999\\037%%2\\ninvoking-client\\037%s\\037%%1\\n' \"$(cat {pid})\"; exit 0;;\n  *'list-clients -F #{{client_pid}}'*) test -f {pid} && printf '%s\\t%%1\\n' \"$(cat {pid})\"; exit 0;;\n  *'display-message -c invoking-client -d 3000 -l exact receipt'*) test -f {proof} || printf '%s\\n' BEFORE_PROOF >> {trace}; touch {release}; exit 0;;\n  *attach-session*) printf '%s' \"$$\" > {pid}; n=0; while test ! -f {release} && test \"$n\" -lt 200; do n=$((n + 1)); sleep 0.01; done; test -f {release}; exit;;\nesac\nexit 0\n",
                 trace = shell_words::quote(&trace.to_string_lossy()),
                 pid = shell_words::quote(&pid_file.to_string_lossy()),
                 release = shell_words::quote(&release.to_string_lossy()),
