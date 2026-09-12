@@ -412,12 +412,13 @@ fn run_loop(
             dirty = false;
         }
         // Terminal input wakes poll immediately. When no consultation is
-        // animating, a 500 ms ceiling keeps store-backed lifecycle changes
-        // visible within one second while avoiding ten idle wakeups per second.
+        // animating, the one-second ceiling keeps store-backed lifecycle
+        // changes within the product's one-second visibility contract without
+        // waking once between otherwise scheduled clock paints.
         let input_wait = if animated {
             Duration::from_millis(100)
         } else {
-            Duration::from_millis(500)
+            Duration::from_secs(1)
         };
         if !event::poll(input_wait)? {
             continue;
