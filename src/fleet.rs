@@ -295,22 +295,32 @@ pub fn next_remote_node<'a>(
     timestamp: f64,
     manual: bool,
 ) -> Option<&'a FleetNode> {
+    let attempt_order = |node: &FleetNode| {
+        if node.last_attempt_at > timestamp {
+            0
+        } else {
+            node.last_attempt_at.to_bits()
+        }
+    };
     nodes
         .iter()
         .filter(|node| {
             manual
+                // Recover legacy remote-clock entries and local clock rollback
+                // instead of deferring their next observation into the future.
+                || node.last_attempt_at > timestamp
                 || timestamp - node.last_attempt_at
                     >= if node.status == "ready" { 15.0 } else { 30.0 }
         })
         .min_by(|left, right| {
             let left_key = (
                 !(manual && selected_node_id == Some(&left.node_id)),
-                left.last_attempt_at.to_bits(),
+                attempt_order(left),
                 &left.node_id,
             );
             let right_key = (
                 !(manual && selected_node_id == Some(&right.node_id)),
-                right.last_attempt_at.to_bits(),
+                attempt_order(right),
                 &right.node_id,
             );
             left_key.cmp(&right_key)
@@ -1516,12 +1526,10 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
         let node = self.handshake(candidate, alias)?;
         let snapshot = validate_snapshot(&self.snapshot_request(&node)?, Some(&node.node_id))?;
         self.store.upsert_fleet_node(&node)?;
-        let captured = snapshot
-            .get("captured_at")
-            .and_then(Value::as_f64)
-            .expect("validated");
+        // Scheduling and cache age belong to the receiving machine's clock.
+        // Keep the remote capture timestamp only inside the source payload.
         self.store
-            .put_remote_snapshot(&node.node_id, &snapshot, captured)?;
+            .put_remote_snapshot(&node.node_id, &snapshot, now())?;
         self.store.get_fleet_node(&node.node_id)?.ok_or_else(|| {
             FleetError::new(
                 FleetErrorKind::Error,
@@ -1556,12 +1564,8 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 return Err(error);
             }
         };
-        let captured = snapshot
-            .get("captured_at")
-            .and_then(Value::as_f64)
-            .expect("validated");
         self.store
-            .put_remote_snapshot(&node.node_id, &snapshot, captured)?;
+            .put_remote_snapshot(&node.node_id, &snapshot, now())?;
         self.cached_sessions(Some(&node.node_id), false)
     }
 
@@ -1582,8 +1586,9 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
             let Ok(snapshot) = validate_snapshot(&stored.payload, Some(&node.node_id)) else {
                 continue;
             };
-            let stale =
-                node.status != "ready" || timestamp - stored.captured_at > REMOTE_STALE_SECONDS;
+            let stale = node.status != "ready"
+                || stored.captured_at > timestamp
+                || timestamp - stored.captured_at > REMOTE_STALE_SECONDS;
             let cards = keyed_values(snapshot.get("cards"));
             let profiles = keyed_values(snapshot.get("profiles"));
             let mut all = snapshot

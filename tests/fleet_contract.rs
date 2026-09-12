@@ -298,6 +298,72 @@ fn cached_remote_identity_includes_node_and_stale_cache_cannot_need_attention() 
 }
 
 #[test]
+fn remote_clock_skew_does_not_control_local_cache_age_or_polling() {
+    for offset in [-3600.0, 3600.0] {
+        let temp = TempDir::new().unwrap();
+        let store = initialized_store(&temp, "state.db");
+        let remote = Uuid::new_v4().to_string();
+        let mut source = snapshot(&remote, "thread");
+        source["captured_at"] = json!(now() + offset);
+        let remote_capture = source["captured_at"].clone();
+        let hello = json!({
+            "type":"hello", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+            "node_id":remote, "machine":"atlas", "package_version":"0.6.0",
+            "capabilities":CAPABILITIES,
+        });
+        let fake = FakeTransport::with(vec![Ok(hello), Ok(source.clone()), Ok(source)]);
+        let manager = FleetManager::new(&store, &fake);
+        let candidate = NodeCandidate {
+            alias: "atlas".into(),
+            ssh_target: "atlas".into(),
+            sources: vec!["explicit".into()],
+            hostname: None,
+            online: None,
+            os_name: None,
+        };
+        let before = now();
+        manager.add(&candidate, None).unwrap();
+        for refresh in [false, true] {
+            if refresh {
+                manager.refresh_node(&remote).unwrap();
+            }
+            let after = now();
+            let stored = store.get_remote_snapshot(&remote).unwrap().unwrap();
+            assert_eq!(stored.payload["captured_at"], remote_capture);
+            assert!((before..=after).contains(&stored.captured_at));
+            let node = store.get_fleet_node(&remote).unwrap().unwrap();
+            assert_eq!(node.last_attempt_at, stored.captured_at);
+            assert_eq!(node.last_seen, stored.captured_at);
+            assert!(!manager.cached_sessions(Some(&remote), false).unwrap()[0].stale);
+            let nodes = [node];
+            assert!(next_remote_node(&nodes, None, stored.captured_at + 14.0, false).is_none());
+            assert!(next_remote_node(&nodes, None, stored.captured_at + 16.0, false).is_some());
+        }
+        let payload = store.get_remote_snapshot(&remote).unwrap().unwrap().payload;
+        store
+            .put_remote_snapshot(&remote, &payload, now() - 46.0)
+            .unwrap();
+        assert!(manager.cached_sessions(Some(&remote), false).unwrap()[0].stale);
+        // Legacy versions stored a remote capture clock in these local fields.
+        // An existing future entry must be stale and immediately refreshable.
+        store
+            .put_remote_snapshot(&remote, &payload, now() + 3600.0)
+            .unwrap();
+        assert!(manager.cached_sessions(Some(&remote), false).unwrap()[0].stale);
+        let mut normal_due = node(&Uuid::new_v4().to_string(), "normal-due");
+        normal_due.last_attempt_at = now() - 60.0;
+        let nodes = [normal_due, store.get_fleet_node(&remote).unwrap().unwrap()];
+        assert_eq!(
+            next_remote_node(&nodes, None, now(), false)
+                .unwrap()
+                .node_id,
+            remote,
+            "legacy future entries must not starve behind continuously due nodes"
+        );
+    }
+}
+
+#[test]
 fn refresh_scheduler_is_bounded_oldest_first_and_manual_selection_only() {
     let mut selected = node(&Uuid::new_v4().to_string(), "selected");
     selected.last_attempt_at = 90.0;

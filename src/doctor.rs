@@ -22,9 +22,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -903,40 +901,15 @@ fn push_subject_check(
 }
 
 fn probe_provider(executable: &str, timeout: Duration) -> ProviderRuntime {
-    let mut child = match Command::new(executable)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return ProviderRuntime::default(),
-    };
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child.wait_with_output().ok();
-                let version = output.as_ref().and_then(|output| {
-                    let stdout = clean(&String::from_utf8_lossy(&output.stdout));
-                    let stderr = clean(&String::from_utf8_lossy(&output.stderr));
-                    (!stdout.is_empty())
-                        .then_some(stdout)
-                        .or_else(|| (!stderr.is_empty()).then_some(stderr))
-                });
-                return ProviderRuntime {
-                    available: status.success(),
-                    version,
-                };
-            }
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return ProviderRuntime::default();
+    match crate::consult::run_output_bounded(Path::new(executable), &["--version"], timeout) {
+        Ok(output) => {
+            let version = clean(&output);
+            ProviderRuntime {
+                available: true,
+                version: (!version.is_empty()).then_some(version),
             }
         }
+        Err(_) => ProviderRuntime::default(),
     }
 }
 
@@ -1005,4 +978,48 @@ fn now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+#[cfg(all(test, unix))]
+mod probe_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    #[test]
+    fn doctor_probe_deadline_includes_inherited_output_after_root_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("provider-fixture");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nsleep 30 &\nprintf '2.1.228\\n'\nexec /usr/bin/true\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = Instant::now();
+        let result = probe_provider(executable.to_str().unwrap(), Duration::from_millis(100));
+        assert!(
+            !result.available,
+            "an incomplete probe must not claim availability"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn doctor_probe_accepts_complete_success_and_rejects_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("provider-fixture");
+        for (body, available) in [
+            ("printf '2.1.228\\n'", true),
+            ("printf rejected >&2; exit 7", false),
+        ] {
+            fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let result = probe_provider(executable.to_str().unwrap(), Duration::from_secs(1));
+            assert_eq!(result.available, available);
+            if available {
+                assert_eq!(result.version.as_deref(), Some("2.1.228"));
+            }
+        }
+    }
 }

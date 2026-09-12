@@ -773,8 +773,16 @@ impl CodexSide {
             let ephemeral = thread
                 .and_then(|value| value.get("ephemeral"))
                 .and_then(Value::as_bool);
-            if id.is_none() || ephemeral != Some(true) {
-                bail!("Codex did not confirm an ephemeral fork; refusing to continue");
+            let child_uuid = id.and_then(|value| Uuid::parse_str(value).ok());
+            let parent_uuid = Uuid::parse_str(&side.parent_id).ok();
+            if child_uuid.is_none()
+                || child_uuid == parent_uuid
+                || id == Some(side.parent_id.as_str())
+                || ephemeral != Some(true)
+            {
+                bail!(
+                    "Codex did not confirm a valid, distinct ephemeral fork; refusing to continue"
+                );
             }
             let observed_model = result.get("model").and_then(Value::as_str);
             let observed_effort = result.get("reasoningEffort").and_then(Value::as_str);
@@ -1742,18 +1750,38 @@ pub(crate) fn terminate_child(child: &mut OwnedChild) -> Result<()> {
     }
     #[cfg(unix)]
     {
-        if let Some(exited) = owned_child_state(child)? {
+        if owned_child_state(child)?.is_some() {
             // SAFETY: callers create a fresh process group before spawn and do
             // not reap before this point. The waitable leader pins its PGID;
             // only this operation's group is signalled, including descendants
             // whose launcher has already exited.
-            if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH)
-                    && !exited_group_is_empty(child.id(), exited, &error)
-                {
-                    return Err(error).context("could not terminate provider side process group");
+            let retry_deadline = Instant::now() + Duration::from_millis(100);
+            loop {
+                if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0 {
+                    break;
                 }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH)
+                    || exited_group_is_empty(
+                        child.id(),
+                        owned_child_state(child)? == Some(true),
+                        &error,
+                    )
+                {
+                    break;
+                }
+                // Darwin may reject killpg while the last member is exiting
+                // but is not yet observable as a waitable zombie. Retain the
+                // leader (and therefore PGID ownership), and briefly retry;
+                // never suppress EPERM for a group with a live member.
+                if cfg!(target_os = "macos")
+                    && error.raw_os_error() == Some(libc::EPERM)
+                    && Instant::now() < retry_deadline
+                {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                return Err(error).context("could not terminate provider side process group");
             }
         }
     }
@@ -1796,7 +1824,7 @@ fn exited_group_is_empty(id: u32, exited: bool, error: &std::io::Error) -> bool 
         return count >= 0
             && count <= capacity
             && (count != 0 || std::io::Error::last_os_error().raw_os_error() == Some(0))
-            && count as usize % std::mem::size_of::<u32>() == 0
+            && (count as usize).is_multiple_of(std::mem::size_of::<u32>())
             && members[..count as usize / std::mem::size_of::<u32>()]
                 .iter()
                 .all(|member| *member == id);
@@ -1882,7 +1910,11 @@ fn owned_process_group(command: &mut Command) {
     let _ = command;
 }
 
-fn run_output_bounded(executable: &Path, args: &[&str], timeout: Duration) -> Result<String> {
+pub(crate) fn run_output_bounded(
+    executable: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String> {
     run_output_bounded_cancellable(executable, args, timeout, &CancellationToken::default())
 }
 

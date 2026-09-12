@@ -72,6 +72,13 @@ fn codex_fixture(root: &TempDir, mode: &str) -> (PathBuf, PathBuf) {
             r#"#!/bin/sh
 log={log}
 mode={mode}
+side_id=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+case "$mode" in
+  empty-child) side_id= ;;
+  invalid-child) side_id=not-a-uuid ;;
+  parent-child) side_id=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb ;;
+  parent-child-uppercase) side_id=BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB ;;
+esac
 printf 'ARGV:%s EPHEMERAL:%s\n' "$*" "$PIKA_EPHEMERAL" >> "$log"
 turn=0
 while IFS= read -r line; do
@@ -81,9 +88,9 @@ while IFS= read -r line; do
     *'"method":"initialize"'*) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
     *'"method":"thread/fork"'*)
       if [ "$mode" = mismatch ]; then
-        printf '{{"id":%s,"result":{{"thread":{{"id":"side-id","ephemeral":true}},"model":"gpt-5.6-sol","reasoningEffort":"high"}}}}\n' "$id"
+        printf '{{"id":%s,"result":{{"thread":{{"id":"%s","ephemeral":true}},"model":"gpt-5.6-sol","reasoningEffort":"high"}}}}\n' "$id" "$side_id"
       else
-        printf '{{"id":%s,"result":{{"thread":{{"id":"side-id","ephemeral":true}},"model":"gpt-5.6-sol","reasoningEffort":"medium"}}}}\n' "$id"
+        printf '{{"id":%s,"result":{{"thread":{{"id":"%s","ephemeral":true}},"model":"gpt-5.6-sol","reasoningEffort":"medium"}}}}\n' "$id" "$side_id"
       fi ;;
     *'"method":"turn/start"'*)
       turn=$((turn + 1))
@@ -97,7 +104,7 @@ while IFS= read -r line; do
       fi
       printf '{{"id":%s,"result":{{"turn":{{"id":"turn-%s"}}}}}}\n' "$id" "$turn"
       if [ "$mode" != timeout ]; then
-        printf '{{"method":"item/completed","params":{{"threadId":"side-id","turnId":"turn-%s","item":{{"type":"agentMessage","phase":"final_answer","text":"answer-%s"}}}}}}\n' "$turn" "$turn"
+        printf '{{"method":"item/completed","params":{{"threadId":"%s","turnId":"turn-%s","item":{{"type":"agentMessage","phase":"final_answer","text":"answer-%s"}}}}}}\n' "$side_id" "$turn" "$turn"
       fi ;;
   esac
 done
@@ -145,7 +152,10 @@ fn codex_uses_one_confirmed_ephemeral_child_for_multiple_turns() {
     options.timeout = Duration::from_secs(2);
     let mut side = Consultation::open(&target, options).unwrap();
     assert_eq!(side.parent_id(), "active-leaf");
-    assert_eq!(side.child_id(), Some("side-id"));
+    assert_eq!(
+        side.child_id(),
+        Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    );
     assert_eq!(side.ask("one").unwrap(), "answer-1");
     assert_eq!(side.ask("two").unwrap(), "answer-2");
     assert_eq!(side.receipt().answers_received, 2);
@@ -166,8 +176,37 @@ fn codex_uses_one_confirmed_ephemeral_child_for_multiple_turns() {
     assert!(log.contains("\"excludeTurns\":true"));
     assert!(log.contains("\"sandbox\":\"read-only\""));
     assert_eq!(log.matches("\"method\":\"turn/start\"").count(), 2);
-    assert_eq!(log.matches("\"threadId\":\"side-id\"").count(), 2);
+    assert_eq!(
+        log.matches("\"threadId\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\"")
+            .count(),
+        2
+    );
     assert_eq!(log.matches("\"model\":\"gpt-5.6-sol\"").count(), 3);
+}
+
+#[test]
+fn codex_rejects_invalid_or_parent_fork_identity_before_sending_question() {
+    for mode in [
+        "empty-child",
+        "invalid-child",
+        "parent-child",
+        "parent-child-uppercase",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (executable, log) = codex_fixture(&root, mode);
+        let mut target = session(Provider::Codex, "stable-workstream", root.path());
+        target.active_thread_id = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into());
+        let error = Consultation::open(&target, ConsultationOptions::new(executable))
+            .err()
+            .expect("fork identity must be rejected");
+        assert!(
+            error.to_string().contains("distinct ephemeral fork"),
+            "{mode}: {error}"
+        );
+        assert_eq!(error.receipt.delivery, Delivery::NotSent);
+        assert_eq!(error.receipt.cleanup, Cleanup::Complete);
+        assert!(!fs::read_to_string(log).unwrap().contains("turn/start"));
+    }
 }
 
 #[test]

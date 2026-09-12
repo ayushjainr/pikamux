@@ -6,6 +6,8 @@
 //! card per provider and weekly reset cycle before making a provider call.
 
 use crate::config::Config;
+#[cfg(unix)]
+use crate::consult::{CancellablePipe, CancellationToken, OwnedChild, terminate_child};
 use crate::consult::{Consultation, ConsultationOptions, ConsultationPolicy, consultation_policy};
 use crate::experts::{
     CardStatus, PublishInput, card_state, make_profile, require_local_source_available,
@@ -19,12 +21,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+#[cfg(any(unix, test))]
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+#[cfg(unix)]
+use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::sync::mpsc;
+#[cfg(unix)]
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const WEEK_MINUTES: f64 = 7.0 * 24.0 * 60.0;
@@ -713,92 +721,116 @@ fn parse_card(value: &str) -> Result<PublishInput> {
     })
 }
 
+#[cfg(unix)]
 fn codex_rate_limits(executable: &Path, timeout: Duration) -> Result<Value> {
-    let mut child = Command::new(executable)
+    let deadline = Instant::now() + timeout;
+    let mut command = Command::new(executable);
+    command
         .args(["app-server", "--stdio"])
+        .env("PIKA_EPHEMERAL", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    let mut child = OwnedChild::spawn(&mut command)
         .with_context(|| format!("cannot start {} account observer", executable.display()))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("Codex account observer has no stdin")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("Codex account observer has no stdout")?;
-    let (sender, receiver) = mpsc::channel();
-    let reader = thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            if sender.send(line).is_err() {
-                break;
+    let stop = CancellationToken::default();
+    let stdin = CancellablePipe::new(
+        child
+            .stdin
+            .take()
+            .context("Codex account observer has no stdin")?,
+        stop.clone(),
+    )?;
+    let stdout = CancellablePipe::new(
+        child
+            .stdout
+            .take()
+            .context("Codex account observer has no stdout")?,
+        stop.clone(),
+    )?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        let _ = sender.send(quota_protocol(stdin, stdout));
+    });
+    let result = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Err(anyhow::anyhow!("Codex quota observation timed out"));
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(result) => break result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(anyhow::anyhow!("Codex quota observer stopped"));
             }
         }
-    });
-    let result = (|| {
-        rpc_request(
-            &mut child,
-            &mut stdin,
-            &receiver,
-            1,
-            "initialize",
-            Some(json!({
-                "clientInfo": {"name":"pikamux","title":"Pika quota observer","version":crate::VERSION},
-                "capabilities":{"experimentalApi":true}
-            })),
-            timeout,
-        )?;
-        rpc_send(&mut stdin, &json!({"method":"initialized"}))?;
-        rpc_request(
-            &mut child,
-            &mut stdin,
-            &receiver,
-            2,
-            "account/rateLimits/read",
-            None,
-            timeout,
-        )
-    })();
-    terminate(&mut child);
-    drop(stdin);
-    let _ = reader.join();
+    };
+    // The deadline owns the pipes as well as the group. Even a foreign group
+    // retaining one descriptor cannot keep this worker alive after cancellation.
+    stop.cancel();
+    let cleanup = terminate_child(&mut child);
+    let joined = worker.join();
+    cleanup?;
+    joined.map_err(|_| anyhow::anyhow!("Codex quota worker failed"))?;
     result
 }
 
+#[cfg(not(unix))]
+fn codex_rate_limits(_executable: &Path, _timeout: Duration) -> Result<Value> {
+    bail!("Codex quota observation is unavailable on this client-only platform")
+}
+
+#[cfg(any(unix, test))]
+fn quota_protocol(mut stdin: impl Write, stdout: impl Read) -> Result<Value> {
+    let mut stdout = BufReader::new(stdout);
+    let mut received = 0;
+    rpc_request(
+        &mut stdin,
+        &mut stdout,
+        &mut received,
+        1,
+        "initialize",
+        json!({
+            "clientInfo": {"name":"pikamux","title":"Pika quota observer","version":crate::VERSION},
+            "capabilities":{"experimentalApi":true}
+        }),
+    )?;
+    rpc_send(&mut stdin, &json!({"method":"initialized"}))?;
+    rpc_request(
+        &mut stdin,
+        &mut stdout,
+        &mut received,
+        2,
+        "account/rateLimits/read",
+        Value::Null,
+    )
+}
+
+#[cfg(any(unix, test))]
 fn rpc_request(
-    child: &mut Child,
-    stdin: &mut ChildStdin,
-    receiver: &Receiver<std::io::Result<String>>,
+    stdin: &mut impl Write,
+    stdout: &mut impl BufRead,
+    received: &mut usize,
     id: i64,
     method: &str,
-    params: Option<Value>,
-    timeout: Duration,
+    params: Value,
 ) -> Result<Value> {
-    rpc_send(
-        stdin,
-        &json!({"method":method,"id":id,"params":params.unwrap_or(Value::Null)}),
-    )?;
-    let deadline = Instant::now() + timeout;
+    rpc_send(stdin, &json!({"method":method,"id":id,"params":params}))?;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!("{method} timed out");
+        const MAX_FRAME: usize = 64 * 1024;
+        const MAX_OUTPUT: usize = 1024 * 1024;
+        let mut line = Vec::new();
+        let size = (&mut *stdout)
+            .take((MAX_FRAME + 1) as u64)
+            .read_until(b'\n', &mut line)?;
+        *received = received.saturating_add(size);
+        if size == 0 {
+            bail!("{method} ended before returning a response");
         }
-        let line = match receiver.recv_timeout(remaining.min(Duration::from_millis(250))) {
-            Ok(line) => line?,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if child.try_wait()?.is_some() {
-                    bail!("{method} ended before returning a response");
-                }
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("{method} ended before returning a response")
-            }
-        };
-        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+        if size > MAX_FRAME || *received > MAX_OUTPUT || line.last() != Some(&b'\n') {
+            bail!("Codex quota response exceeded its frame/output limit or was incomplete");
+        }
+        let Ok(message) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
         if message.get("id").and_then(Value::as_i64) == Some(id) && message.get("method").is_none()
@@ -820,18 +852,12 @@ fn rpc_request(
     }
 }
 
-fn rpc_send(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
+#[cfg(any(unix, test))]
+fn rpc_send(stdin: &mut impl Write, value: &Value) -> Result<()> {
     serde_json::to_writer(&mut *stdin, value)?;
     stdin.write_all(b"\n")?;
     stdin.flush()?;
     Ok(())
-}
-
-fn terminate(child: &mut Child) {
-    if child.try_wait().ok().flatten().is_none() {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
 }
 
 fn number(value: &Value) -> Option<f64> {
@@ -1054,6 +1080,54 @@ mod tests {
         assert!(requests.contains("account/rateLimits/read"));
         assert!(!requests.contains("thread/start"));
         assert!(!requests.contains("turn/start"));
+    }
+
+    #[test]
+    fn quota_protocol_rejects_oversized_frame_and_notification_flood() {
+        let error = quota_protocol(Vec::new(), std::io::repeat(b'x')).unwrap_err();
+        assert!(error.to_string().contains("limit"));
+        let line = format!(
+            "{{\"method\":\"notice\",\"params\":\"{}\"}}\n",
+            "x".repeat(4096)
+        );
+        let mut output = std::io::Cursor::new(line.repeat(300));
+        let error = quota_protocol(Vec::new(), &mut output).unwrap_err();
+        assert!(error.to_string().contains("limit"));
+        assert!(output.position() <= 1024 * 1024 + 64 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quota_deadline_includes_inherited_stdout_after_root_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("codex-fake");
+        fs::write(&executable, "#!/bin/sh\nsleep 30 &\nexec /usr/bin/true\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = Instant::now();
+        assert!(codex_rate_limits(&executable, Duration::from_millis(100)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quota_pipe_worker_cancels_without_foreign_holder_eof() {
+        use std::os::unix::net::UnixStream;
+        let (reader, _holder) = UnixStream::pair().unwrap();
+        let stop = CancellationToken::default();
+        let pipe = CancellablePipe::new(reader, stop.clone()).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _ = sender.send(quota_protocol(Vec::new(), pipe));
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
+        stop.cancel();
+        assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_err()
+        );
+        worker.join().unwrap();
     }
 
     #[test]
