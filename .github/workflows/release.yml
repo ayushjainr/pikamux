@@ -169,6 +169,11 @@ jobs:
         with:
           name: release-${{ github.ref_name }}
           path: release
+      - name: Block unsigned macOS publication
+        shell: bash
+        run: |
+          echo 'Release blocked: supply signed and notarized macOS artifacts and add clean-host verification before enabling publication.' >&2
+          exit 1
       - name: Attest release provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:

@@ -48,6 +48,10 @@ pub fn install(target: &Path) -> Result<SkillInstallReceipt> {
     reject_symlink_components(&destination)?;
     fs::create_dir_all(target)
         .with_context(|| format!("cannot create skill directory {}", target.display()))?;
+    sync_directory(target)?;
+    if let Some(parent) = target.parent() {
+        sync_directory(parent)?;
+    }
     reject_symlink_components(&destination)?;
     if fs::read_to_string(&destination).ok().as_deref() == Some(AGENT_CONVO_SKILL) {
         return Ok(SkillInstallReceipt {
@@ -61,6 +65,8 @@ pub fn install(target: &Path) -> Result<SkillInstallReceipt> {
         let path = target.join(format!("SKILL-{}.pika-backup", Uuid::new_v4()));
         fs::copy(&destination, &path)
             .with_context(|| format!("cannot back up existing skill {}", destination.display()))?;
+        fs::File::open(&path)?.sync_all()?;
+        sync_directory(target)?;
         Some(path)
     } else {
         None
@@ -78,11 +84,25 @@ pub fn install(target: &Path) -> Result<SkillInstallReceipt> {
     file.sync_all()?;
     reject_symlink_components(&destination)?;
     fs::rename(&temporary, &destination)?;
+    sync_directory(target)?;
     Ok(SkillInstallReceipt {
         path: destination,
         changed: true,
         backup,
     })
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)
+            .with_context(|| format!("cannot open skill directory {}", path.display()))?
+            .sync_all()
+            .with_context(|| format!("cannot sync skill directory {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn reject_symlink_components(path: &Path) -> Result<()> {

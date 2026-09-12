@@ -76,13 +76,28 @@ fn curl_free_installer_path(root: &Path) -> PathBuf {
 fn fixture(temp: &Path, version: &str, payload: &[u8]) -> (ReleaseManifest, PathBuf, PathBuf) {
     let target = native_target().unwrap();
     let archive = temp.join(artifact_name(version, target).unwrap());
-    fs::write(&archive, payload).unwrap();
-    let binary = temp.join(format!("candidate-{version}"));
+    let candidate_dir = temp.join(format!("candidate-{version}"));
+    fs::create_dir(&candidate_dir).unwrap();
+    let binary = candidate_dir.join("pika");
     candidate(&binary, version, true);
+    let mut license = fs::read(candidate_dir.join("LICENSE")).unwrap();
+    license.extend_from_slice(b"\nFixture identity: ");
+    license.extend_from_slice(payload);
+    license.push(b'\n');
+    fs::write(candidate_dir.join("LICENSE"), license).unwrap();
+    let status = Command::new("python3")
+        .arg("scripts/archive-release.py")
+        .arg("tar.gz")
+        .arg(&candidate_dir)
+        .arg(&binary)
+        .arg(&archive)
+        .status()
+        .unwrap();
+    assert!(status.success());
     let artifact = ReleaseArtifact {
         file: archive.file_name().unwrap().to_str().unwrap().into(),
         sha256: sha256_file(&archive).unwrap(),
-        bytes: payload.len() as u64,
+        bytes: fs::metadata(&archive).unwrap().len(),
     };
     let manifest = ReleaseManifest {
         schema: 2,
@@ -1606,7 +1621,7 @@ fn release_verifier_bounds_archive_expansion_before_parsing_tar_members() {
 
     fs::create_dir(&payload).unwrap();
     let candidate = payload.join("pika");
-    fs::write(&candidate, vec![0_u8; 54 * 1024 * 1024]).unwrap();
+    fs::write(&candidate, vec![0_u8; 56 * 1024 * 1024]).unwrap();
     fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
     copy_release_notices(&payload);
     let target = "aarch64-unknown-linux-musl";

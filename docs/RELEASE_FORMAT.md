@@ -27,7 +27,11 @@ The updater downloads only constructed URLs beneath the Pika GitHub release
 path. API-provided URLs and manifest-provided paths are ignored. Manifests,
 release listings and artifacts have hard size bounds. Target, filename, declared
 size, sidecar checksum and manifest checksum must all agree before extraction.
-The POSIX archive must contain exactly one regular file named `pika`.
+Every native archive contains exactly the executable, `LICENSE`, and
+`THIRD_PARTY.md`; all are regular, bounded files. Publication verification
+requires both notices to match the audited source exactly. Installation and
+rollback bind retained notices byte-for-byte to their own checksum-verified
+archive, so an older valid release survives later dependency-notice changes.
 
 ## One-time Python bridge
 
@@ -59,7 +63,7 @@ pika-version
 pika-native-release.json
 pika-release.json                         # schema 1, stable/bridge releases only
 pikamux-V-py3-none-any.whl                # stable/bridge releases only
-pikamux-V-aarch64-apple-darwin.tar.gz
+pikamux-V-aarch64-apple-darwin.tar.gz     # pika + LICENSE + THIRD_PARTY.md
 pikamux-V-x86_64-apple-darwin.tar.gz
 pikamux-V-aarch64-unknown-linux-musl.tar.gz
 pikamux-V-x86_64-unknown-linux-musl.tar.gz
@@ -69,8 +73,9 @@ LICENSE
 THIRD_PARTY.md
 ```
 
-GitHub supplies source archives for the tag. The Windows ZIP contains only the
-experimental client/bridge executable; it is not a native tmux host.
+GitHub supplies source archives for the tag. The Windows ZIP contains the
+experimental client/bridge executable and the same license notices; it is not a
+native tmux host.
 
 Native schema 2 uses the distinct `pika-native-release.json` name so a stable
 tag may also carry the schema-1 manifest that the frozen updater requires.
@@ -99,8 +104,10 @@ are accepted only for the transition.
 
 `scripts/package-release.sh` refuses an existing output directory or duplicate
 target mappings, verifies each runnable binary's version/help/embedded skill,
-creates fresh archives, and writes checksums over the final bytes. The verifier
-independently rejects duplicate JSON keys.
+creates archives with fixed ordering, ownership, modes, and timestamps, and
+writes checksums over the final bytes. Repacking identical inputs therefore
+reproduces identical native archive bytes. The verifier independently rejects
+duplicate JSON keys.
 Cross-target assembly may set the internal
 `PIKA_CROSS_PACKAGE=1` flag only after every matrix job has run those checks on
 the matching native runner. `scripts/generate-third-party.sh` deterministically
@@ -126,6 +133,8 @@ The native layout stays compatible with the Python installer:
   .install.lock
   current -> releases/V-TARGET-SHA
   releases/V-TARGET-SHA/bin/pika
+  releases/V-TARGET-SHA/LICENSE
+  releases/V-TARGET-SHA/THIRD_PARTY.md
   releases/V-TARGET-SHA/.pika-install.json
   releases/V-TARGET-SHA/bundle/        # exact verified release for explicit fleet use
 ```
@@ -156,19 +165,20 @@ test suite, a locked release build and diagnostic startup measurements on macOS
 arm64 and Linux x86_64.
 
 `.github/workflows/release.yml` builds macOS and musl Linux binaries on matching
-arm64/x86_64 runners, verifies each natively, assembles one manifest and checksum
-set, then pauses at the protected `release` environment. Publication uploads the
-exact assembled artifact only after that environment's owner approval. Every
-third-party workflow action is pinned to an immutable commit. GitHub also issues
-build-provenance attestations for the release payload before publication.
-Configure the GitHub `release` environment with required reviewers before
-creating a tag.
+arm64/x86_64 runners, verifies each natively, and assembles one manifest and
+checksum set. Its publication job is intentionally blocked while the assembled
+macOS executables are unsigned and unnotarized. Once a credential-backed signing
+and notarization stage supplies the exact verified artifacts, publication must
+still pause at the protected `release` environment for owner approval. Every
+third-party workflow action is pinned to an immutable commit; the eventual
+publication path must issue build-provenance attestations over the signed release
+payload.
 
-Before approval, inspect `SHA256SUMS`, CI results, artifact sizes, benchmark
-evidence and platform smoke results. Checksums detect transfer mismatch; they are
-not an independent trust anchor if the release account is compromised. macOS
-signing/notarization and clean-host runtime tests remain publication gates, not
-claims made by cross-compilation.
+Before enabling or approving publication, add and inspect macOS signing and
+notarization evidence, clean-host results, `SHA256SUMS`, CI results, artifact
+sizes, benchmark evidence, and platform smoke results. Checksums detect transfer
+mismatch; they are not an independent trust anchor if the release account is
+compromised.
 
 ## Deliberately separate
 

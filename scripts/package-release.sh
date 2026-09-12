@@ -21,7 +21,7 @@ shift 2
     fail 'Invalid release version.'
 [ ! -e "$pika_output" ] || fail 'Output path already exists; release bytes were not replaced.'
 
-for pika_command in tar gzip mktemp find sort cut wc; do
+for pika_command in mktemp find sort cut wc python3; do
     command -v "$pika_command" >/dev/null 2>&1 || fail "Required command missing: $pika_command."
 done
 if command -v sha256sum >/dev/null 2>&1; then
@@ -75,20 +75,15 @@ for pika_pair in "$@"; do
         "$pika_binary" skill show >/dev/null
     fi
 
-    pika_payload="$pika_stage/payload-$pika_target"
-    mkdir "$pika_payload"
     if [ "$pika_target" = x86_64-pc-windows-msvc ]; then
-        command -v zip >/dev/null 2>&1 || fail 'Required command missing: zip.'
-        cp "$pika_binary" "$pika_payload/pika.exe"
         pika_archive="pikamux-$pika_version-$pika_target.zip"
-        (cd "$pika_payload" && zip -X -q "$pika_stage/$pika_archive" pika.exe)
+        pika_archive_format=zip
     else
-        cp "$pika_binary" "$pika_payload/pika"
-        chmod 755 "$pika_payload/pika"
         pika_archive="pikamux-$pika_version-$pika_target.tar.gz"
-        COPYFILE_DISABLE=1 LC_ALL=C tar -czf "$pika_stage/$pika_archive" -C "$pika_payload" pika
+        pika_archive_format=tar.gz
     fi
-    rm -rf -- "$pika_payload"
+    python3 "$pika_script_dir/archive-release.py" "$pika_archive_format" \
+        "$pika_repo_dir" "$pika_binary" "$pika_stage/$pika_archive"
     pika_sha=$(digest "$pika_stage/$pika_archive")
     pika_bytes=$(wc -c < "$pika_stage/$pika_archive" | tr -d ' ')
     [ "$pika_bytes" -le 20971520 ] || fail "Artifact exceeds the 20 MiB compressed budget: $pika_target"

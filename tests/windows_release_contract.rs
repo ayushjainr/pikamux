@@ -41,7 +41,7 @@ fn release_packager_emits_a_single_executable_windows_client_zip() {
     assert!(listing.status.success());
     assert_eq!(
         String::from_utf8(listing.stdout).unwrap().trim(),
-        "pika.exe"
+        "LICENSE\nTHIRD_PARTY.md\npika.exe"
     );
 }
 
@@ -81,6 +81,6 @@ fn release_packager_keeps_relative_windows_output_rooted_at_the_caller() {
     assert!(listing.status.success());
     assert_eq!(
         String::from_utf8(listing.stdout).unwrap().trim(),
-        "pika.exe"
+        "LICENSE\nTHIRD_PARTY.md\npika.exe"
     );
 }

@@ -83,6 +83,8 @@ def main(argv: list[str]) -> int:
         ).read_bytes(),
         "pikamux_bridge/native/install.sh": install,
         "pikamux_bridge/native/pika-version": f"{native_version}\n".encode(),
+        "pikamux_bridge/native/LICENSE": (repository / "LICENSE").read_bytes(),
+        "pikamux_bridge/native/THIRD_PARTY.md": (repository / "THIRD_PARTY.md").read_bytes(),
     }
     for target, path in sorted(archives.items()):
         data = path.read_bytes()
@@ -101,11 +103,14 @@ def main(argv: list[str]) -> int:
     ).encode()
 
     dist = f"pikamux-{bridge_version}.dist-info"
+    files[f"{dist}/LICENSE"] = (repository / "LICENSE").read_bytes()
+    files[f"{dist}/THIRD_PARTY.md"] = (repository / "THIRD_PARTY.md").read_bytes()
     files[f"{dist}/METADATA"] = (
         "Metadata-Version: 2.1\n"
         "Name: pikamux\n"
         f"Version: {bridge_version}\n"
         "Summary: One-use Pika native transition bridge\n"
+        "License: MIT\n"
         "Requires-Python: >=3.9\n\n"
     ).encode()
     files[f"{dist}/WHEEL"] = (

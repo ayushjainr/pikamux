@@ -32,6 +32,7 @@ pub const ROOT_MARKER: &str = "pikamux-installer-v1\n";
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 pub const MAX_ARTIFACT_BYTES: u64 = 20 * 1024 * 1024;
 pub const MAX_EXECUTABLE_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_NOTICE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_RELEASE_LIST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CANDIDATE_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_RETAINED_RELEASE_SCAN: usize = 256;
@@ -795,27 +796,24 @@ fn validate_retained_release(
             "retained release artifact and receipt differ".into(),
         ));
     }
+    let scratch = ScratchDirectory::new("pika-rollback")?;
+    extract_candidate(&bundle.join(&artifact.file), target, &scratch.path)?;
+    let archived_candidate = scratch.path.join("pika");
+    let notices = read_sibling_notices(&archived_candidate)?;
     validate_existing_release(
         &canonical,
         InstallRequest {
             manifest: &manifest,
             target,
             artifact: &bundle.join(&artifact.file),
-            candidate: &canonical.join("bin/pika"),
+            candidate: &archived_candidate,
             root,
             bin_dir,
         },
         artifact,
+        &notices,
     )?;
-    let scratch = ScratchDirectory::new("pika-rollback")?;
-    extract_candidate(&bundle.join(&artifact.file), target, &scratch.path)?;
-    let archived_candidate = scratch.path.join("pika");
     validate_candidate(&archived_candidate, &receipt.version)?;
-    if sha256_file(&archived_candidate)? != sha256_file(&canonical.join("bin/pika"))? {
-        return Err(UpdateError::Safety(
-            "retained executable differs from its verified archive".into(),
-        ));
-    }
     Ok((receipt.version, canonical))
 }
 
@@ -947,6 +945,13 @@ pub fn prepare_remote_install_bundle(
             "remote bundle installer does not match this Pika release".into(),
         ));
     }
+    // The archive hash in the manifest is the trust anchor. Compare the
+    // transport siblings with that exact archive rather than this build's
+    // notices, so a retained older release remains installable after its
+    // dependency notices legitimately change in a newer Pika version.
+    let notices = read_archive_notices(&artifact_path, target)?;
+    validate_notice_file(&bundle.join("LICENSE"), &notices.license)?;
+    validate_notice_file(&bundle.join("THIRD_PARTY.md"), &notices.third_party)?;
 
     let names = [
         "install.sh".to_owned(),
@@ -954,6 +959,8 @@ pub fn prepare_remote_install_bundle(
         NATIVE_MANIFEST_FILE.to_owned(),
         artifact.file.clone(),
         format!("{}.sha256", artifact.file),
+        "LICENSE".to_owned(),
+        "THIRD_PARTY.md".to_owned(),
     ];
     let output = Command::new("tar")
         .args(["-cf", "-", "-C"])
@@ -964,7 +971,7 @@ pub fn prepare_remote_install_bundle(
             UpdateError::ReleaseLookup(format!("cannot prepare remote bundle: {error}"))
         })?;
     checked_command(&output, "remote bundle preparation")?;
-    let limit = MAX_ARTIFACT_BYTES as usize + 1024 * 1024;
+    let limit = MAX_ARTIFACT_BYTES as usize + 3 * 1024 * 1024;
     if output.stdout.is_empty() || output.stdout.len() > limit {
         return Err(UpdateError::Safety(
             "remote installation payload exceeds the safety limit".into(),
@@ -974,6 +981,97 @@ pub fn prepare_remote_install_bundle(
         version: manifest.version,
         target: target.to_owned(),
         payload: output.stdout,
+    })
+}
+
+fn read_archive_notices(archive: &Path, target: &str) -> Result<ReleaseNotices> {
+    validate_target(target)?;
+    if target != "x86_64-pc-windows-msvc" {
+        #[cfg(unix)]
+        {
+            let scratch = ScratchDirectory::new("pika-notices")?;
+            extract_candidate(archive, target, &scratch.path)?;
+            return read_sibling_notices(&scratch.path.join("pika"));
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(UpdateError::UnsupportedTarget(target.into()));
+        }
+    }
+
+    let mut listing = Command::new("unzip");
+    listing.arg("-Z1").arg(archive);
+    let listing = run_command_bounded(
+        listing,
+        ARCHIVE_OPERATION_TIMEOUT,
+        4096,
+        "archive inspection",
+    )?;
+    checked_command(&listing, "archive inspection")?;
+    let text = String::from_utf8(listing.stdout)
+        .map_err(|_| UpdateError::UnsafeArchiveMember("non-UTF-8 path".into()))?;
+    let members = text.lines().collect::<Vec<_>>();
+    validate_archive_members(members.iter().copied(), target)?;
+    let expected = std::collections::BTreeSet::from(["LICENSE", "THIRD_PARTY.md", "pika.exe"]);
+    if members.len() != 3
+        || members
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            != expected
+    {
+        return Err(UpdateError::UnsafeArchiveMember(
+            "native archive must contain exactly pika.exe, LICENSE, and THIRD_PARTY.md".into(),
+        ));
+    }
+    let mut verbose = Command::new("unzip");
+    verbose.args(["-Z", "-l"]).arg(archive).env("LC_ALL", "C");
+    let verbose = run_command_bounded(
+        verbose,
+        ARCHIVE_OPERATION_TIMEOUT,
+        8192,
+        "archive inspection",
+    )?;
+    checked_command(&verbose, "archive inspection")?;
+    let regular_members = verbose
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| {
+            expected.iter().any(|name| {
+                line.strip_suffix(name.as_bytes())
+                    .is_some_and(|prefix| prefix.last().is_some_and(u8::is_ascii_whitespace))
+            })
+        })
+        .collect::<Vec<_>>();
+    if regular_members.len() != 3
+        || regular_members
+            .iter()
+            .any(|line| line.first() != Some(&b'-'))
+    {
+        return Err(UpdateError::UnsafeArchiveMember(
+            "native archive contains a non-regular member".into(),
+        ));
+    }
+    let read_member = |name: &str| -> Result<Vec<u8>> {
+        let mut command = Command::new("unzip");
+        command.args(["-p"]).arg(archive).arg(name);
+        let output = run_command_bounded(
+            command,
+            ARCHIVE_OPERATION_TIMEOUT,
+            MAX_NOTICE_BYTES as usize,
+            "archive notice inspection",
+        )?;
+        checked_command(&output, "archive notice inspection")?;
+        if output.stdout.is_empty() {
+            return Err(UpdateError::Safety(format!(
+                "release notice is empty: {name}"
+            )));
+        }
+        Ok(output.stdout)
+    };
+    Ok(ReleaseNotices {
+        license: read_member("LICENSE")?,
+        third_party: read_member("THIRD_PARTY.md")?,
     })
 }
 
@@ -1054,7 +1152,10 @@ fn extract_candidate(archive: &Path, target: &str, destination: &Path) -> Result
     // Prove the only payload is bounded before any filesystem extraction.
     // This reader closes at the first byte over the limit and the owned child
     // group is then reaped, so a high-ratio archive cannot fill the disk.
-    validate_archive_expanded_size(archive, MAX_EXECUTABLE_BYTES as usize)?;
+    validate_archive_expanded_size(
+        archive,
+        (MAX_EXECUTABLE_BYTES + 2 * MAX_NOTICE_BYTES) as usize,
+    )?;
     let mut command = Command::new("tar");
     command.args(["-tzf"]).arg(archive);
     let listing = run_command_bounded(
@@ -1073,9 +1174,15 @@ fn extract_candidate(archive: &Path, target: &str, destination: &Path) -> Result
         .map_err(|_| UpdateError::UnsafeArchiveMember("non-UTF-8 path".into()))?;
     let members: Vec<_> = text.lines().collect();
     validate_archive_members(members.iter().copied(), target)?;
-    if members != ["pika"] {
+    let member_set = members
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if member_set != std::collections::BTreeSet::from(["LICENSE", "THIRD_PARTY.md", "pika"])
+        || members.len() != 3
+    {
         return Err(UpdateError::UnsafeArchiveMember(
-            "native archive must contain exactly one executable named pika".into(),
+            "native archive must contain exactly pika, LICENSE, and THIRD_PARTY.md".into(),
         ));
     }
     let mut command = Command::new("tar");
@@ -1087,9 +1194,14 @@ fn extract_candidate(archive: &Path, target: &str, destination: &Path) -> Result
         "archive inspection",
     )?;
     checked_command(&verbose, "archive inspection")?;
-    if verbose.stdout.first() != Some(&b'-') {
+    let verbose_lines = verbose
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if verbose_lines.len() != 3 || verbose_lines.iter().any(|line| line.first() != Some(&b'-')) {
         return Err(UpdateError::UnsafeArchiveMember(
-            "pika is not a regular archive member".into(),
+            "native archive contains a non-regular member".into(),
         ));
     }
     let mut command = Command::new("tar");
@@ -1098,7 +1210,7 @@ fn extract_candidate(archive: &Path, target: &str, destination: &Path) -> Result
         .arg(archive)
         .arg("-C")
         .arg(destination)
-        .arg("pika");
+        .args(["LICENSE", "THIRD_PARTY.md", "pika"]);
     let extracted = run_command_bounded(
         command,
         ARCHIVE_OPERATION_TIMEOUT,
@@ -1116,13 +1228,15 @@ fn extract_candidate(archive: &Path, target: &str, destination: &Path) -> Result
     }
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(candidate, fs::Permissions::from_mode(0o700))?;
+    read_notice_file(&destination.join("LICENSE"))?;
+    read_notice_file(&destination.join("THIRD_PARTY.md"))?;
     Ok(())
 }
 
 #[cfg(unix)]
 fn validate_archive_expanded_size(archive: &Path, limit: usize) -> Result<()> {
     let mut command = Command::new("tar");
-    command.args(["-xOzf"]).arg(archive).arg("pika");
+    command.args(["-xOzf"]).arg(archive);
     let output = run_command_bounded(
         command,
         ARCHIVE_OPERATION_TIMEOUT,
@@ -1152,6 +1266,12 @@ fn checked_command(output: &Output, operation: &str) -> Result<()> {
 
 struct ScratchDirectory {
     path: PathBuf,
+}
+
+#[derive(Debug)]
+struct ReleaseNotices {
+    license: Vec<u8>,
+    third_party: Vec<u8>,
 }
 
 impl ScratchDirectory {
@@ -1266,6 +1386,7 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
     let preflight_launcher = request.bin_dir.join("pika");
     validate_launcher(&preflight_launcher, &preflight_current.join("bin/pika"))?;
     validate_candidate(request.candidate, &request.manifest.version)?;
+    let notices = read_sibling_notices(request.candidate)?;
 
     let root_existed = request.root.exists();
     if !root_existed {
@@ -1325,9 +1446,11 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
                         "same version has different package bytes; publish a new version".into(),
                     ));
                 }
+                let active_release = current.canonicalize()?;
+                validate_existing_release(&active_release, request, release_artifact, &notices)?;
                 ensure_launcher(&launcher, &expected_launcher_target)?;
                 return Ok(InstallOutcome {
-                    release_dir: current.canonicalize()?,
+                    release_dir: active_release,
                     launcher,
                     activated: false,
                 });
@@ -1344,12 +1467,12 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
     );
     let release_dir = releases.join(release_name);
     if release_dir.exists() {
-        validate_existing_release(&release_dir, request, release_artifact)?;
+        validate_existing_release(&release_dir, request, release_artifact, &notices)?;
     } else {
         let stage = releases.join(format!(".stage-{}", Uuid::new_v4()));
         fs::create_dir(&stage)?;
         set_private_directory(&stage)?;
-        let prepared = prepare_release(&stage, request, release_artifact);
+        let prepared = prepare_release(&stage, request, release_artifact, &notices);
         if let Err(error) = prepared {
             let _ = fs::remove_dir_all(&stage);
             return Err(error);
@@ -1361,11 +1484,14 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
         sync_directory(&releases)?;
     }
 
-    let launcher_created = ensure_launcher(&launcher, &expected_launcher_target)?;
+    // On first install, stage the launcher under a private temporary name. The
+    // public `pika` path must never be made durable while `current` is absent:
+    // an interruption may leave no launcher, but never a broken one.
+    let staged_launcher = stage_launcher(&launcher, &expected_launcher_target)?;
     if let Err(error) = atomic_symlink(&release_dir, &current) {
-        if launcher_created {
-            let _ = fs::remove_file(&launcher);
-            if let Some(parent) = launcher.parent() {
+        if let Some(staged) = &staged_launcher {
+            let _ = fs::remove_file(staged);
+            if let Some(parent) = staged.parent() {
                 let _ = sync_directory(parent);
             }
         }
@@ -1373,6 +1499,9 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
         // symlink was renamed before a directory-sync failure, removing its
         // target would turn a recoverable activation error into a broken home.
         return Err(error);
+    }
+    if let Some(staged) = staged_launcher {
+        publish_staged_launcher(&staged, &launcher, &expected_launcher_target)?;
     }
     Ok(InstallOutcome {
         release_dir,
@@ -1393,6 +1522,7 @@ fn prepare_release(
     stage: &Path,
     request: InstallRequest<'_>,
     artifact: &ReleaseArtifact,
+    notices: &ReleaseNotices,
 ) -> Result<()> {
     let bin = stage.join("bin");
     fs::create_dir(&bin)?;
@@ -1417,6 +1547,8 @@ fn prepare_release(
     let receipt_bytes = serde_json::to_vec_pretty(&receipt)
         .map_err(|error| UpdateError::Manifest(error.to_string()))?;
     write_new_file(&stage.join(".pika-install.json"), &receipt_bytes, 0o600)?;
+    write_new_file(&stage.join("LICENSE"), &notices.license, 0o600)?;
+    write_new_file(&stage.join("THIRD_PARTY.md"), &notices.third_party, 0o600)?;
 
     // Retain this exact verified package for explicit, version-pinned fleet
     // installation without a second public download.
@@ -1445,6 +1577,8 @@ fn prepare_release(
         include_bytes!("../scripts/install.sh"),
         0o700,
     )?;
+    write_new_file(&bundle.join("LICENSE"), &notices.license, 0o600)?;
+    write_new_file(&bundle.join("THIRD_PARTY.md"), &notices.third_party, 0o600)?;
     // Persist every payload before the stage name can become a release, then
     // persist the directory hierarchy bottom-up.
     sync_directory(&bin)?;
@@ -1457,6 +1591,7 @@ fn validate_existing_release(
     release_dir: &Path,
     request: InstallRequest<'_>,
     artifact: &ReleaseArtifact,
+    notices: &ReleaseNotices,
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(release_dir)?;
     if !metadata.file_type().is_dir() {
@@ -1491,7 +1626,18 @@ fn validate_existing_release(
             "existing release directory has a different receipt".into(),
         ));
     }
-    validate_candidate(&release_dir.join("bin/pika"), &request.manifest.version)?;
+    let installed_path = release_dir.join("bin/pika");
+    let installed = checked_regular_file(&installed_path)?;
+    let expected = checked_regular_file(request.candidate)?;
+    if fs::metadata(installed)?.len() > MAX_EXECUTABLE_BYTES
+        || sha256_file(installed)? != sha256_file(expected)?
+    {
+        return Err(UpdateError::Safety(
+            "retained executable differs from its verified candidate".into(),
+        ));
+    }
+    validate_notice_file(&release_dir.join("LICENSE"), &notices.license)?;
+    validate_notice_file(&release_dir.join("THIRD_PARTY.md"), &notices.third_party)?;
     let bundle = release_dir.join("bundle");
     if !fs::symlink_metadata(&bundle)?.file_type().is_dir() {
         return Err(UpdateError::Safety(
@@ -1508,7 +1654,41 @@ fn validate_existing_release(
     checked_regular_file(&bundled_artifact)?;
     verify_artifact(&bundled_artifact, artifact)?;
     verify_sidecar(&bundle.join(format!("{}.sha256", artifact.file)), artifact)?;
+    validate_notice_file(&bundle.join("LICENSE"), &notices.license)?;
+    validate_notice_file(&bundle.join("THIRD_PARTY.md"), &notices.third_party)?;
     prepare_remote_install_bundle(&bundle, request.target, Some(&request.manifest.version))?;
+    Ok(())
+}
+
+fn read_sibling_notices(candidate: &Path) -> Result<ReleaseNotices> {
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| UpdateError::Safety("verified candidate has no archive directory".into()))?;
+    Ok(ReleaseNotices {
+        license: read_notice_file(&parent.join("LICENSE"))?,
+        third_party: read_notice_file(&parent.join("THIRD_PARTY.md"))?,
+    })
+}
+
+fn read_notice_file(path: &Path) -> Result<Vec<u8>> {
+    let path = checked_regular_file(path)?;
+    let metadata = fs::metadata(path)?;
+    if metadata.len() == 0 || metadata.len() > MAX_NOTICE_BYTES {
+        return Err(UpdateError::Safety(format!(
+            "release notice has an invalid size: {}",
+            path.display()
+        )));
+    }
+    Ok(fs::read(path)?)
+}
+
+fn validate_notice_file(path: &Path, expected: &[u8]) -> Result<()> {
+    if read_notice_file(path)? != expected {
+        return Err(UpdateError::Safety(format!(
+            "release notice differs from its verified archive: {}",
+            path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -1947,6 +2127,46 @@ fn ensure_launcher(launcher: &Path, expected: &Path) -> Result<bool> {
 }
 
 #[cfg(unix)]
+fn stage_launcher(launcher: &Path, expected: &Path) -> Result<Option<PathBuf>> {
+    validate_launcher(launcher, expected)?;
+    if fs::symlink_metadata(launcher).is_ok() {
+        return Ok(None);
+    }
+    let parent = launcher
+        .parent()
+        .ok_or_else(|| UpdateError::Safety("launcher has no parent directory".into()))?;
+    fs::create_dir_all(parent)?;
+    let staged = parent.join(format!(".pika-launcher-{}", Uuid::new_v4()));
+    use std::os::unix::fs::symlink;
+    symlink(expected, &staged)?;
+    sync_directory(parent)?;
+    Ok(Some(staged))
+}
+
+#[cfg(unix)]
+fn publish_staged_launcher(staged: &Path, launcher: &Path, expected: &Path) -> Result<()> {
+    match fs::symlink_metadata(launcher) {
+        Ok(_) => {
+            validate_launcher(launcher, expected)?;
+            fs::remove_file(staged)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::rename(staged, launcher)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let parent = launcher
+        .parent()
+        .ok_or_else(|| UpdateError::Safety("launcher has no parent directory".into()))?;
+    if let Err(error) = sync_directory(parent) {
+        if fs::read_link(launcher).ok().as_deref() != Some(expected) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LinkActivation {
     Durable,
@@ -2263,6 +2483,38 @@ mod bounded_candidate_tests {
         .unwrap_err();
         assert!(error.to_string().contains("pre-rename"));
         assert_eq!(fs::read_link(&current).unwrap(), first);
+    }
+
+    #[test]
+    fn first_install_keeps_the_public_launcher_absent_until_current_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("managed");
+        let release = root.join("releases/0.6.0-alpha.1-test");
+        let current = root.join("current");
+        let bin = directory.path().join("bin");
+        let launcher = bin.join("pika");
+        let expected = current.join("bin/pika");
+        fs::create_dir_all(release.join("bin")).unwrap();
+        fs::write(release.join("bin/pika"), b"candidate").unwrap();
+
+        let staged = stage_launcher(&launcher, &expected).unwrap().unwrap();
+        assert!(
+            fs::symlink_metadata(&staged)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(fs::symlink_metadata(&launcher).is_err());
+        assert!(fs::symlink_metadata(&current).is_err());
+
+        atomic_symlink(&release, &current).unwrap();
+        assert!(current.join("bin").is_dir());
+        publish_staged_launcher(&staged, &launcher, &expected).unwrap();
+        assert_eq!(fs::read_link(&launcher).unwrap(), expected);
+        assert_eq!(
+            launcher.canonicalize().unwrap(),
+            release.join("bin/pika").canonicalize().unwrap()
+        );
     }
 
     #[test]

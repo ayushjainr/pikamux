@@ -79,45 +79,56 @@ def binary_shape(data, target):
             fail("Windows executable is not x86_64")
 
 def archive_executable(data, target):
+    executable_name = "pika.exe" if target == "x86_64-pc-windows-msvc" else "pika"
+    expected_names = {executable_name, "LICENSE", "THIRD_PARTY.md"}
+    payloads = {}
     if target == "x86_64-pc-windows-msvc":
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as archive:
                 infos = archive.infolist()
-                if len(infos) != 1 or infos[0].filename != "pika.exe":
+                if len(infos) != len(expected_names) or {info.filename for info in infos} != expected_names:
                     fail(f"native archive has the wrong shape: {target}")
-                info = infos[0]
-                mode = (info.external_attr >> 16) & 0o170000
-                if info.is_dir() or mode == 0o120000 or info.flag_bits & 1:
-                    fail(f"native archive member is unsafe: {target}")
-                if info.file_size > 50 * 1024 * 1024:
-                    fail(f"native executable is oversized: {target}")
-                data = archive.read(info)
+                for info in infos:
+                    mode = (info.external_attr >> 16) & 0o170000
+                    if info.is_dir() or mode != 0o100000 or info.flag_bits & 1:
+                        fail(f"native archive member is unsafe: {target}")
+                    limit = 50 * 1024 * 1024 if info.filename == executable_name else 2 * 1024 * 1024
+                    if info.file_size > limit:
+                        fail(f"native archive member is oversized: {target}/{info.filename}")
+                    payloads[info.filename] = archive.read(info)
         except zipfile.BadZipFile as exc:
             fail(f"native archive is not a ZIP file: {target}: {exc}")
     else:
         try:
             with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
-                expanded = compressed.read(51 * 1024 * 1024 + 1)
-            if len(expanded) > 51 * 1024 * 1024:
+                expanded = compressed.read(55 * 1024 * 1024 + 1)
+            if len(expanded) > 55 * 1024 * 1024:
                 fail(f"native archive expands beyond its safety limit: {target}")
             with tarfile.open(fileobj=io.BytesIO(expanded), mode="r:") as archive:
                 members = archive.getmembers()
-                if len(members) != 1 or members[0].name != "pika":
+                if len(members) != len(expected_names) or {member.name for member in members} != expected_names:
                     fail(f"native archive has the wrong shape: {target}")
-                member = members[0]
-                if not member.isfile() or not member.mode & 0o111:
-                    fail(f"native archive executable is unsafe: {target}")
-                if member.size > 50 * 1024 * 1024:
-                    fail(f"native executable is oversized: {target}")
-                stream = archive.extractfile(member)
-                if stream is None:
-                    fail(f"native archive executable is unreadable: {target}")
-                data = stream.read(50 * 1024 * 1024 + 1)
-                if len(data) != member.size:
-                    fail(f"native archive executable size mismatch: {target}")
+                for member in members:
+                    if not member.isfile():
+                        fail(f"native archive member is unsafe: {target}/{member.name}")
+                    if member.name == executable_name and not member.mode & 0o111:
+                        fail(f"native archive executable is unsafe: {target}")
+                    limit = 50 * 1024 * 1024 if member.name == executable_name else 2 * 1024 * 1024
+                    if member.size > limit:
+                        fail(f"native archive member is oversized: {target}/{member.name}")
+                    stream = archive.extractfile(member)
+                    if stream is None:
+                        fail(f"native archive member is unreadable: {target}/{member.name}")
+                    payloads[member.name] = stream.read(limit + 1)
+                    if len(payloads[member.name]) != member.size:
+                        fail(f"native archive member size mismatch: {target}/{member.name}")
         except (tarfile.TarError, EOFError, OSError) as exc:
             fail(f"native archive is not a tar.gz file: {target}: {exc}")
-    binary_shape(data, target)
+    if payloads["LICENSE"] != (source / "LICENSE").read_bytes():
+        fail(f"native archive LICENSE differs from audited source: {target}")
+    if payloads["THIRD_PARTY.md"] != (source / "THIRD_PARTY.md").read_bytes():
+        fail(f"native archive THIRD_PARTY.md differs from audited source: {target}")
+    binary_shape(payloads[executable_name], target)
 
 def check_native(manifest_path, asset_root):
     try:
@@ -215,9 +226,19 @@ if bridge.is_file():
                 embedded + "install.sh",
                 embedded + "pika-version",
                 embedded + "pika-native-release.json",
+                embedded + "LICENSE",
+                embedded + "THIRD_PARTY.md",
+                f"pikamux-{version}.dist-info/LICENSE",
+                f"pikamux-{version}.dist-info/THIRD_PARTY.md",
             }
             if not required.issubset(names):
                 fail("bridge has no embedded native manifest")
+            for name in ("LICENSE", "THIRD_PARTY.md"):
+                expected_notice = (source / name).read_bytes()
+                if wheel.read(embedded + name) != expected_notice:
+                    fail(f"bridge native {name} differs from audited source")
+                if wheel.read(f"pikamux-{version}.dist-info/{name}") != expected_notice:
+                    fail(f"bridge distribution {name} differs from audited source")
             with wheel.open(embedded + "pika-native-release.json") as stream:
                 payload = json.load(stream, object_pairs_hook=unique_json_object)
             if set(payload) != {"schema", "package", "version", "channel", "artifacts"}:
