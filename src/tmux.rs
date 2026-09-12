@@ -1284,7 +1284,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn guarded_attach_records_only_after_the_server_accepts_the_exact_pane() {
+    fn guarded_attach_rejects_a_delayed_nonzero_exit() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("tmux-fixture");
         fs::write(
@@ -1302,12 +1302,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(code, 130);
-        assert!(started);
+        assert!(!started);
     }
 
     #[cfg(unix)]
     #[test]
-    fn attach_handoff_runs_callback_before_interrupted_client_exits() {
+    fn attach_handoff_rejects_a_delayed_interrupted_client() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("tmux-fixture");
         fs::write(
@@ -1325,10 +1325,30 @@ mod tests {
             })
             .unwrap();
         assert_eq!(code, 130);
-        assert!(
-            started,
-            "attach history must survive Ctrl-C/detach exit codes"
-        );
+        assert!(!started, "a non-zero terminal exit must remain fail-closed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_handoff_records_a_delayed_successful_detach() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("tmux-fixture");
+        fs::write(
+            &executable,
+            "#!/bin/sh\ncase \"$*\" in *attach-session*) sleep 0.25; exit 0;; *) exit 0;; esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let tmux = Tmux::with_executable(executable.to_string_lossy(), None);
+        let mut started = false;
+        let code = tmux
+            .attach_with_started_mode("pika-c-workstream", Some("%1"), false, || {
+                started = true;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(code, 0);
+        assert!(started);
     }
 
     #[cfg(unix)]
