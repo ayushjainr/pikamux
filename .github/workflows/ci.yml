@@ -12,6 +12,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  # Archive contracts exercise the CLI built alongside tests. Debug symbols are
+  # not shipped and must not consume its release-artifact size budget.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
 
 jobs:
   test:

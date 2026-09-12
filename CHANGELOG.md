@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.3 — native distribution
+
+- Validate installation archives using executables without development symbols.
+- Publish native downloads for macOS, Linux, and the Windows client.
+
 ## 0.6.2 — Linux process recovery
 
 - Recognize exited, unreaped Linux processes as stopped so graceful handover
