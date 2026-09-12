@@ -413,6 +413,33 @@ pub(crate) struct ReconcileLedger<'a> {
     tx: &'a Transaction<'a>,
 }
 
+/// One reconciliation's cross-process snapshot fence. SQLite's connection-local
+/// `data_version` changes for commits made by every *other* connection but not
+/// for this connection's own bounded batches. Beginning each batch with an
+/// immediate transaction makes the version check and write one atomic gate.
+pub(crate) struct ReconcileSession {
+    db: Connection,
+    version: i64,
+}
+
+impl ReconcileSession {
+    pub(crate) fn transaction<T>(
+        &mut self,
+        operation: impl FnOnce(&ReconcileLedger<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = tx.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?;
+        if current != self.version {
+            bail!("local reconciliation was superseded by another process before it could commit")
+        }
+        let result = operation(&ReconcileLedger { tx: &tx })?;
+        tx.commit()?;
+        Ok(result)
+    }
+}
+
 impl Store {
     pub fn from_paths(paths: &Paths) -> Self {
         Self {
@@ -544,6 +571,14 @@ impl Store {
         let result = operation(&ReconcileLedger { tx: &tx })?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Capture a cross-process commit cursor before any slow OS/provider reads.
+    /// All resulting reconciliation writes must use the returned connection.
+    pub(crate) fn begin_reconcile_session(&self) -> Result<ReconcileSession> {
+        let db = self.open_write()?;
+        let version = db.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        Ok(ReconcileSession { db, version })
     }
 
     pub fn upsert_session(&self, session: &Session, preserve_name: bool) -> Result<bool> {
