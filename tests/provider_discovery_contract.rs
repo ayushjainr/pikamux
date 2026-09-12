@@ -8,7 +8,7 @@ use pikamux::{
     tmux::Tmux,
 };
 use rusqlite::{Connection, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::{fs, path::Path};
 
 fn paths(root: &Path) -> Paths {
@@ -302,6 +302,80 @@ fn claude_history_only_exact_lookup_ignores_title_and_browser_budget() {
             .tracked(Provider::Claude, &[identity.into()].into_iter().collect())
             .len(),
         1
+    );
+}
+
+#[test]
+fn claude_exact_uuid_survives_the_ten_thousand_transcript_browse_cap() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let project = paths.claude_home.join("projects/p");
+    fs::create_dir_all(&project).unwrap();
+    for index in 0..10_001 {
+        fs::write(project.join(format!("filler-{index:05}.jsonl")), b"{}\n").unwrap();
+    }
+    let identity = "77777777-7777-4777-8777-777777777777";
+    json_line(
+        &project.join(format!("{identity}.jsonl")),
+        serde_json::json!({"type":"custom-title","customTitle":"exact_old_expert"}),
+    );
+
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let requested = providers.find(Provider::Claude, identity);
+    assert_eq!(requested.len(), 1);
+    assert_eq!(requested[0].session_id, identity);
+    assert_eq!(requested[0].name.as_deref(), Some("exact_old_expert"));
+    let tracked = providers.tracked(Provider::Claude, &BTreeSet::from([identity.into()]));
+    assert_eq!(tracked.len(), 1);
+    assert_eq!(tracked[0].session_id, identity);
+}
+
+#[test]
+fn codex_archive_lookup_is_scoped_to_bounded_index_candidates() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    fs::create_dir_all(&paths.codex_home).unwrap();
+    let target = "88888888-8888-4888-8888-888888888888";
+    fs::write(
+        paths.codex_home.join("session_index.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "id":target, "thread_name":"archived_target", "updated_at":10
+            })
+        ),
+    )
+    .unwrap();
+    let db = Connection::open(paths.codex_home.join("state_1.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(
+            id, name TEXT, cwd TEXT, git_branch TEXT, rollout_path TEXT,
+            model TEXT, created_at INTEGER, updated_at INTEGER, archived INTEGER
+         );",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES(?1,'archived_target',NULL,NULL,NULL,NULL,1,10,1)",
+        [target],
+    )
+    .unwrap();
+    // An unrelated row with a non-text ID made the old whole-archive collector
+    // discard all archive evidence. A candidate-scoped query never decodes it.
+    db.execute(
+        "INSERT INTO threads VALUES(42,'unrelated',NULL,NULL,NULL,NULL,1,11,1)",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    assert!(providers.find(Provider::Codex, target).is_empty());
+    assert!(
+        providers
+            .find(Provider::Codex, "archived_target")
+            .is_empty()
     );
 }
 

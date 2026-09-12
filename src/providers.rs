@@ -22,6 +22,7 @@ use walkdir::WalkDir;
 
 const MAX_PROVIDER_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_PROVIDER_RESULTS: usize = 2_000;
+const MAX_CODEX_INDEX_RECORDS: usize = 100_000;
 const MAX_CODEX_RECONCILE_NAMED: usize = 128;
 const MAX_CODEX_METADATA_LINE_BYTES: u64 = 64 * 1024;
 const MAX_CODEX_METADATA_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
@@ -29,6 +30,11 @@ const MAX_CODEX_LIFECYCLE_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CODEX_LIFECYCLE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CODEX_LIFECYCLE_RECORDS: usize = 16;
 const MAX_CLAUDE_DISCOVERY_FILES: usize = 1_000;
+const MAX_CLAUDE_TRANSCRIPT_FILES: usize = 10_000;
+const MAX_CLAUDE_TRANSCRIPT_ENTRIES: usize = 20_000;
+const MAX_CLAUDE_SESSION_ENTRIES: usize = 10_000;
+const MAX_CLAUDE_PROJECT_ENTRIES: usize = 10_000;
+const MAX_CLAUDE_EXACT_PATH_CHECKS: usize = 100_000;
 const MAX_CLAUDE_METADATA_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CLAUDE_TITLE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CLAUDE_CHANGED_TITLES: usize = 16;
@@ -598,17 +604,10 @@ fn codex_records(
     let Ok(rows) = rows else {
         return Vec::new();
     };
-    let archived_ids = if columns.contains("archived") {
-        db.prepare("SELECT id FROM threads WHERE COALESCE(archived,0) != 0")
-            .and_then(|mut statement| {
-                statement
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<BTreeSet<_>>>()
-            })
-            .unwrap_or_default()
-    } else {
-        BTreeSet::new()
-    };
+    // The provider database can retain an arbitrarily large archive. Only
+    // index records that could enter this bounded result need an archive
+    // lookup; querying that exact set avoids collecting the whole archive.
+    let archived_ids = codex_archived_index_ids(&db, &columns, &index_records);
     let tracked = identities.cloned().unwrap_or_default();
     let broad_scan = query.is_none() && identities.is_none();
     let mut metadata_budget = MAX_CODEX_METADATA_TOTAL_BYTES;
@@ -644,17 +643,24 @@ fn codex_records(
         .enumerate()
         .map(|(index, candidate)| (candidate.session_id.clone(), index))
         .collect::<BTreeMap<_, _>>();
-    let mut indexed_records = filter_codex_index(
-        index_records,
-        query,
-        named_only,
-        if include_named_with_identities {
-            None
-        } else {
-            identities
-        },
-        &archived_ids,
-    );
+    // If archive evidence is unreadable, retain only database-backed active
+    // rows. An index-only label is not enough evidence to resurrect a thread.
+    let mut indexed_records = archived_ids
+        .as_ref()
+        .map(|archived_ids| {
+            filter_codex_index(
+                index_records,
+                query,
+                named_only,
+                if include_named_with_identities {
+                    None
+                } else {
+                    identities
+                },
+                archived_ids,
+            )
+        })
+        .unwrap_or_default();
     if include_named_with_identities {
         let identities = identities.expect("reconciliation identities supplied");
         retain_reconciliation_index(&mut indexed_records, identities);
@@ -709,7 +715,7 @@ fn codex_index_records(home: &Path) -> Vec<Candidate> {
     for line in BufReader::new(file.take(16 * 1024 * 1024))
         .lines()
         .map_while(Result::ok)
-        .take(100_000)
+        .take(MAX_CODEX_INDEX_RECORDS)
     {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -750,6 +756,39 @@ fn codex_index_records(home: &Path) -> Vec<Candidate> {
         );
     }
     records.into_values().collect()
+}
+
+fn codex_archived_index_ids(
+    db: &Connection,
+    columns: &BTreeSet<String>,
+    index_records: &[Candidate],
+) -> Option<BTreeSet<String>> {
+    if !columns.contains("archived") || index_records.is_empty() {
+        return Some(BTreeSet::new());
+    }
+    let identities = index_records
+        .iter()
+        .map(|candidate| candidate.session_id.as_str())
+        .take(MAX_CODEX_INDEX_RECORDS)
+        .collect::<BTreeSet<_>>();
+    let mut archived = BTreeSet::new();
+    for chunk in identities.iter().copied().collect::<Vec<_>>().chunks(500) {
+        let marks = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id FROM threads WHERE COALESCE(archived,0) != 0 AND id IN ({marks}) LIMIT {}",
+            chunk.len()
+        );
+        let mut statement = db.prepare(&sql).ok()?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()?;
+        archived.extend(rows.collect::<rusqlite::Result<Vec<_>>>().ok()?);
+    }
+    Some(archived)
 }
 
 fn filter_codex_index(
@@ -904,31 +943,18 @@ fn claude_records(
     identities: Option<&BTreeSet<String>>,
     reconcile_activity: Option<&BTreeMap<String, f64>>,
 ) -> Vec<Candidate> {
+    let exact_identities = claude_exact_identities(query, identities);
     // Inventory once: the live registry and historical lookup share these
     // exact paths instead of walking the entire projects tree for every row.
-    let mut transcripts: Vec<_> = WalkDir::new(home.join("projects"))
-        .min_depth(2)
-        .max_depth(2)
-        .into_iter()
-        .flatten()
-        .filter(|entry| {
-            entry.file_type().is_file() && entry.path().extension() == Some(OsStr::new("jsonl"))
-        })
-        .map(|entry| entry.into_path())
-        .take(10_000)
-        .collect();
+    // General discovery is capped independently from exact UUIDs, so the
+    // 10,001st transcript cannot make a requested or watched identity vanish.
+    let mut transcripts = claude_transcript_paths(home, &exact_identities, query);
     let transcript_paths = transcripts
         .iter()
         .filter_map(|path| Some((path.file_stem()?.to_str()?.to_owned(), path.clone())))
         .collect::<BTreeMap<_, _>>();
     let mut records: BTreeMap<String, Candidate> = BTreeMap::new();
-    let mut session_paths = fs::read_dir(home.join("sessions"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension() == Some(OsStr::new("json")))
-        .collect::<Vec<_>>();
+    let mut session_paths = claude_session_paths(home, &exact_identities, identities.is_some());
     session_paths.sort_by_key(|path| {
         let identity = path.file_stem().and_then(OsStr::to_str).unwrap_or("");
         (
@@ -1123,6 +1149,134 @@ fn claude_records(
     }
     output.sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at));
     output
+}
+
+fn claude_exact_identities(
+    query: Option<&str>,
+    identities: Option<&BTreeSet<String>>,
+) -> BTreeSet<String> {
+    query
+        .into_iter()
+        .chain(identities.into_iter().flatten().map(String::as_str))
+        .filter(|identity| Providers::valid_id(Provider::Claude, identity))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn claude_transcript_paths(
+    home: &Path,
+    exact_identities: &BTreeSet<String>,
+    requested: Option<&str>,
+) -> Vec<PathBuf> {
+    let projects = home.join("projects");
+    let mut selected = BTreeMap::<String, PathBuf>::new();
+    let mut general = 0_usize;
+    // Count every traversed entry before filtering. A tree full of directories,
+    // errors, or unrelated files must not bypass the work bound.
+    for entry in WalkDir::new(&projects)
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+        .take(MAX_CLAUDE_TRANSCRIPT_ENTRIES)
+        .flatten()
+    {
+        if !entry.file_type().is_file() || entry.path().extension() != Some(OsStr::new("jsonl")) {
+            continue;
+        }
+        let Some(identity) = entry.path().file_stem().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let exact = exact_identities.contains(identity);
+        if !exact && general >= MAX_CLAUDE_TRANSCRIPT_FILES {
+            continue;
+        }
+        let is_new = !selected.contains_key(identity);
+        let replace = selected
+            .get(identity)
+            .is_none_or(|existing| modified(entry.path()) > modified(existing));
+        if replace {
+            selected.insert(identity.to_owned(), entry.into_path());
+        }
+        if !exact && is_new {
+            general += 1;
+        }
+    }
+
+    // The browsing traversal is intentionally finite. Recover exact UUIDs by
+    // probing their deterministic basename beneath a bounded project set. The
+    // explicitly requested UUID is checked first, followed by watched IDs.
+    let mut ordered_exact = requested
+        .filter(|identity| exact_identities.contains(*identity))
+        .map(str::to_owned)
+        .into_iter()
+        .collect::<Vec<_>>();
+    ordered_exact.extend(
+        exact_identities
+            .iter()
+            .filter(|identity| Some(identity.as_str()) != requested)
+            .cloned(),
+    );
+    let project_paths = fs::read_dir(&projects)
+        .into_iter()
+        .flatten()
+        .take(MAX_CLAUDE_PROJECT_ENTRIES)
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_type().ok()?.is_dir().then(|| entry.path()))
+        .collect::<Vec<_>>();
+    let mut checks = 0_usize;
+    'identities: for identity in ordered_exact {
+        if selected.contains_key(&identity) {
+            continue;
+        }
+        for project in &project_paths {
+            if checks >= MAX_CLAUDE_EXACT_PATH_CHECKS {
+                break 'identities;
+            }
+            checks += 1;
+            let candidate = project.join(format!("{identity}.jsonl"));
+            if candidate.is_file() {
+                selected.insert(identity, candidate);
+                break;
+            }
+        }
+    }
+    selected.into_values().collect()
+}
+
+fn claude_session_paths(
+    home: &Path,
+    exact_identities: &BTreeSet<String>,
+    exact_only: bool,
+) -> Vec<PathBuf> {
+    let sessions = home.join("sessions");
+    let mut selected = exact_identities
+        .iter()
+        .filter_map(|identity| {
+            let path = sessions.join(format!("{identity}.json"));
+            path.is_file().then_some((identity.clone(), path))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if exact_only {
+        return selected.into_values().collect();
+    }
+    for entry in fs::read_dir(&sessions)
+        .into_iter()
+        .flatten()
+        .take(MAX_CLAUDE_SESSION_ENTRIES)
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_file())
+            || path.extension() != Some(OsStr::new("json"))
+        {
+            continue;
+        }
+        let Some(identity) = path.file_stem().and_then(OsStr::to_str) else {
+            continue;
+        };
+        selected.entry(identity.to_owned()).or_insert(path);
+    }
+    selected.into_values().collect()
 }
 
 fn transcript_title(path: &Path, explicit_only: bool, byte_budget: &mut u64) -> Option<String> {

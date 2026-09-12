@@ -1,9 +1,11 @@
 use pikamux::experts::{
-    CardStatus, PublishInput, PublisherProof, card_state, make_profile, profile_freshness, publish,
-    publish_current_work, rank_experts, transcript_fingerprint,
+    CardStatus, LocalSourceIndex, PublishInput, PublisherProof, SourceAvailability, card_state,
+    make_profile, profile_freshness, publish, publish_current_work, rank_experts,
+    transcript_fingerprint,
 };
 use pikamux::model::{Provider, Session, Status};
 use pikamux::store::{Store, StoredExpertProfile};
+use pikamux::{config::Config, paths::Paths};
 use rusqlite::Connection;
 use std::collections::BTreeSet;
 use std::fs;
@@ -305,4 +307,48 @@ fn unwatched_card_remains_discoverable_without_retracking() {
     assert!(!matches[0].watched);
     assert!(matches[0].discoverable);
     assert!(store.list_sessions().unwrap().is_empty());
+}
+
+#[test]
+fn batched_source_index_maps_active_leaves_back_to_stable_workstreams() {
+    let root = tempdir().unwrap();
+    let paths = Paths {
+        config_dir: root.path().join("config"),
+        state_dir: root.path().join("state"),
+        config: root.path().join("config/config.json"),
+        database: root.path().join("state/pika.db"),
+        codex_home: root.path().join("codex"),
+        claude_home: root.path().join("claude"),
+        opencode_data_home: root.path().join("opencode-data"),
+        opencode_config_home: root.path().join("opencode-config"),
+    };
+    fs::create_dir_all(&paths.codex_home).unwrap();
+    let transcript = root.path().join("leaf.jsonl");
+    fs::write(&transcript, b"history\n").unwrap();
+    let db = Connection::open(paths.codex_home.join("state_1.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, archived INTEGER);
+         INSERT INTO threads VALUES('active-leaf',0);
+         INSERT INTO threads VALUES('archived-leaf',1);",
+    )
+    .unwrap();
+    drop(db);
+
+    let mut active = session(Provider::Codex, "stable-active");
+    active.active_thread_id = Some("active-leaf".into());
+    active.transcript_path = Some(transcript.to_string_lossy().into_owned());
+    let mut archived = session(Provider::Codex, "stable-archived");
+    archived.active_thread_id = Some("archived-leaf".into());
+    archived.transcript_path = active.transcript_path.clone();
+
+    let index = LocalSourceIndex::read(
+        &paths,
+        &Config::default(),
+        &[active.clone(), archived.clone()],
+    );
+    assert_eq!(
+        index.availability(&active),
+        SourceAvailability::SourceAvailable
+    );
+    assert_eq!(index.availability(&archived), SourceAvailability::Archived);
 }

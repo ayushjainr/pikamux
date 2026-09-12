@@ -111,17 +111,12 @@ pub struct LocalSourceIndex {
 impl LocalSourceIndex {
     pub fn read(paths: &Paths, config: &Config, sessions: &[Session]) -> Self {
         let providers = Providers::new(paths, config);
-        let mut states = BTreeMap::new();
-        for session in sessions {
-            let identity = session.provider_thread_id().to_owned();
-            let state = providers.source_state(
-                session.provider,
-                &identity,
-                session.transcript_path.as_deref(),
-            );
-            states.insert((session.provider, identity), state);
+        // Preserve Pika's stable workstream key while resolving each provider's
+        // active leaf in one batched metadata pass. This avoids reopening the
+        // Codex/OpenCode database once per expert row.
+        Self {
+            states: providers.source_states(sessions),
         }
-        Self { states }
     }
 
     pub fn availability(&self, session: &Session) -> SourceAvailability {
@@ -134,7 +129,7 @@ impl LocalSourceIndex {
         }
         match self
             .states
-            .get(&(session.provider, session.provider_thread_id().to_owned()))
+            .get(&(session.provider, session.session_id.clone()))
             .copied()
             .unwrap_or(ProviderSourceState::Unknown)
         {
