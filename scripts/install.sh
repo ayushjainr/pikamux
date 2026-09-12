@@ -226,7 +226,10 @@ if [ -z "$pika_no_setup" ]; then
             "Agent consultation is not configured because skill installation failed: $pika_skill_detail"
         printf 'After correcting the path, run exactly: %q skill install\n' "$pika_launcher"
         printf 'Then run exactly: %q setup\n' "$pika_launcher"
-        exit 0
+        # The native executable is active, but the advertised agent-to-agent
+        # integration is not. Preserve that partial-success distinction for
+        # automation instead of claiming the complete install succeeded.
+        exit 3
     fi
     [ -z "$pika_skill_detail" ] || printf '%s\n' "$pika_skill_detail"
     if ! command -v tmux >/dev/null 2>&1; then

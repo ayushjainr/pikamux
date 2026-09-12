@@ -34,6 +34,7 @@ pub const MAX_ARTIFACT_BYTES: u64 = 20 * 1024 * 1024;
 pub const MAX_EXECUTABLE_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_RELEASE_LIST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CANDIDATE_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_RETAINED_RELEASE_SCAN: usize = 256;
 const CANDIDATE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const ARCHIVE_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 pub const RELEASE_API: &str =
@@ -357,9 +358,11 @@ struct UpdateNoticeCache {
     failed: bool,
 }
 
-/// Return a best-effort cached update notice for a managed installation.
-/// Unmanaged builds, disabled checks, network failure, and a concurrently
-/// running check are all ordinary `None` outcomes for the board.
+/// Return a best-effort, strictly offline update notice for a managed
+/// installation. The interactive board must never own an unjoinable network
+/// child: explicit `pika update --check` is the network refresh boundary.
+/// Unmanaged builds, disabled checks, missing cache and stale cache are all
+/// ordinary `None` outcomes.
 #[cfg(unix)]
 pub fn cached_update_notice(executable: &Path) -> Option<String> {
     if std::env::var("PIKA_UPDATE_CHECK")
@@ -374,60 +377,22 @@ pub fn cached_update_notice(executable: &Path) -> Option<String> {
 #[cfg(unix)]
 fn cached_update_notice_inner(executable: &Path) -> Result<Option<String>> {
     let managed = discover_managed_install(executable)?;
-    let target = native_target()?;
-    let lock_path = managed.root.join(".update-check.lock");
-    if fs::symlink_metadata(&lock_path)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(UpdateError::Safety(
-            "update-check lock must not be a symlink".into(),
-        ));
-    }
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    if lock.try_lock_exclusive().is_err() {
-        return Ok(None);
-    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |duration| duration.as_secs_f64());
     let cache_path = managed.root.join(".update-check.json");
-    let cached = read_update_notice_cache(&cache_path);
-    let fresh = cached.as_ref().is_some_and(|cache| {
+    let Some(cache) = read_update_notice_cache(&cache_path) else {
+        return Ok(None);
+    };
+    let fresh = {
         let age = now - cache.checked_at;
         cache.current == managed.version
             && age >= 0.0
             && age < if cache.failed { 3600.0 } else { 6.0 * 3600.0 }
-    });
-    let cache = if fresh {
-        cached.expect("fresh cache exists")
-    } else {
-        let scratch = ScratchDirectory::new("pika-update-check")?;
-        let listing = scratch.path.join("releases.json");
-        let latest = download(RELEASE_API, &listing, MAX_RELEASE_LIST_BYTES, 10)
-            .and_then(|()| select_latest_release(&fs::read(&listing)?, &managed.version, target));
-        let cache = match latest {
-            Ok(latest) => UpdateNoticeCache {
-                current: managed.version.clone(),
-                checked_at: now,
-                latest,
-                failed: false,
-            },
-            Err(_) => UpdateNoticeCache {
-                current: managed.version.clone(),
-                checked_at: now,
-                latest: None,
-                failed: true,
-            },
-        };
-        write_update_notice_cache(&cache_path, &cache)?;
-        cache
     };
+    if !fresh {
+        return Ok(None);
+    }
     let latest = cache.latest.filter(|version| {
         compare_versions(version, &managed.version)
             .is_ok_and(|ordering| ordering == Ordering::Greater)
@@ -447,24 +412,6 @@ fn read_update_notice_cache(path: &Path) -> Option<UpdateNoticeCache> {
         return None;
     }
     serde_json::from_slice(&fs::read(path).ok()?).ok()
-}
-
-#[cfg(unix)]
-fn write_update_notice_cache(path: &Path, cache: &UpdateNoticeCache) -> Result<()> {
-    if fs::symlink_metadata(path)
-        .ok()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(UpdateError::Safety(
-            "update-check cache must not be a symlink".into(),
-        ));
-    }
-    let bytes =
-        serde_json::to_vec(cache).map_err(|error| UpdateError::Manifest(error.to_string()))?;
-    let temporary = path.with_file_name(format!(".update-check-{}.tmp", Uuid::new_v4()));
-    write_new_file(&temporary, &bytes, 0o600)?;
-    fs::rename(&temporary, path)?;
-    Ok(())
 }
 
 impl UpdateOutcome {
@@ -761,7 +708,12 @@ pub fn rollback_managed(executable: &Path, requested: Option<&str>) -> Result<Up
     validate_launcher(&managed.bin_dir.join("pika"), &current.join("bin/pika"))?;
 
     let mut candidates = Vec::new();
-    for entry in fs::read_dir(&releases)? {
+    for (index, entry) in fs::read_dir(&releases)?.enumerate() {
+        if index >= MAX_RETAINED_RELEASE_SCAN {
+            return Err(UpdateError::Safety(format!(
+                "retained release inventory exceeds {MAX_RETAINED_RELEASE_SCAN} entries; nothing activated"
+            )));
+        }
         let entry = entry?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
@@ -788,7 +740,7 @@ pub fn rollback_managed(executable: &Path, requested: Option<&str>) -> Result<Up
         );
         return Err(UpdateError::Safety(format!("{detail}; nothing activated")));
     };
-    atomic_symlink(&release_dir, &current)?;
+    let _activation = atomic_symlink(&release_dir, &current)?;
     validate_launcher(&managed.bin_dir.join("pika"), &current.join("bin/pika"))?;
     Ok(UpdateOutcome {
         disposition: UpdateDisposition::RolledBack,
@@ -1995,7 +1947,23 @@ fn ensure_launcher(launcher: &Path, expected: &Path) -> Result<bool> {
 }
 
 #[cfg(unix)]
-fn atomic_symlink(target: &Path, link: &Path) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkActivation {
+    Durable,
+    SwitchedDurabilityUnconfirmed,
+}
+
+#[cfg(unix)]
+fn atomic_symlink(target: &Path, link: &Path) -> Result<LinkActivation> {
+    atomic_symlink_with_sync(target, link, sync_directory)
+}
+
+#[cfg(unix)]
+fn atomic_symlink_with_sync(
+    target: &Path,
+    link: &Path,
+    mut sync_parent: impl FnMut(&Path) -> Result<()>,
+) -> Result<LinkActivation> {
     use std::os::unix::fs::symlink;
     let parent = link
         .parent()
@@ -2004,12 +1972,26 @@ fn atomic_symlink(target: &Path, link: &Path) -> Result<()> {
     symlink(target, &temporary)?;
     // Make both the old activation and the temporary replacement durable
     // before rename. After the atomic swap, persist the selected name.
-    if let Err(error) = sync_directory(parent) {
+    if let Err(error) = sync_parent(parent) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
     match fs::rename(&temporary, link) {
-        Ok(()) => sync_directory(parent),
+        Ok(()) => match sync_parent(parent) {
+            Ok(()) => Ok(LinkActivation::Durable),
+            Err(error) => {
+                // rename(2) already chose the new release. Re-read the link so
+                // callers never report "nothing activated" or remove the new
+                // launcher after a post-rename fsync error. Durability across
+                // an immediate power loss is unconfirmed, but current state is
+                // exact and usable.
+                if fs::read_link(link).ok().as_deref() == Some(target) {
+                    Ok(LinkActivation::SwitchedDurabilityUnconfirmed)
+                } else {
+                    Err(error)
+                }
+            }
+        },
         Err(error) => {
             let _ = fs::remove_file(&temporary);
             Err(error.into())
@@ -2237,6 +2219,50 @@ mod bounded_candidate_tests {
         assert_eq!(result.unwrap(), b"partial");
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(held_writer);
+    }
+
+    #[test]
+    fn activation_reports_the_link_as_switched_after_post_rename_sync_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let current = directory.path().join("current");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        std::os::unix::fs::symlink(&first, &current).unwrap();
+        let mut syncs = 0;
+        let outcome = atomic_symlink_with_sync(&second, &current, |_parent| {
+            syncs += 1;
+            if syncs == 2 {
+                Err(UpdateError::Io(io::Error::other(
+                    "injected post-rename fsync failure",
+                )))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(outcome, LinkActivation::SwitchedDurabilityUnconfirmed);
+        assert_eq!(fs::read_link(&current).unwrap(), second);
+    }
+
+    #[test]
+    fn activation_remains_unswitched_after_pre_rename_sync_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let current = directory.path().join("current");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        std::os::unix::fs::symlink(&first, &current).unwrap();
+        let error = atomic_symlink_with_sync(&second, &current, |_parent| {
+            Err(UpdateError::Io(io::Error::other(
+                "injected pre-rename fsync failure",
+            )))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("pre-rename"));
+        assert_eq!(fs::read_link(&current).unwrap(), first);
     }
 
     #[test]

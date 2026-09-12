@@ -304,25 +304,17 @@ cli.os.killpg = lambda pid, sig: kills.append((pid, sig))
 class InterruptedProcess:
     pid = 4242
     def __init__(self):
-        self.calls = 0
         self.reaped = False
-    def poll(self):
-        return -9 if self.reaped else None
     def wait(self, timeout=None):
-        self.calls += 1
-        if self.calls == 1:
-            point_to(native)
-            raise KeyboardInterrupt()
-        if self.calls == 2:
-            raise subprocess.TimeoutExpired("install", timeout)
         self.reaped = True
         return -9
 
 interrupted = InterruptedProcess()
-def interrupted_popen(_command, **options):
-    assert options == {"start_new_session": True}
-    return interrupted
-cli.subprocess.Popen = interrupted_popen
+cli._start_activation = lambda _command: (interrupted, -1)
+def interrupted_wait(_process, _receipt, _timeout):
+    point_to(native)
+    raise KeyboardInterrupt()
+cli._wait_activation_receipt = interrupted_wait
 try:
     cli._activate_and_exec([])
 except cli.BridgeError as error:
@@ -336,16 +328,15 @@ assert kills == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
 
 class TimeoutProcess:
     pid = 4343
-    def __init__(self): self.calls = 0
-    def poll(self): return None if self.calls < 2 else -15
     def wait(self, timeout=None):
-        self.calls += 1
-        if self.calls == 1: raise subprocess.TimeoutExpired("install", timeout)
         return -15
 
 point_to(bridge)
 timed_out = TimeoutProcess()
-cli.subprocess.Popen = lambda *_args, **_kwargs: timed_out
+cli._start_activation = lambda _command: (timed_out, -1)
+cli._wait_activation_receipt = lambda _process, _receipt, timeout: (_ for _ in ()).throw(
+    subprocess.TimeoutExpired("install", timeout)
+)
 try:
     cli._activate_and_exec([])
 except cli.BridgeError as error:
@@ -355,19 +346,83 @@ else:
 
 class FailedProcess:
     pid = 4444
-    def poll(self): return 7
     def wait(self, timeout=None):
-        point_to(native)
         return 7
 
 failed = FailedProcess()
-cli.subprocess.Popen = lambda *_args, **_kwargs: failed
+cli._start_activation = lambda _command: (failed, -1)
+def failed_wait(_process, _receipt, _timeout):
+    point_to(native)
+    return 7
+cli._wait_activation_receipt = failed_wait
 try:
     cli._activate_and_exec([])
 except cli.BridgeError as error:
     assert "exited 7; managed release 'native' is now current" in str(error)
 else:
     raise AssertionError("failed activation was accepted")
+assert kills[-2:] == [(4444, signal.SIGTERM), (4444, signal.SIGKILL)]
+"#;
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .arg(temp.path())
+        .env(
+            "PYTHONPATH",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("bridge"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn bridge_cleans_same_group_descendants_after_nonzero_installer_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = r#"
+from pathlib import Path
+import os
+import subprocess
+import sys
+import time
+import pikamux_bridge.cli as cli
+
+base = Path(sys.argv[1])
+root = base / "managed"
+bridge = root / "releases" / "bridge"
+bundle = base / "bundle"
+bin_dir = base / "bin"
+for path in (bridge, bundle, bin_dir):
+    path.mkdir(parents=True, exist_ok=True)
+(root / "current").symlink_to(bridge, target_is_directory=True)
+child_pid_file = base / "child-pid"
+
+cli.sys.prefix = str(bridge)
+cli._managed_receipt = lambda: (root, bin_dir)
+cli._native_bundle = lambda: bundle
+(bundle / "install.sh").write_text(
+    f'#!/bin/sh\nsleep 30 & echo $! > "{child_pid_file}"\nexit 7\n'
+)
+
+try:
+    cli._activate_and_exec([])
+except cli.BridgeError as error:
+    assert "exited 7" in str(error)
+else:
+    raise AssertionError("failed activation was accepted")
+
+child_pid = int(child_pid_file.read_text().strip())
+for _ in range(100):
+    try:
+        os.kill(child_pid, 0)
+    except ProcessLookupError:
+        break
+    time.sleep(0.01)
+else:
+    raise AssertionError("installer descendant survived bridge cleanup")
 "#;
     let output = Command::new("python3")
         .args(["-c", script])

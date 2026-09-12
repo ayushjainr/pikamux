@@ -261,6 +261,18 @@ fn board_update_notice_uses_fresh_managed_cache_without_network() {
         cached_update_notice(&installed.launcher),
         Some("0.6.0-alpha.2".into())
     );
+    fs::write(
+        root.join(".update-check.json"),
+        serde_json::to_vec(&json!({
+            "current":"0.6.0-alpha.1",
+            "checked_at":0.0,
+            "latest":"0.6.0-alpha.3",
+            "failed":false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cached_update_notice(&installed.launcher), None);
 }
 
 fn fleet_node(id: &str, version: &str) -> FleetNode {
@@ -1253,7 +1265,7 @@ fn default_shell_bootstrap_succeeds_without_a_controlling_tty() {
 }
 
 #[test]
-fn bootstrap_reports_successful_activation_and_exact_skill_remediation() {
+fn bootstrap_reports_partial_success_and_exact_skill_remediation() {
     let temporary = tempfile::tempdir().unwrap();
     let temp = temporary.path().canonicalize().unwrap();
     let bundle = temp.join("release");
@@ -1296,8 +1308,9 @@ fn bootstrap_reports_successful_activation_and_exact_skill_remediation() {
         .env("CODEX_HOME", &codex_home)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
+    assert_eq!(
+        output.status.code(),
+        Some(3),
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)

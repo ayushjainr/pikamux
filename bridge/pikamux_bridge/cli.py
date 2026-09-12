@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -167,8 +168,58 @@ def _activation_outcome(root: Path, bridge_prefix: Path) -> str:
     return f"managed release {active.name!r} is now current"
 
 
+_ACTIVATION_SUPERVISOR = r"""
+import os
+import signal
+import subprocess
+import sys
+
+receipt = int(sys.argv[1])
+try:
+    installer = subprocess.Popen(sys.argv[2:])
+    code = installer.wait()
+except BaseException:
+    code = 125
+try:
+    os.write(receipt, (str(code) + "\n").encode("ascii"))
+finally:
+    os.close(receipt)
+# Keep the session leader alive so its PID continues to pin the exact process
+# group until the bridge has cleaned every same-group descendant.
+while True:
+    signal.pause()
+"""
+
+
+def _start_activation(command: list[str]) -> tuple[subprocess.Popen[bytes], int]:
+    receipt_read, receipt_write = os.pipe()
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", _ACTIVATION_SUPERVISOR, str(receipt_write), *command],
+            start_new_session=True,
+            pass_fds=(receipt_write,),
+        )
+    except BaseException:
+        os.close(receipt_read)
+        raise
+    finally:
+        os.close(receipt_write)
+    return process, receipt_read
+
+
+def _wait_activation_receipt(process: subprocess.Popen[bytes], receipt: int, timeout: float) -> int:
+    """Read one bounded installer status while the supervisor pins the PGID."""
+    ready, _, _ = select.select([receipt], [], [], timeout)
+    if not ready:
+        raise subprocess.TimeoutExpired(process.args, timeout)
+    value = os.read(receipt, 32)
+    if not re.fullmatch(rb"-?[0-9]+\n", value):
+        raise BridgeError("Native activation returned an invalid status receipt.")
+    return int(value)
+
+
 def _stop_activation(process: subprocess.Popen[bytes]) -> str | None:
-    """Terminate the session-owned process group and reap its leader."""
+    """Terminate the owned group while its live supervisor pins the PGID."""
     failures: list[str] = []
     previous_interrupt = None
     try:
@@ -178,35 +229,33 @@ def _stop_activation(process: subprocess.Popen[bytes]) -> str | None:
         # invokes it elsewhere.
         pass
     try:
-        if process.poll() is None:
+        # The supervisor deliberately remains alive after its installer exits,
+        # pinning this exact session-owned process group. Clean same-group
+        # descendants before wait(2) releases that identity; an escaped process
+        # is outside our ownership.
+        term_sent = False
+        for owned_signal in (signal.SIGTERM, signal.SIGKILL):
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(process.pid, owned_signal)
+                term_sent = term_sent or owned_signal == signal.SIGTERM
             except ProcessLookupError:
                 pass
+            except PermissionError:
+                # Darwin reports EPERM when a process group contains only the
+                # already-signalled zombie leader. If TERM succeeded, any live
+                # same-user descendant would still make SIGKILL signalable.
+                if not (owned_signal == signal.SIGKILL and term_sent):
+                    failures.append(
+                        f"{signal.Signals(owned_signal).name} failed: permission denied"
+                    )
             except OSError as exc:
-                failures.append(f"SIGTERM failed: {exc}")
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except OSError as exc:
-                    failures.append(f"SIGKILL failed: {exc}")
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    failures.append("process group did not exit after SIGKILL")
-                except OSError as exc:
-                    failures.append(f"reap failed: {exc}")
-            except OSError as exc:
-                failures.append(f"reap failed: {exc}")
-        else:
-            try:
-                process.wait()
-            except OSError as exc:
-                failures.append(f"reap failed: {exc}")
+                failures.append(f"{signal.Signals(owned_signal).name} failed: {exc}")
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            failures.append("process group leader was not reaped after SIGKILL")
+        except OSError as exc:
+            failures.append(f"reap failed: {exc}")
     finally:
         if previous_interrupt is not None:
             signal.signal(signal.SIGINT, previous_interrupt)
@@ -236,7 +285,7 @@ def _activate_and_exec(arguments: list[str]) -> None:
         "--no-setup",
     ]
     try:
-        process = subprocess.Popen(command, start_new_session=True)
+        process, receipt = _start_activation(command)
     except OSError as exc:
         raise _activation_error(
             f"Cannot start the verified native installer ({exc})",
@@ -245,7 +294,11 @@ def _activate_and_exec(arguments: list[str]) -> None:
             None,
         ) from exc
     try:
-        return_code = process.wait(timeout=600)
+        try:
+            return_code = _wait_activation_receipt(process, receipt, 600)
+        finally:
+            if receipt >= 0:
+                os.close(receipt)
     except subprocess.TimeoutExpired as exc:
         cleanup = _stop_activation(process)
         raise _activation_error(
@@ -264,9 +317,14 @@ def _activate_and_exec(arguments: list[str]) -> None:
             bridge_prefix,
             cleanup,
         ) from exc
+    cleanup = _stop_activation(process)
+    if cleanup:
+        raise _activation_error(
+            "Native activation cleanup was not verified", root, bridge_prefix, cleanup
+        )
     if return_code:
         raise _activation_error(
-            f"Native activation exited {return_code}", root, bridge_prefix, None
+            f"Native activation exited {return_code}", root, bridge_prefix, cleanup
         )
     launcher = bin_dir / "pika"
     try:
