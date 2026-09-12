@@ -57,11 +57,11 @@ Completion requires self-score and an independent adversarial score of at least
 
 | Gate | Result |
 | --- | --- |
-| Native behavior suite | 343 tests pass on macOS arm64, including isolated real-tmux journeys, mixed-runtime compatibility, and the frozen-updater transition |
+| Native behavior suite | 343 tests pass from a Git-archive clean checkout on macOS arm64, including isolated real-tmux journeys, mixed-runtime compatibility, and the frozen-updater transition |
 | Mixed-runtime transition | Real Python v0.5.0a4 and Rust alternated SQLite hook writes; each consumed the other's fleet v2 envelopes |
 | Formatting/lint/MSRV | `cargo +1.88.0 fmt --check` and warnings-as-errors Clippy passed for all targets/features |
 | Dependency integrity | Locked license inventory reproduced exactly; RustSec scanned 157 locked crates with zero advisories after updating `time` to 0.3.47 |
-| Native packaging | Release archive, strict manifest, sidecar checksums, offline installer, installed version/help, and embedded skill verified in a disposable root |
+| Native packaging | The macOS arm64 release archive, strict manifest, sidecar, offline install, version/help, and embedded skill pass in a disposable root; relative-output structural assembly verifies all five target archive/checksum layouts |
 | Startup | p95 4.67 ms native versus 146.30 ms Python, 100 launches each |
 | Board | first-frame p95 11.41 ms versus 487.15 ms; input p95 0.143 ms versus 8.57 ms |
 | Hook | p95 14.43 ms versus 498.39 ms, 100 events each |
