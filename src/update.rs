@@ -4,6 +4,9 @@
 //! enters here only after it has an archive and an extracted candidate; this
 //! module verifies both before writing the managed installation root.
 
+use crate::consult::{
+    CancellablePipe, CancellationToken, OwnedChild, poll_owned_child, terminate_child,
+};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,7 +15,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1359,124 +1362,105 @@ fn run_candidate_bounded(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command
-        .spawn()
+    let mut child = OwnedChild::spawn(&mut command)
         .map_err(|error| UpdateError::Candidate(error.to_string()))?;
+    let stop = CancellationToken::default();
     let Some(stdout) = child.stdout.take() else {
-        terminate_candidate_tree(&mut child);
         return Err(UpdateError::Candidate(
             "candidate stdout was unavailable".into(),
         ));
     };
     let Some(stderr) = child.stderr.take() else {
-        terminate_candidate_tree(&mut child);
         return Err(UpdateError::Candidate(
             "candidate stderr was unavailable".into(),
         ));
     };
+    let stdout = CancellablePipe::new(stdout, stop.clone())?;
+    let stderr = CancellablePipe::new(stderr, stop.clone())?;
     let (sender, receiver) = mpsc::sync_channel(2);
-    fn drain_candidate_output<R: Read + Send + 'static>(
-        is_stdout: bool,
-        mut stream: R,
-        sender: mpsc::SyncSender<(bool, io::Result<Vec<u8>>)>,
-    ) {
-        let sender = sender.clone();
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let result = stream
-                .by_ref()
-                .take((MAX_CANDIDATE_OUTPUT_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .map(|_| bytes);
-            let _ = sender.send((is_stdout, result));
-        });
-    }
-    drain_candidate_output(true, stdout, sender.clone());
-    drain_candidate_output(false, stderr, sender.clone());
+    let stdout_worker = drain_candidate_output(true, stdout, sender.clone());
+    let stderr_worker = drain_candidate_output(false, stderr, sender.clone());
     drop(sender);
 
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                terminate_candidate_tree(&mut child);
-                return Err(UpdateError::Candidate(format!(
-                    "{} exceeded its {} second deadline",
-                    arguments.join(" "),
-                    timeout.as_secs_f64()
-                )));
+    let outcome = (|| {
+        let status = loop {
+            // This observes exit without reaping, kills the pinned group,
+            // then caches the reaped status. No stale numeric PGID is used.
+            match poll_owned_child(&mut child) {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    return Err(UpdateError::Candidate(format!(
+                        "{} exceeded its {} second deadline",
+                        arguments.join(" "),
+                        timeout.as_secs_f64()
+                    )));
+                }
+                Err(error) => {
+                    return Err(UpdateError::Candidate(format!(
+                        "candidate wait failed: {error}"
+                    )));
+                }
             }
-            Err(error) => {
-                terminate_candidate_tree(&mut child);
-                return Err(UpdateError::Candidate(format!(
-                    "candidate wait failed: {error}"
-                )));
+        };
+        // A descendant outside the owned group may retain a pipe. It is not
+        // ours to signal; the same probe deadline bounds waiting for its EOF.
+        let mut stdout = None;
+        let mut stderr = None;
+        while stdout.is_none() || stderr.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let (is_stdout, result) = receiver
+                .recv_timeout(remaining)
+                .map_err(|_| UpdateError::Candidate("candidate output did not close".into()))?;
+            let bytes = result.map_err(|error| UpdateError::Candidate(error.to_string()))?;
+            if bytes.len() > MAX_CANDIDATE_OUTPUT_BYTES {
+                return Err(UpdateError::Candidate(
+                    "candidate output exceeds 1 MiB".into(),
+                ));
+            }
+            if is_stdout {
+                stdout = Some(bytes);
+            } else {
+                stderr = Some(bytes);
             }
         }
-    };
-    // A validation probe has no reason to leave descendants behind. Closing
-    // the process group also guarantees inherited output pipes reach EOF.
-    terminate_candidate_tree(&mut child);
-
-    // Pipe closure is part of the same advertised probe deadline. Reuse the
-    // original deadline rather than a short post-exit grace that becomes
-    // flaky under linker/CI contention.
-    let output_deadline = deadline;
-    let mut stdout = None;
-    let mut stderr = None;
-    while stdout.is_none() || stderr.is_none() {
-        let remaining = output_deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| UpdateError::Candidate("candidate output did not close".into()))?;
-        let (is_stdout, result) = receiver
-            .recv_timeout(remaining)
-            .map_err(|_| UpdateError::Candidate("candidate output did not close".into()))?;
-        let bytes = result.map_err(|error| UpdateError::Candidate(error.to_string()))?;
-        if bytes.len() > MAX_CANDIDATE_OUTPUT_BYTES {
-            return Err(UpdateError::Candidate(
-                "candidate output exceeds 1 MiB".into(),
-            ));
-        }
-        if is_stdout {
-            stdout = Some(bytes);
-        } else {
-            stderr = Some(bytes);
-        }
+        Ok(Output {
+            status,
+            stdout: stdout.unwrap_or_default(),
+            stderr: stderr.unwrap_or_default(),
+        })
+    })();
+    let cleanup = terminate_child(&mut child);
+    stop.cancel();
+    // Unix pipes are nonblocking, so cancellation bounds these joins even
+    // when a foreign process keeps its inherited descriptor open.
+    #[cfg(unix)]
+    {
+        let _ = stdout_worker.join();
+        let _ = stderr_worker.join();
     }
-    Ok(Output {
-        status,
-        stdout: stdout.unwrap_or_default(),
-        stderr: stderr.unwrap_or_default(),
-    })
+    #[cfg(not(unix))]
+    drop((stdout_worker, stderr_worker));
+    cleanup
+        .map_err(|error| UpdateError::Candidate(format!("candidate cleanup failed: {error}")))?;
+    outcome
 }
 
-fn terminate_candidate_tree(child: &mut Child) {
-    #[cfg(unix)]
-    unsafe {
-        // `run_candidate_bounded` creates this child as its own process-group
-        // leader, so the negative PID cannot target Pika's process group.
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    #[cfg(windows)]
-    {
-        // Keep the owned root bounded on the experimental client target. The
-        // release probe itself is not allowed to delegate validation work.
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &child.id().to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+fn drain_candidate_output<R: Read + Send + 'static>(
+    is_stdout: bool,
+    mut stream: R,
+    sender: mpsc::SyncSender<(bool, io::Result<Vec<u8>>)>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stream
+            .by_ref()
+            .take((MAX_CANDIDATE_OUTPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send((is_stdout, result));
+    })
 }
 
 fn validate_install_paths(root: &Path, bin_dir: &Path) -> Result<()> {
@@ -1894,5 +1878,39 @@ mod bounded_candidate_tests {
         let (_directory, candidate) = script("dd if=/dev/zero bs=1048577 count=1 2>/dev/null");
         let error = run_candidate_bounded(&candidate, &[], Duration::from_secs(2)).unwrap_err();
         assert!(error.to_string().contains("exceeds 1 MiB"));
+    }
+
+    #[test]
+    fn candidate_probe_preserves_reaped_failure_status_and_both_streams() {
+        let (_directory, candidate) = script("printf out\nprintf err >&2\nexit 7");
+        for _ in 0..10 {
+            let output = run_candidate_bounded(&candidate, &[], Duration::from_secs(1)).unwrap();
+            assert_eq!(output.status.code(), Some(7));
+            assert_eq!(output.stdout, b"out");
+            assert_eq!(output.stderr, b"err");
+        }
+    }
+
+    #[test]
+    fn candidate_pipe_workers_cancel_without_foreign_holder_eof() {
+        use std::os::unix::net::UnixStream;
+
+        let stop = CancellationToken::default();
+        let (reader, mut held_writer) = UnixStream::pair().unwrap();
+        held_writer.write_all(b"partial").unwrap();
+        let reader = CancellablePipe::new(reader, stop.clone()).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let worker = drain_candidate_output(true, reader, sender);
+        // Simulate the output deadline expiring while a foreign process
+        // still owns a writer. No PID is needed or safe to signal here.
+        assert!(receiver.recv_timeout(Duration::from_millis(30)).is_err());
+        let started = Instant::now();
+        stop.cancel();
+        worker.join().unwrap();
+        let (is_stdout, result) = receiver.recv().unwrap();
+        assert!(is_stdout);
+        assert_eq!(result.unwrap(), b"partial");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held_writer);
     }
 }

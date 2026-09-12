@@ -273,7 +273,7 @@ fn provider_version_probes_are_bounded_and_reap_pipe_holding_descendants() {
     let healthy = temp.path().join("healthy");
     fs::write(
         &healthy,
-        "#!/bin/sh\nprintf '%s\\n' 'opencode 1.18.21'\n(sleep 5) &\n",
+        "#!/bin/sh\nprintf '%s\\n' 'opencode 1.18.21'\n/bin/sleep 5 &\nexec /usr/bin/true\n",
     )
     .unwrap();
     fs::set_permissions(&healthy, fs::Permissions::from_mode(0o700)).unwrap();
@@ -287,7 +287,7 @@ fn provider_version_probes_are_bounded_and_reap_pipe_holding_descendants() {
     assert!(started.elapsed() < Duration::from_secs(2));
 
     let stalled = temp.path().join("stalled");
-    fs::write(&stalled, "#!/bin/sh\nsleep 5\n").unwrap();
+    fs::write(&stalled, "#!/bin/sh\n/bin/sleep 5\n").unwrap();
     fs::set_permissions(&stalled, fs::Permissions::from_mode(0o700)).unwrap();
     let started = Instant::now();
     let evidence = probe_provider_executable(
@@ -297,6 +297,40 @@ fn provider_version_probes_are_bounded_and_reap_pipe_holding_descendants() {
     );
     assert!(!evidence.available);
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_version_probe_preserves_stderr_and_failure_status_after_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = temp.path().join("provider");
+    fs::write(
+        &provider,
+        "#!/bin/sh\nprintf 'codex 1.2.3\\n' >&2\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    for _ in 0..10 {
+        let evidence = probe_provider_executable(
+            Provider::Codex,
+            provider.to_str().unwrap(),
+            Duration::from_secs(1),
+        );
+        assert!(evidence.compatible());
+        assert_eq!(evidence.version.as_deref(), Some("codex 1.2.3"));
+    }
+    fs::write(
+        &provider,
+        "#!/bin/sh\nprintf 'codex 1.2.3\\n' >&2\nexit 7\n",
+    )
+    .unwrap();
+    let evidence = probe_provider_executable(
+        Provider::Codex,
+        provider.to_str().unwrap(),
+        Duration::from_secs(1),
+    );
+    assert!(!evidence.available);
+    assert_eq!(evidence.version.as_deref(), Some("codex 1.2.3"));
 }
 
 #[test]

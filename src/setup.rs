@@ -1,5 +1,6 @@
 use crate::{
     config::Config,
+    consult::{CancellablePipe, CancellationToken, OwnedChild, poll_owned_child, terminate_child},
     model::Provider,
     paths::Paths,
     store::{HookObservation, Store},
@@ -16,9 +17,6 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -266,17 +264,7 @@ pub fn probe_provider_executable(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
-    let mut child = match command.spawn() {
+    let mut child = match OwnedChild::spawn(&mut command) {
         Ok(child) => child,
         Err(_) => {
             return ProviderExecutableEvidence {
@@ -286,29 +274,59 @@ pub fn probe_provider_executable(
             };
         }
     };
-    let pid = child.id();
-    let output = child.stdout.take().map(read_probe_stream);
-    let errors = child.stderr.take().map(read_probe_stream);
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            _ => {
-                terminate_probe_group(pid);
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
+    let stop = CancellationToken::default();
+    let pipes = (|| -> std::io::Result<_> {
+        Ok((
+            CancellablePipe::new(
+                child.stdout.take().expect("stdout configured"),
+                stop.clone(),
+            )?,
+            CancellablePipe::new(
+                child.stderr.take().expect("stderr configured"),
+                stop.clone(),
+            )?,
+        ))
+    })();
+    let (stdout, stderr) = match pipes {
+        Ok(pipes) => pipes,
+        Err(_) => {
+            return ProviderExecutableEvidence {
+                available: false,
+                version: None,
+                compatibility_error: None,
+            };
         }
     };
-    let stdout = receive_probe_stream(output, pid);
-    let stderr = receive_probe_stream(errors, pid);
+    let (output, stdout_worker) = read_probe_stream(stdout);
+    let (errors, stderr_worker) = read_probe_stream(stderr);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        // The launcher stays unreaped until its process group is terminated.
+        // Repeated cleanup consults cached status, never a reusable PID/PGID.
+        match poll_owned_child(&mut child) {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            _ => break None,
+        }
+    };
+    let cleaned = terminate_child(&mut child).is_ok();
+    let stdout = receive_probe_stream(output, deadline);
+    let stderr = receive_probe_stream(errors, deadline);
+    let output_closed = stdout.is_some() && stderr.is_some();
+    stop.cancel();
+    #[cfg(unix)]
+    {
+        let _ = stdout_worker.join();
+        let _ = stderr_worker.join();
+    }
+    #[cfg(not(unix))]
+    drop((stdout_worker, stderr_worker));
     let version = [stdout, stderr]
         .into_iter()
+        .flatten()
         .find(|value| !value.trim().is_empty())
         .map(|value| sanitize_version(&value));
-    let available = status.is_some_and(|value| value.success());
+    let available = cleaned && output_closed && status.is_some_and(|value| value.success());
     let compatibility_error = if available {
         provider_compatibility_error(provider, version.as_deref())
     } else {
@@ -351,9 +369,11 @@ fn provider_compatibility_error(provider: Provider, version: Option<&str>) -> Op
     }
 }
 
-fn read_probe_stream(mut stream: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+fn read_probe_stream(
+    mut stream: impl Read + Send + 'static,
+) -> (mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
     let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         let mut retained = Vec::new();
         let mut buffer = [0_u8; 8192];
         loop {
@@ -367,38 +387,52 @@ fn read_probe_stream(mut stream: impl Read + Send + 'static) -> mpsc::Receiver<V
         }
         let _ = sender.send(retained);
     });
+    (receiver, worker)
+}
+
+fn receive_probe_stream(receiver: mpsc::Receiver<Vec<u8>>, deadline: Instant) -> Option<String> {
     receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+        .map(|value| String::from_utf8_lossy(&value).into_owned())
 }
 
-fn receive_probe_stream(receiver: Option<mpsc::Receiver<Vec<u8>>>, pid: u32) -> String {
-    let Some(receiver) = receiver else {
-        return String::new();
-    };
-    match receiver.recv_timeout(Duration::from_millis(250)) {
-        Ok(value) => String::from_utf8_lossy(&value).into_owned(),
-        Err(_) => {
-            terminate_probe_group(pid);
-            receiver
-                .recv_timeout(Duration::from_millis(250))
-                .map(|value| String::from_utf8_lossy(&value).into_owned())
-                .unwrap_or_default()
-        }
+#[cfg(all(test, unix))]
+mod probe_pipe_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn pipe_deadlines_are_shared_and_workers_cancel_without_foreign_holder_eof() {
+        let stop = CancellationToken::default();
+        let (stdout, mut held_stdout) = UnixStream::pair().unwrap();
+        let (stderr, _held_stderr) = UnixStream::pair().unwrap();
+        held_stdout.write_all(b"partial").unwrap();
+        let (stdout, stdout_worker) =
+            read_probe_stream(CancellablePipe::new(stdout, stop.clone()).unwrap());
+        let (stderr, stderr_worker) =
+            read_probe_stream(CancellablePipe::new(stderr, stop.clone()).unwrap());
+        let deadline = Instant::now() + Duration::from_millis(30);
+        assert!(receive_probe_stream(stdout, deadline).is_none());
+        let started = Instant::now();
+        assert!(receive_probe_stream(stderr, deadline).is_none());
+        // Both foreign writers are still open. Cancellation must release the
+        // readers and their threads without signalling any process.
+        stop.cancel();
+        stdout_worker.join().unwrap();
+        stderr_worker.join().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn version_stream_retention_is_bounded() {
+        let oversized = vec![b'x'; MAX_VERSION_OUTPUT_BYTES * 2];
+        let (output, worker) = read_probe_stream(std::io::Cursor::new(oversized));
+        let value = receive_probe_stream(output, Instant::now() + Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(value.len(), MAX_VERSION_OUTPUT_BYTES);
     }
 }
-
-#[cfg(unix)]
-fn terminate_probe_group(pid: u32) {
-    if let Ok(pid) = i32::try_from(pid) {
-        // SAFETY: the provider probe was placed in its own process group in
-        // `pre_exec`; the negative PID can target only that owned group.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn terminate_probe_group(_pid: u32) {}
 
 fn sanitize_version(value: &str) -> String {
     value
