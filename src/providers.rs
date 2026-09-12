@@ -222,32 +222,46 @@ impl<'a> Providers<'a> {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let mut child = match OwnedChild::spawn(&mut command) {
+        let child = match OwnedChild::spawn(&mut command) {
             Ok(child) => child,
             Err(_) => return false,
         };
-        let stop = CancellationToken::default();
-        let named = (|| {
-            let input = CancellablePipe::new(child.stdin.take()?, stop.clone()).ok()?;
-            let output = CancellablePipe::new(child.stdout.take()?, stop.clone()).ok()?;
-            let session_id = session_id.to_owned();
-            let name = name.to_owned();
-            let (sender, receiver) = mpsc::sync_channel(1);
-            std::thread::spawn(move || {
-                let result = codex_name_protocol(input, output, &session_id, &name);
-                let _ = sender.send(result.is_ok_and(|named| named));
-            });
-            receiver
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .ok()
-        })()
-        .unwrap_or(false);
-        stop.cancel();
-        // The unreaped leader pins its PGID until owned descendants are killed.
-        // Never signal the caller's group or wait for a foreign pipe holder.
-        let cleaned = terminate_child(&mut child).is_ok();
-        named && cleaned
+        finish_codex_native_name(child, session_id, name, deadline)
     }
+}
+
+fn finish_codex_native_name(
+    mut child: OwnedChild,
+    session_id: &str,
+    name: &str,
+    deadline: Instant,
+) -> bool {
+    let stop = CancellationToken::default();
+    let named = (|| {
+        // The absolute deadline includes process startup. Never begin a request
+        // if startup has already exhausted it, but still clean up the group.
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let input = CancellablePipe::new(child.stdin.take()?, stop.clone()).ok()?;
+        let output = CancellablePipe::new(child.stdout.take()?, stop.clone()).ok()?;
+        let session_id = session_id.to_owned();
+        let name = name.to_owned();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = codex_name_protocol(input, output, &session_id, &name);
+            let _ = sender.send(result.is_ok_and(|named| named));
+        });
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
+    })()
+    .unwrap_or(false);
+    stop.cancel();
+    // The unreaped leader pins its PGID until owned descendants are killed.
+    // Never signal the caller's group or wait for a foreign pipe holder.
+    let cleaned = terminate_child(&mut child).is_ok();
+    named && cleaned
 }
 
 fn codex_name_protocol(
@@ -1412,35 +1426,119 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn native_name_deadline_bounds_blocked_writes_and_kills_descendants() {
-        let temp = tempfile::tempdir().unwrap();
+    fn ready_native_name_fixture(
+        temp: &tempfile::TempDir,
+        body: &str,
+    ) -> (OwnedChild, std::os::fd::OwnedFd) {
+        use std::os::fd::AsFd;
         let pid_file = temp.path().join("descendant.pid");
         let (paths, config) = native_name_fixture(
-            &temp,
+            temp,
             &format!(
-                "sleep 30 &\nprintf '%s' \"$!\" > {}\nprintf '%s\\n' '{{\"id\":1,\"result\":{{}}}}'\nwait",
+                "sleep 30 &\nprintf '%s\\n' \"$!\" > {}\n{body}\nwait",
                 shell_words::quote(&pid_file.to_string_lossy())
             ),
         );
-        let started = Instant::now();
-        assert!(
-            !Providers::new(&paths, &config).set_codex_native_name_with_timeout(
-                "11111111-1111-4111-8111-111111111111",
-                &"x".repeat(64 * 1024),
-                Duration::from_secs(1)
-            )
-        );
-        assert!(started.elapsed() < Duration::from_secs(2));
-        let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
-        for _ in 0..100 {
-            // Signal zero only inspects our fixture child; no user process is signalled.
-            if unsafe { libc::kill(pid, 0) } == -1 {
-                return;
+        let mut command = Command::new(config.executable(Provider::Codex));
+        command
+            .args(["app-server", "--stdio"])
+            .env("CODEX_HOME", &paths.codex_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let child = OwnedChild::spawn(&mut command).unwrap();
+        let output = child
+            .stdout
+            .as_ref()
+            .unwrap()
+            .as_fd()
+            .try_clone_to_owned()
+            .unwrap();
+        // Startup scheduling is not the blocked-I/O behavior under test. Prove
+        // the fixture created its descendant before starting that deadline.
+        // Production still sets its absolute deadline before process spawn.
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+                .is_some_and(|pid| pid > 0)
+            {
+                return (child, output);
             }
+            assert!(
+                Instant::now() < ready_deadline,
+                "naming fixture never started"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
-        panic!("owned naming descendant survived cleanup");
+    }
+
+    #[cfg(unix)]
+    fn assert_naming_descendants_closed(output: &std::os::fd::OwnedFd) {
+        use std::os::fd::AsRawFd;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut descriptor = libc::pollfd {
+            fd: output.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // This pipe is inherited by both owned processes. HUP proves all
+            // writers have closed, without depending on orphan/PID reaping
+            // latency or signalling any process by a potentially recycled PID.
+            let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+            assert!(result >= 0, "failed to inspect fixture pipe");
+            if descriptor.revents & libc::POLLHUP != 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned naming descendant retained its pipe after cleanup"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_name_deadline_bounds_blocked_writes_and_kills_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let (child, output) =
+            ready_native_name_fixture(&temp, "printf '%s\\n' '{\"id\":1,\"result\":{}}'");
+        let started = Instant::now();
+        assert!(!finish_codex_native_name(
+            child,
+            "11111111-1111-4111-8111-111111111111",
+            &"x".repeat(64 * 1024),
+            started + Duration::from_secs(1)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_naming_descendants_closed(&output);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_name_expired_startup_deadline_skips_protocol_and_kills_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let request_file = temp.path().join("request");
+        let (child, output) = ready_native_name_fixture(
+            &temp,
+            &format!(
+                "IFS= read -r request && printf '%s' \"$request\" > {}",
+                shell_words::quote(&request_file.to_string_lossy())
+            ),
+        );
+        let deadline = Instant::now();
+        assert!(!finish_codex_native_name(
+            child,
+            "11111111-1111-4111-8111-111111111111",
+            "name",
+            deadline
+        ));
+        assert!(deadline.elapsed() < Duration::from_secs(1));
+        assert_naming_descendants_closed(&output);
+        assert!(!request_file.exists(), "expired operation sent a request");
     }
 
     #[cfg(unix)]
