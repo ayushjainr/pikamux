@@ -1067,6 +1067,7 @@ pub trait FleetInstallTransport: FleetTransport {
         &self,
         target: &str,
         bundle: &RemoteInstallBundle,
+        expected_node_id: Option<&str>,
     ) -> Result<String, FleetError>;
 }
 
@@ -1165,6 +1166,7 @@ impl FleetInstallTransport for SshTransport {
         &self,
         target: &str,
         bundle: &RemoteInstallBundle,
+        expected_node_id: Option<&str>,
     ) -> Result<String, FleetError> {
         if bundle.is_empty() || bundle.len() > MAX_REMOTE_INSTALL_BYTES {
             return Err(FleetError::new(
@@ -1172,18 +1174,41 @@ impl FleetInstallTransport for SshTransport {
                 "Verified remote installation bundle exceeds the safety limit",
             ));
         }
-        // All paths are created by the remote shell. No target, alias, local
-        // path or manifest value is interpolated into this fixed program.
+        // A trusted-node upgrade must prove identity on this mutation connection,
+        // not merely on a previous SSH connection that may resolve differently.
+        // Existing Python nodes already speak this hello protocol. The native
+        // coordinator validates it before sending an approval line or any archive
+        // bytes; the remote shell cannot stage or install before that approval.
         const SCRIPT: &str = "set -eu; pika_stage=$(mktemp -d /tmp/pika-remote.XXXXXXXX); trap 'rm -rf -- \"$pika_stage\"' EXIT HUP INT TERM; tar -xf - -C \"$pika_stage\"; bash \"$pika_stage/install.sh\" --bundle \"$pika_stage\" --no-setup";
+        let script = if let Some(expected) = expected_node_id {
+            if Uuid::parse_str(expected).is_err() {
+                return Err(FleetError::new(
+                    FleetErrorKind::InvalidRequest,
+                    "Invalid expected installation node identity",
+                ));
+            }
+            let hello = json!({"op":"hello", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION, "expected_node_id":expected});
+            let pika = remote_pika_command(&["_fleet".to_owned(), "--stdio".to_owned()])?;
+            format!(
+                "set -eu; printf '%s\\n' {} | ({}); IFS= read -r pika_approval; [ \"$pika_approval\" = PIKA-INSTALL-VERIFIED ] || exit 75; {SCRIPT}",
+                shell_quote(&hello.to_string()),
+                pika
+            )
+        } else {
+            // Explicit bootstrap of a missing, not-yet-trusted node has no prior
+            // immutable identity. It is separately approved and trusted afterward.
+            SCRIPT.to_owned()
+        };
         let mut command = Command::new(&self.executable);
         command.args(self.base_args(target, false)?);
-        command.args(["sh", "-c", &shell_quote(SCRIPT)]);
-        let output = run_bounded_command(
+        command.args(["sh", "-c", &shell_quote(&script)]);
+        let output = run_bounded_command_with_identity(
             &mut command,
             Some(bundle.as_bytes()),
             Duration::from_secs(900),
             MAX_STDERR_BYTES,
             MAX_STDERR_BYTES,
+            expected_node_id.map(|expected| (expected, self.overall_timeout)),
         )
         .map_err(|error| {
             if error.kind == FleetErrorKind::Unreachable {
@@ -1382,7 +1407,8 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
     }
 
     /// Install only an already verified, bounded bundle on an already trusted
-    /// node. The immutable node ID is proved on both sides of the mutation.
+    /// node. Its immutable ID is proved before, on the mutation connection, and
+    /// after installation; reconnects cannot redirect a previously approved write.
     pub fn upgrade_bundle(
         &self,
         value: &str,
@@ -1408,7 +1434,8 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 ),
             ));
         }
-        self.transport.install_bundle(&node.ssh_target, bundle)?;
+        self.transport
+            .install_bundle(&node.ssh_target, bundle, Some(&node.node_id))?;
         let installed_version = self.verify_node_identity(&node).map_err(|error| {
             if matches!(
                 error.kind,
@@ -3394,6 +3421,17 @@ fn run_bounded_command(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> Result<BoundedOutput, FleetError> {
+    run_bounded_command_with_identity(command, input, timeout, stdout_limit, stderr_limit, None)
+}
+
+fn run_bounded_command_with_identity(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    identity_guard: Option<(&str, Duration)>,
+) -> Result<BoundedOutput, FleetError> {
     if input.is_some_and(|bytes| bytes.len() > MAX_REMOTE_INSTALL_BYTES) {
         return Err(FleetError::new(
             FleetErrorKind::InvalidRequest,
@@ -3432,16 +3470,73 @@ fn run_bounded_command(
         }
     };
     let overflow = Arc::new(AtomicBool::new(false));
-    let stdout_thread = spawn_bounded_reader(stdout, stdout_limit, overflow.clone());
+    let (stdout_thread, identity_result) = if let Some((expected, guard_timeout)) = identity_guard {
+        let expected = expected.to_owned();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let overflow = overflow.clone();
+        let reader = thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            let result = read_install_identity(&mut stdout, &expected);
+            let accepted = result.is_ok();
+            let _ = sender.send(result);
+            if accepted {
+                read_bounded_output(stdout, stdout_limit, overflow)
+            } else {
+                Vec::new()
+            }
+        });
+        (reader, Some((receiver, Instant::now() + guard_timeout)))
+    } else {
+        (
+            spawn_bounded_reader(stdout, stdout_limit, overflow.clone()),
+            None,
+        )
+    };
     let stderr_thread = spawn_bounded_reader(stderr, stderr_limit, overflow.clone());
     let (write_sender, write_result) = mpsc::sync_channel(1);
     let input = input.map(<[u8]>::to_vec);
+    let writer_stop = stop.clone();
     let writer_thread = thread::spawn(move || {
-        let result = input
-            .as_deref()
-            .map_or(Ok(()), |bytes| stdin.write_all(bytes))
-            .and_then(|_| stdin.flush())
-            .map_err(|error| error.to_string());
+        let result = (|| -> Result<(), FleetError> {
+            if let Some((identity_result, deadline)) = identity_result {
+                loop {
+                    if writer_stop.is_cancelled() || Instant::now() >= deadline {
+                        return Err(FleetError::new(
+                            FleetErrorKind::Quarantined,
+                            "Remote installation identity was not verified before the deadline; nothing installed",
+                        ));
+                    }
+                    match identity_result.recv_timeout(Duration::from_millis(10)) {
+                        Ok(result) => {
+                            result?;
+                            break;
+                        }
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Err(FleetError::new(
+                                FleetErrorKind::Quarantined,
+                                "Remote installation identity reader stopped; nothing installed",
+                            ));
+                        }
+                    }
+                }
+                stdin
+                    .write_all(b"PIKA-INSTALL-VERIFIED\n")
+                    .map_err(|error| {
+                        FleetError::new(FleetErrorKind::Unreachable, error.to_string())
+                    })?;
+            }
+            input
+                .as_deref()
+                .map_or(Ok(()), |bytes| stdin.write_all(bytes))
+                .and_then(|_| stdin.flush())
+                .map_err(|error| {
+                    FleetError::new(
+                        FleetErrorKind::Unreachable,
+                        format!("SSH input write failed: {error}"),
+                    )
+                })
+        })();
         // Dropping stdin is part of the protocol: remote readers waiting for
         // EOF must be able to proceed before Pika waits for process exit.
         drop(stdin);
@@ -3453,10 +3548,7 @@ fn run_bounded_command(
             match write_result.try_recv() {
                 Ok(Ok(())) => write_complete = true,
                 Ok(Err(error)) => {
-                    break Err(FleetError::new(
-                        FleetErrorKind::Unreachable,
-                        format!("SSH input write failed: {error}"),
-                    ));
+                    break Err(error);
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     break Err(FleetError::new(
@@ -3525,24 +3617,56 @@ fn kill_reap(child: &mut OwnedChild) {
 }
 
 fn spawn_bounded_reader<R: Read + Send + 'static>(
-    mut reader: R,
+    reader: R,
     limit: usize,
     overflow: Arc<AtomicBool>,
 ) -> thread::JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut result = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) | Err(_) => return result,
-                Ok(count) if result.len().saturating_add(count) > limit => {
-                    overflow.store(true, Ordering::Relaxed);
-                    return result;
-                }
-                Ok(count) => result.extend_from_slice(&chunk[..count]),
+    thread::spawn(move || read_bounded_output(reader, limit, overflow))
+}
+
+fn read_install_identity<R: BufRead>(reader: &mut R, expected: &str) -> Result<(), FleetError> {
+    let mut line = Vec::new();
+    let state = read_bounded_line(reader, &mut line, MAX_STDERR_BYTES).map_err(|error| {
+        FleetError::new(
+            FleetErrorKind::Quarantined,
+            format!("Remote installation identity could not be read; nothing installed: {error}"),
+        )
+    })?;
+    if state != (BoundedLine::Complete { overflow: false }) {
+        return Err(FleetError::new(
+            FleetErrorKind::Incompatible,
+            "Remote installation identity response was incomplete or oversized; nothing installed",
+        ));
+    }
+    let value: Value = serde_json::from_slice(&line).map_err(|_| {
+        FleetError::new(
+            FleetErrorKind::Incompatible,
+            "Remote installation identity response was not JSON; nothing installed",
+        )
+    })?;
+    if value.get("type").and_then(Value::as_str) == Some("error") {
+        return Err(FleetError::new(
+            parse_error_kind(value.get("kind").and_then(Value::as_str)),
+            "Remote rejected the installation identity check; nothing installed",
+        ));
+    }
+    validate_hello(&value, None, Some(expected))?;
+    Ok(())
+}
+
+fn read_bounded_output<R: Read>(mut reader: R, limit: usize, overflow: Arc<AtomicBool>) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => return result,
+            Ok(count) if result.len().saturating_add(count) > limit => {
+                overflow.store(true, Ordering::Relaxed);
+                return result;
             }
+            Ok(count) => result.extend_from_slice(&chunk[..count]),
         }
-    })
+    }
 }
 fn spawn_jsonl_reader<R: Read + Send + 'static>(
     reader: R,

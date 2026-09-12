@@ -167,9 +167,11 @@ fn hello(id: &str, version: &str) -> Value {
     })
 }
 
+type RecordedInstall = (String, Vec<u8>, Option<String>);
+
 struct UpgradeTransport {
     responses: Mutex<Vec<Value>>,
-    installs: Mutex<Vec<(String, Vec<u8>)>>,
+    installs: Mutex<Vec<RecordedInstall>>,
 }
 
 impl FleetTransport for &UpgradeTransport {
@@ -201,11 +203,13 @@ impl FleetInstallTransport for &UpgradeTransport {
         &self,
         target: &str,
         bundle: &pikamux::update::RemoteInstallBundle,
+        expected_node_id: Option<&str>,
     ) -> Result<String, FleetError> {
-        self.installs
-            .lock()
-            .unwrap()
-            .push((target.into(), bundle.as_bytes().to_vec()));
+        self.installs.lock().unwrap().push((
+            target.into(),
+            bundle.as_bytes().to_vec(),
+            expected_node_id.map(str::to_owned),
+        ));
         Ok("installed".into())
     }
 }
@@ -938,7 +942,8 @@ fn fleet_upgrade_proves_the_same_node_before_and_after_install() {
         transport.installs.lock().unwrap().as_slice(),
         &[(
             "research-node.example".to_owned(),
-            remote.as_bytes().to_vec()
+            remote.as_bytes().to_vec(),
+            Some(node_id.to_owned())
         )]
     );
 }
@@ -1001,7 +1006,7 @@ fn ssh_remote_install_keeps_payload_on_stdin_and_command_fixed() {
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
     let transport = SshTransport::new(&ssh, Duration::from_secs(1), Duration::from_secs(5));
     let detail = transport
-        .install_bundle("research-node.example", &remote)
+        .install_bundle("research-node.example", &remote, None)
         .unwrap();
     assert_eq!(detail, "installed");
     assert_eq!(fs::read(payload).unwrap(), remote.as_bytes());
@@ -1014,6 +1019,158 @@ fn ssh_remote_install_keeps_payload_on_stdin_and_command_fixed() {
     );
     assert!(arguments.contains("--no-setup"));
     assert!(!arguments.contains(temp.path().to_string_lossy().as_ref()));
+}
+
+fn isolated_install_ssh(temp: &Path, expected: &str, mutation_node: &str) -> PathBuf {
+    let bin = temp.join("remote-bin");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir(temp.join("home")).unwrap();
+    let ssh = temp.join("ssh");
+    fs::write(
+        &ssh,
+        r##"#!/bin/sh
+set -eu
+base=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export HOME="$base/home" XDG_CONFIG_HOME="$base/home/config" XDG_DATA_HOME="$base/home/data" XDG_CACHE_HOME="$base/home/cache" PIKA_DB="$base/home/state.db" CODEX_HOME="$base/home/codex" CLAUDE_CONFIG_DIR="$base/home/claude" OPENCODE_CONFIG_DIR="$base/home/opencode"
+export PATH="$base/remote-bin:/usr/bin:/bin"
+case "$*" in *pika_stage=*) export PIKA_TEST_INSTALL_CONNECTION=1 ;; esac
+while [ "$#" -gt 0 ]; do
+    case "$1" in -T|-tt) shift ;; -o) shift 2 ;; *) shift; break ;; esac
+done
+exec /bin/sh -c "$*"
+"##,
+    )
+    .unwrap();
+    fs::write(
+        bin.join("pika"),
+        format!(
+            "#!/bin/sh\nif [ \"${{PIKA_TEST_INSTALL_CONNECTION:-}}\" = 1 ]; then printf '%s\\n' '{}'; else printf '%s\\n' '{}'; fi\n",
+            hello(mutation_node, "0.5.0a4"),
+            hello(expected, "0.5.0a4")
+        ),
+    )
+    .unwrap();
+    fs::write(
+        bin.join("uname"),
+        format!(
+            "#!/bin/sh\ncase \"$1\" in -s) printf '%s\\n' '{}' ;; -m) printf '%s\\n' '{}' ;; esac\n",
+            if cfg!(target_os = "macos") { "Darwin" } else { "Linux" },
+            if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" },
+        ),
+    )
+    .unwrap();
+    fs::write(
+        bin.join("mktemp"),
+        "#!/bin/sh\nbase=$(dirname \"$0\")/..\nprintf 'mktemp\\n' >> \"$base/mutations\"\nmkdir \"$base/stage\"\nprintf '%s\\n' \"$base/stage\"\n",
+    )
+    .unwrap();
+    fs::write(
+        bin.join("tar"),
+        "#!/bin/sh\nbase=$(dirname \"$0\")/..\nprintf 'tar\\n' >> \"$base/mutations\"\ncat > \"$base/payload\"\n",
+    )
+    .unwrap();
+    fs::write(
+        bin.join("bash"),
+        "#!/bin/sh\nbase=$(dirname \"$0\")/..\nprintf 'install\\n' >> \"$base/mutations\"\nprintf installed\n",
+    )
+    .unwrap();
+    for executable in [
+        &ssh,
+        &bin.join("pika"),
+        &bin.join("uname"),
+        &bin.join("mktemp"),
+        &bin.join("tar"),
+        &bin.join("bash"),
+    ] {
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    ssh
+}
+
+#[test]
+fn remote_upgrade_identity_is_bound_to_the_mutation_connection_before_any_write() {
+    let temp = tempfile::tempdir().unwrap();
+    let version = "0.6.0-alpha.1";
+    let bundle = release_bundle(temp.path(), version);
+    let remote =
+        prepare_remote_install_bundle(&bundle, native_target().unwrap(), Some(version)).unwrap();
+    let expected = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let changed = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let ssh = isolated_install_ssh(temp.path(), expected, changed);
+    let store = Store::at(temp.path().join("state.db"));
+    store.initialize().unwrap();
+    store
+        .upsert_fleet_node(&fleet_node(expected, "0.5.0a4"))
+        .unwrap();
+    let transport = SshTransport::new(ssh, Duration::from_secs(1), Duration::from_secs(5));
+    let error = FleetManager::new(&store, transport)
+        .upgrade_bundle("research-node", &remote)
+        .unwrap_err();
+    assert_eq!(error.kind.as_str(), "quarantined");
+    assert!(
+        !temp.path().join("mutations").exists(),
+        "even the remote staging directory must wait for exact identity proof"
+    );
+    assert!(
+        !temp.path().join("payload").exists(),
+        "the archive must not be sent to a different node"
+    );
+    assert_eq!(
+        store
+            .get_fleet_node(expected)
+            .unwrap()
+            .unwrap()
+            .package_version
+            .as_deref(),
+        Some("0.5.0a4")
+    );
+}
+
+#[test]
+fn remote_upgrade_same_connection_accepts_a_verified_node_and_preserves_archive_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let version = "0.6.0-alpha.1";
+    let bundle = release_bundle(temp.path(), version);
+    let remote =
+        prepare_remote_install_bundle(&bundle, native_target().unwrap(), Some(version)).unwrap();
+    let expected = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let ssh = isolated_install_ssh(temp.path(), expected, expected);
+    let transport = SshTransport::new(ssh, Duration::from_secs(1), Duration::from_secs(5));
+    assert_eq!(
+        transport
+            .install_bundle("research-node.example", &remote, Some(expected))
+            .unwrap(),
+        "installed"
+    );
+    assert_eq!(
+        fs::read(temp.path().join("payload")).unwrap(),
+        remote.as_bytes()
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("mutations")).unwrap(),
+        "mktemp\ntar\ninstall\n"
+    );
+}
+
+#[test]
+fn remote_upgrade_stalled_identity_is_bounded_and_never_receives_install_approval() {
+    let temp = tempfile::tempdir().unwrap();
+    let version = "0.6.0-alpha.1";
+    let bundle = release_bundle(temp.path(), version);
+    let remote =
+        prepare_remote_install_bundle(&bundle, native_target().unwrap(), Some(version)).unwrap();
+    let expected = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let ssh = isolated_install_ssh(temp.path(), expected, expected);
+    fs::write(temp.path().join("remote-bin/pika"), "#!/bin/sh\nsleep 30\n").unwrap();
+    let transport = SshTransport::new(ssh, Duration::from_secs(1), Duration::from_millis(100));
+    let started = std::time::Instant::now();
+    let error = transport
+        .install_bundle("research-node.example", &remote, Some(expected))
+        .unwrap_err();
+    assert_eq!(error.kind.as_str(), "quarantined");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(!temp.path().join("mutations").exists());
+    assert!(!temp.path().join("payload").exists());
 }
 
 #[test]
