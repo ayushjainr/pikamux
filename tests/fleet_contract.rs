@@ -900,7 +900,9 @@ fn snapshot_request_cancellation_joins_and_kills_owned_descendants() {
     let worker = std::thread::spawn(move || {
         transport.request_cancellable("atlas", &json!({"op":"snapshot"}), false, &worker_token)
     });
-    for _ in 0..100 {
+    // Process creation can be delayed on loaded CI hosts; this only waits for
+    // the fixture to exist and does not weaken the cancellation deadline below.
+    for _ in 0..500 {
         if owned_pid.is_file() {
             break;
         }
@@ -914,7 +916,9 @@ fn snapshot_request_cancellation_joins_and_kills_owned_descendants() {
     assert!(cancelled_at.elapsed() < Duration::from_secs(1));
 
     let pid: i32 = fs::read_to_string(&owned_pid).unwrap().parse().unwrap();
-    for _ in 0..50 {
+    // A killed grandchild may briefly remain as an init-owned zombie. Two
+    // seconds still distinguishes cleanup from the fixture's 30-second sleep.
+    for _ in 0..200 {
         // SAFETY: signal zero only probes the exact disposable fixture descendant.
         if unsafe { libc::kill(pid, 0) } != 0 {
             return;
