@@ -205,11 +205,79 @@ if bridge.is_file():
         if hashlib.sha256(data).hexdigest() != value["sha256"]:
             fail("bridge wheel checksum mismatch")
         with zipfile.ZipFile(wheel_path) as wheel:
-            listed = wheel.namelist()
+            infos = wheel.infolist()
+            listed = [info.filename for info in infos]
             names = set(listed)
             if len(names) != len(listed):
                 fail("bridge wheel contains duplicate member names")
-            for info in wheel.infolist():
+            embedded = "pikamux_bridge/native/"
+            archive_pattern = re.compile(
+                rf"^{re.escape(embedded)}pikamux-"
+                r"(?P<native>\d+\.\d+\.\d+(?:(?:a|b|rc)\d+|-(?:alpha|beta|rc)\.\d+)?)"
+                r"-(?P<target>aarch64-apple-darwin|x86_64-apple-darwin|"
+                r"aarch64-unknown-linux-musl|x86_64-unknown-linux-musl)\.tar\.gz"
+                r"(?P<sidecar>\.sha256)?$"
+            )
+            native_versions = set()
+            mapped = {}
+            for name in names:
+                match = archive_pattern.fullmatch(name)
+                if match:
+                    native_versions.add(match.group("native"))
+                    key = (match.group("target"), bool(match.group("sidecar")))
+                    if key in mapped:
+                        fail("bridge wheel has duplicate native target payloads")
+                    mapped[key] = name
+            if len(native_versions) != 1 or set(mapped) != {
+                (target, sidecar) for target in bridge_targets for sidecar in (False, True)
+            }:
+                fail("bridge wheel has an invalid native payload set")
+            wheel_native_version = next(iter(native_versions))
+            dist = f"pikamux-{version}.dist-info"
+            expected_names = {
+                "pikamux_bridge/__init__.py",
+                "pikamux_bridge/cli.py",
+                "pikamux_bridge/agent-convo/SKILL.md",
+                embedded + "install.sh",
+                embedded + "pika-version",
+                embedded + "pika-native-release.json",
+                embedded + "LICENSE",
+                embedded + "THIRD_PARTY.md",
+                f"{dist}/LICENSE",
+                f"{dist}/THIRD_PARTY.md",
+                f"{dist}/METADATA",
+                f"{dist}/WHEEL",
+                f"{dist}/entry_points.txt",
+                f"{dist}/RECORD",
+                *mapped.values(),
+            }
+            if names != expected_names:
+                extra = sorted(names - expected_names)
+                missing = sorted(expected_names - names)
+                fail(
+                    "bridge wheel member allowlist mismatch"
+                    + (f"; extra: {', '.join(extra)}" if extra else "")
+                    + (f"; missing: {', '.join(missing)}" if missing else "")
+                )
+
+            def wheel_member_limit(name):
+                if name in mapped.values() and not name.endswith(".sha256"):
+                    return 20 * 1024 * 1024
+                if name.endswith(".sha256") or name.endswith("/pika-version"):
+                    return 256
+                if name.endswith("/pika-native-release.json"):
+                    return 64 * 1024
+                if name.endswith(("/LICENSE", "/THIRD_PARTY.md")):
+                    return 2 * 1024 * 1024
+                if name.endswith("/RECORD"):
+                    return 1024 * 1024
+                if name.endswith(("/__init__.py", "/METADATA", "/WHEEL", "/entry_points.txt")):
+                    return 256 * 1024
+                return 2 * 1024 * 1024
+
+            compressed_total = 0
+            expanded_total = 0
+            for info in infos:
                 parts = Path(info.filename).parts
                 mode = (info.external_attr >> 16) & 0o170000
                 if (
@@ -217,22 +285,22 @@ if bridge.is_file():
                     or info.filename.startswith(("/", "\\"))
                     or "\\" in info.filename
                     or ".." in parts
-                    or mode == 0o120000
+                    or info.is_dir()
+                    or mode != 0o100000
+                    or info.flag_bits & 1
+                    or info.compress_type != zipfile.ZIP_DEFLATED
                 ):
                     fail(f"unsafe bridge wheel member: {info.filename}")
-            embedded = "pikamux_bridge/native/"
-            required = {
-                "pikamux_bridge/agent-convo/SKILL.md",
-                embedded + "install.sh",
-                embedded + "pika-version",
-                embedded + "pika-native-release.json",
-                embedded + "LICENSE",
-                embedded + "THIRD_PARTY.md",
-                f"pikamux-{version}.dist-info/LICENSE",
-                f"pikamux-{version}.dist-info/THIRD_PARTY.md",
-            }
-            if not required.issubset(names):
-                fail("bridge has no embedded native manifest")
+                limit = wheel_member_limit(info.filename)
+                if info.file_size <= 0 or info.file_size > limit:
+                    fail(f"bridge wheel member exceeds its size limit: {info.filename}")
+                compressed_total += info.compress_size
+                expanded_total += info.file_size
+            if compressed_total > 64 * 1024 * 1024:
+                fail("bridge wheel compressed members exceed 64 MiB")
+            if expanded_total > 96 * 1024 * 1024:
+                fail("bridge wheel expands beyond 96 MiB")
+
             for name in ("LICENSE", "THIRD_PARTY.md"):
                 expected_notice = (source / name).read_bytes()
                 if wheel.read(embedded + name) != expected_notice:
@@ -256,6 +324,8 @@ if bridge.is_file():
             )
             if payload["channel"] != expected_channel:
                 fail("embedded native channel/version mismatch")
+            if native_version != wheel_native_version:
+                fail("embedded native version does not match wheel member names")
             if set(payload["artifacts"]) != bridge_targets:
                 fail("bridge does not embed every supported native target")
             for target, artifact in payload["artifacts"].items():

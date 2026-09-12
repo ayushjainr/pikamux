@@ -27,11 +27,18 @@ The updater downloads only constructed URLs beneath the Pika GitHub release
 path. API-provided URLs and manifest-provided paths are ignored. Manifests,
 release listings and artifacts have hard size bounds. Target, filename, declared
 size, sidecar checksum and manifest checksum must all agree before extraction.
+Offline bundle files must be regular, non-symlink entries within the same bounds;
+bounded streaming copies them into an owned scratch directory only after those
+checks, and partial copies are removed on every failure.
 Every native archive contains exactly the executable, `LICENSE`, and
 `THIRD_PARTY.md`; all are regular, bounded files. Publication verification
 requires both notices to match the audited source exactly. Installation and
 rollback bind retained notices byte-for-byte to their own checksum-verified
 archive, so an older valid release survives later dependency-notice changes.
+The hidden activation boundary re-extracts that verified archive and compares
+the supplied and running executable bytes before any candidate probe or managed
+write. SIGINT and SIGTERM cancel and reap the exact archive/candidate subprocess
+group before returning the conventional 130 or 143 status.
 
 ## One-time Python bridge
 
@@ -52,6 +59,10 @@ the built wheel in a disposable managed environment, then proves first-use
 native activation. The wheel embeds all four supported Mac/Linux archives and
 fails closed on an unsupported host; it never labels one platform binary as
 universal. It remains a transition envelope, not a second implementation.
+Publication accepts only the exact generated wheel member set. Member count,
+type, encryption and compression flags, per-member compressed/expanded sizes,
+and aggregate expansion are checked before any member is read; extra Python,
+`.pth`, duplicate, link, and high-ratio payloads fail closed.
 
 ## Release assets
 
@@ -150,6 +161,9 @@ atomic symlink swap. A process interruption or power loss therefore recovers to
 either the prior release or the fully persisted new release. Failure leaves the
 prior launcher usable. Downgrades and changed bytes under an existing version are
 refused. Old releases remain available for running callbacks and rollback.
+Every existing component Pika trusts beneath the managed root, plus its public
+launcher symlink, must be owned by the current effective user; foreign-owned
+components are rejected before validation, activation, or rollback.
 
 Managed native activation and `pika update` do not open Pika's state database,
 scan provider histories, modify hooks or skills, run setup, restart agents, or

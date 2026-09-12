@@ -130,7 +130,10 @@ def main(argv: list[str]) -> int:
             for name, data in sorted(files.items()):
                 info = zipfile.ZipInfo(name, (2020, 1, 1, 0, 0, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
-                info.external_attr = 0o644 << 16
+                # Encode an explicit regular-file type, not only permission
+                # bits, so the publication verifier can reject links and
+                # special members without ambiguity.
+                info.external_attr = 0o100644 << 16
                 wheel.writestr(info, data, compresslevel=9)
         if temporary.stat().st_size > MAX_WHEEL_BYTES:
             fail("universal bridge wheel exceeds the frozen updater's 64 MiB limit")

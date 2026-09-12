@@ -776,7 +776,7 @@ fn bad_checksum_or_candidate_writes_nothing() {
             root: &root,
             bin_dir: &bin,
         }),
-        Err(UpdateError::Candidate(_))
+        Err(UpdateError::Safety(_))
     ));
     assert!(!root.exists());
 }

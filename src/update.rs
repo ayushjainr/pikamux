@@ -20,6 +20,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,6 +60,8 @@ pub enum UpdateError {
     Candidate(String),
     #[error("release lookup failed: {0}")]
     ReleaseLookup(String),
+    #[error("installation interrupted by signal {0}; nothing further was activated")]
+    Interrupted(i32),
     #[error(
         "this copy is not the active installer-managed Pika; update it with its original installation method"
     )]
@@ -513,6 +517,8 @@ pub fn discover_managed_install(executable: &Path) -> Result<ManagedInstallation
     if bin.file_name().and_then(|name| name.to_str()) != Some("bin") {
         return Err(UpdateError::Unmanaged);
     }
+    validate_path_owner(&executable).map_err(|_| UpdateError::Unmanaged)?;
+    validate_path_owner(bin).map_err(|_| UpdateError::Unmanaged)?;
     let release_dir = bin.parent().ok_or(UpdateError::Unmanaged)?.to_path_buf();
     let receipt = current_receipt(&release_dir)
         .map_err(|_| UpdateError::Unmanaged)?
@@ -522,6 +528,7 @@ pub fn discover_managed_install(executable: &Path) -> Result<ManagedInstallation
         normalized_install_path(&receipt.bin_dir, false).map_err(|_| UpdateError::Unmanaged)?;
     initialize_or_validate_root(&root, true).map_err(|_| UpdateError::Unmanaged)?;
     let releases = root.join("releases");
+    validate_current(&root.join("current"), &releases).map_err(|_| UpdateError::Unmanaged)?;
     if release_dir.parent() != Some(releases.as_path())
         || root
             .join("current")
@@ -583,10 +590,15 @@ pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
         }
         let source_path = bundle.join(&artifact.file);
         let sidecar_path = bundle.join(format!("{}.sha256", artifact.file));
-        let source = checked_regular_file(&source_path)?;
         verify_sidecar(&sidecar_path, artifact)?;
+        verify_artifact(&source_path, artifact)?;
         let copy = scratch.path.join(&artifact.file);
-        fs::copy(source, &copy)?;
+        copy_regular_bounded(
+            &source_path,
+            &copy,
+            artifact.bytes,
+            "native release archive",
+        )?;
         verify_artifact(&copy, artifact)?;
         (manifest, copy)
     } else {
@@ -765,6 +777,7 @@ fn validate_retained_release(
     bin_dir: &Path,
     target: &str,
 ) -> Result<(String, PathBuf)> {
+    validate_path_owner(release_dir)?;
     let canonical = release_dir.canonicalize()?;
     if canonical.parent() != Some(root.join("releases").canonicalize()?.as_path()) {
         return Err(UpdateError::Safety(
@@ -784,6 +797,7 @@ fn validate_retained_release(
         ));
     }
     let bundle = canonical.join("bundle");
+    validate_path_owner(&bundle)?;
     let manifest = read_manifest_file(&bundle.join(NATIVE_MANIFEST_FILE))?;
     if manifest.version != receipt.version {
         return Err(UpdateError::Safety(
@@ -862,12 +876,14 @@ fn already_current(managed: &ManagedInstallation) -> UpdateOutcome {
 }
 
 fn read_manifest_file(path: &Path) -> Result<ReleaseManifest> {
-    let path = checked_regular_file(path)?;
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > MAX_MANIFEST_BYTES as u64 {
-        return Err(UpdateError::Manifest("manifest exceeds 64 KiB".into()));
-    }
-    ReleaseManifest::parse(&fs::read(path)?)
+    let bytes = read_regular_bounded(path, MAX_MANIFEST_BYTES as u64, "release manifest")?;
+    ReleaseManifest::parse(&bytes)
+}
+
+/// Read one local release manifest through the same regular-file and size
+/// boundary used by update bundles.
+pub fn read_release_manifest(path: &Path) -> Result<ReleaseManifest> {
+    read_manifest_file(path)
 }
 
 fn checked_bundle(path: &Path) -> Result<PathBuf> {
@@ -932,15 +948,17 @@ pub fn prepare_remote_install_bundle(
 
     let version_path = bundle.join("pika-version");
     checked_regular_file(&version_path)?;
-    let version = fs::read_to_string(&version_path)?;
+    let version = String::from_utf8(read_regular_bounded(&version_path, 128, "pika-version")?)
+        .map_err(|_| UpdateError::Safety("pika-version is not UTF-8".into()))?;
     if version.lines().count() != 1 || version.trim() != manifest.version {
         return Err(UpdateError::Safety(
             "remote bundle has an invalid pika-version file".into(),
         ));
     }
     let installer_path = bundle.join("install.sh");
-    checked_regular_file(&installer_path)?;
-    if fs::read(&installer_path)? != include_bytes!("../scripts/install.sh") {
+    if read_regular_bounded(&installer_path, 1024 * 1024, "bundle installer")?
+        != include_bytes!("../scripts/install.sh")
+    {
         return Err(UpdateError::Safety(
             "remote bundle installer does not match this Pika release".into(),
         ));
@@ -953,6 +971,36 @@ pub fn prepare_remote_install_bundle(
     validate_notice_file(&bundle.join("LICENSE"), &notices.license)?;
     validate_notice_file(&bundle.join("THIRD_PARTY.md"), &notices.third_party)?;
 
+    // Freeze the validated semantic payload in an owned directory. The
+    // caller-controlled bundle is never handed to tar, so a replacement race
+    // cannot substitute installer or notice bytes after validation.
+    let transport = ScratchDirectory::new("pika-remote-bundle")?;
+    copy_regular_bounded(
+        &artifact_path,
+        &transport.path.join(&artifact.file),
+        artifact.bytes,
+        "native release archive",
+    )?;
+    fs::write(
+        transport.path.join(NATIVE_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| UpdateError::Manifest(error.to_string()))?,
+    )?;
+    fs::write(
+        transport.path.join(format!("{}.sha256", artifact.file)),
+        format!("{}\n", artifact.sha256),
+    )?;
+    fs::write(
+        transport.path.join("pika-version"),
+        format!("{}\n", manifest.version),
+    )?;
+    fs::write(
+        transport.path.join("install.sh"),
+        include_bytes!("../scripts/install.sh"),
+    )?;
+    fs::write(transport.path.join("LICENSE"), &notices.license)?;
+    fs::write(transport.path.join("THIRD_PARTY.md"), &notices.third_party)?;
+
     let names = [
         "install.sh".to_owned(),
         "pika-version".to_owned(),
@@ -962,16 +1010,19 @@ pub fn prepare_remote_install_bundle(
         "LICENSE".to_owned(),
         "THIRD_PARTY.md".to_owned(),
     ];
-    let output = Command::new("tar")
-        .args(["-cf", "-", "-C"])
-        .arg(&bundle)
-        .args(&names)
-        .output()
-        .map_err(|error| {
-            UpdateError::ReleaseLookup(format!("cannot prepare remote bundle: {error}"))
-        })?;
-    checked_command(&output, "remote bundle preparation")?;
     let limit = MAX_ARTIFACT_BYTES as usize + 3 * 1024 * 1024;
+    let mut command = Command::new("tar");
+    command
+        .args(["-cf", "-", "-C"])
+        .arg(&transport.path)
+        .args(&names);
+    let output = run_command_bounded(
+        command,
+        ARCHIVE_OPERATION_TIMEOUT,
+        limit,
+        "remote bundle preparation",
+    )?;
+    checked_command(&output, "remote bundle preparation")?;
     if output.stdout.is_empty() || output.stdout.len() > limit {
         return Err(UpdateError::Safety(
             "remote installation payload exceeds the safety limit".into(),
@@ -1086,13 +1137,107 @@ fn checked_regular_file(path: &Path) -> Result<&Path> {
     Ok(path)
 }
 
-fn verify_sidecar(path: &Path, artifact: &ReleaseArtifact) -> Result<()> {
-    let path = checked_regular_file(path)?;
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > 256 {
+#[cfg(unix)]
+fn open_regular_read(path: &Path, description: &str) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            UpdateError::Safety(format!(
+                "cannot open {description} as a regular file: {error}"
+            ))
+        })?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(UpdateError::Safety(format!(
+            "{description} must be a regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_regular_read(path: &Path, description: &str) -> Result<File> {
+    checked_regular_file(path)?;
+    File::open(path).map_err(|error| {
+        UpdateError::Safety(format!(
+            "cannot open {description} as a regular file: {error}"
+        ))
+    })
+}
+
+fn read_regular_bounded(path: &Path, limit: u64, description: &str) -> Result<Vec<u8>> {
+    let mut file = open_regular_read(path, description)?;
+    let metadata = file.metadata()?;
+    if metadata.len() == 0 || metadata.len() > limit {
+        return Err(UpdateError::Safety(format!(
+            "{description} has an invalid size: {}",
+            path.display()
+        )));
+    }
+    let capacity = usize::try_from(metadata.len()).map_err(|_| {
+        UpdateError::Safety(format!("{description} exceeds this platform's size limit"))
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    Read::by_ref(&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > limit {
+        return Err(UpdateError::Safety(format!(
+            "{description} changed while it was being read; nothing activated"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn copy_regular_bounded(
+    source: &Path,
+    destination: &Path,
+    exact_bytes: u64,
+    description: &str,
+) -> Result<()> {
+    if exact_bytes == 0 || exact_bytes > MAX_ARTIFACT_BYTES {
+        return Err(UpdateError::Safety(format!(
+            "{description} has an invalid declared size"
+        )));
+    }
+    let mut input = open_regular_read(source, description)?;
+    if input.metadata()?.len() != exact_bytes {
         return Err(UpdateError::ChecksumMismatch);
     }
-    let value = fs::read_to_string(path)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let copied = io::copy(
+        &mut Read::by_ref(&mut input).take(exact_bytes + 1),
+        &mut output,
+    );
+    let result = match copied {
+        Ok(bytes) if bytes == exact_bytes => {
+            output.sync_all()?;
+            Ok(())
+        }
+        Ok(_) => Err(UpdateError::Safety(format!(
+            "{description} changed while it was being copied; nothing activated"
+        ))),
+        Err(error) => Err(UpdateError::Io(error)),
+    };
+    if result.is_err() {
+        drop(output);
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+fn verify_sidecar(path: &Path, artifact: &ReleaseArtifact) -> Result<()> {
+    let value = String::from_utf8(
+        read_regular_bounded(path, 256, "artifact checksum")
+            .map_err(|_| UpdateError::ChecksumMismatch)?,
+    )
+    .map_err(|_| UpdateError::ChecksumMismatch)?;
     if value.lines().count() != 1 || value.trim() != artifact.sha256 {
         return Err(UpdateError::ChecksumMismatch);
     }
@@ -1350,7 +1495,7 @@ struct CurrentReceipt {
 pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
     let normalized_root = normalized_install_path(request.root, true)?;
     let normalized_bin_dir = normalized_install_path(request.bin_dir, false)?;
-    let request = InstallRequest {
+    let unbound_request = InstallRequest {
         manifest: request.manifest,
         target: request.target,
         artifact: request.artifact,
@@ -1358,16 +1503,18 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
         root: &normalized_root,
         bin_dir: &normalized_bin_dir,
     };
-    request.manifest.validate()?;
+    unbound_request.manifest.validate()?;
     let local_target = native_target()?;
-    if request.target != local_target {
+    if unbound_request.target != local_target {
         return Err(UpdateError::Safety(format!(
             "artifact target {} does not match this machine ({local_target})",
-            request.target
+            unbound_request.target
         )));
     }
-    let release_artifact = request.manifest.artifact_for(request.target)?;
-    let artifact_file = request
+    let release_artifact = unbound_request
+        .manifest
+        .artifact_for(unbound_request.target)?;
+    let artifact_file = unbound_request
         .artifact
         .file_name()
         .and_then(|name| name.to_str())
@@ -1377,7 +1524,33 @@ pub fn install_staged(request: InstallRequest<'_>) -> Result<InstallOutcome> {
             "artifact filename does not match manifest".into(),
         ));
     }
-    verify_artifact(request.artifact, release_artifact)?;
+    verify_artifact(unbound_request.artifact, release_artifact)?;
+
+    // The archive checksum is the installation trust boundary. Re-extract it
+    // here from an owned byte-for-byte copy, even if an outer installer already
+    // extracted and probed a candidate. Reverification after the bounded copy
+    // closes the path-replacement window before extraction and retention.
+    let bound_scratch = ScratchDirectory::new("pika-install-candidate")?;
+    let bound_artifact = bound_scratch.path.join(&release_artifact.file);
+    copy_regular_bounded(
+        unbound_request.artifact,
+        &bound_artifact,
+        release_artifact.bytes,
+        "native release archive",
+    )?;
+    verify_artifact(&bound_artifact, release_artifact)?;
+    extract_candidate(&bound_artifact, unbound_request.target, &bound_scratch.path)?;
+    let bound_candidate = bound_scratch.path.join("pika");
+    compare_candidate_bytes(unbound_request.candidate, &bound_candidate)?;
+    let request = InstallRequest {
+        manifest: unbound_request.manifest,
+        target: unbound_request.target,
+        artifact: &bound_artifact,
+        candidate: &bound_candidate,
+        root: unbound_request.root,
+        bin_dir: unbound_request.bin_dir,
+    };
+
     validate_install_paths(request.root, request.bin_dir)?;
     if request.root.exists() {
         initialize_or_validate_root(request.root, true)?;
@@ -1599,6 +1772,7 @@ fn validate_existing_release(
             "release path is not a managed directory".into(),
         ));
     }
+    validate_metadata_owner(&metadata, release_dir)?;
     let bin_dir = release_dir.join("bin");
     let bin_metadata = fs::symlink_metadata(&bin_dir)?;
     if !bin_metadata.file_type().is_dir() {
@@ -1606,12 +1780,15 @@ fn validate_existing_release(
             "release bin path is not a managed directory".into(),
         ));
     }
+    validate_metadata_owner(&bin_metadata, &bin_dir)?;
     let receipt_path = release_dir.join(".pika-install.json");
-    if !fs::symlink_metadata(&receipt_path)?.file_type().is_file() {
+    let receipt_metadata = fs::symlink_metadata(&receipt_path)?;
+    if !receipt_metadata.file_type().is_file() {
         return Err(UpdateError::Safety(
             "installation receipt must be a regular file".into(),
         ));
     }
+    validate_metadata_owner(&receipt_metadata, &receipt_path)?;
     let receipt = read_receipt(&receipt_path)?;
     if receipt.schema != MANIFEST_SCHEMA
         || receipt.kind != "native"
@@ -1627,6 +1804,7 @@ fn validate_existing_release(
         ));
     }
     let installed_path = release_dir.join("bin/pika");
+    validate_path_owner(&installed_path)?;
     let installed = checked_regular_file(&installed_path)?;
     let expected = checked_regular_file(request.candidate)?;
     if fs::metadata(installed)?.len() > MAX_EXECUTABLE_BYTES
@@ -1638,24 +1816,34 @@ fn validate_existing_release(
     }
     validate_notice_file(&release_dir.join("LICENSE"), &notices.license)?;
     validate_notice_file(&release_dir.join("THIRD_PARTY.md"), &notices.third_party)?;
+    validate_path_owner(&release_dir.join("LICENSE"))?;
+    validate_path_owner(&release_dir.join("THIRD_PARTY.md"))?;
     let bundle = release_dir.join("bundle");
-    if !fs::symlink_metadata(&bundle)?.file_type().is_dir() {
+    let bundle_metadata = fs::symlink_metadata(&bundle)?;
+    if !bundle_metadata.file_type().is_dir() {
         return Err(UpdateError::Safety(
             "release bundle path is not a managed directory".into(),
         ));
     }
+    validate_metadata_owner(&bundle_metadata, &bundle)?;
     let bundled_manifest = read_manifest_file(&bundle.join(NATIVE_MANIFEST_FILE))?;
+    validate_path_owner(&bundle.join(NATIVE_MANIFEST_FILE))?;
     if &bundled_manifest != request.manifest {
         return Err(UpdateError::Safety(
             "existing release bundle has a different manifest".into(),
         ));
     }
     let bundled_artifact = bundle.join(&artifact.file);
+    validate_path_owner(&bundled_artifact)?;
     checked_regular_file(&bundled_artifact)?;
     verify_artifact(&bundled_artifact, artifact)?;
     verify_sidecar(&bundle.join(format!("{}.sha256", artifact.file)), artifact)?;
+    validate_path_owner(&bundle.join(format!("{}.sha256", artifact.file)))?;
     validate_notice_file(&bundle.join("LICENSE"), &notices.license)?;
     validate_notice_file(&bundle.join("THIRD_PARTY.md"), &notices.third_party)?;
+    for name in ["LICENSE", "THIRD_PARTY.md", "pika-version", "install.sh"] {
+        validate_path_owner(&bundle.join(name))?;
+    }
     prepare_remote_install_bundle(&bundle, request.target, Some(&request.manifest.version))?;
     Ok(())
 }
@@ -1671,15 +1859,62 @@ fn read_sibling_notices(candidate: &Path) -> Result<ReleaseNotices> {
 }
 
 fn read_notice_file(path: &Path) -> Result<Vec<u8>> {
-    let path = checked_regular_file(path)?;
-    let metadata = fs::metadata(path)?;
-    if metadata.len() == 0 || metadata.len() > MAX_NOTICE_BYTES {
-        return Err(UpdateError::Safety(format!(
-            "release notice has an invalid size: {}",
-            path.display()
-        )));
+    read_regular_bounded(path, MAX_NOTICE_BYTES, "release notice")
+}
+
+fn compare_candidate_bytes(supplied: &Path, archived: &Path) -> Result<()> {
+    let mut supplied = open_regular_read(supplied, "supplied native candidate")?;
+    let mut archived = open_regular_read(archived, "archive-bound native candidate")?;
+    let supplied_metadata = supplied.metadata()?;
+    let archived_metadata = archived.metadata()?;
+    if supplied_metadata.len() == 0
+        || supplied_metadata.len() > MAX_EXECUTABLE_BYTES
+        || supplied_metadata.len() != archived_metadata.len()
+    {
+        return Err(UpdateError::Safety(
+            "supplied executable differs from the checksum-verified archive; nothing executed"
+                .into(),
+        ));
     }
-    Ok(fs::read(path)?)
+    let digest = |file: &mut File| -> Result<([u8; 32], u64)> {
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut bytes = 0_u64;
+        let mut reader = Read::by_ref(file).take(MAX_EXECUTABLE_BYTES + 1);
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            bytes += read as u64;
+            hash.update(&buffer[..read]);
+        }
+        Ok((hash.finalize().into(), bytes))
+    };
+    let supplied_digest = digest(&mut supplied)?;
+    let archived_digest = digest(&mut archived)?;
+    if supplied_digest.1 != supplied_metadata.len()
+        || archived_digest.1 != archived_metadata.len()
+        || supplied_digest.0 != archived_digest.0
+    {
+        return Err(UpdateError::Safety(
+            "supplied executable differs from the checksum-verified archive; nothing executed"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Prove that the hidden installation command is running from the exact
+/// executable path supplied by the outer bootstrap. This closes the last
+/// substitution gap before `install_staged` rebinds that executable to the
+/// checksum-verified archive.
+#[cfg(unix)]
+pub fn verify_running_install_candidate(candidate: &Path) -> Result<()> {
+    let running = std::env::current_exe().map_err(|error| {
+        UpdateError::Safety(format!("cannot identify the running installer: {error}"))
+    })?;
+    compare_candidate_bytes(&running, candidate)
 }
 
 fn validate_notice_file(path: &Path, expected: &[u8]) -> Result<()> {
@@ -1752,6 +1987,8 @@ fn run_command_bounded(
     stdout_limit: usize,
     operation: &str,
 ) -> Result<Output> {
+    #[cfg(unix)]
+    let interrupts = ScopedCommandInterrupts::install()?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1780,6 +2017,10 @@ fn run_command_bounded(
     let deadline = Instant::now() + timeout;
     let outcome = (|| {
         let status = loop {
+            #[cfg(unix)]
+            if let Some(code) = interrupts.exit_code() {
+                return Err(UpdateError::Interrupted(code));
+            }
             // This observes exit without reaping, kills the pinned group,
             // then caches the reaped status. No stale numeric PGID is used.
             match poll_owned_child(&mut child) {
@@ -1804,10 +2045,21 @@ fn run_command_bounded(
         let mut stdout = None;
         let mut stderr = None;
         while stdout.is_none() || stderr.is_none() {
+            #[cfg(unix)]
+            if let Some(code) = interrupts.exit_code() {
+                return Err(UpdateError::Interrupted(code));
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let (is_stdout, result) = receiver
-                .recv_timeout(remaining)
-                .map_err(|_| UpdateError::Candidate("candidate output did not close".into()))?;
+            let (is_stdout, result) =
+                match receiver.recv_timeout(remaining.min(Duration::from_millis(25))) {
+                    Ok(value) => value,
+                    Err(mpsc::RecvTimeoutError::Timeout) if !remaining.is_zero() => continue,
+                    Err(_) => {
+                        return Err(UpdateError::Candidate(
+                            "candidate output did not close".into(),
+                        ));
+                    }
+                };
             let bytes = result.map_err(|error| UpdateError::Candidate(error.to_string()))?;
             let limit = if is_stdout {
                 stdout_limit
@@ -1849,7 +2101,59 @@ fn run_command_bounded(
     drop((stdout_worker, stderr_worker));
     cleanup
         .map_err(|error| UpdateError::Candidate(format!("candidate cleanup failed: {error}")))?;
+    #[cfg(unix)]
+    if let Some(code) = interrupts.exit_code() {
+        return Err(UpdateError::Interrupted(code));
+    }
     outcome
+}
+
+#[cfg(unix)]
+struct ScopedCommandInterrupts {
+    signal: Arc<AtomicUsize>,
+    registrations: Vec<signal_hook::SigId>,
+}
+
+#[cfg(unix)]
+impl ScopedCommandInterrupts {
+    fn install() -> Result<Self> {
+        let signal = Arc::new(AtomicUsize::new(0));
+        let mut registrations = Vec::with_capacity(2);
+        for value in [libc::SIGINT, libc::SIGTERM] {
+            match signal_hook::flag::register_usize(value, Arc::clone(&signal), value as usize) {
+                Ok(registration) => registrations.push(registration),
+                Err(error) => {
+                    for registration in registrations.drain(..) {
+                        signal_hook::low_level::unregister(registration);
+                    }
+                    return Err(UpdateError::Safety(format!(
+                        "cannot install scoped update signal handling: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(Self {
+            signal,
+            registrations,
+        })
+    }
+
+    fn exit_code(&self) -> Option<i32> {
+        match self.signal.load(AtomicOrdering::SeqCst) as i32 {
+            libc::SIGINT => Some(130),
+            libc::SIGTERM => Some(143),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ScopedCommandInterrupts {
+    fn drop(&mut self) {
+        for registration in self.registrations.drain(..) {
+            signal_hook::low_level::unregister(registration);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1962,6 +2266,9 @@ fn normalized_install_path(path: &Path, reject_final_symlink: bool) -> Result<Pa
 
 fn initialize_or_validate_root(root: &Path, existed: bool) -> Result<()> {
     let marker = root.join(".pika-install-root");
+    if root.exists() {
+        validate_path_owner(root)?;
+    }
     for path in [
         marker.as_path(),
         &root.join("tools"),
@@ -1970,9 +2277,17 @@ fn initialize_or_validate_root(root: &Path, existed: bool) -> Result<()> {
         &root.join(".update-check.lock"),
     ] {
         reject_symlink(path)?;
+        if fs::symlink_metadata(path).is_ok() {
+            validate_path_owner(path)?;
+        }
+    }
+    let current = root.join("current");
+    if fs::symlink_metadata(&current).is_ok() {
+        validate_path_owner(&current)?;
     }
     if existed || marker.exists() {
-        if !marker.is_file() || fs::read_to_string(&marker)? != ROOT_MARKER {
+        let marker_bytes = read_regular_bounded(&marker, 64, "managed root marker")?;
+        if marker_bytes != ROOT_MARKER.as_bytes() {
             return Err(UpdateError::Safety(
                 "root is not a Pika-managed installation; nothing overwritten".into(),
             ));
@@ -2006,15 +2321,43 @@ fn reject_symlink(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn validate_metadata_owner(metadata: &fs::Metadata, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    validate_uid(metadata.uid(), unsafe { libc::geteuid() }, path)
+}
+
+#[cfg(not(unix))]
+fn validate_metadata_owner(_metadata: &fs::Metadata, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn validate_uid(actual: u32, expected: u32, path: &Path) -> Result<()> {
+    if actual != expected {
+        return Err(UpdateError::Safety(format!(
+            "managed installation component is owned by another user: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_path_owner(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    validate_metadata_owner(&metadata, path)
+}
+
+#[cfg(unix)]
 fn open_lock(path: &Path) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
-    Ok(OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)?)
+        .open(path)?;
+    validate_metadata_owner(&file.metadata()?, path)?;
+    Ok(file)
 }
 
 fn validate_current(current: &Path, releases: &Path) -> Result<()> {
@@ -2023,6 +2366,7 @@ fn validate_current(current: &Path, releases: &Path) -> Result<()> {
             "activation path is not a symlink".into(),
         )),
         Ok(_) => {
+            validate_path_owner(current)?;
             let destination = current
                 .canonicalize()
                 .map_err(|_| UpdateError::Safety("activation symlink is broken".into()))?;
@@ -2034,6 +2378,8 @@ fn validate_current(current: &Path, releases: &Path) -> Result<()> {
                     "activation path points outside managed releases".into(),
                 ));
             }
+            validate_path_owner(releases)?;
+            validate_path_owner(&destination)?;
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -2044,6 +2390,7 @@ fn validate_current(current: &Path, releases: &Path) -> Result<()> {
 fn validate_launcher(launcher: &Path, expected: &Path) -> Result<()> {
     match fs::symlink_metadata(launcher) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
+            validate_metadata_owner(&metadata, launcher)?;
             if fs::read_link(launcher)? == expected {
                 Ok(())
             } else {
@@ -2074,6 +2421,7 @@ fn current_receipt(current: &Path) -> Result<Option<CurrentReceipt>> {
             "installation receipt must not be a symlink".into(),
         ));
     }
+    validate_path_owner(&path)?;
     let bytes = read_bounded_receipt(&path)?;
     let receipt: CurrentReceipt = serde_json::from_slice(&bytes)
         .map_err(|error| UpdateError::Safety(format!("invalid installation receipt: {error}")))?;
@@ -2107,7 +2455,8 @@ fn read_bounded_receipt(path: &Path) -> Result<Vec<u8>> {
             "installation receipt is not a small regular file".into(),
         ));
     }
-    Ok(fs::read(path)?)
+    validate_metadata_owner(&metadata, path)?;
+    read_regular_bounded(path, MAX_MANIFEST_BYTES as u64, "installation receipt")
 }
 
 #[cfg(unix)]
@@ -2536,5 +2885,14 @@ mod bounded_candidate_tests {
 
         let error = validate_archive_expanded_size(&archive, 64 * 1024).unwrap_err();
         assert!(error.to_string().contains("safety limit"));
+    }
+
+    #[test]
+    fn managed_component_owner_mismatch_fails_closed() {
+        let path = Path::new("/managed/component");
+        validate_uid(501, 501, path).unwrap();
+        let error = validate_uid(0, 501, path).unwrap_err();
+        assert!(error.to_string().contains("owned by another user"));
+        assert!(error.to_string().contains("/managed/component"));
     }
 }

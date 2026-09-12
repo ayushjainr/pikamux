@@ -9,6 +9,7 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 fn candidate(path: &Path, version: &str, marker: Option<&Path>) {
     let marker_command = marker.map_or_else(String::new, |path| {
@@ -27,11 +28,21 @@ fn candidate(path: &Path, version: &str, marker: Option<&Path>) {
 fn direct_fixture(root: &Path, version: &str) -> (ReleaseManifest, PathBuf, PathBuf) {
     let target = native_target().unwrap();
     let archive = root.join(artifact_name(version, target).unwrap());
-    fs::write(&archive, format!("archive {version}\n")).unwrap();
-    let binary = root.join(format!("candidate-{version}"));
+    let payload = root.join(format!("payload-{version}"));
+    fs::create_dir(&payload).unwrap();
+    let binary = payload.join("pika");
     candidate(&binary, version, None);
-    fs::copy("LICENSE", root.join("LICENSE")).unwrap();
-    fs::copy("THIRD_PARTY.md", root.join("THIRD_PARTY.md")).unwrap();
+    fs::copy("LICENSE", payload.join("LICENSE")).unwrap();
+    fs::copy("THIRD_PARTY.md", payload.join("THIRD_PARTY.md")).unwrap();
+    let archived = Command::new("python3")
+        .arg("scripts/archive-release.py")
+        .arg("tar.gz")
+        .arg(&payload)
+        .arg(&binary)
+        .arg(&archive)
+        .status()
+        .unwrap();
+    assert!(archived.success());
     let artifact = ReleaseArtifact {
         file: archive.file_name().unwrap().to_string_lossy().into_owned(),
         sha256: sha256_file(&archive).unwrap(),
@@ -157,6 +168,108 @@ fn replace_bundle_notices(bundle: &Path, license: &[u8], third_party: &[u8]) {
     fs::write(bundle.join("THIRD_PARTY.md"), third_party).unwrap();
 }
 
+fn shaped_cross_binary(root: &Path, target: &str) -> PathBuf {
+    let path = root.join(format!("pika-{}", target.replace('/', "-")));
+    let mut bytes = vec![0_u8; 64 * 1024];
+    match target {
+        "aarch64-apple-darwin" | "x86_64-apple-darwin" => {
+            bytes[..4].copy_from_slice(b"\xcf\xfa\xed\xfe");
+            let cpu = if target.starts_with("aarch64") {
+                0x0100000c_u32
+            } else {
+                0x01000007_u32
+            };
+            bytes[4..8].copy_from_slice(&cpu.to_le_bytes());
+        }
+        "aarch64-unknown-linux-musl" | "x86_64-unknown-linux-musl" => {
+            bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
+            let machine = if target.starts_with("aarch64") {
+                183_u16
+            } else {
+                62_u16
+            };
+            bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        }
+        _ => panic!("unsupported bridge fixture target"),
+    }
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+fn transition_release(root: &Path) -> PathBuf {
+    let native_version = env!("CARGO_PKG_VERSION");
+    let targets = [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-musl",
+        "x86_64-unknown-linux-musl",
+    ];
+    let native = root.join("bridge-native");
+    let mut package = Command::new("bash");
+    package
+        .arg("scripts/package-release.sh")
+        .arg(native_version)
+        .arg(&native)
+        .env("PIKA_CROSS_PACKAGE", "1");
+    for target in targets {
+        package.arg(format!(
+            "{target}={}",
+            shaped_cross_binary(root, target).display()
+        ));
+    }
+    assert!(package.status().unwrap().success());
+
+    let output = root.join("bridge-release");
+    fs::create_dir(&output).unwrap();
+    let wheel = output.join("pikamux-0.5.0a5-py3-none-any.whl");
+    let mut package = Command::new("python3");
+    package
+        .arg("scripts/package-python-bridge.py")
+        .args(["0.5.0a5", native_version])
+        .arg(&wheel);
+    for target in targets {
+        package.arg(format!(
+            "{target}={}",
+            native
+                .join(artifact_name(native_version, target).unwrap())
+                .display()
+        ));
+    }
+    assert!(package.status().unwrap().success());
+    output
+}
+
+fn rewrite_bridge_outer_checksums(release: &Path) {
+    let manifest_path = release.join("pika-release.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let wheel = manifest["wheel"].as_str().unwrap().to_owned();
+    manifest["sha256"] = serde_json::json!(sha256_file(&release.join(&wheel)).unwrap());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let mut files = fs::read_dir(release)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.file_name().unwrap() != "SHA256SUMS")
+        .collect::<Vec<_>>();
+    files.sort();
+    let checksums = files
+        .iter()
+        .map(|path| {
+            format!(
+                "{}  {}\n",
+                sha256_file(path).unwrap(),
+                path.file_name().unwrap().to_string_lossy()
+            )
+        })
+        .collect::<String>();
+    fs::write(release.join("SHA256SUMS"), checksums).unwrap();
+}
+
 #[test]
 fn reused_release_binary_is_compared_before_it_can_run_or_activate() {
     let temp = tempfile::tempdir().unwrap();
@@ -204,6 +317,45 @@ fn reused_release_binary_is_compared_before_it_can_run_or_activate() {
         root.join("current").canonicalize().unwrap(),
         first.release_dir
     );
+}
+
+#[test]
+fn supplied_candidate_must_match_verified_archive_before_any_probe() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("managed");
+    let bin = temp.path().join("bin");
+    let (manifest, archive, archived_binary) = direct_fixture(temp.path(), "0.6.0-alpha.1");
+    let marker = temp.path().join("substituted-candidate-ran");
+    let substitute = temp.path().join("substitute-pika");
+    candidate(&substitute, "0.6.0-alpha.1", Some(&marker));
+
+    let error = install_staged(InstallRequest {
+        manifest: &manifest,
+        target: native_target().unwrap(),
+        artifact: &archive,
+        candidate: &substitute,
+        root: &root,
+        bin_dir: &bin,
+    })
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("differs from the checksum-verified archive"),
+        "{error}"
+    );
+    assert!(!marker.exists(), "substituted candidate was executed");
+    assert!(!root.exists(), "managed root was written before binding");
+
+    install_staged(InstallRequest {
+        manifest: &manifest,
+        target: native_target().unwrap(),
+        artifact: &archive,
+        candidate: &archived_binary,
+        root: &root,
+        bin_dir: &bin,
+    })
+    .unwrap();
 }
 
 #[test]
@@ -513,6 +665,190 @@ fn transition_wheel_is_reproducible_and_carries_notices_for_wheel_and_native_ins
             .unwrap();
         assert!(extracted.status.success(), "missing wheel member {member}");
         assert_eq!(extracted.stdout, fs::read(source).unwrap());
+    }
+}
+
+#[test]
+fn transition_verifier_rejects_extra_python_and_zip_bomb_members_before_reads() {
+    for mode in ["extra", "bomb"] {
+        let temp = tempfile::tempdir().unwrap();
+        let release = transition_release(temp.path());
+        let baseline = Command::new("bash")
+            .arg("scripts/verify-release.sh")
+            .arg(&release)
+            .output()
+            .unwrap();
+        assert!(
+            baseline.status.success(),
+            "{}",
+            String::from_utf8_lossy(&baseline.stderr)
+        );
+
+        let wheel = release.join("pikamux-0.5.0a5-py3-none-any.whl");
+        let mutator = temp.path().join("mutate-wheel.py");
+        fs::write(
+            &mutator,
+            r#"import pathlib, sys, zipfile
+wheel = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+temporary = wheel.with_suffix('.new')
+with zipfile.ZipFile(wheel, 'r') as source, zipfile.ZipFile(temporary, 'w') as target:
+    for info in source.infolist():
+        data = source.read(info.filename)
+        if mode == 'bomb' and info.filename == 'pikamux_bridge/cli.py':
+            data = b'0' * (3 * 1024 * 1024)
+        target.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+    if mode == 'extra':
+        info = zipfile.ZipInfo('pika_bootstrap.pth', (2020, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.external_attr = 0o100644 << 16
+        target.writestr(info, b'import pika_bootstrap\n', compresslevel=9)
+temporary.replace(wheel)
+"#,
+        )
+        .unwrap();
+        assert!(
+            Command::new("python3")
+                .arg(&mutator)
+                .arg(&wheel)
+                .arg(mode)
+                .status()
+                .unwrap()
+                .success()
+        );
+        rewrite_bridge_outer_checksums(&release);
+
+        let rejected = Command::new("bash")
+            .arg("scripts/verify-release.sh")
+            .arg(&release)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success(), "hostile {mode} wheel passed");
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        if mode == "extra" {
+            assert!(stderr.contains("member allowlist mismatch"), "{stderr}");
+        } else {
+            assert!(stderr.contains("member exceeds its size limit"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn offline_bootstrap_rejects_oversized_bundle_files_before_copying_or_writing_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let bundle = temp.path().join("bundle");
+    fs::create_dir(&bundle).unwrap();
+    let version = env!("CARGO_PKG_VERSION");
+    fs::write(bundle.join("pika-version"), format!("{version}\n")).unwrap();
+    fs::write(
+        bundle.join("pika-native-release.json"),
+        vec![b'x'; 64 * 1024 + 1],
+    )
+    .unwrap();
+    let root = temp.path().join("managed");
+    let output = Command::new("bash")
+        .arg("scripts/install.sh")
+        .arg("--bundle")
+        .arg(&bundle)
+        .arg("--root")
+        .arg(&root)
+        .arg("--bin-dir")
+        .arg(temp.path().join("bin"))
+        .arg("--no-setup")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Native release manifest exceeds its safety limit"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.exists());
+}
+
+#[test]
+fn install_native_reaps_archive_subprocess_groups_on_int_and_term() {
+    for (signal, expected_code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
+        let temp = tempfile::tempdir().unwrap();
+        let target = native_target().unwrap();
+        let version = env!("CARGO_PKG_VERSION");
+        let artifact_name = artifact_name(version, target).unwrap();
+        let artifact = temp.path().join(&artifact_name);
+        fs::write(&artifact, b"checksum-bound archive fixture\n").unwrap();
+        let checksum = sha256_file(&artifact).unwrap();
+        let manifest = ReleaseManifest {
+            schema: 2,
+            package: "pikamux".into(),
+            version: version.into(),
+            channel: "preview".into(),
+            artifacts: BTreeMap::from([(
+                target.into(),
+                ReleaseArtifact {
+                    file: artifact_name,
+                    sha256: checksum,
+                    bytes: fs::metadata(&artifact).unwrap().len(),
+                },
+            )]),
+        };
+        let manifest_path = temp.path().join("pika-native-release.json");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let fake_bin = temp.path().join("fake-bin");
+        fs::create_dir(&fake_bin).unwrap();
+        let descendant_pid = temp.path().join("archive-descendant.pid");
+        let fake_tar = fake_bin.join("tar");
+        fs::write(
+            &fake_tar,
+            "#!/bin/sh\nsleep 300 &\nprintf '%s\\n' \"$!\" > \"$PIKA_TEST_ARCHIVE_DESCENDANT\"\nwait\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_tar, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", fake_bin.display());
+        let executable = Path::new(env!("CARGO_BIN_EXE_pika"));
+        let mut process = Command::new(executable)
+            .arg("_install-native")
+            .arg("--manifest")
+            .arg(&manifest_path)
+            .arg("--artifact")
+            .arg(&artifact)
+            .arg("--candidate")
+            .arg(executable)
+            .arg("--target")
+            .arg(target)
+            .arg("--root")
+            .arg(temp.path().join("managed"))
+            .arg("--bin-dir")
+            .arg(temp.path().join("bin"))
+            .arg("--no-setup")
+            .env("PATH", path)
+            .env("PIKA_TEST_ARCHIVE_DESCENDANT", &descendant_pid)
+            .spawn()
+            .unwrap();
+        let appeared = Instant::now() + Duration::from_secs(5);
+        while !descendant_pid.exists() && Instant::now() < appeared {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(descendant_pid.exists(), "archive subprocess never started");
+        let descendant: i32 = fs::read_to_string(&descendant_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(process.id() as i32, signal) }, 0);
+        let status = process.wait().unwrap();
+        assert_eq!(status.code(), Some(expected_code), "{status}");
+
+        let reaped = Instant::now() + Duration::from_secs(3);
+        while unsafe { libc::kill(descendant, 0) } == 0 && Instant::now() < reaped {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            unsafe { libc::kill(descendant, 0) },
+            -1,
+            "archive descendant {descendant} survived signal {signal}"
+        );
+        assert!(!temp.path().join("managed").exists());
     }
 }
 

@@ -41,6 +41,7 @@ if [ -n "$pika_bundle" ]; then
     [ -d "$pika_bundle" ] && [ ! -L "$pika_bundle" ] || fail 'The bundle must be a real directory.'
     pika_bundle=$(cd "$pika_bundle" && pwd -P)
     [ -f "$pika_bundle/pika-version" ] && [ ! -L "$pika_bundle/pika-version" ] || fail 'The native bundle has no regular pika-version file.'
+    [ "$(wc -c < "$pika_bundle/pika-version" | tr -d ' ')" -le 128 ] || fail 'Invalid pika-version file.'
     pika_version=$(sed -n '1p' "$pika_bundle/pika-version")
     [ "$(wc -l < "$pika_bundle/pika-version" | tr -d ' ')" = 1 ] || fail 'Invalid pika-version file.'
 fi
@@ -102,6 +103,26 @@ download() {
         fail 'Download failed. Nothing activated.'
 }
 
+copy_bounded_regular() {
+    local pika_source=$1
+    local pika_destination=$2
+    local pika_limit=$3
+    local pika_label=$4
+    [ -f "$pika_source" ] && [ ! -L "$pika_source" ] || fail "$pika_label must be a regular file."
+    local pika_source_bytes
+    pika_source_bytes=$(wc -c < "$pika_source" | tr -d ' ')
+    case "$pika_source_bytes" in *[!0-9]*|'') fail "$pika_label has an invalid size." ;; esac
+    [ "$pika_source_bytes" -gt 0 ] && [ "$pika_source_bytes" -le "$pika_limit" ] || \
+        fail "$pika_label exceeds its safety limit."
+    # This byte ceiling remains effective if a local bundle entry changes
+    # after metadata inspection. The exact length check catches truncation or
+    # replacement, and EXIT cleanup owns the partial destination.
+    head -c $((pika_limit + 1)) -- "$pika_source" > "$pika_destination" || \
+        fail "$pika_label could not be copied safely."
+    [ "$(wc -c < "$pika_destination" | tr -d ' ')" = "$pika_source_bytes" ] || \
+        fail "$pika_label changed while it was copied. Nothing was executed."
+}
+
 if [ -z "$pika_bundle" ] && [ -z "$pika_version" ]; then
     # Pin the moving `latest` pointer once, then fetch every other byte from
     # that immutable tag. Users never need to put a version in the install
@@ -115,12 +136,9 @@ fi
 
 pika_archive="pikamux-${pika_version}-${pika_target}.tar.gz"
 if [ -n "$pika_bundle" ]; then
-    [ -f "$pika_bundle/pika-native-release.json" ] && [ ! -L "$pika_bundle/pika-native-release.json" ] || fail 'The bundle has no regular pika-native-release.json.'
-    [ -f "$pika_bundle/$pika_archive" ] && [ ! -L "$pika_bundle/$pika_archive" ] || fail "The bundle has no regular $pika_archive."
-    [ -f "$pika_bundle/$pika_archive.sha256" ] && [ ! -L "$pika_bundle/$pika_archive.sha256" ] || fail 'The bundle has no regular artifact checksum.'
-    cp "$pika_bundle/pika-native-release.json" "$pika_tmp/pika-native-release.json"
-    cp "$pika_bundle/$pika_archive" "$pika_tmp/$pika_archive"
-    cp "$pika_bundle/$pika_archive.sha256" "$pika_tmp/$pika_archive.sha256"
+    copy_bounded_regular "$pika_bundle/pika-native-release.json" "$pika_tmp/pika-native-release.json" 65536 'Native release manifest'
+    copy_bounded_regular "$pika_bundle/$pika_archive" "$pika_tmp/$pika_archive" 20971520 'Native release archive'
+    copy_bounded_regular "$pika_bundle/$pika_archive.sha256" "$pika_tmp/$pika_archive.sha256" 256 'Native artifact checksum'
 else
     pika_base="$PIKA_RELEASE_ROOT/download/v${pika_version}"
     download "$pika_base/pika-native-release.json" "$pika_tmp/pika-native-release.json" 65536
