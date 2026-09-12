@@ -194,7 +194,7 @@ fn version_is_native_and_side_effect_free() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("pika 0.6.0-alpha.1"));
+        .stdout(format!("pika {}\n", env!("CARGO_PKG_VERSION")));
     assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
 }
 

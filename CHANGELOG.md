@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1 — cross-platform native release
+
+- Correct platform-specific compilation for Linux hosts and the Windows client.
+- Keep release validation aligned with the published version and dependency notices.
+
 ## 0.6.0 — Pika in Rust
 
 - Ship a small native executable for macOS and Linux, with prebuilt downloads

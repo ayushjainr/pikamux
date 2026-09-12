@@ -714,8 +714,10 @@ mod platform {
 
 // Darwin's proc status value for an unreaped zombie. Kept as a numeric wire
 // value so this race-classification helper remains testable on every host.
+#[cfg(any(target_os = "macos", test))]
 const MACOS_ZOMBIE_STATUS: u32 = 5;
 
+#[cfg(any(target_os = "macos", test))]
 fn mac_unreadable_process_is_transient(
     original_pid: i64,
     original_start: u64,
@@ -732,7 +734,6 @@ fn mac_unreadable_process_is_transient(
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
     use super::{ProcessObservation, ProcessRecord};
-    use std::collections::BTreeMap;
     pub fn snapshot() -> ProcessObservation {
         ProcessObservation::error("process identity observation is unsupported on this platform")
     }

@@ -4,9 +4,13 @@
 //! enters here only after it has an archive and an extracted candidate; this
 //! module verifies both before writing the managed installation root.
 
+// Windows shares release metadata parsing, but does not activate host installs.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use crate::consult::{
     CancellablePipe, CancellationToken, OwnedChild, poll_owned_child, terminate_child,
 };
+#[cfg(unix)]
 use fs2::FileExt;
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -17,14 +21,21 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc;
+#[cfg(unix)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -2459,6 +2470,20 @@ fn validate_secure_directory(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn validate_secure_directory(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_secure_directory_metadata(_metadata: &fs::Metadata, _path: &Path) -> Result<()> {
+    Err(UpdateError::Safety(
+        "native host installation requires macOS or Linux".into(),
+    ))
+}
+
+#[cfg(not(unix))]
+fn write_new_file(_path: &Path, _bytes: &[u8], _mode: u32) -> Result<()> {
+    Err(UpdateError::Safety(
+        "native host installation requires macOS or Linux".into(),
+    ))
 }
 
 #[cfg(not(unix))]

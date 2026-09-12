@@ -1,16 +1,16 @@
 use anyhow::{Context, Result, bail};
+use std::{collections::BTreeMap, process::Command, thread, time::Duration};
+#[cfg(unix)]
 use std::{
-    collections::BTreeMap,
     io::{self, IsTerminal, Write},
-    process::Command,
     sync::atomic::{AtomicU32, Ordering},
-    thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 pub const FOREGROUND_ENV: &str = "PIKA_TERMINAL_FOREGROUND";
 pub const BACKGROUND_ENV: &str = "PIKA_TERMINAL_BACKGROUND";
 pub const WINDOWS_TERMINAL_DA2: &[u8] = b"\x1b[>0;10;1c";
+#[cfg(unix)]
 const PALETTE_QUERY: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
 
 #[cfg(unix)]
