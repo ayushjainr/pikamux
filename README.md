@@ -120,14 +120,14 @@ the same terminal geometry; hook runs alternate Python/native order.
 
 | Contract | Native Rust | Python v0.5.0a4 |
 | --- | ---: | ---: |
-| CLI startup, p95 (100 launches) | 4.00 ms | 136.21 ms |
-| Cached board first frame, p95 (30 launches) | 11.63 ms | 454.79 ms |
+| CLI startup, p95 (100 launches) | 4.74 ms | 137.16 ms |
+| Cached board first frame, p95 (30 launches) | 11.11 ms | 454.81 ms |
 | Board input redraw, p95 (1,000 keys) | 0.117 ms | 8.26 ms |
-| Hook fast path, p95 (100 events) | 13.50 ms | 470.97 ms |
-| 200-row local reconciliation, p95 (30 runs) | 81.29 ms | 2,333.46 ms |
-| Five-minute idle CPU, mean | 0.978% | 19.157% |
-| Warm board RSS, p95 | 11.63 MiB | 36.48 MiB |
-| Binary / gzip | 4.45 MB / 2.29 MB | interpreter environment required |
+| Hook fast path, p95 (100 events) | 13.07 ms | 473.13 ms |
+| 200-row local reconciliation, p95 (30 runs) | 74.80 ms | 2,352.12 ms |
+| Idle CPU, mean across 5 × 5-minute runs | 0.925% | 19.637% |
+| Warm RSS p95, worst of 5 runs | 11.91 MiB | 39.41 MiB |
+| Binary / gzip | 4.49 MB / 2.31 MB | interpreter environment required |
 
 Reproduce the measurements with:
 
@@ -138,7 +138,7 @@ python3 dev/measure_board.py target/release/pika \
 python3 dev/measure_hook.py target/release/pika dev/python-v050a4 --samples 100
 python3 dev/measure_reconcile.py target/release/pika dev/python-v050a4 --samples 30
 python3 dev/measure_board_steady.py target/release/pika dev/python-v050a4 \
-  --seconds 300 --program both
+  --seconds 300 --runs 5 --program both
 ```
 
 Timing is hardware-specific; the behavioural gates are not. See the full
