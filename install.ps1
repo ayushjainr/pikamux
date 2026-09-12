@@ -220,12 +220,15 @@ param(
             }
         } else { [IO.Directory]::Move($stage, $destination); $stage = $null }
 
-        $receipt = @{ schema = 1; package = 'pikamux'; version = $version; sha256 = $artifact.sha256 }
-        $pendingReceipt = Join-Path $root ('.receipt-' + [Guid]::NewGuid().ToString('N'))
-        [IO.File]::WriteAllText($pendingReceipt, ($receipt | ConvertTo-Json), $utf8)
-        if (Test-Path -LiteralPath $receiptPath) {
-            [IO.File]::Replace($pendingReceipt, $receiptPath, $null)
-        } else { [IO.File]::Move($pendingReceipt, $receiptPath) }
+        if (-not $previous -or $previous.version -cne $version) {
+            $receipt = @{ schema = 1; package = 'pikamux'; version = $version; sha256 = $artifact.sha256 }
+            $pendingReceipt = Join-Path $root ('.receipt-' + [Guid]::NewGuid().ToString('N'))
+            [IO.File]::WriteAllText($pendingReceipt, ($receipt | ConvertTo-Json), $utf8)
+            if (Test-Path -LiteralPath $receiptPath) {
+                $backupReceipt = Join-Path $root ('.previous-receipt-' + [Guid]::NewGuid().ToString('N') + '.json')
+                [IO.File]::Replace($pendingReceipt, $receiptPath, $backupReceipt)
+            } else { [IO.File]::Move($pendingReceipt, $receiptPath) }
+        }
         if (-not $NoPath) {
             $oldDirectory = $null
             if ($previous) { $oldDirectory = Join-Path $releases "$($previous.version)-$($previous.sha256.Substring(0, 12))" }

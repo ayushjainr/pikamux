@@ -47,6 +47,13 @@ try {
     Check ([Environment]::GetEnvironmentVariable('Path', 'User') -ceq $oldUserPath) 'NoPath preserves user PATH'
     & $installer -Bundle $bundle -NoPath
     Check (@(Get-ChildItem (Join-Path $root 'releases')).Count -eq 1) 'repeat install is idempotent'
+    Check ([IO.File]::ReadAllText($receiptPath) -ceq $receiptBytes) 'repeat install preserves receipt'
+    $earlier = $receiptBytes | ConvertFrom-Json
+    $earlier.version = '0.0.1'
+    [IO.File]::WriteAllText($receiptPath, ($earlier | ConvertTo-Json), $utf8)
+    & $installer -Bundle $bundle -NoPath
+    Check (@(Get-ChildItem -LiteralPath $root -Filter '.previous-receipt-*.json' -Force).Count -eq 1) 'update atomically backs up prior receipt'
+    $receiptBytes = [IO.File]::ReadAllText($receiptPath)
 
     $bad = Join-Path $testRoot 'corrupt'
     Copy-Item -LiteralPath $bundle -Destination $bad -Recurse
