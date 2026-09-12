@@ -288,6 +288,78 @@ fn newest_lifecycle_wins_and_safety_remains_stronger() {
 }
 
 #[test]
+fn equal_time_hook_updates_preserve_acknowledgement_and_question_rules() {
+    let (_temp, store) = store();
+    let mut context = HookContext::at(20.0);
+    context.desired_name = Some("work".into());
+    let completion = event(Provider::Codex, "exact", "Stop");
+    handle_hook(&store, Provider::Codex, &completion, &context).unwrap();
+    assert!(
+        store
+            .acknowledge_attention(Provider::Codex, "exact", 20.0, false)
+            .unwrap()
+    );
+
+    // An older non-attention hook must project the already-acknowledged fact,
+    // not restore unread from its stale session snapshot or reject the update.
+    context.now = 19.0;
+    let result = handle_hook(
+        &store,
+        Provider::Codex,
+        &event(Provider::Codex, "exact", "UserPromptSubmit"),
+        &context,
+    )
+    .unwrap();
+    assert_eq!((result.status, result.unread), (Some(Status::Ready), false));
+    assert!(result.alert.is_none());
+
+    // Equal timestamps are not stale by definition: preserve Python's >= rule,
+    // including a new question at the completion's timestamp.
+    context.now = 20.0;
+    let mut question = event(Provider::Codex, "exact", "PreToolUse");
+    question.tool_name = Some("request_user_input".into());
+    let result = handle_hook(&store, Provider::Codex, &question, &context).unwrap();
+    assert_eq!(
+        (result.status, result.unread),
+        (Some(Status::NeedsYou), true)
+    );
+    assert!(
+        !store
+            .acknowledge_attention(Provider::Codex, "exact", 20.0, true)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .get_session(Provider::Codex, "exact")
+            .unwrap()
+            .unwrap()
+            .last_event_at,
+        20.0
+    );
+}
+
+#[test]
+fn equal_time_attached_completion_clears_unread_without_advancing_watermark() {
+    let (_temp, store) = store();
+    let mut context = HookContext::at(20.0);
+    context.desired_name = Some("work".into());
+    let completion = event(Provider::Codex, "exact", "Stop");
+    handle_hook(&store, Provider::Codex, &completion, &context).unwrap();
+    context.pane_attached = true;
+    let result = handle_hook(&store, Provider::Codex, &completion, &context).unwrap();
+    assert_eq!((result.status, result.unread), (Some(Status::Ready), false));
+    let session = store
+        .get_session(Provider::Codex, "exact")
+        .unwrap()
+        .unwrap();
+    assert!(!session.unread);
+    assert_eq!(session.last_event_at, 20.0);
+    let observations = store.status_observations(Provider::Codex, "exact").unwrap();
+    assert!(!observations[0].unread);
+    assert_eq!(observations[0].observed_at, 20.0);
+}
+
+#[test]
 fn session_end_preserves_an_unread_completion_and_its_event_time() {
     let (_temp, store) = store();
     let mut context = HookContext::at(10.0);

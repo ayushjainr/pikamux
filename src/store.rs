@@ -381,9 +381,10 @@ pub struct Store {
     validated: Arc<AtomicBool>,
 }
 
-/// One short, writer-serialized view used by local reconciliation. Keeping
-/// its reads and writes on one SQLite transaction avoids hundreds of database
-/// opens while still preventing a hook from being overwritten mid-refresh.
+/// One short, writer-serialized view shared by reconciliation and hook ingestion.
+/// Identity checks, authoritative observations, projections and session writes
+/// must use this same transaction so overlapping writers cannot publish stale
+/// projections. Provider/process I/O belongs outside the transaction.
 pub(crate) struct ReconcileLedger<'a> {
     tx: &'a Transaction<'a>,
 }
@@ -685,39 +686,9 @@ impl Store {
         session_id: &str,
         preserve_live_owners: bool,
     ) -> Result<bool> {
-        let mut db = self.open_write()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for table in [
-            "usage_cache",
-            "session_events",
-            "session_status_observations",
-            "identity_interruptions",
-            "expert_profiles",
-            "expert_refresh_attempts",
-            "recovery_owners",
-            "launch_reservations",
-        ] {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE provider=? AND session_id=?"),
-                params![provider.as_str(), session_id],
-            )?;
-        }
-        if !preserve_live_owners {
-            tx.execute(
-                "DELETE FROM live_owners WHERE provider=? AND session_id=?",
-                params![provider.as_str(), session_id],
-            )?;
-        }
-        tx.execute(
-            "DELETE FROM launch_bindings WHERE provider=? AND session_id=?",
-            params![provider.as_str(), session_id],
-        )?;
-        let deleted = tx.execute(
-            "DELETE FROM sessions WHERE provider=? AND session_id=?",
-            params![provider.as_str(), session_id],
-        )? == 1;
-        tx.commit()?;
-        Ok(deleted)
+        self.reconcile_transaction(|ledger| {
+            ledger.delete_session(provider, session_id, preserve_live_owners)
+        })
     }
 
     pub fn record_status_observation(
@@ -904,18 +875,9 @@ impl Store {
         provider: Provider,
         session_id: &str,
     ) -> Result<()> {
-        let mut db = self.open_write()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT OR IGNORE INTO identity_interruptions(provider,session_id,status,unread,attention_reason,error,last_event_at) SELECT provider,session_id,status,unread,attention_reason,error,last_event_at FROM sessions WHERE provider=? AND session_id=?",
-            params![provider.as_str(), session_id],
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO session_status_observations(provider,session_id,kind,status,unread,attention_reason,error,observed_at,source) SELECT provider,session_id,'lifecycle',status,unread,attention_reason,error,last_event_at,'identity-interruption' FROM sessions WHERE provider=? AND session_id=?",
-            params![provider.as_str(), session_id],
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.reconcile_transaction(|ledger| {
+            ledger.capture_identity_interruption(provider, session_id)
+        })
     }
 
     pub fn get_identity_interruption(
@@ -1166,18 +1128,7 @@ impl Store {
     }
 
     pub fn delete_pending(&self, launch_token: &str) -> Result<bool> {
-        let mut db = self.open_write()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let deleted = tx.execute(
-            "DELETE FROM pending_launches WHERE launch_token=?",
-            [launch_token],
-        )? == 1;
-        tx.execute(
-            "DELETE FROM meta WHERE key=?",
-            [launch_phase_key(launch_token)],
-        )?;
-        tx.commit()?;
-        Ok(deleted)
+        self.reconcile_transaction(|ledger| ledger.delete_pending(launch_token))
     }
 
     pub fn prune_pending(&self, pending_before: f64, binding_before: f64) -> Result<usize> {
@@ -1211,18 +1162,7 @@ impl Store {
         provider: Provider,
         session_id: &str,
     ) -> Result<bool> {
-        let mut db = self.open_write()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = launch_binding_tx(&tx, launch_token)? {
-            tx.commit()?;
-            return Ok(existing == (provider, session_id.to_owned()));
-        }
-        tx.execute(
-            "INSERT INTO launch_bindings(launch_token,provider,session_id,created_at) VALUES (?,?,?,?)",
-            params![launch_token, provider.as_str(), session_id, now()],
-        )?;
-        tx.commit()?;
-        Ok(true)
+        self.reconcile_transaction(|ledger| ledger.bind_launch(launch_token, provider, session_id))
     }
 
     pub fn get_launch_binding(&self, launch_token: &str) -> Result<Option<(Provider, String)>> {
@@ -1249,48 +1189,9 @@ impl Store {
         pid: i64,
         start_time: i64,
     ) -> Result<bool> {
-        let mut db = self.open_write()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if launch_binding_tx(&tx, launch_token)? != Some((provider, session_id.to_owned())) {
-            tx.commit()?;
-            return Ok(false);
-        }
-        let pending: Option<(Provider, Option<i64>, Option<i64>)> = tx
-            .query_row(
-                "SELECT provider,root_pid,root_pid_start FROM pending_launches WHERE launch_token=?",
-                [launch_token],
-                |row| {
-                    Ok((
-                        parse_provider(row.get_ref(0)?.as_str()?, 0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        if pending.is_some_and(|candidate| candidate != (provider, Some(pid), Some(start_time))) {
-            tx.commit()?;
-            return Ok(false);
-        }
-        put_recovery_owner_tx(
-            &tx,
-            provider,
-            session_id,
-            pid,
-            start_time,
-            launch_token,
-            now(),
-        )?;
-        tx.execute(
-            "DELETE FROM pending_launches WHERE launch_token=?",
-            [launch_token],
-        )?;
-        tx.execute(
-            "DELETE FROM meta WHERE key=?",
-            [launch_phase_key(launch_token)],
-        )?;
-        tx.commit()?;
-        Ok(true)
+        self.reconcile_transaction(|ledger| {
+            ledger.certify_launch(launch_token, provider, session_id, pid, start_time)
+        })
     }
 
     /// Atomically retarget a certified launch. Liveness checks belong to the caller.
@@ -1304,46 +1205,16 @@ impl Store {
         pid: i64,
         start_time: i64,
     ) -> Result<bool> {
-        let mut db = self.open_write()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let binding = launch_binding_tx(&tx, launch_token)?;
-        let proof = recovery_owner_tx(&tx, provider, from_session_id)?;
-        let target = recovery_owner_tx(&tx, provider, to_session_id)?;
-        let competing_target = target.is_some_and(|owner| {
-            owner.pid != pid || owner.start_time != start_time || owner.launch_token != launch_token
-        });
-        if binding != Some((provider, from_session_id.to_owned()))
-            || proof.as_ref().is_none_or(|owner| {
-                owner.pid != pid
-                    || owner.start_time != start_time
-                    || owner.launch_token != launch_token
-            })
-            || competing_target
-        {
-            tx.commit()?;
-            return Ok(false);
-        }
-        let changed = tx.execute(
-            "UPDATE launch_bindings SET session_id=?,created_at=? WHERE launch_token=? AND provider=? AND session_id=?",
-            params![to_session_id, now(), launch_token, provider.as_str(), from_session_id],
-        )? == 1;
-        if changed {
-            tx.execute(
-                "DELETE FROM recovery_owners WHERE provider=? AND session_id=?",
-                params![provider.as_str(), from_session_id],
-            )?;
-            put_recovery_owner_tx(
-                &tx,
+        self.reconcile_transaction(|ledger| {
+            ledger.switch_launch_binding(
+                launch_token,
                 provider,
+                from_session_id,
                 to_session_id,
                 pid,
                 start_time,
-                launch_token,
-                now(),
-            )?;
-        }
-        tx.commit()?;
-        Ok(changed)
+            )
+        })
     }
 
     pub fn reserve_resume(
@@ -1467,24 +1338,7 @@ impl Store {
     }
 
     pub fn set_live_owner(&self, owner: &LiveOwner) -> Result<bool> {
-        let db = self.open_write()?;
-        if is_untracked_connection(&db, owner.provider, &owner.session_id)? {
-            return Ok(false);
-        }
-        db.execute(
-            r#"INSERT INTO live_owners(provider,session_id,pid,start_time,owner_token,last_seen)
-            VALUES (?,?,?,?,?,?) ON CONFLICT(provider,session_id,pid,owner_token) DO UPDATE SET
-            start_time=excluded.start_time,last_seen=excluded.last_seen"#,
-            params![
-                owner.provider.as_str(),
-                owner.session_id,
-                owner.pid,
-                owner.start_time,
-                owner.owner_token,
-                owner.last_seen
-            ],
-        )?;
-        Ok(true)
+        self.reconcile_transaction(|ledger| ledger.set_live_owner(owner))
     }
 
     pub fn live_owners(&self, provider: Provider, session_id: &str) -> Result<Vec<LiveOwner>> {
@@ -1520,26 +1374,9 @@ impl Store {
         pid: Option<i64>,
         owner_token: Option<&str>,
     ) -> Result<usize> {
-        let db = self.open_write()?;
-        let deleted = match (pid, owner_token) {
-            (None, None) => db.execute(
-                "DELETE FROM live_owners WHERE provider=? AND session_id=?",
-                params![provider.as_str(), session_id],
-            )?,
-            (Some(pid), None) => db.execute(
-                "DELETE FROM live_owners WHERE provider=? AND session_id=? AND pid=?",
-                params![provider.as_str(), session_id, pid],
-            )?,
-            (None, Some(token)) => db.execute(
-                "DELETE FROM live_owners WHERE provider=? AND session_id=? AND owner_token=?",
-                params![provider.as_str(), session_id, token],
-            )?,
-            (Some(pid), Some(token)) => db.execute(
-                "DELETE FROM live_owners WHERE provider=? AND session_id=? AND pid=? AND owner_token=?",
-                params![provider.as_str(), session_id, pid, token],
-            )?,
-        };
-        Ok(deleted)
+        self.reconcile_transaction(|ledger| {
+            ledger.delete_live_owners(provider, session_id, pid, owner_token)
+        })
     }
 
     pub fn delete_other_live_owner_sessions(
@@ -1548,11 +1385,9 @@ impl Store {
         pid: i64,
         keep_session_id: &str,
     ) -> Result<usize> {
-        let db = self.open_write()?;
-        Ok(db.execute(
-            "DELETE FROM live_owners WHERE provider=? AND pid=? AND session_id<>?",
-            params![provider.as_str(), pid, keep_session_id],
-        )?)
+        self.reconcile_transaction(|ledger| {
+            ledger.delete_other_live_owner_sessions(provider, pid, keep_session_id)
+        })
     }
 
     pub fn set_recovery_owner(&self, owner: &RecoveryOwner) -> Result<()> {
@@ -2037,12 +1872,7 @@ impl Store {
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        let db = self.open_write()?;
-        db.execute(
-            "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
+        self.reconcile_transaction(|ledger| ledger.set_meta(key, value))
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -2058,27 +1888,11 @@ impl Store {
     }
 
     pub fn delete_meta(&self, key: &str) -> Result<bool> {
-        let db = self.open_write()?;
-        Ok(db.execute("DELETE FROM meta WHERE key=?", [key])? == 1)
+        self.reconcile_transaction(|ledger| ledger.delete_meta(key))
     }
 
     pub fn record_attach(&self, provider: Provider, session_id: &str) -> Result<()> {
-        let mut db = self.open_write()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = serde_json::to_string(&(provider.as_str(), session_id))?;
-        let previous: Option<String> = tx
-            .query_row(
-                "SELECT value FROM meta WHERE key='last_attached'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(previous) = previous.filter(|value| value != &current) {
-            set_meta_tx(&tx, "previous_attached", &previous)?;
-        }
-        set_meta_tx(&tx, "last_attached", &current)?;
-        tx.commit()?;
-        Ok(())
+        self.reconcile_transaction(|ledger| ledger.record_attach(provider, session_id))
     }
 
     pub fn previous_attached(&self) -> Result<Option<(Provider, String)>> {
@@ -2096,16 +1910,7 @@ impl Store {
     }
 
     pub fn record_hook_observation(&self, observation: &HookObservation) -> Result<()> {
-        let db = self.open_write()?;
-        db.execute(
-            r#"INSERT INTO hook_observations(provider,fingerprint,event_name,session_id,observed_at,source,managed)
-            VALUES (?,?,?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET
-            fingerprint=excluded.fingerprint,event_name=excluded.event_name,
-            session_id=excluded.session_id,observed_at=excluded.observed_at,
-            source=excluded.source,managed=excluded.managed"#,
-            params![observation.provider.as_str(), observation.fingerprint, observation.event_name, observation.session_id, observation.observed_at, observation.source, bool_i64(observation.managed)],
-        )?;
-        Ok(())
+        self.reconcile_transaction(|ledger| ledger.record_hook_observation(observation))
     }
 
     pub fn get_hook_observation(&self, provider: Provider) -> Result<Option<HookObservation>> {
@@ -2217,6 +2022,342 @@ fn nonzero_or(value: f64, fallback: f64) -> f64 {
 }
 
 impl ReconcileLedger<'_> {
+    pub(crate) fn delete_session(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        preserve_live_owners: bool,
+    ) -> Result<bool> {
+        let tx = self.tx;
+        for table in [
+            "usage_cache",
+            "session_events",
+            "session_status_observations",
+            "identity_interruptions",
+            "expert_profiles",
+            "expert_refresh_attempts",
+            "recovery_owners",
+            "launch_reservations",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE provider=? AND session_id=?"),
+                params![provider.as_str(), session_id],
+            )?;
+        }
+        if !preserve_live_owners {
+            tx.execute(
+                "DELETE FROM live_owners WHERE provider=? AND session_id=?",
+                params![provider.as_str(), session_id],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM launch_bindings WHERE provider=? AND session_id=?",
+            params![provider.as_str(), session_id],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM sessions WHERE provider=? AND session_id=?",
+            params![provider.as_str(), session_id],
+        )? == 1;
+        Ok(deleted)
+    }
+
+    pub(crate) fn capture_identity_interruption(
+        &self,
+        provider: Provider,
+        session_id: &str,
+    ) -> Result<()> {
+        let tx = self.tx;
+        tx.execute(
+            "INSERT OR IGNORE INTO identity_interruptions(provider,session_id,status,unread,attention_reason,error,last_event_at) SELECT provider,session_id,status,unread,attention_reason,error,last_event_at FROM sessions WHERE provider=? AND session_id=?",
+            params![provider.as_str(), session_id],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO session_status_observations(provider,session_id,kind,status,unread,attention_reason,error,observed_at,source) SELECT provider,session_id,'lifecycle',status,unread,attention_reason,error,last_event_at,'identity-interruption' FROM sessions WHERE provider=? AND session_id=?",
+            params![provider.as_str(), session_id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_pending(&self, launch_token: &str) -> Result<bool> {
+        let tx = self.tx;
+        let deleted = tx.execute(
+            "DELETE FROM pending_launches WHERE launch_token=?",
+            [launch_token],
+        )? == 1;
+        tx.execute(
+            "DELETE FROM meta WHERE key=?",
+            [launch_phase_key(launch_token)],
+        )?;
+        Ok(deleted)
+    }
+
+    pub(crate) fn bind_launch(
+        &self,
+        launch_token: &str,
+        provider: Provider,
+        session_id: &str,
+    ) -> Result<bool> {
+        let tx = self.tx;
+        if let Some(existing) = launch_binding_tx(tx, launch_token)? {
+            return Ok(existing == (provider, session_id.to_owned()));
+        }
+        tx.execute(
+            "INSERT INTO launch_bindings(launch_token,provider,session_id,created_at) VALUES (?,?,?,?)",
+            params![launch_token, provider.as_str(), session_id, now()],
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn certify_launch(
+        &self,
+        launch_token: &str,
+        provider: Provider,
+        session_id: &str,
+        pid: i64,
+        start_time: i64,
+    ) -> Result<bool> {
+        let tx = self.tx;
+        if launch_binding_tx(tx, launch_token)? != Some((provider, session_id.to_owned())) {
+            return Ok(false);
+        }
+        let pending: Option<(Provider, Option<i64>, Option<i64>)> = tx
+            .query_row(
+                "SELECT provider,root_pid,root_pid_start FROM pending_launches WHERE launch_token=?",
+                [launch_token],
+                |row| {
+                    Ok((
+                        parse_provider(row.get_ref(0)?.as_str()?, 0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if pending.is_some_and(|candidate| candidate != (provider, Some(pid), Some(start_time))) {
+            return Ok(false);
+        }
+        put_recovery_owner_tx(
+            tx,
+            provider,
+            session_id,
+            pid,
+            start_time,
+            launch_token,
+            now(),
+        )?;
+        tx.execute(
+            "DELETE FROM pending_launches WHERE launch_token=?",
+            [launch_token],
+        )?;
+        tx.execute(
+            "DELETE FROM meta WHERE key=?",
+            [launch_phase_key(launch_token)],
+        )?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn switch_launch_binding(
+        &self,
+        launch_token: &str,
+        provider: Provider,
+        from_session_id: &str,
+        to_session_id: &str,
+        pid: i64,
+        start_time: i64,
+    ) -> Result<bool> {
+        let tx = self.tx;
+        let binding = launch_binding_tx(tx, launch_token)?;
+        let proof = recovery_owner_tx(tx, provider, from_session_id)?;
+        let target = recovery_owner_tx(tx, provider, to_session_id)?;
+        let competing_target = target.is_some_and(|owner| {
+            owner.pid != pid || owner.start_time != start_time || owner.launch_token != launch_token
+        });
+        if binding != Some((provider, from_session_id.to_owned()))
+            || proof.as_ref().is_none_or(|owner| {
+                owner.pid != pid
+                    || owner.start_time != start_time
+                    || owner.launch_token != launch_token
+            })
+            || competing_target
+        {
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE launch_bindings SET session_id=?,created_at=? WHERE launch_token=? AND provider=? AND session_id=?",
+            params![to_session_id, now(), launch_token, provider.as_str(), from_session_id],
+        )? == 1;
+        if changed {
+            tx.execute(
+                "DELETE FROM recovery_owners WHERE provider=? AND session_id=?",
+                params![provider.as_str(), from_session_id],
+            )?;
+            put_recovery_owner_tx(
+                tx,
+                provider,
+                to_session_id,
+                pid,
+                start_time,
+                launch_token,
+                now(),
+            )?;
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn set_live_owner(&self, owner: &LiveOwner) -> Result<bool> {
+        let db = self.tx;
+        if is_untracked_connection(db, owner.provider, &owner.session_id)? {
+            return Ok(false);
+        }
+        db.execute(
+            r#"INSERT INTO live_owners(provider,session_id,pid,start_time,owner_token,last_seen)
+            VALUES (?,?,?,?,?,?) ON CONFLICT(provider,session_id,pid,owner_token) DO UPDATE SET
+            start_time=excluded.start_time,last_seen=excluded.last_seen"#,
+            params![
+                owner.provider.as_str(),
+                owner.session_id,
+                owner.pid,
+                owner.start_time,
+                owner.owner_token,
+                owner.last_seen
+            ],
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn delete_live_owners(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        pid: Option<i64>,
+        owner_token: Option<&str>,
+    ) -> Result<usize> {
+        let db = self.tx;
+        let deleted = match (pid, owner_token) {
+            (None, None) => db.execute(
+                "DELETE FROM live_owners WHERE provider=? AND session_id=?",
+                params![provider.as_str(), session_id],
+            )?,
+            (Some(pid), None) => db.execute(
+                "DELETE FROM live_owners WHERE provider=? AND session_id=? AND pid=?",
+                params![provider.as_str(), session_id, pid],
+            )?,
+            (None, Some(token)) => db.execute(
+                "DELETE FROM live_owners WHERE provider=? AND session_id=? AND owner_token=?",
+                params![provider.as_str(), session_id, token],
+            )?,
+            (Some(pid), Some(token)) => db.execute(
+                "DELETE FROM live_owners WHERE provider=? AND session_id=? AND pid=? AND owner_token=?",
+                params![provider.as_str(), session_id, pid, token],
+            )?,
+        };
+        Ok(deleted)
+    }
+
+    pub(crate) fn delete_other_live_owner_sessions(
+        &self,
+        provider: Provider,
+        pid: i64,
+        keep_session_id: &str,
+    ) -> Result<usize> {
+        let db = self.tx;
+        Ok(db.execute(
+            "DELETE FROM live_owners WHERE provider=? AND pid=? AND session_id<>?",
+            params![provider.as_str(), pid, keep_session_id],
+        )?)
+    }
+
+    pub(crate) fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let db = self.tx;
+        db.execute(
+            "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_meta(&self, key: &str) -> Result<bool> {
+        let db = self.tx;
+        Ok(db.execute("DELETE FROM meta WHERE key=?", [key])? == 1)
+    }
+
+    pub(crate) fn record_attach(&self, provider: Provider, session_id: &str) -> Result<()> {
+        let tx = self.tx;
+        let current = serde_json::to_string(&(provider.as_str(), session_id))?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key='last_attached'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(previous) = previous.filter(|value| value != &current) {
+            set_meta_tx(tx, "previous_attached", &previous)?;
+        }
+        set_meta_tx(tx, "last_attached", &current)?;
+        Ok(())
+    }
+
+    pub(crate) fn record_hook_observation(&self, observation: &HookObservation) -> Result<()> {
+        let db = self.tx;
+        db.execute(
+            r#"INSERT INTO hook_observations(provider,fingerprint,event_name,session_id,observed_at,source,managed)
+            VALUES (?,?,?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET
+            fingerprint=excluded.fingerprint,event_name=excluded.event_name,
+            session_id=excluded.session_id,observed_at=excluded.observed_at,
+            source=excluded.source,managed=excluded.managed"#,
+            params![observation.provider.as_str(), observation.fingerprint, observation.event_name, observation.session_id, observation.observed_at, observation.source, bool_i64(observation.managed)],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn get_session_by_thread(
+        &self,
+        provider: Provider,
+        thread_id: &str,
+    ) -> Result<Option<Session>> {
+        let db = self.tx;
+        db.query_row(
+            "SELECT * FROM sessions WHERE provider=? AND (session_id=? OR active_thread_id=?) ORDER BY CASE WHEN session_id=? THEN 0 ELSE 1 END LIMIT 1",
+            params![provider.as_str(), thread_id, thread_id, thread_id],
+            session_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn get_pending(&self, launch_token: &str) -> Result<Option<PendingLaunch>> {
+        let db = self.tx;
+        db.query_row(
+            "SELECT * FROM pending_launches WHERE launch_token=?",
+            [launch_token],
+            pending_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn find_pending_for_pane(&self, pane: &str) -> Result<Option<PendingLaunch>> {
+        let db = self.tx;
+        db.query_row(
+            "SELECT * FROM pending_launches WHERE tmux_pane=? ORDER BY created_at DESC LIMIT 1",
+            [pane],
+            pending_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let db = self.tx;
+        db.query_row("SELECT value FROM meta WHERE key=?", [key], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub(crate) fn get_session(
         &self,
         provider: Provider,

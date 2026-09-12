@@ -1,6 +1,6 @@
 use crate::model::{ObservationKind, Provider, Session, Status, StatusObservation};
 use crate::status::{ProjectionFallback, project_status};
-use crate::store::{HookObservation, LiveOwner, PendingLaunch, Store};
+use crate::store::{HookObservation, LiveOwner, PendingLaunch, ReconcileLedger, Store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -267,6 +267,24 @@ pub fn handle_hook(
     payload: &HookPayload,
     context: &HookContext,
 ) -> Result<HookResult> {
+    handle_hook_with_checkpoints(store, provider, payload, context, |_| Ok(()))
+}
+
+#[derive(Clone, Copy)]
+enum HookCheckpoint {
+    BeforeTransaction,
+    Projected,
+}
+
+// The no-op production callback is optimized away. Tests use these exact
+// boundaries to control overlapping writers and failed commits without sleeps.
+fn handle_hook_with_checkpoints(
+    store: &Store,
+    provider: Provider,
+    payload: &HookPayload,
+    context: &HookContext,
+    mut checkpoint: impl FnMut(HookCheckpoint) -> Result<()>,
+) -> Result<HookResult> {
     let enriched = enrich_hook_payload(provider, payload);
     let payload = &enriched;
     validate_payload(provider, payload)?;
@@ -301,9 +319,26 @@ pub fn handle_hook(
         ));
     }
 
-    store.initialize()?;
+    // Enrichment is bounded provider I/O and must finish before taking the writer
+    // lock. Every database decision below, including canonical identity and owner
+    // updates, sees the same state as the final projection and session upsert.
+    checkpoint(HookCheckpoint::BeforeTransaction)?;
+    store.reconcile_transaction(|ledger| {
+        handle_hook_transaction(ledger, provider, payload, context, || {
+            checkpoint(HookCheckpoint::Projected)
+        })
+    })
+}
+
+fn handle_hook_transaction(
+    store: &ReconcileLedger<'_>,
+    provider: Provider,
+    payload: &HookPayload,
+    context: &HookContext,
+    after_projection: impl FnOnce() -> Result<()>,
+) -> Result<HookResult> {
     if store.is_untracked(provider, &payload.session_id)? {
-        store.delete_live_owner(provider, &payload.session_id, None, None)?;
+        store.delete_live_owners(provider, &payload.session_id, None, None)?;
         return Ok(HookResult::ignored(
             provider,
             Some(payload.session_id.clone()),
@@ -356,7 +391,7 @@ pub fn handle_hook(
     if store.is_untracked(provider, &canonical_id)?
         || store.is_untracked(provider, &payload.session_id)?
     {
-        store.delete_live_owner(provider, &canonical_id, None, None)?;
+        store.delete_live_owners(provider, &canonical_id, None, None)?;
         return Ok(HookResult::ignored(
             provider,
             Some(canonical_id),
@@ -376,7 +411,7 @@ pub fn handle_hook(
 
     if provider == Provider::Opencode && payload.hook_event_name == "SessionEnd" && payload.deleted
     {
-        store.delete_live_owner(provider, &canonical_id, None, None)?;
+        store.delete_live_owners(provider, &canonical_id, None, None)?;
         store.delete_recovery_owner(provider, &canonical_id)?;
         store.delete_session(provider, &canonical_id, false)?;
         return Ok(HookResult {
@@ -604,6 +639,7 @@ pub fn handle_hook(
             && before.attention_reason == session.attention_reason
             && before.error == session.error
     });
+    after_projection()?;
     store.upsert_session(&session, true)?;
     if let Some(placeholder) = placeholder
         && placeholder.session_id != canonical_id
@@ -966,7 +1002,7 @@ enum LaunchDecision {
 }
 
 fn validate_launch(
-    store: &Store,
+    store: &ReconcileLedger<'_>,
     provider: Provider,
     session_id: &str,
     payload: &HookPayload,
@@ -1113,7 +1149,7 @@ fn launch_mismatch(
 
 #[allow(clippy::too_many_arguments)]
 fn record_launch_conflict(
-    store: &Store,
+    store: &ReconcileLedger<'_>,
     launch_token: Option<&str>,
     winner: &Session,
     competitor_provider: Provider,
@@ -1171,7 +1207,7 @@ fn record_launch_conflict(
 }
 
 fn update_owner(
-    store: &Store,
+    store: &ReconcileLedger<'_>,
     provider: Provider,
     session_id: &str,
     payload: &HookPayload,
@@ -1181,7 +1217,7 @@ fn update_owner(
         return Ok(());
     };
     if payload.hook_event_name == "SessionEnd" {
-        store.delete_live_owner(provider, session_id, Some(pid), owner_token(context))?;
+        store.delete_live_owners(provider, session_id, Some(pid), owner_token(context))?;
     } else {
         if provider == Provider::Opencode {
             store.delete_other_live_owner_sessions(provider, pid, session_id)?;
@@ -1202,7 +1238,7 @@ fn owner_token(context: &HookContext) -> Option<&str> {
     Some(context.owner_token.as_str())
 }
 
-fn pending_name(store: &Store, context: &HookContext) -> Result<Option<String>> {
+fn pending_name(store: &ReconcileLedger<'_>, context: &HookContext) -> Result<Option<String>> {
     context
         .launch_token
         .as_deref()
@@ -1436,4 +1472,247 @@ fn now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::{Connection, ErrorCode};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    const DEADLINE: Duration = Duration::from_secs(3);
+
+    fn payload(provider: Provider, event: &str) -> HookPayload {
+        let tool = if provider == Provider::Claude {
+            "AskUserQuestion"
+        } else {
+            "request_user_input"
+        };
+        parse_hook_payload(
+            serde_json::to_vec(&json!({
+                "session_id": "exact",
+                "hook_event_name": event,
+                "tool_name": tool,
+                "cwd": "/project",
+            }))
+            .unwrap()
+            .as_slice(),
+            provider,
+        )
+        .unwrap()
+    }
+
+    fn context(at: f64) -> HookContext {
+        let mut context = HookContext::at(at);
+        context.desired_name = Some("work".into());
+        context.owner_pid = Some(42);
+        context.owner_start_time = Some(7);
+        context.owner_token = "exact-owner".into();
+        context
+    }
+
+    #[test]
+    fn overlapping_hooks_keep_newest_attention_and_atomic_owner_observations() {
+        for provider in [Provider::Codex, Provider::Claude, Provider::Opencode] {
+            for newer_first in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let store = Store::at(temp.path().join("state/pika.db"));
+                handle_hook(
+                    &store,
+                    provider,
+                    &payload(provider, "SessionStart"),
+                    &context(1.0),
+                )
+                .unwrap();
+                let question_event = if provider == Provider::Opencode {
+                    "QuestionRequest"
+                } else {
+                    "PreToolUse"
+                };
+                let (first_event, first_at, second_event, second_at) = if newer_first {
+                    (question_event, 20.0, "UserPromptSubmit", 10.0)
+                } else {
+                    ("UserPromptSubmit", 10.0, question_event, 20.0)
+                };
+                let (projected_tx, projected_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let first_store = store.clone();
+                let first = thread::spawn(move || {
+                    handle_hook_with_checkpoints(
+                        &first_store,
+                        provider,
+                        &payload(provider, first_event),
+                        &context(first_at),
+                        |checkpoint| {
+                            if matches!(checkpoint, HookCheckpoint::Projected) {
+                                projected_tx.send(())?;
+                                release_rx.recv_timeout(DEADLINE)?;
+                            }
+                            Ok(())
+                        },
+                    )
+                });
+                projected_rx.recv_timeout(DEADLINE).unwrap();
+
+                // This is the old vulnerable gap: projection has completed but
+                // the session upsert has not. Prove the immediate writer lock
+                // still exists, independently of OS thread scheduling.
+                let probe = Connection::open(store.path()).unwrap();
+                probe.busy_timeout(Duration::ZERO).unwrap();
+                assert_eq!(
+                    probe
+                        .execute_batch("BEGIN IMMEDIATE")
+                        .unwrap_err()
+                        .sqlite_error_code(),
+                    Some(ErrorCode::DatabaseBusy)
+                );
+                // WAL readers cannot see any portion of the staged hook.
+                assert_eq!(
+                    store
+                        .get_session(provider, "exact")
+                        .unwrap()
+                        .unwrap()
+                        .last_event_at,
+                    1.0
+                );
+                assert_eq!(
+                    store.live_owners(provider, "exact").unwrap()[0].last_seen,
+                    1.0
+                );
+                assert_eq!(
+                    store
+                        .get_hook_observation(provider)
+                        .unwrap()
+                        .unwrap()
+                        .observed_at,
+                    1.0
+                );
+                assert_eq!(
+                    store.status_observations(provider, "exact").unwrap()[0].observed_at,
+                    1.0
+                );
+
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (second_projected_tx, second_projected_rx) = mpsc::channel();
+                let second_store = store.clone();
+                let second = thread::spawn(move || {
+                    handle_hook_with_checkpoints(
+                        &second_store,
+                        provider,
+                        &payload(provider, second_event),
+                        &context(second_at),
+                        |checkpoint| {
+                            match checkpoint {
+                                HookCheckpoint::BeforeTransaction => entered_tx.send(())?,
+                                HookCheckpoint::Projected => second_projected_tx.send(())?,
+                            }
+                            Ok(())
+                        },
+                    )
+                });
+                // Both invocations are now in progress. The second writer must
+                // not project until the first commits; no timing sleeps decide
+                // the event order or the assertion above.
+                entered_rx.recv_timeout(DEADLINE).unwrap();
+                assert!(matches!(
+                    second_projected_rx.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                release_tx.send(()).unwrap();
+                first.join().unwrap().unwrap();
+                let second_result = second.join().unwrap().unwrap();
+                second_projected_rx.recv_timeout(DEADLINE).unwrap();
+                let final_session = store.get_session(provider, "exact").unwrap().unwrap();
+                assert_eq!(
+                    (
+                        final_session.status,
+                        final_session.unread,
+                        final_session.last_event_at
+                    ),
+                    (Status::NeedsYou, true, 20.0),
+                    "provider={provider:?}, newer_first={newer_first}"
+                );
+                assert_eq!(final_session.attention_reason.as_deref(), Some("question"));
+                assert_eq!(second_result.status, Some(Status::NeedsYou));
+                assert_eq!(second_result.alert.is_some(), !newer_first);
+                let observations = store.status_observations(provider, "exact").unwrap();
+                assert_eq!(observations[0].status, final_session.status);
+                assert_eq!(observations[0].observed_at, final_session.last_event_at);
+                let owners = store.live_owners(provider, "exact").unwrap();
+                assert_eq!(owners.len(), 1);
+                assert_eq!(owners[0].pid, 42);
+                assert_eq!(owners[0].start_time, Some(7));
+                assert_eq!(owners[0].owner_token, "exact-owner");
+            }
+        }
+    }
+
+    #[test]
+    fn failed_hook_projection_rolls_back_identity_owner_and_observation_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::at(temp.path().join("state/pika.db"));
+        let mut context = context(10.0);
+        context.launch_token = Some("pending-token".into());
+        context.pane_id = Some("%42".into());
+        context.pane_session = Some("test-home".into());
+        store
+            .add_pending(&PendingLaunch {
+                launch_token: "pending-token".into(),
+                provider: Provider::Codex,
+                name: "work".into(),
+                cwd: "/project".into(),
+                tmux_session: context.pane_session.clone(),
+                tmux_pane: context.pane_id.clone(),
+                expected_session_id: Some("exact".into()),
+                root_pid: context.owner_pid,
+                root_pid_start: context.owner_start_time,
+                preexisting_session_ids: None,
+                candidate_session_id: None,
+                candidate_observed_at: None,
+                created_at: 1.0,
+            })
+            .unwrap();
+        let result = handle_hook_with_checkpoints(
+            &store,
+            Provider::Codex,
+            &payload(Provider::Codex, "PreToolUse"),
+            &context,
+            |checkpoint| {
+                if matches!(checkpoint, HookCheckpoint::Projected) {
+                    bail!("injected failure before hook session update");
+                }
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("injected failure"));
+        assert!(
+            store
+                .get_session(Provider::Codex, "exact")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .live_owners(Provider::Codex, "exact")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_hook_observation(Provider::Codex)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .status_observations(Provider::Codex, "exact")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.get_launch_binding("pending-token").unwrap().is_none());
+        assert!(store.get_pending("pending-token").unwrap().is_some());
+        assert!(store.list_activity_events(10).unwrap().is_empty());
+    }
 }
