@@ -419,6 +419,72 @@ fn read_update_notice_cache(path: &Path) -> Option<UpdateNoticeCache> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
+#[cfg(unix)]
+fn record_update_check(managed: &ManagedInstallation, outcome: &UpdateOutcome) {
+    let latest = match outcome.disposition {
+        UpdateDisposition::Available => Some(outcome.version.clone()),
+        _ => None,
+    };
+    // The check itself remains authoritative even if a concurrent board owns
+    // the cache lock or the optional cache cannot be refreshed. The board
+    // treats a missing/stale cache as the ordinary no-notice state.
+    let _ = write_update_notice_cache(managed, latest);
+}
+
+#[cfg(unix)]
+fn write_update_notice_cache(managed: &ManagedInstallation, latest: Option<String>) -> Result<()> {
+    initialize_or_validate_root(&managed.root, true)?;
+    let lock_path = managed.root.join(".update-check.lock");
+    reject_symlink(&lock_path)?;
+    let lock = open_lock(&lock_path)?;
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            UpdateError::Busy
+        } else {
+            UpdateError::Io(error)
+        }
+    })?;
+    initialize_or_validate_root(&managed.root, true)?;
+
+    let cache_path = managed.root.join(".update-check.json");
+    reject_symlink(&cache_path)?;
+    if let Ok(metadata) = fs::symlink_metadata(&cache_path) {
+        if !metadata.file_type().is_file() {
+            return Err(UpdateError::Safety(
+                "update notice cache must be a regular file".into(),
+            ));
+        }
+        validate_path_owner(&cache_path)?;
+    }
+    let checked_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |duration| duration.as_secs_f64());
+    let bytes = serde_json::to_vec(&UpdateNoticeCache {
+        current: managed.version.clone(),
+        checked_at,
+        latest,
+        failed: false,
+    })
+    .map_err(|error| UpdateError::Safety(format!("cannot encode update notice: {error}")))?;
+    if bytes.len() > 4096 {
+        return Err(UpdateError::Safety(
+            "update notice cache exceeds its size limit".into(),
+        ));
+    }
+
+    let temporary = managed
+        .root
+        .join(format!(".update-check-{}", Uuid::new_v4()));
+    write_new_file(&temporary, &bytes, 0o600)?;
+    let result = fs::rename(&temporary, &cache_path)
+        .map_err(UpdateError::Io)
+        .and_then(|()| sync_directory(&managed.root));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 impl UpdateOutcome {
     pub fn message(&self) -> String {
         match self.disposition {
@@ -568,6 +634,8 @@ pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
         parse_version(release)?;
     }
     let managed = discover_managed_install(request.executable)?;
+    let refresh_notice_cache =
+        request.check && request.bundle.is_none() && request.release.is_none();
     let target = native_target()?;
     let scratch = ScratchDirectory::new("pika-update")?;
 
@@ -610,7 +678,11 @@ pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
                 let selected =
                     select_latest_release(&fs::read(listing)?, &managed.version, target)?;
                 let Some(selected) = selected else {
-                    return Ok(already_current(&managed));
+                    let outcome = already_current(&managed);
+                    if refresh_notice_cache {
+                        record_update_check(&managed, &outcome);
+                    }
+                    return Ok(outcome);
                 };
                 selected
             }
@@ -641,6 +713,9 @@ pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
         if let Some(outcome) =
             metadata_update_outcome(&managed, &manifest, artifact, request.check)?
         {
+            if refresh_notice_cache {
+                record_update_check(&managed, &outcome);
+            }
             return Ok(outcome);
         }
         let artifact_path = scratch.path.join(&artifact.file);

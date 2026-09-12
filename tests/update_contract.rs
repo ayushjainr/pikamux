@@ -1208,6 +1208,82 @@ fn public_cli_installs_and_checks_a_native_bundle_end_to_end() {
         String::from_utf8_lossy(&checked.stdout).trim(),
         format!("Pika {version} is already current.")
     );
+
+    let newer_version = "0.6.0-alpha.2";
+    let newer = release_bundle(temp.path(), newer_version);
+    let newer_manifest = newer.join("pika-native-release.json");
+    let newer_artifact = artifact_name(newer_version, target).unwrap();
+    let listing = temp.path().join("releases.json");
+    fs::write(
+        &listing,
+        serde_json::to_vec(&json!([{
+            "tag_name":format!("v{newer_version}"),
+            "draft":false,
+            "prerelease":true,
+            "assets":[
+                {"name":"pika-native-release.json","state":"uploaded"},
+                {"name":newer_artifact,"state":"uploaded"},
+                {"name":format!("{newer_artifact}.sha256"),"state":"uploaded"}
+            ]
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let fake_bin = temp.path().join("fake-update-bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let curl = fake_bin.join("curl");
+    fs::write(
+        &curl,
+        r#"#!/bin/sh
+output=''
+previous=''
+for value in "$@"; do
+  if [ "$previous" = '--output' ]; then output=$value; fi
+  previous=$value
+done
+url=$previous
+case "$url" in
+  *'/releases?per_page=100') source="$PIKA_TEST_RELEASE_LIST" ;;
+  */pika-native-release.json) source="$PIKA_TEST_NATIVE_MANIFEST" ;;
+  *) exit 17 ;;
+esac
+cp "$source" "$output"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap());
+    let available = Command::new(bin.join("pika"))
+        .args(["update", "--check"])
+        .env("HOME", temp.path().join("home"))
+        .env("PATH", path)
+        .env("PIKA_TEST_RELEASE_LIST", listing)
+        .env("PIKA_TEST_NATIVE_MANIFEST", newer_manifest)
+        .output()
+        .unwrap();
+    assert!(
+        available.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&available.stdout),
+        String::from_utf8_lossy(&available.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&available.stdout).contains(newer_version),
+        "{}",
+        String::from_utf8_lossy(&available.stdout)
+    );
+    assert_eq!(
+        cached_update_notice(&bin.join("pika")),
+        Some(newer_version.into())
+    );
+    assert_eq!(
+        fs::symlink_metadata(root.join(".update-check.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
 }
 
 #[test]

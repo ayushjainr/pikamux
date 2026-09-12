@@ -750,6 +750,26 @@ temporary.replace(wheel)
 }
 
 #[test]
+fn transition_verifier_binds_top_level_version_to_bridge_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let release = transition_release(temp.path());
+    fs::write(release.join("pika-version"), "0.5.0a4\n").unwrap();
+    rewrite_bridge_outer_checksums(&release);
+    let rejected = Command::new("bash")
+        .arg("scripts/verify-release.sh")
+        .arg(&release)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("pika-version does not match the bridge manifest"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
 fn install_rejects_permissive_managed_directories_before_writes_and_creates_private_ones() {
     let temp = tempfile::tempdir().unwrap();
     let (manifest, archive, binary) = direct_fixture(temp.path(), "0.6.0-alpha.1");

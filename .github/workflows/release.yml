@@ -30,6 +30,8 @@ jobs:
           cargo fetch --locked
           scripts/generate-third-party.sh /tmp/THIRD_PARTY.md
           diff -u THIRD_PARTY.md /tmp/THIRD_PARTY.md
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit --deny warnings
 
   build:
     needs: verify

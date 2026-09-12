@@ -197,6 +197,8 @@ if bridge.is_file():
             fail("bridge version is not accepted by the frozen updater")
         if value["wheel"] != f"pikamux-{version}-py3-none-any.whl":
             fail("bridge wheel/version mismatch")
+        if (root / "pika-version").read_text() != version + "\n":
+            fail("pika-version does not match the bridge manifest")
         allowed_top_level.update({bridge.name, value["wheel"]})
         wheel_path = root / value["wheel"]
         if wheel_path.is_symlink() or wheel_path.stat().st_size > 64 * 1024 * 1024:
