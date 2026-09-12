@@ -157,36 +157,51 @@ candidate_probe() {
     pika_probe_index=$((pika_probe_index + 1))
     local pika_probe_stdout="$pika_tmp/probe-$pika_probe_index.stdout"
     local pika_probe_stderr="$pika_tmp/probe-$pika_probe_index.stderr"
-    local pika_probe_timed_out="$pika_tmp/probe-$pika_probe_index.timed-out"
+    local pika_probe_status_file="$pika_tmp/probe-$pika_probe_index.status"
     # A file-size limit prevents a diagnostic probe from filling the staging
     # filesystem before its wall-clock deadline. Monitor mode gives the
-    # candidate an isolated process group so the watchdog also reaps work it
-    # spawned; the group leader itself is always waited below.
+    # candidate an isolated process group. The wrapper deliberately remains
+    # alive after recording the candidate's status, pinning ownership of the
+    # PGID until the parent has terminated every inherited descendant.
     set -m
     (
         ulimit -f 1024 2>/dev/null || :
-        exec "$@"
+        set +e
+        "$@"
+        pika_wrapped_status=$?
+        printf '%s\n' "$pika_wrapped_status" >"$pika_probe_status_file"
+        while :; do sleep 60; done
     ) >"$pika_probe_stdout" 2>"$pika_probe_stderr" &
     local pika_probe_pid=$!
     set +m
-    set -m
-    (
-        sleep "$pika_probe_timeout"
-        if kill -0 "$pika_probe_pid" 2>/dev/null; then
-            : >"$pika_probe_timed_out"
-            kill -TERM -- "-$pika_probe_pid" 2>/dev/null || :
-            sleep 1
-            kill -KILL -- "-$pika_probe_pid" 2>/dev/null || :
-        fi
-    ) &
-    local pika_watchdog_pid=$!
-    set +m
-    local pika_probe_status=0
-    wait "$pika_probe_pid" || pika_probe_status=$?
-    kill -TERM -- "-$pika_watchdog_pid" 2>/dev/null || :
-    wait "$pika_watchdog_pid" 2>/dev/null || :
-    [ ! -e "$pika_probe_timed_out" ] || \
+    local pika_probe_tick=0
+    local pika_probe_tick_limit=$((pika_probe_timeout * 10))
+    while [ ! -e "$pika_probe_status_file" ] && \
+        kill -0 "$pika_probe_pid" 2>/dev/null && \
+        [ "$pika_probe_tick" -lt "$pika_probe_tick_limit" ]; do
+        sleep 0.1
+        pika_probe_tick=$((pika_probe_tick + 1))
+    done
+    local pika_probe_timed_out=0
+    if [ ! -e "$pika_probe_status_file" ] && \
+        kill -0 "$pika_probe_pid" 2>/dev/null && \
+        [ "$pika_probe_tick" -ge "$pika_probe_tick_limit" ]; then
+        pika_probe_timed_out=1
+    fi
+    # Clean the exact pinned group on success and failure. This closes output
+    # files held by descendants before validation continues.
+    kill -TERM -- "-$pika_probe_pid" 2>/dev/null || :
+    sleep 0.1
+    kill -KILL -- "-$pika_probe_pid" 2>/dev/null || :
+    wait "$pika_probe_pid" 2>/dev/null || :
+    [ "$pika_probe_timed_out" -eq 0 ] || \
         fail "Native executable $pika_probe_label timed out after ${pika_probe_timeout}s."
+    [ -e "$pika_probe_status_file" ] || \
+        fail "Native executable $pika_probe_label stopped without a status receipt."
+    local pika_probe_status
+    pika_probe_status=$(<"$pika_probe_status_file")
+    case "$pika_probe_status" in *[!0-9]*|'') \
+        fail "Native executable $pika_probe_label returned an invalid status receipt." ;; esac
     [ "$(wc -c < "$pika_probe_stdout" | tr -d ' ')" -le 1048576 ] && \
         [ "$(wc -c < "$pika_probe_stderr" | tr -d ' ')" -le 1048576 ] || \
         fail "Native executable $pika_probe_label exceeded the output limit."
