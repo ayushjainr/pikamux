@@ -1874,15 +1874,19 @@ mod bounded_candidate_tests {
         // the background child deliberately retains both inherited pipes.
         // Falling off the end of a non-interactive shell is not portable: some
         // shells wait for background jobs and would test the root deadline
-        // instead of descendant cleanup.
-        let (_directory, candidate) =
-            script("sleep 30 &\nprintf 'pika 0.0.0\\n'\nexec /usr/bin/true");
+        // instead of descendant cleanup. Five seconds leaves scheduler
+        // headroom in a parallel suite while remaining far below the child's
+        // 30-second lifetime and the production probe deadline.
+        let (_directory, candidate) = script(
+            "sleep 30 &\nprintf 'pika 0.0.0\\n'\nprintf 'diagnostic\\n' >&2\nexec /usr/bin/true",
+        );
         let started = Instant::now();
         let output =
-            run_candidate_bounded(&candidate, &["--version"], Duration::from_secs(1)).unwrap();
+            run_candidate_bounded(&candidate, &["--version"], Duration::from_secs(5)).unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap(), "pika 0.0.0\n");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), "diagnostic\n");
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
