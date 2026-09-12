@@ -739,24 +739,6 @@ impl Store {
         let _ = tx.commit();
     }
 
-    fn prune_remote_cache(&self, node_id: &str, revision: &str) {
-        let Ok(mut db) = self.open_fleet_cache() else {
-            return;
-        };
-        let Ok(tx) = db.transaction_with_behavior(TransactionBehavior::Immediate) else {
-            return;
-        };
-        let _ = tx.execute(
-            "DELETE FROM projection_chunks WHERE node_id=? AND revision<>?",
-            params![node_id, revision],
-        );
-        let _ = tx.execute(
-            "DELETE FROM projections WHERE node_id=? AND revision<>?",
-            params![node_id, revision],
-        );
-        let _ = tx.commit();
-    }
-
     pub(crate) fn reconcile_transaction<T>(
         &self,
         operation: impl FnOnce(&ReconcileLedger<'_>) -> Result<T>,
@@ -2200,7 +2182,7 @@ impl Store {
         let prepared = prepare_remote_snapshot(node_id, payload, captured_at)?;
         self.stage_remote_cache(&prepared)?;
         let mut db = self.open_write()?;
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<Option<String>> {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let trusted = tx
                 .query_row(
@@ -2213,20 +2195,22 @@ impl Store {
             if !trusted {
                 bail!("remote snapshot requires an adopted fleet node");
             }
-            write_remote_snapshot_tx(&tx, node_id, &prepared, captured_at)?;
+            let previous_revision = write_remote_snapshot_tx(&tx, node_id, &prepared, captured_at)?;
             tx.execute(
             "UPDATE fleet_nodes SET status='ready',last_seen=?,last_error=NULL,last_attempt_at=?,updated_at=? WHERE node_id=?",
             params![captured_at, captured_at, now(), node_id],
         )?;
             tx.commit()?;
-            Ok(())
+            Ok(previous_revision)
         })();
-        if result.is_ok() {
-            self.prune_remote_cache(node_id, &prepared.revision);
-        } else {
-            self.discard_remote_cache_revision(node_id, &prepared.revision);
+        match &result {
+            Ok(Some(previous)) if previous != &prepared.revision => {
+                self.discard_remote_cache_revision(node_id, previous);
+            }
+            Ok(_) => {}
+            Err(_) => self.discard_remote_cache_revision(node_id, &prepared.revision),
         }
-        result
+        result.map(drop)
     }
 
     /// Atomically make an onboarded node and its validated first snapshot
@@ -2243,11 +2227,11 @@ impl Store {
         let prepared = prepare_remote_snapshot(&node.node_id, payload, captured_at)?;
         self.stage_remote_cache(&prepared)?;
         let mut db = self.open_write()?;
-        let result = (|| -> Result<bool> {
+        let result = (|| -> Result<(bool, Option<String>)> {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if !fleet_refresh_is_current(&tx, &node.node_id, generation)? {
                 tx.commit()?;
-                return Ok(false);
+                return Ok((false, None));
             }
             if let Some(collision) = tx
                 .query_row(
@@ -2293,20 +2277,23 @@ impl Store {
             last_error=excluded.last_error,updated_at=excluded.updated_at"#,
             params![node.node_id, node.alias, node.ssh_target, sources, node.status, node.protocol_version, node.package_version, capabilities, last_seen, last_attempt_at, node.last_error, created_at, updated_at],
         )?;
-            write_remote_snapshot_tx(&tx, &node.node_id, &prepared, captured_at)?;
+            let previous_revision =
+                write_remote_snapshot_tx(&tx, &node.node_id, &prepared, captured_at)?;
             tx.execute(
             "UPDATE fleet_nodes SET status='ready',last_seen=?,last_error=NULL,last_attempt_at=?,updated_at=? WHERE node_id=?",
             params![captured_at, captured_at, timestamp, node.node_id],
         )?;
             tx.commit()?;
-            Ok(true)
+            Ok((true, previous_revision))
         })();
-        if matches!(result, Ok(true)) {
-            self.prune_remote_cache(&node.node_id, &prepared.revision);
-        } else {
-            self.discard_remote_cache_revision(&node.node_id, &prepared.revision);
+        match &result {
+            Ok((true, Some(previous))) if previous != &prepared.revision => {
+                self.discard_remote_cache_revision(&node.node_id, previous);
+            }
+            Ok((true, _)) => {}
+            _ => self.discard_remote_cache_revision(&node.node_id, &prepared.revision),
         }
-        result
+        result.map(|(committed, _)| committed)
     }
 
     /// Commit a remote snapshot only while its pre-I/O refresh claim is still
@@ -2322,11 +2309,11 @@ impl Store {
         let prepared = prepare_remote_snapshot(node_id, payload, captured_at)?;
         self.stage_remote_cache(&prepared)?;
         let mut db = self.open_write()?;
-        let result = (|| -> Result<bool> {
+        let result = (|| -> Result<(bool, Option<String>)> {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if !fleet_refresh_is_current(&tx, node_id, generation)? {
                 tx.commit()?;
-                return Ok(false);
+                return Ok((false, None));
             }
             let trusted = tx
                 .query_row(
@@ -2339,20 +2326,40 @@ impl Store {
             if !trusted {
                 bail!("remote snapshot requires an adopted fleet node");
             }
-            write_remote_snapshot_tx(&tx, node_id, &prepared, captured_at)?;
+            let previous_revision = write_remote_snapshot_tx(&tx, node_id, &prepared, captured_at)?;
             tx.execute(
             "UPDATE fleet_nodes SET status='ready',last_seen=?,last_error=NULL,last_attempt_at=?,updated_at=? WHERE node_id=?",
             params![captured_at, captured_at, now(), node_id],
         )?;
             tx.commit()?;
-            Ok(true)
+            Ok((true, previous_revision))
         })();
-        if matches!(result, Ok(true)) {
-            self.prune_remote_cache(node_id, &prepared.revision);
-        } else {
-            self.discard_remote_cache_revision(node_id, &prepared.revision);
+        match &result {
+            Ok((true, Some(previous))) if previous != &prepared.revision => {
+                self.discard_remote_cache_revision(node_id, previous);
+            }
+            Ok((true, _)) => {}
+            _ => self.discard_remote_cache_revision(node_id, &prepared.revision),
         }
-        result
+        result.map(|(committed, _)| committed)
+    }
+
+    /// Check only whether an authoritative snapshot row exists. Board health
+    /// uses this constant-size query so a 64-node fleet cannot re-materialize
+    /// every full JSON payload after reading the bounded projections.
+    pub fn has_remote_snapshot(&self, node_id: &str) -> Result<bool> {
+        if !self.exists() {
+            return Ok(false);
+        }
+        let db = self.open_read()?;
+        Ok(db
+            .query_row(
+                "SELECT 1 FROM remote_snapshots WHERE node_id=?",
+                [node_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     pub fn get_remote_snapshot(&self, node_id: &str) -> Result<Option<RemoteSnapshot>> {
@@ -4186,7 +4193,14 @@ fn write_remote_snapshot_tx(
     node_id: &str,
     prepared: &PreparedRemoteSnapshot,
     captured_at: f64,
-) -> Result<()> {
+) -> Result<Option<String>> {
+    let previous_revision = tx
+        .query_row(
+            "SELECT value FROM meta WHERE key=?",
+            [remote_cache_revision_key(node_id)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
     tx.execute(
         "INSERT INTO remote_snapshots(node_id,payload_json,captured_at) VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET payload_json=excluded.payload_json,captured_at=excluded.captured_at",
         params![node_id, &prepared.encoded, captured_at],
@@ -4198,7 +4212,7 @@ fn write_remote_snapshot_tx(
         "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![remote_cache_revision_key(node_id), prepared.revision],
     )?;
-    Ok(())
+    Ok(previous_revision)
 }
 
 fn fleet_refresh_is_current(tx: &Transaction<'_>, node_id: &str, generation: u64) -> Result<bool> {

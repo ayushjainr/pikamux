@@ -1021,9 +1021,9 @@ fn fleet_node_health(store: &Store) -> Vec<String> {
         } else if node.status != "ready" {
             health.push(format!("{} · machine status {}", node.alias, node.status));
         }
-        match store.get_remote_snapshot(&node.node_id) {
-            Ok(Some(_)) => {}
-            Ok(None) => health.push(format!("{} · no cached snapshot yet", node.alias)),
+        match store.has_remote_snapshot(&node.node_id) {
+            Ok(true) => {}
+            Ok(false) => health.push(format!("{} · no cached snapshot yet", node.alias)),
             Err(error) => health.push(format!(
                 "{} · cached snapshot unavailable · {error}",
                 node.alias

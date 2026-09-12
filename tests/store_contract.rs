@@ -721,6 +721,7 @@ fn remote_snapshot_storage_rejects_oversized_payload_before_json_parse() {
         updated_at: 1.0,
     };
     store.upsert_fleet_node(&node).unwrap();
+    assert!(!store.has_remote_snapshot(&node.node_id).unwrap());
     let payload = json!({"padding":"x".repeat(MAX_REMOTE_SNAPSHOT_BYTES)});
     assert!(
         store
@@ -743,6 +744,7 @@ fn remote_snapshot_storage_rejects_oversized_payload_before_json_parse() {
         (&node.node_id, &oversized_unicode, 1.0),
     )
     .unwrap();
+    assert!(store.has_remote_snapshot(&node.node_id).unwrap());
     assert!(store.get_remote_snapshot(&node.node_id).is_err());
 }
 
