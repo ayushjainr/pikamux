@@ -154,8 +154,8 @@ impl ClientCliRuntime for FakeRuntime {
     fn read_choice(&mut self) -> Result<Option<String>> {
         Ok(self.choices.pop_front())
     }
-    fn open_board(&mut self, node: &ClientNode) -> Result<i32> {
-        self.opened.push(node.clone());
+    fn open_fleet_board(&mut self, config: &ClientConfig) -> Result<i32> {
+        self.opened.extend(config.nodes.values().cloned());
         Ok(0)
     }
     fn load_config(&mut self) -> Result<ClientConfig> {
@@ -402,17 +402,15 @@ fn bridge_start_and_serve_use_validated_loopback_options_only() {
 }
 
 #[test]
-fn setup_starts_only_the_client_bridge_after_pairing_when_requested() {
+fn setup_pairs_without_starting_a_bridge_or_reverse_tunnel() {
     let mut runtime = FakeRuntime::default();
-    let (_, output, _) = run(&["pika", "setup", "devbox"], &mut runtime).unwrap();
+    run(&["pika", "setup", "devbox"], &mut runtime).unwrap();
     assert_eq!(runtime.saved.len(), 1);
-    assert_eq!(runtime.starts.len(), 1);
-    assert!(output.contains("CLIENT BRIDGE STARTED"));
-    assert!(output.contains("local window routing are automatic"));
+    assert!(runtime.starts.is_empty());
 }
 
 #[test]
-fn first_bare_run_selects_pairs_remembers_and_opens_without_manual_commands() {
+fn first_bare_run_pairs_only_selected_hosts_and_opens_locally() {
     let mut runtime = FakeRuntime {
         interactive: true,
         hosts: vec!["devbox".into(), "unselected".into()],
@@ -421,47 +419,25 @@ fn first_bare_run_selects_pairs_remembers_and_opens_without_manual_commands() {
     };
     let (_, output, _) = run(&["pika"], &mut runtime).unwrap();
     assert_eq!(runtime.opened.len(), 1);
-    assert!(runtime.config.nodes[NODE_ID].allow_fleet_relay);
+    assert!(!runtime.config.nodes[NODE_ID].allow_fleet_relay);
     assert_eq!(runtime.opened[0].node_id, NODE_ID);
-    assert_eq!(runtime.config.default_node_id.as_deref(), Some(NODE_ID));
-    assert_eq!(runtime.starts.len(), 1);
+    assert!(runtime.starts.is_empty());
     assert!(runtime.ssh_calls.iter().all(|call| call.target == "devbox"));
-    assert!(!output.contains("RemoteForward"));
+    assert!(output.contains("appear together"));
     let count = runtime.ssh_calls.len();
     let saved = runtime.saved.len();
     run(&["pika"], &mut runtime).unwrap();
     assert_eq!(
         runtime.ssh_calls.len(),
-        count + 1,
-        "one identity check, no repeated pairing"
+        count,
+        "no blocking network before cached board"
     );
     assert_eq!(runtime.saved.len(), saved);
-    assert_eq!(runtime.starts.len(), 1, "reuse ready bridge");
     assert_eq!(runtime.opened.len(), 2);
-    let count = runtime.ssh_calls.len();
-    run(&["pika", "status"], &mut runtime).unwrap();
-    assert_eq!(
-        runtime.ssh_calls.len(),
-        count,
-        "explicit status remains read-only even on a terminal"
-    );
 }
 
 #[test]
-fn older_pairing_without_default_opens_its_only_known_machine() {
-    let mut runtime = FakeRuntime::default();
-    run(&["pika", "setup", "devbox", "--no-start"], &mut runtime).unwrap();
-    runtime.config.default_node_id = None;
-    runtime.interactive = true;
-    runtime.hosts = vec!["other-machine".into()];
-    run(&["pika"], &mut runtime).unwrap();
-    assert_eq!(runtime.opened[0].node_id, NODE_ID);
-    assert_eq!(runtime.config.default_node_id.as_deref(), Some(NODE_ID));
-    assert!(runtime.ssh_calls.iter().all(|call| call.target == "devbox"));
-}
-
-#[test]
-fn multiple_legacy_pairings_do_not_guess_a_default() {
+fn existing_pairings_all_open_together_even_with_a_legacy_default() {
     let mut runtime = FakeRuntime::default();
     run(&["pika", "setup", "devbox", "--no-start"], &mut runtime).unwrap();
     let mut second = runtime.config.nodes[NODE_ID].clone();
@@ -469,15 +445,31 @@ fn multiple_legacy_pairings_do_not_guess_a_default() {
     second.alias = "another".into();
     second.ssh_target = "another".into();
     runtime.config.nodes.insert(WRONG_NODE_ID.into(), second);
-    runtime.config.default_node_id = None;
     runtime.interactive = true;
-    runtime.choices.push_back("".into());
     let count = runtime.ssh_calls.len();
     let (_, output, _) = run(&["pika"], &mut runtime).unwrap();
-    assert!(output.contains("1. another · paired"));
+    assert_eq!(runtime.opened.len(), 2);
     assert_eq!(runtime.ssh_calls.len(), count);
-    assert!(runtime.opened.is_empty());
-    assert!(runtime.config.default_node_id.is_none());
+    assert!(!output.contains("Where is"));
+    assert!(runtime.starts.is_empty());
+    assert!(runtime.bridge_checks.is_empty());
+}
+
+#[test]
+fn multi_selection_is_validated_before_any_contact_and_deduplicates() {
+    use pikamux::client_cli::select_targets;
+    let hosts = vec!["rs6".into(), "rs2a".into(), "mac".into()];
+    assert_eq!(
+        select_targets("1, 2 1", &hosts).unwrap(),
+        vec!["rs6", "rs2a"]
+    );
+    assert_eq!(select_targets("all", &hosts).unwrap(), hosts);
+    assert_eq!(
+        select_targets("user@my-mac 2", &hosts).unwrap(),
+        vec!["user@my-mac", "rs2a"]
+    );
+    assert!(select_targets("1 99", &hosts).is_err());
+    assert!(select_targets("-evil", &hosts).is_err());
 }
 
 #[test]
@@ -496,7 +488,7 @@ fn first_run_cancellation_and_invalid_choices_never_contact_candidates() {
 }
 
 #[test]
-fn manual_host_and_setup_chooser_work_without_ssh_config() {
+fn setup_adds_without_replacing_existing_pairings_and_enter_keeps_board() {
     let mut runtime = FakeRuntime {
         interactive: true,
         choices: ["user@personal-mac".into()].into(),
@@ -507,58 +499,42 @@ fn manual_host_and_setup_chooser_work_without_ssh_config() {
     runtime.choices.push_back("".into());
     let count = runtime.ssh_calls.len();
     run(&["pika", "setup"], &mut runtime).unwrap();
-    assert_eq!(
-        runtime.ssh_calls.len(),
-        count,
-        "cancel keeps remembered host"
-    );
-    assert_eq!(runtime.config.default_node_id.as_deref(), Some(NODE_ID));
+    assert_eq!(runtime.ssh_calls.len(), count);
+    assert_eq!(runtime.opened.len(), 2);
 }
 
 #[test]
-fn changed_node_and_older_host_fail_before_bridge_or_board() {
+fn explicit_repair_never_replaces_a_changed_machine_identity() {
     let mut runtime = FakeRuntime::default();
     run(&["pika", "setup", "devbox", "--no-start"], &mut runtime).unwrap();
-    runtime.interactive = true;
     runtime.wrong_hello_node = true;
     let saved = runtime.saved.len();
+    let calls = runtime.ssh_calls.len();
     assert!(
-        run(&["pika"], &mut runtime)
+        run(&["pika", "setup", "devbox"], &mut runtime)
             .unwrap_err()
             .to_string()
             .contains("identity changed")
     );
-    runtime.wrong_hello_node = false;
-    runtime.old_host = true;
-    assert!(
-        run(&["pika"], &mut runtime)
-            .unwrap_err()
-            .to_string()
-            .contains("ssh devbox pika update")
-    );
     assert_eq!(runtime.saved.len(), saved);
-    assert!(runtime.starts.is_empty());
-    assert!(runtime.opened.is_empty());
+    assert_eq!(
+        runtime.ssh_calls.len(),
+        calls + 1,
+        "rejected before remote pairing write"
+    );
 }
 
 #[test]
-fn first_run_old_host_is_not_paired_or_remembered() {
+fn native_board_does_not_require_the_old_remote_board_capability() {
     let mut runtime = FakeRuntime {
         interactive: true,
         old_host: true,
         choices: ["devbox".into()].into(),
         ..FakeRuntime::default()
     };
-    assert!(
-        run(&["pika"], &mut runtime)
-            .unwrap_err()
-            .to_string()
-            .contains("ssh devbox pika update")
-    );
-    assert_eq!(runtime.ssh_calls.len(), 1);
-    assert!(runtime.saved.is_empty());
+    run(&["pika"], &mut runtime).unwrap();
+    assert_eq!(runtime.opened.len(), 1);
     assert!(runtime.starts.is_empty());
-    assert!(runtime.opened.is_empty());
 }
 
 #[test]

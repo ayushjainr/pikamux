@@ -241,7 +241,7 @@ param(
         Write-Host "Pika installed - $destination\pika.exe"
         Write-Host 'Windows client for agents hosted on macOS or Linux.'
         Write-Host 'Next: pika'
-        Write-Host 'Choose your Mac or Linux host once; Pika remembers it.'
+        Write-Host 'Choose your machines once; Pika shows their threads together.'
     } finally {
         if ($lock) { $lock.Dispose() }
         if ($stage -and (Test-Path -LiteralPath $stage)) { [IO.Directory]::Delete($stage, $true) }

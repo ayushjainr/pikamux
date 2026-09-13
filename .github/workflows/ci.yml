@@ -63,7 +63,7 @@ jobs:
 
   windows-client:
     timeout-minutes: 15
-    name: Windows x86_64 client/bridge only
+    name: Windows x86_64 fleet client
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -75,9 +75,12 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Check client contracts
-        run: cargo clippy --locked --lib --bin pika --test client_bridge_contract --test client_cli_contract -- -D warnings
+        run: cargo clippy --locked --lib --bin pika --test client_bridge_contract --test client_cli_contract --test client_board_contract -- -D warnings
       - name: Test client contracts
-        run: cargo test --locked --test client_bridge_contract --test client_cli_contract
+        run: |
+          cargo test --locked --test client_bridge_contract --test client_cli_contract --test client_board_contract
+          cargo test --locked --lib monitor::tests
+          cargo test --locked --lib windows_io::tests
       - name: Verify client-only command surface
         shell: pwsh
         run: |

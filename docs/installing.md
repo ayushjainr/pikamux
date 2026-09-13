@@ -109,14 +109,15 @@ irm https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.ps1 | iex
 pika
 ```
 
-Choose the Mac or Linux machine whose board you want to use. Pika lists your
-existing SSH hosts, or you can enter a host name directly. That host needs Pika
-installed and working SSH access. Pika remembers your choice, starts local window
-routing, and opens the board over SSH. No SSH configuration edits are needed.
-The board combines that machine's threads with all its configured remote
-servers. Opening those threads can route through the board machine; separate
-Windows pairing for each server is not required. Choose your existing Mac board
-to see the same fleet there and on Windows. Use `pika setup` to choose another board.
+Choose the Mac and Linux machines you want to see together. Pika lists SSH-config
+hosts first, followed by Tailscale candidates; select several numbers or enter
+SSH host names. Each selected machine needs Pika installed and working SSH access.
+Your board runs locally on Windows and remembers all selected machines. Existing
+pairings appear automatically, with no single board host to choose. No SSH
+configuration edits or reverse tunnels are needed.
+Press Enter to open the exact conversation in a new Windows Terminal window.
+The board stays open. Offline machines retain visibly cached rows while other
+machines continue refreshing. Use `pika setup` to add more machines.
 
 The installer requires 64-bit Windows and PowerShell 5.1 or newer. It verifies
 the release manifest, checksum and ZIP contents before running the client,

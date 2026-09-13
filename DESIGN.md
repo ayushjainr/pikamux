@@ -165,22 +165,25 @@ the monitor itself remains open.
 Server federation adds no daemon and no listener. The optional laptop
 new-window bridge is a separate client-side process bound only to loopback; it
 is reached from a paired server solely through the user's reverse SSH forward.
-On Windows, interactive bare `pika` owns that SSH connection and its forward:
-first run offers passive SSH-config discovery and manual host entry, contacts
-only the chosen host, pairs it, and remembers its immutable node UUID. Later
-launches revalidate that node, reuse or start the loopback bridge, and open the
-remote board through an identity-checked endpoint. `pika setup` changes the
-selection; redirected bare output and `pika status` remain finite and read-only.
-Pika does not edit SSH configuration, bypass SSH authentication, auto-upgrade a
-host, or terminate an existing connection when its forwarding port is occupied.
-The selected board is its normal federated board, not a host-only inventory.
-Windows marks that locally selected coordinator as allowed to relay fleet opens.
-A destination paired directly on Windows uses its local SSH mapping; otherwise,
-the client launches only the trusted coordinator with exact destination and
-conversation UUID arguments. The coordinator requires an existing trusted fleet
-entry and exact cached row, then uses the normal fresh, UUID-checked attach path.
-Legacy pairings do not implicitly acquire relay permission until selected as a
-board. A bridge request cannot grant this permission or supply a new SSH target.
+On Windows, interactive bare `pika` renders the same monitor locally. First run
+offers multi-selection from passive SSH-config and Tailscale discovery; only
+selected machines receive pairing requests. Existing client pairings are all
+selected automatically, regardless of the legacy default-board field. A dedicated
+client-fleet cache beside the pairing file stores validated remote snapshots, not
+local provider history. It never imports a paired server's fleet topology.
+The cached board paints before any SSH request. One fair, bounded background
+observer refreshes selected machines and preserves cached-offline visibility.
+Enter dispatches a single-flight action worker: fresh fleet identity validation,
+then locally constructed Windows Terminal arguments for the exact destination.
+No reverse tunnel, bridge startup, or mandatory remote coordinator is involved.
+Peeks, action failures, and update instructions stay in a scrollable inspector;
+untrack is explicitly confirmed. A window receipt confirms process launch only,
+not eventual attachment. Unknown outcomes are never automatically retried.
+Windows pipe cancellation targets only the active synchronous I/O of the exact
+worker thread; it cannot cancel unrelated I/O after that call returns.
+The legacy bridge remains optional for openings initiated on a remote console;
+its short connection budget is separate from its bounded launch-receipt budget,
+and a disconnected caller cannot terminate the listener.
 Passive discovery reads existing SSH
 configuration and Tailscale's local status document without probing candidates.
 The monitor's local two-second reconciliation never performs SSH. It keeps at

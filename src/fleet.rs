@@ -1533,6 +1533,8 @@ impl SshTransport {
             "-o".to_owned(),
             "BatchMode=yes".to_owned(),
             "-o".to_owned(),
+            "ClearAllForwardings=yes".to_owned(),
+            "-o".to_owned(),
             format!("ConnectTimeout={}", self.connect_timeout.as_secs().max(1)),
             target.to_owned(),
         ])

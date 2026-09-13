@@ -2,6 +2,7 @@
 pub mod attention;
 #[cfg(not(windows))]
 pub mod cli;
+pub mod client_board;
 pub mod client_bridge;
 pub mod client_cli;
 pub mod config;
@@ -14,7 +15,6 @@ pub mod experts;
 pub mod fleet;
 pub mod hooks;
 pub mod model;
-#[cfg(not(windows))]
 pub mod monitor;
 pub mod open_history;
 pub mod paths;
@@ -32,6 +32,8 @@ pub mod tmux;
 pub mod update;
 pub mod usage;
 pub mod wait;
+#[cfg(windows)]
+mod windows_io;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

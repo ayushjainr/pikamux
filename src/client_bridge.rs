@@ -972,8 +972,19 @@ impl ClientBridgeTransport for TcpClientBridgeTransport {
                 ClientBridgeError::unavailable(format!("Client bridge unavailable: {error}"))
             })?;
         stream
-            .set_read_timeout(Some(endpoint.timeout))
-            .and_then(|_| stream.set_write_timeout(Some(endpoint.timeout)))
+            // The short endpoint budget detects an absent loopback forward.
+            // A launch receipt also includes SSH transit and Windows process
+            // creation; legacy 350ms configs must not truncate that operation.
+            .set_read_timeout(Some(
+                if request.get("type").and_then(Value::as_str) == Some("ping") {
+                    endpoint.timeout
+                } else {
+                    endpoint.timeout.max(Duration::from_secs(10))
+                },
+            ))
+            .and_then(|_| {
+                stream.set_write_timeout(Some(endpoint.timeout.max(Duration::from_secs(2))))
+            })
             .map_err(|error| {
                 ClientBridgeError::outcome_unknown(format!(
                     "Client bridge outcome is unknown after connecting: {error}"

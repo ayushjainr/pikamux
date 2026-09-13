@@ -1368,58 +1368,7 @@ fn run_remote_board_consultation(
 ) -> Result<ConsultationOutcome> {
     let remote = exact_remote(pika, &io.item)?;
     require_remote_source_available(&remote)?;
-    let local_policy = crate::consult::consultation_policy(remote.session.provider, false)?;
-    let policy = fleet::ConsultationPolicy {
-        consultation_mode: local_policy.mode,
-        model: local_policy.model.unwrap_or_default(),
-        effort: local_policy.effort.unwrap_or_default(),
-    };
-    let node = pika
-        .store
-        .get_fleet_node(&remote.node_id)?
-        .context("remote expert machine is no longer trusted")?;
-    let mut side = fleet::RemoteConsultation::open_cancellable(
-        &SshTransport::default(),
-        node,
-        remote,
-        policy.clone(),
-        fleet::ConsultationTimeouts {
-            open: Duration::from_secs(30),
-            event: Duration::from_secs(900),
-            cleanup: Duration::from_secs(30),
-        },
-        io.cancellation.clone(),
-    )
-    .map_err(anyhow::Error::from)?;
-    let opening = side.opening_receipt();
-    let _ = io.events.send(ConsultationEvent::Opened {
-        child_id: opening.child_id.clone(),
-        policy: Some(if policy.model.is_empty() {
-            policy.consultation_mode.clone()
-        } else {
-            format!("{} · {}", policy.consultation_mode, policy.model)
-        }),
-        proof: Some(opening.proof_label()),
-    });
-    for command in io.commands {
-        match command {
-            ConsultationInput::Question(question) => match side.ask(&question) {
-                Ok(answer) => {
-                    let _ = io.events.send(ConsultationEvent::Answer(answer));
-                }
-                Err(error) => {
-                    let retry_safe = error.kind == FleetErrorKind::InvalidRequest;
-                    let _ = io.events.send(ConsultationEvent::Error {
-                        message: error.to_string(),
-                        retry_safe,
-                    });
-                }
-            },
-            ConsultationInput::Close => break,
-        }
-    }
-    side.close().map_err(anyhow::Error::from)?;
-    Ok(ConsultationOutcome::discarded())
+    crate::client_board::remote_consultation(&pika.store, &SshTransport::default(), io)
 }
 fn list(pika: &Pika, a: ListArgs) -> Result<i32> {
     let inventory = if pika.store.exists() {

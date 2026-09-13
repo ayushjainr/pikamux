@@ -155,6 +155,52 @@ pub enum BoardAction {
     Quit,
 }
 
+/// Client actions run off the input thread. Only one can be in flight: repeated
+/// Enter never queues a burst of windows, and an uncertain result is not retried.
+pub(crate) struct ActionDriver {
+    worker: Arc<dyn Fn(BoardAction) -> Result<String> + Send + Sync>,
+    pending: Option<Receiver<Result<String>>>,
+}
+
+impl ActionDriver {
+    pub(crate) fn new(
+        worker: impl Fn(BoardAction) -> Result<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            worker: Arc::new(worker),
+            pending: None,
+        }
+    }
+
+    fn submit(&mut self, action: BoardAction) -> String {
+        if self.pending.is_some() {
+            return "An action is already in progress; no second request was sent.".into();
+        }
+        let worker = self.worker.clone();
+        let (send, receive) = mpsc::sync_channel(1);
+        self.pending = Some(receive);
+        thread::spawn(move || {
+            let _ = send.send(worker(action));
+        });
+        "Opening request · you can keep using the board".into()
+    }
+
+    fn poll(&mut self) -> Option<String> {
+        let result = match self.pending.as_ref()?.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!(
+                "Action worker stopped. Outcome is unknown; check the destination window before retrying."
+            )),
+        };
+        self.pending = None;
+        Some(match result {
+            Ok(note) => note,
+            Err(error) => format!("Not completed · {error:#}"),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConsultationInput {
     Question(String),
@@ -351,6 +397,7 @@ pub fn run_items_dynamic_with_notice_and_refresh(
 
 /// Local observation health is separate from conversation status and cached
 /// item updates. A latest-value flag cannot queue a stale warning after recovery.
+#[cfg(not(windows))]
 pub(crate) fn run_items_dynamic_with_local_health(
     items: Vec<BoardItem>,
     updates: LatestReceiver<Vec<BoardItem>>,
@@ -380,8 +427,48 @@ fn run_loop(
     local_refresh_delayed: Option<Arc<AtomicBool>>,
     fleet_health: Option<FleetHealthFeed>,
 ) -> Result<BoardAction> {
+    run_loop_with_actions(
+        items,
+        updates,
+        driver,
+        update_notice,
+        refresh_request,
+        local_refresh_delayed,
+        (fleet_health, None),
+    )
+}
+
+pub(crate) fn run_client_board(
+    items: Vec<BoardItem>,
+    updates: LatestReceiver<Vec<BoardItem>>,
+    consultation: ConsultationDriver,
+    refresh: SyncSender<()>,
+    health: FleetHealthFeed,
+    actions: ActionDriver,
+) -> Result<BoardAction> {
+    run_loop_with_actions(
+        items,
+        Some(ItemUpdates::Latest(updates)),
+        Some(consultation),
+        None,
+        Some(refresh),
+        None,
+        (Some(health), Some(actions)),
+    )
+}
+
+fn run_loop_with_actions(
+    items: Vec<BoardItem>,
+    updates: Option<ItemUpdates>,
+    driver: Option<ConsultationDriver>,
+    update_notice: Option<Receiver<Option<String>>>,
+    refresh_request: Option<SyncSender<()>>,
+    local_refresh_delayed: Option<Arc<AtomicBool>>,
+    (fleet_health, mut actions): (Option<FleetHealthFeed>, Option<ActionDriver>),
+) -> Result<BoardAction> {
     let _terminal = TerminalGuard::enter()?;
     let mut board = Board::new(items);
+    board.client_actions = actions.is_some();
     board.fleet_health = fleet_health
         .as_ref()
         .map(|feed| feed.initial.clone())
@@ -392,6 +479,10 @@ fn run_loop(
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
     loop {
+        if let Some(note) = actions.as_mut().and_then(ActionDriver::poll) {
+            board.action_notice = Some(note);
+            dirty = true;
+        }
         if let Some(updates) = &updates {
             match updates {
                 ItemUpdates::Queue(updates) => {
@@ -465,6 +556,13 @@ fn run_loop(
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 if let Some(action) = board.key(key, driver.as_ref()) {
                     if let Some(action) = route_board_action(action, refresh_request.as_ref()) {
+                        if action != BoardAction::Quit
+                            && let Some(actions) = actions.as_mut()
+                        {
+                            board.action_notice = Some(actions.submit(action));
+                            dirty = true;
+                            continue;
+                        }
                         return Ok(action);
                     } else {
                         dirty = true;
@@ -791,6 +889,10 @@ struct Board {
     update_prompt: bool,
     local_refresh_delayed: bool,
     fleet_health: Vec<String>,
+    action_notice: Option<String>,
+    action_scroll: usize,
+    client_actions: bool,
+    confirm_untrack: Option<BoardItem>,
 }
 
 impl Board {
@@ -809,6 +911,10 @@ impl Board {
             update_prompt: false,
             local_refresh_delayed: false,
             fleet_health: Vec::new(),
+            action_notice: None,
+            action_scroll: 0,
+            client_actions: false,
+            confirm_untrack: None,
         }
     }
 
@@ -985,6 +1091,38 @@ impl Board {
             self.chat_key(key);
             return None;
         }
+        if let Some(item) = self.confirm_untrack.clone() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('x') => {
+                    self.confirm_untrack = None;
+                    return Some(BoardAction::Untrack(item));
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.confirm_untrack = None;
+                    self.action_notice = None;
+                }
+                _ => {}
+            }
+            return None;
+        }
+        if self.action_notice.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.action_notice = None;
+                    self.action_scroll = 0;
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    self.action_scroll = self.action_scroll.saturating_add(8);
+                    return None;
+                }
+                KeyCode::PageUp => {
+                    self.action_scroll = self.action_scroll.saturating_sub(8);
+                    return None;
+                }
+                _ => {}
+            }
+        }
         if self.update_prompt {
             match key.code {
                 KeyCode::Enter | KeyCode::Char('y') => {
@@ -1037,6 +1175,19 @@ impl Board {
                     .map(BoardAction::Peek);
             }
             KeyCode::Char('x') => {
+                if self.client_actions {
+                    if let Some(item) = self.selected().filter(|item| item.actionable()) {
+                        self.action_notice = Some(format!(
+                            "Stop watching {} @{}?\n{} · {}\nThe agent and its conversation stay intact.\nEnter / x confirm · Esc cancel",
+                            item.session.display_name(),
+                            item.node_label().unwrap_or("here"),
+                            item.session.provider,
+                            item.session.session_id
+                        ));
+                        self.confirm_untrack = Some(item);
+                    }
+                    return None;
+                }
                 return self
                     .selected()
                     .filter(|item| item.actionable())
@@ -1233,6 +1384,25 @@ impl Board {
 
         if let Some(chat) = &self.chat {
             self.draw_chat(output, chat, list_width, width, height)?;
+        } else if let Some(report) = &self.action_notice {
+            let x = if width >= 100 { list_width + 2 } else { 0 };
+            let available = width.saturating_sub(x);
+            let lines = report
+                .lines()
+                .flat_map(|line| wrap(&crate::fleet::sanitize_terminal_text(line), available))
+                .collect::<Vec<_>>();
+            let rows = usize::from(height.saturating_sub(5));
+            let offset = self.action_scroll.min(lines.len().saturating_sub(rows));
+            for y in 2..height.saturating_sub(2) {
+                queue!(output, MoveTo(x as u16, y), Print(" ".repeat(available)))?;
+            }
+            for (index, line) in lines.iter().skip(offset).take(rows).enumerate() {
+                queue!(
+                    output,
+                    MoveTo(x as u16, 2 + index as u16),
+                    Print(fit(line, available))
+                )?;
+            }
         } else if width >= 100
             && let Some(selected) = self.selected()
         {
@@ -1253,6 +1423,14 @@ impl Board {
                 ChatPhase::Failed | ChatPhase::Closed => "esc return to board",
             };
             queue!(output, Print(fit(help, width)))?;
+        } else if self.action_notice.is_some() {
+            queue!(
+                output,
+                Print(fit(
+                    "esc dismiss · pgup/pgdn scroll result · ↑↓ select · enter open · q leave",
+                    width
+                ))
+            )?;
         } else if self.filtering {
             queue!(
                 output,
@@ -1835,6 +2013,74 @@ fn playbook_tip() -> &'static str {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn client_action_failure_is_an_in_panel_report_without_a_retry() {
+        let (started, receive) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let wait = Arc::new(Mutex::new(wait));
+        let mut driver = ActionDriver::new(move |_| {
+            started.send(()).unwrap();
+            wait.lock().unwrap().recv().unwrap();
+            anyhow::bail!("fixture launch failed; no retry")
+        });
+        let mut board = Board::new(vec![BoardItem::local(session(Status::Working))]);
+        let selected = board.selected_key.clone();
+        let action = board.key(key(KeyCode::Enter), None).unwrap();
+        driver.submit(action.clone());
+        receive.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(driver.submit(action).contains("no second request"));
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(note) = driver.poll() {
+                board.action_notice = Some(note);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            board
+                .action_notice
+                .as_ref()
+                .unwrap()
+                .contains("fixture launch failed")
+        );
+        assert_eq!(board.selected_key, selected);
+        for width in [72, 120] {
+            let mut rendered = Vec::new();
+            board.draw(&mut rendered, width, 25).unwrap();
+            assert!(
+                String::from_utf8(rendered)
+                    .unwrap()
+                    .contains("fixture launch failed")
+            );
+        }
+        assert_eq!(board.key(key(KeyCode::Esc), None), None);
+        assert!(board.action_notice.is_none());
+        assert_eq!(
+            board.key(key(KeyCode::Char('q')), None),
+            Some(BoardAction::Quit)
+        );
+        assert!(
+            receive.try_recv().is_err(),
+            "failure never automatically retries"
+        );
+    }
+
+    #[test]
+    fn client_stop_watching_confirms_the_original_exact_row() {
+        let mut board = Board::new(vec![BoardItem::local(session(Status::Working))]);
+        board.client_actions = true;
+        let exact = board.selected().unwrap();
+        assert_eq!(board.key(key(KeyCode::Char('x')), None), None);
+        board.replace_items(Vec::new());
+        assert_eq!(
+            board.key(key(KeyCode::Enter), None),
+            Some(BoardAction::Untrack(exact))
+        );
+    }
 
     fn session(status: Status) -> Session {
         Session {

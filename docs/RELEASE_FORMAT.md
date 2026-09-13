@@ -169,5 +169,6 @@ and probes the verified executable before activation. Versioned directories unde
 running bridge. The per-user PATH selects the installed version. Re-running the
 installer updates it; downgrades and changed bytes for an installed version are
 refused. Installation does not pair machines. Interactive `pika` then offers a
-host chooser and manages pairing, the client bridge, and its SSH forward without
-editing SSH configuration.
+multi-machine chooser and renders their combined fleet locally. Existing
+pairings remain selected. Normal opens launch Windows Terminal directly, without
+the optional bridge or reverse SSH forwarding.

@@ -673,6 +673,54 @@ fn loopback_server_launches_once_without_real_windows_or_powershell() {
 }
 
 #[test]
+fn legacy_short_connect_budget_allows_a_delayed_launch_receipt() {
+    struct SlowLauncher(FakeLauncher);
+    impl WindowLauncher for SlowLauncher {
+        fn launch(&mut self, argv: &[String]) -> Result<(), ClientBridgeError> {
+            thread::sleep(Duration::from_millis(500));
+            self.0.launch(argv)
+        }
+    }
+    let (client_id, source_id, target_id, session_id) = ids();
+    let launcher = FakeLauncher::default();
+    let launched = launcher.launched.clone();
+    let mut bridge = ClientLaunchBridge::new(
+        config(&client_id, &source_id, &target_id),
+        SlowLauncher(launcher),
+        "fake-wt",
+        "fake-ssh",
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = LoopbackEndpoint::new(
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+        Duration::from_millis(50),
+    )
+    .unwrap();
+    let worker = thread::spawn(move || serve_client_bridge_once(&listener, &mut bridge).unwrap());
+    let request = make_launch_request(
+        &client_id,
+        SOURCE_TOKEN,
+        &source_id,
+        &target_id,
+        Provider::Codex,
+        &session_id,
+        None,
+    )
+    .unwrap();
+    let receipt = request_client_launch(
+        &mut pikamux::client_bridge::TcpClientBridgeTransport,
+        &endpoint,
+        &request,
+    )
+    .unwrap();
+    assert_eq!(receipt.message_type, "launched");
+    worker.join().unwrap();
+    assert_eq!(launched.lock().unwrap().len(), 1);
+}
+
+#[test]
 fn launch_request_rejects_non_uuid_provider_identity_and_unknown_fields() {
     let (client_id, source_id, target_id, _) = ids();
     let malformed = json!({

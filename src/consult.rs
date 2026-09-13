@@ -2124,6 +2124,8 @@ fn exited_group_is_empty(id: u32, exited: bool, error: &std::io::Error) -> bool 
 pub(crate) struct CancellablePipe<T> {
     pipe: T,
     stop: CancellationToken,
+    #[cfg(windows)]
+    interrupt: Option<crate::windows_io::PipeInterrupt>,
 }
 
 impl<T> CancellablePipe<T> {
@@ -2144,17 +2146,34 @@ impl<T> CancellablePipe<T> {
 
     #[cfg(not(unix))]
     pub(crate) fn new(pipe: T, stop: CancellationToken) -> std::io::Result<Self> {
-        Ok(Self { pipe, stop })
+        Ok(Self {
+            pipe,
+            stop,
+            #[cfg(windows)]
+            interrupt: None,
+        })
     }
 }
 
 impl<T: Read> Read for CancellablePipe<T> {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(windows)]
+        if self.interrupt.is_none() {
+            self.interrupt = Some(crate::windows_io::PipeInterrupt::new(self.stop.clone())?);
+        }
         loop {
             if self.stop.is_cancelled() {
                 return Ok(0);
             }
-            match self.pipe.read(output) {
+            #[cfg(windows)]
+            let result = self
+                .interrupt
+                .as_ref()
+                .expect("initialized")
+                .call(|| self.pipe.read(output));
+            #[cfg(not(windows))]
+            let result = self.pipe.read(output);
+            match result {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(2));
                 }
@@ -2167,11 +2186,23 @@ impl<T: Read> Read for CancellablePipe<T> {
 
 impl<T: Write> Write for CancellablePipe<T> {
     fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        #[cfg(windows)]
+        if self.interrupt.is_none() {
+            self.interrupt = Some(crate::windows_io::PipeInterrupt::new(self.stop.clone())?);
+        }
         loop {
             if self.stop.is_cancelled() {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
             }
-            match self.pipe.write(input) {
+            #[cfg(windows)]
+            let result = self
+                .interrupt
+                .as_ref()
+                .expect("initialized")
+                .call(|| self.pipe.write(input));
+            #[cfg(not(windows))]
+            let result = self.pipe.write(input);
+            match result {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(2));
                 }

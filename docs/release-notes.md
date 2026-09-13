@@ -1,14 +1,12 @@
-Open your whole Pika board from Windows with one command.
+Your machines, together in a local Windows board.
 
-- Run `pika`, choose your existing Mac or Linux board once, and see its local
-  conversations and configured servers together.
-- Pika remembers your choice and handles pairing, local window routing, and
-  the SSH connection. No manual SSH configuration edits.
-- Open fleet conversations through the board host without pairing each
-  destination separately on Windows. Machine and conversation identities are
-  checked before attachment.
-- Keep the board open after launching a conversation in a new window.
-- Existing Mac and Linux workflows remain unchanged.
+- Run `pika` to see all paired machines together, without choosing a remote
+  board host. Existing pairings are retained.
+- Add several SSH or Tailscale machines through `pika setup`.
+- Open the exact conversation directly in a new Windows Terminal window.
+  Launch failures remain visible in the board; no automatic retry is made.
+- Keep private consultations and read-only peeks inside the panel.
+- See cached rows immediately, including when one machine is offline.
 
 In local PowerShell:
 
@@ -18,8 +16,5 @@ pika
 ```
 
 The native Windows client is experimental; agents remain on Mac or Linux hosts.
-Keep the board host updated with `pika update`. macOS and Linux installation:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.sh | bash
-```
+No reverse SSH tunnel or single hub is needed. Existing Mac and Linux workflows
+remain unchanged.

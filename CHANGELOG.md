@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.7 — One local Windows board, all your machines
+
+- Combine all paired machines in a native Windows board, with cached-first
+  startup and independent machine health. No mandatory remote board host.
+- Select multiple SSH or Tailscale machines; retain existing pairings.
+- Open exact conversations directly in Windows Terminal without a reverse
+  tunnel. Launch failures stay visible inside the board, without automatic retries.
+- Keep remote peeks and private multi-turn consultations inside the board.
+- Allow delayed launch receipts on optional bridges and keep the listener alive
+  when a caller disconnects. Cancel blocked Windows pipe reads and writes.
+
 ## 0.6.6 — One Windows command, your whole fleet
 
 - Open the remote board directly from `pika` on Windows. Choose an SSH host

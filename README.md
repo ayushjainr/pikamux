@@ -50,8 +50,8 @@ irm https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.ps1 | iex
 pika
 ```
 
-Choose where your Pika board lives once. Pika remembers it and shows threads
-across all servers configured on that board, not just that machine.
+Choose your machines once. Pika combines their threads in one local board;
+Enter opens the selected conversation in a new Windows Terminal window.
 The native client is experimental; local agent hosting requires WSL.
 See [Windows setup](docs/installing.md#windows).
 
@@ -114,7 +114,7 @@ from the same board. Pika must be installed on each machine; you choose which
 machines to connect. Start locally and add others when you need them.
 
 See the [machine setup guide](docs/guide.md#multiple-machines).
-Native Windows agent hosting is not supported; the Windows client bridge is
+Native Windows agent hosting is not supported; the Windows fleet client is
 experimental.
 
 ## Privacy
