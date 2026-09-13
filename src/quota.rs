@@ -247,7 +247,9 @@ fn valid(row: &QuotaSnapshot, at: f64) -> bool {
 
 /// Convert at the display host, including DST at the reset instant, not on the remote server.
 pub(crate) fn reset_label(timestamp: i64) -> String {
-    let stamp = timestamp as libc::time_t;
+    // Infer the platform ABI from localtime below; musl deprecates the named
+    // time_t alias even on our supported 64-bit targets.
+    let stamp = timestamp as _;
     let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
     // SAFETY: libc receives valid pointers to a timestamp and writable tm; the
     // reentrant variants initialize tm only on success. Neither pointer escapes.
