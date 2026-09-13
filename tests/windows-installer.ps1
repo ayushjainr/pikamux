@@ -43,11 +43,14 @@ try {
     $receipt = $receiptBytes | ConvertFrom-Json
     $directory = Join-Path $root "releases\$version-$($receipt.sha256.Substring(0,12))"
     Check ((& (Join-Path $directory 'pika.exe') --version) -ceq "pika $version") 'verified client installed'
+    Check ($receipt.exe_sha256 -ceq (Get-FileHash -LiteralPath (Join-Path $directory 'pika.exe') -Algorithm SHA256).Hash.ToLowerInvariant()) 'receipt binds verified executable for safe client handoff'
     Check ($env:PATH -ceq $oldPath) 'NoPath preserves current PATH'
     Check ([Environment]::GetEnvironmentVariable('Path', 'User') -ceq $oldUserPath) 'NoPath preserves user PATH'
     & $installer -Bundle $bundle -NoPath
     Check (@(Get-ChildItem (Join-Path $root 'releases')).Count -eq 1) 'repeat install is idempotent'
     Check ([IO.File]::ReadAllText($receiptPath) -ceq $receiptBytes) 'repeat install preserves receipt'
+    Reject { & $installer -PikaInstallVersion '1.2.3;exit' -NoPath } 'Invalid requested stable release version'
+    Check ([IO.File]::ReadAllText($receiptPath) -ceq $receiptBytes) 'invalid pinned version preserves installation'
     $earlier = $receiptBytes | ConvertFrom-Json
     $earlier.version = '0.0.1'
     [IO.File]::WriteAllText($receiptPath, ($earlier | ConvertTo-Json), $utf8)

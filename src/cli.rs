@@ -832,12 +832,25 @@ fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
         BoardAction::Untrack(item) => untrack_board_item(pika, item),
         BoardAction::Ask(item) => ask_board_item(pika, item),
         BoardAction::Refresh => unreachable!("interactive refresh is handled in-place"),
-        BoardAction::Update(version) => update_command(UpdateArgs {
-            check: version.is_none(),
-            bundle: None,
-            release: version,
-            rollback: None,
-        }),
+        BoardAction::Update(version) => {
+            let executable = std::env::current_exe()?;
+            let outcome = match update::update_managed(UpdateRequest {
+                executable: &executable,
+                bundle: None,
+                release: version.as_deref(),
+                check: version.is_none(),
+            }) {
+                Err(update::UpdateError::Interrupted(code)) => return Ok(code),
+                result => result?,
+            };
+            println!("{}", outcome.message());
+            if outcome.disposition == update::UpdateDisposition::Installed {
+                // Replace only this board process; retained runtimes keep agent callbacks valid.
+                use std::os::unix::process::CommandExt;
+                return Err(std::process::Command::new(outcome.launcher).exec().into());
+            }
+            Ok(0)
+        }
         BoardAction::Quit => Ok(0),
     }
 }

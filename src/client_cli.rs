@@ -44,6 +44,8 @@ struct WindowsClientCli {
 
 #[derive(Subcommand, Debug)]
 enum WindowsClientCommand {
+    /// Install the latest verified Pika client on this machine.
+    Update,
     /// Show selected machines and optional bridge readiness.
     Status,
     /// Add machines to your combined board.
@@ -107,6 +109,9 @@ impl Default for ClientBridgeOptions {
 
 /// OS/process boundary for deterministic Windows-client workflow tests.
 pub trait ClientCliRuntime {
+    fn update(&mut self) -> Result<i32> {
+        bail!("Client updater is unavailable")
+    }
     fn interactive(&self) -> bool {
         false
     }
@@ -149,6 +154,9 @@ impl SystemClientRuntime {
 }
 
 impl ClientCliRuntime for SystemClientRuntime {
+    fn update(&mut self) -> Result<i32> {
+        crate::windows_update::install(None, false)
+    }
     fn interactive(&self) -> bool {
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
     }
@@ -453,6 +461,11 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    let args = args.into_iter().map(Into::into).collect::<Vec<OsString>>();
+    #[cfg(windows)]
+    if let Some(code) = crate::windows_update::forward(&args)? {
+        return Ok(code);
+    }
     let mut runtime = SystemClientRuntime::discover()?;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
@@ -474,6 +487,22 @@ where
 {
     let cli = WindowsClientCli::try_parse_from(args)?;
     match cli.command {
+        Some(WindowsClientCommand::Update) => {
+            if !runtime.interactive() {
+                bail!("Run `pika update` in an interactive terminal to confirm the update");
+            }
+            write!(output, "Update Pika on this machine? [y/N] ")?;
+            output.flush()?;
+            if runtime
+                .read_choice()?
+                .is_some_and(|choice| matches!(choice.trim(), "y" | "Y"))
+            {
+                runtime.update()
+            } else {
+                writeln!(output, "Update skipped.")?;
+                Ok(0)
+            }
+        }
         None if runtime.interactive() => home(runtime, output, false),
         None | Some(WindowsClientCommand::Status) => status(runtime, output),
         Some(WindowsClientCommand::Setup(arguments)) if arguments.ssh_target.is_none() => {

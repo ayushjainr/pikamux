@@ -279,18 +279,28 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
             BoardAction::Open(item) => {
                 let remote = exact_remote(&store, &item)?;
                 manager.attach(&remote)?;
-                Ok(format!("Window launched · {} · {} · check that window for exact recovery", remote.qualified_name(), remote.session.session_id))
+                Ok(format!(
+                    "Window launched · {} · {} · check that window for exact recovery",
+                    remote.qualified_name(),
+                    remote.session.session_id
+                ))
             }
             BoardAction::Peek(item) => {
                 let remote = exact_remote(&store, &item)?;
-                Ok(format!("{} · peek · unread preserved\n{}", remote.qualified_name(), manager.capture(&remote, 80)?))
+                Ok(format!(
+                    "{} · peek · unread preserved\n{}",
+                    remote.qualified_name(),
+                    manager.capture(&remote, 80)?
+                ))
             }
             BoardAction::Untrack(item) => {
                 let remote = exact_remote(&store, &item)?;
                 manager.untrack(&remote, None)?;
-                Ok(format!("Stopped watching {}. The agent and conversation were left intact.", remote.qualified_name()))
+                Ok(format!(
+                    "Stopped watching {}. The agent and conversation were left intact.",
+                    remote.qualified_name()
+                ))
             }
-            BoardAction::Update(_) => Ok("To update, run in PowerShell: irm https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.ps1 | iex".into()),
             _ => bail!("This action is not available in the client board"),
         }
     });
@@ -321,8 +331,10 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
     if done.recv_timeout(Duration::from_millis(50)).is_ok() {
         let _ = worker.join();
     }
-    result?;
-    Ok(0)
+    match result? {
+        BoardAction::Update(version) => crate::windows_update::install(version.as_deref(), true),
+        _ => Ok(0),
+    }
 }
 
 /// Shared with the host board: one ephemeral remote side for all follow-ups.

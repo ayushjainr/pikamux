@@ -37,6 +37,7 @@ pub mod usage;
 pub mod wait;
 #[cfg(windows)]
 mod windows_io;
+mod windows_update;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

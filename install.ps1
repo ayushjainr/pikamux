@@ -2,11 +2,12 @@
 [CmdletBinding()]
 param(
     [Alias('Bundle')][string]$PikaInstallBundlePath,
-    [Alias('NoPath')][switch]$PikaInstallSkipPath
+    [Alias('NoPath')][switch]$PikaInstallSkipPath,
+    [string]$PikaInstallVersion
 )
 
 & {
-    param($Bundle, $NoPath)
+    param($Bundle, $NoPath, $RequestedVersion)
     $ErrorActionPreference = 'Stop'
     Set-StrictMode -Version 2
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
@@ -121,8 +122,15 @@ param(
         [Net.ServicePointManager]::SecurityProtocol = $oldTls -bor [Net.SecurityProtocolType]::Tls12
         Assert-PlainPath $scratch
         [void][IO.Directory]::CreateDirectory($scratch)
-        $versionFile = Receive-File 'pika-version' "$releaseRoot/latest/download/pika-version" 128
-        $versionText = [IO.File]::ReadAllText($versionFile)
+        if ($RequestedVersion) {
+            if ($Bundle -or $RequestedVersion -cnotmatch '\A[0-9]+\.[0-9]+\.[0-9]+\z') {
+                throw 'Invalid requested stable release version.'
+            }
+            $versionText = "$RequestedVersion`n"
+        } else {
+            $versionFile = Receive-File 'pika-version' "$releaseRoot/latest/download/pika-version" 128
+            $versionText = [IO.File]::ReadAllText($versionFile)
+        }
         if ($versionText -cnotmatch '\A[0-9]+\.[0-9]+\.[0-9]+\r?\n\z') {
             throw 'Invalid stable release version.'
         }
@@ -220,8 +228,10 @@ param(
             }
         } else { [IO.Directory]::Move($stage, $destination); $stage = $null }
 
-        if (-not $previous -or $previous.version -cne $version) {
-            $receipt = @{ schema = 1; package = 'pikamux'; version = $version; sha256 = $artifact.sha256 }
+        $executableHash = (Get-FileHash -LiteralPath (Join-Path $destination 'pika.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+        if (-not $previous -or $previous.version -cne $version -or
+            -not $previous.PSObject.Properties['exe_sha256'] -or $previous.exe_sha256 -cne $executableHash) {
+            $receipt = @{ schema = 1; package = 'pikamux'; version = $version; sha256 = $artifact.sha256; exe_sha256 = $executableHash }
             $pendingReceipt = Join-Path $root ('.receipt-' + [Guid]::NewGuid().ToString('N'))
             [IO.File]::WriteAllText($pendingReceipt, ($receipt | ConvertTo-Json), $utf8)
             if (Test-Path -LiteralPath $receiptPath) {
@@ -248,4 +258,4 @@ param(
         if (Test-Path -LiteralPath $scratch) { [IO.Directory]::Delete($scratch, $true) }
         [Net.ServicePointManager]::SecurityProtocol = $oldTls
     }
-} $PikaInstallBundlePath $PikaInstallSkipPath
+} $PikaInstallBundlePath $PikaInstallSkipPath $PikaInstallVersion

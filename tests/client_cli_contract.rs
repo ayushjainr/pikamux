@@ -105,6 +105,7 @@ struct SshCall {
 }
 
 struct FakeRuntime {
+    updates: usize,
     interactive: bool,
     hosts: Vec<String>,
     choices: std::collections::VecDeque<String>,
@@ -126,6 +127,7 @@ impl Default for FakeRuntime {
         let mut config = ClientConfig::empty();
         config.client_id = CLIENT_ID.to_owned();
         Self {
+            updates: 0,
             interactive: false,
             hosts: Vec::new(),
             choices: Default::default(),
@@ -145,6 +147,10 @@ impl Default for FakeRuntime {
 }
 
 impl ClientCliRuntime for FakeRuntime {
+    fn update(&mut self) -> Result<i32> {
+        self.updates += 1;
+        Ok(0)
+    }
     fn interactive(&self) -> bool {
         self.interactive
     }
@@ -228,6 +234,43 @@ impl ClientCliRuntime for FakeRuntime {
         self.serves.push(options.clone());
         Ok(())
     }
+}
+
+#[test]
+fn client_update_requires_yes_and_never_pairs_or_starts_agents() {
+    for (choice, expected) in [("y", 1), ("Y", 1), ("n", 0), ("", 0), ("1", 0)] {
+        let mut runtime = FakeRuntime {
+            interactive: true,
+            choices: [choice.into()].into(),
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        assert_eq!(
+            run_client_cli(
+                ["pika", "update"],
+                &mut runtime,
+                &mut output,
+                &mut Vec::new()
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(runtime.updates, expected);
+        assert!(runtime.ssh_calls.is_empty());
+        assert!(runtime.saved.is_empty());
+        assert!(String::from_utf8(output).unwrap().contains("[y/N]"));
+    }
+    let mut runtime = FakeRuntime::default();
+    assert!(
+        run_client_cli(
+            ["pika", "update"],
+            &mut runtime,
+            &mut Vec::new(),
+            &mut Vec::new()
+        )
+        .is_err()
+    );
+    assert_eq!(runtime.updates, 0);
 }
 
 fn run(arguments: &[&str], runtime: &mut FakeRuntime) -> Result<(i32, String, String)> {

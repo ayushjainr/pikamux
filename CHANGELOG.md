@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.11 — Update without leaving Pika behind
+
+- Offer new releases with an explicit Y/N confirmation on every platform.
+  Defer the prompt during typing, consultations, and active actions.
+- Install verified Windows client updates directly from Pika, without copying
+  an installer command. Preserve running agents, pairings, and remote machines.
+- Reopen the board after a successful update. Hand off old Windows PATH entries
+  to the verified active release so existing PowerShell sessions stay current.
+
 ## 0.6.10 — Quota at a glance, steadier boards
 
 - Reduce board flicker with buffered, synchronized frame presentation and skip

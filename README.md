@@ -77,8 +77,8 @@ steps instead of opening a duplicate.
 | **x** | Stop watching; keep the agent running and its history |
 | **q** | Leave the board; keep agents running |
 
-Run `pika update --check` to check for a new release. Available updates appear on the board. Press **U** to review
-an update; installation requires your approval and leaves running agents alone.
+Pika checks for updates in the background. When prompted, press **Y** to update
+and reopen the board, or **N** to keep working. Running agents stay running.
 See [installation and updates](docs/installing.md) for other install methods.
 
 ## Let your agents consult prior work

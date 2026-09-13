@@ -44,6 +44,12 @@ skill installation and onboarding. Run `pika setup` when ready.
 
 ## Updates
 
+Pika checks for new releases in the background and offers **Update now? [y/N]**.
+Press Y to install and reopen the board, or N to keep working. Press U to revisit
+the offer. The prompt waits while you're typing or in a private consultation.
+
+On macOS and Linux, you can also use:
+
 ```bash
 pika update --check
 pika update
@@ -54,7 +60,8 @@ board. The second lets you review and install the available version. You can
 also press **U** on the board to review a cached update.
 
 Pika verifies the download and prepares the new release before switching the
-command. Running agents continue; reopen Pika to use the new version.
+command. Running agents continue. Board updates reopen Pika automatically;
+after a command-line update, run `pika` to open the new version.
 Updates apply only to the local machine. To review newer hooks and bundled
 skills after an update, run `pika setup`.
 
@@ -125,8 +132,10 @@ installs under `%LOCALAPPDATA%\Pika\Client`, and adds the command to your user
 PATH and current PowerShell session. No administrator access is needed. It does
 not change SSH configuration, pair machines, or start a bridge during installation.
 
-Run the same install command to update. Previous releases remain on disk; an
-already running bridge is left alone. Windows `pika update` is not available.
+Accept the board's update offer, or run `pika update` and confirm with Y.
+Previous releases remain on disk; an already running bridge is left alone.
+The board reopens after updating, and existing PowerShell sessions hand off to
+the verified active client. The installer remains available for recovery.
 Offline installation accepts `install.ps1 -Bundle C:\path\to\release`; `-NoPath`
 leaves PATH unchanged. See [client pairing](guide.md#open-a-local-window-from-a-remote-pika-board).
 

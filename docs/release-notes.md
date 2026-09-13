@@ -1,28 +1,22 @@
-Quota at a glance. A steadier board.
+Update from Pika. Keep your agents running.
 
-- See weekly Codex and Claude allowance, reset times, and reading freshness above
-  the board shortcuts on macOS and Linux. The strip stays tied to the machine
-  running Pika, even when you select a thread on another server.
-- Reduce flicker with buffered, synchronized frames, including in Windows Terminal.
-  Unchanged frames no longer trigger a repaint.
-- Get background update notices without interrupting agents. Installation remains
-  your choice; Windows shows the PowerShell update command inside the board.
+When a new version is available, Pika asks **Update now? [y/N]**. Press Y to
+download and verify it, then return to the updated board. Enter, N, or Esc leaves
+your installation unchanged; U opens the offer again.
 
-Claude quota uses its signed-in CLI's status-line feed during normal activity.
-Run `pika setup` to add the collector; existing status-line commands are preserved.
-Pika does not send model prompts or extract login tokens to populate the meter.
-The native Windows client has no local quota source yet and labels that explicitly.
+- Works on macOS, Linux, and the native Windows client.
+- Waits until you're out of a private consultation or text-entry field before
+  offering an update.
+- Updates only this machine. Running agents, paired machines, and conversations
+  are left intact.
+- Windows verifies the new executable before handing off, including when an
+  already-open PowerShell still points at the older release.
 
-Update on macOS or Linux:
-
-```sh
-pika update
-```
-
-Update in Windows PowerShell:
+To get this update from an older Windows version, run the installer once more:
 
 ```powershell
 irm https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.ps1 | iex
 ```
 
-Close and reopen the board after updating. Your running agents are left intact.
+On macOS and Linux, run `pika update`. Future board updates need only your
+confirmation.

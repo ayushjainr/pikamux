@@ -517,7 +517,7 @@ fn run_loop_with_actions(
         if let Some(notice) = &update_notice {
             match notice.try_recv() {
                 Ok(version) => {
-                    board.update_version = version;
+                    board.receive_update(version);
                     dirty = true;
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
@@ -532,6 +532,7 @@ fn run_loop_with_actions(
             dirty |= board.replace_fleet_health(health);
         }
         dirty |= board.drain_consultation();
+        dirty |= board.offer_update();
         if let Some(quota) = fleet_health.as_ref().and_then(|feed| feed.quota.as_ref()) {
             // Subscription allowance belongs to this board's base, not its selected thread.
             quota.select(None);
@@ -580,7 +581,7 @@ fn run_loop_with_actions(
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 if let Some(action) = board.key(key, driver.as_ref()) {
                     if let Some(action) = route_board_action(action, refresh_request.as_ref()) {
-                        if action != BoardAction::Quit
+                        if !matches!(action, BoardAction::Quit | BoardAction::Update(_))
                             && let Some(actions) = actions.as_mut()
                         {
                             board.action_notice = Some(actions.submit(action));
@@ -956,6 +957,7 @@ struct Board {
     quit_when_chat_closes: bool,
     update_version: Option<String>,
     update_prompt: bool,
+    update_offer_pending: bool,
     local_refresh_delayed: bool,
     fleet_health: Vec<String>,
     action_notice: Option<String>,
@@ -980,6 +982,7 @@ impl Board {
             quit_when_chat_closes: false,
             update_version: None,
             update_prompt: false,
+            update_offer_pending: false,
             local_refresh_delayed: false,
             fleet_health: Vec::new(),
             action_notice: None,
@@ -987,6 +990,27 @@ impl Board {
             client_actions: false,
             confirm_untrack: None,
         }
+    }
+
+    fn receive_update(&mut self, version: Option<String>) {
+        if version != self.update_version {
+            self.update_offer_pending = version.is_some();
+            self.update_version = version;
+        }
+    }
+
+    fn offer_update(&mut self) -> bool {
+        if self.update_offer_pending
+            && self.chat.is_none()
+            && !self.filtering
+            && self.confirm_untrack.is_none()
+            && self.action_notice.is_none()
+        {
+            self.update_offer_pending = false;
+            self.update_prompt = true;
+            return true;
+        }
+        false
     }
 
     fn observe_local_refresh(&mut self, delayed: &AtomicBool) -> bool {
@@ -1205,10 +1229,13 @@ impl Board {
         }
         if self.update_prompt {
             match key.code {
-                KeyCode::Enter | KeyCode::Char('y') => {
+                KeyCode::Char('y' | 'Y') if key.kind != KeyEventKind::Repeat => {
+                    self.update_prompt = false;
                     return Some(BoardAction::Update(self.update_version.clone()));
                 }
-                KeyCode::Esc | KeyCode::Char('n') => self.update_prompt = false,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n' | 'N' | 'q') => {
+                    self.update_prompt = false
+                }
                 _ => {}
             }
             return None;
@@ -1278,10 +1305,7 @@ impl Board {
             }
             KeyCode::Char('r') => return Some(BoardAction::Refresh),
             KeyCode::Char('U') => {
-                if self.client_actions {
-                    return Some(BoardAction::Update(self.update_version.clone()));
-                }
-                if self.update_version.is_some() {
+                if self.update_version.is_some() || self.client_actions {
                     self.update_prompt = true;
                 } else {
                     return Some(BoardAction::Update(None));
@@ -1647,9 +1671,9 @@ impl Board {
         )?;
         for (row, line) in [
             "",
-            "Install this verified release on this machine only?",
+            "New version available. Update now? [y/N]",
             "Running agents stay running; other machines are unchanged.",
-            "Reopen Pika afterward. `pika setup` reviews integration changes.",
+            "Pika verifies the download and reopens the board after updating.",
         ]
         .into_iter()
         .enumerate()
@@ -1660,7 +1684,7 @@ impl Board {
             output,
             MoveTo(0, height.saturating_sub(2)),
             SetForegroundColor(Color::DarkGrey),
-            Print(fit("enter / y install · esc / n cancel", width)),
+            Print(fit("y update · n / enter / esc not now", width)),
             ResetColor
         )?;
         Ok(())
@@ -2449,7 +2473,7 @@ mod tests {
         assert!(!board.update_prompt);
         board.key(key(KeyCode::Char('U')), None);
         assert_eq!(
-            board.key(key(KeyCode::Enter), None),
+            board.key(key(KeyCode::Char('y')), None),
             Some(BoardAction::Update(Some("0.7.0".into())))
         );
     }
@@ -2966,21 +2990,45 @@ mod tests {
     }
 
     #[test]
-    fn client_update_opens_instructions_without_promising_an_install() {
+    fn client_update_requires_confirmation_and_returns_an_install_action() {
         let mut board = board(Status::Working);
         board.client_actions = true;
         board.update_version = Some("9.0.0".into());
-        assert!(
-            matches!(board.key(key(KeyCode::Char('U')), None), Some(BoardAction::Update(Some(version))) if version == "9.0.0")
-        );
-        assert!(!board.update_prompt);
+        assert_eq!(board.key(key(KeyCode::Char('U')), None), None);
+        assert!(board.update_prompt);
         let mut rendered = Vec::new();
         board.draw(&mut rendered, 120, 30).unwrap();
         assert!(
             String::from_utf8(rendered)
                 .unwrap()
-                .contains("update 9.0.0")
+                .contains("Update now? [y/N]")
         );
+        assert_eq!(
+            board.key(key(KeyCode::Char('Y')), None),
+            Some(BoardAction::Update(Some("9.0.0".into())))
+        );
+    }
+
+    #[test]
+    fn update_offer_is_once_per_version_deferred_during_typing_and_defaults_to_no() {
+        let mut board = board(Status::Working);
+        board.filtering = true;
+        board.receive_update(Some("9.0.0".into()));
+        assert!(!board.offer_update());
+        board.filtering = false;
+        assert!(board.offer_update());
+        assert_eq!(board.key(key(KeyCode::Enter), None), None);
+        assert!(!board.update_prompt);
+        board.receive_update(Some("9.0.0".into()));
+        assert!(!board.offer_update());
+        board.receive_update(Some("9.1.0".into()));
+        assert!(board.offer_update());
+        let mut repeat = key(KeyCode::Char('y'));
+        repeat.kind = KeyEventKind::Repeat;
+        assert_eq!(board.key(repeat, None), None);
+        assert!(board.update_prompt);
+        assert_eq!(board.key(key(KeyCode::Char('n')), None), None);
+        assert!(!board.update_prompt);
     }
 
     #[test]

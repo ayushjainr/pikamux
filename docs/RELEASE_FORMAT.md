@@ -157,7 +157,7 @@ provenance attestations. See [releasing](releasing.md).
 - Setup migration and long-lived callback rewrites remain previewed operations.
 - Remote upgrades remain explicit, version-pinned and per machine.
 - Automatic pruning, delta updates and OS package managers are deferred.
-- Native Windows hosting and in-client self-update remain separate future work.
+- Native Windows hosting remains separate future work.
 
 ## Windows bootstrap
 
@@ -166,9 +166,16 @@ manifest and matching checksum sidecar. It pins download paths to that version,
 bounds downloads and extraction, allows only the three declared archive files,
 and probes the verified executable before activation. Versioned directories under
 `%LOCALAPPDATA%\Pika\Client\releases` avoid replacing an executable used by a
-running bridge. The per-user PATH selects the installed version. Re-running the
-installer updates it; downgrades and changed bytes for an installed version are
-refused. Installation does not pair machines. Interactive `pika` then offers a
+running bridge. The per-user PATH selects the installed version. The board offers
+confirmed in-client updates and restarts itself after verification; `pika update`
+also asks for confirmation. The executable embeds the reviewed bootstrap, pins
+the offered release, and requires its own active managed installation before
+invoking it. Receipts additionally bind the activated executable's SHA256.
+Older managed launch paths forward to a verified newer active release, so an
+already-open PowerShell does not strand users on the old binary. The bootstrap
+remains available for initial installation and recovery; downgrades and changed
+bytes for an installed version are refused. Installation does not pair machines.
+Interactive `pika` then offers a
 multi-machine chooser and renders their combined fleet locally. Existing
 pairings remain selected. Normal opens launch Windows Terminal directly, without
 the optional bridge or reverse SSH forwarding.

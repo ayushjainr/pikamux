@@ -206,7 +206,7 @@ observer refreshes selected machines and preserves cached-offline visibility.
 Enter dispatches a single-flight action worker: fresh fleet identity validation,
 then locally constructed Windows Terminal arguments for the exact destination.
 No reverse tunnel, bridge startup, or mandatory remote coordinator is involved.
-Peeks, action failures, and update instructions stay in a scrollable inspector;
+Peeks and action failures stay in a scrollable inspector;
 untrack is explicitly confirmed. A window receipt confirms process launch only,
 not eventual attachment. Unknown outcomes are never automatically retried.
 Windows pipe cancellation targets only the exact owned pipe's outstanding I/O;
@@ -217,9 +217,17 @@ and retried after an hour. A short cross-process lease prevents concurrent board
 from duplicating requests. A separate update-cache database never writes agent
 state or invalidates reconciliation. Only newer, complete releases compatible
 with the running channel and platform produce a notice. `PIKA_UPDATE_CHECK=0`
-disables these checks. No update is installed automatically; Windows shows the
-PowerShell installer command in-panel, while managed hosts retain explicit update
-confirmation and verification. Closing the board cancels and reaps its check.
+disables these checks. A new release offers `Update now? [y/N]` once per version
+per board visit, deferred while a consultation, filter, or action has focus.
+Only an explicit Y approves; Enter, N, and Esc decline. U reopens the offer.
+Approval restores the terminal and stops board observers before updating only
+this installation, then reopens the verified new board. Windows executes its
+embedded, reviewed installer with the approved version pinned, not a script from
+a moving branch. Retained Windows paths forward to the newer active executable
+only after its bounded receipt and executable digest validate; this avoids stale
+PowerShell PATH entries reopening the old client. Staged installer probes never
+forward. No agent, pairing, or remote installation is
+changed. Closing the board cancels and reaps its update check.
 The legacy bridge remains optional for openings initiated on a remote console;
 its short connection budget is separate from its bounded launch-receipt budget,
 and a disconnected caller cannot terminate the listener.
