@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.9 — Quota at a glance, steadier boards
+## 0.6.10 — Quota at a glance, steadier boards
 
 - Reduce board flicker with buffered, synchronized frame presentation and skip
   terminal writes when the visible frame is unchanged.

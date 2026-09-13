@@ -64,3 +64,24 @@ fn missing_telemetry_is_silent_and_does_not_replace_existing_display() {
         .stdout("");
     assert!(!root.path().join("claude/.pika-quota.json").exists());
 }
+
+#[test]
+fn early_exiting_statusline_preserves_output_and_exit_status_without_reading_input() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("claude")).unwrap();
+    // Exceed the pipe capacity so a non-reading child reliably closes it while
+    // the writer still has bytes, rather than relying on scheduler timing.
+    let payload = format!("{{}}{}", " ".repeat(512 * 1024));
+    command(root.path())
+        .args([
+            "_claude-statusline",
+            "--forward",
+            "exec sh -c 'printf visible; printf warning >&2; exit 17'",
+        ])
+        .write_stdin(payload)
+        .assert()
+        .code(17)
+        .stdout("visible")
+        .stderr("warning");
+    assert!(!root.path().join("state").exists());
+}

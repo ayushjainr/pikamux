@@ -162,7 +162,16 @@ pub(crate) fn run(forward: Option<String>) -> Result<i32> {
     }
     if let Some(command) = forward {
         let mut child = std::process::Command::new("sh");
-        child.args(["-c", &command]);
+        // Some valid status lines (for example a clock) never read stdin.
+        // Keep a parent reader alive and drain any unused payload after the
+        // command exits, preserving its exact output/status without weakening
+        // the shared SSH runner's strict input-delivery contract.
+        child.args([
+            "-c",
+            "sh -c \"$1\"; pika_statusline_status=$?; cat >/dev/null; exit \"$pika_statusline_status\"",
+            "sh",
+            &command,
+        ]);
         let output = crate::fleet::run_bounded_command_cancellable(
             &mut child,
             Some(&bytes),
