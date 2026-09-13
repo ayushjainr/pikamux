@@ -1338,6 +1338,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn exact_test_pane() -> Pane {
         parse_pane(
             &[

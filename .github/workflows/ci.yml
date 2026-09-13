@@ -79,8 +79,11 @@ jobs:
       - name: Test client contracts
         run: |
           cargo test --locked --test client_bridge_contract --test client_cli_contract --test client_board_contract
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --lib monitor::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --lib windows_io::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify client-only command surface
         shell: pwsh
         run: |

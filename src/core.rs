@@ -168,7 +168,7 @@ impl Pika {
     /// taking its write gate. Bumping this generation under that same gate lets
     /// an exact board action proceed immediately without allowing an older
     /// observation to commit after it.
-    #[cfg(any(not(windows), test))]
+    #[cfg(not(windows))]
     pub(crate) fn invalidate_local_reconciliation(&self) {
         let _guard = self
             .local_reconcile_fence
@@ -2152,9 +2152,10 @@ mod tests {
     use super::*;
     use crate::{
         hooks::{HookContext, handle_hook, parse_hook_payload},
-        model::ExpertProfile,
-        store::{LiveOwner, StoredExpertProfile},
+        store::LiveOwner,
     };
+    #[cfg(unix)]
+    use crate::{model::ExpertProfile, store::StoredExpertProfile};
     use std::sync::{Arc, Barrier};
     fn test_pika() -> (tempfile::TempDir, Pika) {
         let root = tempfile::tempdir().unwrap();

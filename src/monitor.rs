@@ -2582,13 +2582,16 @@ mod tests {
 
     #[test]
     fn first_control_c_requests_cleanup_before_quitting() {
-        let driver = ConsultationDriver::new(|io| {
+        let (release, wait) = mpsc::channel();
+        let wait = Arc::new(Mutex::new(wait));
+        let driver = ConsultationDriver::new(move |io| {
             io.events.send(ConsultationEvent::Opened {
                 child_id: None,
                 policy: None,
                 proof: None,
             })?;
             assert_eq!(io.commands.recv()?, ConsultationInput::Close);
+            wait.lock().unwrap().recv()?;
             Ok(ConsultationOutcome::discarded())
         });
         let mut board = board(Status::Working);
@@ -2596,6 +2599,7 @@ mod tests {
         let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(board.key(interrupt, Some(&driver)), None);
         assert!(board.quit_when_chat_closes);
+        release.send(()).unwrap();
         for _ in 0..50 {
             board.drain_consultation();
             if board.chat.is_none() {
@@ -2610,10 +2614,13 @@ mod tests {
     fn forced_board_exit_joins_private_consultation_cleanup() {
         let cleaned = Arc::new(Mutex::new(false));
         let observed = Arc::clone(&cleaned);
+        let (release, wait) = mpsc::channel();
+        let wait = Arc::new(Mutex::new(wait));
         let driver = ConsultationDriver::new(move |io| {
             while !io.cancellation.is_cancelled() {
                 thread::sleep(Duration::from_millis(2));
             }
+            wait.lock().unwrap().recv()?;
             *observed.lock().unwrap() = true;
             Ok(ConsultationOutcome::discarded())
         });
@@ -2622,6 +2629,7 @@ mod tests {
         let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(board.key(interrupt, Some(&driver)), None);
         assert_eq!(board.key(interrupt, Some(&driver)), Some(BoardAction::Quit));
+        release.send(()).unwrap();
         drop(board);
         assert!(*cleaned.lock().unwrap());
     }

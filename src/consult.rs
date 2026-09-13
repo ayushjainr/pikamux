@@ -2560,6 +2560,7 @@ fn decode_chunked(mut value: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
     use std::io::Cursor;
 
