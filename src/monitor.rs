@@ -1091,6 +1091,15 @@ impl Board {
             self.chat_key(key);
             return None;
         }
+        // Holding Enter/x is not approval for another window or for the
+        // confirmation that the first keypress just opened. Navigation repeats
+        // and ordinary typing in the private panel/filter remain available.
+        if !self.filtering
+            && key.kind == KeyEventKind::Repeat
+            && matches!(key.code, KeyCode::Enter | KeyCode::Char('x' | 'n' | 'U'))
+        {
+            return None;
+        }
         if let Some(item) = self.confirm_untrack.clone() {
             match key.code {
                 KeyCode::Enter | KeyCode::Char('x') => {
@@ -2075,6 +2084,10 @@ mod tests {
         board.client_actions = true;
         let exact = board.selected().unwrap();
         assert_eq!(board.key(key(KeyCode::Char('x')), None), None);
+        let mut repeated = key(KeyCode::Char('x'));
+        repeated.kind = KeyEventKind::Repeat;
+        assert_eq!(board.key(repeated, None), None);
+        assert!(board.confirm_untrack.is_some());
         board.replace_items(Vec::new());
         assert_eq!(
             board.key(key(KeyCode::Enter), None),
