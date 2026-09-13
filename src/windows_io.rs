@@ -1,9 +1,10 @@
-//! Interrupt synchronous pipe I/O on its exact owning thread. The guard is
-//! active only across one pipe call; it never cancels unrelated thread work.
+//! Cancel only the exact owned pipe's outstanding I/O. Rust's blocking stdio
+//! API uses overlapped Windows pipes internally, requiring CancelIoEx rather
+//! than thread-level CancelSynchronousIo.
 use crate::consult::CancellationToken;
 use std::{
     io,
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    os::windows::io::{AsRawHandle, OwnedHandle},
     sync::{Arc, Mutex, mpsc},
     thread,
     time::Duration,
@@ -11,9 +12,7 @@ use std::{
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn GetCurrentThreadId() -> u32;
-    fn OpenThread(access: u32, inherit: i32, id: u32) -> *mut std::ffi::c_void;
-    fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;
+    fn CancelIoEx(file: *mut std::ffi::c_void, overlapped: *mut std::ffi::c_void) -> i32;
 }
 
 pub(crate) struct PipeInterrupt {
@@ -23,14 +22,7 @@ pub(crate) struct PipeInterrupt {
 }
 
 impl PipeInterrupt {
-    pub(crate) fn new(stop: CancellationToken) -> io::Result<Self> {
-        // SAFETY: open a non-inheritable handle to this still-running thread.
-        // OwnedHandle pins its identity and closes it on watchdog completion.
-        let handle = unsafe { OpenThread(1, 0, GetCurrentThreadId()) };
-        if handle.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    pub(crate) fn new(stop: CancellationToken, handle: OwnedHandle) -> io::Result<Self> {
         let active = Arc::new(Mutex::new(false));
         let watching = active.clone();
         let (finish, finished) = mpsc::channel();
@@ -45,12 +37,13 @@ impl PipeInterrupt {
                     if stop.is_cancelled() {
                         let active = watching.lock().expect("pipe activity poisoned");
                         if *active {
-                            // SAFETY: the handle names only this pipe worker, and
-                            // the activity lock prevents a cancellation after the
-                            // call returns to unrelated work. Repeat to cover the
-                            // race between cancellation and entry into kernel I/O.
+                            // SAFETY: this owned duplicate pins only this Pika
+                            // pipe, never another process or pipe. Null cancels
+                            // all outstanding I/O on that pipe in this process.
+                            // Repetition covers cancellation before kernel entry;
+                            // the activity lock fences return to unrelated work.
                             unsafe {
-                                CancelSynchronousIo(handle.as_raw_handle());
+                                CancelIoEx(handle.as_raw_handle(), std::ptr::null_mut());
                             }
                         }
                     }

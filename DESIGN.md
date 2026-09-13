@@ -179,8 +179,8 @@ No reverse tunnel, bridge startup, or mandatory remote coordinator is involved.
 Peeks, action failures, and update instructions stay in a scrollable inspector;
 untrack is explicitly confirmed. A window receipt confirms process launch only,
 not eventual attachment. Unknown outcomes are never automatically retried.
-Windows pipe cancellation targets only the active synchronous I/O of the exact
-worker thread; it cannot cancel unrelated I/O after that call returns.
+Windows pipe cancellation targets only the exact owned pipe's outstanding I/O;
+it cannot cancel another conversation's or process's I/O.
 The legacy bridge remains optional for openings initiated on a remote console;
 its short connection budget is separate from its bounded launch-receipt budget,
 and a disconnected caller cannot terminate the listener.

@@ -2125,7 +2125,7 @@ pub(crate) struct CancellablePipe<T> {
     pipe: T,
     stop: CancellationToken,
     #[cfg(windows)]
-    interrupt: Option<crate::windows_io::PipeInterrupt>,
+    interrupt: crate::windows_io::PipeInterrupt,
 }
 
 impl<T> CancellablePipe<T> {
@@ -2144,33 +2144,34 @@ impl<T> CancellablePipe<T> {
         Ok(Self { pipe, stop })
     }
 
-    #[cfg(not(unix))]
-    pub(crate) fn new(pipe: T, stop: CancellationToken) -> std::io::Result<Self> {
+    #[cfg(windows)]
+    pub(crate) fn new(pipe: T, stop: CancellationToken) -> std::io::Result<Self>
+    where
+        T: std::os::windows::io::AsHandle,
+    {
+        let handle = pipe.as_handle().try_clone_to_owned()?;
+        let interrupt = crate::windows_io::PipeInterrupt::new(stop.clone(), handle)?;
         Ok(Self {
             pipe,
             stop,
-            #[cfg(windows)]
-            interrupt: None,
+            interrupt,
         })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn new(pipe: T, stop: CancellationToken) -> std::io::Result<Self> {
+        Ok(Self { pipe, stop })
     }
 }
 
 impl<T: Read> Read for CancellablePipe<T> {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        #[cfg(windows)]
-        if self.interrupt.is_none() {
-            self.interrupt = Some(crate::windows_io::PipeInterrupt::new(self.stop.clone())?);
-        }
         loop {
             if self.stop.is_cancelled() {
                 return Ok(0);
             }
             #[cfg(windows)]
-            let result = self
-                .interrupt
-                .as_ref()
-                .expect("initialized")
-                .call(|| self.pipe.read(output));
+            let result = self.interrupt.call(|| self.pipe.read(output));
             #[cfg(not(windows))]
             let result = self.pipe.read(output);
             match result {
@@ -2186,20 +2187,12 @@ impl<T: Read> Read for CancellablePipe<T> {
 
 impl<T: Write> Write for CancellablePipe<T> {
     fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
-        #[cfg(windows)]
-        if self.interrupt.is_none() {
-            self.interrupt = Some(crate::windows_io::PipeInterrupt::new(self.stop.clone())?);
-        }
         loop {
             if self.stop.is_cancelled() {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
             }
             #[cfg(windows)]
-            let result = self
-                .interrupt
-                .as_ref()
-                .expect("initialized")
-                .call(|| self.pipe.write(input));
+            let result = self.interrupt.call(|| self.pipe.write(input));
             #[cfg(not(windows))]
             let result = self.pipe.write(input);
             match result {
