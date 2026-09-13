@@ -1018,7 +1018,7 @@ fn finish_board_observer(
     // a completed observer can be joined and a slow read can finish detached
     // without ever becoming authoritative.
     let _ = refresh.try_send(());
-    if done.recv_timeout(Duration::from_millis(50)).is_ok() {
+    if done.try_recv().is_ok() && worker.is_finished() {
         let _ = worker.join();
     }
 }
@@ -5776,12 +5776,19 @@ mod fleet_consultation_tests {
             let _ = done_sender.send(());
         });
 
-        let started = Instant::now();
-        finish_board_observer(&stop, &refresh_sender, &done_receiver, worker);
-        assert!(started.elapsed() < Duration::from_millis(150));
-        assert!(stop.load(Ordering::Relaxed));
-
+        // Prove shutdown returns while the observer is still held, rather than
+        // measuring a 150 ms wall-clock slice on a shared CI runner.
+        let (returned_sender, returned_receiver) = mpsc::sync_channel(1);
+        let shutdown_stop = stop.clone();
+        let shutdown = thread::spawn(move || {
+            finish_board_observer(&shutdown_stop, &refresh_sender, &done_receiver, worker);
+            let _ = returned_sender.send(done_receiver);
+        });
+        let returned = returned_receiver.recv_timeout(Duration::from_secs(2));
         release_sender.send(()).unwrap();
+        shutdown.join().unwrap();
+        let done_receiver = returned.expect("shutdown must return before the observer is released");
+        assert!(stop.load(Ordering::Relaxed));
         done_receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("detached observer exits safely after its bounded work returns");

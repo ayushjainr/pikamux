@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.11 — Update without leaving Pika behind
+## 0.6.12 — Update without leaving Pika behind
 
 - Offer new releases with an explicit Y/N confirmation on every platform.
   Defer the prompt during typing, consultations, and active actions.
@@ -8,6 +8,7 @@
   an installer command. Preserve running agents, pairings, and remote machines.
 - Reopen the board after a successful update. Hand off old Windows PATH entries
   to the verified active release so existing PowerShell sessions stay current.
+- Stop board observation without waiting on an unfinished local reader.
 
 ## 0.6.10 — Quota at a glance, steadier boards
 
