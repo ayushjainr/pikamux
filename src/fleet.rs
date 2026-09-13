@@ -59,6 +59,7 @@ pub const CAPABILITIES: &[&str] = &[
     "expert-directory-notices-v1",
     "setup-explicit-names-v1",
     "client-board-v1",
+    "quota-v1",
 ];
 const REQUIRED_CAPABILITIES: &[&str] = &[
     "inventory",
@@ -3804,6 +3805,9 @@ fn validate_opening_isolation(provider: Provider, value: &Value) -> bool {
 /// must revalidate exact process ownership before every action; the fleet layer
 /// supplies immutable node/provider/conversation routing and bounded wire I/O.
 pub trait FleetService {
+    fn quota(&mut self) -> Result<Value, FleetError> {
+        Ok(json!([]))
+    }
     fn snapshot(&mut self, expert_directory: bool) -> Result<Value, FleetError>;
     fn candidates(&mut self, include_unconfirmed: bool) -> Result<Vec<Candidate>, FleetError>;
     fn adopt(&mut self, provider: Provider, session_id: &str) -> Result<Session, FleetError>;
@@ -3920,7 +3924,7 @@ fn handle_request<S: FleetService>(
         FleetError::new(FleetErrorKind::InvalidRequest, "Fleet operation is missing")
     })?;
     let allowed: &[&str] = match op {
-        "hello" => &["op", "protocol", "version", "expected_node_id"],
+        "hello" | "quota" => &["op", "protocol", "version", "expected_node_id"],
         "snapshot" => &[
             "op",
             "protocol",
@@ -3977,6 +3981,15 @@ fn handle_request<S: FleetService>(
         ));
     }
     match op {
+        "quota" => {
+            if request.get("expected_node_id").and_then(Value::as_str) != Some(node_id) {
+                return Err(FleetError::new(
+                    FleetErrorKind::InvalidRequest,
+                    "Quota requires exact machine identity",
+                ));
+            }
+            Ok(json!({"type":"quota", "node_id":node_id, "readings":service.quota()?}))
+        }
         "hello" => Ok(json!({
             "type":"hello", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
             "node_id":node_id, "machine":machine, "package_version":package_version,
@@ -5020,10 +5033,10 @@ fn shell_quote(value: &str) -> String {
 }
 
 #[derive(Debug)]
-struct BoundedOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct BoundedOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 fn run_bounded_command(
@@ -5036,7 +5049,7 @@ fn run_bounded_command(
     run_bounded_command_with_identity(command, input, timeout, stdout_limit, stderr_limit, None)
 }
 
-fn run_bounded_command_cancellable(
+pub(crate) fn run_bounded_command_cancellable(
     command: &mut Command,
     input: Option<&[u8]>,
     timeout: Duration,

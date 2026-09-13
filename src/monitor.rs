@@ -10,8 +10,8 @@ use crossterm::{
     execute, queue,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{
-        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode, size,
+        BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
+        LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
     },
 };
 use std::{
@@ -116,7 +116,7 @@ impl<T> LatestSender<T> {
 }
 
 impl<T> LatestReceiver<T> {
-    fn take(&self) -> Option<T> {
+    pub(crate) fn take(&self) -> Option<T> {
         self.value
             .lock()
             .expect("latest-value channel poisoned")
@@ -132,11 +132,21 @@ enum ItemUpdates {
 pub(crate) struct FleetHealthFeed {
     initial: Vec<String>,
     updates: LatestReceiver<Vec<String>>,
+    quota: Option<crate::quota::Feed>,
 }
 
 impl FleetHealthFeed {
     pub(crate) fn new(initial: Vec<String>, updates: LatestReceiver<Vec<String>>) -> Self {
-        Self { initial, updates }
+        Self {
+            initial,
+            updates,
+            quota: None,
+        }
+    }
+
+    pub(crate) fn with_quota(mut self, quota: crate::quota::Feed) -> Self {
+        self.quota = Some(quota);
+        self
     }
 }
 
@@ -445,12 +455,13 @@ pub(crate) fn run_client_board(
     refresh: SyncSender<()>,
     health: FleetHealthFeed,
     actions: ActionDriver,
+    update_notice: Receiver<Option<String>>,
 ) -> Result<BoardAction> {
     run_loop_with_actions(
         items,
         Some(ItemUpdates::Latest(updates)),
         Some(consultation),
-        None,
+        Some(update_notice),
         Some(refresh),
         None,
         (Some(health), Some(actions)),
@@ -468,12 +479,16 @@ fn run_loop_with_actions(
 ) -> Result<BoardAction> {
     let _terminal = TerminalGuard::enter()?;
     let mut board = Board::new(items);
+    board.quota_enabled = fleet_health
+        .as_ref()
+        .is_some_and(|feed| feed.quota.is_some());
     board.client_actions = actions.is_some();
     board.fleet_health = fleet_health
         .as_ref()
         .map(|feed| feed.initial.clone())
         .unwrap_or_default();
     let mut stdout = io::stdout().lock();
+    let mut presenter = FramePresenter::default();
     let mut dirty = true;
     let mut last_draw = Instant::now()
         .checked_sub(Duration::from_secs(1))
@@ -517,6 +532,14 @@ fn run_loop_with_actions(
             dirty |= board.replace_fleet_health(health);
         }
         dirty |= board.drain_consultation();
+        if let Some(quota) = fleet_health.as_ref().and_then(|feed| feed.quota.as_ref()) {
+            // Subscription allowance belongs to this board's base, not its selected thread.
+            quota.select(None);
+            if let Some(view) = quota.updates.take() {
+                board.quota = view;
+                dirty = true;
+            }
+        }
         if board.quit_when_chat_closes && board.chat.is_none() {
             return Ok(BoardAction::Quit);
         }
@@ -533,9 +556,10 @@ fn run_loop_with_actions(
         };
         if dirty || last_draw.elapsed() >= paint_interval {
             let (width, height) = size().unwrap_or((100, 30));
-            board.ensure_visible(height);
-            board.draw(&mut stdout, width, height)?;
-            stdout.flush()?;
+            board.ensure_visible(height.saturating_sub(board.quota_height(width, height)));
+            presenter.present(&mut stdout, (width, height), |frame| {
+                board.draw(frame, width, height)
+            })?;
             last_draw = Instant::now();
             dirty = false;
         }
@@ -591,6 +615,43 @@ fn route_board_action(
     Some(action)
 }
 
+/// Compose before touching stdout: its line buffering otherwise exposes every
+/// newline between the clear and the finished board. Synchronized output also
+/// protects frames larger than one terminal write. Unsupported terminals ignore
+/// the mode and still receive a prebuilt frame rather than incremental drawing.
+#[derive(Default)]
+struct FramePresenter {
+    previous: Vec<u8>,
+    scratch: Vec<u8>,
+    dimensions: Option<(u16, u16)>,
+}
+
+impl FramePresenter {
+    fn present(
+        &mut self,
+        output: &mut impl Write,
+        dimensions: (u16, u16),
+        draw: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+    ) -> Result<bool> {
+        self.scratch.clear();
+        queue!(self.scratch, BeginSynchronizedUpdate)?;
+        draw(&mut self.scratch)?;
+        queue!(self.scratch, EndSynchronizedUpdate)?;
+        if self.dimensions == Some(dimensions) && self.previous == self.scratch {
+            return Ok(false);
+        }
+        if let Err(error) = output.write_all(&self.scratch).and_then(|_| output.flush()) {
+            // A partial write must not strand the terminal inside a frozen frame.
+            self.dimensions = None;
+            let _ = execute!(output, EndSynchronizedUpdate, ResetColor);
+            return Err(error.into());
+        }
+        std::mem::swap(&mut self.previous, &mut self.scratch);
+        self.dimensions = Some(dimensions);
+        Ok(true)
+    }
+}
+
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -606,7 +667,13 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen, ResetColor);
+        let _ = execute!(
+            io::stdout(),
+            EndSynchronizedUpdate,
+            Show,
+            LeaveAlternateScreen,
+            ResetColor
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -878,6 +945,8 @@ impl Drop for ChatState {
 }
 
 struct Board {
+    quota_enabled: bool,
+    quota: crate::quota::View,
     items: Vec<BoardItem>,
     selected_key: Option<BoardKey>,
     filter: String,
@@ -900,6 +969,8 @@ impl Board {
         sort_items(&mut items);
         let selected_key = items.first().map(BoardItem::key);
         Self {
+            quota_enabled: false,
+            quota: crate::quota::View::default(),
             items,
             selected_key,
             filter: String::new(),
@@ -1207,6 +1278,9 @@ impl Board {
             }
             KeyCode::Char('r') => return Some(BoardAction::Refresh),
             KeyCode::Char('U') => {
+                if self.client_actions {
+                    return Some(BoardAction::Update(self.update_version.clone()));
+                }
                 if self.update_version.is_some() {
                     self.update_prompt = true;
                 } else {
@@ -1276,13 +1350,24 @@ impl Board {
     fn ensure_visible(&mut self, height: u16) {
         let visible = self.visible();
         let selected = self.selected_index(&visible);
-        let rows = usize::from(height.saturating_sub(7)).max(1);
-        if selected < self.offset {
-            self.offset = selected;
+        let budget = usize::from(height.saturating_sub(3)).max(3);
+        let mut used = 0;
+        let mut prior = "";
+        let mut first = selected;
+        for index in (self.offset.min(selected)..=selected).rev() {
+            let Some(item) = visible.get(index) else {
+                break;
+            };
+            let group = item_group(item);
+            let cost = 1 + if group == prior { 0 } else { 2 };
+            if used + cost > budget {
+                break;
+            }
+            used += cost;
+            first = index;
+            prior = group;
         }
-        if selected >= self.offset + rows {
-            self.offset = selected + 1 - rows;
-        }
+        self.offset = first;
     }
 
     fn draw(&self, output: &mut impl Write, width: u16, height: u16) -> Result<()> {
@@ -1290,6 +1375,9 @@ impl Board {
         if self.update_prompt {
             return self.draw_update_prompt(output, usize::from(width), height);
         }
+        let terminal_height = height;
+        let quota_height = self.quota_height(width, height);
+        let height = height.saturating_sub(quota_height);
         let width = usize::from(width);
         let visible = self.visible();
         let needs = visible
@@ -1331,10 +1419,9 @@ impl Board {
             width
         };
         let selected_index = self.selected_index(&visible);
-        let rows = usize::from(height.saturating_sub(6)).max(1);
         let mut line = 1_u16;
         let mut prior_group = "";
-        for (index, item) in visible.iter().enumerate().skip(self.offset).take(rows) {
+        for (index, item) in visible.iter().enumerate().skip(self.offset) {
             let session = &item.session;
             let current_group = item_group(item);
             if current_group != prior_group && line < height.saturating_sub(2) {
@@ -1417,6 +1504,8 @@ impl Board {
         {
             self.draw_detail(output, &selected, list_width + 2, width, height)?;
         }
+        let height = terminal_height;
+        self.draw_quota(output, width, height, quota_height)?;
         queue!(
             output,
             MoveTo(0, height.saturating_sub(2)),
@@ -1471,6 +1560,78 @@ impl Board {
                 SetForegroundColor(Color::DarkYellow),
                 Print(fit(&health, width))
             )?;
+        }
+        queue!(output, ResetColor)?;
+        Ok(())
+    }
+
+    fn quota_height(&self, width: u16, height: u16) -> u16 {
+        if !self.quota_enabled || height < 8 {
+            0
+        } else if height < 20 || width < 65 {
+            1
+        } else if width >= 144 {
+            2
+        } else {
+            3
+        }
+    }
+
+    fn draw_quota(
+        &self,
+        output: &mut impl Write,
+        width: usize,
+        height: u16,
+        rows: u16,
+    ) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let scope = "this machine";
+        let empty = crate::quota::View::default();
+        let view = if self.quota.node_id.is_none() {
+            &self.quota
+        } else {
+            &empty
+        };
+        let at = crate::quota::now();
+        let y = height.saturating_sub(2 + rows);
+        let lines = if rows == 1 {
+            let short = crate::quota::PROVIDERS
+                .map(|provider| crate::quota::compact_row(provider, view, at));
+            vec![format!("WEEKLY {} | {} · {scope}", short[0], short[1])]
+        } else {
+            let title = format!("⚡ WEEKLY LEFT · {scope} · resets in local time");
+            let readings =
+                crate::quota::PROVIDERS.map(|provider| crate::quota::row(provider, view, at, true));
+            if rows == 2 {
+                let half = width.saturating_sub(3) / 2;
+                vec![
+                    title,
+                    format!("{} │ {}", fit(&readings[0], half), fit(&readings[1], half)),
+                ]
+            } else {
+                vec![title, readings[0].clone(), readings[1].clone()]
+            }
+        };
+        let color = std::env::var_os("NO_COLOR").is_none();
+        for (index, line) in lines.iter().enumerate() {
+            queue!(output, MoveTo(0, y + index as u16), ResetColor)?;
+            let mut previous = None;
+            for ch in fit(line, width).chars() {
+                let tone = if ch == '█' {
+                    Color::Yellow
+                } else if ch == '░' || index == 0 && rows > 1 {
+                    Color::DarkGrey
+                } else {
+                    Color::Reset
+                };
+                if color && previous != Some(tone) {
+                    queue!(output, SetForegroundColor(tone))?;
+                    previous = Some(tone);
+                }
+                queue!(output, Print(ch))?;
+            }
         }
         queue!(output, ResetColor)?;
         Ok(())
@@ -2021,6 +2182,102 @@ fn playbook_tip() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FrameOutput {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+        fail_flush_once: bool,
+    }
+
+    impl Write for FrameOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if std::mem::take(&mut self.fail_flush_once) {
+                return Err(io::Error::other("injected terminal failure"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn frame_presenter_batches_rows_and_skips_identical_frames_but_not_resizes() {
+        let mut presenter = FramePresenter::default();
+        let mut output = FrameOutput::default();
+        let draw = |frame: &mut Vec<u8>| -> Result<()> {
+            queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
+            for _ in 0..100 {
+                writeln!(frame, "Unicode █ quota · a complete row")?;
+            }
+            Ok(())
+        };
+        assert!(presenter.present(&mut output, (120, 30), draw).unwrap());
+        assert_eq!((output.writes, output.flushes), (1, 1));
+        assert!(output.bytes.starts_with(b"\x1b[?2026h"));
+        assert!(output.bytes.ends_with(b"\x1b[?2026l"));
+        for _ in 0..10 {
+            assert!(!presenter.present(&mut output, (120, 30), draw).unwrap());
+        }
+        assert_eq!((output.writes, output.flushes), (1, 1));
+        assert!(presenter.present(&mut output, (100, 30), draw).unwrap());
+        assert_eq!((output.writes, output.flushes), (2, 2));
+        assert!(
+            presenter
+                .present(&mut output, (100, 30), |frame| {
+                    frame.write_all(b"changed selection")?;
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert_eq!((output.writes, output.flushes), (3, 3));
+    }
+
+    #[test]
+    fn frame_presenter_does_not_clear_the_terminal_when_composition_fails() {
+        let mut presenter = FramePresenter::default();
+        let mut output = FrameOutput::default();
+        assert!(
+            presenter
+                .present(&mut output, (120, 30), |frame| {
+                    queue!(frame, Clear(ClearType::All))?;
+                    anyhow::bail!("injected composition failure")
+                })
+                .is_err()
+        );
+        assert!(output.bytes.is_empty());
+        assert_eq!(output.flushes, 0);
+    }
+
+    #[test]
+    fn frame_presenter_ends_sync_after_output_failure_and_does_not_cache_failed_frame() {
+        let mut presenter = FramePresenter::default();
+        let mut output = FrameOutput {
+            fail_flush_once: true,
+            ..FrameOutput::default()
+        };
+        let draw = |frame: &mut Vec<u8>| -> Result<()> {
+            frame.write_all(b"board")?;
+            Ok(())
+        };
+        assert!(presenter.present(&mut output, (120, 30), draw).is_err());
+        assert!(
+            output
+                .bytes
+                .windows(8)
+                .filter(|v| *v == b"\x1b[?2026l")
+                .count()
+                >= 2
+        );
+        assert_eq!(presenter.dimensions, None);
+        assert!(presenter.present(&mut output, (120, 30), draw).unwrap());
+        assert!(!presenter.present(&mut output, (120, 30), draw).unwrap());
+    }
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -2706,5 +2963,107 @@ mod tests {
         assert_eq!(board.visible()[0].session.status, Status::Starting);
         assert_eq!(group(&board.visible()[0].session), "WORKING");
         assert!(Board::new(Vec::new()).visible().is_empty());
+    }
+
+    #[test]
+    fn client_update_opens_instructions_without_promising_an_install() {
+        let mut board = board(Status::Working);
+        board.client_actions = true;
+        board.update_version = Some("9.0.0".into());
+        assert!(
+            matches!(board.key(key(KeyCode::Char('U')), None), Some(BoardAction::Update(Some(version))) if version == "9.0.0")
+        );
+        assert!(!board.update_prompt);
+        let mut rendered = Vec::new();
+        board.draw(&mut rendered, 120, 30).unwrap();
+        assert!(
+            String::from_utf8(rendered)
+                .unwrap()
+                .contains("update 9.0.0")
+        );
+    }
+
+    #[test]
+    fn quota_footer_reserves_space_and_stays_on_base_when_selection_changes() {
+        let mut board = board(Status::Working);
+        board.quota_enabled = true;
+        let at = crate::quota::now();
+        board.quota.readings = vec![crate::expert_refresh::QuotaSnapshot {
+            provider: Provider::Codex,
+            used_percent: 37.0,
+            reset_at: at as i64 + 86400,
+            observed_at: at,
+            source: "test".into(),
+        }];
+        for (width, height, reserved) in [
+            (160, 30, 2),
+            (100, 30, 3),
+            (80, 24, 3),
+            (80, 15, 1),
+            (40, 12, 1),
+        ] {
+            assert_eq!(board.quota_height(width, height), reserved);
+            let mut rendered = Vec::new();
+            board.draw(&mut rendered, width, height).unwrap();
+            let text = String::from_utf8(rendered).unwrap();
+            assert!(text.contains("WEEKLY"));
+            assert!(text.contains("63%"));
+            assert!(text.contains("enter open"));
+            assert!(text.contains(&format!("\u{1b}[{};1H", height - 1)));
+        }
+        let mut remote = BoardItem::local(session(Status::Working));
+        remote.node_id = Some("other-machine".into());
+        remote.node_name = Some("rs6".into());
+        board.items = vec![remote.clone()];
+        board.selected_key = Some(remote.key());
+        for client_actions in [false, true] {
+            board.client_actions = client_actions;
+            let mut rendered = Vec::new();
+            board.draw(&mut rendered, 100, 30).unwrap();
+            let text = String::from_utf8(rendered).unwrap();
+            assert!(text.contains("63%"));
+            assert!(text.contains("WEEKLY LEFT · this machine"));
+            assert!(!text.contains("WEEKLY LEFT · @rs6"));
+        }
+        board.items.clear();
+        let mut rendered = Vec::new();
+        board.draw(&mut rendered, 100, 30).unwrap();
+        assert!(String::from_utf8(rendered).unwrap().contains("63%"));
+        // Never relabel a remote reading as this machine's allowance.
+        board.quota.node_id = Some("other-machine".into());
+        let mut rendered = Vec::new();
+        board.draw(&mut rendered, 100, 30).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(!text.contains("63%"));
+        assert!(text.contains("awaiting usage"));
+    }
+
+    #[test]
+    fn selection_remains_visible_above_quota_even_across_groups() {
+        let mut items = Vec::new();
+        for index in 0..40 {
+            let mut item = session(if index % 2 == 0 {
+                Status::Working
+            } else {
+                Status::Ready
+            });
+            item.session_id = format!("thread-{index}");
+            item.name = Some(format!("thread-{index}"));
+            items.push(BoardItem::local(item));
+        }
+        let mut board = Board::new(items);
+        board.quota_enabled = true;
+        for index in 0..40 {
+            let item = board.visible()[index].clone();
+            board.selected_key = Some(item.key());
+            board.ensure_visible(12);
+            let mut rendered = Vec::new();
+            board.draw(&mut rendered, 80, 13).unwrap();
+            assert!(
+                String::from_utf8(rendered)
+                    .unwrap()
+                    .contains(&item.session.display_name())
+            );
+        }
     }
 }

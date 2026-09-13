@@ -302,15 +302,20 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
             io,
         )
     });
+    let (update_checker, update_receiver) = crate::update_check::start(&store);
+    let (quota_worker, quota_feed) = crate::quota::start(store.clone(), None);
     let result = monitor::run_client_board(
         items,
         receive,
         driver,
         refresh,
-        monitor::FleetHealthFeed::new(health, health_receive),
+        monitor::FleetHealthFeed::new(health, health_receive).with_quota(quota_feed),
         actions,
+        update_receiver,
     );
     cancellation.cancel();
+    drop(update_checker);
+    drop(quota_worker);
     // Cancellation owns SSH cleanup. A slow read-only observer may finish after
     // the UI exits, but cannot delay closing the console or launch another window.
     if done.recv_timeout(Duration::from_millis(50)).is_ok() {

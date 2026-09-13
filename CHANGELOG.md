@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.8 — Quota at a glance, steadier boards
+
+- Reduce board flicker with buffered, synchronized frame presentation and skip
+  terminal writes when the visible frame is unchanged.
+- Show Codex and Claude weekly quota bars above the board shortcuts, with local
+  reset times and reading freshness. Keep quota tied to the machine running the
+  board regardless of thread selection; keep unavailable readings distinct from zero.
+- Collect Claude's documented status-line quota feed during normal use, preserving
+  existing status-line commands and saving no conversation content.
+- Check for updates automatically in the background on macOS, Linux, and Windows.
+  Show newer compatible releases on the board without delaying startup or
+  interrupting agents. Updates remain explicitly initiated by the user.
+- Cache release checks across board sessions and back off quietly when offline.
+- Show Windows update instructions inside the board without an installation prompt.
+
 ## 0.6.7 — One local Windows board, all your machines
 
 - Combine all paired machines in a native Windows board, with cached-first

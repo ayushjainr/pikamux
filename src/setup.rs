@@ -539,6 +539,7 @@ pub fn claude_settings_change(home: &Path, executable: &Path) -> Result<FileChan
         CLAUDE_EVENTS,
         executable,
     )?;
+    crate::claude_quota::configure(&mut value, executable)?;
     let after = pretty_object_preserving_top_order(
         &before,
         value.as_object().expect("value is an object"),

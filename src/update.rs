@@ -2860,7 +2860,7 @@ impl PartialOrd for VersionKey {
     }
 }
 
-fn compare_versions(left: &str, right: &str) -> Result<Ordering> {
+pub(crate) fn compare_versions(left: &str, right: &str) -> Result<Ordering> {
     Ok(parse_version(left)?.cmp(&parse_version(right)?))
 }
 

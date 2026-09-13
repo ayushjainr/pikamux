@@ -57,6 +57,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    #[command(name = "_claude-statusline", hide = true)]
+    ClaudeStatusline {
+        #[arg(long)]
+        forward: Option<String>,
+    },
     /// List tracked conversations without opening the board.
     List(ListArgs),
     /// Open the oldest conversation that needs attention.
@@ -537,6 +542,7 @@ where
 {
     let cli = Cli::try_parse_from(args)?;
     match cli.command {
+        Some(Command::ClaudeStatusline { forward }) => crate::claude_quota::run(forward),
         Some(Command::InstallNative(args)) => install_native(args),
         Some(Command::TerminalBridge(args)) => terminal_bridge(args),
         Some(Command::Hook(args)) => hook(args),
@@ -597,6 +603,7 @@ fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
         }
         Some(
             Command::InstallNative(_)
+            | Command::ClaudeStatusline { .. }
             | Command::TerminalBridge(_)
             | Command::Hook(_)
             | Command::ProcessExit(_),
@@ -777,15 +784,14 @@ fn observe_board(pika: &Pika) -> Result<BoardAction> {
             thread::park_timeout(Duration::from_secs(2));
         }
     });
-    let (update_sender, update_receiver) = mpsc::sync_channel(1);
-    let update_executable = std::env::current_exe().ok();
-    // Cache-only and bounded: opening or quitting the board never abandons a
-    // network process or scratch directory. Network refresh belongs to the
-    // explicit `pika update --check` command.
-    let update_notice = update_executable
-        .as_deref()
-        .and_then(update::cached_update_notice);
-    let _ = update_sender.send(update_notice);
+    let (update_checker, update_receiver) = crate::update_check::start(&pika.store);
+    let (quota_worker, quota_feed) = crate::quota::start(
+        pika.store.clone(),
+        Some(
+            crate::expert_refresh::SystemQuotaSource::new(&pika.config, &pika.paths)
+                .with_timeout(Duration::from_secs(4)),
+        ),
+    );
     let action = monitor::run_items_dynamic_with_local_health(
         cached,
         receiver,
@@ -793,13 +799,16 @@ fn observe_board(pika: &Pika) -> Result<BoardAction> {
         update_receiver,
         refresh_sender.clone(),
         local_refresh_delayed,
-        monitor::FleetHealthFeed::new(initial_fleet_health, fleet_health_receiver),
+        monitor::FleetHealthFeed::new(initial_fleet_health, fleet_health_receiver)
+            .with_quota(quota_feed),
     );
     // Once the board has returned an action, no observation that began for its
     // old frame may write identity state after that action. The fence waits
     // only for an already-running bounded write batch; slow provider reads are
     // invalidated and may finish detached without becoming authoritative.
     pika.invalidate_local_reconciliation();
+    drop(update_checker);
+    drop(quota_worker);
     // The background SSH group is owned by this board. Cancellation is observed
     // by the command loop, which kills and reaps its exact process group before
     // the worker returns. Join it before an exact action starts another refresh.
@@ -5192,6 +5201,16 @@ struct LocalFleetService<'a> {
 }
 
 impl FleetService for LocalFleetService<'_> {
+    fn quota(&mut self) -> std::result::Result<serde_json::Value, FleetError> {
+        let source =
+            crate::expert_refresh::SystemQuotaSource::new(&self.pika.config, &self.pika.paths)
+                .with_timeout(Duration::from_secs(4));
+        Ok(serde_json::to_value(crate::quota::read_local(
+            &source,
+            &CancellationToken::default(),
+        ))
+        .expect("quota readings serialize"))
+    }
     fn snapshot(
         &mut self,
         expert_directory: bool,

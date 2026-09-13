@@ -1307,11 +1307,16 @@ fn mutation_timeout_reuses_durable_idempotency_key() {
 
 #[derive(Default)]
 struct Service {
+    quota_reads: usize,
     untracks: usize,
     current_event_at: f64,
     acknowledgement_events: Vec<f64>,
 }
 impl FleetService for Service {
+    fn quota(&mut self) -> Result<Value, FleetError> {
+        self.quota_reads += 1;
+        Ok(json!([]))
+    }
     fn snapshot(&mut self, _extended: bool) -> Result<Value, FleetError> {
         unreachable!()
     }
@@ -1374,6 +1379,45 @@ fn server_validates_exact_route_and_replays_mutation_receipt_once() {
         .collect();
     assert_eq!(receipts[0], receipts[1]);
     assert_eq!(service.untracks, 1);
+}
+
+#[test]
+fn quota_endpoint_requires_exact_machine_and_does_not_touch_conversations() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "state.db");
+    let node_id = store.ensure_local_node_id().unwrap();
+    let mut service = Service::default();
+    for expected in [
+        None,
+        Some(Uuid::new_v4().to_string()),
+        Some(node_id.clone()),
+    ] {
+        let mut request =
+            json!({"op":"quota", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION});
+        if let Some(expected) = expected {
+            request["expected_node_id"] = json!(expected);
+        }
+        let mut output = Vec::new();
+        handle_fleet_stdio(
+            &store,
+            "fixture",
+            "0.6.7",
+            &mut service,
+            Cursor::new(format!("{request}\n")),
+            &mut output,
+        )
+        .unwrap();
+        let reply: Value = serde_json::from_slice(&output).unwrap();
+        if request["expected_node_id"] == node_id {
+            assert_eq!(reply["type"], "quota");
+            assert_eq!(reply["node_id"], node_id);
+        } else {
+            assert_eq!(reply["type"], "error");
+        }
+    }
+    assert_eq!(service.quota_reads, 1);
+    assert_eq!(service.untracks, 0);
+    assert!(store.list_sessions().unwrap().is_empty());
 }
 
 #[test]

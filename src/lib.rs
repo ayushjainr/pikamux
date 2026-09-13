@@ -1,5 +1,6 @@
 #[cfg(not(windows))]
 pub mod attention;
+mod claude_quota;
 #[cfg(not(windows))]
 pub mod cli;
 pub mod client_board;
@@ -20,6 +21,7 @@ pub mod open_history;
 pub mod paths;
 pub mod process;
 pub mod providers;
+mod quota;
 pub mod resolve;
 pub mod scheduler;
 pub mod setup;
@@ -30,6 +32,7 @@ pub mod store;
 pub mod terminal;
 pub mod tmux;
 pub mod update;
+mod update_check;
 pub mod usage;
 pub mod wait;
 #[cfg(windows)]

@@ -45,6 +45,31 @@ high-leverage operating habits selected from current state; it never displaces
 current state or keyboard recovery guidance. Usage is a deliberate secondary
 view, not default visual spectacle.
 
+Subscription quota is a compact footer immediately above keyboard shortcuts,
+separate from per-thread token accounting. Codex and Claude show weekly remaining
+bars, reset dates in the viewing machine's local time, and individual observation
+ages. Wide boards share one row; medium boards stack providers; short boards
+retain percentages and stale labels without sacrificing the selected thread.
+The strip stays on the machine running the board, labeled `this machine`, even
+when a remote thread is selected. It never sums allowances or assumes the same
+account is signed in across machines. Clients without a local quota source show
+that limitation instead of substituting a remote account.
+
+A separate cancellable worker reads base-machine quota at most every two minutes
+while the board is open. Moving between threads never triggers quota SSH calls.
+Codex uses only its account rate-limit RPC;
+Claude prefers its documented status-line rate-limit feed, captured by a silent
+native adapter installed through setup. Existing status-line commands and their
+options are retained; the adapter forwards the original JSON and display output.
+Only the weekly percentage, reset time, observation time, and source are saved
+in a private bounded cache; the older utilization cache remains a fallback.
+No model turn, credential export, or transcript read is needed. Missing
+readings remain unavailable. Readings older than five minutes are visibly stale;
+crossing a reset never manufactures a refill. The optional `quota-v1` exact-node-bound
+read-only endpoint remains available to protocol clients, but the board does not
+use remote quota. Older fleet hosts therefore need no upgrade for the base-machine
+strip. Quota never writes to conversation state or blocks rendering/input.
+
 Stopping observation is distinct from detaching a tmux client. `x` opens a
 UUID-bound confirmation in the inspector: Pika removes the workstream from Live
 Operations while leaving the agent process, provider conversation, and expert
@@ -150,7 +175,12 @@ calm. Slower usage accounting starts independently every thirty seconds only
 while visible and carries forward its last known values. Monitor workers are
 daemon-scoped so optional accounting or reconciliation can never hold open a quit
 or delay an attach. The monitor uses the alternate screen and redraws text only;
-it adds no runtime dependency or persistent background daemon.
+it adds no runtime dependency or persistent background daemon. Each frame is built
+in memory before any terminal output, bracketed by synchronized-update markers,
+and written only when its bytes or terminal dimensions change. This prevents
+line-buffered stdout from exposing the cleared screen and partially drawn rows.
+Terminals without synchronized-output support still receive a prebuilt frame.
+Resize forces repaint; write failures and terminal teardown end synchronization.
 Playbook rotation is derived from wall-clock five-minute buckets, so it requires
 no additional timer, task, or persistent state.
 Expert cards are loaded locally on a separate five-minute cadence; this display
@@ -181,6 +211,15 @@ untrack is explicitly confirmed. A window receipt confirms process launch only,
 not eventual attachment. Unknown outcomes are never automatically retried.
 Windows pipe cancellation targets only the exact owned pipe's outstanding I/O;
 it cannot cancel another conversation's or process's I/O.
+Boards on all platforms check public release metadata in a separate, cancellable
+background worker. Successful checks are cached for six hours; failures are quiet
+and retried after an hour. A short cross-process lease prevents concurrent boards
+from duplicating requests. A separate update-cache database never writes agent
+state or invalidates reconciliation. Only newer, complete releases compatible
+with the running channel and platform produce a notice. `PIKA_UPDATE_CHECK=0`
+disables these checks. No update is installed automatically; Windows shows the
+PowerShell installer command in-panel, while managed hosts retain explicit update
+confirmation and verification. Closing the board cancels and reaps its check.
 The legacy bridge remains optional for openings initiated on a remote console;
 its short connection budget is separate from its bounded launch-receipt budget,
 and a disconnected caller cannot terminate the listener.

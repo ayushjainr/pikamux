@@ -44,7 +44,8 @@ pub const REFRESH_WINDOW_SECONDS: f64 = 6.0 * 60.0 * 60.0;
 pub const QUOTA_RESERVE_PERCENT: f64 = 10.0;
 const MAX_CLAUDE_QUOTA_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuotaSnapshot {
     pub provider: Provider,
     pub used_percent: f64,
@@ -69,7 +70,11 @@ impl QuotaSnapshot {
 
 /// Parses the Codex account RPC response without starting a model turn.
 pub fn parse_codex_quota(data: &Value, observed_at: f64) -> Option<QuotaSnapshot> {
-    let limits = data.get("rateLimits")?.as_object()?;
+    let limits = data
+        .get("rateLimitsByLimitId")
+        .and_then(|v| v.get("codex"))
+        .or_else(|| data.get("rateLimits"))?
+        .as_object()?;
     let weekly = [limits.get("primary"), limits.get("secondary")]
         .into_iter()
         .flatten()
@@ -78,7 +83,7 @@ pub fn parse_codex_quota(data: &Value, observed_at: f64) -> Option<QuotaSnapshot
             window
                 .get("windowDurationMins")
                 .and_then(number)
-                .is_some_and(|minutes| minutes >= WEEK_MINUTES)
+                .is_some_and(|minutes| minutes == WEEK_MINUTES)
         })?;
     let used_percent = weekly.get("usedPercent").and_then(number)?;
     let reset_at = weekly.get("resetsAt").and_then(integer)?;
@@ -139,10 +144,30 @@ pub trait QuotaSource {
 pub struct SystemQuotaSource {
     executables: BTreeMap<Provider, PathBuf>,
     claude_cache: PathBuf,
+    claude_home: PathBuf,
     timeout: Duration,
 }
 
 impl SystemQuotaSource {
+    pub(crate) fn snapshot_cancellable(
+        &self,
+        provider: Provider,
+        now: f64,
+        cancellation: &crate::consult::CancellationToken,
+    ) -> Result<Option<QuotaSnapshot>> {
+        if provider == Provider::Claude {
+            return self.read_claude(now);
+        }
+        if provider != Provider::Codex {
+            return Ok(None);
+        }
+        let executable = self
+            .executables
+            .get(&provider)
+            .context("Codex is not configured")?;
+        let value = codex_rate_limits_cancellable(executable, self.timeout, cancellation)?;
+        Ok(parse_codex_quota(&value, now))
+    }
     pub fn new(config: &Config, paths: &Paths) -> Self {
         let executables = Provider::ALL
             .into_iter()
@@ -151,6 +176,7 @@ impl SystemQuotaSource {
         Self {
             executables,
             claude_cache: paths.claude_home.with_extension("json"),
+            claude_home: paths.claude_home.clone(),
             timeout: Duration::from_secs(10),
         }
     }
@@ -175,6 +201,9 @@ impl SystemQuotaSource {
     }
 
     fn read_claude(&self, now: f64) -> Result<Option<QuotaSnapshot>> {
+        if let Some(reading) = crate::claude_quota::read(&self.claude_home, now) {
+            return Ok(Some(reading));
+        }
         let file = match File::open(&self.claude_cache) {
             Ok(value) => value,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -735,6 +764,18 @@ fn parse_card(value: &str) -> Result<PublishInput> {
 
 #[cfg(unix)]
 fn codex_rate_limits(executable: &Path, timeout: Duration) -> Result<Value> {
+    codex_rate_limits_cancellable(executable, timeout, &CancellationToken::default())
+}
+
+#[cfg(unix)]
+fn codex_rate_limits_cancellable(
+    executable: &Path,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<Value> {
+    if cancellation.is_cancelled() {
+        bail!("Quota check cancelled");
+    }
     let deadline = Instant::now() + timeout;
     let mut command = Command::new(executable);
     command
@@ -765,6 +806,9 @@ fn codex_rate_limits(executable: &Path, timeout: Duration) -> Result<Value> {
         let _ = sender.send(quota_protocol(stdin, stdout));
     });
     let result = loop {
+        if cancellation.is_cancelled() {
+            break Err(anyhow::anyhow!("Quota check cancelled"));
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break Err(anyhow::anyhow!("Codex quota observation timed out"));
@@ -790,6 +834,15 @@ fn codex_rate_limits(executable: &Path, timeout: Duration) -> Result<Value> {
 #[cfg(not(unix))]
 fn codex_rate_limits(_executable: &Path, _timeout: Duration) -> Result<Value> {
     bail!("Codex quota observation is unavailable on this client-only platform")
+}
+
+#[cfg(not(unix))]
+fn codex_rate_limits_cancellable(
+    _executable: &Path,
+    _timeout: Duration,
+    _cancellation: &crate::consult::CancellationToken,
+) -> Result<Value> {
+    bail!("Quota must be read on the agent host")
 }
 
 #[cfg(any(unix, test))]
@@ -1132,6 +1185,41 @@ mod tests {
         let error = quota_protocol(Vec::new(), &mut output).unwrap_err();
         assert!(error.to_string().contains("limit"));
         assert!(output.position() <= 1024 * 1024 + 64 * 1024);
+    }
+
+    #[test]
+    fn quota_prefers_codex_bucket_and_does_not_label_monthly_as_weekly() {
+        let weekly =
+            json!({"secondary":{"usedPercent":37,"windowDurationMins":10080,"resetsAt":3000}});
+        let monthly =
+            json!({"secondary":{"usedPercent":80,"windowDurationMins":43200,"resetsAt":3000}});
+        let value = json!({"rateLimits":monthly, "rateLimitsByLimitId":{"codex":weekly}});
+        assert_eq!(
+            parse_codex_quota(&value, 1000.0)
+                .unwrap()
+                .remaining_percent(),
+            63.0
+        );
+        assert!(parse_codex_quota(&json!({"rateLimits":monthly}), 1000.0).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn board_quit_cancels_inflight_quota_without_waiting_for_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("codex-fake");
+        fs::write(&executable, "#!/bin/sh\nread first\nread second\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let cancel = CancellationToken::default();
+        let worker_cancel = cancel.clone();
+        let worker = thread::spawn(move || {
+            codex_rate_limits_cancellable(&executable, Duration::from_secs(30), &worker_cancel)
+        });
+        thread::sleep(Duration::from_millis(30));
+        let at = Instant::now();
+        cancel.cancel();
+        assert!(worker.join().unwrap().is_err());
+        assert!(at.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]
