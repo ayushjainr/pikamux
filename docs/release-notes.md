@@ -1,5 +1,9 @@
 Open your agent. Return to your place.
 
+This patch fixes opening conversations on hosts using shells such as `dash`.
+Pika now creates a single-process launch holder explicitly, without relaxing
+its checks against replacing another running process.
+
 Pika now returns to the same board selection and filter after you detach from a
 native agent. If opening fails, the explanation stays in the board. An uncertain
 launch is never automatically repeated.

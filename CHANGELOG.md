@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.15 — Reliable opening across shells
+
+- Open exact conversations on hosts whose default shell keeps a child process
+  for commands. Pika's private launch holder now explicitly replaces its shell;
+  protections against replacing another process remain unchanged.
+
 ## 0.6.14 — Return to the same board
 
 - Return to your selected conversation and filter after detaching from a native

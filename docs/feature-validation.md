@@ -2,10 +2,17 @@
 
 Audit: 2026-09-14, against `37d9b7c` / 0.6.12 plus the local repairs described below.
 This is a contributor audit, not a fleet-installation certificate. The repairs
-described here are included in the 0.6.14 release candidate; installed machines
+described here are included in 0.6.14 and the 0.6.15 shell-portability patch; installed machines
 require separate version and workflow verification.
 
 ## Conclusion
+
+Installed 0.6.14 passed five isolated macOS board journeys. The same release's
+rs6 verification exposed a shell-portability defect: `sh -c 'sleep 30'` retained
+a shell parent and child, so the unchanged idle-tree safety check refused Pika's
+own launch holder. Version 0.6.15 uses `exec sleep 30` and the real board regression
+sets `SHELL=/bin/sh` explicitly. This is separate from a genuine second agent,
+which must still be refused. Installed-host verification follows publication.
 
 Pika's identity, storage, provider-protocol, and update contracts have substantial
 automated coverage. That coverage did **not** establish that its everyday board

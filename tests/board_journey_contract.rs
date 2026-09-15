@@ -125,6 +125,9 @@ impl BoardProcess {
             .env("TMUX_TMPDIR", root.path().join("sockets"))
             .env("PIKA_TMUX_SOCKET", "board-journey")
             .env("PIKA_UPDATE_CHECK", "0")
+            // Linux /bin/sh is often dash, which does not optimize a final
+            // external command into exec as some other shells do.
+            .env("SHELL", "/bin/sh")
             .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin", root.path().join("bin").display()),

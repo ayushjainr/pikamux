@@ -829,8 +829,19 @@ impl Tmux {
     }
 
     pub fn create_holding_session(&self, tmux_name: &str, cwd: &str) -> Result<Pane> {
+        // Some shells (notably dash) retain a shell parent for `sleep 30`.
+        // The private holder must be a single process on every host so the
+        // unchanged idle-tree check can prove it is safe to replace.
         self.output(
-            ["new-session", "-d", "-s", tmux_name, "-c", cwd, "sleep 30"],
+            [
+                "new-session",
+                "-d",
+                "-s",
+                tmux_name,
+                "-c",
+                cwd,
+                "exec sleep 30",
+            ],
             true,
         )?;
         self.get_pane(tmux_name)?
