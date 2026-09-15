@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.13 — Return to the same board
+
+- Return to your selected conversation and filter after detaching from a native
+  agent. Keep failed opens in the board without automatically repeating a launch.
+- Recover from transient session-observation conflicts during local and remote
+  opens, preserving exact identity checks and duplicate-process protection.
+- Keep pane previews and stop-watching confirmations inside the Unix board;
+  add keyboard help and a separate cumulative-usage view.
+- Explain missing expert cards, show recorded activity and pane availability,
+  and retain readable structured OpenCode error messages.
+- Support SSH aliases with a configured remote command and Pika installations
+  outside the remote shell's default PATH.
+- Preserve tmux identity framing when the invoking terminal uses a non-UTF-8 locale.
+
 ## 0.6.12 — Update without leaving Pika behind
 
 - Offer new releases with an explicit Y/N confirmation on every platform.

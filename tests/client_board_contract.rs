@@ -219,14 +219,10 @@ fn exact_open_uses_the_selected_server_directly_after_fresh_validation() {
     assert!(!argv.contains(&"rs6".into()));
     assert!(!argv.contains(&"-R".into()));
     assert!(argv.contains(&"ClearAllForwardings=yes".into()));
-    assert!(argv.ends_with(&[
-        "--expected-node-id".into(),
-        NODE_B.into(),
-        "--provider".into(),
-        "codex".into(),
-        "--session-id".into(),
-        THREAD.into()
-    ]));
+    assert!(argv.contains(&"RemoteCommand=none".into()));
+    assert!(argv.last().unwrap().contains(&format!(
+        "'--expected-node-id' '{NODE_B}' '--provider' 'codex' '--session-id' '{THREAD}'"
+    )));
 }
 
 #[test]

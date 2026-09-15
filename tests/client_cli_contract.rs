@@ -35,6 +35,27 @@ mod system_ssh_pairing {
     }
 
     #[test]
+    fn pairing_overrides_alias_remote_command_and_finds_a_non_path_install() {
+        let (directory, executable) = fixture(
+            r#"
+case " $* " in *' RemoteCommand=none '*) ;; *) echo 'Cannot execute command-line and remote command.' >&2; exit 1;; esac
+for argument do remote=$argument; done
+task_root=${0%/*}
+exec env -i HOME="$task_root/home" PATH=/usr/bin:/bin /bin/sh -c "$remote"
+"#,
+        );
+        let bin = directory.path().join("home/.local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let pika = bin.join("pika");
+        fs::write(&pika, "#!/bin/sh\ntest \"$1\" = _client-pair || exit 2\ntest \"$2\" = --stdio || exit 3\nIFS= read -r request\nprintf '{\"paired\":true}\\n'\n").unwrap();
+        fs::set_permissions(&pika, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            request(&executable, &json!({}), Duration::from_secs(2)).unwrap(),
+            json!({"paired":true})
+        );
+    }
+
+    #[test]
     fn ssh_pairing_deadline_includes_a_peer_that_never_reads_input() {
         let (_directory, executable) = fixture("exec /bin/sleep 5");
         let started = Instant::now();
@@ -596,13 +617,14 @@ fn board_connection_owns_its_forward_and_binds_exact_machine_without_shell_text(
     );
     assert!(args.windows(2).any(|pair| pair == ["-S", "none"]));
     assert!(args.contains(&"ExitOnForwardFailure=yes".into()));
-    assert!(args.ends_with(&[
-        "user@devbox".into(),
-        "pika".into(),
-        "_client-board".into(),
-        "--expected-node-id".into(),
-        NODE_ID.into()
-    ]));
+    assert!(args.contains(&"RemoteCommand=none".into()));
+    assert_eq!(args[args.len() - 2], "user@devbox");
+    assert!(
+        args.last()
+            .unwrap()
+            .contains(&format!("'_client-board' '--expected-node-id' '{NODE_ID}'"))
+    );
+    assert!(args.last().unwrap().contains("\"$HOME/.local/bin/pika\""));
     assert!(!args.iter().any(|arg| arg.contains(TOKEN)));
     let mut bad = node.clone();
     bad.node_id = "x; echo unsafe".into();

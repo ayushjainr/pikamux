@@ -253,10 +253,11 @@ impl ClientCliRuntime for SystemClientRuntime {
                 "ConnectTimeout=8",
                 "-o",
                 "ClearAllForwardings=yes",
+                "-o",
+                "RemoteCommand=none",
             ])
             .arg(target)
-            .arg("pika")
-            .args(remote_arguments)
+            .arg(crate::fleet::remote_pika_command(remote_arguments)?)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -661,6 +662,8 @@ pub fn board_ssh_arguments(node: &ClientNode) -> Result<Vec<String>> {
         "-o".into(),
         "ControlMaster=no".into(),
         "-o".into(),
+        "RemoteCommand=none".into(),
+        "-o".into(),
         "ExitOnForwardFailure=yes".into(),
         "-o".into(),
         "ConnectTimeout=8".into(),
@@ -674,10 +677,11 @@ pub fn board_ssh_arguments(node: &ClientNode) -> Result<Vec<String>> {
             crate::client_bridge::DEFAULT_LOCAL_PORT
         ),
         node.ssh_target.clone(),
-        "pika".into(),
-        "_client-board".into(),
-        "--expected-node-id".into(),
-        node.node_id.clone(),
+        crate::fleet::remote_pika_command(&[
+            "_client-board".into(),
+            "--expected-node-id".into(),
+            node.node_id.clone(),
+        ])?,
     ])
 }
 

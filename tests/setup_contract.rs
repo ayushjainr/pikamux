@@ -36,6 +36,44 @@ fn options(executable: PathBuf) -> SetupOptions {
 }
 
 #[test]
+fn opencode_plugin_preserves_structured_error_messages_without_dumping_payloads() {
+    let temp = tempfile::tempdir().unwrap();
+    let plugin = include_str!("../assets/pika-opencode.js.in")
+        .replace("__PIKA_COMMAND_JSON__", "[\"unused-fixture\"]");
+    fs::write(temp.path().join("plugin.mjs"), plugin).unwrap();
+    fs::write(temp.path().join("check.mjs"), r#"
+import assert from 'node:assert/strict';
+import { Pika } from './plugin.mjs';
+const received = [];
+globalThis.Bun = { spawn: () => ({ stdin: { write: payload => received.push(JSON.parse(payload)), end() {} }, exited: Promise.resolve(0) }) };
+const plugin = await Pika({ directory: '/fixture', client: { session: { get: async () => ({ data: { id: 'ses_fixture' } }) } } });
+for (const [error, expected] of [
+  [{ name: 'APIError', data: { message: 'Rate limit reached', secret: 'do-not-copy' } }, 'Rate limit reached'],
+  [new Error('Connection closed'), 'Connection closed'],
+  ['Turn cancelled', 'Turn cancelled'],
+  [{ code: 400, secret: 'do-not-copy' }, 'OpenCode turn failed; no error explanation was supplied'],
+]) {
+  await plugin.event({ event: { type: 'session.error', properties: { sessionID: 'ses_fixture', error } } });
+  assert.equal(received.at(-1).error, expected);
+  assert.equal(received.at(-1).hook_event_name, 'StopFailure');
+}
+assert(!JSON.stringify(received).includes('do-not-copy'));
+assert(!JSON.stringify(received).includes('[object Object]'));
+"#).unwrap();
+    let output = Command::new("node")
+        .arg(temp.path().join("check.mjs"))
+        .env_remove("PIKA_EPHEMERAL")
+        .env_remove("PIKA_SESSION_ID")
+        .output()
+        .expect("Node is required to exercise the provider-owned plugin");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn json_hooks_preserve_foreign_handlers_quote_paths_and_are_idempotent() {
     let temp = tempfile::tempdir().unwrap();
     let binary = executable(temp.path());

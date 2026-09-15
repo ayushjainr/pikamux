@@ -28,6 +28,9 @@ pub struct ReceiptHandoff {
 }
 
 const SEPARATOR: &str = "\u{1f}";
+// Non-UTF-8 tmux clients replace literal control characters with underscores.
+// Printable framing survives that output conversion without changing user locale.
+const FORMAT_SEPARATOR: &str = r"\037";
 pub const HISTORY_LIMIT: usize = 100_000;
 pub const WINDOWS_TERMINAL_DA2_RESPONSE: &str = "\u{1b}[>0;10;1c";
 const TERMINAL_REPLY_KEY_OPTION: &str = "@pika_terminal_reply_key";
@@ -118,7 +121,7 @@ impl Tmux {
             "#{@pika_name}",
             "#{@pika_launch_token}",
         ]
-        .join(SEPARATOR);
+        .join(FORMAT_SEPARATOR);
         let output = self.output(["list-panes", "-a", "-F", &format], false)?;
         if !output.status.success() {
             let message = String::from_utf8_lossy(&output.stderr);
@@ -255,20 +258,26 @@ impl Tmux {
     }
 
     fn client_is_attached_to_pane(&self, client_pid: i32, pane_id: &str) -> bool {
-        let Ok(output) = self.output(["list-clients", "-F", "#{client_pid}\t#{pane_id}"], false)
-        else {
+        let Ok(output) = self.output(
+            ["list-clients", "-F", r"#{client_pid}\037#{pane_id}"],
+            false,
+        ) else {
             return false;
         };
         output.status.success()
             && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-                line.split_once('\t').is_some_and(|(pid, pane)| {
-                    pid.parse::<i32>() == Ok(client_pid) && pane == pane_id
-                })
+                line.split_once(r"\037")
+                    .or_else(|| line.split_once('\t'))
+                    .is_some_and(|(pid, pane)| {
+                        pid.parse::<i32>() == Ok(client_pid) && pane == pane_id
+                    })
             })
     }
 
     fn attached_client_name(&self, client_pid: i32, pane_id: &str) -> Option<String> {
-        let format = format!("#{{client_name}}{SEPARATOR}#{{client_pid}}{SEPARATOR}#{{pane_id}}");
+        let format = format!(
+            "#{{client_name}}{FORMAT_SEPARATOR}#{{client_pid}}{FORMAT_SEPARATOR}#{{pane_id}}"
+        );
         let output = self.output(["list-clients", "-F", &format], false).ok()?;
         output.status.success().then_some(()).and_then(|_| {
             String::from_utf8_lossy(&output.stdout)
@@ -1507,14 +1516,19 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let tmux = tmux_fixture(&temp, &format!("exec /usr/bin/yes flood {redirect}"));
             let started = Instant::now();
-            let error = tmux.output(["list-panes"], false).unwrap_err();
+            // Exercise the byte limit independently of host scheduling. The
+            // separate timeout test covers the production deadline; under
+            // load, that deadline can correctly win before 16 MiB arrives.
+            let error = tmux
+                .output_with_timeout(["list-panes"], false, Duration::from_secs(10))
+                .unwrap_err();
             assert!(
                 error
                     .to_string()
                     .contains(&format!("tmux {channel} exceeded")),
                 "{error:#}"
             );
-            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(started.elapsed() < Duration::from_secs(11));
         }
     }
 

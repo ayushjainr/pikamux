@@ -87,6 +87,17 @@ impl BoardItem {
 
 type BoardKey = (Option<String>, Provider, String);
 
+/// Only UI state survives a native terminal handoff, never identity evidence.
+#[derive(Default)]
+pub(crate) struct BoardMemory {
+    initialized: bool,
+    selected_key: Option<BoardKey>,
+    filter: String,
+    offset: usize,
+    update_version: Option<String>,
+    pub(crate) notice: Option<String>,
+}
+
 /// A one-slot channel whose producer always replaces an unpublished value.
 /// The board polls for changes already, so a separate wakeup queue would only
 /// reintroduce the stale-snapshot race this channel is meant to avoid.
@@ -170,6 +181,7 @@ pub enum BoardAction {
 pub(crate) struct ActionDriver {
     worker: Arc<dyn Fn(BoardAction) -> Result<String> + Send + Sync>,
     pending: Option<Receiver<Result<String>>>,
+    inline_open: bool,
 }
 
 impl ActionDriver {
@@ -179,20 +191,50 @@ impl ActionDriver {
         Self {
             worker: Arc::new(worker),
             pending: None,
+            inline_open: true,
         }
+    }
+
+    /// Unix attaches take over this terminal; inspection and untracking do not.
+    #[cfg(not(windows))]
+    pub(crate) fn local(
+        worker: impl Fn(BoardAction) -> Result<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inline_open: false,
+            ..Self::new(worker)
+        }
+    }
+
+    fn handles(&self, action: &BoardAction) -> bool {
+        matches!(action, BoardAction::Peek(_) | BoardAction::Untrack(_))
+            || (self.inline_open && matches!(action, BoardAction::Open(_)))
     }
 
     fn submit(&mut self, action: BoardAction) -> String {
         if self.pending.is_some() {
             return "An action is already in progress; no second request was sent.".into();
         }
+        let progress = match &action {
+            BoardAction::Peek(item) => format!(
+                "PEEK · {} · {}\nReading output · unread preserved",
+                item.session.display_name(),
+                item.session.session_id
+            ),
+            BoardAction::Untrack(item) => format!(
+                "Stopping observation · {} · {}",
+                item.session.display_name(),
+                item.session.session_id
+            ),
+            _ => "Opening request · you can keep using the board".into(),
+        };
         let worker = self.worker.clone();
         let (send, receive) = mpsc::sync_channel(1);
         self.pending = Some(receive);
         thread::spawn(move || {
             let _ = send.send(worker(action));
         });
-        "Opening request · you can keep using the board".into()
+        progress
     }
 
     fn poll(&mut self) -> Option<String> {
@@ -415,16 +457,16 @@ pub(crate) fn run_items_dynamic_with_local_health(
     update_notice: Receiver<Option<String>>,
     refresh_request: SyncSender<()>,
     local_refresh_delayed: Arc<AtomicBool>,
-    fleet_health: FleetHealthFeed,
+    (fleet_health, actions, memory): (FleetHealthFeed, ActionDriver, &mut BoardMemory),
 ) -> Result<BoardAction> {
-    run_loop(
+    run_loop_with_actions(
         items,
         Some(ItemUpdates::Latest(updates)),
         driver,
         Some(update_notice),
         Some(refresh_request),
         Some(local_refresh_delayed),
-        Some(fleet_health),
+        (Some(fleet_health), Some(actions), Some(memory)),
     )
 }
 
@@ -444,7 +486,7 @@ fn run_loop(
         update_notice,
         refresh_request,
         local_refresh_delayed,
-        (fleet_health, None),
+        (fleet_health, None, None),
     )
 }
 
@@ -464,7 +506,7 @@ pub(crate) fn run_client_board(
         Some(update_notice),
         Some(refresh),
         None,
-        (Some(health), Some(actions)),
+        (Some(health), Some(actions), None),
     )
 }
 
@@ -475,14 +517,22 @@ fn run_loop_with_actions(
     update_notice: Option<Receiver<Option<String>>>,
     refresh_request: Option<SyncSender<()>>,
     local_refresh_delayed: Option<Arc<AtomicBool>>,
-    (fleet_health, mut actions): (Option<FleetHealthFeed>, Option<ActionDriver>),
+    (fleet_health, mut actions, mut memory): (
+        Option<FleetHealthFeed>,
+        Option<ActionDriver>,
+        Option<&mut BoardMemory>,
+    ),
 ) -> Result<BoardAction> {
     let _terminal = TerminalGuard::enter()?;
     let mut board = Board::new(items);
+    if let Some(memory) = memory.as_deref_mut() {
+        board.restore(memory);
+    }
     board.quota_enabled = fleet_health
         .as_ref()
         .is_some_and(|feed| feed.quota.is_some());
     board.client_actions = actions.is_some();
+    board.client_updates = actions.as_ref().is_some_and(|driver| driver.inline_open);
     board.fleet_health = fleet_health
         .as_ref()
         .map(|feed| feed.initial.clone())
@@ -581,12 +631,16 @@ fn run_loop_with_actions(
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 if let Some(action) = board.key(key, driver.as_ref()) {
                     if let Some(action) = route_board_action(action, refresh_request.as_ref()) {
-                        if !matches!(action, BoardAction::Quit | BoardAction::Update(_))
-                            && let Some(actions) = actions.as_mut()
+                        if let Some(actions) = actions.as_mut()
+                            && actions.handles(&action)
                         {
+                            board.action_scroll = 0;
                             board.action_notice = Some(actions.submit(action));
                             dirty = true;
                             continue;
+                        }
+                        if let Some(memory) = memory.as_deref_mut() {
+                            board.remember(memory);
                         }
                         return Ok(action);
                     } else {
@@ -963,10 +1017,35 @@ struct Board {
     action_notice: Option<String>,
     action_scroll: usize,
     client_actions: bool,
+    client_updates: bool,
     confirm_untrack: Option<BoardItem>,
 }
 
 impl Board {
+    fn restore(&mut self, memory: &mut BoardMemory) {
+        if memory.initialized {
+            self.filter.clone_from(&memory.filter);
+            self.selected_key.clone_from(&memory.selected_key);
+            self.offset = memory.offset;
+            self.update_version.clone_from(&memory.update_version);
+            let needle = self.filter.to_lowercase();
+            if !self.items.iter().any(|item| {
+                Some(item.key()) == self.selected_key && Self::matches_filter(item, &needle)
+            }) {
+                self.reselect_first();
+            }
+        }
+        self.action_notice = memory.notice.take();
+    }
+
+    fn remember(&self, memory: &mut BoardMemory) {
+        memory.initialized = true;
+        memory.selected_key.clone_from(&self.selected_key);
+        memory.filter.clone_from(&self.filter);
+        memory.offset = self.offset;
+        memory.update_version.clone_from(&self.update_version);
+    }
+
     fn new(mut items: Vec<BoardItem>) -> Self {
         sort_items(&mut items);
         let selected_key = items.first().map(BoardItem::key);
@@ -988,6 +1067,7 @@ impl Board {
             action_notice: None,
             action_scroll: 0,
             client_actions: false,
+            client_updates: false,
             confirm_untrack: None,
         }
     }
@@ -1255,6 +1335,17 @@ impl Board {
             }
             return None;
         }
+        if matches!(key.code, KeyCode::Enter | KeyCode::Char('p' | 'a' | 'x'))
+            && let Some(item) = self.selected().filter(|item| !item.actionable())
+        {
+            self.action_scroll = 0;
+            self.action_notice = Some(format!(
+                "Cached machine state · {} · {}\nPress r to refresh before acting. No request was sent.",
+                item.session.display_name(),
+                item.session.session_id
+            ));
+            return None;
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.select(-1),
             KeyCode::Down | KeyCode::Char('j') => self.select(1),
@@ -1265,6 +1356,33 @@ impl Board {
                 self.selected_key = self.visible().last().map(|item| item.key());
             }
             KeyCode::Char('/') => self.filtering = true,
+            KeyCode::Char('?') => {
+                self.action_scroll = 0;
+                self.action_notice = Some("PIKA KEYS\n\n↑↓ / j k · select a conversation\nEnter · open the selected exact conversation\np · preview live Pika pane output; unread preserved\na · private expert consultation in this panel\nx · stop watching, after confirmation; agent stays intact\nn · open the oldest attention item\n/ · filter by name or machine\nr · refresh observations\nu · cumulative usage for the selected conversation\nU · review an available update\nPageUp / PageDown · scroll a preview or help\nEsc · dismiss panel or clear filter\nq · leave Pika\n\nPrivate consultation: Enter sends, Ctrl+J adds a newline,\nCtrl+U clears the draft, Esc closes the private side.".into());
+            }
+            KeyCode::Char('u') => {
+                self.action_scroll = 0;
+                if self
+                    .action_notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.starts_with("CUMULATIVE USAGE"))
+                {
+                    self.action_notice = None;
+                } else if let Some(item) = self.selected() {
+                    let s = &item.session;
+                    self.action_notice = Some(format!(
+                        "CUMULATIVE USAGE · {}\n{} · {}\n\nTotal tokens: {}\nInput: {}\nOutput: {}\nCached input: {}\nCache writes: {}\n\nProvider-reported accounting, not context-window size or a subscription bill.\nOpenCode includes descendant sessions. Missing counters are unavailable.\n\nu / Esc returns to the inspector.",
+                        s.display_name(),
+                        s.provider,
+                        s.session_id,
+                        usage::format_tokens(s.total_tokens),
+                        usage::format_tokens(s.input_tokens),
+                        usage::format_tokens(s.output_tokens),
+                        usage::format_tokens(s.cached_input_tokens),
+                        usage::format_tokens(s.cache_write_tokens),
+                    ));
+                }
+            }
             KeyCode::Esc => {
                 self.filter.clear();
                 self.reselect_first();
@@ -1305,7 +1423,7 @@ impl Board {
             }
             KeyCode::Char('r') => return Some(BoardAction::Refresh),
             KeyCode::Char('U') => {
-                if self.update_version.is_some() || self.client_actions {
+                if self.update_version.is_some() || self.client_updates {
                     self.update_prompt = true;
                 } else {
                     return Some(BoardAction::Update(None));
@@ -1570,7 +1688,7 @@ impl Board {
             queue!(
                 output,
                 Print(fit(
-                    "↑↓ move · enter open · p peek · a ask · x stop watching · / filter · r refresh · U update · q leave",
+                    "↑↓ move · enter open · p peek · a ask · x unwatch · / filter · r refresh · ? keys · q leave",
                     width
                 ))
             )?;
@@ -1731,29 +1849,45 @@ impl Board {
             detail_row(output, x, y, available, "model", model)?;
             y += 1;
         }
-        if session.total_tokens.is_some() {
-            detail_row(
-                output,
-                x,
-                y,
-                available,
-                "tokens",
-                &usage::format_tokens(session.total_tokens),
-            )?;
-            y += 1;
-        }
+        detail_row(
+            output,
+            x,
+            y,
+            available,
+            "event",
+            &format!(
+                "{} ago · last recorded activity",
+                human_age(session.last_event_at.max(session.last_activity_at))
+            ),
+        )?;
+        y += 1;
+        detail_row(
+            output,
+            x,
+            y,
+            available,
+            "home",
+            if session.tmux_pane.is_some() {
+                "Pika pane recorded · verified again before open / peek"
+            } else {
+                "No Pika pane recorded · Enter checks how to open safely"
+            },
+        )?;
+        y += 1;
         let detail = session
             .error
             .as_deref()
             .or(session.attention_reason.as_deref())
+            .filter(|text| !matches!(*text, "completed" | "working" | "[object Object]"))
             .unwrap_or(match session.status {
                 Status::NeedsYou => "Waiting for your answer",
-                Status::Ready => "A result is available",
+                Status::Ready if session.unread => "Result waiting · not yet collected",
+                Status::Ready => "Ready for your next instruction",
                 Status::Working | Status::Starting => "The agent is working",
                 Status::Parked => "Saved and ready to resume",
                 Status::Unbound => "Live outside its protected home",
                 Status::OpenTwice => "Multiple exact processes detected",
-                Status::Error => "Recovery needs attention",
+                Status::Error => "An unresolved error was recorded; open to inspect it",
             });
         queue!(
             output,
@@ -1769,12 +1903,44 @@ impl Board {
                 y += 1;
             }
             if let Some(scope) = &expert.scope {
-                detail_row(output, x, y, available, "KNOWS", scope)?;
-                y += 1;
+                for (index, line) in wrap(scope, available.saturating_sub(8))
+                    .iter()
+                    .take(3)
+                    .enumerate()
+                {
+                    if y >= height.saturating_sub(5) {
+                        break;
+                    }
+                    detail_row(
+                        output,
+                        x,
+                        y,
+                        available,
+                        if index == 0 { "KNOWS" } else { "" },
+                        line,
+                    )?;
+                    y += 1;
+                }
             }
             if let Some(current) = &expert.current_work {
-                detail_row(output, x, y, available, "NOW", current)?;
-                y += 1;
+                for (index, line) in wrap(current, available.saturating_sub(8))
+                    .iter()
+                    .take(3)
+                    .enumerate()
+                {
+                    if y >= height.saturating_sub(5) {
+                        break;
+                    }
+                    detail_row(
+                        output,
+                        x,
+                        y,
+                        available,
+                        if index == 0 { "NOW" } else { "" },
+                        line,
+                    )?;
+                    y += 1;
+                }
             }
             if !expert.topics.is_empty() && y < height.saturating_sub(5) {
                 detail_row(
@@ -1792,11 +1958,21 @@ impl Board {
                 MoveTo(x as u16, y),
                 SetForegroundColor(Color::DarkGrey),
                 Print(fit(
-                    "Enter opens the exact conversation in its native agent interface.",
+                    "No expert card for this exact conversation yet.",
                     available
                 )),
                 ResetColor
             )?;
+            if y.saturating_add(1) < height.saturating_sub(5) {
+                queue!(
+                    output,
+                    MoveTo(x as u16, y + 1),
+                    Print(fit(
+                        "Work / result summary not recorded · p previews live pane output",
+                        available
+                    ))
+                )?;
+            }
         }
         if item.stale && height > 15 {
             queue!(
@@ -1816,6 +1992,18 @@ impl Board {
                 MoveTo(x as u16, height.saturating_sub(4)),
                 SetForegroundColor(Color::DarkGrey),
                 Print(fit(playbook_tip(), available)),
+                ResetColor
+            )?;
+        }
+        if height > 12 {
+            queue!(
+                output,
+                MoveTo(x as u16, height.saturating_sub(3)),
+                SetForegroundColor(Color::DarkGrey),
+                Print(fit(
+                    "enter open · p preview · a consult · u usage · ? keys",
+                    available
+                )),
                 ResetColor
             )?;
         }
@@ -2592,6 +2780,34 @@ mod tests {
             assert_eq!(board.key(key(code), None), None);
         }
         assert!(board.chat.is_none());
+    }
+
+    #[test]
+    fn handoff_restores_exact_node_selection_filter_and_offset_but_not_old_evidence() {
+        let here = BoardItem::local(session(Status::Ready));
+        let mut remote = here.clone();
+        remote.node_id = Some("remote".into());
+        let mut before = Board::new(vec![here.clone(), remote.clone()]);
+        before.selected_key = Some(remote.key());
+        before.filter = "thread".into();
+        before.offset = 4;
+        before.update_version = Some("9.9.9".into());
+        let mut memory = BoardMemory::default();
+        before.remember(&mut memory);
+        remote.stale = true;
+        remote.session.status = Status::Parked;
+        let mut after = Board::new(vec![remote.clone(), here.clone()]);
+        after.restore(&mut memory);
+        assert_eq!(after.selected_key, Some(remote.key()));
+        assert_eq!(after.filter, "thread");
+        assert_eq!(after.offset, 4);
+        assert!(after.selected().unwrap().stale);
+        assert_eq!(after.selected().unwrap().session.status, Status::Parked);
+        assert_eq!(after.update_version.as_deref(), Some("9.9.9"));
+        // An absent row cannot be resurrected by remembered UI selection.
+        let mut missing = Board::new(vec![here.clone()]);
+        missing.restore(&mut memory);
+        assert_eq!(missing.selected_key, Some(here.key()));
     }
 
     #[test]

@@ -689,15 +689,19 @@ pub fn windows_terminal_command(
         "-tt".to_owned(),
         "-o".to_owned(),
         "ClearAllForwardings=yes".to_owned(),
+        "-o".to_owned(),
+        "RemoteCommand=none".to_owned(),
         node.ssh_target.clone(),
-        "pika".to_owned(),
-        "_fleet-open".to_owned(),
-        "--expected-node-id".to_owned(),
-        exact_node_id,
-        "--provider".to_owned(),
-        provider.as_str().to_owned(),
-        "--session-id".to_owned(),
-        exact_session_id,
+        crate::fleet::remote_pika_command(&[
+            "_fleet-open".to_owned(),
+            "--expected-node-id".to_owned(),
+            exact_node_id,
+            "--provider".to_owned(),
+            provider.as_str().to_owned(),
+            "--session-id".to_owned(),
+            exact_session_id,
+        ])
+        .map_err(|error| ClientBridgeError::invalid(error.to_string()))?,
     ])
 }
 
@@ -725,12 +729,18 @@ pub fn windows_fleet_terminal_command(
         terminal_executable,
         ssh_executable,
     )?;
-    let endpoint = command
-        .iter_mut()
-        .find(|arg| arg.as_str() == "_fleet-open")
-        .expect("fixed command endpoint");
-    *endpoint = "_client-fleet-open".into();
-    command.extend(["--target-node-id".into(), target]);
+    *command.last_mut().expect("fixed remote command") = crate::fleet::remote_pika_command(&[
+        "_client-fleet-open".into(),
+        "--expected-node-id".into(),
+        source.node_id.clone(),
+        "--provider".into(),
+        provider.as_str().into(),
+        "--session-id".into(),
+        conversation_identity(provider, session_id)?,
+        "--target-node-id".into(),
+        target,
+    ])
+    .map_err(|error| ClientBridgeError::invalid(error.to_string()))?;
     Ok(command)
 }
 

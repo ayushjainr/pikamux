@@ -5,6 +5,15 @@ export const Pika = async ({ client, directory }) => {
   let currentRootId = expectedRootId;
   let initialNameClaimed = Boolean(expectedRootId);
   const command = __PIKA_COMMAND_JSON__;
+  // Provider errors are often { name, data: { message } }, not Error instances.
+  // Keep only the human explanation, never serialize arbitrary error payloads.
+  const errorMessage = (error, fallback) => {
+    const message = typeof error === "string" ? error :
+      error && (typeof error.message === "string" ? error.message :
+      error.data && typeof error.data.message === "string" ? error.data.message : null);
+    return typeof message === "string" && message.trim() && message !== "[object Object]"
+      ? message.slice(0, 2000) : fallback;
+  };
   const send = async (hook_event_name, session_id, extra = {}) => {
     if (!session_id) return;
     const payload = JSON.stringify({
@@ -72,7 +81,7 @@ export const Pika = async ({ client, directory }) => {
               query: { directory },
               body: { title: desired },
             });
-            if (updated && updated.error) nativeNameError = String(updated.error);
+            if (updated && updated.error) nativeNameError = errorMessage(updated.error, "OpenCode could not update the title");
             const verified = await client.session.get({
               path: { id },
               query: { directory },
@@ -80,7 +89,7 @@ export const Pika = async ({ client, directory }) => {
             observedTitle = verified && verified.data && verified.data.title;
             if (observedTitle !== desired && !nativeNameError)
               nativeNameError = "OpenCode did not retain the requested title";
-          } catch (error) { nativeNameError = String(error); }
+          } catch (error) { nativeNameError = errorMessage(error, "OpenCode could not update the title"); }
         }
         await send("SessionStart", id, {
           session_title: observedTitle,
@@ -104,7 +113,7 @@ export const Pika = async ({ client, directory }) => {
       } else if (event.type === "question.replied" || event.type === "question.rejected") {
         await send("QuestionReply", id);
       } else if (event.type === "session.error") {
-        await send("StopFailure", id, { error: String(p.error || "OpenCode turn failed") });
+        await send("StopFailure", id, { error: errorMessage(p.error, "OpenCode turn failed; no error explanation was supplied") });
       }
     },
   };

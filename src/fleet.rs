@@ -1536,6 +1536,8 @@ impl SshTransport {
             "-o".to_owned(),
             "ClearAllForwardings=yes".to_owned(),
             "-o".to_owned(),
+            "RemoteCommand=none".to_owned(),
+            "-o".to_owned(),
             format!("ConnectTimeout={}", self.connect_timeout.as_secs().max(1)),
             target.to_owned(),
         ])
@@ -5010,7 +5012,7 @@ fn parse_error_kind(value: Option<&str>) -> FleetErrorKind {
         _ => FleetErrorKind::Error,
     }
 }
-fn remote_pika_command(arguments: &[String]) -> Result<String, FleetError> {
+pub(crate) fn remote_pika_command(arguments: &[String]) -> Result<String, FleetError> {
     for argument in arguments {
         if argument.contains(['\r', '\n', '\0']) || argument.len() > 1024 {
             return Err(FleetError::new(

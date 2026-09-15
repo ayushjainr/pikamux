@@ -548,6 +548,10 @@ pub(crate) struct ReconcileSession {
     version: i64,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("local reconciliation was superseded by another process before it could commit")]
+pub(crate) struct ReconcileSuperseded;
+
 impl ReconcileSession {
     pub(crate) fn transaction<T>(
         &mut self,
@@ -558,7 +562,7 @@ impl ReconcileSession {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = tx.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?;
         if current != self.version {
-            bail!("local reconciliation was superseded by another process before it could commit")
+            return Err(ReconcileSuperseded.into());
         }
         let result = operation(&ReconcileLedger { tx: &tx })?;
         tx.commit()?;

@@ -1,22 +1,23 @@
-Update from Pika. Keep your agents running.
+Open your agent. Return to your place.
 
-When a new version is available, Pika asks **Update now? [y/N]**. Press Y to
-download and verify it, then return to the updated board. Enter, N, or Esc leaves
-your installation unchanged; U opens the offer again.
+Pika now returns to the same board selection and filter after you detach from a
+native agent. If opening fails, the explanation stays in the board. An uncertain
+launch is never automatically repeated.
 
-- Works on macOS, Linux, and the native Windows client.
-- Waits until you're out of a private consultation or text-entry field before
-  offering an update.
-- Updates only this machine. Running agents, paired machines, and conversations
-  are left intact.
-- Windows verifies the new executable before handing off, including when an
-  already-open PowerShell still points at the older release.
+- Recover from transient verification conflicts during local and remote opens,
+  while retaining exact-conversation checks.
+- Preview pane output with **p** without leaving the board or marking work read.
+  Saved conversations without a live pane get a clear explanation.
+- Use **?** for keyboard help, **u** for cumulative usage, and **x** to stop
+  watching a conversation without stopping its agent.
+- See recorded activity, pane availability and explicit missing-card information
+  in the inspector.
+- Connect through SSH aliases that define their own remote command, including
+  hosts where Pika is installed outside the noninteractive shell's PATH.
+- Read structured OpenCode errors instead of an object placeholder.
 
-To get this update from an older Windows version, run the installer once more:
+Update from the board's **Update now? [y/N]** offer, or run `pika update`.
+Each machine updates independently; running conversations remain intact.
 
-```powershell
-irm https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.ps1 | iex
-```
-
-On macOS and Linux, run `pika update`. Future board updates need only your
-confirmation.
+The OpenCode hook improvement takes effect after reviewing and applying
+`pika setup` on the host. Updating the executable alone does not rewrite hooks.

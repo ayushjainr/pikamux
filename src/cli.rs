@@ -559,8 +559,8 @@ fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
             if !monitor::interactive_terminal() {
                 return bare(pika);
             }
-            drive_client_board(
-                || observe_board(pika),
+            drive_board(
+                |memory| observe_board(pika, memory),
                 |action| finish_board_action(pika, action),
             )
         }
@@ -642,7 +642,7 @@ fn peek_popup(pika: &Pika, a: PeekPopupArgs) -> Result<i32> {
 
 fn bare(pika: &Pika) -> Result<i32> {
     if !monitor::interactive_terminal() {
-        let mut inventory = pika.reconcile_local()?;
+        let mut inventory = pika.reconcile_for_action()?;
         let _ = usage::hydrate_sessions(&pika.paths, &pika.store, &mut inventory.sessions);
         inventory.sessions.extend(
             inventory
@@ -652,26 +652,49 @@ fn bare(pika: &Pika) -> Result<i32> {
         );
         return print_sessions(inventory.sessions, true);
     }
-    finish_board_action(pika, observe_board(pika)?)
+    drive_board(
+        |memory| observe_board(pika, memory),
+        |action| finish_board_action(pika, action),
+    )
 }
 
-// The Windows board connection owns the reverse forward. Keep it alive after
-// an exact open (a new window, or an attach that has since detached); q exits.
-fn drive_client_board(
-    mut observe: impl FnMut() -> Result<BoardAction>,
+// Both ordinary Unix boards and legacy bridged boards survive terminal handoff.
+// Only a fresh user action can attempt another open, including after uncertainty.
+fn drive_board(
+    mut observe: impl FnMut(&mut monitor::BoardMemory) -> Result<BoardAction>,
     mut apply: impl FnMut(BoardAction) -> Result<i32>,
 ) -> Result<i32> {
+    let mut memory = monitor::BoardMemory::default();
     loop {
-        let action = observe()?;
-        let reopen = matches!(&action, BoardAction::Open(_));
-        let code = apply(action)?;
-        if !reopen || code != 0 {
-            return Ok(code);
+        let action = observe(&mut memory)?;
+        if let BoardAction::Open(item) = &action {
+            let identity = format!(
+                "{} · {} · {}{}",
+                item.session.display_name(),
+                item.session.provider,
+                item.session.session_id,
+                item.node_name
+                    .as_ref()
+                    .or(item.node_id.as_ref())
+                    .map(|name| format!(" @{name}"))
+                    .unwrap_or_default()
+            );
+            memory.notice = match apply(action) {
+                Ok(0) => None,
+                Ok(code) => Some(format!(
+                    "OPEN RETURNED · {identity}\nThe terminal handoff ended with status {code}.\nNo launch was automatically retried. Press Esc, check the selected row, then Enter to open it with fresh identity checks."
+                )),
+                Err(error) => Some(format!(
+                    "OPEN NEEDS ATTENTION · {identity}\n\n{error:#}\n\nNo launch was automatically retried. Press Esc, check the selected row, then Enter to open it with fresh identity checks."
+                )),
+            };
+        } else {
+            return apply(action);
         }
     }
 }
 
-fn observe_board(pika: &Pika) -> Result<BoardAction> {
+fn observe_board(pika: &Pika, memory: &mut monitor::BoardMemory) -> Result<BoardAction> {
     // Paint all bounded durable state immediately, including offline fleet
     // rows. No provider, process, tmux, or SSH observation belongs here.
     let (cached, initial_fleet_health) = board_items(pika)?;
@@ -799,8 +822,12 @@ fn observe_board(pika: &Pika) -> Result<BoardAction> {
         update_receiver,
         refresh_sender.clone(),
         local_refresh_delayed,
-        monitor::FleetHealthFeed::new(initial_fleet_health, fleet_health_receiver)
-            .with_quota(quota_feed),
+        (
+            monitor::FleetHealthFeed::new(initial_fleet_health, fleet_health_receiver)
+                .with_quota(quota_feed),
+            board_action_driver(pika.clone()),
+            memory,
+        ),
     );
     // Once the board has returned an action, no observation that began for its
     // old frame may write identity state after that action. The fence waits
@@ -1284,20 +1311,79 @@ fn maybe_open_client_window(
 }
 
 fn peek_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
+    println!("{}", board_peek_report(pika, &item)?);
+    Ok(0)
+}
+
+fn board_action_driver(pika: Pika) -> monitor::ActionDriver {
+    monitor::ActionDriver::local(move |action| match action {
+        BoardAction::Peek(item) => board_peek_report(&pika, &item),
+        BoardAction::Untrack(item) => {
+            if item.pending_token.is_some() {
+                bail!("This conversation is still starting; its exact identity is not yet known.");
+            }
+            if item.node_id.is_some() {
+                let remote = exact_remote(&pika, &item)?;
+                FleetManager::new(&pika.store, SshTransport::default())
+                    .untrack(&remote, None)
+                    .map_err(anyhow::Error::from)?;
+                return Ok(format!(
+                    "Stopped watching {}. The agent and its history are unchanged.",
+                    remote.qualified_name()
+                ));
+            }
+            let (_, report) = untrack_report(&pika, &item.session)?;
+            Ok(report)
+        }
+        _ => bail!("This action requires the main terminal."),
+    })
+}
+
+fn board_peek_report(pika: &Pika, item: &BoardItem) -> Result<String> {
+    let identity = format!(
+        "{} · {} · {}",
+        item.session.display_name(),
+        item.session.provider,
+        item.session.session_id
+    );
     if item.pending_token.is_some() {
-        bail!("This conversation is still starting; open it to see provider output.")
+        return Ok(format!(
+            "PEEK · {identity}\nStill starting · press Esc, then Enter to see provider output.\nUnread preserved."
+        ));
     }
     if item.node_id.is_some() {
-        let remote = exact_remote(pika, &item)?;
-        println!(
-            "{}",
-            FleetManager::new(&pika.store, SshTransport::default())
-                .capture(&remote, pika.config.peek_lines)
-                .map_err(anyhow::Error::from)?
-        );
-        return Ok(0);
+        let remote = exact_remote(pika, item)?;
+        let output = FleetManager::new(&pika.store, SshTransport::default())
+            .capture(&remote, pika.config.peek_lines)
+            .map_err(anyhow::Error::from)
+            .with_context(|| {
+                format!("PEEK · {identity} @{} · unread preserved", remote.node_name)
+            })?;
+        return Ok(format!(
+            "PEEK · {identity} @{} · unread preserved\n\n{output}",
+            remote.node_name
+        ));
     }
-    peek_session(pika, item.session, None, false)
+    if item.session.tmux_pane.is_none() {
+        return Ok(format!(
+            "PEEK · {identity}\n\nNo live Pika pane is recorded for this conversation.\nPika has not opened it or read its transcript. Unread preserved.\n\nPress Esc, then Enter to open the exact conversation.\nOr run: pika open {}",
+            shell_words::quote(&format!(
+                "{}:{}",
+                item.session.provider, item.session.session_id
+            ))
+        ));
+    }
+    let output = pika
+        .capture_exact(&item.session, pika.config.peek_lines)
+        .with_context(|| format!("PEEK · {identity} · unread preserved"))?;
+    Ok(format!(
+        "PEEK · {identity} · unread preserved\n\n{}",
+        if output.trim().is_empty() {
+            "The verified pane has no output yet."
+        } else {
+            &output
+        }
+    ))
 }
 
 fn untrack_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
@@ -1394,7 +1480,7 @@ fn run_remote_board_consultation(
 }
 fn list(pika: &Pika, a: ListArgs) -> Result<i32> {
     let inventory = if pika.store.exists() {
-        pika.reconcile_local()?
+        pika.reconcile_for_action()?
     } else {
         pika.cached_inventory()?
     };
@@ -1735,7 +1821,7 @@ fn open_name(pika: &Pika, name: &str, allow_create: bool) -> Result<i32> {
         let current = std::env::current_dir()?.canonicalize()?;
         let root = repository_root(&current);
         let mut matches = pika
-            .reconcile_local()?
+            .reconcile_for_action()?
             .sessions
             .into_iter()
             .filter(|session| {
@@ -2018,7 +2104,7 @@ fn repository_root(path: &std::path::Path) -> PathBuf {
 fn next(pika: &Pika) -> Result<i32> {
     let manager = FleetManager::new(&pika.store, SshTransport::default());
     let selected = attention::choose(
-        pika.reconcile_local()?.sessions,
+        pika.reconcile_for_action()?.sessions,
         manager
             .cached_sessions(None, false)
             .map_err(anyhow::Error::from)?,
@@ -2126,22 +2212,26 @@ fn untrack(pika: &Pika, name: &str) -> Result<i32> {
     }
 }
 fn untrack_exact(pika: &Pika, s: Session) -> Result<i32> {
+    let (code, report) = untrack_report(pika, &s)?;
+    println!("{report}");
+    Ok(code)
+}
+
+fn untrack_report(pika: &Pika, s: &Session) -> Result<(i32, String)> {
     pika.store.untrack_session(s.provider, &s.session_id)?;
     let clear_error = s
         .tmux_pane
         .as_deref()
-        .and_then(|_| pika.clear_exact_tags(&s).err());
-    println!(
+        .and_then(|_| pika.clear_exact_tags(s).err());
+    let mut report = format!(
         "Stopped watching {}. The agent and its history were not stopped or archived.",
         s.display_name()
     );
     if let Some(error) = clear_error {
-        eprintln!(
-            "pika: Watch state was removed, but pane identity changed before its Pika tags could be cleared: {error}"
-        );
-        return Ok(2);
+        report.push_str(&format!("\nWatch state was removed, but pane identity changed before its Pika tags could be cleared: {error}"));
+        return Ok((2, report));
     }
-    Ok(0)
+    Ok((0, report))
 }
 fn wait(pika: &Pika, a: WaitArgs) -> Result<i32> {
     let selected = local_wait_target(
@@ -2149,7 +2239,7 @@ fn wait(pika: &Pika, a: WaitArgs) -> Result<i32> {
         resolve_named_target(pika, &a.name, true, LocalTargetDomain::Daily, true)?,
     )?;
     let initial = pika
-        .reconcile_local()?
+        .reconcile_for_action()?
         .sessions
         .into_iter()
         .find(|session| {
@@ -2162,7 +2252,7 @@ fn wait(pika: &Pika, a: WaitArgs) -> Result<i32> {
         let now = Instant::now();
         let s = if now >= next_reconcile {
             next_reconcile = now + Duration::from_secs(5);
-            pika.reconcile_local()?
+            pika.reconcile_for_action()?
                 .sessions
                 .into_iter()
                 .find(|session| {
@@ -5180,7 +5270,7 @@ fn exact_local_session(
     fresh: bool,
 ) -> Result<Session> {
     if fresh {
-        pika.reconcile_local()?;
+        pika.reconcile_for_action()?;
     }
     let session = pika
         .store
@@ -5228,7 +5318,7 @@ impl FleetService for LocalFleetService<'_> {
         &mut self,
         expert_directory: bool,
     ) -> std::result::Result<serde_json::Value, FleetError> {
-        let inventory = self.pika.reconcile_local()?;
+        let inventory = self.pika.reconcile_for_action()?;
         let node_id = self.pika.store.ensure_local_node_id()?;
         let machine = local_machine_alias(self.pika).map_err(FleetError::from)?;
         let mut sessions = inventory.sessions;
@@ -5432,7 +5522,7 @@ mod fleet_consultation_tests {
     use std::os::unix::net::UnixStream;
 
     #[test]
-    fn windows_board_remains_connected_after_multiple_opens_and_exits_on_quit() {
+    fn board_remains_connected_after_multiple_opens_and_exits_on_quit() {
         let root = tempfile::tempdir().unwrap();
         let item = BoardItem::local(fixture_session(root.path()));
         let mut actions = std::collections::VecDeque::from([
@@ -5441,8 +5531,8 @@ mod fleet_consultation_tests {
             BoardAction::Quit,
         ]);
         let mut opens = 0;
-        let code = drive_client_board(
-            || Ok(actions.pop_front().expect("quit must stop")),
+        let code = drive_board(
+            |_| Ok(actions.pop_front().expect("quit must stop")),
             |action| {
                 if matches!(action, BoardAction::Open(_)) {
                     opens += 1;
@@ -5457,20 +5547,39 @@ mod fleet_consultation_tests {
     }
 
     #[test]
-    fn windows_board_never_retries_a_failed_or_uncertain_open() {
+    fn board_displays_failed_or_uncertain_open_without_retrying_it() {
         let root = tempfile::tempdir().unwrap();
         let item = BoardItem::local(fixture_session(root.path()));
         let mut observed = 0;
-        let error = drive_client_board(
-            || {
+        let mut opens = 0;
+        let code = drive_board(
+            |memory| {
                 observed += 1;
-                Ok(BoardAction::Open(item.clone()))
+                if observed == 1 {
+                    Ok(BoardAction::Open(item.clone()))
+                } else {
+                    assert!(
+                        memory
+                            .notice
+                            .as_deref()
+                            .unwrap()
+                            .contains("outcome unknown")
+                    );
+                    Ok(BoardAction::Quit)
+                }
             },
-            |_| bail!("launch outcome unknown"),
+            |action| {
+                if matches!(action, BoardAction::Open(_)) {
+                    opens += 1;
+                    bail!("launch outcome unknown");
+                }
+                Ok(0)
+            },
         )
-        .unwrap_err();
-        assert_eq!(observed, 1);
-        assert!(error.to_string().contains("outcome unknown"));
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(observed, 2);
+        assert_eq!(opens, 1);
     }
 
     fn fixture_session(root: &std::path::Path) -> Session {

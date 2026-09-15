@@ -26,6 +26,24 @@ pub const LIVE_OWNER_LEASE_SECONDS: f64 = 300.0;
 const CONTINUATION_FRESH_SECONDS: f64 = 30.0 * 60.0;
 const RECONCILE_WRITE_BATCH: usize = 64;
 
+/// Retry a discarded *observation*, never its old writes or an attach/launch.
+/// A closed-board generation fence and identity failures are not retryable.
+fn fresh_observation<T>(mut observe: impl FnMut() -> Result<T>) -> Result<T> {
+    for attempt in 0..3 {
+        match observe() {
+            Err(error) if error.is::<crate::store::ReconcileSuperseded>() => {
+                if attempt == 2 {
+                    bail!(
+                        "Pika state kept changing during verification. No requested attach or launch was performed; retry the same command."
+                    );
+                }
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded observation attempts always return")
+}
+
 #[derive(Clone, Debug)]
 pub struct Inventory {
     pub sessions: Vec<Session>,
@@ -160,6 +178,10 @@ impl Pika {
     pub fn reconcile_local(&self) -> Result<Inventory> {
         self.reconcile_local_with_candidates()
             .map(|observed| observed.inventory)
+    }
+
+    pub(crate) fn reconcile_for_action(&self) -> Result<Inventory> {
+        fresh_observation(|| self.reconcile_local())
     }
 
     /// Fence an observation that was started for a board which has now closed.
@@ -717,7 +739,7 @@ impl Pika {
         let ReconciledInventory {
             inventory,
             candidates: mut metadata,
-        } = self.reconcile_local_with_candidates()?;
+        } = fresh_observation(|| self.reconcile_local_with_candidates())?;
         let mut sessions = inventory.sessions;
         // An explicit daily-name or UUID lookup is also the recovery path for
         // a conversation the user previously stopped watching. Keep the
@@ -1008,7 +1030,7 @@ impl Pika {
         {
             self.store.upsert_session(&session, false)?;
         }
-        let inventory = self.reconcile_local()?;
+        let inventory = self.reconcile_for_action()?;
         if let Some(current) = inventory.sessions.into_iter().find(|candidate| {
             candidate.provider == session.provider && candidate.session_id == session.session_id
         }) {
@@ -2197,6 +2219,51 @@ mod tests {
             created_at: 1.0,
             lifecycle_status: Some(Status::Working),
         })
+    }
+
+    #[test]
+    fn foreground_reobserves_after_another_connection_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::at(temp.path().join("state.db"));
+        store.initialize().unwrap();
+        let mut scans = 0;
+        fresh_observation(|| {
+            scans += 1;
+            let mut observed = store.begin_reconcile_session()?;
+            if scans == 1 {
+                store.ensure_local_node_id()?;
+            }
+            observed.transaction(|_| Ok(()))
+        })
+        .unwrap();
+        assert_eq!(scans, 2, "a new scan and snapshot fence are required");
+    }
+
+    #[test]
+    fn foreground_retry_is_bounded_and_never_retries_identity_or_closed_board_fences() {
+        let mut scans = 0;
+        let result: Result<()> = fresh_observation(|| {
+            scans += 1;
+            Err(crate::store::ReconcileSuperseded.into())
+        });
+        assert_eq!(scans, 3);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("retry the same command")
+        );
+        for reason in [
+            "OPEN TWICE",
+            "local reconciliation was superseded before it could commit",
+        ] {
+            let mut scans = 0;
+            let _: Result<()> = fresh_observation(|| {
+                scans += 1;
+                bail!("{reason}")
+            });
+            assert_eq!(scans, 1);
+        }
     }
 
     #[test]

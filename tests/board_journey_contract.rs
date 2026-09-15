@@ -1,0 +1,337 @@
+//! Exercise the actual Unix executable through a disposable terminal, not just
+//! BoardAction enums. No provider, real SSH endpoint, or user tmux server is used.
+#![cfg(unix)]
+
+use pikamux::store::Store;
+use std::{
+    fs::{self, File},
+    io::{Read, Write},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{fs::PermissionsExt, process::CommandExt},
+    },
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+struct BoardProcess {
+    child: Child,
+    terminal: File,
+    output: String,
+    root: tempfile::TempDir,
+    real_tmux: bool,
+}
+
+impl Drop for BoardProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if self.real_tmux {
+            let _ = Command::new(self.root.path().join("bin/tmux"))
+                .env_clear()
+                .env("HOME", self.root.path().join("home"))
+                .env("TMUX_TMPDIR", self.root.path().join("sockets"))
+                .args(["-L", "board-journey", "kill-server"])
+                .output();
+        }
+    }
+}
+
+impl BoardProcess {
+    fn start() -> Self {
+        // Keep the Unix socket path below the platform's address-length limit.
+        let root = tempfile::Builder::new()
+            .prefix("pika-board-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        for dir in [
+            "bin", "home", "config", "state", "cache", "data", "codex", "claude", "oc", "tmp",
+            "sockets",
+        ] {
+            fs::create_dir_all(root.path().join(dir)).unwrap();
+        }
+        for name in [
+            "tmux",
+            "codex",
+            "claude",
+            "opencode",
+            "ssh",
+            "curl",
+            "tailscale",
+        ] {
+            let path = root.path().join("bin").join(name);
+            fs::write(
+                &path,
+                if name == "tmux" {
+                    "#!/bin/sh\nprintf 'no server running\\n' >&2\nexit 1\n"
+                } else {
+                    "#!/bin/sh\nexit 97\n"
+                },
+            )
+            .unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store = Store::at(root.path().join("state/pika.db"));
+        store.initialize().unwrap();
+        let db = rusqlite::Connection::open(store.path()).unwrap();
+        db.execute(
+            "INSERT INTO sessions(provider,session_id,name,status,unread,managed,source,created_at,updated_at,last_event_at,last_activity_at) VALUES ('codex','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','audit_saved','READY',1,1,'fixture',1,1,1,1)",
+            [],
+        ).unwrap();
+        drop(db);
+        let (mut master, mut slave) = (-1, -1);
+        let mut size = libc::winsize {
+            ws_row: 32,
+            ws_col: 140,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut size,
+                )
+            },
+            0
+        );
+        let terminal = unsafe { File::from_raw_fd(master) };
+        let child_terminal = unsafe { File::from_raw_fd(slave) };
+        let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pika"));
+        command
+            .env_clear()
+            .env("HOME", root.path().join("home"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("PIKA_CONFIG_HOME", root.path().join("config/pika"))
+            .env("PIKA_STATE_HOME", root.path().join("state"))
+            .env("PIKA_DB_PATH", store.path())
+            .env("CODEX_HOME", root.path().join("codex"))
+            .env("CLAUDE_CONFIG_DIR", root.path().join("claude"))
+            .env("OPENCODE_DATA_HOME", root.path().join("oc"))
+            .env("OPENCODE_CONFIG_DIR", root.path().join("config/oc"))
+            .env("TMPDIR", root.path().join("tmp"))
+            .env("TMUX_TMPDIR", root.path().join("sockets"))
+            .env("PIKA_TMUX_SOCKET", "board-journey")
+            .env("PIKA_UPDATE_CHECK", "0")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
+            )
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(child_terminal.try_clone().unwrap()))
+            .stdout(Stdio::from(child_terminal.try_clone().unwrap()))
+            .stderr(Stdio::from(child_terminal.try_clone().unwrap()));
+        command.process_group(0);
+        let child = command.spawn().unwrap();
+        drop(child_terminal);
+        let mut board = Self {
+            child,
+            terminal,
+            output: String::new(),
+            root,
+            real_tmux: false,
+        };
+        board.await_text("audit_saved");
+        board
+    }
+
+    fn send(&mut self, keys: &[u8]) {
+        self.output.clear();
+        self.terminal.write_all(keys).unwrap();
+    }
+
+    fn await_text(&mut self, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            let mut bytes = [0; 32768];
+            match self.terminal.read(&mut bytes) {
+                Ok(n) => self.output.push_str(&String::from_utf8_lossy(&bytes[..n])),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("terminal read: {e}; output: {}", self.output),
+            }
+            if self.output.contains(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing {expected:?}; output: {}",
+                self.output
+            );
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "board exited before {expected:?}: {}",
+                self.output
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn finish(&mut self) {
+        self.send(b"q");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // Drain pending frames while waiting: a real terminal consumes
+            // output continuously, and a full PTY must not manufacture a hang.
+            let mut bytes = [0; 32768];
+            let _ = self.terminal.read(&mut bytes);
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(Instant::now() < deadline, "board did not quit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut flags = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(self.terminal.as_raw_fd(), flags.as_mut_ptr()) },
+            0
+        );
+        assert_ne!(
+            unsafe { flags.assume_init() }.c_lflag & libc::ICANON,
+            0,
+            "terminal left raw"
+        );
+    }
+}
+
+#[test]
+fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
+    let real_tmux = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|path| path.join("tmux"))
+        .find(|path| path.is_file())
+        .map(|path| fs::canonicalize(path).unwrap());
+    let Some(real_tmux) = real_tmux else {
+        eprintln!("tmux unavailable; real board handoff was not exercised");
+        return;
+    };
+    let mut board = BoardProcess::start();
+    fs::write(
+        board.root.path().join("bin/tmux"),
+        format!(
+            "#!/bin/sh\nexec {} -f /dev/null \"$@\"\n",
+            shell_words::quote(real_tmux.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    board.real_tmux = true;
+    fs::write(board.root.path().join("bin/codex"),
+        "#!/bin/sh\ntest \"$1\" = resume || exit 97\nprintf 'FAKE AGENT READY\\n'\nwhile :; do sleep 1; done\n"
+    ).unwrap();
+    board.send(b"/audit\r");
+    board.await_text("FILTER audit");
+    let mut original_pane = None;
+    for _ in 0..2 {
+        board.send(b"\r");
+        board.await_text("CONTINUITY PROVEN");
+        board.send(b"\x02d");
+        board.await_text("FILTER audit");
+        assert!(board.child.try_wait().unwrap().is_none());
+        let store = Store::at(board.root.path().join("state/pika.db"));
+        let session = store
+            .get_session(
+                pikamux::model::Provider::Codex,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            )
+            .unwrap()
+            .unwrap();
+        assert!(session.tmux_pane.is_some());
+        if let Some(pane) = &original_pane {
+            assert_eq!(&session.tmux_pane, pane, "reopen created another home");
+        } else {
+            original_pane = Some(session.tmux_pane);
+        }
+    }
+    board.finish();
+}
+
+#[test]
+fn failed_open_returns_to_filtered_board_without_replaying_the_action() {
+    let mut board = BoardProcess::start();
+    board.send(b"/audit\r");
+    board.await_text("FILTER audit");
+    board.send(b"\r");
+    board.await_text("OPEN NEEDS ATTENTION");
+    assert!(
+        board
+            .output
+            .contains("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    );
+    assert!(board.child.try_wait().unwrap().is_none());
+    board.send(b"\x1b");
+    board.await_text("FILTER audit");
+    board.finish();
+}
+
+#[test]
+fn saved_thread_peek_explains_unavailable_inside_board_and_preserves_unread() {
+    let mut board = BoardProcess::start();
+    board.send(b"p");
+    board.await_text("No live Pika pane");
+    assert!(
+        board.child.try_wait().unwrap().is_none(),
+        "peek must stay in the board"
+    );
+    let db = rusqlite::Connection::open(board.root.path().join("state/pika.db")).unwrap();
+    let unread: bool = db
+        .query_row(
+            "SELECT unread FROM sessions WHERE name='audit_saved'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(unread, "peek acknowledged unseen work");
+    board.send(b"\x1b");
+    board.await_text("audit_saved");
+    board.finish();
+}
+
+#[test]
+fn help_and_usage_are_real_board_actions_with_a_return_path() {
+    let mut board = BoardProcess::start();
+    board.send(b"?");
+    board.await_text("PIKA KEYS");
+    board.send(b"\x1b");
+    board.await_text("audit_saved");
+    board.send(b"u");
+    board.await_text("CUMULATIVE USAGE");
+    board.finish();
+}
+
+#[test]
+fn unwatch_can_be_cancelled_and_then_confirmed_without_leaving_the_board() {
+    let mut board = BoardProcess::start();
+    board.send(b"x");
+    board.await_text("Stop watching audit_saved");
+    board.send(b"\x1b");
+    board.await_text("audit_saved");
+    let store = Store::at(board.root.path().join("state/pika.db"));
+    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    assert!(
+        !store
+            .is_untracked(pikamux::model::Provider::Codex, id)
+            .unwrap()
+    );
+    board.send(b"x");
+    board.await_text("Stop watching audit_saved");
+    board.send(b"\r");
+    board.await_text("Stopped watching audit_saved");
+    assert!(
+        store
+            .is_untracked(pikamux::model::Provider::Codex, id)
+            .unwrap()
+    );
+    assert!(board.child.try_wait().unwrap().is_none());
+    board.finish();
+}

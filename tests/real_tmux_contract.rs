@@ -187,7 +187,7 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
     assert_eq!(fs::read_to_string(&committed).unwrap(), "after-receipt");
     let transcript = fs::read_to_string(transcript).unwrap();
     assert!(
-        transcript.contains("CONTINUITY PROVEN · receipt_test"),
+        transcript.contains("CONTINUITY PROVEN - receipt_test - ATTACHED LIVE"),
         "{transcript:?}"
     );
 }
@@ -205,7 +205,9 @@ fn real_isolated_tmux_receipt_helper() {
     let handoff = tmux
         .attach_exact_with_observed_receipt(
             &pane,
-            "CONTINUITY PROVEN · receipt_test · ATTACHED LIVE",
+            // Keep the fixture ASCII: a C-locale terminal can render a Unicode
+            // separator through ACS escape sequences instead of literal UTF-8.
+            "CONTINUITY PROVEN - receipt_test - ATTACHED LIVE",
             || fs::write(&committed, "after-receipt").map_err(Into::into),
         )
         .unwrap();
@@ -282,13 +284,13 @@ fn real_isolated_tmux_list_clients_proves_the_exact_selected_pane() {
                 &client.socket,
                 "list-clients",
                 "-F",
-                "#{client_pid}\t#{pane_id}",
+                r"#{client_pid}\037#{pane_id}",
             ])
             .output()
             .unwrap();
         if output.status.success()
             && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-                line.split_once('\t').is_some_and(|(pid, selected)| {
+                line.split_once(r"\037").is_some_and(|(pid, selected)| {
                     pid.parse::<i32>().is_ok_and(|pid| pid > 0) && selected == pane
                 })
             })

@@ -200,9 +200,12 @@ fn terminal_command_is_argv_only_and_pins_node_provider_and_conversation() {
             .iter()
             .any(|value| value == "ClearAllForwardings=yes")
     );
-    assert!(command.iter().any(|value| value == &target_id));
-    assert!(command.iter().any(|value| value == "claude"));
-    assert!(command.iter().any(|value| value == &session_id));
+    assert!(command.contains(&"RemoteCommand=none".into()));
+    let remote = command.last().unwrap();
+    assert!(remote.contains(&format!("'--expected-node-id' '{target_id}'")));
+    assert!(remote.contains("'--provider' 'claude'"));
+    assert!(remote.contains(&format!("'--session-id' '{session_id}'")));
+    assert!(remote.contains("\"$HOME/.local/bin/pika\""));
     assert!(!command.iter().any(|value| value == "--continue"));
     assert!(!command.iter().any(|value| value == "--last"));
 
@@ -216,8 +219,9 @@ fn terminal_command_is_argv_only_and_pins_node_provider_and_conversation() {
     .unwrap();
     assert!(
         opencode
-            .iter()
-            .any(|value| value == "ses_fdd613642ffeZLuODNNxjAL3h7")
+            .last()
+            .unwrap()
+            .contains("'--session-id' 'ses_fdd613642ffeZLuODNNxjAL3h7'")
     );
     assert!(
         windows_terminal_command(
@@ -263,16 +267,22 @@ fn chosen_board_routes_multiple_unpaired_servers_through_its_trusted_ssh_target(
         let commands = launched.lock().unwrap();
         let args = commands.last().unwrap();
         assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--expected-node-id", &source_id])
+            args.last()
+                .unwrap()
+                .contains(&format!("'--expected-node-id' '{source_id}'"))
         );
         assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--target-node-id", target])
+            args.last()
+                .unwrap()
+                .contains(&format!("'--target-node-id' '{target}'"))
         );
         assert!(args.contains(&"developer@devbox".into()));
-        assert!(args.contains(&"_client-fleet-open".into()));
-        assert!(args.contains(&session_id));
+        assert!(args.last().unwrap().contains("'_client-fleet-open'"));
+        assert!(
+            args.last()
+                .unwrap()
+                .contains(&format!("'--session-id' '{session_id}'"))
+        );
         assert!(!args.iter().any(|arg| arg.contains(SOURCE_TOKEN)));
     }
     assert_eq!(launched.lock().unwrap().len(), 2);
