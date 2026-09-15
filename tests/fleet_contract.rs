@@ -947,6 +947,165 @@ fn intentional_refresh_cancellation_preserves_ready_node_and_cached_snapshot() {
 }
 
 #[test]
+fn cached_board_carries_real_expertise_with_independent_clocks_and_node_identity() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "board-expertise.db");
+    let received_at = now();
+    let remote_at = received_at + 400.0;
+    let mut ids = Vec::new();
+    for (alias, scope) in [("atlas", "Owns pricing"), ("gpu", "Owns rendering")] {
+        let id = Uuid::new_v4().to_string();
+        store.upsert_fleet_node(&node(&id, alias)).unwrap();
+        let mut value = snapshot(&id, CODEX_THREAD_ID);
+        value["captured_at"] = json!(remote_at);
+        value["profiles"][0]["scope"] = json!(format!("\u{1b}[31m{scope}\u{1b}[0m"));
+        value["profiles"][0]["scope_updated_at"] = json!(remote_at - 100.0);
+        value["profiles"][0]["current_state_updated_at"] = json!(remote_at - 20.0);
+        value["cards"][0]["status"] = json!("STALE");
+        value["cards"][0]["detail"] = json!("legacy card lacks a current-state snapshot");
+        value["cards"][0]["current_state_status"] = json!("STALE");
+        store.put_remote_snapshot(&id, &value, received_at).unwrap();
+        ids.push((id, scope));
+    }
+    let fake = FakeTransport::default();
+    let manager = FleetManager::new(&store, &fake);
+    // Exercise both the bounded aggregate projection and exact-node snapshot.
+    let aggregate = manager.cached_sessions(None, false).unwrap();
+    assert_eq!(aggregate.len(), 2);
+    for (id, scope) in ids {
+        let exact = manager.cached_sessions(Some(&id), false).unwrap();
+        let projected = aggregate.iter().find(|row| row.node_id == id).unwrap();
+        assert_eq!(&exact[0], projected);
+        assert_eq!(projected.expert_scope.as_deref(), Some(scope));
+        assert_eq!(
+            projected.expert_current_work.as_deref(),
+            Some("Validating rollout")
+        );
+        assert_eq!(projected.expert_topics, ["pricing"]);
+        assert_eq!(projected.scope_updated_at, Some(received_at - 100.0));
+        assert_eq!(projected.current_state_updated_at, Some(received_at - 20.0));
+        assert_eq!(projected.current_state_status.as_deref(), Some("STALE"));
+        assert_eq!(
+            projected.card_detail.as_deref(),
+            Some("legacy card lacks a current-state snapshot")
+        );
+        assert!(projected.session.transcript_path.is_none());
+    }
+    assert!(fake.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn cached_board_missing_legacy_or_other_identity_profiles_do_not_invent_expertise() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "board-missing-expertise.db");
+    let id = Uuid::new_v4().to_string();
+    store.upsert_fleet_node(&node(&id, "atlas")).unwrap();
+    let fake = FakeTransport::default();
+    let manager = FleetManager::new(&store, &fake);
+    for mode in [
+        "missing",
+        "other-uuid",
+        "other-provider",
+        "blank",
+        "blank-current",
+    ] {
+        let mut value = snapshot(&id, CODEX_THREAD_ID);
+        match mode {
+            "missing" => value["profiles"] = json!([]),
+            "other-uuid" => value["profiles"][0]["session_id"] = json!(CODEX_OTHER_ID),
+            "other-provider" => value["profiles"][0]["provider"] = json!("claude"),
+            "blank" => {
+                value["profiles"][0]["scope"] = json!(" ");
+                value["profiles"][0]["current_state"] = json!("");
+                value["profiles"][0]["topics"] = json!([]);
+            }
+            "blank-current" => {
+                value["profiles"][0]["current_state"] = json!("");
+            }
+            _ => unreachable!(),
+        }
+        store.put_remote_snapshot(&id, &value, now()).unwrap();
+        for node_id in [None, Some(id.as_str())] {
+            let rows = manager.cached_sessions(node_id, false).unwrap();
+            assert_eq!(rows.len(), 1, "{mode}");
+            assert_eq!(
+                rows[0].expert_scope.as_deref(),
+                (mode == "blank-current").then_some("Owns pricing infrastructure"),
+                "{mode}"
+            );
+            assert_eq!(rows[0].expert_current_work, None, "{mode}");
+            assert_eq!(
+                rows[0].expert_topics.is_empty(),
+                mode != "blank-current",
+                "{mode}"
+            );
+            assert_eq!(rows[0].scope_updated_at, None, "{mode}");
+            assert_eq!(rows[0].current_state_updated_at, None, "{mode}");
+            assert_eq!(
+                rows[0].card_detail.as_deref(),
+                Some("matches remote source")
+            );
+        }
+    }
+    assert!(fake.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn remote_peek_cancellation_never_dispatches_and_success_is_read_only_and_exact() {
+    let temp = TempDir::new().unwrap();
+    let store = initialized_store(&temp, "cancellable-peek.db");
+    let id = Uuid::new_v4().to_string();
+    store.upsert_fleet_node(&node(&id, "atlas")).unwrap();
+    let mut value = snapshot(&id, CODEX_THREAD_ID);
+    value["sessions"][0]["unread"] = json!(true);
+    store.put_remote_snapshot(&id, &value, now()).unwrap();
+    let fake = FakeTransport::with(vec![Ok(
+        json!({"type":"peek", "node_id":id, "text":concat!(
+            "\u{1b}[31mfirst row\u{1b}[0m\r\n\n",
+            "\u{1b}]52;c;secret-clipboard\u{7}",
+            "\u{1b}Pprivate-dcs\u{7}still-private\u{1b}\\",
+            "\u{1b}_hidden-apc\u{1b}\\\u{1b}Xhidden-sos\u{1b}\\",
+            "\u{9d}52;c;c1-secret\u{9c}\u{90}c1-dcs\u{9c}",
+            "\u{98}c1-sos\u{9c}\u{9e}c1-pm\u{9c}\u{9f}c1-apc\u{9c}",
+            "\u{9b}32m\u{1b}(B",
+            "\u{61c}\u{200e}\u{200f}\u{202e}\u{2066}second row\u{2069}\u{7}\n",
+            "\u{1b}]52;c;truncated-secret"
+        )}),
+    )]);
+    let manager = FleetManager::new(&store, &fake);
+    let selected = manager.cached_sessions(Some(&id), false).unwrap().remove(0);
+    let cancelled = CancellationToken::default();
+    cancelled.cancel();
+    assert!(
+        manager
+            .capture_cancellable(&selected, 99, &cancelled)
+            .unwrap_err()
+            .message
+            .contains("cancelled")
+    );
+    assert!(fake.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        manager
+            .capture_cancellable(&selected, usize::MAX, &CancellationToken::default())
+            .unwrap(),
+        "first row\n\nsecond row\n"
+    );
+    let requests = fake.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].2);
+    assert_eq!(requests[0].1["op"], "peek");
+    assert_eq!(requests[0].1["expected_node_id"], id);
+    assert_eq!(requests[0].1["provider"], "codex");
+    assert_eq!(requests[0].1["session_id"], CODEX_THREAD_ID);
+    assert_eq!(requests[0].1["lines"], 2000);
+    assert_eq!(
+        manager.cached_sessions(Some(&id), false).unwrap()[0],
+        selected
+    );
+    assert!(selected.session.unread);
+}
+
+#[test]
 fn cached_remote_identity_includes_node_and_stale_cache_cannot_need_attention() {
     let temp = TempDir::new().unwrap();
     let store = initialized_store(&temp, "state.db");
@@ -1612,6 +1771,9 @@ fn remote_consultation_reuses_one_connection_and_requires_v2_cleanup() {
         seen_at: now(),
         card_status: None,
         card_detail: None,
+        expert_scope: None,
+        expert_current_work: None,
+        expert_topics: Vec::new(),
         watched: true,
         availability: Some("source-available".into()),
         scope_updated_at: None,
@@ -1661,6 +1823,9 @@ fn remote_opening_requires_v2_ephemeral_exact_child_and_provider_isolation() {
         seen_at: now(),
         card_status: None,
         card_detail: None,
+        expert_scope: None,
+        expert_current_work: None,
+        expert_topics: Vec::new(),
         watched: true,
         availability: Some("source-available".into()),
         scope_updated_at: None,
@@ -1742,6 +1907,9 @@ fn remote_opening_validates_claude_flags_and_opencode_exact_child() {
             seen_at: now(),
             card_status: None,
             card_detail: None,
+            expert_scope: None,
+            expert_current_work: None,
+            expert_topics: Vec::new(),
             watched: true,
             availability: Some("source-available".into()),
             scope_updated_at: None,
@@ -1792,6 +1960,9 @@ fn remote_consultation_cancellation_kills_owned_transport_promptly() {
         seen_at: now(),
         card_status: None,
         card_detail: None,
+        expert_scope: None,
+        expert_current_work: None,
+        expert_topics: Vec::new(),
         watched: true,
         availability: Some("source-available".into()),
         scope_updated_at: None,
@@ -1873,6 +2044,9 @@ fn remote_consultation_refuses_wrong_leaf_before_sending_question() {
         seen_at: now(),
         card_status: None,
         card_detail: None,
+        expert_scope: None,
+        expert_current_work: None,
+        expert_topics: Vec::new(),
         watched: true,
         availability: Some("source-available".into()),
         scope_updated_at: None,
@@ -1914,6 +2088,9 @@ fn remote_consultation_rejects_partial_frames_and_unverified_cleanup() {
         seen_at: now(),
         card_status: None,
         card_detail: None,
+        expert_scope: None,
+        expert_current_work: None,
+        expert_topics: Vec::new(),
         watched: true,
         availability: Some("source-available".into()),
         scope_updated_at: None,

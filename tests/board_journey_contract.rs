@@ -2,7 +2,10 @@
 //! BoardAction enums. No provider, real SSH endpoint, or user tmux server is used.
 #![cfg(unix)]
 
-use pikamux::store::Store;
+use pikamux::{
+    model::{ObservationKind, Status, StatusObservation},
+    store::Store,
+};
 use std::{
     fs::{self, File},
     io::{Read, Write},
@@ -12,7 +15,7 @@ use std::{
     },
     process::{Child, Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 struct BoardProcess {
@@ -291,7 +294,7 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
         board.await_text("FILTER audit");
         assert!(board.child.try_wait().unwrap().is_none());
         let store = Store::at(board.root.path().join("state/pika.db"));
-        let session = store
+        let mut session = store
             .get_session(
                 pikamux::model::Provider::Codex,
                 "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -302,6 +305,55 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
         if let Some(pane) = &original_pane {
             assert_eq!(&session.tmux_pane, pane, "reopen created another home");
         } else {
+            // The earlier exact opening acknowledged the original completion.
+            // Publish a new authoritative lifecycle observation, not only an
+            // unread compatibility-cache bit that reconciliation may restore.
+            let completed_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+            store
+                .record_status_observation(
+                    session.provider,
+                    &session.session_id,
+                    &StatusObservation {
+                        kind: ObservationKind::Lifecycle,
+                        status: Status::Ready,
+                        unread: true,
+                        attention_reason: Some("completed".into()),
+                        error: None,
+                        observed_at: completed_at,
+                        source: "fixture:Stop".into(),
+                    },
+                )
+                .unwrap();
+            session.status = Status::Ready;
+            session.unread = true;
+            session.last_event_at = completed_at;
+            store.upsert_session(&session, true).unwrap();
+            board.send(b"r");
+            board.await_text("Pane output");
+            board.await_text("FAKE AGENT READY");
+            assert!(
+                store
+                    .get_session(session.provider, &session.session_id)
+                    .unwrap()
+                    .unwrap()
+                    .unread,
+                "automatic preview acknowledged the result"
+            );
+            let completion = store
+                .status_observations(session.provider, &session.session_id)
+                .unwrap()
+                .into_iter()
+                .find(|observation| observation.kind == ObservationKind::Lifecycle)
+                .unwrap();
+            assert_eq!(completion.observed_at, completed_at);
+            assert_eq!(completion.status, Status::Ready);
+            assert!(
+                completion.unread,
+                "automatic preview acknowledged the authoritative completion"
+            );
             original_pane = Some(session.tmux_pane);
         }
     }

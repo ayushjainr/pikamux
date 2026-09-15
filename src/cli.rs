@@ -1083,6 +1083,22 @@ fn board_items_from_inventory(
                         .then(|| profile.current_state.clone()),
                     topics: profile.topics.clone(),
                     freshness: Some(format!("updated {} ago", short_age(profile.updated_at))),
+                    scope_freshness: Some(format!(
+                        "updated {} ago",
+                        short_age(if profile.scope_updated_at > 0.0 {
+                            profile.scope_updated_at
+                        } else {
+                            profile.updated_at
+                        })
+                    )),
+                    current_work_freshness: Some(format!(
+                        "updated {} ago",
+                        short_age(if profile.current_state_updated_at > 0.0 {
+                            profile.current_state_updated_at
+                        } else {
+                            profile.updated_at
+                        })
+                    )),
                 });
             BoardItem {
                 expert,
@@ -1147,18 +1163,14 @@ fn append_cached_fleet(
     match cached {
         Ok(cached) => {
             for remote in cached.sessions {
+                let expert = ExpertAnnotation::from_remote(&remote);
                 items.push(BoardItem {
                     session: remote.session,
                     node_id: Some(remote.node_id),
                     node_name: Some(remote.node_name),
                     stale: remote.stale,
                     pending_token: None,
-                    expert: remote.card_detail.map(|detail| ExpertAnnotation {
-                        scope: Some(detail),
-                        current_work: None,
-                        topics: Vec::new(),
-                        freshness: remote.card_status,
-                    }),
+                    expert,
                 });
             }
             health.extend(
@@ -1316,6 +1328,7 @@ fn peek_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
 }
 
 fn board_action_driver(pika: Pika) -> monitor::ActionDriver {
+    let preview_pika = pika.clone();
     monitor::ActionDriver::local(move |action| match action {
         BoardAction::Peek(item) => board_peek_report(&pika, &item),
         BoardAction::Untrack(item) => {
@@ -1336,6 +1349,21 @@ fn board_action_driver(pika: Pika) -> monitor::ActionDriver {
             Ok(report)
         }
         _ => bail!("This action requires the main terminal."),
+    })
+    .with_preview(move |item, cancellation| {
+        if cancellation.is_cancelled() {
+            bail!("Preview cancelled");
+        }
+        if item.node_id.is_some() {
+            let remote = exact_remote(&preview_pika, &item)?;
+            return FleetManager::new(
+                &preview_pika.store,
+                SshTransport::new("ssh", Duration::from_secs(5), Duration::from_secs(10)),
+            )
+            .capture_cancellable(&remote, 100, &cancellation)
+            .map_err(anyhow::Error::from);
+        }
+        preview_pika.capture_exact(&item.session, 100)
     })
 }
 
@@ -4107,6 +4135,9 @@ mod consultation_jsonl_schema_tests {
             seen_at: 1.0,
             card_status: None,
             card_detail: None,
+            expert_scope: None,
+            expert_current_work: None,
+            expert_topics: Vec::new(),
             watched: true,
             availability: Some("source-available".into()),
             scope_updated_at: None,
@@ -5649,6 +5680,9 @@ mod fleet_consultation_tests {
             seen_at: 1.0,
             card_status: None,
             card_detail: None,
+            expert_scope: None,
+            expert_current_work: None,
+            expert_topics: Vec::new(),
             watched: true,
             availability: Some("source-available".into()),
             scope_updated_at: None,
@@ -5759,6 +5793,9 @@ mod fleet_consultation_tests {
             seen_at: 1.0,
             card_status: None,
             card_detail: None,
+            expert_scope: None,
+            expert_current_work: None,
+            expert_topics: Vec::new(),
             watched: true,
             availability: Some("source-available".into()),
             scope_updated_at: None,
@@ -6069,6 +6106,9 @@ done
             seen_at: 1.0,
             card_status: None,
             card_detail: None,
+            expert_scope: None,
+            expert_current_work: None,
+            expert_topics: Vec::new(),
             watched: true,
             availability: Some("source-available".into()),
             scope_updated_at: None,

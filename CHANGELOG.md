@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.17 — See the work without leaving the board
+
+- Show recent output from the selected live pane automatically, keeping unread
+  state intact. Selection never asks a model or interrupts the agent.
+- Give questions and recent output priority, with remembered expertise leading
+  parked conversations. Adapt the rail to thread names and terminal width.
+- Show genuine remote expertise instead of card-health diagnostics. Keep durable
+  scope and current work separate, each with its own observation age.
+- Preserve indentation and line breaks in previews, remove hidden terminal
+  control payloads, and discard late replies after selection changes.
+
 ## 0.6.16 — A clearer board, an easier return
 
 - Keep automatically discovered conversations off the board until selected;

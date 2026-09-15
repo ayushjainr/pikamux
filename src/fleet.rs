@@ -285,6 +285,10 @@ pub struct FleetSession {
     pub seen_at: f64,
     pub card_status: Option<String>,
     pub card_detail: Option<String>,
+    /// Provider-authored expertise, never the card-health diagnostic above.
+    pub expert_scope: Option<String>,
+    pub expert_current_work: Option<String>,
+    pub expert_topics: Vec<String>,
     pub watched: bool,
     pub availability: Option<String>,
     pub scope_updated_at: Option<f64>,
@@ -2773,11 +2777,21 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
     }
 
     pub fn capture(&self, session: &FleetSession, lines: usize) -> Result<String, FleetError> {
-        let response = self.session_request(
+        self.capture_cancellable(session, lines, &CancellationToken::default())
+    }
+
+    pub fn capture_cancellable(
+        &self,
+        session: &FleetSession,
+        lines: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<String, FleetError> {
+        let response = self.session_request_cancellable(
             session,
             "peek",
             false,
             Some(json!({"lines":lines.clamp(1, 2000)})),
+            cancellation,
         )?;
         exact_fields(
             object(&response, "Remote peek receipt is malformed")?,
@@ -2792,12 +2806,15 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                 "Remote peek receipt is malformed",
             ));
         }
-        wire_string(response.get("text"), "peek text", MAX_MESSAGE_BYTES)?.ok_or_else(|| {
-            FleetError::new(
+        match response.get("text") {
+            Some(Value::String(text)) if text.len() <= MAX_MESSAGE_BYTES => {
+                Ok(sanitize_terminal_lines(text))
+            }
+            _ => Err(FleetError::new(
                 FleetErrorKind::Quarantined,
                 "Remote peek receipt is malformed",
-            )
-        })
+            )),
+        }
     }
 
     pub fn acknowledge(&self, session: &FleetSession) -> Result<bool, FleetError> {
@@ -3039,6 +3056,23 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
         mutating: bool,
         extra: Option<Value>,
     ) -> Result<Value, FleetError> {
+        self.session_request_cancellable(
+            session,
+            op,
+            mutating,
+            extra,
+            &CancellationToken::default(),
+        )
+    }
+
+    fn session_request_cancellable(
+        &self,
+        session: &FleetSession,
+        op: &str,
+        mutating: bool,
+        extra: Option<Value>,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, FleetError> {
         let node = self
             .store
             .get_fleet_node(&session.node_id)?
@@ -3059,7 +3093,8 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
         ) {
             target.extend(source);
         }
-        self.transport.request(&node.ssh_target, &payload, mutating)
+        self.transport
+            .request_cancellable(&node.ssh_target, &payload, mutating, cancellation)
     }
 
     fn snapshot_request(&self, node: &FleetNode) -> Result<Value, FleetError> {
@@ -4545,6 +4580,9 @@ mod receiver_clock_tests {
             seen_at: 0.0,
             card_status: None,
             card_detail: None,
+            expert_scope: None,
+            expert_current_work: None,
+            expert_topics: Vec::new(),
             watched: true,
             availability: Some("source-available".into()),
             scope_updated_at: None,
@@ -4896,6 +4934,17 @@ fn cached_fleet_session(
     card: Option<&Map<String, Value>>,
     profile: Option<&Map<String, Value>>,
 ) -> FleetSession {
+    // The wire already carries bounded profiles separately from card-health
+    // receipts. Re-parse that evidence at this cache boundary: older snapshots
+    // may omit it, and a mismatched projection must not borrow another UUID's
+    // expertise. Parsing also strips provider-controlled terminal sequences.
+    let profile = profile
+        .and_then(|value| profile_from_wire(&Value::Object(value.clone())).ok())
+        .map(|value| value.profile)
+        .filter(|value| {
+            value.provider == session.provider && value.session_id == session.session_id
+        });
+    let nonempty = |value: &str| (!value.trim().is_empty()).then(|| value.to_owned());
     FleetSession {
         node_id: node.node_id.clone(),
         node_name: node.alias.clone(),
@@ -4911,6 +4960,14 @@ fn cached_fleet_session(
             .and_then(|value| value.get("detail"))
             .and_then(Value::as_str)
             .map(str::to_owned),
+        expert_scope: profile.as_ref().and_then(|value| nonempty(&value.summary)),
+        expert_current_work: profile
+            .as_ref()
+            .and_then(|value| nonempty(&value.current_state)),
+        expert_topics: profile
+            .as_ref()
+            .map(|value| value.topics.clone())
+            .unwrap_or_default(),
         watched: card
             .and_then(|value| value.get("watched"))
             .and_then(Value::as_bool)
@@ -4920,12 +4977,14 @@ fn cached_fleet_session(
             .and_then(Value::as_str)
             .map(str::to_owned),
         scope_updated_at: profile
-            .and_then(|value| value.get("scope_updated_at"))
-            .and_then(Value::as_f64)
+            .as_ref()
+            .map(|value| value.scope_updated_at)
+            .filter(|value| *value > 0.0)
             .map(|value| receiver_clock_timestamp(seen_at, remote_captured_at, value)),
         current_state_updated_at: profile
-            .and_then(|value| value.get("current_state_updated_at"))
-            .and_then(Value::as_f64)
+            .as_ref()
+            .map(|value| value.current_state_updated_at)
+            .filter(|value| *value > 0.0)
             .map(|value| receiver_clock_timestamp(seen_at, remote_captured_at, value)),
         current_state_status: card
             .and_then(|value| value.get("current_state_status"))
@@ -5606,6 +5665,101 @@ pub fn sanitize_terminal_text(value: &str) -> String {
         if matches!(ch, '\n' | '\r') {
             result.push(' ')
         } else if ch == '\t' || !ch.is_control() {
+            result.push(ch)
+        }
+    }
+    result
+}
+
+/// Pane evidence preserves rows, but strips terminal programs and their hidden
+/// payloads. A truncated control string fails closed through the end of input.
+pub fn sanitize_terminal_lines(value: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum Escape {
+        None,
+        Start,
+        Intermediate,
+        Csi,
+        String { osc: bool },
+        StringEnd { osc: bool },
+    }
+    let mut state = Escape::None;
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        // CAN/SUB abort a terminal sequence without displaying its payload.
+        if matches!(ch, '\x18' | '\x1a') {
+            state = Escape::None;
+            continue;
+        }
+        if ch == '\x1b' && matches!(state, Escape::Csi | Escape::Intermediate) {
+            state = Escape::Start;
+            continue;
+        }
+        match state {
+            Escape::Start => {
+                state = match ch {
+                    '[' => Escape::Csi,
+                    ']' => Escape::String { osc: true },
+                    'P' | 'X' | '^' | '_' => Escape::String { osc: false },
+                    '\x1b' => Escape::Start,
+                    ' '..='/' => Escape::Intermediate,
+                    _ => Escape::None,
+                };
+                continue;
+            }
+            Escape::Intermediate => {
+                if ('0'..='~').contains(&ch) {
+                    state = Escape::None;
+                }
+                continue;
+            }
+            Escape::Csi => {
+                if ('@'..='~').contains(&ch) {
+                    state = Escape::None;
+                }
+                continue;
+            }
+            Escape::String { osc } => {
+                if ch == '\u{9c}' || (osc && ch == '\x07') {
+                    state = Escape::None;
+                } else if ch == '\x1b' {
+                    state = Escape::StringEnd { osc };
+                }
+                continue;
+            }
+            Escape::StringEnd { osc } => {
+                state = if matches!(ch, '\\' | '\u{9c}') || (osc && ch == '\x07') {
+                    Escape::None
+                } else if ch == '\x1b' {
+                    Escape::StringEnd { osc }
+                } else {
+                    Escape::String { osc }
+                };
+                continue;
+            }
+            Escape::None => {}
+        }
+        state = match ch {
+            '\x1b' => Escape::Start,
+            '\u{9b}' => Escape::Csi,
+            '\u{9d}' => Escape::String { osc: true },
+            '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => Escape::String { osc: false },
+            _ => Escape::None,
+        };
+        if !matches!(state, Escape::None) {
+            continue;
+        }
+        if ch == '\n' {
+            result.push('\n')
+        } else if ch == '\r' && chars.peek() == Some(&'\n') {
+            // Normalize a CRLF row ending without adding a visible space.
+        } else if ch == '\r' {
+            result.push(' ')
+        } else if ch == '\t'
+            || (!ch.is_control()
+                && !matches!(ch, '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+        {
             result.push(ch)
         }
     }

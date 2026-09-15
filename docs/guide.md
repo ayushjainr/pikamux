@@ -339,8 +339,11 @@ inventory refresh is in flight, selected oldest-attempt-first from due machines;
 there is no artificial gap while more machines are due, and selection affects
 only an explicit manual refresh. A machine whose SSH latency pushes the serial
 fleet past the 45-second freshness budget is honestly marked `CACHED`; it never
-blocks typing, local state, or quitting. Remote
-pane tails are fetched only after explicit `p`, and remote side questions keep
+blocks typing, local state, or quitting. The selected live pane gets a bounded,
+read-only preview without marking its output read. Remote previews refresh at
+most once every fifteen seconds; changing selection cancels the previous request
+and discards late replies. Stale or unbound rows are not sampled. Press `p` for a
+larger preview. Remote side questions keep
 one ephemeral SSH/JSONL process for all follow-ups. Stale rows move to a
 `PARKED` section with a `cached` label, lose actionable attention status, retain their last-success age,
 and never disappear merely because a machine is offline.

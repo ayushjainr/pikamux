@@ -56,7 +56,11 @@ Provider-authored work updates and durable scope retain their card age; ordinary
 selection never generates a summary or interviews an agent. `d` opens full
 identity, ownership metadata and the unabridged card. Missing pane bookkeeping
 is not a permanent warning: actual blocked opening gets exact recovery steps.
-The panel keeps UUID-bound actions and an explicit read-only preview. Narrow terminals fall
+The panel keeps UUID-bound actions and automatically samples only the selected
+eligible pane. Output remains in memory, preserves unread state and never invokes
+a model. Recent output gets space before secondary expertise; parked rows lead
+with remembered scope. The rail adapts to names rather than consuming a fixed
+fraction of a wide screen. Narrow terminals fall
 back to the sortable table and selected-workstream detail band, removing
 secondary columns before truncating identity or state. Below the supported
 minimum, show the required dimensions and retain a visible quit path. A
@@ -280,8 +284,14 @@ The monitor's local two-second reconciliation never performs SSH. It keeps at
 most one bounded remote inventory request in flight and replaces a node's cache
 only after receiving and validating a complete versioned snapshot. Failed,
 truncated, incompatible, or identity-mismatched responses preserve the last-good
-snapshot and make its age/error visible. Remote pane previews are never polled;
-`p` launches one explicit background fetch. Remote side questions use one SSH
+snapshot and make its age/error visible. Selected-pane previews use a separate
+single-flight worker: selection settles for 250 ms before capture; local captures
+refresh no faster than two seconds, remote captures fifteen seconds, and failures
+thirty seconds. Selection changes cancel prior work and fence late results by
+generation and exact node/provider/UUID/pane identity. Stale, pending, and unbound
+rows never trigger automatic capture. The worker retains only a bounded recent
+tail in memory, strips terminal programs, and does not acknowledge unread output.
+`p` opens a larger explicit preview. Remote side questions use one SSH
 JSONL process for the consultation lifetime, and remote mutations use exact node,
 provider, and conversation UUIDs with no name fallback.
 

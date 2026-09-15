@@ -19,6 +19,7 @@ pub mod model;
 pub mod monitor;
 pub mod open_history;
 pub mod paths;
+mod preview;
 pub mod process;
 pub mod providers;
 mod quota;

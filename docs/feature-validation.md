@@ -7,6 +7,36 @@ require separate version and workflow verification.
 
 ## Conclusion
 
+### 0.6.17: selected-pane briefing
+
+Automatic preview uses one cancellable worker, a selection-generation fence and
+exact node/provider/UUID/pane identity. Only the selected eligible pane is read;
+no model call, transcript scan, durable preview cache or acknowledgement is added.
+Local refresh is bounded to two seconds, remote to fifteen seconds, and failures
+to thirty seconds. Old output remains visible during refresh; unavailable output
+is stated honestly. Control programs are removed without flattening terminal rows.
+
+The inspector adapts its rail and budgets recent output before a full expert card.
+Durable scope and current work have separate ages; remote card diagnostics cannot
+become expertise. Old snapshots with no genuine profile do not invent one.
+
+Targeted evidence: 46 monitor tests, six real-tmux board journeys, five Windows
+client contracts, eight preview-worker tests, 41 fleet contracts and five expert
+federation contracts. The open/return journey observes automatic pane output
+without pressing `p` and checks unread preservation. Layout fixtures cover
+120×24, 140×32 and 180×48 with full cards and recent output. This section records
+isolated fake-provider evidence, not a live-provider or Windows-device certificate.
+
+Release-candidate validation on macOS: all 567 native tests passed, with formatting,
+warnings-as-errors Clippy, third-party notices and RustSec checks also passing.
+Six exported terminal frames at 120×24 and 180×48 were rendered and inspected:
+no clipping or overlapping actions; larger screens retain more recent output.
+The deployment smoke fixture was corrected to publish a new authoritative Stop
+event rather than flipping an acknowledged projection bit. Both the observation
+and projected unread state remain intact after automatic capture. Independent
+adversarial review closed the multiline and compact-layout findings; publication
+and installed-machine validation remain separate gates.
+
 ### Unreleased: mouse-reporting cleanup at terminal boundaries
 
 The reported `0;55;31M`/`m` fragments match SGR mouse reports leaking into the

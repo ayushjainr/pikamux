@@ -81,17 +81,16 @@ pub fn cached_board(store: &Store) -> Result<(Vec<BoardItem>, Vec<String>)> {
     let items = cached
         .sessions
         .into_iter()
-        .map(|remote| BoardItem {
-            session: remote.session,
-            node_id: Some(remote.node_id),
-            node_name: Some(remote.node_name),
-            stale: remote.stale,
-            pending_token: None,
-            expert: remote.card_detail.map(|scope| ExpertAnnotation {
-                scope: Some(scope),
-                freshness: remote.card_status,
-                ..ExpertAnnotation::default()
-            }),
+        .map(|remote| {
+            let expert = ExpertAnnotation::from_remote(&remote);
+            BoardItem {
+                session: remote.session,
+                node_id: Some(remote.node_id),
+                node_name: Some(remote.node_name),
+                stale: remote.stale,
+                pending_token: None,
+                expert,
+            }
         })
         .collect();
     let mut health = cached
@@ -262,6 +261,7 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
         let _ = done_send.send(());
     });
     let action_path = cache_path.to_owned();
+    let preview_path = cache_path.to_owned();
     let action_stop = cancellation.clone();
     let actions = monitor::ActionDriver::new(move |action| {
         let store = Store::at(&action_path);
@@ -303,6 +303,16 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
             }
             _ => bail!("This action is not available in the client board"),
         }
+    });
+    let actions = actions.with_preview(move |item, cancellation| {
+        let store = Store::at(&preview_path);
+        let remote = exact_remote(&store, &item)?;
+        FleetManager::new(
+            &store,
+            SshTransport::new("ssh.exe", Duration::from_secs(5), Duration::from_secs(10)),
+        )
+        .capture_cancellable(&remote, 100, &cancellation)
+        .map_err(anyhow::Error::from)
     });
     let side_path = cache_path.to_owned();
     let driver = ConsultationDriver::new(move |io| {
