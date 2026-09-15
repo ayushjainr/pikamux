@@ -6,7 +6,7 @@ use crate::{
 use anyhow::Result;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{self, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute, queue,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{
@@ -712,11 +712,16 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, Hide) {
-            let _ = disable_raw_mode();
-            return Err(error.into());
-        }
-        Ok(Self)
+        let guard = Self;
+        // A previous SSH/TUI may have left mouse reporting enabled. This board
+        // does not capture mouse input, so clear it before accepting keys.
+        execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            EnterAlternateScreen,
+            Hide
+        )?;
+        Ok(guard)
     }
 }
 
@@ -725,6 +730,7 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             io::stdout(),
             EndSynchronizedUpdate,
+            DisableMouseCapture,
             Show,
             LeaveAlternateScreen,
             ResetColor
@@ -1197,6 +1203,34 @@ impl Board {
         self.items.iter().find(|item| item.key() == *key).cloned()
     }
 
+    fn disambiguated_name(&self, item: &BoardItem) -> String {
+        let name = item.session.display_name();
+        let ambiguous = item.session.name.as_ref().is_some_and(|label| {
+            self.items.iter().any(|other| {
+                other.node_id == item.node_id
+                    && other.session.provider == item.session.provider
+                    && other.session.name.as_ref() == Some(label)
+                    && other.key() != item.key()
+            })
+        });
+        let name = crate::fleet::sanitize_terminal_text(&name);
+        if ambiguous {
+            let tail: String = item
+                .session
+                .session_id
+                .chars()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("{name} · {tail}")
+        } else {
+            name
+        }
+    }
+
     fn begin_chat(&mut self, driver: Option<&ConsultationDriver>) {
         let Some(item) = self.selected() else {
             return;
@@ -1358,7 +1392,7 @@ impl Board {
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Char('?') => {
                 self.action_scroll = 0;
-                self.action_notice = Some("PIKA KEYS\n\n↑↓ / j k · select a conversation\nEnter · open the selected exact conversation\np · preview live Pika pane output; unread preserved\na · private expert consultation in this panel\nx · stop watching, after confirmation; agent stays intact\nn · open the oldest attention item\n/ · filter by name or machine\nr · refresh observations\nu · cumulative usage for the selected conversation\nU · review an available update\nPageUp / PageDown · scroll a preview or help\nEsc · dismiss panel or clear filter\nq · leave Pika\n\nPrivate consultation: Enter sends, Ctrl+J adds a newline,\nCtrl+U clears the draft, Esc closes the private side.".into());
+                self.action_notice = Some("PIKA KEYS\n\n↑↓ / j k · select a conversation\nEnter · open the selected exact conversation\np · preview live Pika pane output; unread preserved\na · private expert consultation in this panel\nd · identity details and full expert card\nx · stop watching, after confirmation; agent stays intact\nn · open the oldest attention item\n/ · filter by name or machine\nr · refresh observations\nu · cumulative usage for the selected conversation\nU · review an available update\nPageUp / PageDown · scroll a preview or help\nEsc · dismiss panel or clear filter\nq · leave Pika\n\nInside an agent: use the visible Pika return control.\nPrivate consultation: Enter sends, Ctrl+J adds a newline,\nCtrl+U clears the draft, Esc closes the private side.".into());
             }
             KeyCode::Char('u') => {
                 self.action_scroll = 0;
@@ -1381,6 +1415,38 @@ impl Board {
                         usage::format_tokens(s.cached_input_tokens),
                         usage::format_tokens(s.cache_write_tokens),
                     ));
+                }
+            }
+            KeyCode::Char('d') => {
+                self.action_scroll = 0;
+                if self
+                    .action_notice
+                    .as_deref()
+                    .is_some_and(|note| note.starts_with("CONVERSATION DETAILS"))
+                {
+                    self.action_notice = None;
+                } else if let Some(item) = self.selected() {
+                    let s = &item.session;
+                    self.action_notice = Some(format!(
+                        "CONVERSATION DETAILS · {}\n\nProvider: {}\nUUID: {}\nMachine: {}\nPath: {}\nBranch: {}\nModel: {}\nRecorded pane: {}\n\nPane records are not current identity proof. Opening and previewing revalidate the exact conversation.\n\nd / Esc returns to the briefing.",
+                        s.display_name(),
+                        s.provider,
+                        s.session_id,
+                        item.node_label().unwrap_or("this machine"),
+                        s.cwd.as_deref().unwrap_or("not recorded"),
+                        s.branch.as_deref().unwrap_or("not recorded"),
+                        s.model.as_deref().unwrap_or("not recorded"),
+                        s.tmux_pane.as_deref().unwrap_or("none"),
+                    ));
+                    if let Some(expert) = &item.expert {
+                        self.action_notice.as_mut().unwrap().push_str(&format!(
+                            "\n\nEXPERT CARD · {}\n\nUseful for\n{}\n\nLast work update\n{}\n\nTopics\n{}",
+                            expert.freshness.as_deref().unwrap_or("age unknown"),
+                            expert.scope.as_deref().unwrap_or("not recorded"),
+                            expert.current_work.as_deref().unwrap_or("not recorded"),
+                            expert.topics.join(" · "),
+                        ));
+                    }
                 }
             }
             KeyCode::Esc => {
@@ -1513,7 +1579,23 @@ impl Board {
     }
 
     fn draw(&self, output: &mut impl Write, width: u16, height: u16) -> Result<()> {
-        queue!(output, MoveTo(0, 0), Clear(ClearType::All))?;
+        if std::env::var_os("NO_COLOR").is_some() {
+            let mut frame = Vec::new();
+            self.draw_frame(&mut frame, width, height)?;
+            output.write_all(&without_colors(&frame))?;
+            return Ok(());
+        }
+        self.draw_frame(output, width, height)
+    }
+
+    fn draw_frame(&self, output: &mut impl Write, width: u16, height: u16) -> Result<()> {
+        queue!(
+            output,
+            SetAttribute(Attribute::Reset),
+            ResetColor,
+            MoveTo(0, 0),
+            Clear(ClearType::All)
+        )?;
         if self.update_prompt {
             return self.draw_update_prompt(output, usize::from(width), height);
         }
@@ -1538,22 +1620,20 @@ impl Board {
             .iter()
             .filter(|item| item_group(item) == "PARKED")
             .count();
-        styled(output, Color::Red, true, "PIKA // LIVE OPERATIONS")?;
+        styled(output, Color::Red, true, "PIKA")?;
         let update = self
             .update_version
             .as_deref()
             .map(|version| format!(" · update {version} · U review"))
             .unwrap_or_default();
-        queue!(
+        draw_status_summary(
             output,
-            Print(fit(
-                &format!(
-                    "  {needs} need you · {working} working · {ready} ready · {parked} parked{update}"
-                ),
-                width.saturating_sub(24)
-            )),
-            Print("\r\n")
+            [needs, working, ready, parked],
+            &update,
+            width.saturating_sub(6),
+            std::env::var_os("NO_COLOR").is_none(),
         )?;
+        queue!(output, Print("\r\n"))?;
 
         let list_width = if width >= 100 {
             width.min(160) * 36 / 100
@@ -1598,7 +1678,13 @@ impl Board {
                 ""
             };
             let usable = list_width.saturating_sub(12);
-            let label = format!("{}{}{}{}", session.display_name(), node, pending, stale);
+            let label = format!(
+                "{}{}{}{}",
+                self.disambiguated_name(item),
+                node,
+                pending,
+                stale
+            );
             let row = format!(
                 "{marker} {provider} {:<width$} {age:>5}",
                 truncate(&label, usable),
@@ -1818,159 +1904,114 @@ impl Board {
     ) -> Result<()> {
         let session = &item.session;
         let available = width.saturating_sub(x + 1);
-        queue!(
+        queue!(output, MoveTo(x as u16, 2))?;
+        styled(
             output,
-            MoveTo(x as u16, 2),
-            SetAttribute(Attribute::Bold),
-            Print(fit(&session.display_name(), available)),
-            SetAttribute(Attribute::NoBold),
-            MoveTo(x as u16, 3),
-            Print(fit(
-                &format!("{} · {}", session.provider, session.status),
-                available
-            )),
-            MoveTo(x as u16, 4),
-            Print(fit(&format!("id      {}", session.session_id), available))
+            Color::Reset,
+            true,
+            &truncate(&self.disambiguated_name(item), available),
         )?;
-        let mut y = 5_u16;
-        if let Some(node) = item.node_label() {
-            detail_row(output, x, y, available, "machine", node)?;
-            y += 1;
-        }
-        if let Some(cwd) = &session.cwd {
-            detail_row(output, x, y, available, "path", cwd)?;
-            y += 1;
-        }
-        if let Some(branch) = &session.branch {
-            detail_row(output, x, y, available, "branch", branch)?;
-            y += 1;
-        }
+        let mut context = session.provider.to_string();
         if let Some(model) = &session.model {
-            detail_row(output, x, y, available, "model", model)?;
+            context.push_str(&format!(" · {model}"));
+        }
+        if let Some(node) = item.node_label() {
+            context.push_str(&format!(" · @{node}"));
+        }
+        detail_row(output, x, 3, available, "", &context)?;
+        let mut y = 4_u16;
+        if let Some(cwd) = &session.cwd {
+            // Keep a recognizable suffix, not the host's filesystem plumbing.
+            let location = project_location(cwd);
+            let location = session
+                .branch
+                .as_ref()
+                .map_or(location.clone(), |branch| format!("{location} · {branch}"));
+            detail_row(output, x, y, available, "", &location)?;
             y += 1;
         }
-        detail_row(
-            output,
-            x,
-            y,
-            available,
-            "event",
-            &format!(
-                "{} ago · last recorded activity",
-                human_age(session.last_event_at.max(session.last_activity_at))
-            ),
-        )?;
         y += 1;
-        detail_row(
+        queue!(output, MoveTo(x as u16, y))?;
+        styled(
             output,
-            x,
-            y,
-            available,
-            "home",
-            if session.tmux_pane.is_some() {
-                "Pika pane recorded · verified again before open / peek"
+            if item.stale {
+                Color::Yellow
             } else {
-                "No Pika pane recorded · Enter checks how to open safely"
+                status_color(session.status)
+            },
+            true,
+            if item.stale {
+                "CACHED"
+            } else {
+                session.status.as_str()
             },
         )?;
         y += 1;
-        let detail = session
-            .error
-            .as_deref()
-            .or(session.attention_reason.as_deref())
-            .filter(|text| !matches!(*text, "completed" | "working" | "[object Object]"))
-            .unwrap_or(match session.status {
-                Status::NeedsYou => "Waiting for your answer",
-                Status::Ready if session.unread => "Result waiting · not yet collected",
-                Status::Ready => "Ready for your next instruction",
-                Status::Working | Status::Starting => "The agent is working",
-                Status::Parked => "Saved and ready to resume",
-                Status::Unbound => "Live outside its protected home",
-                Status::OpenTwice => "Multiple exact processes detected",
-                Status::Error => "An unresolved error was recorded; open to inspect it",
-            });
-        queue!(
+        let last = session.last_event_at.max(session.last_activity_at);
+        detail_row(
             output,
-            MoveTo(x as u16, y.saturating_add(1)),
-            SetForegroundColor(status_color(session.status)),
-            Print(fit(detail, available)),
-            ResetColor
+            x,
+            y,
+            available,
+            "",
+            &if last > 0.0 {
+                format!("Last activity · {} ago", human_age(last))
+            } else {
+                "Activity time not recorded".into()
+            },
         )?;
-        y = y.saturating_add(3);
+        y += 2;
+        let bottom = height.saturating_sub(6);
+        let (heading, message) = briefing_message(item);
+        draw_briefing_block(output, x, &mut y, bottom, available, heading, message, 3)?;
         if let Some(expert) = &item.expert {
-            if let Some(freshness) = &expert.freshness {
-                detail_row(output, x, y, available, "EXPERT", freshness)?;
-                y += 1;
+            // These are provider-authored card claims, not a new summary or a
+            // live activity feed. Always keep the observation age with them.
+            if let Some(current) = &expert.current_work
+                && matches!(
+                    session.status,
+                    Status::Working | Status::Starting | Status::Ready
+                )
+            {
+                draw_briefing_block(
+                    output,
+                    x,
+                    &mut y,
+                    bottom,
+                    available,
+                    "Last work update",
+                    current,
+                    2,
+                )?;
             }
             if let Some(scope) = &expert.scope {
-                for (index, line) in wrap(scope, available.saturating_sub(8))
-                    .iter()
-                    .take(3)
-                    .enumerate()
-                {
-                    if y >= height.saturating_sub(5) {
-                        break;
-                    }
-                    detail_row(
-                        output,
-                        x,
-                        y,
-                        available,
-                        if index == 0 { "KNOWS" } else { "" },
-                        line,
-                    )?;
-                    y += 1;
-                }
+                draw_briefing_block(output, x, &mut y, bottom, available, "Useful for", scope, 2)?;
             }
-            if let Some(current) = &expert.current_work {
-                for (index, line) in wrap(current, available.saturating_sub(8))
-                    .iter()
-                    .take(3)
-                    .enumerate()
-                {
-                    if y >= height.saturating_sub(5) {
-                        break;
-                    }
-                    detail_row(
-                        output,
-                        x,
-                        y,
-                        available,
-                        if index == 0 { "NOW" } else { "" },
-                        line,
-                    )?;
-                    y += 1;
-                }
-            }
-            if !expert.topics.is_empty() && y < height.saturating_sub(5) {
+            if !expert.topics.is_empty() && y.saturating_add(1) < bottom {
                 detail_row(
                     output,
                     x,
                     y,
                     available,
-                    "TOPICS",
-                    &expert.topics.join(" · "),
+                    "",
+                    &expert
+                        .topics
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" · "),
                 )?;
+                y += 1;
             }
-        } else if height > y.saturating_add(2) {
-            queue!(
-                output,
-                MoveTo(x as u16, y),
-                SetForegroundColor(Color::DarkGrey),
-                Print(fit(
-                    "No expert card for this exact conversation yet.",
-                    available
-                )),
-                ResetColor
-            )?;
-            if y.saturating_add(1) < height.saturating_sub(5) {
-                queue!(
+            if y < bottom {
+                detail_row(
                     output,
-                    MoveTo(x as u16, y + 1),
-                    Print(fit(
-                        "Work / result summary not recorded · p previews live pane output",
-                        available
-                    ))
+                    x,
+                    y,
+                    available,
+                    "Card",
+                    expert.freshness.as_deref().unwrap_or("age unknown"),
                 )?;
             }
         }
@@ -2001,7 +2042,11 @@ impl Board {
                 MoveTo(x as u16, height.saturating_sub(3)),
                 SetForegroundColor(Color::DarkGrey),
                 Print(fit(
-                    "enter open · p preview · a consult · u usage · ? keys",
+                    if item.stale {
+                        "r refresh · d details · ? keys"
+                    } else {
+                        "Enter open · p preview · a consult · d details"
+                    },
                     available
                 )),
                 ResetColor
@@ -2030,7 +2075,7 @@ impl Board {
             SetForegroundColor(Color::Magenta),
             SetAttribute(Attribute::Bold),
             Print(fit(&format!("PRIVATE ASK // {}", chat.name), available)),
-            SetAttribute(Attribute::NoBold),
+            SetAttribute(Attribute::NormalIntensity),
             ResetColor,
             MoveTo(x as u16, 2),
             SetForegroundColor(Color::DarkGrey),
@@ -2154,13 +2199,150 @@ fn detail_row(
     label: &str,
     value: &str,
 ) -> Result<()> {
+    queue!(output, MoveTo(x as u16, y), ResetColor)?;
+    let label = if label.is_empty() {
+        String::new()
+    } else {
+        format!("{label} · ")
+    };
+    let label = truncate(&label, width);
+    styled(output, Color::Cyan, false, &label)?;
     queue!(
         output,
-        MoveTo(x as u16, y),
-        SetForegroundColor(Color::DarkGrey),
-        Print(fit(&format!("{label:<7} {value}"), width)),
-        ResetColor
+        Print(truncate(
+            &crate::fleet::sanitize_terminal_text(value),
+            width.saturating_sub(label.width())
+        ))
     )?;
+    Ok(())
+}
+
+// Frames contain separate colour and attribute commands. Keep emphasis and
+// selection, remove colour commands only; cursor movement must stay intact.
+fn without_colors(frame: &[u8]) -> Vec<u8> {
+    let mut plain = Vec::with_capacity(frame.len());
+    let mut offset = 0;
+    while offset < frame.len() {
+        if frame[offset..].starts_with(b"\x1b[") {
+            let start = offset + 2;
+            let end = frame[start..]
+                .iter()
+                .position(|byte| !byte.is_ascii_digit() && *byte != b';')
+                .map(|length| start + length);
+            if let Some(end) = end
+                && frame[end] == b'm'
+                && std::str::from_utf8(&frame[start..end]).is_ok_and(|codes| {
+                    codes
+                        .split(';')
+                        .filter_map(|code| code.parse::<u8>().ok())
+                        .any(|code| matches!(code, 30..=49 | 90..=107))
+                })
+            {
+                offset = end + 1;
+                continue;
+            }
+        }
+        plain.push(frame[offset]);
+        offset += 1;
+    }
+    plain
+}
+
+fn project_location(path: &str) -> String {
+    let parts: Vec<_> = path
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return path.to_owned();
+    }
+    parts[parts.len().saturating_sub(2)..].join("/")
+}
+
+fn briefing_message(item: &BoardItem) -> (&'static str, &str) {
+    if item.stale {
+        return (
+            "Last observation",
+            "Refresh this machine before opening or consulting.",
+        );
+    }
+    let s = &item.session;
+    let reason = s.attention_reason.as_deref().filter(|text| {
+        !text.trim().is_empty() && !matches!(*text, "completed" | "working" | "[object Object]")
+    });
+    match s.status {
+        Status::NeedsYou => (
+            "Needs your answer",
+            reason.unwrap_or("Open the conversation to see the question."),
+        ),
+        Status::Ready => (
+            "Ready to continue",
+            reason.unwrap_or(if s.unread {
+                "New output is waiting. Open it, or preview without marking it read."
+            } else {
+                "Open when you're ready to continue."
+            }),
+        ),
+        Status::Working => (
+            "In progress",
+            reason.unwrap_or("No activity detail recorded. Preview the live output for more."),
+        ),
+        Status::Starting => (
+            "Opening",
+            "The agent is starting. Its first update has not arrived yet.",
+        ),
+        Status::Parked => ("", ""),
+        Status::OpenTwice => (
+            "Opening blocked",
+            "More than one process claims this conversation. Open for exact recovery steps.",
+        ),
+        Status::Unbound => (
+            "Running elsewhere",
+            "Open to check how to reconnect safely.",
+        ),
+        Status::Error => (
+            "Needs a check",
+            s.error
+                .as_deref()
+                .filter(|text| !text.trim().is_empty() && *text != "[object Object]")
+                .or(reason)
+                .unwrap_or("An error was recorded. Open for recovery steps."),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_briefing_block(
+    output: &mut impl Write,
+    x: usize,
+    y: &mut u16,
+    bottom: u16,
+    width: usize,
+    heading: &str,
+    text: &str,
+    max_lines: usize,
+) -> Result<()> {
+    if text.trim().is_empty() || y.saturating_add(3) >= bottom {
+        return Ok(());
+    }
+    queue!(output, MoveTo(x as u16, *y))?;
+    styled(output, Color::Cyan, true, &truncate(heading, width))?;
+    *y += 1;
+    let lines = wrap(&crate::fleet::sanitize_terminal_text(text), width);
+    // Reserve a line for the card's age, even on shorter terminals.
+    let count = max_lines
+        .min(usize::from(bottom.saturating_sub(*y + 2)))
+        .min(lines.len());
+    for (index, line) in lines.iter().take(count).enumerate() {
+        let line = if index + 1 == count && count < lines.len() {
+            format!("{}…", truncate(line, width.saturating_sub(1)))
+        } else {
+            line.clone()
+        };
+        detail_row(output, x, *y, width, "", &line)?;
+        *y += 1;
+    }
+    *y += 1;
     Ok(())
 }
 
@@ -2228,6 +2410,38 @@ fn group_color(value: &str) -> Color {
     }
 }
 
+fn draw_status_summary(
+    output: &mut impl Write,
+    [needs, working, ready, parked]: [usize; 4],
+    update: &str,
+    mut width: usize,
+    colors: bool,
+) -> Result<()> {
+    for (text, color) in [
+        ("  ".to_owned(), Color::Reset),
+        (format!("{needs} need you"), group_color("NEEDS YOU")),
+        (" · ".to_owned(), Color::Reset),
+        (format!("{working} working"), group_color("WORKING")),
+        (" · ".to_owned(), Color::Reset),
+        (format!("{ready} ready"), group_color("READY")),
+        (" · ".to_owned(), Color::Reset),
+        (format!("{parked} parked"), group_color("PARKED")),
+        (update.to_owned(), Color::Reset),
+    ] {
+        if width == 0 {
+            break;
+        }
+        let visible = truncate(&text, width);
+        width = width.saturating_sub(UnicodeWidthStr::width(visible.as_str()));
+        if colors {
+            styled(output, color, false, &visible)?;
+        } else {
+            queue!(output, Print(visible))?;
+        }
+    }
+    Ok(())
+}
+
 fn phase_color(phase: ChatPhase) -> Color {
     match phase {
         ChatPhase::Opening | ChatPhase::Waiting | ChatPhase::Closing => Color::Yellow,
@@ -2270,7 +2484,7 @@ fn styled(output: &mut impl Write, color: Color, bold: bool, value: &str) -> Res
     }
     queue!(output, Print(value))?;
     if bold {
-        queue!(output, SetAttribute(Attribute::NoBold))?;
+        queue!(output, SetAttribute(Attribute::NormalIntensity))?;
     }
     queue!(output, ResetColor)?;
     Ok(())
@@ -2635,6 +2849,50 @@ mod tests {
 
     fn board(status: Status) -> Board {
         Board::new(vec![BoardItem::local(session(status))])
+    }
+
+    #[test]
+    fn board_heading_is_just_pika_with_status_counts_retained() {
+        let mut output = Vec::new();
+        board(Status::Working).draw(&mut output, 120, 35).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("PIKA"));
+        assert!(!rendered.contains("LIVE OPERATIONS"));
+        assert!(rendered.contains("1 working"));
+    }
+
+    #[test]
+    fn status_summary_matches_section_colors_and_keeps_separators_neutral() {
+        let mut output = Vec::new();
+        draw_status_summary(&mut output, [1, 1, 5, 20], "", 120, true).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        for (text, color) in [
+            ("1 need you", Color::Red),
+            ("1 working", Color::Cyan),
+            ("5 ready", Color::Green),
+            ("20 parked", Color::DarkGrey),
+            (" · ", Color::Reset),
+        ] {
+            assert!(rendered.contains(&format!("{}{text}", SetForegroundColor(color))));
+        }
+    }
+
+    #[test]
+    fn status_summary_is_bounded_and_supports_plain_text() {
+        let mut output = Vec::new();
+        let update = " · update 0.7.0 · U review";
+        draw_status_summary(&mut output, [1, 1, 5, 20], update, 120, false).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("  1 need you · 1 working · 5 ready · 20 parked{update}")
+        );
+        for width in 0..60 {
+            let mut output = Vec::new();
+            draw_status_summary(&mut output, [1, 1, 5, 20], update, width, false).unwrap();
+            let rendered = String::from_utf8(output).unwrap();
+            assert!(UnicodeWidthStr::width(rendered.as_str()) <= width);
+            assert!(!rendered.contains('\x1b'));
+        }
     }
 
     #[test]
@@ -3191,10 +3449,127 @@ mod tests {
         let mut rendered = Vec::new();
         board.draw(&mut rendered, 120, 30).unwrap();
         let rendered = String::from_utf8(rendered).unwrap();
-        assert!(rendered.contains("EXPERT  CURRENT"));
-        assert!(rendered.contains("KNOWS   factor publication"));
-        assert!(rendered.contains("NOW     validating monthly outputs"));
-        assert!(rendered.contains("TOPICS  parquet · S3"));
+        assert!(rendered.contains("CURRENT"));
+        assert!(rendered.contains("Useful for"));
+        assert!(rendered.contains("factor publication"));
+        assert!(rendered.contains("Last work update"));
+        assert!(rendered.contains("validating monthly outputs"));
+        assert!(rendered.contains("parquet · S3"));
+    }
+
+    #[test]
+    fn briefing_keeps_plumbing_in_details_without_changing_open_identity() {
+        let mut item = BoardItem::local(session(Status::Parked));
+        item.session.cwd = Some("/mnt/users/ajain/tracker/db".into());
+        item.expert = Some(ExpertAnnotation {
+            scope: Some("Agent consultation and exact recovery".into()),
+            freshness: Some("updated 32d ago".into()),
+            ..ExpertAnnotation::default()
+        });
+        let id = item.session.session_id.clone();
+        let mut board = Board::new(vec![item.clone()]);
+        let mut frame = Vec::new();
+        board.draw(&mut frame, 140, 32).unwrap();
+        let rendered = String::from_utf8(frame).unwrap();
+        assert!(rendered.contains("tracker/db"));
+        assert!(rendered.contains("Useful for"));
+        assert!(rendered.contains("updated 32d ago"));
+        assert!(!rendered.contains(&id));
+        assert!(!rendered.contains("No Pika pane"));
+        assert!(!rendered.contains("/mnt/users/ajain"));
+        assert!(
+            !rendered.contains("\x1b[21m"),
+            "SGR 21 becomes double underline on common terminals"
+        );
+        assert!(rendered.contains("\x1b[22m"));
+        assert_eq!(board.key(key(KeyCode::Char('d')), None), None);
+        let details = board.action_notice.as_deref().unwrap();
+        assert!(details.contains(&id));
+        assert!(details.contains("/mnt/users/ajain/tracker/db"));
+        assert!(details.contains("Agent consultation and exact recovery"));
+        board.key(key(KeyCode::Esc), None);
+        assert_eq!(
+            board.key(key(KeyCode::Enter), None),
+            Some(BoardAction::Open(item))
+        );
+    }
+
+    #[test]
+    fn briefing_uses_state_specific_evidence_and_never_fabricates_a_result() {
+        let mut item = BoardItem::local(session(Status::NeedsYou));
+        item.session.attention_reason = Some("Approval required for publication".into());
+        assert_eq!(
+            briefing_message(&item),
+            ("Needs your answer", "Approval required for publication")
+        );
+        item.session.status = Status::Ready;
+        item.session.attention_reason = Some("completed".into());
+        item.session.unread = true;
+        assert!(briefing_message(&item).1.contains("New output is waiting"));
+        item.session.status = Status::Working;
+        item.session.attention_reason = None;
+        assert!(
+            briefing_message(&item)
+                .1
+                .contains("No activity detail recorded")
+        );
+        item.stale = true;
+        assert_eq!(briefing_message(&item).0, "Last observation");
+        item.stale = false;
+        item.session.status = Status::Parked;
+        assert_eq!(briefing_message(&item), ("", ""));
+        assert_eq!(project_location(r"C:\Users\user\tracker\db"), "tracker/db");
+    }
+
+    #[test]
+    fn no_color_preserves_selection_emphasis_cursor_and_unicode() {
+        let input =
+            b"\x1b[0m\x1b[2;3H\x1b[7m\x1b[38;5;14mPika\x1b[39m\x1b[27m\x1b[1mheading\x1b[22m";
+        let output = without_colors(input);
+        assert_eq!(
+            output,
+            b"\x1b[0m\x1b[2;3H\x1b[7mPika\x1b[27m\x1b[1mheading\x1b[22m"
+        );
+        assert_eq!(without_colors("← Pika".as_bytes()), "← Pika".as_bytes());
+    }
+
+    #[test]
+    fn briefings_fit_short_terminals_and_disambiguate_only_colliding_names() {
+        let mut first = BoardItem::local(session(Status::Working));
+        first.session.cwd = Some("/tmp/project".into());
+        first.expert = Some(ExpertAnnotation {
+            scope: Some("A long but evidence-backed description. ".repeat(40)),
+            current_work: Some("A provider-authored work update. ".repeat(40)),
+            freshness: Some("updated 32d ago".into()),
+            topics: vec!["one".into(), "two".into(), "three".into()],
+        });
+        let mut second = first.clone();
+        second.session.session_id = "22222222-2222-4222-8222-222222222222".into();
+        let board = Board::new(vec![first.clone(), second.clone()]);
+        assert_eq!(board.disambiguated_name(&first), "thread · 11111111");
+        assert_eq!(board.disambiguated_name(&second), "thread · 22222222");
+        let cursor = regex::Regex::new("\\x1b\\[([0-9]+);([0-9]+)H").unwrap();
+        for (width, height) in [(100, 16), (100, 20), (120, 25), (140, 32), (80, 24)] {
+            let mut output = Vec::new();
+            board.draw(&mut output, width, height).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            for capture in cursor.captures_iter(&output) {
+                assert!(
+                    capture[1].parse::<u16>().unwrap() <= height,
+                    "content below terminal"
+                );
+                assert!(
+                    capture[2].parse::<u16>().unwrap() <= width,
+                    "content outside terminal"
+                );
+            }
+            if width >= 100 && height >= 20 {
+                assert!(
+                    output.contains("updated 32d ago"),
+                    "card text must retain its age"
+                );
+            }
+        }
     }
 
     #[test]

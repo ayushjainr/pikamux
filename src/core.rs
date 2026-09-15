@@ -682,11 +682,61 @@ impl Pika {
                 |candidate| !excluded.contains(&(candidate.provider, candidate.session_id.clone())),
             ));
         }
+        candidates.extend(
+            self.unconfirmed_candidates()?
+                .into_iter()
+                .filter(|candidate| {
+                    candidate
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| !name.trim().is_empty())
+                        && !excluded.contains(&(candidate.provider, candidate.session_id.clone()))
+                }),
+        );
+        let mut seen = BTreeSet::new();
+        candidates
+            .retain(|candidate| seen.insert((candidate.provider, candidate.session_id.clone())));
         candidates.sort_by(|left, right| right.updated_at.total_cmp(&left.updated_at));
         candidates.dedup_by(|left, right| {
             left.provider == right.provider && left.session_id == right.session_id
         });
         Ok(candidates)
+    }
+
+    fn unconfirmed_candidates(&self) -> Result<Vec<Candidate>> {
+        let providers = Providers::new(&self.paths, &self.config);
+        let mut sessions = self.store.list_unconfirmed_sessions()?;
+        sessions.sort_by(|a, b| b.last_activity_at.total_cmp(&a.last_activity_at));
+        sessions.truncate(200);
+        let states = providers.source_states(&sessions);
+        Ok(sessions
+            .into_iter()
+            .filter(|session| {
+                !matches!(
+                    states.get(&(session.provider, session.session_id.clone())),
+                    Some(
+                        crate::providers::ProviderSourceState::Archived
+                            | crate::providers::ProviderSourceState::Deleted
+                    )
+                )
+            })
+            .map(|session| Candidate {
+                provider: session.provider,
+                session_id: session.session_id,
+                name: session.name,
+                cwd: session.cwd,
+                branch: session.branch,
+                transcript_path: session.transcript_path,
+                model: session.model,
+                created_at: session.created_at,
+                updated_at: session.last_activity_at,
+                live: false,
+                pid: None,
+                source: "unconfirmed-observation".into(),
+                parent_session_id: None,
+                lifecycle_status: None,
+            })
+            .collect())
     }
 
     /// Return a bounded second-screen inventory of conversations without an
@@ -701,20 +751,23 @@ impl Pika {
             .into_iter()
             .chain(self.store.list_untracked_sessions()?)
             .map(|session| (session.provider, session.session_id))
-            .chain(Provider::ALL.into_iter().flat_map(|provider| {
-                providers
-                    .import_candidates(provider)
+            .chain(
+                self.import_named()?
                     .into_iter()
-                    .map(move |candidate| (candidate.provider, candidate.session_id))
-            }))
+                    .map(|candidate| (candidate.provider, candidate.session_id)),
+            )
             .collect();
         let mut candidates = Provider::ALL
             .into_iter()
             .flat_map(|provider| providers.browse(provider))
+            .chain(self.unconfirmed_candidates()?)
             .filter(|candidate| {
                 !excluded.contains(&(candidate.provider, candidate.session_id.clone()))
             })
             .collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        candidates
+            .retain(|candidate| seen.insert((candidate.provider, candidate.session_id.clone())));
         candidates.sort_by(|left, right| right.updated_at.total_cmp(&left.updated_at));
         candidates.dedup_by(|left, right| {
             left.provider == right.provider && left.session_id == right.session_id
@@ -747,6 +800,7 @@ impl Pika {
         // ambiguous choices have no side effect; `open_session` removes only
         // the exact selected tombstone immediately before the open action.
         sessions.extend(self.store.list_untracked_sessions()?);
+        sessions.extend(self.store.list_unconfirmed_sessions()?);
         let mut known: BTreeSet<(Provider, String)> = sessions
             .iter()
             .map(|item| (item.provider, item.session_id.clone()))
@@ -886,6 +940,20 @@ impl Pika {
             .store
             .reconcile_transaction(|ledger| identity_owners(session, processes, ledger, now()))?;
         let identity_pids = owners.pids();
+        if identity_pids.len() > 1 {
+            let pids = identity_pids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            bail!(
+                "OPEN TWICE · {}\nMore than one {} client claims this conversation.\nInspect the observed copies: `ps -p {} -o pid,ppid,tty,args`\nExit the extra copy normally, then run: `pika open {}`\nNo process was stopped.",
+                receipt_text(&session.display_name()),
+                session.provider,
+                pids,
+                shell_words::quote(&format!("{}:{}", session.provider, session.session_id)),
+            );
+        }
         if identity_pids.len() != 1 {
             bail!(
                 "Pika cannot bind the pane to one exact {} process (found {}). No pane action was performed.",
@@ -2031,6 +2099,21 @@ fn identity_owners(
             owners.leases.insert(owner.pid);
         }
     }
+    // Direct argv detection already folds runtime launchers into their native
+    // children. A hook lease or recovery certificate must not reintroduce the
+    // same launcher as a second client when the evidence sets are combined.
+    let canonical: BTreeSet<_> = process::canonical_identity_pids(&owners.pids(), processes)
+        .into_iter()
+        .collect();
+    owners.direct.retain(|pid| canonical.contains(pid));
+    owners.leases.retain(|pid| canonical.contains(pid));
+    if owners
+        .recovery
+        .as_ref()
+        .is_some_and(|owner| !canonical.contains(&owner.pid))
+    {
+        owners.recovery = None;
+    }
     Ok(owners)
 }
 
@@ -2219,6 +2302,55 @@ mod tests {
             created_at: 1.0,
             lifecycle_status: Some(Status::Working),
         })
+    }
+
+    #[test]
+    fn unconfirmed_legacy_rows_are_selectable_without_automatic_board_membership() {
+        let (_root, pika) = test_pika();
+        let mut named = test_session("named");
+        named.managed = false;
+        named.source = "external".into();
+        pika.store.upsert_session(&named, false).unwrap();
+        let mut unnamed = named.clone();
+        unnamed.session_id = "unnamed".into();
+        unnamed.name = None;
+        pika.store.upsert_session(&unnamed, false).unwrap();
+        assert!(pika.store.list_sessions().unwrap().is_empty());
+        let choices = pika.import_named().unwrap();
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].session_id, "named");
+        let recent = pika.import_recent_unnamed(20).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].session_id, "unnamed");
+        pika.adopt_candidate(&choices[0]).unwrap();
+        assert_eq!(pika.store.list_sessions().unwrap().len(), 1);
+        assert!(pika.import_named().unwrap().is_empty());
+        assert_eq!(pika.import_recent_unnamed(20).unwrap().len(), 1);
+        assert!(pika.store.list_untracked_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_open_confirms_unconfirmed_identity_even_if_launch_is_blocked() {
+        let (_root, pika) = test_pika();
+        let mut external = test_session("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+        external.managed = false;
+        external.source = "external".into();
+        pika.store.upsert_session(&external, false).unwrap();
+        let choices = pika.resolve_local("portfolio_review").unwrap();
+        assert_eq!(choices.len(), 1);
+        assert!(
+            pika.store.list_sessions().unwrap().is_empty(),
+            "lookup is read-only"
+        );
+        // The fixture tmux cannot create a pane. Choice is durable even when
+        // the later launch fails; there is no automatic launch retry.
+        assert!(pika.open_session(choices[0].clone(), false).is_err());
+        assert!(
+            pika.store
+                .is_watched(external.provider, &external.session_id)
+                .unwrap()
+        );
+        assert!(pika.store.list_unconfirmed_sessions().unwrap().is_empty());
     }
 
     #[test]
@@ -2885,6 +3017,88 @@ mod tests {
                 .live_owners(Provider::Codex, identity)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn certified_launcher_does_not_reappear_as_a_second_native_client() {
+        let (_root, pika) = test_pika();
+        let identity = "11111111-1111-4111-8111-111111111111";
+        let mut session = test_session(identity);
+        pika.store.upsert_session(&session, false).unwrap();
+        pika.store
+            .bind_launch("launcher-token", Provider::Codex, identity)
+            .unwrap();
+        let certificate = crate::store::RecoveryOwner {
+            provider: Provider::Codex,
+            session_id: identity.into(),
+            pid: 2,
+            start_time: 20,
+            launch_token: "launcher-token".into(),
+            created_at: now(),
+        };
+        pika.store.set_recovery_owner(&certificate).unwrap();
+        pika.store
+            .set_live_owner(&LiveOwner {
+                provider: Provider::Codex,
+                session_id: identity.into(),
+                pid: 2,
+                start_time: Some(20),
+                owner_token: "launcher-lease".into(),
+                last_seen: now(),
+            })
+            .unwrap();
+        let mut processes = BTreeMap::from([
+            (1, record(1, None, 10, &["sh"])),
+            (
+                2,
+                record(2, Some(1), 20, &["node", "/bin/codex", "resume", identity]),
+            ),
+            (
+                3,
+                record(3, Some(2), 30, &["/vendor/codex", "resume", identity]),
+            ),
+            (4, record(4, None, 40, &["codex", "resume", identity])),
+        ]);
+        let owners = pika
+            .store
+            .reconcile_transaction(|ledger| identity_owners(&session, &processes, ledger, now()))
+            .unwrap();
+        assert_eq!(owners.pids(), BTreeSet::from([3, 4]));
+        pika.reconcile_one(&mut session, &[tagged_pane(identity)], &processes)
+            .unwrap();
+        assert_eq!(session.status, Status::OpenTwice);
+        processes.remove(&4);
+        pika.reconcile_one(&mut session, &[tagged_pane(identity)], &processes)
+            .unwrap();
+        assert_eq!(session.home_state, "exact");
+        assert_ne!(session.status, Status::OpenTwice);
+        let owners = pika
+            .store
+            .reconcile_transaction(|ledger| identity_owners(&session, &processes, ledger, now()))
+            .unwrap();
+        assert_eq!(owners.pids(), BTreeSet::from([3]));
+        assert!(owners.proves_pane(3, &tagged_pane(identity)));
+        // Suppress only duplicate observation; don't destroy the launch receipt.
+        assert!(
+            pika.store
+                .get_recovery_owner(Provider::Codex, identity)
+                .unwrap()
+                .is_some()
+        );
+        // A reused PID invalidates the stored generation even if a new runtime
+        // launcher happens to own the same argv. Fresh direct evidence is separate.
+        processes.get_mut(&2).unwrap().start_time = 25;
+        let owners = pika
+            .store
+            .reconcile_transaction(|ledger| identity_owners(&session, &processes, ledger, now()))
+            .unwrap();
+        assert_eq!(owners.pids(), BTreeSet::from([3]));
+        assert!(
+            pika.store
+                .get_recovery_owner(Provider::Codex, identity)
+                .unwrap()
+                .is_none()
         );
     }
 

@@ -10,6 +10,34 @@ use std::{
 pub const FOREGROUND_ENV: &str = "PIKA_TERMINAL_FOREGROUND";
 pub const BACKGROUND_ENV: &str = "PIKA_TERMINAL_BACKGROUND";
 pub const WINDOWS_TERMINAL_DA2: &[u8] = b"\x1b[>0;10;1c";
+
+/// DEC mouse-reporting modes are separate from termios. A child or failed SSH
+/// connection can leave them enabled even after normal typing is restored.
+/// Own this guard only around interactive handoffs, never JSONL or hook output.
+pub(crate) struct MouseReportingGuard(bool);
+
+impl MouseReportingGuard {
+    pub(crate) fn new(interactive: bool) -> Self {
+        use std::io::IsTerminal;
+        let guard =
+            Self(interactive && std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+        guard.reset();
+        guard
+    }
+
+    fn reset(&self) {
+        if self.0 {
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+        }
+    }
+}
+
+impl Drop for MouseReportingGuard {
+    fn drop(&mut self) {
+        // Do not flush input: queued ordinary keystrokes belong to the user.
+        self.reset();
+    }
+}
 #[cfg(unix)]
 const PALETTE_QUERY: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
 
@@ -720,6 +748,7 @@ where
     let prior = unsafe { prior.assume_init() };
     let _signals = BridgeSignalGuard::install()?;
     let mut terminal = TerminalModeGuard::new(input, prior)?;
+    let _mouse_reporting = MouseReportingGuard::new(true);
     let mut color_filter = palette.map(ColorQueryFilter::new);
     let mut input_filter = suppress_da2.then(|| ExactInputFilter::new(&[WINDOWS_TERMINAL_DA2]));
     let mut on_handoff = Some(on_handoff);

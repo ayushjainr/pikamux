@@ -682,10 +682,10 @@ fn drive_board(
             memory.notice = match apply(action) {
                 Ok(0) => None,
                 Ok(code) => Some(format!(
-                    "OPEN RETURNED · {identity}\nThe terminal handoff ended with status {code}.\nNo launch was automatically retried. Press Esc, check the selected row, then Enter to open it with fresh identity checks."
+                    "OPEN RETURNED · {identity}\nThe terminal handoff ended with status {code}.\n\nEsc back · r refresh. No automatic retry."
                 )),
                 Err(error) => Some(format!(
-                    "OPEN NEEDS ATTENTION · {identity}\n\n{error:#}\n\nNo launch was automatically retried. Press Esc, check the selected row, then Enter to open it with fresh identity checks."
+                    "OPEN NEEDS ATTENTION · {identity}\n\n{error:#}\n\nEsc back · r refresh after resolving the cause. No automatic retry."
                 )),
             };
         } else {
@@ -1613,6 +1613,7 @@ fn resolve_structural_local(
         .list_sessions()?
         .into_iter()
         .chain(pika.store.list_untracked_sessions()?)
+        .chain(pika.store.list_unconfirmed_sessions()?)
         .filter(|session| provider.is_none_or(|value| session.provider == value))
         .collect::<Vec<_>>();
     if include_provider_candidates {
@@ -1683,6 +1684,7 @@ fn resolve_expert_local(pika: &Pika, name: &str) -> Result<Vec<Session>> {
         let root = repository_root(&current);
         let mut sessions = pika.store.list_sessions()?;
         sessions.extend(pika.store.list_untracked_sessions()?);
+        sessions.extend(pika.store.list_unconfirmed_sessions()?);
         sessions.retain(|session| {
             session
                 .cwd
@@ -2333,7 +2335,8 @@ fn adopt(pika: &Pika, name: &str) -> Result<i32> {
 
 fn experts(pika: &Pika, a: QueryArgs) -> Result<i32> {
     let mut tracked = pika.store.list_sessions()?;
-    let unwatched = pika.store.list_untracked_sessions()?;
+    let mut unwatched = pika.store.list_untracked_sessions()?;
+    unwatched.extend(pika.store.list_unconfirmed_sessions()?);
     let untracked = unwatched
         .iter()
         .map(|s| (s.provider, s.session_id.clone()))
@@ -2461,7 +2464,8 @@ fn expert(pika: &Pika, a: ExpertArgs) -> Result<i32> {
         }
         ExpertCommand::Status { json } => {
             let mut sessions = pika.store.list_sessions()?;
-            let unwatched = pika.store.list_untracked_sessions()?;
+            let mut unwatched = pika.store.list_untracked_sessions()?;
+            unwatched.extend(pika.store.list_unconfirmed_sessions()?);
             let untracked = unwatched
                 .iter()
                 .map(|session| (session.provider, session.session_id.clone()))
@@ -3072,7 +3076,8 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
             }
         }
     }
-    if !a.no_import && (first_setup || explicit_import) {
+    let has_unconfirmed = !a.no_import && !pika.store.list_unconfirmed_sessions()?.is_empty();
+    if !a.no_import && (first_setup || explicit_import || has_unconfirmed) {
         let named = pika.import_named()?;
         let mut selected = if a.import_all {
             named
@@ -3081,7 +3086,7 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
         };
         let browse_recent = a.browse_all
             || (!a.import_all
-                && first_setup
+                && (first_setup || has_unconfirmed)
                 && io::stdin().is_terminal()
                 && confirm("Browse recent provider-labeled conversations too? [y/N] ")?);
         if browse_recent {
@@ -3156,6 +3161,7 @@ fn choose_candidates(c: Vec<crate::model::Candidate>) -> Result<Vec<crate::model
         return Ok(Vec::new());
     }
     println!("\nNamed conversations available to watch:");
+    println!("Names may be provider-generated. Only your selections are added to the board.");
     for (i, x) in c.iter().enumerate() {
         println!(
             "  {:>2}. {:<8} {:<28} {}",
@@ -5328,7 +5334,13 @@ impl FleetService for LocalFleetService<'_> {
         }
         let mut expert_sessions = Vec::new();
         if expert_directory {
-            for session in self.pika.store.list_untracked_sessions()? {
+            for session in self
+                .pika
+                .store
+                .list_untracked_sessions()?
+                .into_iter()
+                .chain(self.pika.store.list_unconfirmed_sessions()?)
+            {
                 if self
                     .pika
                     .store
@@ -5870,6 +5882,20 @@ mod fleet_consultation_tests {
         assert!(
             pika.store
                 .is_untracked(session.provider, &session.session_id)
+                .unwrap()
+        );
+        let mut unconfirmed = session.clone();
+        unconfirmed.session_id = "22222222-2222-4222-8222-222222222222".into();
+        unconfirmed.name = Some("unconfirmed_expert".into());
+        unconfirmed.managed = false;
+        pika.store.upsert_session(&unconfirmed, false).unwrap();
+        let matches = resolve_expert_local(&pika, "unconfirmed_expert").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].session_id, unconfirmed.session_id);
+        assert!(
+            !pika
+                .store
+                .is_watched(unconfirmed.provider, &unconfirmed.session_id)
                 .unwrap()
         );
     }

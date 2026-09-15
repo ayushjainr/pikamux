@@ -1793,6 +1793,7 @@ impl FleetTransport for SshTransport {
         arguments: &[String],
         tty: bool,
     ) -> Result<i32, FleetError> {
+        let _mouse_reporting = crate::terminal::MouseReportingGuard::new(tty);
         let status = self
             .command(&node.ssh_target, arguments, tty)?
             .status()

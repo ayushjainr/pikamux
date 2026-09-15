@@ -564,7 +564,7 @@ fn reconciliation_persists_native_rename_and_active_leaf_lifecycle() {
 }
 
 #[test]
-fn renamed_independent_codex_fork_becomes_a_distinct_watched_row() {
+fn renamed_independent_codex_fork_requires_its_own_tracking_choice() {
     let root = tempfile::tempdir().unwrap();
     let paths = paths(root.path());
     fs::create_dir_all(&paths.codex_home).unwrap();
@@ -610,6 +610,15 @@ fn renamed_independent_codex_fork_becomes_a_distinct_watched_row() {
         store,
         Tmux::with_executable("/usr/bin/false", Some("isolated".into())),
     );
+    let rows = pika.reconcile_local().unwrap().sessions;
+    assert_eq!(rows.len(), 1);
+    let candidates = pika.import_named().unwrap();
+    let fork = candidates
+        .iter()
+        .find(|candidate| candidate.session_id == fork_id)
+        .unwrap();
+    assert_eq!(fork.name.as_deref(), Some("strategy_dashboard"));
+    pika.adopt_candidate(fork).unwrap();
     let rows = pika.reconcile_local().unwrap().sessions;
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().any(|row| {

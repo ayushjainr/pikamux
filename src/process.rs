@@ -395,14 +395,28 @@ pub fn find_session_processes(
     canonical_identity_pids(&matches, processes)
 }
 
-fn canonical_identity_pids(
+pub(crate) fn canonical_identity_pids(
     matches: &BTreeSet<i64>,
     processes: &BTreeMap<i64, ProcessRecord>,
 ) -> Vec<i64> {
     let launcher_aliases: BTreeSet<i64> = matches
         .iter()
-        .filter_map(|pid| processes.get(pid).and_then(|record| record.parent_pid))
-        .filter(|parent| matches.contains(parent))
+        .filter_map(|pid| {
+            let child = processes.get(pid)?;
+            let parent = processes.get(&child.parent_pid?)?;
+            let runtime = Path::new(parent.argv.first()?).file_name()?.to_str()?;
+            // An actual provider spawning another provider is not a launcher
+            // alias. Require the known runtime shim, identical forwarded args,
+            // and a plausible parent/child generation ordering.
+            (matches.contains(&parent.pid)
+                && matches!(runtime, "node" | "nodejs" | "bun")
+                && parent.argv.len() >= 2
+                && child.provider().is_some()
+                && child.provider() == parent.provider()
+                && parent.start_time <= child.start_time
+                && parent.argv[2..] == child.argv[1..])
+                .then_some(parent.pid)
+        })
         .collect();
     matches.difference(&launcher_aliases).copied().collect()
 }
@@ -792,6 +806,23 @@ mod tests {
             find_session_processes("uuid", Provider::Codex, &records),
             vec![1, 2]
         );
+    }
+
+    #[test]
+    fn native_child_clients_and_mismatched_launchers_are_not_aliases() {
+        for parent in [
+            record(1, None, &["codex", "resume", "uuid"]),
+            record(1, None, &["node", "codex", "resume", "uuid", "--different"]),
+        ] {
+            let records = BTreeMap::from([
+                (1, parent),
+                (2, record(2, Some(1), &["codex", "resume", "uuid"])),
+            ]);
+            assert_eq!(
+                find_session_processes("uuid", Provider::Codex, &records),
+                vec![1, 2]
+            );
+        }
     }
 
     #[test]

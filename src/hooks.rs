@@ -667,12 +667,17 @@ fn handle_hook_transaction(
         store.delete_session(provider, &placeholder.session_id, false)?;
     }
 
-    let tag_request = context.pane_id.as_ref().map(|pane_id| HookTagRequest {
-        pane_id: pane_id.clone(),
-        provider,
-        session_id: canonical_id.clone(),
-        name: session.display_name(),
-    });
+    let watched = store.is_watched(provider, &canonical_id)?;
+    let tag_request = context
+        .pane_id
+        .as_ref()
+        .filter(|_| watched)
+        .map(|pane_id| HookTagRequest {
+            pane_id: pane_id.clone(),
+            provider,
+            session_id: canonical_id.clone(),
+            name: session.display_name(),
+        });
     let mut launch_certified = false;
     if let Some(token) = launch_token.as_deref() {
         if let Some(pending) = store.get_pending(token)? {
@@ -722,7 +727,8 @@ fn handle_hook_transaction(
     } else {
         None
     };
-    let alert = (session.unread
+    let alert = (watched
+        && session.unread
         && newly_actionable
         && !context.pane_attached
         && matches!(
@@ -1545,6 +1551,7 @@ mod tests {
             for newer_first in [false, true] {
                 let temp = tempfile::tempdir().unwrap();
                 let store = Store::at(temp.path().join("state/pika.db"));
+                store.restore_tracking(provider, "exact").unwrap();
                 handle_hook(
                     &store,
                     provider,

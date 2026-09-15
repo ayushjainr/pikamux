@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.16 — A clearer board, an easier return
+
+- Keep automatically discovered conversations off the board until selected;
+  retain their records and expert cards without generating false attention.
+- Simplify selected-thread briefings, colour-code status counts, and move full
+  identity and diagnostics behind **d**. Fix unintended double underlining.
+- Return from a Pika agent home using its **← Pika** control or displayed
+  function key, normally **F12**, without stopping the agent.
+- Stop counting a verified Codex launcher and its native child as two clients.
+  Genuine duplicate conversations still block opening and show exact next steps.
+- Reset mouse reporting at board and interactive handoff boundaries so clicks
+  do not keep sending terminal-control fragments into the shell.
+
 ## 0.6.15 — Reliable opening across shells
 
 - Open exact conversations on hosts whose default shell keeps a child process

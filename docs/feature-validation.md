@@ -7,6 +7,92 @@ require separate version and workflow verification.
 
 ## Conclusion
 
+### Unreleased: mouse-reporting cleanup at terminal boundaries
+
+The reported `0;55;31M`/`m` fragments match SGR mouse reports leaking into the
+shell after a terminal handoff. Termios restoration did not disable the separate
+DEC mouse modes. Board entry/teardown and interactive PTY/SSH handoff guards now
+disable mouse capture without discarding input or altering the terminal palette.
+Noninteractive handoffs do not emit cleanup escapes. Board setup also establishes
+its teardown guard before fallible terminal output.
+
+Six executable board journeys and two terminal-signal contracts passed in the
+disposable Mac environment. The PTY fixtures enable mouse reporting, then verify
+the reset follows child output on successful exit, failed exit and forwarded
+SIGTERM; canonical typing mode is restored. The fixture must consume PTY output
+while waiting: macOS TCSADRAIN otherwise waits for its absent terminal reader.
+This is not live Surface/SSH-disconnect certification, and cannot guarantee
+cleanup after SIGKILL or for SSH processes launched outside Pika. Installed
+Mac and rs6 executables remain unchanged.
+
+### Unreleased: launcher certificates cannot manufacture duplicate clients
+
+A read-only rs6 inspection of the reported `cf_perf` failure found a single
+Node launcher/native Codex child chain. Direct argv scanning folded the launcher
+away, but its valid saved recovery certificate added that PID back into the
+combined ownership set, manufacturing `OPEN TWICE` and blocking attachment.
+Ownership now canonicalizes the combined direct/lease/recovery evidence without
+deleting a still-valid certificate. Only recognized runtime launchers with
+matching forwarded arguments and plausible parent/child generations are folded;
+an actual native client spawning another native client stays distinct.
+
+Regression coverage reproduces the certificate-plus-hook-lease case, proves a
+real additional client remains blocked, verifies automatic recovery after that
+copy leaves, and rejects reused certificate generations. Core (28) and process
+(11) unit tests pass. Genuine multiple-client pane failures now name the observed
+PIDs, a read-only inspection command and the exact UUID reopen command; the board
+no longer suggests blindly retrying before resolving the cause. Live rs6 state
+and its installed 0.6.15 executable were not changed by this diagnosis or repair.
+
+### Unreleased: concise briefings and visible return navigation
+
+The heading is now `PIKA`, with status-coloured counts. The selected briefing
+leads with recognizable context and state-specific recorded evidence; short
+expert excerpts retain card age and normal text contrast. `d` exposes the full
+UUID, path, recorded pane and unabridged card. Only otherwise colliding names
+show short identity fingerprints by default. No card interview, model turn or
+new transcript read is triggered by selection. Missing question/result content
+is not fabricated. The SGR 21 bold-reset bug is corrected to SGR 22, and
+`NO_COLOR` now strips colour from the whole composed board while retaining
+selection/emphasis and cursor control.
+
+Exact Pika homes get a default-background `← Pika` strip. F12 (or the displayed
+free F11/F10 fallback) and a click return without stopping the agent. Existing
+root bindings and catch-all bindings are retained; keys pass through outside
+opted-in homes. If no control can be allocated, the strip states the limitation.
+
+Executed on the Mac in disposable environments: 43 monitor unit tests, 23 tmux
+unit tests, six executable board journeys, five identity-safety contracts and
+four real-tmux contracts passed. The actual PTY journey exercises F12, a mouse
+click, custom-F12 preservation with F11 fallback, same-pane reopening, retained
+filter and return to an existing tmux client's previous session. Layout tests
+cover widths 80–140 and heights 16–32. Formatting, diff whitespace checks and
+warnings-as-errors Clippy pass. These are fake-provider/local-terminal results,
+not screenshots or device certification for Surface, rs6 or native agent themes.
+No publication, installation, live settings or user-agent cutover occurred.
+
+### Unreleased: explicit board membership
+
+Provider names and hook events are no longer sufficient to enter the watched
+inventory. Explicit Pika selections and exact attachments record durable,
+provider/UUID-qualified receipts. Legacy managed and historical launch/attach
+evidence remain accepted; unconfirmed external records are retained separately
+and offered by setup or exact lookup, without deletion or unwatch tombstones.
+They cannot emit alerts or request pane tagging before selection. Independent
+renamed forks require their own choice; existing continuations retain their home.
+Existing expert cards remain discoverable independently of board membership.
+
+Executed evidence: the real Unix board hides an unconfirmed generated title while
+retaining its unread record; explicit lookup stays read-only and selected opening
+records consent even if launch is blocked; hooks for all three providers cannot
+subscribe through names or inherited panes; tracking survives renames and respects
+unwatch tombstones. Store, setup, discovery, identity, fleet, CLI and expert
+federation contracts pass. The concurrency-hook fixture now explicitly subscribes
+before expecting an alert. An unrelated provider-version probe timeout passed its
+isolated rerun without changing its production deadline. Formatting and
+warnings-as-errors Clippy pass. Installed copies and fleet state were not changed
+in this membership pass; deployment and hook callback updates remain separate.
+
 Installed 0.6.14 passed five isolated macOS board journeys. The same release's
 rs6 verification exposed a shell-portability defect: `sh -c 'sleep 30'` retained
 a shell parent and child, so the unchanged idle-tree safety check refused Pika's
@@ -58,15 +144,15 @@ macOS/Linux are agent hosts. Native Windows is a client, not a tmux host.
 | B15 | `u`: secondary cumulative usage view | **Executed, repaired.** Previously absent. Totals moved out of the primary inspector; accounting is explicitly not context-window size or a subscription bill. |
 | B16 | `U`: update offer, explicit Y/N, resume updated board | **Contract.** Native/Windows policy and updater tests; no installed-command cutover performed. Unix inline actions retain native updater behaviour. |
 | B17 | `q`, Escape, Ctrl-C, terminal restoration | **Executed/Contract.** PTY leave/escape and terminal-signal tests. Escape dismisses focused panels/filters; it is not universally a quit key. |
-| B18 | Inspector: identity, path, branch, model, reason, home | **Partial, improved.** Added last-recorded-event age, cautious pane wording and meaningful fallback reasons. It is not the full `explain --json` evidence view. |
-| B19 | Inspector: expert scope/current work/topics | **Partial.** Exact local card fields wrap instead of occupying one truncated line. Missing exact cards are now explicit. Remote board annotations retain less structure than the expert-search directory. |
+| B18 | Inspector: context, state-specific reason, identity details | **Contract, improved (unreleased).** Default briefing keeps metadata secondary; `d` exposes exact identity, full path/model/branch and recorded pane. It is not the full `explain --json` evidence view. |
+| B19 | Inspector: expert scope/current work/topics | **Partial, improved (unreleased).** Bounded readable excerpts retain card age; `d` exposes the full card. Remote board annotations retain less structure than the expert-search directory. |
 | B20 | Inspector: automatic selected live pane tail | **Gap.** No periodic selected-pane capture worker. Explicit `p` is implemented; automatic preview described in DESIGN/guide is not. |
 | B21 | Inspector: useful result/current-work summary without a card | **Gap.** Lifecycle words such as `completed` cannot explain the work. No independent live-work/result summary fallback exists. The board now says when no summary is recorded. |
 | B22 | Return-visit / since-last-visit briefing | **Gap.** Event history exists, but the documented visit-watermark briefing is not wired into the monitor. |
 | B23 | Five-minute playbook tips | **Partial.** Timer-free rotation exists, but selects generic tips by time rather than current operational context. |
 | B24 | Narrow terminal and mouse-wheel support | **Partial/Gap.** Consultation can use full width; ordinary selected detail disappears below the split threshold rather than becoming the documented detail band. Mouse events are not handled. |
 | B25 | No-flicker rendering, resize and sanitization | **Contract.** Buffered synchronized frames, dirty-frame logic, resize and hostile-text tests. Surface flicker is not live-verified by these Mac tests. |
-| B26 | `NO_COLOR` accessibility | **Gap.** Quota rendering checks it, but ordinary board styling still emits colour commands. DESIGN's global claim is too broad. |
+| B26 | `NO_COLOR` accessibility | **Contract, repaired (unreleased).** Whole-frame colour filtering preserves selection, emphasis, cursor movement and Unicode. |
 | B27 | Account quota footer | **Contract.** Codex RPC and Claude status-line/cache parsing, expiry, reset and layout fixtures. Viewing-machine scope only; missing data is unavailable, not borrowed from another machine. |
 | B28 | Cost of background observation | **Partial.** Cached-first board and bounded/single-flight workers exist. Full local discovery currently has a 20-second fallback plus store notifications; usage worker wakes every two seconds even when usage is hidden. DESIGN's visible-only 30-second accounting is not implemented. |
 

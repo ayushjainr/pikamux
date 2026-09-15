@@ -2,6 +2,7 @@
 
 use std::{
     fs::{self, File},
+    io::Read,
     os::{fd::FromRawFd, unix::process::CommandExt},
     process::{Child, Command, Stdio},
     thread,
@@ -41,6 +42,38 @@ fn wait_for(deadline: Instant, mut condition: impl FnMut() -> bool, message: &st
     }
 }
 
+fn read_pending(master: &mut File, fd: libc::c_int) -> String {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut output = Vec::new();
+    let mut buffer = [0; 4096];
+    while let Ok(count) = master.read(&mut buffer) {
+        if count == 0 {
+            break;
+        }
+        output.extend_from_slice(&buffer[..count]);
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn assert_mouse_reporting_reset(output: &str) {
+    let enabled = output
+        .rfind("\x1b[?1006h")
+        .expect("fixture never enabled SGR mouse reporting");
+    for mode in [1000, 1002, 1003, 1006, 1015] {
+        let disabled = output
+            .rfind(&format!("\x1b[?{mode}l"))
+            .expect("missing mouse reset");
+        assert!(
+            disabled > enabled,
+            "mouse reset must follow the client's output"
+        );
+    }
+}
+
 #[test]
 fn real_terminal_bridge_forwards_signals_and_restores_caller_tty() {
     let temp = tempfile::tempdir().unwrap();
@@ -50,7 +83,7 @@ fn real_terminal_bridge_forwards_signals_and_restores_caller_tty() {
     fs::write(
         &child_script,
         format!(
-            "#!/bin/sh\ntrap 'printf winch\\n >> {signals}' WINCH\ntrap 'printf tstp\\n >> {signals}' TSTP\ntrap 'printf cont\\n >> {signals}' CONT\ntrap 'printf term\\n >> {signals}; exit 0' TERM\nprintf '%s' \"$$\" > {pid}\nwhile :; do :; done\n",
+            "#!/bin/sh\ntrap 'printf winch\\n >> {signals}' WINCH\ntrap 'printf tstp\\n >> {signals}' TSTP\ntrap 'printf cont\\n >> {signals}' CONT\ntrap 'printf term\\n >> {signals}; exit 0' TERM\nprintf '\\033[?1000h\\033[?1006h'\nprintf '%s' \"$$\" > {pid}\nwhile :; do :; done\n",
             signals = shell_words::quote(&signal_log.to_string_lossy()),
             pid = shell_words::quote(&child_pid_file.to_string_lossy()),
         ),
@@ -74,7 +107,7 @@ fn real_terminal_bridge_forwards_signals_and_restores_caller_tty() {
         },
         0
     );
-    let _master = unsafe { File::from_raw_fd(master_fd) };
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
     let mut baseline = std::mem::MaybeUninit::<libc::termios>::uninit();
     assert_eq!(
@@ -137,9 +170,13 @@ fn real_terminal_bridge_forwards_signals_and_restores_caller_tty() {
 
     assert_eq!(unsafe { libc::kill(bridge_pid, libc::SIGTSTP) }, 0);
     let mut stopped = false;
+    let mut output = String::new();
     wait_for(
         Instant::now() + Duration::from_secs(3),
         || {
+            // Consume output like a terminal: macOS TCSADRAIN waits for the
+            // PTY reader before restoring typing mode.
+            output.push_str(&read_pending(&mut master, master_fd));
             let mut status = 0;
             let waited =
                 unsafe { libc::waitpid(bridge_pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
@@ -170,6 +207,7 @@ fn real_terminal_bridge_forwards_signals_and_restores_caller_tty() {
     assert_eq!(unsafe { libc::kill(bridge_pid, libc::SIGTERM) }, 0);
     let termination_deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
+        output.push_str(&read_pending(&mut master, master_fd));
         if let Some(status) = bridge.0.try_wait().unwrap() {
             break status;
         }
@@ -212,5 +250,62 @@ fn real_terminal_bridge_forwards_signals_and_restores_caller_tty() {
 
     let child_pid: libc::pid_t = fs::read_to_string(child_pid_file).unwrap().parse().unwrap();
     assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1);
+    output.push_str(&read_pending(&mut master, master_fd));
+    assert_mouse_reporting_reset(&output);
     drop(slave);
+}
+
+#[test]
+fn terminal_bridge_clears_mouse_reporting_after_normal_and_failed_child_exits() {
+    for code in [0, 7] {
+        let (mut master_fd, mut slave_fd) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let child = Command::new(env!("CARGO_BIN_EXE_pika"))
+            .args([
+                "_terminal-bridge",
+                "--foreground",
+                "255,255,255",
+                "--background",
+                "0,0,0",
+                "--",
+                "/bin/sh",
+                "-c",
+                &format!("printf '\\033[?1000h\\033[?1006h'; exit {code}"),
+            ])
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut bridge = BridgeProcess(child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = String::new();
+        loop {
+            output.push_str(&read_pending(&mut master, master_fd));
+            if let Some(status) = bridge.0.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(code));
+                break;
+            }
+            assert!(Instant::now() < deadline, "terminal cleanup stalled");
+            thread::sleep(Duration::from_millis(10));
+        }
+        output.push_str(&read_pending(&mut master, master_fd));
+        assert_mouse_reporting_reset(&output);
+        assert_ne!(terminal_flags(slave_fd) & libc::ICANON, 0);
+    }
 }

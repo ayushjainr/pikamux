@@ -59,6 +59,61 @@ fn store_fixture() -> (tempfile::TempDir, Store) {
 }
 
 #[test]
+fn provider_labels_are_not_tracking_and_explicit_choices_survive_renames() {
+    let (_temp, store) = store_fixture();
+    for provider in Provider::ALL {
+        let mut row = session("same-id", Status::Ready, true, 1.0);
+        row.provider = provider;
+        row.name = Some("Looks personally named".into());
+        row.source = "external".into();
+        row.managed = false;
+        store.upsert_session(&row, false).unwrap();
+        assert!(!store.is_watched(provider, "same-id").unwrap());
+    }
+    assert!(store.list_sessions().unwrap().is_empty());
+    assert_eq!(store.list_unconfirmed_sessions().unwrap().len(), 3);
+    assert!(store.list_untracked_sessions().unwrap().is_empty());
+    store.restore_tracking(Provider::Codex, "same-id").unwrap();
+    let mut row = store
+        .get_session(Provider::Codex, "same-id")
+        .unwrap()
+        .unwrap();
+    row.name = None;
+    row.status = Status::Parked;
+    store.upsert_session(&row, false).unwrap();
+    assert_eq!(store.list_sessions().unwrap().len(), 1);
+    assert!(store.is_watched(Provider::Codex, "same-id").unwrap());
+    assert!(!store.is_watched(Provider::Claude, "same-id").unwrap());
+    store.untrack_session(Provider::Codex, "same-id").unwrap();
+    store.upsert_session(&row, false).unwrap();
+    assert!(store.list_sessions().unwrap().is_empty());
+    assert_eq!(store.list_unconfirmed_sessions().unwrap().len(), 2);
+    store.restore_tracking(Provider::Codex, "same-id").unwrap();
+    assert_eq!(store.list_sessions().unwrap().len(), 1);
+}
+
+#[test]
+fn legacy_managed_and_exact_attach_evidence_survive_without_name_heuristics() {
+    let (_temp, store) = store_fixture();
+    let mut managed = session("managed", Status::Parked, false, 1.0);
+    managed.name = None;
+    store.upsert_session(&managed, false).unwrap();
+    let mut external = session("attached", Status::Parked, false, 1.0);
+    external.managed = false;
+    store.upsert_session(&external, false).unwrap();
+    store
+        .set_meta("last_attached", r#"["codex","attached"]"#)
+        .unwrap();
+    assert_eq!(store.list_sessions().unwrap().len(), 2);
+    // A newly recorded attachment keeps its own receipt after history advances.
+    store.record_attach(Provider::Codex, "attached").unwrap();
+    store.record_attach(Provider::Codex, "second").unwrap();
+    store.record_attach(Provider::Codex, "third").unwrap();
+    assert!(store.is_watched(Provider::Codex, "attached").unwrap());
+    assert!(store.list_unconfirmed_sessions().unwrap().is_empty());
+}
+
+#[test]
 fn initialization_is_current_wal_and_private() {
     let (_temp, store) = store_fixture();
     store.initialize().unwrap();

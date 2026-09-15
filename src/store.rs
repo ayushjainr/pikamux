@@ -39,6 +39,19 @@ const MAX_REMOTE_BOARD_CACHE_BYTES: usize = MAX_REMOTE_SNAPSHOT_BYTES + 512 * 10
 const MAX_REMOTE_EXPERT_INDEX_BYTES: usize = 2 * MAX_REMOTE_SNAPSHOT_BYTES + 512 * 1024;
 const MAX_REMOTE_CACHE_CHUNKS: usize = 128;
 
+// Names, lifecycle events and pane tags are observations, not consent to watch.
+// Retain legacy managed rows and exact historical launch/attach evidence. No
+// migration deletes uncertain rows: they remain available for explicit selection.
+const WATCH_EVIDENCE: &str = "(sessions.managed=1 OR EXISTS (SELECT 1 FROM meta WHERE key=('tracking-choice:' || sessions.provider || ':' || sessions.session_id)) OR EXISTS (SELECT 1 FROM launch_bindings b WHERE b.provider=sessions.provider AND b.session_id=sessions.session_id) OR EXISTS (SELECT 1 FROM meta WHERE key IN ('last_attached','previous_attached') AND value=json_array(sessions.provider,sessions.session_id)))";
+
+fn is_watched_connection(db: &Connection, provider: Provider, session_id: &str) -> Result<bool> {
+    Ok(db.query_row(
+        &format!("SELECT EXISTS (SELECT 1 FROM sessions WHERE provider=? AND session_id=? AND {WATCH_EVIDENCE} AND NOT EXISTS (SELECT 1 FROM untracked_sessions u WHERE u.provider=sessions.provider AND u.session_id=sessions.session_id))"),
+        params![provider.as_str(), session_id],
+        |row| row.get(0),
+    )?)
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE sessions (
     provider TEXT NOT NULL,
@@ -912,11 +925,25 @@ impl Store {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
-        self.list_sessions_query(false)
+        self.list_sessions_query(false, false)
     }
 
     pub fn list_untracked_sessions(&self) -> Result<Vec<Session>> {
-        self.list_sessions_query(true)
+        self.list_sessions_query(true, false)
+    }
+
+    /// Observed, but never confirmed for the board. This is not an unwatch
+    /// tombstone and does not discard provider data, owners, events or cards.
+    pub fn list_unconfirmed_sessions(&self) -> Result<Vec<Session>> {
+        self.list_sessions_query(false, true)
+    }
+
+    pub fn is_watched(&self, provider: Provider, session_id: &str) -> Result<bool> {
+        if !self.exists() {
+            return Ok(false);
+        }
+        let db = self.open_read()?;
+        is_watched_connection(&db, provider, session_id)
     }
 
     pub fn list_provider_hidden_sessions(&self) -> Result<Vec<Session>> {
@@ -932,17 +959,21 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn list_sessions_query(&self, untracked: bool) -> Result<Vec<Session>> {
+    fn list_sessions_query(&self, untracked: bool, unconfirmed: bool) -> Result<Vec<Session>> {
         if !self.exists() {
             return Ok(Vec::new());
         }
         let db = self.open_read()?;
         let sql = if untracked {
             "SELECT sessions.* FROM sessions JOIN untracked_sessions USING(provider,session_id)"
+                .to_owned()
         } else {
-            "SELECT sessions.* FROM sessions LEFT JOIN untracked_sessions USING(provider,session_id) WHERE untracked_sessions.session_id IS NULL"
+            format!(
+                "SELECT sessions.* FROM sessions LEFT JOIN untracked_sessions USING(provider,session_id) WHERE untracked_sessions.session_id IS NULL AND {}{WATCH_EVIDENCE}",
+                if unconfirmed { "NOT " } else { "" }
+            )
         };
-        let mut statement = db.prepare(sql)?;
+        let mut statement = db.prepare(&sql)?;
         let mut sessions = statement
             .query_map([], session_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1034,6 +1065,11 @@ impl Store {
         tx.execute(
             "DELETE FROM meta WHERE key=?",
             [provider_hidden_key(provider, session_id)],
+        )?;
+        set_meta_tx(
+            &tx,
+            &format!("tracking-choice:{provider}:{session_id}"),
+            "explicit-selection",
         )?;
         tx.commit()?;
         Ok(restored)
@@ -3172,6 +3208,10 @@ fn nonzero_or(value: f64, fallback: f64) -> f64 {
 }
 
 impl ReconcileLedger<'_> {
+    pub(crate) fn is_watched(&self, provider: Provider, session_id: &str) -> Result<bool> {
+        is_watched_connection(self.tx, provider, session_id)
+    }
+
     pub(crate) fn hide_provider_session(
         &self,
         provider: Provider,
@@ -3520,6 +3560,29 @@ impl ReconcileLedger<'_> {
 
     pub(crate) fn record_attach(&self, provider: Provider, session_id: &str) -> Result<()> {
         let tx = self.tx;
+        // Preserve legacy proof before the two-entry history rotates. These
+        // exact historical selections must not become unconfirmed later.
+        let legacy = tx
+            .prepare("SELECT value FROM meta WHERE key IN ('last_attached','previous_attached')")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for encoded in legacy {
+            if let Ok((provider_name, identity)) =
+                serde_json::from_str::<(String, String)>(&encoded)
+                && let Ok(provider) = provider_name.parse::<Provider>()
+            {
+                set_meta_tx(
+                    tx,
+                    &format!("tracking-choice:{provider}:{identity}"),
+                    "legacy-exact-attach",
+                )?;
+            }
+        }
+        set_meta_tx(
+            tx,
+            &format!("tracking-choice:{provider}:{session_id}"),
+            "exact-attach",
+        )?;
         let current = serde_json::to_string(&(provider.as_str(), session_id))?;
         let previous: Option<String> = tx
             .query_row(

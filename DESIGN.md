@@ -5,6 +5,18 @@ shows where attention is needed and opens the exact selected conversation;
 expert cards let agents discover and consult relevant project experience.
 Provider harnesses remain responsible for their conversations and history.
 
+Board membership is an explicit Pika choice, separate from provider naming.
+An open, creation or adoption keeps watching that exact provider identity;
+provider-generated names, hook events and inherited pane tags alone do not.
+Explicit selection and exact attachment receipts persist independently of later
+renames and lifecycle events. Existing managed records and historical exact
+launch/attach evidence remain watched. Other legacy external observations remain
+stored but are excluded from the board, attention queue and alerts. Setup offers
+them for selection (named first, recent unnamed second); exact-name/UUID opening
+also restores them. This is not archival, deletion or an explicit-unwatch tombstone.
+Provider names are labels, not proof that a human renamed a conversation. Hooks
+must not grant tracking to a new fork merely by inheriting its parent's pane.
+
 ## Design principles
 
 Keep identity, attention, and freshness visible. Use keyboard-first navigation
@@ -17,8 +29,9 @@ failure behind a successful-looking attachment.
 - On wide terminals, a grouped workstream rail keeps the delegation portfolio
   visible while a persistent inspector explains the selected exact identity,
   expert card, live pane tail, and available actions.
-- One stable selection band binds every action to a visible provider, name, and
-  immutable UUID fingerprint.
+- One stable selection band binds every action to an exact provider and UUID.
+  Names and machine labels are visible; otherwise colliding names also show a
+  short UUID fingerprint. Full identity evidence is available through `d`.
 - Exact/protected language requires current UUID-to-PID pane evidence. Tags,
   attachment, and liveness alone never earn it.
 - Provider launcher/native-child aliases count as one logical client. Shared
@@ -35,8 +48,15 @@ failure behind a successful-looking attachment.
 The operational topology is status → anomaly → explanation → action. On wide
 terminals, the live monitor uses a compact status header, a left rail grouped by
 attention state, and a right inspector for the selected workstream. The
-inspector presents provider UUID proof before card-derived expertise, a
-read-only selected-pane tail, and UUID-bound actions. Narrow terminals fall
+inspector leads with recognizable name, provider/model and a compact project
+location, then a state-specific briefing. Questions/reasons lead when attention
+is required; ready output is identified without inventing a result summary;
+working detail uses recorded observations. Parked expertise stays readable.
+Provider-authored work updates and durable scope retain their card age; ordinary
+selection never generates a summary or interviews an agent. `d` opens full
+identity, ownership metadata and the unabridged card. Missing pane bookkeeping
+is not a permanent warning: actual blocked opening gets exact recovery steps.
+The panel keeps UUID-bound actions and an explicit read-only preview. Narrow terminals fall
 back to the sortable table and selected-workstream detail band, removing
 secondary columns before truncating identity or state. Below the supported
 minimum, show the required dimensions and retain a visible quit path. A
@@ -99,6 +119,29 @@ and Esc closes and discards the side before returning focus to operations.
 Local selection persists by `(provider, UUID)`; federated selection persists by
 `(node UUID, provider, UUID)` across refresh and resort. The human spelling is
 `thread@machine`, while every action is freshly routed by immutable identities.
+
+Pika-owned native-agent homes show a single bottom navigation row: `← Pika`
+and the available return key, normally F12. Clicking the label or pressing the
+displayed key detaches a fresh terminal attachment; an existing tmux client
+switches back to its previous session. Neither action sends an exit command to
+the agent. The normal board loop retains selection, filter and viewport, while
+freshly checking identity on the next opening. Separate Windows agent windows
+close their attachment and leave the original board running; native window
+focus remains the terminal/OS's responsibility.
+
+Only unallocated root bindings are used (F12, then F11/F10; unused left-status
+mouse bindings). An existing catch-all or conflicting custom binding is never
+replaced. If no control is available, the strip reports that limitation rather
+than advertising a dead shortcut. Outside opted-in Pika homes, the keyboard
+input is passed through. The strip is session-local and default-background;
+it does not alter provider configuration, window styles or the agent status line.
+
+Board entry and teardown disable inherited mouse reporting, independently of
+raw typing mode. Interactive PTY and Pika-owned SSH handoffs likewise reset
+mouse reporting on entry and return, including ordinary error returns. Cleanup
+does not flush queued keyboard input or impose a palette. Uncatchable process
+termination and SSH sessions launched outside Pika are not cleanup guarantees.
+
 An unbound live process cannot be opened as if managed. Refresh errors retain
 the last good screen and identify the failure. Empty, loading, narrow, overflow,
 unread, working, ready, parked, error, unbound, remote, and cached-offline states

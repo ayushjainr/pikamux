@@ -34,6 +34,10 @@ const FORMAT_SEPARATOR: &str = r"\037";
 pub const HISTORY_LIMIT: usize = 100_000;
 pub const WINDOWS_TERMINAL_DA2_RESPONSE: &str = "\u{1b}[>0;10;1c";
 const TERMINAL_REPLY_KEY_OPTION: &str = "@pika_terminal_reply_key";
+const RETURN_CONDITION: &str = "#{&&:#{@pika_return_navigation},#{m:pika-*,#{session_name}}}";
+// An existing tmux client returns to its previous session (where the board
+// remains running). A new terminal attachment detaches back to its caller.
+const RETURN_ACTION: &str = "if-shell -F '#{client_last_session}' 'switch-client -l' detach-client";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const STDOUT_LIMIT: usize = 16 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
@@ -353,6 +357,122 @@ impl Tmux {
         Ok(())
     }
 
+    /// A tiny session-local navigation strip, separate from the provider's TUI.
+    /// Root bindings are allocated only when free; outside an opted-in Pika
+    /// home the same key is passed through, and existing bindings are retained.
+    fn configure_return_navigation(&self, pane: &Pane) -> Result<()> {
+        if !is_pika_session(&pane.session_name) {
+            bail!("Pika will not configure a user-owned tmux pane");
+        }
+        let listed = self.output(["list-keys", "-T", "root"], true)?;
+        let bindings = String::from_utf8(listed.stdout)?;
+        let shortcut = self.return_binding(&bindings, &["F12", "F11", "F10"], false)?;
+        let mouse = self.return_binding(
+            &bindings,
+            &["MouseDown1StatusLeft", "MouseUp1StatusLeft"],
+            true,
+        )?;
+        let hint = match shortcut {
+            Some(key) => format!("{key} · agent keeps running"),
+            None if mouse.is_some() => "click to return · agent keeps running".into(),
+            None => "custom key bindings · use your detach control".into(),
+        };
+        let style = if std::env::var_os("NO_COLOR").is_some() {
+            "default"
+        } else {
+            "fg=cyan,bold"
+        };
+        let range = if mouse.is_some() {
+            "range=left"
+        } else {
+            "norange"
+        };
+        let bar = format!("#[align=left,{range},{style}] ← Pika #[default,norange]  {hint}");
+        let target = shell_words::quote(&pane.pane_id);
+        let mutation = [
+            format!("set-option -t {target} @pika_return_navigation 1"),
+            format!("set-option -t {target} status on"),
+            format!("set-option -t {target} status-position bottom"),
+            format!("set-option -t {target} status-style 'fg=default,bg=default,none'"),
+            format!(
+                "set-option -t {target} status-format[0] {}",
+                shell_words::quote(&bar)
+            ),
+        ]
+        .join(" ; ");
+        self.output(
+            [
+                "if-shell",
+                "-F",
+                "-t",
+                &pane.pane_id,
+                &pane_generation_condition(pane),
+                &mutation,
+                "run-shell 'exit 75'",
+            ],
+            true,
+        )?;
+        Ok(())
+    }
+
+    fn return_binding<'a>(
+        &self,
+        bindings: &str,
+        candidates: &[&'a str],
+        mouse: bool,
+    ) -> Result<Option<&'a str>> {
+        let parsed: Vec<_> = bindings
+            .lines()
+            .map(|line| {
+                shell_words::split(line)
+                    .unwrap_or_else(|_| line.split_whitespace().map(str::to_owned).collect())
+            })
+            .collect();
+        // An Any binding is a user-defined catch-all, not an unused key.
+        if parsed
+            .iter()
+            .any(|line| root_binding_key(line) == Some("Any"))
+        {
+            return Ok(None);
+        }
+        for key in candidates {
+            let replay = if mouse {
+                "send-keys -M".into()
+            } else {
+                format!("send-keys {key}")
+            };
+            let command = ["if-shell", "-F", RETURN_CONDITION, RETURN_ACTION, &replay];
+            if let Some(existing) = parsed
+                .iter()
+                .find(|line| root_binding_key(line) == Some(*key))
+            {
+                let key_index = existing.iter().position(|word| word == "-T").unwrap() + 2;
+                if return_command_words(existing[key_index + 1..].iter().map(String::as_str))
+                    == return_command_words(command.into_iter())
+                {
+                    return Ok(Some(key));
+                }
+                continue;
+            }
+            self.output(
+                [
+                    "bind-key",
+                    "-T",
+                    "root",
+                    key,
+                    "if-shell",
+                    "-F",
+                    RETURN_CONDITION,
+                    RETURN_ACTION,
+                    &replay,
+                ],
+                true,
+            )?;
+            return Ok(Some(key));
+        }
+        Ok(None)
+    }
+
     pub fn ensure_rgb(&self) {
         let Ok(current) = self.output(["show-options", "-s", "-v", "terminal-features"], false)
         else {
@@ -547,6 +667,7 @@ impl Tmux {
         self.ensure_terminal_reply_guard();
         self.ensure_rgb();
         self.configure_exact_home(pane)?;
+        self.configure_return_navigation(pane)?;
         let condition = pane_generation_condition(pane);
         let attach = if inside_tmux {
             format!("switch-client -t {}", shell_words::quote(&pane.pane_id))
@@ -672,6 +793,7 @@ impl Tmux {
         self.ensure_terminal_reply_guard();
         self.ensure_rgb();
         self.configure_exact_home(pane)?;
+        self.configure_return_navigation(pane)?;
         let condition = pane_generation_condition(pane);
         let attach = if inside_tmux {
             format!("switch-client -t {}", shell_words::quote(&pane.pane_id))
@@ -1191,6 +1313,35 @@ fn nonempty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+fn root_binding_key(words: &[String]) -> Option<&str> {
+    let table = words.iter().position(|word| word == "-T")?;
+    (words.get(table + 1)?.as_str() == "root")
+        .then(|| words.get(table + 2).map(String::as_str))
+        .flatten()
+}
+
+// tmux may print command arguments as either quoted strings or brace groups.
+// Normalize only our small, fixed return-command vocabulary for exact reuse.
+fn return_command_words<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut result = Vec::new();
+    for word in words {
+        if matches!(word, "{" | "}") {
+            continue;
+        }
+        if word.starts_with("if-shell ")
+            || word.starts_with("send-keys ")
+            || word.starts_with("switch-client ")
+        {
+            if let Ok(parts) = shell_words::split(word) {
+                result.extend(return_command_words(parts.iter().map(String::as_str)));
+                continue;
+            }
+        }
+        result.push(word.to_owned());
+    }
+    result
+}
+
 fn pane_generation_condition(pane: &Pane) -> String {
     let pane_pid = pane.pane_pid.to_string();
     let created = pane.created.to_string();
@@ -1444,6 +1595,94 @@ mod tests {
         fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         Tmux::with_executable(executable.to_string_lossy(), None)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn return_controls_keep_custom_keys_and_reuse_only_the_exact_owned_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("trace");
+        let tmux = tmux_fixture(
+            &temp,
+            &format!(
+                "printf '%s\\n' \"$*\" >> {}",
+                shell_words::quote(trace.to_str().unwrap())
+            ),
+        );
+        let custom = "bind-key -T root F12 display-message my-action\nbind-key -T root MouseDown1StatusLeft display-menu custom";
+        assert_eq!(
+            tmux.return_binding(custom, &["F12", "F11", "F10"], false)
+                .unwrap(),
+            Some("F11")
+        );
+        assert_eq!(
+            tmux.return_binding(
+                custom,
+                &["MouseDown1StatusLeft", "MouseUp1StatusLeft"],
+                true
+            )
+            .unwrap(),
+            Some("MouseUp1StatusLeft")
+        );
+        let calls = fs::read_to_string(&trace).unwrap();
+        assert!(calls.contains("bind-key -T root F11"));
+        assert!(!calls.contains("bind-key -T root F12"));
+        assert!(!calls.contains("bind-key -T root MouseDown1StatusLeft"));
+        assert!(!calls.contains("kill-"));
+        let own = format!(
+            "bind-key -T root F12 if-shell -F {} {} 'send-keys F12'",
+            shell_words::quote(RETURN_CONDITION),
+            shell_words::quote(RETURN_ACTION)
+        );
+        assert_eq!(
+            tmux.return_binding(&own, &["F12"], false).unwrap(),
+            Some("F12")
+        );
+        assert_eq!(
+            fs::read_to_string(&trace).unwrap(),
+            calls,
+            "reused binding should not be rewritten"
+        );
+        assert_eq!(
+            tmux.return_binding("bind-key -T root Any send-keys", &["F12"], false)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            fs::read_to_string(&trace).unwrap(),
+            calls,
+            "catch-all binding belongs to the user"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn return_strip_is_scoped_to_exact_home_and_never_restylizes_the_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("trace");
+        let tmux = tmux_fixture(
+            &temp,
+            &format!(
+                "printf '%s\\n' \"$*\" >> {}",
+                shell_words::quote(trace.to_str().unwrap())
+            ),
+        );
+        tmux.configure_return_navigation(&exact_test_pane())
+            .unwrap();
+        let calls = fs::read_to_string(&trace).unwrap();
+        assert!(calls.contains("#{@pika_session_id}"));
+        assert!(calls.contains("#{session_created}"));
+        assert!(calls.contains("status-format[0]"));
+        assert!(calls.contains("← Pika"));
+        assert!(calls.contains("F12 · agent keeps running"));
+        assert!(calls.contains("fg=default,bg=default"));
+        assert!(!calls.contains("window-style"));
+        assert!(!calls.contains("pane-border-style"));
+        assert!(!calls.contains("set-option -g"));
+        let mut foreign = exact_test_pane();
+        foreign.session_name = "my-own-session".into();
+        assert!(tmux.configure_return_navigation(&foreign).is_err());
+        assert_eq!(fs::read_to_string(&trace).unwrap(), calls);
     }
 
     #[cfg(unix)]

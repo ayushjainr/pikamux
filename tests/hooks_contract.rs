@@ -28,6 +28,34 @@ fn event(provider: Provider, id: &str, name: &str) -> pikamux::hooks::HookPayloa
     )
 }
 
+#[test]
+fn generated_titles_and_inherited_panes_cannot_subscribe_or_alert() {
+    let (_temp, store) = store();
+    for provider in Provider::ALL {
+        let mut payload = event(provider, "external-child", "Stop");
+        payload.session_title = Some("Review all MCP tools".into());
+        let mut context = HookContext::at(10.0);
+        context.pane_id = Some("%1".into());
+        context.pane_session = Some("inherited-pane".into());
+        let result = handle_hook(&store, provider, &payload, &context).unwrap();
+        assert!(result.alert.is_none());
+        assert!(result.tag_request.is_none());
+        assert!(!store.is_watched(provider, "external-child").unwrap());
+        assert!(
+            store
+                .get_session(provider, "external-child")
+                .unwrap()
+                .is_some()
+        );
+        store.restore_tracking(provider, "external-child").unwrap();
+        context.now = 20.0;
+        let result = handle_hook(&store, provider, &payload, &context).unwrap();
+        assert!(result.tag_request.is_some());
+        assert!(store.is_watched(provider, "external-child").unwrap());
+    }
+    assert_eq!(store.list_sessions().unwrap().len(), 3);
+}
+
 fn session(provider: Provider, id: &str, status: Status) -> Session {
     Session {
         provider,
@@ -231,6 +259,7 @@ fn bounded_immutable_metadata_corrects_codex_identity_and_proves_workers() {
 #[test]
 fn newest_lifecycle_wins_and_safety_remains_stronger() {
     let (_temp, store) = store();
+    store.restore_tracking(Provider::Codex, "exact").unwrap();
     let mut context = HookContext::at(20.0);
     context.desired_name = Some("research".into());
     let completed = handle_hook(

@@ -52,7 +52,8 @@ name before offering broader machine or conversation discovery. Enter
 native provider name. If an existing copy cannot be handed over safely, Pika
 shows the exact recovery steps.
 
-Detach with `Ctrl-b d` to return to setup; the agent stays running. Setup shows
+Click `← Pika` or press the return key shown beside it (normally F12) to return
+to setup; the agent stays running. Setup shows
 the command you can use any time:
 
 ```bash
@@ -122,31 +123,26 @@ existing files, preserves existing JSON key order, and merges lifecycle hooks
 into Codex and Claude user settings and installs a local OpenCode event plugin.
 On first setup it asks for the default provider, previews configuration, and
 offers one conversation recovery walkthrough. Optional machine discovery and
-broader imports follow that experience. Default import suggestions require
-explicit naming provenance, not merely a display title or a live process.
-Claude custom-title records and its custom-name registry qualify. The Codex and
-OpenCode metadata currently read by Pika does not reliably distinguish an
-automatic title from a manual rename. Setup therefore uses two separate chooser
-steps: **Personally named** first, followed by **Recent** conversations without a
-confirmed personal name. Recent shows up to ten conversations updated within the
-last fourteen days, newest first, including automatic titles and untitled sessions.
-This also includes genuine renames whose authorship cannot be established; they
-are not classified as workers or deleted. Selections from the first step carry
-forward; Enter skips selection in either step, and `q` finishes without scanning
-the next step. Older titles and unknown activity dates remain under **Browse all**
-(`b`), which does not repeat already selected conversations. `all` selects only
-the current view, never the hidden inventory.
-Existing watched/Pika-created homes remain untouched. `pika NAME` or an exact
-UUID still resolves independently of this setup suggestion filter.
-Later setup runs configure
-and verify the integration without rescanning conversation inventory or machines;
-use `--browse-all`, `--import-all`, `--machine`, or the daily `pika NAME` entry point
-when that work is intentional. `--browse-all` includes generated and unconfirmed
-titles but does not adopt them automatically; `--import-all` adds only the
-currently eligible suggestion set unless combined with `--browse-all`.
-Updated remote nodes apply the same rule. Older nodes must be updated before
-their suggestions can be called confirmed; their broader title inventory remains
-available through explicit Browse all. Archived sessions, missing histories, and
+broader imports follow that experience. Names supplied by providers do not reliably
+prove a personal rename. Setup offers **Named conversations** first and an optional
+second screen of up to twenty **Recent unnamed conversations**, newest first.
+Only your selections enter the board; `all` applies to the displayed choices.
+
+Opening, creating or adopting a conversation through Pika records your choice
+independently of its name. Existing managed conversations and exact historical
+launch/attach evidence remain watched. Other legacy external observations stay
+stored but no longer appear on the board or emit alerts. Setup offers these
+unconfirmed records for selection, including on a later commissioning run.
+`pika NAME` or `pika open UUID` also restores the exact selected conversation.
+Nothing is deleted, and existing expert cards remain discoverable independently
+of board membership. Renaming alone cannot subscribe a new independent fork.
+
+Use `--browse-all` to include the second screen, `--import-all` to select eligible
+named candidates, or both to include recent unnamed candidates too. Use
+`--no-import` to configure integrations without conversation selection. Machine
+selection remains separate. Each host enforces its own tracking choices; older
+hosts need updating before their board inventory follows this rule.
+Archived sessions, provider-confirmed deleted histories, and
 subordinate Codex threads (`thread_source=subagent`, including native
 side work) and short-lived workers from known automation harness origins are
 also excluded. Pika reads only immutable `session_meta` provenance and requires
@@ -574,8 +570,10 @@ Starting and cached states use row labels rather than additional sections.
 A quiet board distinguishes checked machines from
 stale or unavailable ones, so completion does not create an inbox-clearing chore.
 On wide terminals it uses a grouped workstream rail and a selected-workstream
-inspector inspired by a live operations board: exact identity, signal, thread
-expertise, read-only pane tail, and actions remain visible together. Narrow terminals
+briefing: the selected conversation's state, recorded reason, expertise and
+available actions. The project location is abbreviated; `d` reveals its full
+path, exact identity, recorded pane and complete expert card. Card content keeps
+its observation age and is not presented as a live summary. Narrow terminals
 retain the compact table view. Use arrows or j/k to select, Enter to open the
 selected identity, and `a` to focus an ephemeral multi-turn side consultation
 inside the Pika panel for that exact identity. Press `A` instead for the faster
@@ -584,12 +582,12 @@ terminals; narrow terminals use a focused full-width side panel.
 Inside the side, type normally, press Enter to send, Ctrl+J for a newline,
 Ctrl+U to clear the draft, arrows to scroll, and Esc to close and discard the
 side without leaving Pika. Use `n` for the oldest attention item, `p` for a full
-sanitized pane peek, `u` to reveal or hide provider usage, `r` to reconcile
+sanitized pane peek, `d` for details, `u` for provider usage, `r` to reconcile
 immediately, `?` for keys, and `q` to leave from the operations view.
 Press `x` to stop watching the selected workstream. Pika asks for confirmation
 inside the panel, then removes that identity from Live Operations while leaving its
 agent process, provider conversation, and thread profile intact. This differs from
-tmux's `Ctrl-b d`, which only detaches your current view and keeps the workstream
+`← Pika`, which only returns your current view and keeps the workstream
 on Pika. An untracked live hook cannot silently add the row back; explicitly
 open its native ID or adopt the conversation when you want Pika to watch it again.
 An `unbound:%pane` placeholder cannot be removed until Pika learns the immutable
@@ -606,7 +604,12 @@ every five minutes without spending provider quota. The selected-pane tail is
 read-only, transcript-free, and never acknowledges unread work. Selection
 remains stable by provider identity even when a status change reorders rows.
 Use `/` to filter. Selection, filter and viewport are preserved while opening a
-native agent and returning by detach. Refresh can explicitly regroup the display.
+native agent and returning with `← Pika` or its displayed key (normally F12).
+Pika preserves existing tmux bindings and selects F11/F10 if F12 is occupied;
+your terminal may require its Fn key to send a function key. Clicking is an
+alternative. The navigation strip leaves the agent's native interface and
+terminal background intact. In a separate agent window, returning leaves the
+original board open. Refresh can explicitly regroup the display.
 The inspector's `WHY` explanation shares its evidence with
 `pika explain NAME --json`: lifecycle, runtime and safety observations determine
 the winning rule. A live process alone does not prove a working turn. Remote

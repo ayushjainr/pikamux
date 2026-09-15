@@ -1,27 +1,20 @@
-Open your agent. Return to your place.
+Your agents, a clearer board, an easier way back.
 
-This patch fixes opening conversations on hosts using shells such as `dash`.
-Pika now creates a single-process launch holder explicitly, without relaxing
-its checks against replacing another running process.
-
-Pika now returns to the same board selection and filter after you detach from a
-native agent. If opening fails, the explanation stays in the board. An uncertain
-launch is never automatically repeated.
-
-- Recover from transient verification conflicts during local and remote opens,
-  while retaining exact-conversation checks.
-- Preview pane output with **p** without leaving the board or marking work read.
-  Saved conversations without a live pane get a clear explanation.
-- Use **?** for keyboard help, **u** for cumulative usage, and **x** to stop
-  watching a conversation without stopping its agent.
-- See recorded activity, pane availability and explicit missing-card information
-  in the inspector.
-- Connect through SSH aliases that define their own remote command, including
-  hosts where Pika is installed outside the noninteractive shell's PATH.
-- Read structured OpenCode errors instead of an object placeholder.
+- **Watch what you choose.** Automatically discovered conversations no longer
+  join the board or generate attention just because they have a title. Existing
+  explicit selections remain watched; other records and expert cards are retained.
+- **See what matters.** Colour-coded counts and concise briefings replace the
+  dense inspector. Press **d** for full identity, paths and expert-card details.
+  Unintended double underlining is fixed; your terminal background is preserved.
+- **Return without stopping work.** Pika agent homes show **← Pika** and a return
+  key, normally **F12**. Click or use the displayed key to return while the agent
+  keeps running. Existing custom bindings are preserved.
+- **Open the right conversation.** A Codex launcher and its native child are no
+  longer mistaken for two separate clients. Genuine duplicates still fail closed,
+  with specific inspection and recovery commands.
+- **Leave the terminal clean.** Board and interactive handoff cleanup now disable
+  leftover mouse reporting without discarding typed input.
 
 Update from the board's **Update now? [y/N]** offer, or run `pika update`.
-Each machine updates independently; running conversations remain intact.
-
-The OpenCode hook improvement takes effect after reviewing and applying
-`pika setup` on the host. Updating the executable alone does not rewrite hooks.
+Each machine updates independently. Existing agents and conversations are not
+restarted; reopen the board to use the new interface.

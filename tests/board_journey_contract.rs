@@ -79,6 +79,10 @@ impl BoardProcess {
             "INSERT INTO sessions(provider,session_id,name,status,unread,managed,source,created_at,updated_at,last_event_at,last_activity_at) VALUES ('codex','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','audit_saved','READY',1,1,'fixture',1,1,1,1)",
             [],
         ).unwrap();
+        db.execute(
+            "INSERT INTO sessions(provider,session_id,name,status,unread,managed,source,created_at,updated_at,last_event_at,last_activity_at) VALUES ('codex','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','Generated provider title','READY',1,0,'external',1,1,1,1)",
+            [],
+        ).unwrap();
         drop(db);
         let (mut master, mut slave) = (-1, -1);
         let mut size = libc::winsize {
@@ -155,6 +159,27 @@ impl BoardProcess {
         self.terminal.write_all(keys).unwrap();
     }
 
+    fn tmux(&self, args: &[&str]) -> String {
+        let output = Command::new(self.root.path().join("bin/tmux"))
+            .env_clear()
+            .env("HOME", self.root.path().join("home"))
+            .env("TMUX_TMPDIR", self.root.path().join("sockets"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.root.path().join("bin").display()),
+            )
+            .args(["-L", "board-journey"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
     fn await_text(&mut self, expected: &str) {
         let deadline = Instant::now() + Duration::from_secs(6);
         loop {
@@ -188,9 +213,20 @@ impl BoardProcess {
             // Drain pending frames while waiting: a real terminal consumes
             // output continuously, and a full PTY must not manufacture a hang.
             let mut bytes = [0; 32768];
-            let _ = self.terminal.read(&mut bytes);
+            if let Ok(count) = self.terminal.read(&mut bytes) {
+                self.output
+                    .push_str(&String::from_utf8_lossy(&bytes[..count]));
+            }
             if let Some(status) = self.child.try_wait().unwrap() {
                 assert!(status.success());
+                // Drain bytes written between the last read and process exit.
+                while let Ok(count) = self.terminal.read(&mut bytes) {
+                    if count == 0 {
+                        break;
+                    }
+                    self.output
+                        .push_str(&String::from_utf8_lossy(&bytes[..count]));
+                }
                 break;
             }
             assert!(Instant::now() < deadline, "board did not quit");
@@ -205,6 +241,14 @@ impl BoardProcess {
             unsafe { flags.assume_init() }.c_lflag & libc::ICANON,
             0,
             "terminal left raw"
+        );
+        assert!(
+            self.output.contains("\x1b[?1006l"),
+            "SGR mouse reporting left enabled"
+        );
+        assert!(
+            self.output.contains("\x1b[?1000l"),
+            "click reporting left enabled"
         );
     }
 }
@@ -235,10 +279,15 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
     board.send(b"/audit\r");
     board.await_text("FILTER audit");
     let mut original_pane = None;
-    for _ in 0..2 {
+    // Exercise both user-facing routes, not tmux's prefix sequence.
+    for return_keys in [
+        b"\x1b[24~".as_slice(),
+        b"\x1b[<0;3;32M\x1b[<0;3;32m".as_slice(),
+    ] {
         board.send(b"\r");
         board.await_text("CONTINUITY PROVEN");
-        board.send(b"\x02d");
+        board.await_text("agent keeps running");
+        board.send(return_keys);
         board.await_text("FILTER audit");
         assert!(board.child.try_wait().unwrap().is_none());
         let store = Store::at(board.root.path().join("state/pika.db"));
@@ -256,6 +305,45 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
             original_pane = Some(session.tmux_pane);
         }
     }
+    // Preserve a user's F12 binding; the strip must advertise and use F11.
+    board.tmux(&[
+        "bind-key",
+        "-T",
+        "root",
+        "F12",
+        "display-message",
+        "my-custom-F12",
+    ]);
+    board.send(b"\r");
+    board.await_text("F11");
+    board.send(b"\x1b[23~");
+    board.await_text("FILTER audit");
+    assert!(
+        board
+            .tmux(&["list-keys", "-T", "root"])
+            .contains("my-custom-F12")
+    );
+
+    // For an existing tmux client, return to its previous session rather than
+    // detaching the whole terminal. No agent is killed by either route.
+    board.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "origin",
+        "printf 'ORIGINAL BOARD\\n'; exec sleep 30",
+    ]);
+    board.send(b"\r");
+    board.await_text("F11");
+    let target = original_pane.flatten().unwrap();
+    board.tmux(&["switch-client", "-t", "origin"]);
+    board.tmux(&["switch-client", "-t", &target]);
+    board.send(b"\x1b[23~");
+    board.await_text("ORIGINAL BOARD");
+    // Only fixture teardown uses tmux's conventional detach; the user-facing
+    // return above has already landed on the originating session.
+    board.tmux(&["detach-client"]);
+    board.await_text("FILTER audit");
     board.finish();
 }
 
@@ -274,6 +362,23 @@ fn failed_open_returns_to_filtered_board_without_replaying_the_action() {
     assert!(board.child.try_wait().unwrap().is_none());
     board.send(b"\x1b");
     board.await_text("FILTER audit");
+    board.finish();
+}
+
+#[test]
+fn board_excludes_unconfirmed_provider_titles_without_deleting_the_record() {
+    let mut board = BoardProcess::start();
+    assert!(!board.output.contains("Generated provider title"));
+    let store = Store::at(board.root.path().join("state/pika.db"));
+    let external = store
+        .get_session(
+            pikamux::model::Provider::Codex,
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        )
+        .unwrap()
+        .unwrap();
+    assert!(external.unread);
+    assert_eq!(store.list_unconfirmed_sessions().unwrap().len(), 1);
     board.finish();
 }
 
