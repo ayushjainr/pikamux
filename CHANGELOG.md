@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.13 — Return to the same board
+## 0.6.14 — Return to the same board
 
 - Return to your selected conversation and filter after detaching from a native
   agent. Keep failed opens in the board without automatically repeating a launch.

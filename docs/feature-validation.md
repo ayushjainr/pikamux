@@ -2,7 +2,7 @@
 
 Audit: 2026-09-14, against `37d9b7c` / 0.6.12 plus the local repairs described below.
 This is a contributor audit, not a fleet-installation certificate. The repairs
-described here are included in the 0.6.13 release candidate; installed machines
+described here are included in the 0.6.14 release candidate; installed machines
 require separate version and workflow verification.
 
 ## Conclusion
