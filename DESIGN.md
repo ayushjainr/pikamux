@@ -161,15 +161,18 @@ cache projection. Each subscription has its own cursor; slower consumers take
 the latest snapshot rather than accumulating a backlog. Observation continues
 through attachment without another inventory scan per view.
 Old reconciliation reads are fenced at handoff before exact opening proceeds.
-The return strip ends with the newest non-stale `NEEDS YOU` conversation's name
-and remote machine, within that same filter. It uses the winning lifecycle event
+The return strip ends with the newest non-stale attention item's name
+and remote machine, within that same filter. An agent request uses `↑ name`;
+opening warnings use `⚠ name · reason` (`open twice`, `error`, or `outside Pika`).
+Counts and suffix share the same attention categories, without implying that an
+ownership problem is an agent-authored question. It uses the winning event
 time with an immutable-identity tie-breaker, never row order or cache refresh time.
-READY, ownership errors, pending launches and stale rows cannot become this label.
+READY, pending launches and stale rows cannot become this label.
 It remains until resolved or superseded; no animation or extra observation is
 needed. Narrow clients shorten the label, then omit it before navigation/counts.
 There is no second inventory on the destination. Across SSH, one service-owned
 stream per destination sends bounded counts and, with `board-feed-v2`, an inert
-display name to an exact-node-verified
+request name; `board-feed-v3` additionally carries an allowlisted warning kind to an exact-node-verified
 endpoint. Its random feed identity is bound to the exact tmux client and pane;
 concurrent boards cannot borrow each other's counts. Heartbeats renew a
 15-second display lease; an absent or expired feed says `Board disconnected`,
@@ -182,7 +185,8 @@ navigation. Agent output, status lines, identity checks and acknowledgement
 remain independent.
 The extended frame never contains a question, transcript, action or executable
 format; labels are bounded and restricted before tmux expansion. Version-1
-receivers continue to receive counts only.
+receivers continue to receive counts only. Version-2 receivers omit warning
+labels instead of presenting them as agent requests.
 
 Only unallocated root bindings are used (F12, then F11/F10; unused left-status
 mouse bindings). An existing catch-all or conflicting custom binding is never

@@ -24,7 +24,32 @@ const MAX_FRAME_BYTES: usize = 512;
 pub(crate) struct Summary {
     pub counts: [usize; 4],
     pub colors: bool,
-    pub latest_request: Option<String>,
+    pub latest_attention: Option<String>,
+    pub warning: Option<AttentionWarning>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttentionWarning {
+    OpenTwice,
+    Error,
+    Unbound,
+}
+
+impl AttentionWarning {
+    fn label(self) -> &'static str {
+        match self {
+            Self::OpenTwice => "open twice",
+            Self::Error => "error",
+            Self::Unbound => "outside Pika",
+        }
+    }
+    fn wire(self) -> &'static str {
+        match self {
+            Self::OpenTwice => "open-twice",
+            Self::Error => "error",
+            Self::Unbound => "unbound",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -264,6 +289,7 @@ impl Source {
             .stderr(Stdio::null());
         let stop = self.0.stop.clone();
         let extended = node.capabilities.iter().any(|cap| cap == "board-feed-v2");
+        let warnings = node.capabilities.iter().any(|cap| cap == "board-feed-v3");
         // Spawning is lazy and off the board renderer. The owned child is reaped
         // on disconnect or board shutdown; its pipe never shares agent input.
         let mut child = None;
@@ -282,7 +308,9 @@ impl Source {
                 )?);
                 child = Some(owned);
             }
-            let frame = if extended {
+            let frame = if warnings {
+                summary.encode_attention()
+            } else if extended {
                 summary.encode_extended()
             } else {
                 summary.encode()
@@ -437,20 +465,26 @@ pub(crate) fn summarize(items: &[BoardItem], filter: &str) -> Summary {
             })
             .count()
     });
+    let (latest_attention, warning) = latest_attention(items, &needle)
+        .map_or((None, None), |(label, warning)| (Some(label), warning));
     Summary {
         counts,
         colors: std::env::var_os("NO_COLOR").is_none(),
-        latest_request: latest_request(items, &needle),
+        latest_attention,
+        warning,
     }
 }
 
-fn latest_request(items: &[BoardItem], needle: &str) -> Option<String> {
+fn latest_attention(
+    items: &[BoardItem],
+    needle: &str,
+) -> Option<(String, Option<AttentionWarning>)> {
     let latest = items
         .iter()
         .filter(|item| {
             !item.stale
                 && item.pending_token.is_none()
-                && item.session.status == crate::model::Status::NeedsYou
+                && group(item.session.status, false) == "NEEDS YOU"
                 && matches_filter(item, needle)
         })
         .max_by(|a, b| {
@@ -481,7 +515,13 @@ fn latest_request(items: &[BoardItem], needle: &str) -> Option<String> {
         label.push_str(machine);
     }
     let label = safe_label(&label);
-    (!label.is_empty()).then_some(label)
+    let warning = match latest.session.status {
+        crate::model::Status::OpenTwice => Some(AttentionWarning::OpenTwice),
+        crate::model::Status::Error => Some(AttentionWarning::Error),
+        crate::model::Status::Unbound => Some(AttentionWarning::Unbound),
+        _ => None,
+    };
+    (!label.is_empty()).then_some((label, warning))
 }
 
 // Text is embedded inside nested tmux formats and strftime. An allowlist makes
@@ -510,7 +550,20 @@ impl Summary {
         format!(
             "v2|{}|{}",
             self.encode(),
-            self.latest_request.as_deref().unwrap_or_default()
+            if self.warning.is_none() {
+                self.latest_attention.as_deref().unwrap_or_default()
+            } else {
+                // Older receivers always draw an agent-request arrow.
+                ""
+            }
+        )
+    }
+    pub fn encode_attention(&self) -> String {
+        format!(
+            "v3|{}|{}|{}",
+            self.encode(),
+            self.warning.map_or("request", AttentionWarning::wire),
+            self.latest_attention.as_deref().unwrap_or_default()
         )
     }
     #[cfg(any(unix, test))]
@@ -518,7 +571,24 @@ impl Summary {
         if value.len() > MAX_FRAME_BYTES {
             bail!("Invalid board summary");
         }
-        let (value, latest_request) = if let Some(value) = value.strip_prefix("v2|") {
+        let (value, warning) = if let Some(value) = value.strip_prefix("v3|") {
+            let mut parts = value.splitn(3, '|');
+            let counts = parts.next().unwrap_or_default();
+            let warning = match parts.next() {
+                Some("request") => None,
+                Some("open-twice") => Some(AttentionWarning::OpenTwice),
+                Some("error") => Some(AttentionWarning::Error),
+                Some("unbound") => Some(AttentionWarning::Unbound),
+                _ => bail!("Invalid board attention kind"),
+            };
+            let label = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Missing board attention label"))?;
+            (format!("v2|{counts}|{label}"), warning)
+        } else {
+            (value.to_owned(), None)
+        };
+        let (value, latest_attention) = if let Some(value) = value.strip_prefix("v2|") {
             let (counts, label) = value
                 .split_once('|')
                 .ok_or_else(|| anyhow::anyhow!("Invalid board summary"))?;
@@ -527,7 +597,7 @@ impl Summary {
             }
             (counts, (!label.is_empty()).then(|| label.to_owned()))
         } else {
-            (value, None)
+            (value.as_str(), None)
         };
         if value.len() > 40 {
             bail!("Invalid board summary");
@@ -542,13 +612,17 @@ impl Summary {
         if [a, b, c, d].iter().any(|n| **n > 1_000_000) || *colors > 1 {
             bail!("Invalid board summary");
         }
-        if *a == 0 && latest_request.is_some() {
+        if *a == 0 && latest_attention.is_some() {
             bail!("Request label without an attention count");
+        }
+        if warning.is_some() && latest_attention.is_none() {
+            bail!("Warning without an attention label");
         }
         Ok(Self {
             counts: [*a, *b, *c, *d],
             colors: *colors == 1,
-            latest_request,
+            latest_attention,
+            warning,
         })
     }
     pub fn tmux_text(&self) -> String {
@@ -570,25 +644,30 @@ impl Summary {
             })
             .collect::<Vec<_>>()
             .join(" · ");
-        if let Some(label) = &self.latest_request {
+        if let Some(label) = &self.latest_attention {
             use unicode_width::UnicodeWidthStr;
             let label = safe_label(label);
             let plain = Self {
                 colors: false,
-                latest_request: None,
+                latest_attention: None,
                 ..self.clone()
             }
             .tmux_text();
             // Reserve navigation and separators first. Use three deterministic
             // widths; tmux reevaluates these branches when the client resizes.
             let mut suffix = String::new();
+            let marker = if self.warning.is_some() { "⚠" } else { "↑" };
+            let reason = self
+                .warning
+                .map(|warning| format!(" · {}", warning.label()))
+                .unwrap_or_default();
             for width in [8, 20, 48] {
                 let short = shorten_label(&label, width);
-                let minimum = plain.width() + 20 + short.width();
+                let minimum = plain.width() + 20 + short.width() + reason.width();
                 let value = if self.colors {
-                    format!(" · #[fg=red]↑ {short}#[fg=default]")
+                    format!(" · #[fg=red]{marker} {short}{reason}#[fg=default]")
                 } else {
-                    format!(" · ↑ {short}")
+                    format!(" · {marker} {short}{reason}")
                 };
                 let condition = ["#{e|>=:#{client_width},", &minimum.to_string(), "}"].concat();
                 suffix = format!("#{{?{condition},{value},{suffix}}}");
@@ -633,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn newest_request_excludes_results_errors_stale_rows_and_resolves_without_recounting() {
+    fn newest_attention_includes_warnings_excludes_results_and_resolves_without_recounting() {
         use crate::model::Status;
         let old = request("old", 10.0);
         let mut latest = request("ts_quality", 20.0);
@@ -652,13 +731,22 @@ mod tests {
         publisher.publish(rows.clone(), vec![]);
         let snapshot = source.snapshot().unwrap();
         assert_eq!(snapshot.summary.counts, [3, 0, 1, 1]);
-        assert_eq!(
-            snapshot.summary.latest_request.as_deref(),
-            Some("ts_quality @rs2a")
-        );
+        assert_eq!(snapshot.summary.latest_attention.as_deref(), Some("error"));
+        assert_eq!(snapshot.summary.warning, Some(AttentionWarning::Error));
         rows.reverse();
         publisher.publish(rows.clone(), vec![]);
         assert_eq!(source.summary().unwrap(), snapshot.summary);
+        rows.iter_mut()
+            .find(|row| row.session.name.as_deref() == Some("error"))
+            .unwrap()
+            .session
+            .status = Status::Parked;
+        publisher.publish(rows.clone(), vec![]);
+        assert_eq!(
+            source.summary().unwrap().latest_attention.as_deref(),
+            Some("ts_quality @rs2a")
+        );
+        assert_eq!(source.summary().unwrap().warning, None);
         rows.iter_mut()
             .find(|row| row.session.name.as_deref() == Some("ts_quality"))
             .unwrap()
@@ -666,11 +754,11 @@ mod tests {
             .status = Status::Working;
         publisher.publish(rows.clone(), vec![]);
         assert_eq!(
-            source.summary().unwrap().latest_request.as_deref(),
+            source.summary().unwrap().latest_attention.as_deref(),
             Some("old")
         );
         source.filter("result");
-        assert_eq!(source.summary().unwrap().latest_request, None);
+        assert_eq!(source.summary().unwrap().latest_attention, None);
         source.filter("");
         rows.iter_mut()
             .find(|row| row.session.name.as_deref() == Some("old"))
@@ -678,7 +766,7 @@ mod tests {
             .session
             .status = Status::Working;
         publisher.publish(rows, vec![]);
-        assert_eq!(source.summary().unwrap().latest_request, None);
+        assert_eq!(source.summary().unwrap().latest_attention, None);
     }
 
     #[test]
@@ -692,10 +780,48 @@ mod tests {
     }
 
     #[test]
+    fn warnings_are_typed_and_never_sent_as_requests_to_older_receivers() {
+        use crate::model::Status;
+        for (status, kind, reason) in [
+            (Status::OpenTwice, AttentionWarning::OpenTwice, "open twice"),
+            (Status::Error, AttentionWarning::Error, "error"),
+            (Status::Unbound, AttentionWarning::Unbound, "outside Pika"),
+        ] {
+            let mut row = request("ts_quality", 10.0);
+            row.session.status = status;
+            let summary = summarize(&[row.clone()], "");
+            assert_eq!(summary.counts, [1, 0, 0, 0]);
+            assert_eq!(summary.warning, Some(kind));
+            assert_eq!(
+                Summary::decode(&summary.encode_attention()).unwrap(),
+                summary
+            );
+            let legacy = Summary::decode(&summary.encode_extended()).unwrap();
+            assert_eq!(legacy.counts, summary.counts);
+            assert_eq!(legacy.latest_attention, None);
+            assert_eq!(legacy.warning, None);
+            let rendered = summary.tmux_text();
+            assert!(rendered.contains(&format!("⚠ ts_quality · {reason}")));
+            assert!(!rendered.contains("↑"));
+            row.pending_token = Some("pending".into());
+            assert_eq!(summarize(&[row], "").latest_attention, None);
+        }
+        for frame in [
+            "v3|1,0,0,0,0|shell|name",
+            "v3|1,0,0,0,0|error|",
+            "v3|0,0,0,0,0|error|name",
+            "v3|1,0,0,0,0|error|#{client_pid}",
+            "v3|1,0,0,0,0|request",
+        ] {
+            assert!(Summary::decode(frame).is_err(), "{frame}");
+        }
+    }
+
+    #[test]
     fn request_labels_are_bounded_inert_and_versioned() {
         let label = "ts_quality @rs2a";
         let summary = Summary {
-            latest_request: Some(label.into()),
+            latest_attention: Some(label.into()),
             ..summary()
         };
         assert_eq!(
@@ -703,7 +829,7 @@ mod tests {
             summary
         );
         assert_eq!(
-            Summary::decode(&summary.encode()).unwrap().latest_request,
+            Summary::decode(&summary.encode()).unwrap().latest_attention,
             None
         );
         for label in [
@@ -725,7 +851,7 @@ mod tests {
         assert!(Summary::decode(&format!("v2|1,2,4,4,0|{}", "a".repeat(161))).is_err());
         assert!(Summary::decode("v2|0,1,0,0,0|resolved").is_err());
         let hostile = summarize(&[request("#{client_pid},%H\x1b[2J", 5.0)], "");
-        let label = hostile.latest_request.unwrap();
+        let label = hostile.latest_attention.unwrap();
         assert!(!label.contains(['#', '%', ',', '{', '}', '\x1b']));
         assert_eq!(shorten_label("策略测试abcdef", 8), "策略测…");
         let text = summary.tmux_text();
@@ -773,7 +899,8 @@ mod tests {
         Summary {
             counts: [1, 2, 4, 4],
             colors: false,
-            latest_request: None,
+            latest_attention: None,
+            warning: None,
         }
     }
 
@@ -803,7 +930,7 @@ mod tests {
         // A replacement request is a live update even when counts do not change.
         for name in ["first @node", "next @node"] {
             let labelled = Summary {
-                latest_request: Some(name.into()),
+                latest_attention: Some(name.into()),
                 ..changed.clone()
             };
             source.0.state.lock().unwrap().summary = Some(labelled.clone());
@@ -819,15 +946,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remote_mirror_sends_origin_counts_not_inventory_and_is_capability_gated() {
-        remote_mirror(false);
+        remote_mirror(1);
     }
     #[cfg(unix)]
     #[test]
     fn remote_mirror_adds_request_label_only_for_v2_hosts() {
-        remote_mirror(true);
+        remote_mirror(2);
     }
     #[cfg(unix)]
-    fn remote_mirror(extended: bool) {
+    #[test]
+    fn remote_mirror_sends_typed_warnings_only_to_v3_hosts() {
+        remote_mirror(3);
+    }
+    #[cfg(unix)]
+    fn remote_mirror(version: u8) {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let executable = root.path().join("ssh");
@@ -853,7 +985,7 @@ mod tests {
         };
         let source = Source::default();
         source.0.state.lock().unwrap().summary = Some(Summary {
-            latest_request: Some("ts_quality @rs2a".into()),
+            latest_attention: Some("ts_quality @rs2a".into()),
             ..summary()
         });
         with(Some(Context::Source(source.clone())), || {
@@ -862,8 +994,11 @@ mod tests {
             assert_eq!(args.len(), 1);
             assert!(!trace.exists());
             node.capabilities.push("board-feed-v1".into());
-            if extended {
+            if version >= 2 {
                 node.capabilities.push("board-feed-v2".into());
+            }
+            if version >= 3 {
+                node.capabilities.push("board-feed-v3".into());
             }
             forward(&mut args, &node, &ssh).unwrap();
             assert_eq!(args, ["_fleet-open", "--board-feed", &source.0.token]);
@@ -882,13 +1017,30 @@ mod tests {
         };
         wait("1,2,4,4,0");
         let first = std::fs::read_to_string(&frames).unwrap();
-        assert_eq!(first.contains("v2|1,2,4,4,0|ts_quality @rs2a"), extended);
-        assert_eq!(first.contains("ts_quality"), extended);
+        assert_eq!(
+            first.contains("v2|1,2,4,4,0|ts_quality @rs2a"),
+            version == 2
+        );
+        assert_eq!(first.contains("ts_quality"), version >= 2);
+        source.0.state.lock().unwrap().summary = Some(Summary {
+            latest_attention: Some("warning-only".into()),
+            warning: Some(AttentionWarning::OpenTwice),
+            ..summary()
+        });
+        if version == 3 {
+            wait("v3|1,2,4,4,0|open-twice|warning-only");
+        }
         source.0.state.lock().unwrap().summary = Some(Summary {
             counts: [0, 3, 4, 4],
             ..summary()
         });
         wait("0,3,4,4,0");
+        assert_eq!(
+            std::fs::read_to_string(&frames)
+                .unwrap()
+                .contains("warning-only"),
+            version == 3
+        );
         drop(source);
         let trace = std::fs::read_to_string(trace).unwrap();
         assert_eq!(trace.lines().filter(|line| *line == "-T").count(), 1);
@@ -903,7 +1055,8 @@ mod tests {
         let summary = Summary {
             counts: [1, 2, 4, 4],
             colors: true,
-            latest_request: None,
+            latest_attention: None,
+            warning: None,
         };
         assert_eq!(Summary::decode(&summary.encode()).unwrap(), summary);
         for bad in [

@@ -450,6 +450,7 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
         let store = Store::at(board.root.path().join("state/pika.db"));
         for (status, expected) in [
             (Status::NeedsYou, "1 need you"),
+            (Status::OpenTwice, "open twice"),
             (Status::Working, "1 working"),
         ] {
             board.output.clear();
@@ -502,6 +503,26 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
                     &value.replace("#{client_width}", "60"),
                 ]);
                 assert!(!tiny.contains("audit"), "name displaced navigation: {tiny}");
+            } else if status == Status::OpenTwice {
+                board.await_text("audit_saved");
+                let value = board.tmux(&["show-options", "-gqv", &option]);
+                // Non-UTF-8 tmux replaces glyphs with underscores. The typed
+                // reason and exact name still have to reach the real terminal.
+                assert!(
+                    value.contains("audit_saved") && value.contains("open twice"),
+                    "{value}"
+                );
+                assert!(!value.contains("↑ audit_saved"));
+                let narrow = board.tmux(&[
+                    "display-message",
+                    "-p",
+                    &value.replace("#{client_width}", "87"),
+                ]);
+                assert!(
+                    narrow.contains("open twice"),
+                    "warning lost on narrow client: {narrow}"
+                );
+                assert!(narrow.contains("audit_s"));
             } else {
                 let rendered = board.tmux(&["display-message", "-p", &format!("#{{T:{option}}}")]);
                 assert!(

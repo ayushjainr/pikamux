@@ -772,16 +772,30 @@ impl Tmux {
     }
 
     fn bind_board_summary(&self, client: Option<&str>) -> Result<()> {
-        let mut args = vec!["display-message", "-p"];
-        if let Some(client) = client {
-            args.extend(["-c", client]);
-        }
-        args.push("#{client_pid}|#{pane_id}");
-        let output = self.output(args, true)?;
-        let identity = String::from_utf8(output.stdout)?;
-        let Some((pid, pane)) = identity.trim().split_once('|') else {
+        // tmux 3.2a rejects display-message -p combined with -c. Enumerate
+        // clients and select the already-proven name instead; omitting -c
+        // would silently borrow another attached client's pane and counts.
+        let Some(client) = client.filter(|name| !name.is_empty()) else {
             return Ok(());
         };
+        let format = format!(
+            "#{{client_name}}{FORMAT_SEPARATOR}#{{client_pid}}{FORMAT_SEPARATOR}#{{pane_id}}"
+        );
+        let output = self.output(["list-clients", "-F", &format], true)?;
+        let identities = String::from_utf8(output.stdout)?;
+        let mut matching = identities.lines().filter_map(|line| {
+            let mut fields = tmux_fields(line);
+            let name = fields.next()?;
+            let pid = fields.next()?;
+            let pane = fields.next()?;
+            (name == client && fields.next().is_none()).then_some((pid, pane))
+        });
+        let Some((pid, pane)) = matching.next() else {
+            return Ok(());
+        };
+        if matching.next().is_some() {
+            bail!("ambiguous tmux client for the board return bar");
+        }
         if pid.is_empty()
             || !pid.bytes().all(|b| b.is_ascii_digit())
             || !pane
@@ -837,9 +851,7 @@ impl Tmux {
             ["set-option", "-t", pane, "@pika_board_summary", &text],
             true,
         )?;
-        if let Some(client) = client {
-            self.output(["refresh-client", "-S", "-t", client], false)?;
-        }
+        self.output(["refresh-client", "-S", "-t", client], false)?;
         Ok(())
     }
 
@@ -1794,7 +1806,7 @@ mod tests {
         let tmux = tmux_fixture(
             &temp,
             &format!(
-                "printf '%s\\n' \"$*\" >> {}\ncase \"$*\" in *'client_pid'*) printf '12345|%%1\\n';; esac",
+                "printf '%s\\n' \"$*\" >> {}\ncase \"$*\" in\n'display-message -p -c '*) exit 1;;\n'list-clients -F '*) printf '/dev/other\\03798765\\037%%9\\n/dev/fixture\\03712345\\037%%1\\n';;\nesac",
                 shell_words::quote(trace.to_str().unwrap())
             ),
         );
@@ -1810,6 +1822,46 @@ mod tests {
         assert!(calls.contains("@pika_feed_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         assert!(calls.contains("Board disconnected"));
         assert!(!calls.contains("list-panes"));
+        assert!(!calls.contains("display-message -p -c"));
+        assert!(!calls.contains("set-option -t %9"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn board_summary_never_guesses_a_missing_or_ambiguous_client() {
+        for (client, rows, ambiguous) in [
+            (None, "/dev/other\t98765\t%9\n", false),
+            (Some("/dev/fixture"), "/dev/other\t98765\t%9\n", false),
+            (
+                Some("/dev/fixture"),
+                "/dev/fixture\t12345\t%1\n/dev/fixture\t98765\t%9\n",
+                true,
+            ),
+            (Some("/dev/fixture"), "/dev/fixture\tnot-a-pid\t%1\n", false),
+            (
+                Some("/dev/fixture"),
+                "/dev/fixture\t12345\t%1\textra\n",
+                false,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let trace = temp.path().join("trace");
+            let tmux = tmux_fixture(
+                &temp,
+                &format!(
+                    "printf '%s\\n' \"$*\" >> {}\nprintf '%s' {}",
+                    shell_words::quote(trace.to_str().unwrap()),
+                    shell_words::quote(&rows.replace('\t', SEPARATOR))
+                ),
+            );
+            let result = crate::activity_feed::with(
+                Some(crate::activity_feed::Context::Remote("a".repeat(32))),
+                || tmux.bind_board_summary(client),
+            );
+            assert_eq!(result.is_err(), ambiguous);
+            let calls = fs::read_to_string(trace).unwrap_or_default();
+            assert!(!calls.contains("set-option"));
+        }
     }
 
     #[cfg(unix)]

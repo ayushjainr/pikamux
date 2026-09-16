@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.20 — Keep the board in sight
+
+- Restore live board counts in the agent return bar on tmux 3.2a, binding the
+  feed to the exact attached client rather than guessing another client's pane.
+- Show the newest attention item beside the counts, distinguishing a request
+  for input from opening warnings such as duplicate clients or runtime errors.
+- Keep warning labels compatible with older hosts, shorten them on narrow
+  terminals, and clear them as the underlying attention state changes.
+
 ## 0.6.19 — A steadier board, cleaner previews
 
 - Update changed rows without clearing the screen on routine refreshes, keeping

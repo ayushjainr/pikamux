@@ -62,6 +62,7 @@ pub const CAPABILITIES: &[&str] = &[
     "quota-v1",
     "board-feed-v1",
     "board-feed-v2",
+    "board-feed-v3",
 ];
 const REQUIRED_CAPABILITIES: &[&str] = &[
     "inventory",
