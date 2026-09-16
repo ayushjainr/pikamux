@@ -35,6 +35,7 @@ pub mod skill;
 pub mod status;
 pub mod store;
 pub mod terminal;
+mod terminal_frame;
 pub mod tmux;
 pub mod update;
 mod update_check;

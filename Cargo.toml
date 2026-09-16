@@ -1,6 +1,6 @@
 [package]
 name = "pikamux"
-version = "0.6.18"
+version = "0.6.19"
 edition = "2024"
 rust-version = "1.88"
 description = "One native home for coding agents"
@@ -29,6 +29,7 @@ thiserror = "2.0"
 time = { version = "0.3", features = ["parsing"] }
 toml_edit = "0.23"
 unicode-width = "0.2"
+unicode-segmentation = "1.13"
 uuid = { version = "1.18", features = ["v4"] }
 walkdir = "2.5"
 

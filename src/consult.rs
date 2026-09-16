@@ -2590,8 +2590,12 @@ mod tests {
 
         fn wait_until_started(&self) -> i32 {
             for _ in 0..500 {
-                if let Ok(value) = fs::read_to_string(&self.pid_path) {
-                    return value.parse().unwrap();
+                // File creation can be observed before fs::write publishes the
+                // PID bytes. Wait for the complete fixture receipt, not existence.
+                if let Ok(value) = fs::read_to_string(&self.pid_path)
+                    && let Ok(pid) = value.parse()
+                {
+                    return pid;
                 }
                 thread::sleep(Duration::from_millis(2));
             }

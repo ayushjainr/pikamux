@@ -681,6 +681,10 @@ fn saved_thread_peek_explains_unavailable_inside_board_and_preserves_unread() {
     board.send(b"p");
     board.await_text("No live Pika pane");
     assert!(
+        !board.output.contains("\x1b[2J"),
+        "peek refresh cleared the whole terminal"
+    );
+    assert!(
         board.child.try_wait().unwrap().is_none(),
         "peek must stay in the board"
     );
@@ -717,10 +721,18 @@ fn help_and_usage_are_real_board_actions_with_a_return_path() {
     let mut board = BoardProcess::start();
     board.send(b"?");
     board.await_text("PIKA KEYS");
+    assert!(
+        !board.output.contains("\x1b[2J"),
+        "help refresh cleared the whole terminal"
+    );
     board.send(b"\x1b");
     board.await_text("audit_saved");
     board.send(b"u");
     board.await_text("CUMULATIVE USAGE");
+    assert!(
+        !board.output.contains("\x1b[2J"),
+        "usage refresh cleared the whole terminal"
+    );
     board.finish();
 }
 

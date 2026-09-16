@@ -735,6 +735,7 @@ struct FramePresenter {
     previous: Vec<u8>,
     scratch: Vec<u8>,
     dimensions: Option<(u16, u16)>,
+    rows: Option<Vec<Vec<u8>>>,
 }
 
 impl FramePresenter {
@@ -751,7 +752,30 @@ impl FramePresenter {
         if self.dimensions == Some(dimensions) && self.previous == self.scratch {
             return Ok(false);
         }
-        if let Err(error) = output.write_all(&self.scratch).and_then(|_| output.flush()) {
+        let rows = crate::terminal_frame::rows(&self.scratch, dimensions);
+        if self.dimensions == Some(dimensions) && rows.is_some() && self.rows == rows {
+            std::mem::swap(&mut self.previous, &mut self.scratch);
+            return Ok(false);
+        }
+        let mut patch = Vec::new();
+        if self.dimensions == Some(dimensions)
+            && let (Some(previous), Some(next)) = (&self.rows, &rows)
+        {
+            queue!(patch, BeginSynchronizedUpdate)?;
+            for (y, (old, new)) in previous.iter().zip(next).enumerate() {
+                if old != new {
+                    queue!(patch, MoveTo(0, y as u16))?;
+                    patch.extend_from_slice(new);
+                }
+            }
+            queue!(patch, EndSynchronizedUpdate)?;
+        }
+        let bytes = if patch.is_empty() {
+            &self.scratch
+        } else {
+            &patch
+        };
+        if let Err(error) = output.write_all(bytes).and_then(|_| output.flush()) {
             // A partial write must not strand the terminal inside a frozen frame.
             self.dimensions = None;
             let _ = execute!(output, EndSynchronizedUpdate, ResetColor);
@@ -759,6 +783,7 @@ impl FramePresenter {
         }
         std::mem::swap(&mut self.previous, &mut self.scratch);
         self.dimensions = Some(dimensions);
+        self.rows = rows;
         Ok(true)
     }
 }
@@ -2892,6 +2917,84 @@ mod tests {
         );
         assert!(output.bytes.is_empty());
         assert_eq!(output.flushes, 0);
+    }
+
+    #[test]
+    fn routine_refresh_only_writes_changed_rows_without_clearing_the_screen() {
+        let mut presenter = FramePresenter::default();
+        let mut output = FrameOutput::default();
+        let draw = |frame: &mut Vec<u8>, value: &str| -> Result<()> {
+            queue!(
+                frame,
+                MoveTo(0, 0),
+                Clear(ClearType::All),
+                Print("PIKA"),
+                MoveTo(0, 2),
+                Print(value)
+            )?;
+            Ok(())
+        };
+        presenter
+            .present(&mut output, (40, 10), |frame| {
+                draw(frame, "long preview output")
+            })
+            .unwrap();
+        output.bytes.clear();
+        presenter
+            .present(&mut output, (40, 10), |frame| draw(frame, "short"))
+            .unwrap();
+        let delta = String::from_utf8(output.bytes.clone()).unwrap();
+        assert!(!delta.contains("\x1b[2J"));
+        assert!(!delta.contains("PIKA"));
+        assert!(delta.contains("short                                   "));
+        assert!(delta.contains("\x1b[3;1H"));
+        assert!(!delta.contains("\x1b[1;1H"));
+        output.bytes.clear();
+        presenter
+            .present(&mut output, (40, 10), |frame| draw(frame, ""))
+            .unwrap();
+        assert!(
+            String::from_utf8(output.bytes)
+                .unwrap()
+                .contains(&" ".repeat(40))
+        );
+    }
+
+    #[test]
+    fn actual_board_refresh_uses_incremental_rows_at_supported_sizes() {
+        for dimensions in [(80, 24), (100, 20), (140, 40), (220, 70)] {
+            let mut board = board(Status::Ready);
+            board.preview = Some(crate::preview::View {
+                text: "A real result\n  indentation and 界 unicode".into(),
+                observed_at: Some(1.0),
+                loading: false,
+                error: false,
+            });
+            let mut presenter = FramePresenter::default();
+            let mut output = FrameOutput::default();
+            presenter
+                .present(&mut output, dimensions, |frame| {
+                    board.draw(frame, dimensions.0, dimensions.1)
+                })
+                .unwrap();
+            assert!(
+                presenter.rows.is_some(),
+                "board must not fall back at {dimensions:?}"
+            );
+            output.bytes.clear();
+            board.preview.as_mut().unwrap().text = "A shorter result".into();
+            presenter
+                .present(&mut output, dimensions, |frame| {
+                    board.draw(frame, dimensions.0, dimensions.1)
+                })
+                .unwrap();
+            assert!(presenter.rows.is_some());
+            assert!(
+                !String::from_utf8(output.bytes.clone())
+                    .unwrap()
+                    .contains("\x1b[2J")
+            );
+        }
     }
 
     #[test]

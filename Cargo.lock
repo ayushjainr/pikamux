@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "pikamux"
-version = "0.6.18"
+version = "0.6.19"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -751,6 +751,7 @@ dependencies = [
  "thiserror",
  "time",
  "toml_edit",
+ "unicode-segmentation",
  "unicode-width",
  "uuid",
  "walkdir",

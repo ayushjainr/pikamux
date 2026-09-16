@@ -258,6 +258,10 @@ fn wall_time() -> f64 {
 /// provider screen. Unknown prompts and questions remain intact.
 /// The CLI's raw peek deliberately does not use this filter.
 pub(crate) fn board_output(provider: Provider, text: &str) -> String {
+    // Expanded peek and automatic preview must use the same sanitized input.
+    // capture-pane -e retains SGR codes, including inside prompt/status labels.
+    let clean = crate::fleet::sanitize_terminal_lines(text);
+    let text = clean.as_str();
     if provider == Provider::Claude {
         return claude_board_output(text);
     }
@@ -270,21 +274,38 @@ pub(crate) fn board_output(provider: Provider, text: &str) -> String {
         end -= 1;
     }
     // Do not interpret old output as footer chrome deep in scrollback.
-    let start = end.saturating_sub(12);
+    let start = end.saturating_sub(48);
     let status = (start..end).rev().find(|&i| {
-        codex_status_line(lines[i])
-            && lines[i + 1..end]
+        (i + 1..=end.min(i + 8)).any(|stop| {
+            let status = lines[i..stop]
                 .iter()
-                .all(|line| footer_spacing(line) || footer_hint(line) || quota_segment(line))
+                .map(|line| line.trim())
+                .collect::<String>();
+            codex_status_line(&status)
+                && lines[i + 1..stop].iter().all(|line| {
+                    // A wrapped status is adjacent metadata, not a new paragraph,
+                    // prompt or notification. Preserve uncertain trailing prose.
+                    !line.trim().is_empty()
+                        && (quota_segment(line)
+                            || line.trim().starts_with(['/', '·'])
+                            || line.contains("% left"))
+                })
+                && lines[stop..end]
+                    .iter()
+                    .all(|line| footer_spacing(line) || footer_hint(line))
+        })
     });
     if let Some(index) = status {
         end = index;
     }
     let composer = (start..end).rev().find(|&i| {
-        codex_suggestion(lines[i])
-            && lines[i + 1..end]
-                .iter()
-                .all(|line| footer_spacing(line) || footer_hint(line))
+        (i + 1..=end.min(i + 4)).any(|stop| {
+            let parts: Vec<_> = lines[i..stop].iter().map(|line| line.trim()).collect();
+            (codex_suggestion(&parts.join(" ")) || codex_suggestion(&parts.concat()))
+                && lines[stop..end]
+                    .iter()
+                    .all(|line| footer_spacing(line) || footer_hint(line))
+        })
     });
     if let Some(index) = composer {
         end = index;
@@ -367,6 +388,9 @@ fn codex_suggestion(line: &str) -> bool {
 
 fn claude_board_output(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
+    if let Some(end) = claude_composer_start(&lines) {
+        return lines[..end].join("\n").trim_end().to_owned();
+    }
     let mut end = lines.len();
     while end > 0 && lines[end - 1].trim().is_empty() {
         end -= 1;
@@ -411,6 +435,113 @@ fn claude_board_output(text: &str) -> String {
     lines[..end].join("\n")
 }
 
+// Composer borders plus a recognized footer identify a UI region regardless of
+// the draft/suggestion's wording. Submitted transcript prompts outside that
+// region stay visible. Never apply this crop to identity or attention evidence.
+fn claude_composer_start(lines: &[&str]) -> Option<usize> {
+    let start = lines.len().saturating_sub(48);
+    for i in (start..lines.len()).rev() {
+        let Some(prompt) = lines[i].trim().strip_prefix('❯') else {
+            continue;
+        };
+        if i == 0 || !claude_composer_rule(lines[i - 1]) || numbered_choice(prompt) {
+            continue;
+        }
+        let Some(lower) = (i + 1..lines.len()).find(|&j| claude_rule(lines[j])) else {
+            continue;
+        };
+        // Numbered choices are interactive questions, not the text composer.
+        if lines[i + 1..lower]
+            .iter()
+            .any(|line| numbered_choice(line.trim()))
+        {
+            continue;
+        }
+        let mut footer = lower + 1;
+        while footer < lines.len() && claude_composer_rule(lines[footer]) {
+            footer += 1;
+        }
+        let tail = &lines[footer..];
+        if !claude_footer(tail) {
+            continue;
+        }
+        let mut upper = i - 1;
+        while upper > 0 && claude_composer_rule(lines[upper - 1]) {
+            upper -= 1;
+        }
+        // Claude's context-saving hint may itself be split by terminal layout.
+        for n in 1..=3.min(upper) {
+            let hint = lines[upper - n..upper]
+                .iter()
+                .map(|line| line.trim())
+                .collect::<String>();
+            let hint = hint.to_ascii_lowercase();
+            if hint.starts_with("new task? /clear to save ") && hint.ends_with(" tokens") {
+                upper -= n;
+                break;
+            }
+        }
+        return Some(upper);
+    }
+    None
+}
+
+fn numbered_choice(text: &str) -> bool {
+    text.trim_start()
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_digit())
+}
+
+fn claude_composer_rule(line: &str) -> bool {
+    let line = line.trim();
+    claude_rule(line)
+        || (line.starts_with("────────")
+            && line.ends_with('─')
+            && line.chars().filter(|ch| *ch == '─').count() >= 12)
+}
+
+fn claude_footer(lines: &[&str]) -> bool {
+    let mut recognized = false;
+    for paragraph in lines.split(|line| line.trim().is_empty()) {
+        if paragraph.is_empty() {
+            continue;
+        }
+        if paragraph
+            .iter()
+            .all(|line| claude_status_line(line) || claude_footer_hint(line))
+        {
+            recognized = true;
+            continue;
+        }
+        let text = paragraph
+            .iter()
+            .map(|line| line.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Shell-style custom status, including wrapped branch/model/usage rows.
+        let shell_status = text.split_whitespace().next().is_some_and(|word| {
+            word.contains('@') && (word.contains(":~/") || word.contains(":/"))
+        }) && text.contains("ctx ")
+            && text.contains('%')
+            && ["Opus ", "Sonnet ", "Haiku ", "Fable ", "claude-"]
+                .iter()
+                .any(|name| text.contains(name))
+            && !text.contains('?')
+            && !text.contains("failed")
+            && !text.contains("required");
+        if shell_status
+            || claude_footer_hint(&text)
+            || (recognized && text.starts_with("⧉ ") && text.contains(" · "))
+        {
+            recognized = true;
+        } else {
+            return false;
+        }
+    }
+    recognized
+}
+
 fn claude_rule(line: &str) -> bool {
     let line = line.trim();
     line.chars().count() >= 8 && line.chars().all(|ch| matches!(ch, '─' | '━'))
@@ -421,18 +552,26 @@ fn claude_footer_hint(line: &str) -> bool {
     if footer_hint(line) {
         return true;
     }
-    let line =
-        line.trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '⏵' | '▶' | '⏸'));
-    ["bypass permissions on", "accept edits on", "plan mode on"]
-        .iter()
-        .any(|mode| {
-            line.strip_prefix(mode).is_some_and(|rest| {
-                matches!(
-                    rest.trim(),
-                    "(shift+tab to cycle)" | "(shift+tab to cycle) · ? for shortcuts"
-                )
-            })
+    let line = line.trim_start_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '⏵' | '▶' | '⏸' | '▸' | '»')
+    });
+    [
+        "bypass permissions on",
+        "accept edits on",
+        "plan mode on",
+        "auto mode on",
+    ]
+    .iter()
+    .any(|mode| {
+        line.strip_prefix(mode).is_some_and(|rest| {
+            matches!(
+                rest.trim(),
+                "(shift+tab to cycle)"
+                    | "(shift+tab to cycle) · ? for shortcuts"
+                    | "(shift+tab to cycle) · ← for agents"
+            )
         })
+    })
 }
 
 fn claude_status_line(line: &str) -> bool {
@@ -448,7 +587,7 @@ fn claude_status_line(line: &str) -> bool {
     if !(name.starts_with("claude-") || matches!(name, "Opus" | "Sonnet" | "Haiku" | "Fable"))
         || !words.all(|word| {
             word.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
-                || matches!(word, "low" | "medium" | "high" | "max" | "(1M)")
+                || matches!(word, "low" | "medium" | "high" | "xhigh" | "max" | "(1M)")
         })
     {
         return false;
@@ -909,14 +1048,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_actual_drafts_and_approval_questions_survive() {
+    fn claude_composer_drafts_are_hidden_but_transcript_and_approval_questions_survive() {
         let draft = "Done.\n────────────────────\n❯ Keep the old format too\n  and add regression tests\n────────────────────";
         assert_eq!(
             board_output(
                 Provider::Claude,
                 &format!("{draft}\nSonnet 4.6 · ~/project")
             ),
-            draft
+            "Done."
         );
         for text in [
             "Do you want to make this edit?\n❯ 1. Yes\n  2. No\nEsc to cancel",
@@ -928,6 +1067,46 @@ mod tests {
             "Result\n────────────────────\n❯\n────────────────────\ncustom status text without recognized metadata",
         ] {
             assert_eq!(board_output(Provider::Claude, text), text);
+        }
+    }
+
+    #[test]
+    fn claude_wrapped_custom_footer_and_unquoted_suggestion_are_not_work_output() {
+        let output =
+            "❯ Keep\n● Kept.\n\nKeep as a redeploy reminder, or fold it into the next deploy?";
+        let footer = "\n\n          n\new task? /clear to save 922k tokens\n────────────────────────────\n──────────────── demo ─\n❯ fold it in\n────────────────────────────\n────────────────\n  user@host:~/agentic/demo git feature-a\nbranch Fable 5.1 xhigh\n  ctx █████░ 92% 922k/1.0M  7d 19% (6d3h) $199.05\n\n  ▸▸ auto mode on (shift+tab to cycle) · ← for agents\n\n  ⧉ playbooks · playbooks-v2\n";
+        assert_eq!(
+            board_output(Provider::Claude, &format!("{output}{footer}")),
+            output
+        );
+        for warning in [
+            "Permission required: allow this?",
+            "Connection failed",
+            "A new message needs your answer",
+        ] {
+            let capture = format!("{output}{footer}\n{warning}");
+            assert!(board_output(Provider::Claude, &capture).contains(warning));
+        }
+        let question = "Keep this change?\n────────────────────\n❯ 1. Yes\n  2. No\n────────────────────\nFable 5.1 · ~/demo";
+        assert!(board_output(Provider::Claude, question).contains("2. No"));
+    }
+
+    #[test]
+    fn expanded_peek_filters_ansi_chrome_and_wrapped_codex_suggestions_too() {
+        for (provider, footer) in [
+            (
+                Provider::Codex,
+                "\x1b[2m› Ask Codex to do\nanything\x1b[0m\n\x1b[32mgpt-6-astra medium · /project\nContext 22% left · weekly 58% left\x1b[0m",
+            ),
+            (
+                Provider::Claude,
+                "────────────────────\n\x1b[2m❯ fold it in\x1b[0m\n────────────────────\n\x1b[32mFable 5.1 xhigh · ~/demo\x1b[0m",
+            ),
+        ] {
+            let output = "Real result.\nDo you want to keep the old format?";
+            let filtered = board_output(provider, &format!("{output}\n\n{footer}"));
+            assert_eq!(filtered, output);
+            assert_eq!(board_output(provider, &filtered), filtered);
         }
     }
 

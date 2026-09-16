@@ -277,14 +277,26 @@ it adds no runtime dependency or persistent background daemon. Each frame is bui
 in memory before any terminal output, bracketed by synchronized-update markers,
 and written only when its bytes or terminal dimensions change. This prevents
 line-buffered stdout from exposing the cleared screen and partially drawn rows.
-Terminals without synchronized-output support still receive a prebuilt frame.
-Resize forces repaint; write failures and terminal teardown end synchronization.
+Routine board refreshes rasterize Pika's own drawing commands and overwrite only
+changed rows, including blank cells where old content disappeared. They do not
+clear the screen, so terminals without synchronized-output support do not expose
+a blank frame on each refresh. Unicode graphemes and styles retain their cells.
+Resize, first paint, and unsupported drawing commands use a complete frame;
+write failures and terminal teardown end synchronization.
 Playbook rotation is derived from wall-clock five-minute buckets, so it requires
 no additional timer, task, or persistent state.
 Expert cards are loaded locally on a separate five-minute cadence; this display
 refresh never interviews a provider. A read-only tail captures only the selected
 tmux pane every two seconds in a daemon-scoped worker, does not read provider
 transcripts, and never changes unread state.
+Both automatic preview and expanded board peek sanitize terminal escapes before
+recognizing provider chrome. Known Codex placeholders and status metadata are
+hidden, including wrapped placeholders. Claude's bordered composer and recognized
+footer are excluded as a region, including drafts or generated suggestions,
+custom shell/model/usage status lines and mode hints. Submitted transcript input,
+agent questions and unrecognized notices stay visible. This is a lossy display
+projection only: raw CLI peek, the native agent, lifecycle facts and transcripts
+are not changed by this filter.
 Inline consultation construction and turns run on a dedicated daemon worker so
 provider latency cannot freeze dashboard refresh, typing, or Esc recovery. Esc
 requests cancellation immediately and terminates the transient provider process;

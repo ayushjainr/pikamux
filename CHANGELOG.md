@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.19 — A steadier board, cleaner previews
+
+- Update changed rows without clearing the screen on routine refreshes, keeping
+  the board steady even in terminals without synchronized-output support.
+- Remove wrapped Codex suggestions and recognized Claude composer/status-line
+  clutter from previews and expanded peek, including custom usage footers.
+- Preserve submitted messages, approval questions, unread state, Unicode and
+  colors. Native agent interfaces remain unchanged.
+
 ## 0.6.18 — Stay connected to your work
 
 - Carry the board's live counts into the agent return bar, with the latest
