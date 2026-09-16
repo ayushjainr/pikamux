@@ -109,6 +109,10 @@ impl Default for ClientBridgeOptions {
 
 /// OS/process boundary for deterministic Windows-client workflow tests.
 pub trait ClientCliRuntime {
+    /// Real terminal presentation is opt-in; injected runtimes stay finite.
+    fn styled_setup(&self) -> bool {
+        false
+    }
     fn update(&mut self) -> Result<i32> {
         bail!("Client updater is unavailable")
     }
@@ -154,6 +158,9 @@ impl SystemClientRuntime {
 }
 
 impl ClientCliRuntime for SystemClientRuntime {
+    fn styled_setup(&self) -> bool {
+        crate::onboarding::supported()
+    }
     fn update(&mut self) -> Result<i32> {
         crate::windows_update::install(None, false)
     }
@@ -509,7 +516,39 @@ where
         Some(WindowsClientCommand::Setup(arguments)) if arguments.ssh_target.is_none() => {
             home(runtime, output, true)
         }
-        Some(WindowsClientCommand::Setup(arguments)) => setup(runtime, output, arguments, false),
+        Some(WindowsClientCommand::Setup(arguments)) => {
+            let ui = crate::onboarding::Screen::new(runtime.styled_setup())?;
+            if !ui.active() {
+                return setup(runtime, output, arguments, false);
+            }
+            ui.progress(
+                "Connect your machine",
+                &format!(
+                    "Connecting to {}…",
+                    arguments.ssh_target.as_deref().unwrap_or("your host")
+                ),
+            )?;
+            let mut receipt = Vec::new();
+            if let Err(error) = setup(runtime, &mut receipt, arguments, false) {
+                ui.details(
+                    "Connection needs attention",
+                    &format!("{error:#}\n\nExisting connections were kept."),
+                )?;
+                return Ok(1);
+            }
+            let open = ui.choice(
+                "Connected",
+                "This machine's conversations can now appear on your board.",
+                &["Open board", "Done"],
+            )? == Some(0);
+            drop(ui);
+            if open {
+                let config = runtime.load_config()?;
+                runtime.open_fleet_board(&config)
+            } else {
+                Ok(0)
+            }
+        }
         Some(WindowsClientCommand::Bridge(arguments)) => match arguments.command {
             None | Some(ClientBridgeCommand::Status) => status(runtime, output),
             Some(ClientBridgeCommand::Serve(options)) => {
@@ -547,6 +586,11 @@ fn home<R: ClientCliRuntime, W: Write>(
         // blocking handshake, bridge startup, or topology import before paint.
         return runtime.open_fleet_board(&config);
     }
+    let ui = crate::onboarding::Screen::new(runtime.styled_setup())?;
+    ui.progress(
+        "Find your machines",
+        "Reading saved SSH connections. No machines are being contacted.",
+    )?;
     let mut targets = runtime.discover_hosts()?;
     targets.retain(|target| validate_client_ssh_target(target).is_ok());
     for node in config.nodes.values() {
@@ -554,43 +598,78 @@ fn home<R: ClientCliRuntime, W: Write>(
             targets.push(node.ssh_target.clone());
         }
     }
-    writeln!(
-        output,
-        "Which machines should appear together in Pika?\nDiscovery is passive. Only selected machines are contacted; existing pairings stay selected."
-    )?;
-    for (index, target) in targets.iter().enumerate() {
-        let paired = if config.nodes.values().any(|node| node.ssh_target == *target) {
-            " · paired"
-        } else {
-            ""
-        };
-        writeln!(output, "  {}. {target}{paired}", index + 1)?;
-    }
-    let selected = loop {
-        write!(
+    if !ui.active() {
+        writeln!(
             output,
-            "Machine numbers, all, or SSH hosts (Enter to keep current): "
+            "Which machines should appear together in Pika?\nDiscovery is passive. Only selected machines are contacted; existing pairings stay selected."
         )?;
-        output.flush()?;
-        let Some(choice) = runtime.read_choice()?.filter(|value| !value.is_empty()) else {
-            return if config.nodes.is_empty() {
-                Ok(0)
+        for (index, target) in targets.iter().enumerate() {
+            let paired = if config.nodes.values().any(|node| node.ssh_target == *target) {
+                " · paired"
             } else {
-                runtime.open_fleet_board(&config)
+                ""
             };
-        };
-        match select_targets(&choice, &targets) {
-            Ok(selected) => break selected,
-            Err(error) => writeln!(output, "{error}")?,
+            writeln!(output, "  {}. {target}{paired}", index + 1)?;
+        }
+    }
+    let selected = if ui.active() {
+        let labels = targets
+            .iter()
+            .map(|target| {
+                format!(
+                    "{target}{}",
+                    if config.nodes.values().any(|n| n.ssh_target == *target) {
+                        " · connected"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        match ui.choice("One home for your coding agents", "Connect a Mac or Linux machine to see its conversations here.\nYour selected machines will appear together on one board.", &["Choose saved connections", "Enter an SSH host", "Not now"])? {
+            Some(0) => ui.select("Choose your machines", "Only selected machines will be contacted.\nExisting connections stay on your board.", &labels, true)?.unwrap_or_default().into_iter().map(|i| targets[i].clone()).collect(),
+            Some(1) => {
+                let mut selected = Vec::new();
+                while let Some(value) = ui.input("Connect an SSH host", "Enter one SSH alias or user@host.")? {
+                    match validate_client_ssh_target(&value) {
+                        Ok(_) => { selected.push(value); break; }
+                        Err(error) => ui.details("Check the SSH host", &error.to_string())?,
+                    }
+                }
+                selected
+            }
+            _ => Vec::new(),
+        }
+    } else {
+        loop {
+            write!(
+                output,
+                "Machine numbers, all, or SSH hosts (Enter to keep current): "
+            )?;
+            output.flush()?;
+            let Some(choice) = runtime.read_choice()?.filter(|value| !value.is_empty()) else {
+                return if config.nodes.is_empty() {
+                    Ok(0)
+                } else {
+                    runtime.open_fleet_board(&config)
+                };
+            };
+            match select_targets(&choice, &targets) {
+                Ok(selected) => break selected,
+                Err(error) => writeln!(output, "{error}")?,
+            }
         }
     };
+    let mut notices = Vec::new();
     for target in selected {
         if config.nodes.values().any(|node| node.ssh_target == target) {
             continue;
         }
-        if let Err(error) = setup(
+        ui.progress("Connect your machines", &format!("Connecting to {target}…"))?;
+        let mut receipt = Vec::new();
+        let pairing = setup(
             runtime,
-            output,
+            &mut receipt,
             ClientSetupArgs {
                 ssh_target: Some(target.clone()),
                 alias: None,
@@ -599,12 +678,24 @@ fn home<R: ClientCliRuntime, W: Write>(
                 no_start: true,
             },
             true,
-        ) {
+        );
+        if !ui.active() {
+            output.write_all(&receipt)?;
+        }
+        if let Err(error) = pairing {
             // One unreachable candidate must not hide successfully paired nodes.
-            writeln!(output, "Not added · {target} · {error:#}")?;
+            if ui.active() {
+                notices.push(format!("{target} was not connected.\n{error:#}"));
+            } else {
+                writeln!(output, "Not added · {target} · {error:#}")?;
+            }
         }
     }
     let config = runtime.load_config()?;
+    if ui.active() && !notices.is_empty() {
+        ui.details("Some connections need attention", &format!("{} machine(s) connected. Successful connections were kept.\n\n{}\n\nCheck SSH access and that Pika is installed on these hosts, then run pika setup to try again.", config.nodes.len(), notices.join("\n\n")))?;
+    }
+    drop(ui);
     if config.nodes.is_empty() {
         return Ok(0);
     }

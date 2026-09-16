@@ -1,5 +1,6 @@
 use crate::{
     VERSION,
+    activity_observer::short_age,
     attention::{self, AttentionTarget},
     client_bridge::{self, ClientWindowOutcome, TcpClientBridgeTransport},
     config::Config,
@@ -14,7 +15,7 @@ use crate::{
     model::{Provider, Session},
     monitor::{
         self, BoardAction, BoardItem, ConsultationDriver, ConsultationEvent, ConsultationInput,
-        ConsultationOutcome, ExpertAnnotation,
+        ConsultationOutcome,
     },
     paths::Paths,
     process,
@@ -22,7 +23,7 @@ use crate::{
     scheduler::{self, ScheduleRequest},
     setup::{self, SetupOptions, SetupPaths},
     setup_preview, skill,
-    store::{Store, StoreChangeWatcher},
+    store::Store,
     terminal::{self, Palette},
     update::{self, InstallRequest, UpdateRequest},
     usage, wait as wait_contract,
@@ -45,7 +46,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const LOCAL_RECONCILE_INTERVAL: Duration = Duration::from_secs(20);
 const JSONL_OPERATIONAL_FAILURE: i32 = 1;
 
 #[derive(Parser, Debug)]
@@ -115,6 +115,8 @@ enum Command {
     Fleet(FleetInternalArgs),
     #[command(name = "_fleet-open", hide = true)]
     FleetOpen(FleetOpenArgs),
+    #[command(name = "_board-feed", hide = true)]
+    BoardFeed(BoardFeedArgs),
     #[command(name = "_fleet-ask", hide = true)]
     FleetAsk(FleetAskArgs),
     #[command(name = "_peek-popup", hide = true)]
@@ -225,8 +227,11 @@ struct NewArgs {
     #[arg(long)]
     cwd: Option<PathBuf>,
 }
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 struct SetupArgs {
+    /// Print the detailed setup log instead of the interactive setup screen.
+    #[arg(long)]
+    details: bool,
     /// Default provider for genuinely new conversation names.
     #[arg(long)]
     default_provider: Option<Provider>,
@@ -500,6 +505,15 @@ struct FleetOpenArgs {
     provider: Provider,
     #[arg(long)]
     session_id: String,
+    #[arg(long, value_parser = crate::activity_feed::token)]
+    board_feed: Option<String>,
+}
+#[derive(Args, Debug)]
+struct BoardFeedArgs {
+    #[arg(long)]
+    expected_node_id: String,
+    #[arg(long, value_parser = crate::activity_feed::token)]
+    token: String,
 }
 #[derive(Args, Debug)]
 struct ClientBoardArgs {
@@ -559,10 +573,7 @@ fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
             if !monitor::interactive_terminal() {
                 return bare(pika);
             }
-            drive_board(
-                |memory| observe_board(pika, memory),
-                |action| finish_board_action(pika, action),
-            )
+            run_board(pika)
         }
         Some(Command::ClientFleetOpen(a)) => client_fleet_open(pika, a),
         Some(Command::List(a)) => list(pika, a),
@@ -586,6 +597,11 @@ fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
         Some(Command::Update(a)) => update_command(a),
         Some(Command::Fleet(a)) => fleet_stdio(pika, a),
         Some(Command::FleetOpen(a)) => fleet_open(pika, a),
+        Some(Command::BoardFeed(a)) => {
+            verify_local_node(pika, &a.expected_node_id)?;
+            crate::activity_feed::receive(&pika.tmux, &a.token)?;
+            Ok(0)
+        }
         Some(Command::FleetAsk(a)) => fleet_ask(pika, a),
         Some(Command::PeekPopup(a)) => peek_popup(pika, a),
         Some(Command::ClientPair(a)) => client_pair(pika, a),
@@ -652,10 +668,15 @@ fn bare(pika: &Pika) -> Result<i32> {
         );
         return print_sessions(inventory.sessions, true);
     }
-    drive_board(
-        |memory| observe_board(pika, memory),
-        |action| finish_board_action(pika, action),
-    )
+    if !pika.paths.config.is_file()
+        && crate::onboarding::supported()
+        && pika.store.list_sessions()?.is_empty()
+        && pika.store.list_pending()?.is_empty()
+        && pika.store.list_nodes()?.is_empty()
+    {
+        return setup_command(pika, SetupArgs::default());
+    }
+    run_board(pika)
 }
 
 // Both ordinary Unix boards and legacy bridged boards survive terminal handoff.
@@ -695,104 +716,16 @@ fn drive_board(
 }
 
 fn observe_board(pika: &Pika, memory: &mut monitor::BoardMemory) -> Result<BoardAction> {
-    // Paint all bounded durable state immediately, including offline fleet
-    // rows. No provider, process, tmux, or SSH observation belongs here.
-    let (cached, initial_fleet_health) = board_items(pika)?;
-    // At most one unpublished snapshot is useful: the board always wants the
-    // newest complete observation, never a backlog of stale inventories.
-    let (sender, receiver) = monitor::latest_channel();
-    let (fleet_health_sender, fleet_health_receiver) = monitor::latest_channel();
-    let (refresh_sender, refresh_receiver) = mpsc::sync_channel(1);
-    let stop = Arc::new(AtomicBool::new(false));
-    let local_refresh_delayed = Arc::new(AtomicBool::new(false));
-    let worker_refresh_delayed = Arc::clone(&local_refresh_delayed);
-    let worker_stop = Arc::clone(&stop);
-    let worker = pika.clone();
-    // Transfer the only publisher into the store-driven observer. Remote and
-    // usage workers can only commit to SQLite; Rust ownership prevents either
-    // worker from racing a complete board snapshot into the render channel.
-    let local_sender = sender;
-    let (local_done_sender, local_done_receiver) = mpsc::sync_channel(1);
-    let local_refresh = thread::spawn(move || {
-        let mut store_changes = worker.store.change_watcher().ok();
-        let mut next_reconcile = Instant::now();
-        let mut consecutive_failures = 0;
-        while !worker_stop.load(Ordering::Relaxed) {
-            if Instant::now() >= next_reconcile {
-                let refresh = worker.reconcile_local().and_then(|_| board_items(&worker));
-                worker_refresh_delayed.store(
-                    record_local_refresh_result(&mut consecutive_failures, refresh.is_ok()),
-                    Ordering::Relaxed,
-                );
-                if let Ok((items, fleet_health)) = refresh {
-                    local_sender.publish(items);
-                    fleet_health_sender.publish(fleet_health);
-                    // Never consume a coalesced reconcile/hook commit without
-                    // re-reading the cache. If this creates the first watcher,
-                    // the read also closes the database-creation race window.
-                    if let Some((items, fleet_health)) =
-                        snapshot_after_store_change(&worker.store, &mut store_changes, || {
-                            board_items(&worker)
-                        })
-                    {
-                        local_sender.publish(items);
-                        fleet_health_sender.publish(fleet_health);
-                    }
-                }
-                // Hooks and store notifications carry normal lifecycle changes
-                // immediately. This slower full provider/process sweep is the
-                // bounded fallback for missed hooks and external changes.
-                next_reconcile = Instant::now() + LOCAL_RECONCILE_INTERVAL;
-            }
-            let wait = next_reconcile
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(500));
-            match refresh_receiver.recv_timeout(wait) {
-                Ok(()) => next_reconcile = Instant::now(),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some((items, fleet_health)) =
-                        snapshot_after_store_change(&worker.store, &mut store_changes, || {
-                            board_items(&worker)
-                        })
-                    {
-                        local_sender.publish(items);
-                        fleet_health_sender.publish(fleet_health);
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        let _ = local_done_sender.send(());
-    });
-    let remote_stop = Arc::clone(&stop);
-    let remote_cancel = CancellationToken::default();
-    let worker_remote_cancel = remote_cancel.clone();
-    let remote_worker = pika.clone();
-    let remote_refresh = thread::spawn(move || {
-        while !remote_stop.load(Ordering::Relaxed) && !worker_remote_cancel.is_cancelled() {
-            let manager = FleetManager::new(&remote_worker.store, SshTransport::default());
-            if let Ok(nodes) = manager.nodes()
-                && let Some(node) = fleet::next_remote_node(&nodes, None, now(), false)
-            {
-                // refresh_node commits its snapshot to the store. The sole
-                // store-driven local publisher observes that commit and builds
-                // the next complete board, preventing an older remote read
-                // from overwriting a newer local hook state.
-                let _ = manager.refresh_node_cancellable(&node.node_id, &worker_remote_cancel);
-            }
-            // The board unparks this exact worker during shutdown. A single
-            // parked interval avoids periodic cancellation polling while
-            // preserving the one-second fleet cadence.
-            thread::park_timeout(Duration::from_secs(1));
-        }
-    });
-    let usage_stop = Arc::clone(&stop);
+    let Some(crate::activity_feed::Context::Source(source)) = crate::activity_feed::current()
+    else {
+        bail!("Activity feed is unavailable");
+    };
     let usage_cancel = CancellationToken::default();
     let worker_usage_cancel = usage_cancel.clone();
     let usage_worker = pika.clone();
     let usage_refresh = thread::spawn(move || {
         let mut cursor = usage::UsageRefreshCursor::default();
-        while !usage_stop.load(Ordering::Relaxed) && !worker_usage_cancel.is_cancelled() {
+        while !worker_usage_cancel.is_cancelled() {
             if let Ok(sessions) = usage_worker.store.list_sessions() {
                 let _ = usage::refresh_one_due_bounded(
                     &usage_worker.paths,
@@ -815,41 +748,47 @@ fn observe_board(pika: &Pika, memory: &mut monitor::BoardMemory) -> Result<Board
                 .with_timeout(Duration::from_secs(4)),
         ),
     );
-    let action = monitor::run_items_dynamic_with_local_health(
-        cached,
-        receiver,
+
+    let (_, health_receiver) = monitor::latest_channel();
+    let action = monitor::run_activity_view(
+        &source,
         Some(board_consultation_driver(pika.clone())),
         update_receiver,
-        refresh_sender.clone(),
-        local_refresh_delayed,
-        (
-            monitor::FleetHealthFeed::new(initial_fleet_health, fleet_health_receiver)
-                .with_quota(quota_feed),
-            board_action_driver(pika.clone()),
-            memory,
-        ),
+        monitor::FleetHealthFeed::new(Vec::new(), health_receiver).with_quota(quota_feed),
+        board_action_driver(pika.clone()),
+        Some(memory),
     );
-    // Once the board has returned an action, no observation that began for its
-    // old frame may write identity state after that action. The fence waits
-    // only for an already-running bounded write batch; slow provider reads are
-    // invalidated and may finish detached without becoming authoritative.
     pika.invalidate_local_reconciliation();
     drop(update_checker);
     drop(quota_worker);
-    // The background SSH group is owned by this board. Cancellation is observed
-    // by the command loop, which kills and reaps its exact process group before
-    // the worker returns. Join it before an exact action starts another refresh.
-    stop.store(true, Ordering::Relaxed);
-    remote_cancel.cancel();
     usage_cancel.cancel();
-    remote_refresh.thread().unpark();
     usage_refresh.thread().unpark();
-    let _ = remote_refresh.join();
     let _ = usage_refresh.join();
-    finish_board_observer(&stop, &refresh_sender, &local_done_receiver, local_refresh);
-    // Do not delay Enter/quit behind provider metadata or a bounded SSH
-    // timeout. Exact actions revalidate independently before mutating state.
     action
+}
+
+fn run_board(pika: &Pika) -> Result<i32> {
+    let source = crate::activity_observer::start(pika)?;
+    let mut update = None;
+    let outcome =
+        crate::activity_feed::with(Some(crate::activity_feed::Context::Source(source)), || {
+            drive_board(
+                |memory| observe_board(pika, memory),
+                |action| {
+                    if matches!(action, BoardAction::Update(_)) {
+                        update = Some(action);
+                        Ok(0)
+                    } else {
+                        finish_board_action(pika, action)
+                    }
+                },
+            )
+        });
+    // Retire observation before replacing this installation or running its successor.
+    match update {
+        Some(action) => finish_board_action(pika, action),
+        None => outcome,
+    }
 }
 
 fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
@@ -860,6 +799,11 @@ fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
         BoardAction::Ask(item) => ask_board_item(pika, item),
         BoardAction::Refresh => unreachable!("interactive refresh is handled in-place"),
         BoardAction::Update(version) => {
+            let ui = crate::onboarding::Screen::new(true)?;
+            ui.progress(
+                "Updating Pika",
+                "Updating this installation only. Your agents keep running.",
+            )?;
             let executable = std::env::current_exe()?;
             let outcome = match update::update_managed(UpdateRequest {
                 executable: &executable,
@@ -868,9 +812,23 @@ fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
                 check: version.is_none(),
             }) {
                 Err(update::UpdateError::Interrupted(code)) => return Ok(code),
+                Err(error) if ui.active() => {
+                    ui.details(
+                        "Update needs attention",
+                        &format!(
+                            "{error}\n\nYour agents were not stopped. No automatic retry was made."
+                        ),
+                    )?;
+                    return Ok(1);
+                }
                 result => result?,
             };
-            println!("{}", outcome.message());
+            if !ui.active() {
+                println!("{}", outcome.message());
+            } else if outcome.disposition != update::UpdateDisposition::Installed {
+                ui.details("Pika update", &outcome.message())?;
+            }
+            drop(ui);
             if outcome.disposition == update::UpdateDisposition::Installed {
                 // Replace only this board process; retained runtimes keep agent callbacks valid.
                 use std::os::unix::process::CommandExt;
@@ -879,308 +837,6 @@ fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
             Ok(0)
         }
         BoardAction::Quit => Ok(0),
-    }
-}
-
-fn record_local_refresh_result(consecutive_failures: &mut u8, succeeded: bool) -> bool {
-    *consecutive_failures = if succeeded {
-        0
-    } else {
-        consecutive_failures.saturating_add(1)
-    };
-    *consecutive_failures >= 2
-}
-
-fn ensure_store_change_watcher(store: &Store, watcher: &mut Option<StoreChangeWatcher>) -> bool {
-    if watcher.is_none() {
-        *watcher = store.change_watcher().ok();
-        return watcher.is_some();
-    }
-    false
-}
-
-fn store_changed(store: &Store, watcher: &mut Option<StoreChangeWatcher>) -> bool {
-    if ensure_store_change_watcher(store, watcher) {
-        return true;
-    }
-    match watcher.as_mut().map(StoreChangeWatcher::changed) {
-        Some(Ok(changed)) => changed,
-        Some(Err(_)) => {
-            // A replaced/corrupt connection is not permanent: retry from a
-            // fresh data_version baseline on the next poll.
-            *watcher = None;
-            false
-        }
-        None => false,
-    }
-}
-
-fn snapshot_after_store_change<T>(
-    store: &Store,
-    watcher: &mut Option<StoreChangeWatcher>,
-    load: impl FnOnce() -> Result<T>,
-) -> Option<T> {
-    if !store_changed(store, watcher) {
-        return None;
-    }
-    match load() {
-        Ok(snapshot) => Some(snapshot),
-        Err(_) => {
-            // Re-establishing the watcher makes the next poll reload once even
-            // if SQLite has no newer commit after this transient read failure.
-            *watcher = None;
-            None
-        }
-    }
-}
-
-#[cfg(test)]
-mod board_refresh_tests {
-    use super::{
-        ensure_store_change_watcher, fleet_node_health, record_local_refresh_result,
-        snapshot_after_store_change, store_changed,
-    };
-    use crate::{model::FleetNode, store::Store};
-
-    #[test]
-    fn local_refresh_notice_requires_consecutive_failures_and_clears_on_success() {
-        let mut failures = 0;
-        assert!(!record_local_refresh_result(&mut failures, false));
-        assert!(record_local_refresh_result(&mut failures, false));
-        for _ in 0..1_000 {
-            assert!(record_local_refresh_result(&mut failures, false));
-        }
-        assert!(!record_local_refresh_result(&mut failures, true));
-        assert!(!record_local_refresh_result(&mut failures, false));
-        assert!(!record_local_refresh_result(&mut failures, true));
-        assert!(!record_local_refresh_result(&mut failures, false));
-    }
-
-    #[test]
-    fn watcher_created_after_first_database_initialization_observes_later_commits() {
-        let root = tempfile::tempdir().unwrap();
-        let store = Store::at(root.path().join("state/pika.db"));
-        let mut watcher = store.change_watcher().ok();
-        assert!(watcher.is_none());
-
-        store.initialize().unwrap();
-        ensure_store_change_watcher(&store, &mut watcher);
-        assert!(watcher.is_some());
-        store.set_meta("board-test", "updated").unwrap();
-        assert!(store_changed(&store, &mut watcher));
-    }
-
-    #[test]
-    fn hook_commit_between_reconcile_snapshot_and_watcher_consume_is_reloaded() {
-        let root = tempfile::tempdir().unwrap();
-        let store = Store::at(root.path().join("state/pika.db"));
-        store.initialize().unwrap();
-        let mut watcher = None;
-        assert!(ensure_store_change_watcher(&store, &mut watcher));
-
-        let reconcile_snapshot = store.get_meta("interleaved-hook").unwrap();
-        assert_eq!(reconcile_snapshot, None);
-        store.set_meta("interleaved-hook", "newest").unwrap();
-
-        let delivered = snapshot_after_store_change(&store, &mut watcher, || {
-            store.get_meta("interleaved-hook")
-        });
-        assert_eq!(delivered, Some(Some("newest".into())));
-    }
-
-    #[test]
-    fn fleet_health_reports_node_errors_and_missing_cache_then_clears_on_recovery() {
-        let root = tempfile::tempdir().unwrap();
-        let store = Store::at(root.path().join("state/pika.db"));
-        store.initialize().unwrap();
-        let node_id = "77777777-7777-4777-8777-777777777777";
-        let mut node = FleetNode {
-            node_id: node_id.into(),
-            alias: "atlas".into(),
-            ssh_target: "atlas".into(),
-            sources: vec!["ssh-config".into()],
-            status: "error".into(),
-            protocol_version: Some(crate::fleet::PROTOCOL_VERSION),
-            package_version: Some(crate::VERSION.into()),
-            capabilities: vec!["snapshot".into()],
-            last_seen: 0.0,
-            last_attempt_at: 1.0,
-            last_error: Some("connection refused".into()),
-            created_at: 1.0,
-            updated_at: 1.0,
-        };
-        store.upsert_fleet_node(&node).unwrap();
-        let health = fleet_node_health(&store);
-        assert_eq!(health.len(), 2);
-        assert!(
-            health
-                .iter()
-                .any(|item| item.contains("connection refused"))
-        );
-        assert!(
-            health
-                .iter()
-                .any(|item| item.contains("no cached snapshot"))
-        );
-
-        node.status = "ready".into();
-        node.last_error = None;
-        store.upsert_fleet_node(&node).unwrap();
-        store
-            .put_remote_snapshot(node_id, &serde_json::json!({"sessions": []}), 2.0)
-            .unwrap();
-        assert!(fleet_node_health(&store).is_empty());
-    }
-}
-
-fn finish_board_observer(
-    stop: &AtomicBool,
-    refresh: &mpsc::SyncSender<()>,
-    done: &mpsc::Receiver<()>,
-    worker: thread::JoinHandle<()>,
-) {
-    stop.store(true, Ordering::Relaxed);
-    // Wake the local observer, but never hold Enter/quit behind an in-flight
-    // provider or tmux read. `bare` fences its writes before reaching here, so
-    // a completed observer can be joined and a slow read can finish detached
-    // without ever becoming authoritative.
-    let _ = refresh.try_send(());
-    if done.try_recv().is_ok() && worker.is_finished() {
-        let _ = worker.join();
-    }
-}
-
-fn board_items(pika: &Pika) -> Result<(Vec<BoardItem>, Vec<String>)> {
-    board_items_from_inventory(pika, pika.cached_inventory()?)
-}
-
-fn board_items_from_inventory(
-    pika: &Pika,
-    inventory: crate::core::Inventory,
-) -> Result<(Vec<BoardItem>, Vec<String>)> {
-    let mut inventory = inventory;
-    let _ = usage::hydrate_cached_sessions(&pika.store, &mut inventory.sessions);
-    let profiles = pika
-        .store
-        .list_stored_expert_profiles()?
-        .into_iter()
-        .map(|stored| {
-            (
-                (stored.profile.provider, stored.profile.session_id.clone()),
-                stored.profile,
-            )
-        })
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut items = inventory
-        .sessions
-        .into_iter()
-        .map(|session| {
-            let expert = profiles
-                .get(&(session.provider, session.session_id.clone()))
-                .map(|profile| ExpertAnnotation {
-                    scope: Some(profile.summary.clone()),
-                    current_work: (!profile.current_state.trim().is_empty())
-                        .then(|| profile.current_state.clone()),
-                    topics: profile.topics.clone(),
-                    freshness: Some(format!("updated {} ago", short_age(profile.updated_at))),
-                    scope_freshness: Some(format!(
-                        "updated {} ago",
-                        short_age(if profile.scope_updated_at > 0.0 {
-                            profile.scope_updated_at
-                        } else {
-                            profile.updated_at
-                        })
-                    )),
-                    current_work_freshness: Some(format!(
-                        "updated {} ago",
-                        short_age(if profile.current_state_updated_at > 0.0 {
-                            profile.current_state_updated_at
-                        } else {
-                            profile.updated_at
-                        })
-                    )),
-                });
-            BoardItem {
-                expert,
-                ..BoardItem::local(session)
-            }
-        })
-        .collect::<Vec<_>>();
-    items.extend(inventory.pending.into_iter().map(|pending| BoardItem {
-        session: crate::core::session_from_pending(&pending),
-        node_id: None,
-        node_name: None,
-        stale: false,
-        pending_token: Some(pending.launch_token),
-        expert: None,
-    }));
-    let mut fleet_health = Vec::new();
-    append_cached_fleet(
-        &mut items,
-        &mut fleet_health,
-        FleetManager::new(&pika.store, SshTransport::default())
-            .cached_sessions_with_notices(None, false),
-    );
-    fleet_health.extend(fleet_node_health(&pika.store));
-    Ok((items, fleet_health))
-}
-
-fn fleet_node_health(store: &Store) -> Vec<String> {
-    let nodes = match FleetManager::new(store, SshTransport::default()).nodes() {
-        Ok(nodes) => nodes,
-        Err(error) => return vec![format!("fleet registry unavailable · {}", error.message)],
-    };
-    let mut health = Vec::new();
-    for node in nodes {
-        if let Some(error) = node
-            .last_error
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            health.push(format!("{} · {error}", node.alias));
-        } else if node.status != "ready" {
-            health.push(format!("{} · machine status {}", node.alias, node.status));
-        }
-        match store.has_remote_snapshot(&node.node_id) {
-            Ok(true) => {}
-            Ok(false) => health.push(format!("{} · no cached snapshot yet", node.alias)),
-            Err(error) => health.push(format!(
-                "{} · cached snapshot unavailable · {error}",
-                node.alias
-            )),
-        }
-    }
-    health.sort();
-    health.dedup();
-    health
-}
-
-fn append_cached_fleet(
-    items: &mut Vec<BoardItem>,
-    health: &mut Vec<String>,
-    cached: std::result::Result<fleet::CachedFleetSessions, fleet::FleetError>,
-) {
-    match cached {
-        Ok(cached) => {
-            for remote in cached.sessions {
-                let expert = ExpertAnnotation::from_remote(&remote);
-                items.push(BoardItem {
-                    session: remote.session,
-                    node_id: Some(remote.node_id),
-                    node_name: Some(remote.node_name),
-                    stale: remote.stale,
-                    pending_token: None,
-                    expert,
-                });
-            }
-            health.extend(
-                cached
-                    .notices
-                    .into_iter()
-                    .map(|notice| format!("{} · {}", notice.node_name, notice.message)),
-            );
-        }
-        Err(error) => health.push(error.message),
     }
 }
 
@@ -1387,6 +1043,7 @@ fn board_peek_report(pika: &Pika, item: &BoardItem) -> Result<String> {
             .with_context(|| {
                 format!("PEEK · {identity} @{} · unread preserved", remote.node_name)
             })?;
+        let output = crate::preview::board_output(item.session.provider, &output);
         return Ok(format!(
             "PEEK · {identity} @{} · unread preserved\n\n{output}",
             remote.node_name
@@ -1404,6 +1061,7 @@ fn board_peek_report(pika: &Pika, item: &BoardItem) -> Result<String> {
     let output = pika
         .capture_exact(&item.session, pika.config.peek_lines)
         .with_context(|| format!("PEEK · {identity} · unread preserved"))?;
+    let output = crate::preview::board_output(item.session.provider, &output);
     Ok(format!(
         "PEEK · {identity} · unread preserved\n\n{}",
         if output.trim().is_empty() {
@@ -1586,19 +1244,6 @@ fn print_sessions(sessions: Vec<Session>, usage: bool) -> Result<i32> {
         )
     }
     Ok(0)
-}
-
-fn short_age(timestamp: f64) -> String {
-    let seconds = (now() - timestamp).max(0.0) as u64;
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3_600 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 172_800 {
-        format!("{}h", seconds / 3_600)
-    } else {
-        format!("{}d", seconds / 86_400)
-    }
 }
 
 #[derive(Debug)]
@@ -2809,6 +2454,45 @@ fn skill_command(pika: &Pika, a: SkillArgs) -> Result<i32> {
 }
 
 fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
+    let ui =
+        crate::onboarding::Screen::new(!a.details && !a.yes && !a.dry_run && !a.skip_walkthrough)?;
+    ui.progress(
+        "Getting your board ready",
+        "Finding your existing settings. No agents are being started.",
+    )?;
+    let result = setup_screen(pika, a, &ui);
+    let presented = ui.active();
+    if let Err(error) = &result
+        && ui.active()
+    {
+        ui.details("Setup needs your attention", &format!("{error:#}\n\nSetup stopped. Changes already confirmed may have been applied. Your agents were not stopped."))?;
+    }
+    drop(ui);
+    match result {
+        // Internal navigation outcome, never exposed as a process exit code.
+        Ok(10) => bare(&Pika::discover()?),
+        Err(_) if presented => Ok(1),
+        other => other,
+    }
+}
+
+fn setup_screen(pika: &Pika, a: SetupArgs, ui: &crate::onboarding::Screen) -> Result<i32> {
+    let journal = std::cell::RefCell::new(Vec::<String>::new());
+    // Human setup keeps routine receipts behind Details. Redirected and explicit
+    // diagnostic invocations retain the original finite text interface.
+    macro_rules! println {
+        ($($arg:tt)*) => {{
+            if ui.active() { journal.borrow_mut().push(format!($($arg)*)); }
+            else { std::println!($($arg)*); }
+        }};
+    }
+    macro_rules! eprintln {
+        ($($arg:tt)*) => {{
+            if ui.active() { journal.borrow_mut().push(format!($($arg)*)); }
+            else { std::eprintln!($($arg)*); }
+        }};
+    }
+    let mut notices = Vec::<String>::new();
     let first_setup = !pika.paths.config.is_file();
     let explicit_machines = a.machines.clone();
     let explicit_machine_setup = !explicit_machines.is_empty();
@@ -2875,8 +2559,13 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
         "Pika setup · exact recovery for Codex + Claude + OpenCode\nPreview first · existing settings retained · backups before writes\n"
     );
     let changed = changes.iter().filter(|change| change.changed()).count();
-    for c in changes.iter().filter(|c| c.changed()) {
-        print!("{}", setup_preview::sanitized_unified_diff(c));
+    let preview = changes
+        .iter()
+        .filter(|c| c.changed())
+        .map(setup_preview::sanitized_unified_diff)
+        .collect::<String>();
+    if !ui.active() {
+        print!("{preview}");
     }
     if a.dry_run {
         println!("Dry run only · no files changed.");
@@ -2887,7 +2576,34 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
             eprintln!("pika: Re-run exactly: `pika setup --yes` to apply these changes.");
             return Ok(2);
         }
-        if !confirm("Apply these changes? [y/N] ")? {
+        let approved = if ui.active() {
+            loop {
+                let body = format!(
+                    "See who needs you. Pick up where you left off.\n\nActivity updates + the agent consultation skill.{}\nExisting settings kept; backups before changes.\n{changed} settings file(s). Review changes below.",
+                    if schedule_request.is_some() {
+                        "\nScheduled expert-card refresh may use model quota.\nNo interviews during setup."
+                    } else {
+                        ""
+                    }
+                );
+                match ui.choice(
+                    if first_setup {
+                        "Keep your board up to date"
+                    } else {
+                        "Update your Pika connections"
+                    },
+                    &body,
+                    &["Enable updates", "View changes", "Not now"],
+                )? {
+                    Some(0) => break true,
+                    Some(1) => ui.details("Changes to your settings", &preview)?,
+                    _ => break false,
+                }
+            }
+        } else {
+            confirm("Apply these changes? [y/N] ")?
+        };
+        if !approved {
             println!("No changes applied.");
             return Ok(0);
         }
@@ -2895,6 +2611,10 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
     if changed == 0 {
         println!("Pika hooks, skill, configuration, and schedule are already current.");
     }
+    ui.progress(
+        "Connecting your agents",
+        "Applying the approved settings and keeping backups.",
+    )?;
     let receipt = setup::apply_changes(&changes, &format!("{}", now() as u64))?;
     pika.store.initialize()?;
     for backup in &receipt.backups {
@@ -2907,9 +2627,12 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
     if let Some(request) = &schedule_request {
         match scheduler::activate_schedule(request) {
             Ok(activation) => println!("Expert refresh active · {}", activation.detail),
-            Err(error) => println!(
-                "Expert refresh inactive · {error}. Run `pika expert refresh --due` manually."
-            ),
+            Err(error) => {
+                notices.push("Automatic expert-card refresh is unavailable. Your board still works; see setup details.".into());
+                println!(
+                    "Expert refresh inactive · {error}. Run `pika expert refresh --due` manually."
+                );
+            }
         }
     }
     if !first_setup {
@@ -2918,9 +2641,13 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
                 "Reconciled {} tracked conversation name(s).",
                 inventory.sessions.len()
             ),
-            Err(error) => println!(
-                "Name reconciliation incomplete · {error}. No conversation identity was changed."
-            ),
+            Err(error) => {
+                notices
+                    .push("Conversation names could not be refreshed. See setup details.".into());
+                println!(
+                    "Name reconciliation incomplete · {error}. No conversation identity was changed."
+                );
+            }
         }
     }
 
@@ -2929,6 +2656,10 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
         .map(|session| session.provider)
         .chain(std::iter::once(options.default_provider))
         .collect::<BTreeSet<_>>();
+    ui.progress(
+        "Checking activity updates",
+        "Checking installed integrations, not starting conversations.",
+    )?;
     let commissioning = setup::commissioning_report(
         &SetupPaths::from(&pika.paths),
         &pika.store,
@@ -2990,7 +2721,80 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
         );
     }
 
-    if !a.no_machines && (explicit_machine_setup || (first_setup && io::stdin().is_terminal())) {
+    if ui.active() {
+        for provider in &commissioning.providers {
+            if !provider.required && !provider.runtime.available {
+                continue;
+            }
+            let label = setup_provider_label(provider.provider);
+            if !provider.runtime.compatible()
+                || !provider.hooks_active
+                || !provider.overdue_launches.is_empty()
+            {
+                notices.push(format!(
+                    "{label} needs attention: {}",
+                    provider.missing_proofs().join("; ")
+                ));
+            } else if !provider.observed() {
+                notices.push(if provider.provider == Provider::Codex {
+                    "Codex: activity updates are installed, not yet verified. Open /hooks in Codex to review and trust them.".into()
+                } else { format!("{label}: activity updates are installed; waiting for the first event to verify them.") });
+            }
+        }
+    }
+
+    let has_unconfirmed = !a.no_import && !pika.store.list_unconfirmed_sessions()?.is_empty();
+    if !a.no_import && (first_setup || explicit_import || has_unconfirmed) {
+        ui.progress(
+            "Find your work",
+            "Looking for existing conversations on this machine.",
+        )?;
+        let named = pika.import_named()?;
+        let mut selected = if a.import_all {
+            named
+        } else if ui.active() {
+            choose_setup_conversations(ui, named, false)?
+        } else {
+            choose_candidates(named)?
+        };
+        let browse_recent = a.browse_all
+            || (!a.import_all
+                && (first_setup || has_unconfirmed)
+                && io::stdin().is_terminal()
+                && if ui.active() {
+                    ui.choice("Anything else to bring in?", "Recent conversations may have automatic titles.\nYou can add more later with pika setup --browse-all.", &["Continue", "Browse recent conversations"])? == Some(1)
+                } else {
+                    confirm("Browse recent provider-labeled conversations too? [y/N] ")?
+                });
+        if browse_recent {
+            let recent = pika.import_recent_unnamed(20)?;
+            if a.import_all {
+                selected.extend(recent);
+            } else if ui.active() {
+                selected.extend(choose_setup_conversations(ui, recent, true)?);
+            } else {
+                selected.extend(choose_recent_candidates(recent)?);
+            }
+        }
+        for c in &selected {
+            pika.adopt_candidate(c)?;
+        }
+        if !selected.is_empty() {
+            println!("Watching {} conversation(s).", selected.len());
+        }
+    }
+
+    let add_machines =
+        !a.no_machines && (explicit_machine_setup || (first_setup && io::stdin().is_terminal()));
+    let add_machines = add_machines && (!ui.active() || explicit_machine_setup || ui.choice(
+        "Work on other machines too?", "Your local conversations are already available.\nConnect selected SSH machines to see their work here.",
+        &["Just this machine for now", "Connect another machine"],
+    )? == Some(1));
+    if add_machines {
+        ui.progress(
+            "Find your machines",
+            "Reading saved connections. No candidate has been contacted.",
+        )?;
         let home = directories::BaseDirs::new()
             .context("cannot determine home directory for machine discovery")?;
         let report = fleet::discover_node_candidates(
@@ -3001,7 +2805,25 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
         )
         .map_err(anyhow::Error::from)?;
         let selected = if explicit_machines.is_empty() {
-            choose_machine_candidates(report.candidates)?
+            if ui.active() {
+                let labels = report
+                    .candidates
+                    .iter()
+                    .map(|c| format!("{} · {}", c.alias, c.ssh_target))
+                    .collect::<Vec<_>>();
+                ui.select(
+                    "Connect your machines",
+                    "Only the machines you select will be contacted.",
+                    &labels,
+                    true,
+                )?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|i| report.candidates[i].clone())
+                .collect()
+            } else {
+                choose_machine_candidates(report.candidates)?
+            }
         } else {
             let discovered = report
                 .candidates
@@ -3031,6 +2853,10 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
         let manager = FleetManager::new(&pika.store, SshTransport::default());
         let mut added = Vec::new();
         for candidate in selected {
+            ui.progress(
+                "Connect your machines",
+                &format!("Connecting to {}…", candidate.alias),
+            )?;
             match manager.add(&candidate, Some(&candidate.alias)) {
                 Ok(node) => {
                     println!(
@@ -3051,13 +2877,22 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
                             &target,
                             Some(VERSION),
                         )?;
+                        let prompt = format!(
+                            "Install Pika {} on {} ({})? [y/N] ",
+                            prepared.version(),
+                            candidate.ssh_target,
+                            target
+                        );
                         if a.yes
-                            || confirm(&format!(
-                                "Install Pika {} on {} ({})? [y/N] ",
-                                prepared.version(),
-                                candidate.ssh_target,
-                                target
-                            ))?
+                            || if ui.active() {
+                                ui.choice(
+                                    "Install on this machine?",
+                                    &prompt,
+                                    &["Not now", "Install Pika"],
+                                )? == Some(1)
+                            } else {
+                                confirm(&prompt)?
+                            }
                         {
                             transport
                                 .install_bundle(&candidate.ssh_target, &prepared, None)
@@ -3075,6 +2910,7 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
                             println!("Nothing installed on {}.", candidate.ssh_target);
                         }
                     } else {
+                        notices.push(format!("{} was not connected: Pika is not installed there. See setup details for the command.", candidate.alias));
                         eprintln!(
                             "pika: Pika is missing on {}. Nothing was installed. Install Pika there, then rerun exactly: `pika setup --machine {}`; or provide a reviewed native bundle with `--install-bundle PATH`.",
                             candidate.ssh_target,
@@ -3082,10 +2918,13 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
                         );
                     }
                 }
-                Err(error) => eprintln!(
-                    "pika: {} was not added: {}. No other candidate was contacted.",
-                    candidate.alias, error
-                ),
+                Err(error) => {
+                    notices.push(format!("{} was not connected: {error}", candidate.alias));
+                    eprintln!(
+                        "pika: {} was not added: {}. Other selected machines are handled separately.",
+                        candidate.alias, error
+                    );
+                }
             }
         }
         if remote_import_all {
@@ -3104,32 +2943,41 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
             }
         }
     }
-    let has_unconfirmed = !a.no_import && !pika.store.list_unconfirmed_sessions()?.is_empty();
-    if !a.no_import && (first_setup || explicit_import || has_unconfirmed) {
-        let named = pika.import_named()?;
-        let mut selected = if a.import_all {
-            named
+    if ui.active() {
+        let count = pika.store.list_sessions()?.len();
+        let intro = if count == 0 {
+            "No conversations selected yet.\nYou can start or find one with pika NAME.".to_owned()
         } else {
-            choose_candidates(named)?
+            format!(
+                "{count} conversation(s) on your board.\nEnter opens a conversation. Use its visible ← Pika control to return."
+            )
         };
-        let browse_recent = a.browse_all
-            || (!a.import_all
-                && (first_setup || has_unconfirmed)
-                && io::stdin().is_terminal()
-                && confirm("Browse recent provider-labeled conversations too? [y/N] ")?);
-        if browse_recent {
-            let recent = pika.import_recent_unnamed(20)?;
-            if a.import_all {
-                selected.extend(recent);
+        let body = format!(
+            "{intro}\n\nAgents can discover and consult project experts through the installed skill.\n{}",
+            if notices.is_empty() {
+                "No interviews were run during setup.".into()
             } else {
-                selected.extend(choose_recent_candidates(recent)?);
+                format!("{} connection notice(s) to review below.", notices.len())
             }
-        }
-        for c in &selected {
-            pika.adopt_candidate(c)?;
-        }
-        if !selected.is_empty() {
-            println!("Watching {} conversation(s).", selected.len())
+        );
+        loop {
+            match ui.choice(
+                "Your board",
+                &body,
+                &["Open board", "Connection notices", "Setup details", "Done"],
+            )? {
+                Some(0) => return Ok(10),
+                Some(1) => ui.details(
+                    "Connection notices",
+                    &if notices.is_empty() {
+                        "No connection notices.".into()
+                    } else {
+                        notices.join("\n\n")
+                    },
+                )?,
+                Some(2) => ui.details("Setup details", &journal.borrow().join("\n\n"))?,
+                _ => return Ok(0),
+            }
         }
     }
     if !a.skip_walkthrough && io::stdin().is_terminal() {
@@ -3138,6 +2986,40 @@ fn setup_command(pika: &Pika, a: SetupArgs) -> Result<i32> {
         );
     }
     Ok(0)
+}
+fn choose_setup_conversations(
+    ui: &crate::onboarding::Screen,
+    candidates: Vec<crate::model::Candidate>,
+    recent: bool,
+) -> Result<Vec<crate::model::Candidate>> {
+    let labels = candidates
+        .iter()
+        .map(|c| {
+            format!(
+                "{} · {} · {} · {}",
+                c.name.as_deref().unwrap_or("Unnamed"),
+                c.provider,
+                c.cwd.as_deref().unwrap_or("—"),
+                c.session_id.chars().take(8).collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>();
+    let title = if recent {
+        "Recent conversations"
+    } else {
+        "Choose the work you want to see"
+    };
+    let body = if candidates.is_empty() {
+        "No conversations found in this view.\nContinue to your board; pika NAME can start or find work later."
+    } else {
+        "Only your selections appear on the board.\nSome titles are automatic. Selecting does not move or stop a live agent."
+    };
+    Ok(ui
+        .select(title, body, &labels, true)?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|i| candidates[i].clone())
+        .collect())
 }
 fn setup_provider_label(provider: Provider) -> &'static str {
     match provider {
@@ -5220,7 +5102,10 @@ fn fleet_stdio(pika: &Pika, a: FleetInternalArgs) -> Result<i32> {
 fn fleet_open(pika: &Pika, a: FleetOpenArgs) -> Result<i32> {
     verify_local_node(pika, &a.expected_node_id)?;
     let session = exact_local_session(pika, a.provider, &a.session_id, true)?;
-    let receipt = pika.open_session(session, true)?;
+    let receipt = crate::activity_feed::with(
+        a.board_feed.map(crate::activity_feed::Context::Remote),
+        || pika.open_session(session, true),
+    )?;
     finish_local_open(pika, &receipt)
 }
 fn client_fleet_open(pika: &Pika, a: ClientFleetOpenArgs) -> Result<i32> {
@@ -5232,6 +5117,7 @@ fn client_fleet_open(pika: &Pika, a: ClientFleetOpenArgs) -> Result<i32> {
                 expected_node_id: a.expected_node_id,
                 provider: a.provider,
                 session_id: a.session_id,
+                board_feed: None,
             },
         );
     }
@@ -5953,7 +5839,12 @@ mod fleet_consultation_tests {
         let (returned_sender, returned_receiver) = mpsc::sync_channel(1);
         let shutdown_stop = stop.clone();
         let shutdown = thread::spawn(move || {
-            finish_board_observer(&shutdown_stop, &refresh_sender, &done_receiver, worker);
+            crate::activity_observer::finish_board_observer(
+                &shutdown_stop,
+                &refresh_sender,
+                &done_receiver,
+                worker,
+            );
             let _ = returned_sender.send(done_receiver);
         });
         let returned = returned_receiver.recv_timeout(Duration::from_secs(2));
@@ -6072,7 +5963,7 @@ done
         let local = BoardItem::local(fixture_session(root.path()));
         let mut items = vec![local.clone()];
         let mut health = Vec::new();
-        append_cached_fleet(
+        crate::activity_observer::append_cached_fleet(
             &mut items,
             &mut health,
             Err(fleet::FleetError::new(
@@ -6116,7 +6007,7 @@ done
             current_state_status: None,
         })
         .collect();
-        append_cached_fleet(
+        crate::activity_observer::append_cached_fleet(
             &mut items,
             &mut health,
             Ok(fleet::CachedFleetSessions {
@@ -6137,7 +6028,7 @@ done
         let local = BoardItem::local(fixture_session(root.path()));
         let mut items = vec![local.clone()];
         let mut health = Vec::new();
-        append_cached_fleet(
+        crate::activity_observer::append_cached_fleet(
             &mut items,
             &mut health,
             Ok(fleet::CachedFleetSessions {

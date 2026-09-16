@@ -60,6 +60,8 @@ pub const CAPABILITIES: &[&str] = &[
     "setup-explicit-names-v1",
     "client-board-v1",
     "quota-v1",
+    "board-feed-v1",
+    "board-feed-v2",
 ];
 const REQUIRED_CAPABILITIES: &[&str] = &[
     "inventory",
@@ -1267,6 +1269,50 @@ fn session_from_wire(value: &Value) -> Result<Session, FleetError> {
     })
 }
 
+#[cfg(test)]
+mod preview_wire_tests {
+    use super::*;
+    use crate::{monitor::BoardItem, preview::Driver};
+
+    #[test]
+    fn remote_wire_pane_visibility_reaches_board_preview_without_local_pane_id() {
+        for provider in [Provider::Codex, Provider::Claude] {
+            let session = session_from_wire(&json!({
+                "provider": provider.as_str(),
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "status": "READY", "pane_visible": true, "exact_home": true,
+                "unread": true, "live": true
+            }))
+            .unwrap();
+            assert!(session.tmux_pane.is_none());
+            assert_eq!(session.tmux_session.as_deref(), Some("remote"));
+            let mut row = BoardItem::local(session);
+            row.node_id = Some("22222222-2222-4222-8222-222222222222".into());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let expected = row.clone();
+            let mut driver = Driver::new(move |item, _| {
+                assert_eq!(item.node_id, expected.node_id);
+                assert_eq!(item.session.session_id, expected.session.session_id);
+                assert_eq!(item.session.provider, provider);
+                assert!(item.session.tmux_pane.is_none());
+                tx.send(()).unwrap();
+                Ok("Exact remote output".into())
+            });
+            driver.tick(Some(row.clone()), true);
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("remote preview was incorrectly blocked by missing local pane ID");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while driver.view().unwrap().loading {
+                driver.tick(Some(row.clone()), false);
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert_eq!(driver.view().unwrap().text, "Exact remote output");
+            assert!(row.session.unread);
+        }
+    }
+}
+
 fn validate_profiles(value: Option<&Value>) -> Result<Vec<Value>, FleetError> {
     let values = value.and_then(Value::as_array).ok_or_else(|| {
         FleetError::new(
@@ -1547,7 +1593,7 @@ impl SshTransport {
         ])
     }
 
-    fn command(
+    pub(crate) fn command(
         &self,
         target: &str,
         arguments: &[String],
@@ -1797,9 +1843,11 @@ impl FleetTransport for SshTransport {
         arguments: &[String],
         tty: bool,
     ) -> Result<i32, FleetError> {
+        let mut arguments = arguments.to_vec();
+        crate::activity_feed::forward(&mut arguments, node, self)?;
         let _mouse_reporting = crate::terminal::MouseReportingGuard::new(tty);
         let status = self
-            .command(&node.ssh_target, arguments, tty)?
+            .command(&node.ssh_target, &arguments, tty)?
             .status()
             .map_err(|error| {
                 FleetError::new(

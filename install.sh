@@ -295,7 +295,7 @@ if [ -z "$pika_no_setup" ]; then
         # automation instead of claiming the complete install succeeded.
         exit 3
     fi
-    [ -z "$pika_skill_detail" ] || printf '%s\n' "$pika_skill_detail"
+    # Successful skill wiring is routine; setup explains what it enables.
     if ! command -v tmux >/dev/null 2>&1; then
         printf '%s\n' \
             'tmux is missing. Pika is installed; Pika needs tmux to host agents.' \

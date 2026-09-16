@@ -402,23 +402,30 @@ pub(crate) fn canonical_identity_pids(
     let launcher_aliases: BTreeSet<i64> = matches
         .iter()
         .filter_map(|pid| {
-            let child = processes.get(pid)?;
-            let parent = processes.get(&child.parent_pid?)?;
-            let runtime = Path::new(parent.argv.first()?).file_name()?.to_str()?;
-            // An actual provider spawning another provider is not a launcher
-            // alias. Require the known runtime shim, identical forwarded args,
-            // and a plausible parent/child generation ordering.
-            (matches.contains(&parent.pid)
-                && matches!(runtime, "node" | "nodejs" | "bun")
-                && parent.argv.len() >= 2
-                && child.provider().is_some()
-                && child.provider() == parent.provider()
-                && parent.start_time <= child.start_time
-                && parent.argv[2..] == child.argv[1..])
-                .then_some(parent.pid)
+            let parent = runtime_launcher_generation(*pid, processes)?;
+            matches.contains(&parent.pid).then_some(parent.pid)
         })
         .collect();
     matches.difference(&launcher_aliases).copied().collect()
+}
+
+/// A known runtime forwarding identical provider arguments to its direct child.
+/// Ordinary native parent/child clients are never aliases. Callers retaining this
+/// evidence must also revalidate the live ancestry and both process generations.
+pub(crate) fn runtime_launcher_generation(
+    pid: i64,
+    processes: &BTreeMap<i64, ProcessRecord>,
+) -> Option<ProcessGeneration> {
+    let child = processes.get(&pid)?;
+    let parent = processes.get(&child.parent_pid?)?;
+    let runtime = Path::new(parent.argv.first()?).file_name()?.to_str()?;
+    (matches!(runtime, "node" | "nodejs" | "bun")
+        && parent.argv.len() >= 2
+        && child.provider().is_some()
+        && child.provider() == parent.provider()
+        && parent.start_time <= child.start_time
+        && parent.argv[2..] == child.argv[1..])
+        .then_some(parent.generation())
 }
 
 pub fn shared_provider_process(record: &ProcessRecord, provider: Provider) -> bool {

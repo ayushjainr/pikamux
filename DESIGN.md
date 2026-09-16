@@ -37,6 +37,11 @@ failure behind a successful-looking attachment.
 - Provider launcher/native-child aliases count as one logical client. Shared
   app-server hook leases are advisory when direct UUID-bearing client evidence
   exists; distinct UUID-bearing process trees remain `OPEN TWICE`.
+- Terminal handoff may advance from a verified runtime launcher to its exact
+  native child, provided the launcher generation, pane and launch identity are
+  unchanged and the forwarded arguments match. Native-client replacement and
+  reverse transitions remain blocked. Pane capture still requires an unchanged
+  provider process on both sides of the read.
 - Freshness, partial provider discovery, and refresh failure remain visible;
   stale data is never silently presented as current or fully synchronized.
 - Federation is location, not migration. A user-selected coordinator may show
@@ -108,6 +113,22 @@ forcing a compressed split.
 
 # Interaction & States
 
+Interactive first use and setup share the board's terminal palette and keyboard
+selection model. Setup owns one alternate screen with restored typing/cursor
+state on ordinary exits; progress replaces the current panel rather than entering
+scrollback. Settings changes still require explicit approval, with a sanitized,
+scrollable preview available before writes. Scheduled expert refresh and its
+potential quota use are disclosed in that approval. Routine hook, backup, runtime
+and reconciliation receipts are retained in setup details instead of printed.
+Connection notices distinguish installed integrations from observed activity;
+setup never interviews providers. Conversation choices precede optional machine
+discovery on hosts. First-run Windows clients select remote hosts in the same
+presentation, retaining successful pairings if another selected host fails.
+Already configured boards open directly. Existing watched work without a config
+file is not mistaken for first use. Dry runs, redirected output, --yes and
+--details retain the finite diagnostic interface. Escape never approves a
+settings write or selects machines; below 60 × 20, hidden choices cannot execute.
+
 `pika` opens the live monitor only on an interactive terminal. `pika list` and
 redirected bare output remain finite and stable. Arrow keys or j/k move the
 selection; Enter opens the exact selected identity; `a` focuses the default
@@ -132,6 +153,36 @@ the agent. The normal board loop retains selection, filter and viewport, while
 freshly checking identity on the next opening. Separate Windows agent windows
 close their attachment and leave the original board running; native window
 focus remains the terminal/OS's responsibility.
+
+An activity service owns local/fleet observation and publishes revisioned
+snapshots independently of terminal views. The board and return strip consume
+the same four counts and color setting, including the shared filter and remote
+cache projection. Each subscription has its own cursor; slower consumers take
+the latest snapshot rather than accumulating a backlog. Observation continues
+through attachment without another inventory scan per view.
+Old reconciliation reads are fenced at handoff before exact opening proceeds.
+The return strip ends with the newest non-stale `NEEDS YOU` conversation's name
+and remote machine, within that same filter. It uses the winning lifecycle event
+time with an immutable-identity tie-breaker, never row order or cache refresh time.
+READY, ownership errors, pending launches and stale rows cannot become this label.
+It remains until resolved or superseded; no animation or extra observation is
+needed. Narrow clients shorten the label, then omit it before navigation/counts.
+There is no second inventory on the destination. Across SSH, one service-owned
+stream per destination sends bounded counts and, with `board-feed-v2`, an inert
+display name to an exact-node-verified
+endpoint. Its random feed identity is bound to the exact tmux client and pane;
+concurrent boards cannot borrow each other's counts. Heartbeats renew a
+15-second display lease; an absent or expired feed says `Board disconnected`,
+not frozen live counts. Dropping one view does not stop other subscribers;
+dropping the last subscription stops owned observers and streams, while agents
+remain running. This service is in-process, not a daemon: exiting its Pika
+process ends its feed and remote display leases expire. Older hosts without
+the feed capability retain ordinary return
+navigation. Agent output, status lines, identity checks and acknowledgement
+remain independent.
+The extended frame never contains a question, transcript, action or executable
+format; labels are bounded and restricted before tmux expansion. Version-1
+receivers continue to receive counts only.
 
 Only unallocated root bindings are used (F12, then F11/F10; unused left-status
 mouse bindings). An existing catch-all or conflicting custom binding is never
@@ -291,6 +342,16 @@ thirty seconds. Selection changes cancel prior work and fence late results by
 generation and exact node/provider/UUID/pane identity. Stale, pending, and unbound
 rows never trigger automatic capture. The worker retains only a bounded recent
 tail in memory, strips terminal programs, and does not acknowledge unread output.
+Remote preview eligibility uses the fleet's pane-availability flag, not a local
+pane ID (which is intentionally absent from remote inventory). Availability
+changes cancel in-flight previews; the owning node revalidates exact identity
+when capturing. No remote pane identifier is invented or trusted locally.
+Board previews (including expanded `p`) hide recognized trailing Codex and Claude
+composer suggestions and status-line chrome. Claude's unknown custom status-line
+text is retained rather than guessing away a possible warning or question.
+This presentation-only filter preserves
+unknown input, questions, and queued-input notices; it never changes attention
+evidence, provider settings, or raw CLI peek output.
 `p` opens a larger explicit preview. Remote side questions use one SSH
 JSONL process for the consultation lifetime, and remote mutations use exact node,
 provider, and conversation UUIDs with no name fallback.

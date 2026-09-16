@@ -40,36 +40,44 @@ provider identity and live pane so return and attention do not depend on guessin
 
 ## The first 90 seconds
 
-Start with one conversation:
+Open Pika:
 
 ```bash
-pika setup
+pika
 ```
 
-First setup previews and applies configuration, then asks for one conversation
-name before offering broader machine or conversation discovery. Enter
-`research-notes`: Pika finds the existing conversation or creates one with that
-native provider name. If an existing copy cannot be handed over safely, Pika
-shows the exact recovery steps.
+On a new installation, Pika opens a setup screen using the same colors and
+keyboard controls as the board. Review the integration summary, inspect
+**View changes** if you wish, and approve before settings are written. Existing
+settings are preserved and changed files backed up. Setup installs activity
+updates, the agent consultation skill, and a quota-aware expert-card refresh
+schedule. Scheduled refreshes can use model quota; setup itself runs no interviews.
 
-Click `← Pika` or press the return key shown beside it (normally F12) to return
-to setup; the agent stays running. Setup shows
-the command you can use any time:
+Select the conversations you want to watch with Space, then Enter to continue.
+Recent conversations and other machines are optional. **Open board** takes you
+directly to your work. Connection notices explain any remaining integration
+steps; detailed hook and backup receipts remain under **Setup details**.
+
+Select a conversation and press Enter to open it. Click `← Pika` or press the
+return key shown beside it (normally F12) to return to the board; the agent
+stays running. The return bar carries the board's live counts and names the latest
+conversation waiting for your input, including its machine when remote. It follows
+your board filter; completed results and stale remote rows do not become that
+name. Narrow terminals shorten or hide it to keep navigation visible.
+You can also return by name from your shell:
 
 ```bash
 pika research-notes
 ```
 
-The optional return rehearsal opens that conversation again without sending a
-prompt. After you detach again, `CONTINUITY PROVEN` requires the same active
-provider identity and a verified live home. This proves recovery; any missing
-hook observations remain explicitly separate in the commissioning ledger.
-No tmux session name is part of the daily workflow.
+If no conversation exists with that name, Pika can create one. If a live copy
+cannot be handed over safely, Pika explains the next step. No tmux session name
+is part of the daily workflow. Existing installations open the board directly;
+run `pika setup` when you want to revisit configuration or `pika setup --browse-all`
+to choose more work. `--details` uses the detailed text interface; `--dry-run`
+previews settings without applying them. `--yes` and redirected commands remain
+non-screen interfaces suitable for automation.
 
-Press Enter at the name prompt to skip, or use `pika setup --skip-walkthrough`.
-`--yes`, non-interactive setup, and dry runs do not launch the walkthrough.
-
-After one recovery makes that contract tangible, use `pika` for the live briefing.
 `pika experts QUERY` is a separate entry into existing expertise; it reports
 metadata matches and source availability, not a guarantee the next ask succeeds.
 
@@ -117,16 +125,14 @@ cargo install --path /path/to/pikamux --locked
 pika setup
 ```
 
-`pika setup` is presented as a commissioning flow, not a blind installer. It
-states the integration contract, shows a diff before changing anything, backs up
-existing files, preserves existing JSON key order, and merges lifecycle hooks
-into Codex and Claude user settings and installs a local OpenCode event plugin.
-On first setup it asks for the default provider, previews configuration, and
-offers one conversation recovery walkthrough. Optional machine discovery and
-broader imports follow that experience. Names supplied by providers do not reliably
-prove a personal rename. Setup offers **Named conversations** first and an optional
-second screen of up to twenty **Recent unnamed conversations**, newest first.
-Only your selections enter the board; `all` applies to the displayed choices.
+`pika setup` summarizes proposed integration changes and offers a detailed diff
+before approval. It backs up changed files, preserves existing JSON key order,
+merges lifecycle hooks into Codex and Claude user settings, and installs a local
+OpenCode event plugin. Conversation selection comes before optional machine
+discovery. Names supplied by providers do not reliably prove a personal rename.
+Setup offers named conversations first and an optional second screen of up to
+twenty recent conversations, newest first. Only your selections enter the board;
+the text interface's `all` applies to its displayed choices.
 
 Opening, creating or adopting a conversation through Pika records your choice
 independently of its name. Existing managed conversations and exact historical
@@ -153,10 +159,10 @@ their own runners. The parent conversation or run remains the visible workstream
 OpenCode sessions with a non-null `parent_id` are likewise subordinate workers:
 their root remains the board item, and it stays `WORKING` while any descendant
 has an incomplete turn. Nothing is imported silently. The final
-commissioning ledger distinguishes active hook definitions from observed live
+connection notices and detailed commissioning ledger distinguish active hook definitions from observed live
 events. Codex requires one extra trust step: open
 `/hooks`, approve the Pika definitions, and use Codex once so `pika doctor` can
-observe a real lifecycle event. Pika uses “commissioned” only when every required
+observe a real lifecycle event. Detailed diagnostics use “commissioned” only when every required
 provider passes a version probe, has its current integration active, and has
 delivered an event from that exact definition. The configured default and every
 provider with tracked conversations are required; installed but unused providers

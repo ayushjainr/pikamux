@@ -7,6 +7,28 @@ require separate version and workflow verification.
 
 ## Conclusion
 
+### Unreleased: shared live feed and newest input request
+
+An in-process activity service owns observation; the board and return strip
+consume the same filtered snapshot. Independent cursors keep one view from
+consuming another's updates. The last consumer releases owned workers; exiting
+the Pika process expires its remote feed rather than leaving frozen live counts.
+
+The strip names the newest non-stale NEEDS YOU conversation, with its remote
+machine. READY, errors and pending launches are excluded. Identity breaks equal
+event-time ties; resolving the request removes it or reveals the next pending
+one. Names shorten with terminal width and disappear before crowding navigation.
+The version-2 frame adds only a bounded, inert label; older hosts get counts only.
+
+Executed on isolated macOS fixtures: nine feed tests (including both SSH frame
+versions, label-injection rejection, independent subscribers and unchanged-count
+name updates), 47 monitor tests, and the real-tmux open/live-update/F12/mouse-return
+journey pass. The journey checks the label reaching the terminal, numeric width
+branches and removal after resolution. The receiving endpoint also accepted a
+version-2 frame in its executable contract. Formatting and warnings-as-errors
+Clippy pass. Windows CI now includes feed tests; no real Windows/fleet deployment
+or release is certified by these local checks.
+
 ### 0.6.17: selected-pane briefing
 
 Automatic preview uses one cancellable worker, a selection-generation fence and

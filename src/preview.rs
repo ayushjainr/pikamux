@@ -30,6 +30,7 @@ struct Identity {
     uuid: String,
     active: Option<String>,
     pane: Option<String>,
+    pane_available: bool,
     pending: Option<String>,
     stale: bool,
 }
@@ -42,6 +43,7 @@ impl From<&BoardItem> for Identity {
             uuid: item.session.session_id.clone(),
             active: item.session.active_thread_id.clone(),
             pane: item.session.tmux_pane.clone(),
+            pane_available: pane_available(item),
             pending: item.pending_token.clone(),
             stale: item.stale,
         }
@@ -170,10 +172,11 @@ impl Driver {
             match thread::Builder::new()
                 .name("pika-pane-preview".into())
                 .spawn(move || {
+                    let provider = item.session.provider;
                     let reply = fetch(item, child_cancel).map_err(|error| error.to_string());
                     // Bounds apply before the reply enters the channel, too.
                     let reply = reply
-                        .map(|text| bounded_text(&text))
+                        .map(|text| board_output(provider, &bounded_text(&text)))
                         .map_err(|text| bounded_text(&text));
                     let _ = sender.send(reply);
                 }) {
@@ -217,10 +220,29 @@ fn absence(item: &BoardItem) -> Option<&'static str> {
         Some("Preview paused · machine information is out of date.")
     } else if item.pending_token.is_some() || item.session.session_id.trim().is_empty() {
         Some("Preview available after the conversation starts.")
-    } else if item.session.tmux_pane.as_deref().is_none_or(str::is_empty) {
+    } else if item.session.session_id.starts_with("unbound:") {
+        Some("Preview available after the exact conversation is identified.")
+    } else if !pane_available(item) {
         Some("No recorded pane · open this conversation to see its work.")
     } else {
         None
+    }
+}
+
+fn pane_available(item: &BoardItem) -> bool {
+    if item.node_id.is_some() {
+        // Fleet deliberately never exports pane IDs. Its validated pane_visible
+        // flag is decoded to a session marker; this authorizes only a request.
+        // The owning node still proves exact UUID/pane identity during capture.
+        item.session
+            .tmux_session
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+    } else {
+        item.session
+            .tmux_pane
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
     }
 }
 
@@ -229,6 +251,211 @@ fn wall_time() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Presentation only: never feed this lossy view into attention/identity checks.
+/// Captures are plain text, so only recognize known chrome at the *end* of the
+/// provider screen. Unknown prompts and questions remain intact.
+/// The CLI's raw peek deliberately does not use this filter.
+pub(crate) fn board_output(provider: Provider, text: &str) -> String {
+    if provider == Provider::Claude {
+        return claude_board_output(text);
+    }
+    if provider != Provider::Codex {
+        return text.to_owned();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    // Do not interpret old output as footer chrome deep in scrollback.
+    let start = end.saturating_sub(12);
+    let status = (start..end).rev().find(|&i| {
+        codex_status_line(lines[i])
+            && lines[i + 1..end]
+                .iter()
+                .all(|line| footer_spacing(line) || footer_hint(line) || quota_segment(line))
+    });
+    if let Some(index) = status {
+        end = index;
+    }
+    let composer = (start..end).rev().find(|&i| {
+        codex_suggestion(lines[i])
+            && lines[i + 1..end]
+                .iter()
+                .all(|line| footer_spacing(line) || footer_hint(line))
+    });
+    if let Some(index) = composer {
+        end = index;
+    }
+    if status.is_none() && composer.is_none() {
+        return text.to_owned();
+    }
+    // Animated composer decoration is not conversation output. Only trim it
+    // immediately beside a positively recognized footer, never inside a result.
+    while end > 0 && footer_spacing(lines[end - 1]) {
+        end -= 1;
+    }
+    lines[..end].join("\n")
+}
+
+fn footer_spacing(line: &str) -> bool {
+    line.chars()
+        .all(|ch| ch.is_whitespace() || matches!(ch, '.' | '·' | '⋅'))
+}
+
+fn footer_hint(line: &str) -> bool {
+    matches!(
+        line.trim(),
+        "? for shortcuts" | "? for shortcuts · / for commands"
+    )
+}
+
+fn quota_segment(line: &str) -> bool {
+    let line = line.trim();
+    (line.starts_with("Context ")
+        || line.starts_with("context ")
+        || line.starts_with("weekly ")
+        || line.starts_with("Weekly "))
+        && line.contains("% left")
+}
+
+fn codex_status_line(line: &str) -> bool {
+    let mut segments = line.trim().split('·').map(str::trim);
+    let Some(model) = segments.next() else {
+        return false;
+    };
+    let mut words = model.split_whitespace();
+    let Some(name) = words.next() else {
+        return false;
+    };
+    if !(name.starts_with("gpt-") || name.starts_with("codex-"))
+        || !words.all(|word| {
+            matches!(
+                word,
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+            )
+        })
+    {
+        return false;
+    }
+    segments.any(|segment| {
+        segment.starts_with('/') || segment.starts_with("~/") || quota_segment(segment)
+    })
+}
+
+fn codex_suggestion(line: &str) -> bool {
+    let Some(prompt) = line.trim().strip_prefix('›') else {
+        return false;
+    };
+    let prompt = prompt.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '·');
+    [
+        "Ask Codex to do anything",
+        "Explain this codebase",
+        "Summarize recent commits",
+        "Run /review on my current changes",
+        "Improve documentation in @filename",
+        "Find and fix a bug in @filename",
+        "Write tests for @filename",
+        "Implement {feature}",
+        "Use /skills to list available skills",
+    ]
+    .iter()
+    .any(|suggestion| prompt.strip_prefix(suggestion).is_some_and(footer_spacing))
+}
+
+fn claude_board_output(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    let original_end = end;
+    let start = end.saturating_sub(12);
+    // Status-line commands are user-defined. Hide only recognizable metadata,
+    // not arbitrary text below a prompt (which can include actionable notices).
+    while end > start
+        && (lines[end - 1].trim().is_empty()
+            || claude_footer_hint(lines[end - 1])
+            || claude_status_line(lines[end - 1]))
+    {
+        end -= 1;
+    }
+    let composer = (start..end).rev().find(|&i| {
+        let Some(prompt) = lines[i].trim().strip_prefix('❯') else {
+            return false;
+        };
+        // Both rules are required: the same words can be actual user input or
+        // a quoted example in the conversation. Multiline drafts stay visible.
+        i > 0
+            && claude_rule(lines[i - 1])
+            && i + 1 < end
+            && claude_rule(lines[i + 1])
+            && lines[i + 2..end].iter().all(|line| line.trim().is_empty())
+            && (prompt.trim().is_empty()
+                || prompt
+                    .trim()
+                    .strip_prefix("Try \"")
+                    .is_some_and(|suggestion| suggestion.len() > 1 && suggestion.ends_with('"')))
+    });
+    if let Some(index) = composer {
+        end = index - 1;
+    }
+    if end == original_end {
+        return text.to_owned();
+    }
+    while end > 0 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    lines[..end].join("\n")
+}
+
+fn claude_rule(line: &str) -> bool {
+    let line = line.trim();
+    line.chars().count() >= 8 && line.chars().all(|ch| matches!(ch, '─' | '━'))
+}
+
+fn claude_footer_hint(line: &str) -> bool {
+    let line = line.trim();
+    if footer_hint(line) {
+        return true;
+    }
+    let line =
+        line.trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '⏵' | '▶' | '⏸'));
+    ["bypass permissions on", "accept edits on", "plan mode on"]
+        .iter()
+        .any(|mode| {
+            line.strip_prefix(mode).is_some_and(|rest| {
+                matches!(
+                    rest.trim(),
+                    "(shift+tab to cycle)" | "(shift+tab to cycle) · ? for shortcuts"
+                )
+            })
+        })
+}
+
+fn claude_status_line(line: &str) -> bool {
+    let mut segments = line.trim().split(['·', '|']).map(str::trim);
+    let Some(model) = segments.next() else {
+        return false;
+    };
+    let model = model.trim_matches(['[', ']']);
+    let mut words = model.split_whitespace();
+    let Some(name) = words.next() else {
+        return false;
+    };
+    if !(name.starts_with("claude-") || matches!(name, "Opus" | "Sonnet" | "Haiku" | "Fable"))
+        || !words.all(|word| {
+            word.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+                || matches!(word, "low" | "medium" | "high" | "max" | "(1M)")
+        })
+    {
+        return false;
+    }
+    segments.any(|segment| {
+        segment.starts_with('/') || segment.starts_with("~/") || quota_segment(segment)
+    })
 }
 
 /// Preserve line boundaries, strip terminal programs (including OSC/DCS), and
@@ -484,6 +711,8 @@ mod tests {
         let now = Instant::now();
         let mut remote = item("a");
         remote.node_id = Some("remote".into());
+        remote.session.tmux_pane = None;
+        remote.session.tmux_session = Some("remote".into());
         driver.tick_at(Some(remote.clone()), true, now, 0.0);
         started.recv_timeout(Duration::from_secs(2)).unwrap();
         reply.send(Ok("remote output".into())).unwrap();
@@ -505,6 +734,57 @@ mod tests {
     }
 
     #[test]
+    fn remote_missing_stale_pending_and_unbound_rows_never_capture() {
+        let (mut driver, started, _) = controlled();
+        for mutation in 0..5 {
+            let mut row = item("a");
+            row.node_id = Some("remote".into());
+            row.session.tmux_pane = None;
+            row.session.tmux_session = Some("remote".into());
+            match mutation {
+                0 => row.session.tmux_session = None,
+                1 => row.stale = true,
+                2 => row.pending_token = Some("launch".into()),
+                3 => row.session.session_id = "unbound:%1".into(),
+                _ => row.session.tmux_session = Some(String::new()),
+            }
+            driver.tick(Some(row), true);
+            assert!(!driver.view().unwrap().loading);
+            assert!(started.try_recv().is_err());
+        }
+        // A session name is not enough evidence for a local capture.
+        let mut local = item("a");
+        local.session.tmux_pane = None;
+        local.session.tmux_session = Some("local-session".into());
+        driver.tick(Some(local), true);
+        assert!(started.try_recv().is_err());
+    }
+
+    #[test]
+    fn remote_pane_availability_change_cancels_and_fences_old_output() {
+        let (mut driver, started, reply) = controlled();
+        let now = Instant::now();
+        let mut row = item("a");
+        row.node_id = Some("remote".into());
+        row.session.tmux_pane = None;
+        row.session.tmux_session = Some("remote".into());
+        driver.tick_at(Some(row.clone()), true, now, 0.0);
+        let (_, token) = started.recv_timeout(Duration::from_secs(2)).unwrap();
+        row.session.tmux_session = None;
+        driver.tick_at(Some(row.clone()), false, now, 0.0);
+        assert!(token.is_cancelled());
+        reply.send(Ok("obsolete pane".into())).unwrap();
+        poll_done(&mut driver, Some(row.clone()), now);
+        assert!(driver.view().unwrap().text.contains("No recorded pane"));
+        row.session.tmux_session = Some("remote".into());
+        driver.tick_at(Some(row.clone()), true, now, 0.0);
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        reply.send(Ok("revalidated pane".into())).unwrap();
+        poll_done(&mut driver, Some(row), now);
+        assert_eq!(driver.view().unwrap().text, "revalidated pane");
+    }
+
+    #[test]
     fn terminal_programs_removed_and_unicode_bounds_preserve_lines() {
         assert_eq!(
             bounded_text("a\x1b[31mred\x1b[0m\n\x1b]52;c;secret\x07b\x1bPbad\x1b\\c\u{202e}!"),
@@ -523,6 +803,183 @@ mod tests {
         assert!(recent.len() <= MAX_BYTES && recent.lines().count() <= MAX_LINES);
         let recent = bounded_text(&format!("{}recent", "🦀".repeat(MAX_BYTES)));
         assert!(recent.ends_with("recent") && recent.len() <= MAX_BYTES);
+    }
+
+    #[test]
+    fn codex_footer_is_hidden_but_output_and_queued_questions_survive() {
+        let output = "Result table\n  storage    45/69\n\nNothing removed.\n\n— Worked for 3m 11s —\n\n• Queued follow-up inputs\n  ? 1 question\n    shift + ← to answer";
+        let capture = format!(
+            "{output}\n .    .\n\n› Ask Codex to do anything\n   .      .\n\ngpt-6-astra medium · /project/research · Context 22% left · weekly 58% left · 114M…\n\n"
+        );
+        assert_eq!(board_output(Provider::Codex, &capture), output);
+        for provider in [Provider::Claude, Provider::Opencode] {
+            assert_eq!(board_output(provider, &capture), capture);
+        }
+    }
+
+    #[test]
+    fn footer_filter_preserves_actual_input_questions_and_non_footer_prose() {
+        let actual = "Result\n› Why were three IDs mismatched?";
+        assert_eq!(
+            board_output(
+                Provider::Codex,
+                &format!("{actual}\n\ngpt-6-astra medium · ~/project · weekly 58% left")
+            ),
+            actual
+        );
+        for text in [
+            "Should I overwrite the file?\n› 1. Yes\n  2. No",
+            "› Ask Codex to do anything\nThis is an example of the placeholder.",
+            "gpt-6-astra is faster · /project/results contains measurements",
+            "gpt-6-astra medium · ~/project\nThis is quoted output, not a footer.",
+            "A result ending in dots...\n",
+            "› Ask Codex to do anything except overwrite my files",
+        ] {
+            assert_eq!(board_output(Provider::Codex, text), text);
+        }
+    }
+
+    #[test]
+    fn known_suggestions_and_status_only_footer_are_removed() {
+        assert_eq!(
+            board_output(
+                Provider::Codex,
+                "Done.\n\n›·Ask Codex to do anything    ·    ."
+            ),
+            "Done."
+        );
+        for suggestion in [
+            "Ask Codex to do anything",
+            "Run /review on my current changes",
+            "Improve documentation in @filename",
+            "Implement {feature}",
+        ] {
+            assert_eq!(
+                board_output(
+                    Provider::Codex,
+                    &format!("Done.\n\n› {suggestion}\n? for shortcuts\n")
+                ),
+                "Done."
+            );
+        }
+        assert_eq!(
+            board_output(
+                Provider::Codex,
+                "Done.\n\ngpt-5.6-sol xhigh · ~/project · main\n"
+            ),
+            "Done."
+        );
+        assert_eq!(
+            board_output(
+                Provider::Codex,
+                "Done.\n\ngpt-6-astra medium · /long/project\n Context 22% left · weekly 58% left\n? for shortcuts"
+            ),
+            "Done."
+        );
+        assert_eq!(
+            board_output(
+                Provider::Codex,
+                "› Ask Codex to do anything\ngpt-6-astra medium · ~/project"
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn claude_bordered_suggestions_and_status_line_are_hidden() {
+        for prompt in [
+            "",
+            "Try \"write a test for parser.rs\"",
+            "Try \"edit app.rs to...\"",
+        ] {
+            for status in [
+                "Opus 4.6 · ~/project · main",
+                "[Sonnet 4.6] | /project | Context 22% left",
+                "claude-fable-5-1 · ~/project · weekly 58% left",
+            ] {
+                let output = "● Updated the parser.\nShould the old format still be supported?";
+                let capture = format!(
+                    "{output}\n\n────────────────────\n❯ {prompt}\n────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n{status}\n"
+                );
+                assert_eq!(board_output(Provider::Claude, &capture), output);
+                assert_eq!(board_output(Provider::Opencode, &capture), capture);
+                assert_eq!(board_output(Provider::Codex, &capture), capture);
+            }
+        }
+    }
+
+    #[test]
+    fn claude_actual_drafts_and_approval_questions_survive() {
+        let draft = "Done.\n────────────────────\n❯ Keep the old format too\n  and add regression tests\n────────────────────";
+        assert_eq!(
+            board_output(
+                Provider::Claude,
+                &format!("{draft}\nSonnet 4.6 · ~/project")
+            ),
+            draft
+        );
+        for text in [
+            "Do you want to make this edit?\n❯ 1. Yes\n  2. No\nEsc to cancel",
+            "❯ Try \"write a test for parser.rs\"",
+            "────────────────────\n❯ Try \"write a test for parser.rs\"\n────────────────────\nPermission required: allow writing to /project?",
+            "────────────────────\n❯\n────────────────────\nAuto-update failed · Try claude doctor",
+            "Opus explains this · /project has the examples",
+            "Example:\n────────────────────\n❯ Try \"edit app.rs\"\n────────────────────\nThis shows how the composer looks.",
+            "Result\n────────────────────\n❯\n────────────────────\ncustom status text without recognized metadata",
+        ] {
+            assert_eq!(board_output(Provider::Claude, text), text);
+        }
+    }
+
+    #[test]
+    fn claude_footer_hints_do_not_strip_permission_requests() {
+        for hint in [
+            "? for shortcuts",
+            "⏵⏵ accept edits on (shift+tab to cycle)",
+            "⏸ plan mode on (shift+tab to cycle) · ? for shortcuts",
+        ] {
+            assert_eq!(
+                board_output(
+                    Provider::Claude,
+                    &format!("Done.\n────────────────────\n❯\n────────────────────\n{hint}")
+                ),
+                "Done."
+            );
+        }
+        let notice = "bypass permissions on requires your approval";
+        assert_eq!(board_output(Provider::Claude, notice), notice);
+    }
+
+    #[test]
+    fn shared_worker_filters_local_and_remote_preview_after_terminal_sanitization() {
+        for (provider, footer) in [
+            (
+                Provider::Codex,
+                "› Ask Codex to do anything\ngpt-6-astra medium · ~/project",
+            ),
+            (
+                Provider::Claude,
+                "────────────────────\n❯ Try \"edit app.rs\"\n────────────────────\nOpus 4.6 · ~/project",
+            ),
+        ] {
+            for remote in [false, true] {
+                let now = Instant::now();
+                let mut row = item("a");
+                row.session.provider = provider;
+                if remote {
+                    row.node_id = Some("remote".into());
+                    row.session.tmux_pane = None;
+                    row.session.tmux_session = Some("remote".into());
+                }
+                let mut driver =
+                    Driver::new(move |_, _| Ok(format!("\x1b[32mDone.\x1b[0m\n\n{footer}")));
+                driver.tick_at(Some(row.clone()), true, now, 0.0);
+                poll_done(&mut driver, Some(row.clone()), now);
+                assert_eq!(driver.view().unwrap().text, "Done.");
+                assert!(row.session.unread);
+                assert_eq!(driver.view().unwrap().observed_at, Some(123.0));
+            }
+        }
     }
 
     #[test]

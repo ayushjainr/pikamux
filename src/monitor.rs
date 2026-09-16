@@ -123,7 +123,7 @@ impl BoardItem {
 
 type BoardKey = (Option<String>, Provider, String);
 
-/// Only UI state survives a native terminal handoff, never identity evidence.
+/// Only UI state survives handoff. Activity observation belongs to the feed.
 #[derive(Default)]
 pub(crate) struct BoardMemory {
     initialized: bool,
@@ -173,7 +173,7 @@ impl<T> LatestReceiver<T> {
 
 enum ItemUpdates {
     Queue(Receiver<Vec<BoardItem>>),
-    Latest(LatestReceiver<Vec<BoardItem>>),
+    Feed(crate::activity_feed::Subscription),
 }
 
 pub(crate) struct FleetHealthFeed {
@@ -275,10 +275,11 @@ impl ActionDriver {
             _ => "Opening request · you can keep using the board".into(),
         };
         let worker = self.worker.clone();
+        let summary = crate::activity_feed::current();
         let (send, receive) = mpsc::sync_channel(1);
         self.pending = Some(receive);
         thread::spawn(move || {
-            let _ = send.send(worker(action));
+            let _ = send.send(crate::activity_feed::with(summary, || worker(action)));
         });
         progress
     }
@@ -493,26 +494,24 @@ pub fn run_items_dynamic_with_notice_and_refresh(
     )
 }
 
-/// Local observation health is separate from conversation status and cached
-/// item updates. A latest-value flag cannot queue a stale warning after recovery.
-#[cfg(not(windows))]
-pub(crate) fn run_items_dynamic_with_local_health(
-    items: Vec<BoardItem>,
-    updates: LatestReceiver<Vec<BoardItem>>,
+/// Both the board and other panels subscribe to the same activity producer.
+pub(crate) fn run_activity_view(
+    source: &crate::activity_feed::Source,
     driver: Option<ConsultationDriver>,
     update_notice: Receiver<Option<String>>,
-    refresh_request: SyncSender<()>,
-    local_refresh_delayed: Arc<AtomicBool>,
-    (fleet_health, actions, memory): (FleetHealthFeed, ActionDriver, &mut BoardMemory),
+    fleet_health: FleetHealthFeed,
+    actions: ActionDriver,
+    memory: Option<&mut BoardMemory>,
 ) -> Result<BoardAction> {
+    let initial = source.snapshot().expect("activity producer is seeded");
     run_loop_with_actions(
-        items,
-        Some(ItemUpdates::Latest(updates)),
+        initial.items,
+        Some(ItemUpdates::Feed(source.subscribe())),
         driver,
         Some(update_notice),
-        Some(refresh_request),
-        Some(local_refresh_delayed),
-        (Some(fleet_health), Some(actions), Some(memory)),
+        Some(source.refresh()),
+        Some(source.delayed()),
+        (Some(fleet_health), Some(actions), memory),
     )
 }
 
@@ -536,29 +535,9 @@ fn run_loop(
     )
 }
 
-pub(crate) fn run_client_board(
-    items: Vec<BoardItem>,
-    updates: LatestReceiver<Vec<BoardItem>>,
-    consultation: ConsultationDriver,
-    refresh: SyncSender<()>,
-    health: FleetHealthFeed,
-    actions: ActionDriver,
-    update_notice: Receiver<Option<String>>,
-) -> Result<BoardAction> {
-    run_loop_with_actions(
-        items,
-        Some(ItemUpdates::Latest(updates)),
-        Some(consultation),
-        Some(update_notice),
-        Some(refresh),
-        None,
-        (Some(health), Some(actions), None),
-    )
-}
-
 fn run_loop_with_actions(
     items: Vec<BoardItem>,
-    updates: Option<ItemUpdates>,
+    mut updates: Option<ItemUpdates>,
     driver: Option<ConsultationDriver>,
     update_notice: Option<Receiver<Option<String>>>,
     refresh_request: Option<SyncSender<()>>,
@@ -595,7 +574,7 @@ fn run_loop_with_actions(
             board.action_notice = Some(note);
             dirty = true;
         }
-        if let Some(updates) = &updates {
+        if let Some(updates) = &mut updates {
             match updates {
                 ItemUpdates::Queue(updates) => {
                     while let Ok(items) = updates.try_recv() {
@@ -603,9 +582,11 @@ fn run_loop_with_actions(
                         dirty = true;
                     }
                 }
-                ItemUpdates::Latest(updates) => {
-                    if let Some(items) = updates.take() {
-                        board.replace_items(items);
+                ItemUpdates::Feed(updates) => {
+                    if let Some(frame) = updates.take() {
+                        board.replace_items(frame.items);
+                        board.feed_summary = Some(frame.summary);
+                        board.fleet_health = frame.health;
                         dirty = true;
                     }
                 }
@@ -672,6 +653,12 @@ fn run_loop_with_actions(
             Duration::from_secs(1)
         };
         if dirty || last_draw.elapsed() >= paint_interval {
+            if let Some(crate::activity_feed::Context::Source(source)) =
+                crate::activity_feed::current()
+            {
+                source.filter(&board.filter);
+                board.feed_summary = source.summary();
+            }
             let (width, height) = size().unwrap_or((100, 30));
             board.ensure_visible(height.saturating_sub(board.quota_height(width, height)));
             presenter.present(&mut stdout, (width, height), |frame| {
@@ -1075,6 +1062,7 @@ impl Drop for ChatState {
 }
 
 struct Board {
+    feed_summary: Option<crate::activity_feed::Summary>,
     preview: Option<crate::preview::View>,
     quota_enabled: bool,
     quota: crate::quota::View,
@@ -1122,10 +1110,17 @@ impl Board {
         memory.update_version.clone_from(&self.update_version);
     }
 
+    fn summary(&self) -> crate::activity_feed::Summary {
+        self.feed_summary
+            .clone()
+            .unwrap_or_else(|| crate::activity_feed::summarize(&self.items, &self.filter))
+    }
+
     fn new(mut items: Vec<BoardItem>) -> Self {
         sort_items(&mut items);
         let selected_key = items.first().map(BoardItem::key);
         Self {
+            feed_summary: None,
             quota_enabled: false,
             quota: crate::quota::View::default(),
             items,
@@ -1223,17 +1218,7 @@ impl Board {
     }
 
     fn matches_filter(item: &BoardItem, needle: &str) -> bool {
-        let session = &item.session;
-        needle.is_empty()
-            || session.display_name().to_lowercase().contains(needle)
-            || session.provider.as_str().contains(needle)
-            || session
-                .cwd
-                .as_deref()
-                .is_some_and(|value| value.to_lowercase().contains(needle))
-            || item
-                .node_label()
-                .is_some_and(|value| value.to_lowercase().contains(needle))
+        crate::activity_feed::matches_filter(item, needle)
     }
 
     fn replace_items(&mut self, mut items: Vec<BoardItem>) {
@@ -1675,22 +1660,7 @@ impl Board {
         let height = height.saturating_sub(quota_height);
         let width = usize::from(width);
         let visible = self.visible();
-        let needs = visible
-            .iter()
-            .filter(|item| item_group(item) == "NEEDS YOU")
-            .count();
-        let working = visible
-            .iter()
-            .filter(|item| item_group(item) == "WORKING")
-            .count();
-        let ready = visible
-            .iter()
-            .filter(|item| item_group(item) == "READY")
-            .count();
-        let parked = visible
-            .iter()
-            .filter(|item| item_group(item) == "PARKED")
-            .count();
+        let [needs, working, ready, parked] = self.summary().counts;
         styled(output, Color::Red, true, "PIKA")?;
         let update = self
             .update_version
@@ -1773,6 +1743,36 @@ impl Board {
             line += 1;
         }
 
+        if visible.is_empty() && self.action_notice.is_none() && self.chat.is_none() {
+            let lines = if !self.filter.is_empty() {
+                [
+                    "No conversations match this filter.",
+                    "Press Esc to see all your work.",
+                    "",
+                ]
+            } else {
+                [
+                    "Your board is ready for your work.",
+                    "Run pika NAME to find or start a conversation.",
+                    "Use pika setup to choose existing work or connect machines.",
+                ]
+            };
+            for (index, text) in lines.iter().enumerate() {
+                if 3 + index < height.saturating_sub(2) as usize {
+                    queue!(output, MoveTo(0, 3 + index as u16))?;
+                    styled(
+                        output,
+                        if index == 0 {
+                            Color::Cyan
+                        } else {
+                            Color::Reset
+                        },
+                        false,
+                        &truncate(text, width),
+                    )?;
+                }
+            }
+        }
         if let Some(chat) = &self.chat {
             self.draw_chat(output, chat, list_width, width, height)?;
         } else if let Some(report) = &self.action_notice {
@@ -2558,21 +2558,13 @@ fn draw_briefing_block(
     Ok(())
 }
 
+#[cfg(test)]
 fn group(session: &Session) -> &'static str {
-    match session.status {
-        Status::NeedsYou | Status::Error | Status::OpenTwice | Status::Unbound => "NEEDS YOU",
-        Status::Working | Status::Starting => "WORKING",
-        Status::Ready => "READY",
-        Status::Parked => "PARKED",
-    }
+    crate::activity_feed::group(session.status, false)
 }
 
 fn item_group(item: &BoardItem) -> &'static str {
-    if item.stale {
-        "PARKED"
-    } else {
-        group(&item.session)
-    }
+    crate::activity_feed::group(item.session.status, item.stale)
 }
 
 fn sort_items(items: &mut [BoardItem]) {
@@ -2622,6 +2614,15 @@ fn group_color(value: &str) -> Color {
     }
 }
 
+pub(crate) fn summary_parts([needs, working, ready, parked]: [usize; 4]) -> [(String, Color); 4] {
+    [
+        (format!("{needs} need you"), group_color("NEEDS YOU")),
+        (format!("{working} working"), group_color("WORKING")),
+        (format!("{ready} ready"), group_color("READY")),
+        (format!("{parked} parked"), group_color("PARKED")),
+    ]
+}
+
 fn draw_status_summary(
     output: &mut impl Write,
     [needs, working, ready, parked]: [usize; 4],
@@ -2629,15 +2630,16 @@ fn draw_status_summary(
     mut width: usize,
     colors: bool,
 ) -> Result<()> {
+    let [needs, working, ready, parked] = summary_parts([needs, working, ready, parked]);
     for (text, color) in [
         ("  ".to_owned(), Color::Reset),
-        (format!("{needs} need you"), group_color("NEEDS YOU")),
+        needs,
         (" · ".to_owned(), Color::Reset),
-        (format!("{working} working"), group_color("WORKING")),
+        working,
         (" · ".to_owned(), Color::Reset),
-        (format!("{ready} ready"), group_color("READY")),
+        ready,
         (" · ".to_owned(), Color::Reset),
-        (format!("{parked} parked"), group_color("PARKED")),
+        parked,
         (update.to_owned(), Color::Reset),
     ] {
         if width == 0 {
@@ -3061,6 +3063,36 @@ mod tests {
 
     fn board(status: Status) -> Board {
         Board::new(vec![BoardItem::local(session(status))])
+    }
+
+    #[test]
+    fn board_summary_remembered_on_open_matches_header_including_filter_and_remote_cache() {
+        let mut items = vec![
+            BoardItem::local(session(Status::Ready)),
+            BoardItem::local(session(Status::Working)),
+        ];
+        items[0].session.name = Some("visible-result".into());
+        items[1].session.name = Some("other-work".into());
+        let mut remote = BoardItem::local(session(Status::NeedsYou));
+        remote.node_id = Some("remote".into());
+        remote.session.name = Some("visible-remote".into());
+        remote.stale = true;
+        items.push(remote);
+        let mut board = Board::new(items);
+        board.filter = "visible".into();
+        assert_eq!(board.summary().counts, [0, 0, 1, 1]);
+        let mut memory = BoardMemory::default();
+        board.remember(&mut memory);
+        assert_eq!(
+            crate::activity_feed::summarize(&board.items, &memory.filter),
+            board.summary()
+        );
+        let mut frame = Vec::new();
+        board.draw(&mut frame, 120, 35).unwrap();
+        let frame = String::from_utf8(frame).unwrap();
+        for text in ["0 need you", "0 working", "1 ready", "1 parked"] {
+            assert!(frame.contains(text));
+        }
     }
 
     #[test]

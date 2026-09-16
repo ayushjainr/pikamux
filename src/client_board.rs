@@ -193,8 +193,23 @@ impl<T: FleetTransport, L: WindowLauncher> FleetTransport for WindowTransport<T,
             remote_port: None,
             allow_fleet_relay: false,
         };
-        let argv = windows_terminal_command(&paired, provider, &arguments[6], "wt.exe", "ssh.exe")
-            .map_err(|error| FleetError::new(FleetErrorKind::InvalidRequest, error.to_string()))?;
+        let mut argv =
+            windows_terminal_command(&paired, provider, &arguments[6], "wt.exe", "ssh.exe")
+                .map_err(|error| {
+                    FleetError::new(FleetErrorKind::InvalidRequest, error.to_string())
+                })?;
+        let mut forwarded = arguments.to_vec();
+        crate::activity_feed::forward(
+            &mut forwarded,
+            node,
+            &SshTransport::new("ssh.exe", Duration::from_secs(5), Duration::from_secs(12)),
+        )?;
+        if forwarded.len() != arguments.len() {
+            *argv
+                .last_mut()
+                .expect("terminal command has remote arguments") =
+                fleet::remote_pika_command(&forwarded)?;
+        }
         self.launcher.lock().map_err(|_| FleetError::new(FleetErrorKind::Error, "Window launcher unavailable"))?
             .launch(&argv).map_err(|error| FleetError::new(FleetErrorKind::Error,
                 format!("{error}. Check Windows Terminal is installed and `wt` works in PowerShell. No automatic retry was made.")))?;
@@ -202,16 +217,15 @@ impl<T: FleetTransport, L: WindowLauncher> FleetTransport for WindowTransport<T,
     }
 }
 
-pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
-    let store = Store::at(cache_path);
-    sync_pairings(&store, &config)?;
-    let (items, health) = cached_board(&store)?;
-    let (updates, receive) = monitor::latest_channel();
-    let (health_updates, health_receive) = monitor::latest_channel();
+pub(crate) fn start_activity_feed(store: &Store) -> Result<crate::activity_feed::Source> {
+    let (items, health) = cached_board(store)?;
+    let summary_source = crate::activity_feed::Source::default();
+    let summary_worker = summary_source.publisher();
+    summary_worker.publish(items, health);
     let (refresh, requests) = mpsc::sync_channel(1);
     let cancellation = CancellationToken::default();
     let stop = cancellation.clone();
-    let path = cache_path.to_owned();
+    let path = store.path().to_owned();
     let (done_send, done) = mpsc::sync_channel(1);
     let worker = thread::spawn(move || {
         let store = Store::at(path);
@@ -241,7 +255,7 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
                     }
                 }
                 Err(error) => {
-                    health_updates.publish(vec![error.to_string()]);
+                    summary_worker.health(vec![format!("Machine refresh unavailable: {error}")]);
                     break;
                 }
             }
@@ -250,16 +264,29 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
             }
             match cached_board(&store) {
                 Ok((items, health)) => {
-                    updates.publish(items);
-                    health_updates.publish(health);
+                    summary_worker.publish(items, health);
                 }
                 Err(error) => {
-                    health_updates.publish(vec![format!("Fleet cache unavailable · {error}")])
+                    summary_worker.health(vec![format!("Cached inventory unavailable: {error}")]);
                 }
             }
         }
         let _ = done_send.send(());
     });
+    summary_source.own_observer(refresh, move || {
+        cancellation.cancel();
+        if done.recv_timeout(Duration::from_millis(50)).is_ok() {
+            let _ = worker.join();
+        }
+    });
+    Ok(summary_source)
+}
+
+pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
+    let store = Store::at(cache_path);
+    sync_pairings(&store, &config)?;
+    let summary_source = start_activity_feed(&store)?;
+    let cancellation = CancellationToken::default();
     let action_path = cache_path.to_owned();
     let preview_path = cache_path.to_owned();
     let action_stop = cancellation.clone();
@@ -290,7 +317,10 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
                 Ok(format!(
                     "{} · peek · unread preserved\n{}",
                     remote.qualified_name(),
-                    manager.capture(&remote, 80)?
+                    crate::preview::board_output(
+                        item.session.provider,
+                        &manager.capture(&remote, 80)?
+                    )
                 ))
             }
             BoardAction::Untrack(item) => {
@@ -324,23 +354,26 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
     });
     let (update_checker, update_receiver) = crate::update_check::start(&store);
     let (quota_worker, quota_feed) = crate::quota::start(store.clone(), None);
-    let result = monitor::run_client_board(
-        items,
-        receive,
-        driver,
-        refresh,
-        monitor::FleetHealthFeed::new(health, health_receive).with_quota(quota_feed),
-        actions,
-        update_receiver,
+    let (_, health_receive) = monitor::latest_channel();
+    let result = crate::activity_feed::with(
+        Some(crate::activity_feed::Context::Source(
+            summary_source.clone(),
+        )),
+        || {
+            monitor::run_activity_view(
+                &summary_source,
+                Some(driver),
+                update_receiver,
+                monitor::FleetHealthFeed::new(Vec::new(), health_receive).with_quota(quota_feed),
+                actions,
+                None,
+            )
+        },
     );
     cancellation.cancel();
     drop(update_checker);
     drop(quota_worker);
-    // Cancellation owns SSH cleanup. A slow read-only observer may finish after
-    // the UI exits, but cannot delay closing the console or launch another window.
-    if done.recv_timeout(Duration::from_millis(50)).is_ok() {
-        let _ = worker.join();
-    }
+    drop(summary_source);
     match result? {
         BoardAction::Update(version) => crate::windows_update::install(version.as_deref(), true),
         _ => Ok(0),

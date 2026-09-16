@@ -87,6 +87,23 @@ impl BoardProcess {
             [],
         ).unwrap();
         drop(db);
+        // The board may reconcile before the first key. Seed authoritative
+        // lifecycle evidence, not only the compatibility-cache unread column.
+        store
+            .record_status_observation(
+                pikamux::model::Provider::Codex,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                &StatusObservation {
+                    kind: ObservationKind::Lifecycle,
+                    status: Status::Ready,
+                    unread: true,
+                    attention_reason: Some("completed".into()),
+                    error: None,
+                    observed_at: 1.0,
+                    source: "fixture-completion".into(),
+                },
+            )
+            .unwrap();
         let (mut master, mut slave) = (-1, -1);
         let mut size = libc::winsize {
             ws_row: 32,
@@ -162,6 +179,35 @@ impl BoardProcess {
         self.terminal.write_all(keys).unwrap();
     }
 
+    fn endpoint(&self, args: &[&str]) -> Command {
+        let root = self.root.path();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pika"));
+        command
+            .env_clear()
+            .args(args)
+            .env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("PIKA_CONFIG_HOME", root.join("config/pika"))
+            .env("PIKA_STATE_HOME", root.join("state"))
+            .env("PIKA_DB_PATH", root.join("state/pika.db"))
+            .env("CODEX_HOME", root.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", root.join("claude"))
+            .env("OPENCODE_DATA_HOME", root.join("oc"))
+            .env("OPENCODE_CONFIG_DIR", root.join("config/oc"))
+            .env("TMPDIR", root.join("tmp"))
+            .env("TMUX_TMPDIR", root.join("sockets"))
+            .env("PIKA_TMUX_SOCKET", "board-journey")
+            .env("PIKA_UPDATE_CHECK", "0")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            );
+        command
+    }
+
     fn tmux(&self, args: &[&str]) -> String {
         let output = Command::new(self.root.path().join("bin/tmux"))
             .env_clear()
@@ -197,7 +243,8 @@ impl BoardProcess {
             }
             assert!(
                 Instant::now() < deadline,
-                "missing {expected:?}; output: {}",
+                "missing {expected:?}; tmux: {}; output: {}",
+                fs::read_to_string(self.root.path().join("tmux-trace")).unwrap_or_default(),
                 self.output
             );
             assert!(
@@ -257,6 +304,81 @@ impl BoardProcess {
 }
 
 #[test]
+fn remote_board_feed_verifies_node_bounds_frames_and_clears_on_disconnect() {
+    let board = BoardProcess::start();
+    let store = Store::at(board.root.path().join("state/pika.db"));
+    let node = store.ensure_local_node_id().unwrap();
+    let trace = board.root.path().join("feed-trace");
+    fs::write(
+        board.root.path().join("bin/tmux"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+            shell_words::quote(trace.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    let token = "dddddddddddddddddddddddddddddddd";
+    let mut feed = board
+        .endpoint(&["_board-feed", "--expected-node-id", &node, "--token", token])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = feed.stdin.take().unwrap();
+    let wait = |expected: &str| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !fs::read_to_string(&trace)
+            .unwrap_or_default()
+            .contains(expected)
+        {
+            assert!(Instant::now() < deadline, "missing {expected}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // Fragmented frames and multiple frames in one write are both supported.
+    input.write_all(b"1,2").unwrap();
+    input.write_all(b",4,4,0\n2,1,4,4,0\n").unwrap();
+    wait("2 need you");
+    assert!(fs::read_to_string(&trace).unwrap().contains("1 need you"));
+    input.write_all(b"v2|2,1,4,4,0|ts_quality @rs2a\n").unwrap();
+    wait("↑ ts_quality @rs2a");
+    drop(input);
+    assert!(feed.wait().unwrap().success());
+    wait(&format!("set-option -gu @pika_feed_{token}"));
+
+    let wrong_token = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let wrong = board
+        .endpoint(&[
+            "_board-feed",
+            "--expected-node-id",
+            "00000000-0000-4000-8000-000000000000",
+            "--token",
+            wrong_token,
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("NODE IDENTITY CHANGED"));
+    assert!(!fs::read_to_string(&trace).unwrap().contains(wrong_token));
+
+    let mut bad = board
+        .endpoint(&["_board-feed", "--expected-node-id", &node, "--token", token])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    bad.stdin.take().unwrap().write_all(&[b'1'; 513]).unwrap();
+    assert!(!bad.wait().unwrap().success());
+    assert!(
+        !fs::read_to_string(&trace)
+            .unwrap()
+            .contains("11111111111111111111111111111111111111111")
+    );
+}
+
+#[test]
 fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
     let real_tmux = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|path| path.join("tmux"))
@@ -270,14 +392,15 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
     fs::write(
         board.root.path().join("bin/tmux"),
         format!(
-            "#!/bin/sh\nexec {} -f /dev/null \"$@\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexec {} -f /dev/null \"$@\"\n",
+            shell_words::quote(board.root.path().join("tmux-trace").to_str().unwrap()),
             shell_words::quote(real_tmux.to_str().unwrap())
         ),
     )
     .unwrap();
     board.real_tmux = true;
     fs::write(board.root.path().join("bin/codex"),
-        "#!/bin/sh\ntest \"$1\" = resume || exit 97\nprintf 'FAKE AGENT READY\\n'\nwhile :; do sleep 1; done\n"
+        "#!/bin/sh\ntest \"$1\" = resume || exit 97\nprintf '%s\\n' 'FAKE AGENT READY' '• Queued follow-up inputs' '  ? 1 question' '' '› Ask Codex to do anything' '' 'gpt-6-astra medium · ~/fixture · weekly 58% left'\nwhile :; do sleep 1; done\n"
     ).unwrap();
     board.send(b"/audit\r");
     board.await_text("FILTER audit");
@@ -289,7 +412,105 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
     ] {
         board.send(b"\r");
         board.await_text("CONTINUITY PROVEN");
-        board.await_text("agent keeps running");
+        board.await_text("need you");
+        for label in ["need you", "working", "ready", "parked"] {
+            assert!(
+                board.output.contains(label),
+                "missing return-strip count {label}"
+            );
+        }
+        let clients = board.tmux(&[
+            "show-options",
+            "-v",
+            "-t",
+            "pika-c-aaaaaaaaaa",
+            "@pika_board_clients",
+        ]);
+        let clients: serde_json::Value = serde_json::from_str(&clients).unwrap();
+        let token = clients.as_object().unwrap().values().next_back().unwrap()[1]
+            .as_str()
+            .unwrap();
+        let option = format!("@pika_feed_{token}");
+        // Even if a sender dies without cleanup, tmux evaluates the lease at
+        // render time. Frozen values must never masquerade as live counts.
+        board.tmux(&[
+            "set-option",
+            "-g",
+            &option,
+            "#{?#{<=:%s,1},99 need you,Board disconnected}",
+        ]);
+        assert_eq!(
+            board
+                .tmux(&["display-message", "-p", &format!("#{{T:{option}}}")])
+                .trim(),
+            "Board disconnected"
+        );
+        // The board is hidden, not closed. A real store commit must update the
+        // attached agent's status row without another key or another inventory.
+        let store = Store::at(board.root.path().join("state/pika.db"));
+        for (status, expected) in [
+            (Status::NeedsYou, "1 need you"),
+            (Status::Working, "1 working"),
+        ] {
+            board.output.clear();
+            store
+                .record_status_observation(
+                    pikamux::model::Provider::Codex,
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    &StatusObservation {
+                        kind: ObservationKind::Lifecycle,
+                        status,
+                        unread: false,
+                        attention_reason: Some("fixture live change".into()),
+                        error: None,
+                        observed_at: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs_f64(),
+                        source: "fixture:live".into(),
+                    },
+                )
+                .unwrap();
+            let mut projected = store
+                .get_session(
+                    pikamux::model::Provider::Codex,
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                )
+                .unwrap()
+                .unwrap();
+            projected.status = status;
+            projected.unread = false;
+            store.upsert_session(&projected, true).unwrap();
+            board.await_text(expected);
+            if status == Status::NeedsYou {
+                // Non-UTF-8 tmux clients may replace the arrow glyph; the name
+                // must still reach the actual terminal, and the format keeps it.
+                board.await_text("audit_saved");
+                let value = board.tmux(&["show-options", "-gqv", &option]);
+                let narrow = board.tmux(&[
+                    "display-message",
+                    "-p",
+                    &value.replace("#{client_width}", "72"),
+                ]);
+                assert!(
+                    narrow.contains("audit_s") && !narrow.contains("audit_saved"),
+                    "name did not shorten: {narrow}"
+                );
+                let tiny = board.tmux(&[
+                    "display-message",
+                    "-p",
+                    &value.replace("#{client_width}", "60"),
+                ]);
+                assert!(!tiny.contains("audit"), "name displaced navigation: {tiny}");
+            } else {
+                let rendered = board.tmux(&["display-message", "-p", &format!("#{{T:{option}}}")]);
+                assert!(
+                    !rendered.contains("audit"),
+                    "resolved request still visible: {rendered}"
+                );
+            }
+            assert!(board.child.try_wait().unwrap().is_none());
+        }
         board.send(return_keys);
         board.await_text("FILTER audit");
         assert!(board.child.try_wait().unwrap().is_none());
@@ -334,6 +555,26 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
             board.send(b"r");
             board.await_text("Pane output");
             board.await_text("FAKE AGENT READY");
+            assert!(board.output.contains("Queued follow-up inputs"));
+            assert!(!board.output.contains("Ask Codex to do anything"));
+            assert!(!board.output.contains("weekly 58% left"));
+            // Native pane and raw capture still contain the provider's UI.
+            let raw = board.tmux(&[
+                "capture-pane",
+                "-p",
+                "-t",
+                session.tmux_pane.as_deref().unwrap(),
+            ]);
+            assert!(raw.contains("Ask Codex to do anything"));
+            assert!(raw.contains("weekly 58% left"));
+            board.send(b"p");
+            board.await_text("PEEK");
+            board.await_text("FAKE AGENT READY");
+            assert!(board.output.contains("Queued follow-up inputs"));
+            assert!(!board.output.contains("Ask Codex to do anything"));
+            assert!(!board.output.contains("weekly 58% left"));
+            board.send(b"\x1b");
+            board.await_text("FILTER audit");
             assert!(
                 store
                     .get_session(session.provider, &session.session_id)
@@ -452,6 +693,20 @@ fn saved_thread_peek_explains_unavailable_inside_board_and_preserves_unread() {
         )
         .unwrap();
     assert!(unread, "peek acknowledged unseen work");
+    let store = Store::at(board.root.path().join("state/pika.db"));
+    assert!(
+        store
+            .status_observations(
+                pikamux::model::Provider::Codex,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            )
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == ObservationKind::Lifecycle)
+            .unwrap()
+            .unread,
+        "peek acknowledged the authoritative completion"
+    );
     board.send(b"\x1b");
     board.await_text("audit_saved");
     board.finish();

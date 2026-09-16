@@ -387,12 +387,16 @@ impl Tmux {
         } else {
             "norange"
         };
-        let bar = format!("#[align=left,{range},{style}] ← Pika #[default,norange]  {hint}");
+        let key = shortcut.unwrap_or("click to return");
+        let bar = format!(
+            "#[align=left,{range},{style}] ← Pika #[default,norange]  #{{?@pika_board_summary,{key} #{{E:@pika_board_summary}},{hint}}}"
+        );
         let target = shell_words::quote(&pane.pane_id);
         let mutation = [
             format!("set-option -t {target} @pika_return_navigation 1"),
             format!("set-option -t {target} status on"),
             format!("set-option -t {target} status-position bottom"),
+            format!("set-option -t {target} status-interval 1"),
             format!("set-option -t {target} status-style 'fg=default,bg=default,none'"),
             format!(
                 "set-option -t {target} status-format[0] {}",
@@ -747,6 +751,8 @@ impl Tmux {
     }
 
     fn deliver_receipt(&self, client: Option<&str>, receipt: &str) -> ReceiptDelivery {
+        // Cosmetic and client-scoped: failure cannot change the exact attach.
+        let _ = self.bind_board_summary(client);
         if let Some(client) = client
             && self
                 .output(
@@ -763,6 +769,101 @@ impl Tmux {
         } else {
             ReceiptDelivery::Failed
         }
+    }
+
+    fn bind_board_summary(&self, client: Option<&str>) -> Result<()> {
+        let mut args = vec!["display-message", "-p"];
+        if let Some(client) = client {
+            args.extend(["-c", client]);
+        }
+        args.push("#{client_pid}|#{pane_id}");
+        let output = self.output(args, true)?;
+        let identity = String::from_utf8(output.stdout)?;
+        let Some((pid, pane)) = identity.trim().split_once('|') else {
+            return Ok(());
+        };
+        if pid.is_empty()
+            || !pid.bytes().all(|b| b.is_ascii_digit())
+            || !pane
+                .strip_prefix('%')
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Ok(());
+        }
+        let pid: u32 = pid.parse()?;
+        // Keep a small per-session map; the rendered format selects by exact
+        // client PID and pane. Never use a session-wide last-writer count.
+        let previous = self.output(
+            ["show-options", "-qv", "-t", pane, "@pika_board_clients"],
+            false,
+        )?;
+        let mut clients: BTreeMap<u32, (String, String)> = if previous.stdout.len() <= 4096 {
+            serde_json::from_slice(&previous.stdout).unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        clients.retain(|_, (pane, token)| {
+            pane.strip_prefix('%')
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+                && crate::activity_feed::token(token).is_ok()
+        });
+        clients.remove(&pid);
+        if let Some(context) = crate::activity_feed::current() {
+            while clients.len() >= 8 {
+                clients.pop_first();
+            }
+            clients.insert(pid, (pane.to_owned(), context.token(self).to_owned()));
+        }
+        let mut text = String::new();
+        for (pid, (pane, token)) in &clients {
+            // A literal %0 is consumed by strftime in status formats. Produce
+            // the percent during format expansion instead (after strftime).
+            let pane_number = &pane[1..];
+            text.push_str(&format!(
+                "#{{?#{{&&:#{{==:#{{client_pid}},{pid}}},#{{==:#{{pane_id}},#{{a:37}}{pane_number}}}}}, │ #{{?#{{@pika_feed_{token}}},#{{T:@pika_feed_{token}}},Board disconnected}},}}"
+            ));
+        }
+        self.output(
+            [
+                "set-option",
+                "-t",
+                pane,
+                "@pika_board_clients",
+                &serde_json::to_string(&clients)?,
+            ],
+            true,
+        )?;
+        self.output(
+            ["set-option", "-t", pane, "@pika_board_summary", &text],
+            true,
+        )?;
+        if let Some(client) = client {
+            self.output(["refresh-client", "-S", "-t", client], false)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_board_summary(
+        &self,
+        token: &str,
+        summary: Option<crate::activity_feed::Summary>,
+    ) -> Result<()> {
+        crate::activity_feed::token(token)?;
+        let option = format!("@pika_feed_{token}");
+        if let Some(summary) = summary {
+            let expires = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs()
+                + 15;
+            let text = format!(
+                "#{{?#{{<=:%s,{expires}}},{},Board disconnected}}",
+                summary.tmux_text()
+            );
+            self.output(["set-option", "-g", &option, &text], true)?;
+        } else {
+            self.output(["set-option", "-gu", &option], false)?;
+        }
+        Ok(())
     }
 
     fn attach_exact_with_started_mode<F>(
@@ -1683,6 +1784,32 @@ mod tests {
         foreign.session_name = "my-own-session".into();
         assert!(tmux.configure_return_navigation(&foreign).is_err());
         assert_eq!(fs::read_to_string(&trace).unwrap(), calls);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn board_summary_is_client_and_pane_scoped_not_a_host_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("trace");
+        let tmux = tmux_fixture(
+            &temp,
+            &format!(
+                "printf '%s\\n' \"$*\" >> {}\ncase \"$*\" in *'client_pid'*) printf '12345|%%1\\n';; esac",
+                shell_words::quote(trace.to_str().unwrap())
+            ),
+        );
+        crate::activity_feed::with(
+            Some(crate::activity_feed::Context::Remote("a".repeat(32))),
+            || tmux.bind_board_summary(Some("/dev/fixture")),
+        )
+        .unwrap();
+        let calls = fs::read_to_string(trace).unwrap();
+        assert!(calls.contains("set-option -t %1 @pika_board_summary"));
+        assert!(calls.contains("#{==:#{client_pid},12345}"));
+        assert!(calls.contains("#{==:#{pane_id},#{a:37}1}"));
+        assert!(calls.contains("@pika_feed_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(calls.contains("Board disconnected"));
+        assert!(!calls.contains("list-panes"));
     }
 
     #[cfg(unix)]

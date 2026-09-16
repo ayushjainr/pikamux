@@ -78,6 +78,8 @@ pub struct ExactPaneBinding {
     pub pane_start_time: u64,
     pub provider_pid: i64,
     pub provider_start_time: u64,
+    /// Known forwarding launcher, proved in the same revalidated pane ancestry.
+    provider_launcher: Option<process::ProcessGeneration>,
 }
 
 #[derive(Default)]
@@ -1020,6 +1022,7 @@ impl Pika {
             pane_start_time: pane_generation.start_time,
             provider_pid,
             provider_start_time,
+            provider_launcher: process::runtime_launcher_generation(provider_pid, processes),
         })
     }
 
@@ -1040,7 +1043,7 @@ impl Pika {
 
     fn confirm_exact_handoff(&self, session: &Session, expected: &ExactPaneBinding) -> Result<()> {
         let current = self.exact_pane_binding(session, Some(&expected.pane.pane_id))?;
-        if !same_exact_binding(expected, &current) {
+        if !same_handoff_binding(expected, &current) {
             bail!(
                 "exact conversation ownership changed during terminal handoff; Pika detached without acknowledging it"
             );
@@ -1978,6 +1981,25 @@ fn same_exact_binding(left: &ExactPaneBinding, right: &ExactPaneBinding) -> bool
         && left.pane_start_time == right.pane_start_time
         && left.provider_pid == right.provider_pid
         && left.provider_start_time == right.provider_start_time
+}
+
+fn same_handoff_binding(expected: &ExactPaneBinding, current: &ExactPaneBinding) -> bool {
+    // Startup may first expose the Node/Bun launcher, then its native provider.
+    // Accept only that one-way transition from the still-live, same-generation
+    // launcher. A native client replacement, reused PID, new launch or second
+    // client is not continuity. Exact binding has already revalidated uniqueness,
+    // UUID evidence and every live ancestry edge before reaching this check.
+    same_pane_generation(&expected.pane, &current.pane)
+        && expected.pane_start_time == current.pane_start_time
+        && expected.pane.pika_provider == current.pane.pika_provider
+        && expected.pane.pika_session_id == current.pane.pika_session_id
+        && expected.pane.pika_launch_token == current.pane.pika_launch_token
+        && (same_exact_binding(expected, current)
+            || current.provider_launcher
+                == Some(process::ProcessGeneration {
+                    pid: expected.provider_pid,
+                    start_time: expected.provider_start_time,
+                }))
 }
 
 fn require_idle_pane(
@@ -3587,6 +3609,160 @@ mod tests {
                 .is_none()
         );
         assert!(pika.store.list_pending().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_to_native_handoff_preserves_exact_identity_and_duplicate_guard() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Child(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
+        let other = Child(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
+        let (root, mut pika) = test_pika();
+        let identity = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let pid = i64::from(std::process::id());
+        let start = process::process_start_time(pid).unwrap();
+        let native_pid = i64::from(child.0.id());
+        let other_pid = i64::from(other.0.id());
+        let native_start = process::process_start_time(native_pid).unwrap();
+        let other_start = process::process_start_time(other_pid).unwrap();
+        let row = [
+            "pika-c-test".to_owned(),
+            "%1".into(),
+            pid.to_string(),
+            "/tmp".into(),
+            "codex".into(),
+            "0".into(),
+            "1".into(),
+            "1".into(),
+            "0".into(),
+            String::new(),
+            "1".into(),
+            "1".into(),
+            "codex".into(),
+            identity.into(),
+            "test".into(),
+            "launch-a".into(),
+        ]
+        .join("\u{1f}");
+        let executable = root.path().join("tmux-fixture");
+        std::fs::write(&executable, format!(
+            "#!/bin/sh\ncase \"$*\" in\n *list-panes*) printf '%s\\n' '{row}' ;;\n *) exit 0 ;;\nesac\n"
+        )).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        pika.tmux = Tmux::with_executable(executable.to_string_lossy(), None);
+        let phase = Arc::new(AtomicUsize::new(0));
+        let observed_phase = Arc::clone(&phase);
+        pika.process_observer = Arc::new(move || {
+            let mut records = BTreeMap::from([(
+                pid,
+                record(pid, None, start, &["node", "codex", "resume", identity]),
+            )]);
+            if observed_phase.load(Ordering::SeqCst) > 0 {
+                records.insert(
+                    native_pid,
+                    record(
+                        native_pid,
+                        Some(pid),
+                        native_start,
+                        &["codex", "resume", identity],
+                    ),
+                );
+            }
+            if observed_phase.load(Ordering::SeqCst) > 1 {
+                records.insert(
+                    other_pid,
+                    record(
+                        other_pid,
+                        Some(pid),
+                        other_start,
+                        &["codex", "resume", identity],
+                    ),
+                );
+            }
+            ProcessObservation::complete(records)
+        });
+        let mut session = test_session(identity);
+        session.tmux_pane = Some("%1".into());
+        session.status = Status::Ready;
+        session.unread = true;
+        session.last_event_at = 42.0;
+        pika.store.upsert_session(&session, true).unwrap();
+        let launcher = pika.exact_pane_binding(&session, Some("%1")).unwrap();
+        assert_eq!(launcher.provider_pid, pid);
+        phase.store(1, Ordering::SeqCst);
+        let native = pika.exact_pane_binding(&session, Some("%1")).unwrap();
+        assert_eq!(native.provider_pid, native_pid);
+        assert!(
+            !same_exact_binding(&launcher, &native),
+            "capture must still detect a changed process"
+        );
+        assert!(
+            !same_handoff_binding(&native, &launcher),
+            "no reverse transition"
+        );
+        let mut replacement = native.clone();
+        replacement.provider_pid = other_pid;
+        replacement.provider_start_time = other_start;
+        assert!(
+            !same_handoff_binding(&native, &replacement),
+            "a sibling restart is not the original native client"
+        );
+        let mut retagged = native.clone();
+        retagged.pane.pika_launch_token = Some("launch-b".into());
+        assert!(!same_handoff_binding(&launcher, &retagged));
+        pika.confirm_exact_handoff(&session, &launcher)
+            .expect("same launcher generation handing off to its exact native child must attach");
+        let mut reused = launcher.clone();
+        reused.provider_start_time += 1;
+        assert!(pika.confirm_exact_handoff(&session, &reused).is_err());
+        let mut replaced_pane = launcher.clone();
+        replaced_pane.pane_start_time += 1;
+        assert!(
+            pika.confirm_exact_handoff(&session, &replaced_pane)
+                .is_err()
+        );
+        phase.store(2, Ordering::SeqCst);
+        let error = pika
+            .record_exact_handoff(&session, &launcher, 42.0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("OPEN TWICE"), "{error}");
+        assert!(
+            pika.store
+                .get_session(session.provider, identity)
+                .unwrap()
+                .unwrap()
+                .unread
+        );
+        phase.store(1, Ordering::SeqCst);
+        pika.record_exact_handoff(&session, &launcher, 42.0)
+            .unwrap();
+        assert!(
+            !pika
+                .store
+                .get_session(session.provider, identity)
+                .unwrap()
+                .unwrap()
+                .unread
+        );
     }
 
     #[cfg(unix)]

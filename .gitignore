@@ -1,4 +1,5 @@
 # Local reference export and disposable execution outputs.
+/AGENTS.md
 /reference/
 /target/
 /.toolchains/

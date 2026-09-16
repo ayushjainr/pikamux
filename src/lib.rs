@@ -1,3 +1,6 @@
+mod activity_feed;
+#[cfg(not(windows))]
+mod activity_observer;
 #[cfg(not(windows))]
 pub mod attention;
 mod claude_quota;
@@ -17,6 +20,7 @@ pub mod fleet;
 pub mod hooks;
 pub mod model;
 pub mod monitor;
+mod onboarding;
 pub mod open_history;
 pub mod paths;
 mod preview;
