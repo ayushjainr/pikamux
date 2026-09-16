@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.18 — Stay connected to your work
+
+- Carry the board's live counts into the agent return bar, with the latest
+  conversation waiting for your input. Share one feed across views and machines.
+- Give setup the board's focused interface. Keep hook diffs and backup receipts
+  under details, with explicit approval before settings change.
+- Restore remote previews when the owning machine has a live pane. Hide known
+  Codex and Claude composer/status-line clutter without changing agent output.
+- Preserve exact handoff when a verified launcher starts its native client;
+  continue blocking genuine duplicates and reused process identities.
+- Keep Windows client builds separate from Unix-only feed receivers.
+
 ## 0.6.17 — See the work without leaving the board
 
 - Show recent output from the selected live pane automatically, keeping unread

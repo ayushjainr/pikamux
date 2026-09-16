@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(any(unix, test))]
 const MAX_FRAME_BYTES: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +30,7 @@ pub(crate) struct Summary {
 #[derive(Clone)]
 pub(crate) enum Context {
     Source(Source),
+    #[cfg(any(unix, test))]
     Remote(String),
 }
 thread_local! { static CURRENT: RefCell<Option<Context>> = const { RefCell::new(None) }; }
@@ -303,6 +305,7 @@ impl Context {
                 source.local(tmux.clone());
                 &source.0.token
             }
+            #[cfg(any(unix, test))]
             Self::Remote(token) => token,
         }
     }
@@ -510,6 +513,7 @@ impl Summary {
             self.latest_request.as_deref().unwrap_or_default()
         )
     }
+    #[cfg(any(unix, test))]
     pub fn decode(value: &str) -> Result<Self> {
         if value.len() > MAX_FRAME_BYTES {
             bail!("Invalid board summary");

@@ -1,16 +1,15 @@
-See the work without leaving the board.
+Stay connected to your work—even inside an agent.
 
-- **Recent output, right there.** Select a live conversation to see its pane
-  output. Pika preserves unread status and leaves the agent working. Press
-  **p** for a larger preview or **Enter** to open the conversation.
-- **Space for what matters.** A compact, adaptive rail leaves room for questions,
-  recent output and useful expertise. Parked conversations lead with remembered
-  work instead of empty live-status filler.
-- **Expertise across machines.** Remote cards show actual scope and current
-  work, each with its own age—not internal card-health messages.
-- **Quiet by design.** Only the selected eligible pane is sampled. Requests are
-  bounded; late replies are discarded; selection uses no model calls.
+- **Know who needs you.** The return bar carries your board's live counts and
+  names the newest conversation waiting for input. F12 takes you back without
+  stopping the agent.
+- **A calmer first run.** Setup now feels like the board: focused choices,
+  clear approval, and technical details only when you ask for them.
+- **Cleaner previews, across machines.** See remote pane output without known
+  composer suggestions and status-line clutter. Unread work stays unread.
+- **More dependable opening.** Verified launcher-to-client startup transitions
+  no longer interrupt exact handoff. Genuine duplicate sessions remain blocked.
 
 Update from the board's **Update now? [y/N]** offer, or run `pika update`.
-Each machine updates independently. Existing agents and conversations are not
-restarted; reopen the board to use the new interface.
+Update each participating machine for the new return-bar feed. Existing agents
+keep running; reopen the board to use the new interface.
