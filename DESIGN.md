@@ -132,8 +132,8 @@ settings write or selects machines; below 60 × 20, hidden choices cannot execut
 `pika` opens the live monitor only on an interactive terminal. `pika list` and
 redirected bare output remain finite and stable. Arrow keys or j/k move the
 selection; Enter opens the exact selected identity; `a` focuses the default
-Sol-medium ephemeral multi-turn side consultation inside the inspector; `A`
-uses the faster Luna-medium Codex profile; n opens the oldest attention item
+Luna-medium ephemeral multi-turn Codex side consultation inside the inspector;
+`pika ask --deep` selects Sol-medium explicitly; n opens the oldest attention item
 using the same ordering as `pika next`; p opens a sanitized pane peek; u
 toggles the usage view; r reconciles; ? explains controls; q or Esc recovers or
 exits. `x` asks to stop watching the selected UUID; x or Enter confirms and Esc
@@ -224,11 +224,32 @@ is unchanged. Closing is always available through Esc, including during a slow
 or failed provider turn.
 
 The consultation policy is explicit and immutable for the side's lifetime.
-Codex defaults to `gpt-5.6-sol` at medium effort; the narrow fast path uses
-`gpt-5.6-luna` at medium effort. Both the ephemeral fork and every turn pin that
+Codex user questions (CLI and local/remote boards) default to `gpt-5.6-luna` at
+medium effort. `pika ask --deep` selects `gpt-5.6-sol` at medium effort; `--fast`
+remains an explicit alias for the question default. The wire modes remain `fast`
+and `default` respectively for older peers, and background card interviews keep
+their existing Sol profile. Both the ephemeral fork and every turn pin that
 selection, and visible receipts report it. Claude stays provider-native and
 rejects the fast path until separately benchmarked. Pika's fast path is a model
 profile, not Codex Fast mode or a service-tier setting.
+Fast consultations request focused answers without a project recap or unsolicited
+report. No provider configuration file or parent is changed.
+The first Codex side input carries the consultation guidance as well as the
+question: a fork-level instruction override alone is not sufficient on every
+provider version. Related follow-ups send only their new question, preserving
+the earlier input prefix without a policy-only model turn. Prompt guidance is
+not a substitute for the read-only sandbox or exact-child identity checks.
+Follow-ups reuse the same ephemeral child; there is no warmed agent pool,
+silent retry, context truncation, or parent mutation. Preparation timing includes
+provider startup and fork creation, not just the interval after opening.
+Codex answer fragments can flow through the existing side channel without a
+second provider call. JSONL content streaming is explicit (`--stream`), separate
+from metadata-only progress; remote peers negotiate `consultation-output-v1`.
+Old clients/hosts retain completed-answer behavior. The board coalesces bounded
+partial previews without blocking the provider; the final answer replaces them.
+Fragments are exact-turn-bound and never count as completed answers or permit
+automatic retry. Optional per-turn timing and provider usage distinguish
+observed cache reuse from speculation; missing counters stay unknown.
 
 Codex automation provenance is classified before lifecycle or tmux identity.
 A UUID-matching `session_meta.originator` on the configured worker-origin list

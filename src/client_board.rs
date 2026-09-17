@@ -394,7 +394,10 @@ pub fn remote_consultation(
             remote.source_availability()
         );
     }
-    let local = crate::consult::consultation_policy(remote.session.provider, false)?;
+    let local = crate::consult::consultation_policy(
+        remote.session.provider,
+        crate::consult::question_fast_path(remote.session.provider, false),
+    )?;
     let policy = fleet::ConsultationPolicy {
         consultation_mode: local.mode,
         model: local.model.unwrap_or_default(),
@@ -425,6 +428,9 @@ pub fn remote_consultation(
         }),
         proof: Some(opening.proof_label()),
     });
+    side.set_output_observer(crate::monitor::consultation_preview_observer(
+        io.events.clone(),
+    ));
     for command in io.commands {
         match command {
             ConsultationInput::Question(question) => match side.ask(&question) {

@@ -44,6 +44,7 @@ pub const MAX_CACHED_FLEET_ROWS: usize = 8_000;
 pub const MAX_CACHED_FLEET_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CACHED_FLEET_NODES: usize = 64;
 pub const CAPABILITIES: &[&str] = &[
+    "consultation-output-v1",
     "inventory",
     "candidates",
     "adopt",
@@ -3315,6 +3316,10 @@ pub struct RemoteConsultation {
     cleanup_timeout: Duration,
     cancellation: CancellationToken,
     opening: Option<ConsultationOpeningReceipt>,
+    output: Option<crate::consult::ConsultationOutputObserver>,
+    streamed_bytes: usize,
+    turn_metrics: Option<crate::consult_telemetry::TurnMetrics>,
+    stream_output: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3358,7 +3363,7 @@ impl RemoteConsultation {
     ) -> Result<Self, FleetError> {
         validate_exact_route(&node, &session)?;
         session.require_consultable()?;
-        let args = vec![
+        let mut args = vec![
             "_fleet-ask".to_owned(),
             "--expected-node-id".to_owned(),
             node.node_id.clone(),
@@ -3373,6 +3378,13 @@ impl RemoteConsultation {
             "--effort".to_owned(),
             policy.effort.clone(),
         ];
+        let stream_output = node
+            .capabilities
+            .iter()
+            .any(|value| value == "consultation-output-v1");
+        if stream_output {
+            args.push("--stream-output".into());
+        }
         let mut command = transport.command(&node.ssh_target, &args, false)?;
         command
             .stdin(Stdio::piped())
@@ -3439,6 +3451,10 @@ impl RemoteConsultation {
             cleanup_timeout: timeouts.cleanup,
             cancellation,
             opening: None,
+            output: None,
+            streamed_bytes: 0,
+            turn_metrics: None,
+            stream_output,
         };
         let opened = match side.read_nonprogress(timeouts.open) {
             Ok(value) => value,
@@ -3464,6 +3480,14 @@ impl RemoteConsultation {
             .expect("a returned remote consultation has a validated opening receipt")
     }
 
+    pub fn set_output_observer(&mut self, observer: crate::consult::ConsultationOutputObserver) {
+        self.output = Some(observer);
+    }
+
+    pub fn turn_metrics(&self) -> Option<&crate::consult_telemetry::TurnMetrics> {
+        self.turn_metrics.as_ref()
+    }
+
     pub fn ask(&mut self, question: &str) -> Result<String, FleetError> {
         if question.trim().is_empty() {
             return Err(FleetError::new(
@@ -3484,6 +3508,8 @@ impl RemoteConsultation {
             ));
         }
         self.turn += 1;
+        self.streamed_bytes = 0;
+        self.turn_metrics = None;
         let mut line = serde_json::to_vec(&json!({"question":question}))
             .map_err(|error| FleetError::new(FleetErrorKind::InvalidRequest, error.to_string()))?;
         line.push(b'\n');
@@ -3534,6 +3560,14 @@ impl RemoteConsultation {
             }
         };
         self.answers_received += 1;
+        // Optional diagnostics from newer peers. Missing/invalid measurements
+        // stay unavailable; they are not identity evidence or zeros.
+        self.turn_metrics = object
+            .get("turn_metrics")
+            .and_then(|value| {
+                serde_json::from_value::<crate::consult_telemetry::TurnMetrics>(value.clone()).ok()
+            })
+            .filter(crate::consult_telemetry::TurnMetrics::valid);
         Ok(text)
     }
 
@@ -3769,10 +3803,47 @@ impl RemoteConsultation {
                 }
             };
             match object.get("type").and_then(Value::as_str) {
-                Some("progress") => {
+                Some("progress" | "answer_delta") => {
                     if let Err(error) = validate_progress(object) {
                         self.abort();
                         return Err(error);
+                    }
+                    if object.get("type").and_then(Value::as_str) == Some("answer_delta") {
+                        let value = object.get("output").unwrap_or(&Value::Null);
+                        let delta =
+                            serde_json::from_value::<crate::consult_telemetry::AnswerDelta>(
+                                value.clone(),
+                            )
+                            .ok();
+                        let delta = delta.filter(|delta| {
+                            self.stream_output
+                                && self.opening.is_some()
+                                && self.input.is_some()
+                                && self.turn > self.answers_received
+                                && object.get("stage").and_then(Value::as_str) == Some("turn")
+                                && object.get("delivery").and_then(Value::as_str)
+                                    == Some("confirmed")
+                                && object.get("partial").and_then(Value::as_bool) == Some(true)
+                                && object.get("turn").and_then(Value::as_u64) == Some(self.turn)
+                                && delta.valid(self.turn)
+                                && self.streamed_bytes.saturating_add(delta.text.len())
+                                    <= crate::consult_telemetry::MAX_STREAM_BYTES
+                        });
+                        let Some(delta) = delta else {
+                            self.abort();
+                            return Err(FleetError::new(
+                                FleetErrorKind::Incompatible,
+                                "Invalid or oversized consultation preview; do not resend automatically",
+                            ));
+                        };
+                        self.streamed_bytes += delta.text.len();
+                        if self.output.as_ref().is_some_and(|output| !output(delta)) {
+                            self.abort();
+                            return Err(FleetError::new(
+                                FleetErrorKind::OutcomeUnknown,
+                                "Consultation output consumer closed; partial answer is not complete",
+                            ));
+                        }
                     }
                 }
                 Some("error") => {

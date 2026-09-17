@@ -4,6 +4,7 @@
 //! child for a bounded multi-turn exchange. Pika never types into, resumes, or
 //! terminates the parent. Delivery and cleanup are reported independently.
 
+use crate::consult_telemetry::{AnswerDelta, TurnMetrics, TurnUsage, seconds};
 use crate::model::{Provider, Session};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -36,6 +37,14 @@ const MAX_CODEX_NOTIFICATIONS: usize = 128;
 const MAX_CODEX_NOTIFICATION_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ANSWER_BYTES: usize = 1024 * 1024;
 pub const MAX_QUESTION_BYTES: usize = 64 * 1024;
+
+fn codex_consultation_instructions(policy: &ConsultationPolicy) -> String {
+    let mut instructions = "This is an ephemeral side consultation. Answer from inherited conversation context without modifying files or external state. If tools would be required, explain what needs checking instead. Separate dated historical work from later current state.".to_owned();
+    if policy.mode == "fast" {
+        instructions.push_str(" Answer the specific question directly and concisely. Do not recap the project or produce a full report unless requested. State missing context briefly rather than reconstructing it speculatively.");
+    }
+    instructions
+}
 
 /// Cooperative cancellation shared by the board and the exact Pika-owned
 /// consultation children. Cancelling never signals the parent agent process.
@@ -92,6 +101,13 @@ pub fn consultation_policy(provider: Provider, fast: bool) -> Result<Consultatio
             bail!("fast consultations are not benchmarked for OpenCode; omit --fast")
         }
     }
+}
+
+/// User questions prefer the low-latency Codex profile. Keep this separate from
+/// the wire policy: older peers and background card interviews still use the
+/// explicit `default` (Sol) / `fast` (Luna) contract.
+pub fn question_fast_path(provider: Provider, deep: bool) -> bool {
+    provider == Provider::Codex && !deep
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -174,6 +190,7 @@ pub struct ConsultationProgress {
 }
 
 pub type ConsultationProgressObserver = Arc<dyn Fn(ConsultationProgress) + Send + Sync>;
+pub type ConsultationOutputObserver = Arc<dyn Fn(AnswerDelta) -> bool + Send + Sync>;
 
 #[derive(Clone)]
 pub struct ConsultationOptions {
@@ -183,6 +200,7 @@ pub struct ConsultationOptions {
     pub fast: bool,
     pub cancellation: CancellationToken,
     pub progress: Option<ConsultationProgressObserver>,
+    pub output: Option<ConsultationOutputObserver>,
 }
 
 impl ConsultationOptions {
@@ -194,6 +212,7 @@ impl ConsultationOptions {
             fast: false,
             cancellation: CancellationToken::default(),
             progress: None,
+            output: None,
         }
     }
 }
@@ -270,7 +289,7 @@ impl Consultation {
             side,
             policy,
             started,
-            stage_started: Instant::now(),
+            stage_started: started,
             stage: ConsultationStage::Prepare,
             delivery: Delivery::NotSent,
             cleanup: Cleanup::Pending,
@@ -286,6 +305,13 @@ impl Consultation {
 
     pub fn policy(&self) -> &ConsultationPolicy {
         &self.policy
+    }
+
+    pub fn turn_metrics(&self) -> Option<&TurnMetrics> {
+        match &self.side {
+            Side::Codex(side) if side.turn > 0 => Some(&side.metrics),
+            _ => None,
+        }
     }
 
     pub fn parent_id(&self) -> &str {
@@ -381,9 +407,12 @@ impl Consultation {
             });
             emit_progress(&progress, &receipt, None, None, None);
         };
-        let result = self
-            .side
-            .ask(question, &mut self.delivery, &mut delivery_progress);
+        let result = self.side.ask(
+            question,
+            u64::from(self.turn),
+            &mut self.delivery,
+            &mut delivery_progress,
+        );
         match result {
             Ok(answer) if !answer.trim().is_empty() => {
                 self.delivery = Delivery::Confirmed;
@@ -600,11 +629,12 @@ impl Side {
     fn ask(
         &mut self,
         question: &str,
+        turn: u64,
         delivery: &mut Delivery,
         progress: &mut dyn FnMut(Delivery),
     ) -> Result<String, SideFailure> {
         match self {
-            Self::Codex(side) => side.ask(question, delivery, progress),
+            Self::Codex(side) => side.ask(question, turn, delivery, progress),
             Self::Claude(side) => side.ask(question, delivery, progress),
             Self::Opencode(side) => side.ask(question, delivery, progress),
         }
@@ -943,6 +973,9 @@ struct CodexSide {
     policy: ConsultationPolicy,
     timeout: Duration,
     cancellation: CancellationToken,
+    output: Option<ConsultationOutputObserver>,
+    turn: u64,
+    metrics: TurnMetrics,
 }
 
 impl CodexSide {
@@ -967,6 +1000,9 @@ impl CodexSide {
             policy: policy.clone(),
             timeout: options.timeout,
             cancellation: options.cancellation.clone(),
+            output: options.output.clone(),
+            turn: 0,
+            metrics: TurnMetrics::default(),
         };
         let opened = (|| -> Result<()> {
             side.request(
@@ -988,7 +1024,7 @@ impl CodexSide {
                 "excludeTurns": true,
                 "approvalPolicy": "never",
                 "sandbox": "read-only",
-                "developerInstructions": "This is an ephemeral side consultation. Answer from inherited conversation context without modifying files or external state. If tools would be required, explain what needs checking instead. Separate dated historical work from later current state."
+                "developerInstructions": codex_consultation_instructions(policy)
             });
             fork["model"] = Value::String(policy.model.clone().unwrap_or_default());
             fork["config"] = json!({"model_reasoning_effort": policy.effort});
@@ -1104,14 +1140,31 @@ impl CodexSide {
     fn ask(
         &mut self,
         question: &str,
+        turn: u64,
         delivery: &mut Delivery,
         progress: &mut dyn FnMut(Delivery),
     ) -> Result<String, SideFailure> {
         self.notifications.clear();
         self.notification_bytes = 0;
+        self.turn = turn;
+        self.metrics = TurnMetrics::default();
+        let started = Instant::now();
+        // Codex 0.154.0 can retain inherited developer messages without rendering
+        // thread/fork's developerInstructions override. Put the same policy in
+        // the first actual input too: no extra turn, no rewritten parent prefix,
+        // and no repeated policy text on related follow-ups. This is guidance;
+        // the read-only sandbox and exact-child checks remain separate controls.
+        let input = if turn == 1 {
+            format!(
+                "{}\n\nQuestion:\n{question}",
+                codex_consultation_instructions(&self.policy)
+            )
+        } else {
+            question.to_owned()
+        };
         let mut params = json!({
             "threadId": self.thread_id,
-            "input": [{"type":"text","text":question}],
+            "input": [{"type":"text","text":input}],
             "model": self.policy.model,
             "effort": self.policy.effort
         });
@@ -1136,6 +1189,7 @@ impl CodexSide {
         };
         *delivery = Delivery::Confirmed;
         progress(*delivery);
+        self.metrics.provider_ack_seconds = Some(seconds(started));
         let deadline = Instant::now() + self.timeout;
         let mut final_text = String::new();
         let mut deltas = String::new();
@@ -1175,6 +1229,37 @@ impl CodexSide {
                         params.get("delta").and_then(Value::as_str).unwrap_or(""),
                     )
                     .map_err(|error| SideFailure::turn(error, *delivery))?;
+                    let text = params.get("delta").and_then(Value::as_str).unwrap_or("");
+                    if !text.is_empty() {
+                        self.metrics
+                            .first_text_seconds
+                            .get_or_insert_with(|| seconds(started));
+                        if let Some(output) = &self.output {
+                            let delta = AnswerDelta {
+                                turn: self.turn,
+                                item_id: params
+                                    .get("itemId")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("message")
+                                    .to_owned(),
+                                text: text.to_owned(),
+                            };
+                            if delta.valid(self.turn) && !output(delta) {
+                                return Err(SideFailure::turn(
+                                    "consultation output consumer closed; partial answer is not complete",
+                                    *delivery,
+                                ));
+                            }
+                        }
+                    }
+                }
+                Some("thread/tokenUsage/updated")
+                    if params.get("turnId").and_then(Value::as_str) == Some(&turn_id) =>
+                {
+                    self.metrics.usage = params
+                        .get("tokenUsage")
+                        .and_then(|v| v.get("last"))
+                        .and_then(TurnUsage::from_codex);
                 }
                 Some("item/completed")
                     if params.get("turnId").and_then(Value::as_str) == Some(&turn_id) =>
@@ -1203,7 +1288,12 @@ impl CodexSide {
                         if !final_text.trim().is_empty()
                             && matches!(phase, None | Some("final_answer"))
                         {
-                            return Ok(final_text);
+                            self.metrics
+                                .first_text_seconds
+                                .get_or_insert_with(|| seconds(started));
+                            // Usage can arrive after the final message. Only
+                            // turn/completed confirms that the turn succeeded;
+                            // a message followed by a provider error is partial.
                         }
                     }
                 }
@@ -1242,17 +1332,13 @@ impl CodexSide {
                     } else {
                         final_text
                     };
+                    if !answer.is_empty() {
+                        self.metrics
+                            .first_text_seconds
+                            .get_or_insert_with(|| seconds(started));
+                    }
+                    self.metrics.completed_seconds = Some(seconds(started));
                     return Ok(answer);
-                }
-                Some("thread/status/changed")
-                    if !final_text.is_empty()
-                        && params
-                            .get("status")
-                            .and_then(|value| value.get("type"))
-                            .and_then(Value::as_str)
-                            == Some("idle") =>
-                {
-                    return Ok(final_text);
                 }
                 _ => {}
             }

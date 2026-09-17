@@ -198,9 +198,53 @@ struct AskArgs {
     /// Emit one final machine-readable JSON result.
     #[arg(long)]
     json: bool,
-    /// Use the provider's verified low-latency consultation profile.
-    #[arg(long)]
+    /// Include provisional answer fragments in the JSON-lines stream.
+    #[arg(long, requires = "jsonl")]
+    stream: bool,
+    /// Explicitly select the fast Codex profile (already the default for questions).
+    #[arg(long, conflicts_with = "deep")]
     fast: bool,
+    /// Use Sol-medium for a deeper Codex consultation instead of Luna-medium.
+    #[arg(long)]
+    deep: bool,
+}
+impl AskArgs {
+    fn uses_fast_profile(&self, provider: Provider) -> bool {
+        self.fast || crate::consult::question_fast_path(provider, self.deep)
+    }
+}
+
+#[cfg(test)]
+mod question_profile_tests {
+    use super::*;
+
+    #[test]
+    fn default_and_explicit_profiles_match_the_target_provider() {
+        for (flags, codex_fast) in [
+            (vec![], true),
+            (vec!["--fast"], true),
+            (vec!["--deep"], false),
+        ] {
+            let mut argv = vec!["pika", "ask", "expert"];
+            argv.extend(flags);
+            argv.extend(["--json", "--", "question"]);
+            let Some(Command::Ask(args)) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!("ask command expected");
+            };
+            assert_eq!(args.uses_fast_profile(Provider::Codex), codex_fast);
+            for provider in [Provider::Claude, Provider::Opencode] {
+                // Explicit --fast still rejects unsupported providers; the
+                // new default never opts them into an untested override.
+                assert_eq!(args.uses_fast_profile(provider), args.fast);
+                assert_eq!(
+                    crate::consult::consultation_policy(provider, args.uses_fast_profile(provider))
+                        .is_err(),
+                    args.fast,
+                );
+            }
+        }
+        assert!(Cli::try_parse_from(["pika", "ask", "expert", "--fast", "--deep"]).is_err());
+    }
 }
 #[derive(Args, Debug)]
 struct ExplainArgs {
@@ -547,6 +591,8 @@ struct FleetAskArgs {
     model: Option<String>,
     #[arg(long)]
     effort: Option<String>,
+    #[arg(long)]
+    stream_output: bool,
 }
 
 pub fn run<I, T>(args: I) -> Result<i32>
@@ -1101,6 +1147,8 @@ fn ask_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
                 jsonl: false,
                 json: false,
                 fast: false,
+                deep: false,
+                stream: false,
             },
         );
     }
@@ -1125,7 +1173,9 @@ fn run_local_board_consultation(
 ) -> Result<ConsultationOutcome> {
     let mut options =
         crate::consult::ConsultationOptions::new(pika.config.executable(io.item.session.provider));
+    options.fast = crate::consult::question_fast_path(io.item.session.provider, false);
     options.cancellation = io.cancellation.clone();
+    options.output = Some(monitor::consultation_preview_observer(io.events.clone()));
     if io.item.session.provider == Provider::Opencode {
         options.opencode_database = Some(pika.paths.opencode_data_home.join("opencode.db"));
     }
@@ -3449,6 +3499,15 @@ fn emit_jsonl_value(value: serde_json::Value) -> bool {
     writeln!(output, "{line}").is_ok() && output.flush().is_ok()
 }
 
+// Opt-in content event, separate from metadata-only progress. A delta never
+// acknowledges a completed consultation and never replaces the final answer.
+fn consultation_output_value(delta: &crate::consult_telemetry::AnswerDelta) -> serde_json::Value {
+    serde_json::json!({
+        "type":"answer_delta", "stage":"turn", "delivery":"confirmed",
+        "turn":delta.turn, "partial":true, "output":delta,
+    })
+}
+
 fn consultation_opened_value(
     side: &crate::consult::Consultation,
     session: &Session,
@@ -3479,6 +3538,9 @@ fn consultation_answer_value(
         .as_object_mut()
         .expect("consultation event is an object")
         .insert("text".into(), serde_json::json!(answer));
+    if let Some(metrics) = side.turn_metrics() {
+        value["turn_metrics"] = serde_json::json!(metrics);
+    }
     value
 }
 
@@ -3729,18 +3791,21 @@ fn unresolved_jsonl_policy(
     pika: &Pika,
     name: &str,
     fast: bool,
+    deep: bool,
 ) -> crate::consult::ConsultationPolicy {
     let provider = name
         .split_once(':')
         .and_then(|(prefix, _)| prefix.parse::<Provider>().ok())
         .unwrap_or(pika.config.default_provider);
-    crate::consult::consultation_policy(provider, fast).unwrap_or(
-        crate::consult::ConsultationPolicy {
-            mode: "invalid".into(),
-            model: None,
-            effort: None,
-        },
+    crate::consult::consultation_policy(
+        provider,
+        fast || crate::consult::question_fast_path(provider, deep),
     )
+    .unwrap_or(crate::consult::ConsultationPolicy {
+        mode: "invalid".into(),
+        model: None,
+        effort: None,
+    })
 }
 
 fn rounded_duration(duration: Duration) -> f64 {
@@ -4085,7 +4150,7 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
         Ok(target) => target,
         Err(error) if a.jsonl => {
             return Ok(jsonl_preparation_failure(
-                unresolved_jsonl_policy(pika, &a.name, a.fast),
+                unresolved_jsonl_policy(pika, &a.name, a.fast, a.deep),
                 &error.to_string(),
             ));
         }
@@ -4096,7 +4161,7 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
         Some(NamedTarget::Local(session)) => *session,
         None if a.jsonl => {
             return Ok(jsonl_preparation_failure(
-                unresolved_jsonl_policy(pika, &a.name, a.fast),
+                unresolved_jsonl_policy(pika, &a.name, a.fast, a.deep),
                 &format!("No exact conversation named {:?}.", a.name),
             ));
         }
@@ -4104,9 +4169,10 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
     };
     let mut options =
         crate::consult::ConsultationOptions::new(pika.config.executable(session.provider));
-    options.fast = a.fast;
+    let fast = a.uses_fast_profile(session.provider);
+    options.fast = fast;
     let jsonl_policy = if a.jsonl {
-        match jsonl_policy_or_failure(session.provider, a.fast) {
+        match jsonl_policy_or_failure(session.provider, fast) {
             Ok(policy) => Some(policy),
             Err(code) => return Ok(code),
         }
@@ -4123,6 +4189,11 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
                 cancellation.cancel();
             }
         }));
+        if a.stream {
+            options.output = Some(Arc::new(|delta| {
+                emit_jsonl_value(consultation_output_value(&delta))
+            }));
+        }
     }
     if session.provider == Provider::Opencode {
         options.opencode_database = Some(pika.paths.opencode_data_home.join("opencode.db"));
@@ -4191,6 +4262,7 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
             serde_json::to_string(&serde_json::json!({
                 "answer": answer,
                 "receipt": receipt,
+                "turn_metrics": side.turn_metrics(),
                 "cleanup_error": close_error.as_ref().and_then(|error| error.cleanup_error.clone()),
             }))?
         );
@@ -4205,13 +4277,14 @@ fn ask(pika: &Pika, a: AskArgs) -> Result<i32> {
 }
 
 fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i32> {
+    let fast = a.uses_fast_profile(remote.session.provider);
     let local_policy = if a.jsonl {
-        match jsonl_policy_or_failure(remote.session.provider, a.fast) {
+        match jsonl_policy_or_failure(remote.session.provider, fast) {
             Ok(policy) => policy,
             Err(code) => return Ok(code),
         }
     } else {
-        crate::consult::consultation_policy(remote.session.provider, a.fast)?
+        crate::consult::consultation_policy(remote.session.provider, fast)?
     };
     if let Err(error) = require_remote_source_available(&remote) {
         if a.jsonl {
@@ -4248,6 +4321,7 @@ fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i3
         }
         Err(error) => return Err(error),
     };
+    let prepare_started = Instant::now();
     let opened = fleet::RemoteConsultation::open(
         &SshTransport::default(),
         node,
@@ -4281,7 +4355,13 @@ fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i3
         }
         Err(error) => return Err(anyhow::Error::from(error)),
     };
+    let prepare_seconds = rounded_duration(prepare_started.elapsed());
     if a.jsonl {
+        if a.stream {
+            side.set_output_observer(Arc::new(|delta| {
+                emit_jsonl_value(consultation_output_value(&delta))
+            }));
+        }
         let run = jsonl_run.as_mut().expect("JSONL run exists");
         run.progress(Some("complete"));
         if !run.output_ok {
@@ -4302,8 +4382,12 @@ fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i3
     } else {
         a.question.join(" ")
     };
+    let turn_started = Instant::now();
     let answer = side.ask(&question).map_err(anyhow::Error::from)?;
+    let turn_seconds = rounded_duration(turn_started.elapsed());
+    let cleanup_started = Instant::now();
     let cleanup = side.close();
+    let cleanup_seconds = rounded_duration(cleanup_started.elapsed());
     if a.json {
         println!(
             "{}",
@@ -4311,6 +4395,12 @@ fn ask_remote(pika: &Pika, remote: fleet::FleetSession, a: AskArgs) -> Result<i3
                 "answer": answer,
                 "cleanup": cleanup.as_ref().map(|receipt| &receipt.cleanup).ok(),
                 "cleanup_error": cleanup.as_ref().err().map(ToString::to_string),
+                "turn_metrics": side.turn_metrics(),
+                "stage_durations_seconds": {
+                    "prepare": prepare_seconds,
+                    "turn": turn_seconds,
+                    "cleanup": cleanup_seconds,
+                },
             }))?
         );
     } else {
@@ -4387,6 +4477,9 @@ fn ask_remote_jsonl(
                     .as_object_mut()
                     .expect("consultation event is an object")
                     .insert("text".into(), serde_json::json!(answer));
+                if let Some(metrics) = side.turn_metrics() {
+                    value["turn_metrics"] = serde_json::json!(metrics);
+                }
                 run.output_ok &= emit_jsonl_value(value);
                 if !run.output_ok {
                     result = JSONL_OPERATIONAL_FAILURE;
@@ -4485,6 +4578,9 @@ fn ask_remote_jsonl(
                         .as_object_mut()
                         .expect("consultation event is an object")
                         .insert("text".into(), serde_json::json!(answer));
+                    if let Some(metrics) = side.turn_metrics() {
+                        value["turn_metrics"] = serde_json::json!(metrics);
+                    }
                     run.output_ok &= emit_jsonl_value(value);
                     if !run.output_ok {
                         result = JSONL_OPERATIONAL_FAILURE;
@@ -4785,6 +4881,7 @@ fn serve_fleet_consultation(
                     if !emit_jsonl_value(serde_json::json!({
                         "type":"answer", "text":answer, "receipt":side.receipt(),
                         "policy":side.policy(),
+                        "turn_metrics":side.turn_metrics(),
                     })) {
                         cancellation.cancel();
                         result = JSONL_OPERATIONAL_FAILURE;
@@ -4896,6 +4993,8 @@ fn ask_interactive(pika: &Pika, s: Session) -> Result<i32> {
             jsonl: false,
             json: false,
             fast: false,
+            deep: false,
+            stream: false,
         },
     )
 }
@@ -5167,6 +5266,11 @@ fn fleet_ask(pika: &Pika, a: FleetAskArgs) -> Result<i32> {
     let cancellation = crate::consult::CancellationToken::default();
     let inputs = spawn_fleet_consultation_input(cancellation.clone());
     options.cancellation = cancellation.clone();
+    if a.stream_output {
+        options.output = Some(Arc::new(|delta| {
+            emit_jsonl_value(consultation_output_value(&delta))
+        }));
+    }
     if session.provider == Provider::Opencode {
         options.opencode_database = Some(pika.paths.opencode_data_home.join("opencode.db"));
     }
@@ -6204,6 +6308,8 @@ done
                 jsonl: false,
                 json: false,
                 fast: false,
+                deep: false,
+                stream: false,
             },
         )
         .unwrap_err();

@@ -314,6 +314,7 @@ pub enum ConsultationEvent {
         proof: Option<String>,
     },
     Progress(String),
+    Partial(String),
     Answer(String),
     Error {
         message: String,
@@ -330,6 +331,33 @@ pub struct ConsultationIo {
     /// Flips immediately on the first close request, including while provider
     /// startup or a turn is blocked. Workers must pass it to owned I/O.
     pub cancellation: CancellationToken,
+}
+
+/// Coalesce deltas into a bounded preview. A slow board may skip intermediate
+/// snapshots, never block provider progress, and always gets a canonical Answer.
+pub(crate) fn consultation_preview_observer(
+    events: SyncSender<ConsultationEvent>,
+) -> crate::consult::ConsultationOutputObserver {
+    let current = Mutex::new((0_u64, String::new(), String::new()));
+    Arc::new(move |delta| {
+        let Ok(mut current) = current.lock() else {
+            return false;
+        };
+        if current.0 != delta.turn || current.1 != delta.item_id {
+            *current = (delta.turn, delta.item_id, String::new());
+        }
+        let mut bytes = (64 * 1024_usize)
+            .saturating_sub(current.2.len())
+            .min(delta.text.len());
+        while !delta.text.is_char_boundary(bytes) {
+            bytes -= 1;
+        }
+        current.2.push_str(&delta.text[..bytes]);
+        !matches!(
+            events.try_send(ConsultationEvent::Partial(current.2.clone())),
+            Err(mpsc::TrySendError::Disconnected(_))
+        )
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -847,6 +875,7 @@ struct ChatState {
     input: String,
     input_limit_reached: bool,
     lines: VecDeque<ChatLine>,
+    partial: Option<String>,
     retained_bytes: usize,
     history_truncated: bool,
     phase: ChatPhase,
@@ -882,6 +911,7 @@ impl ChatState {
                 text: "Opening a private side conversation…".into(),
             }]),
             retained_bytes: "Opening a private side conversation…".len(),
+            partial: None,
             history_truncated: false,
             phase: ChatPhase::Opening,
             command_sender: Some(command_sender),
@@ -907,6 +937,7 @@ impl ChatState {
                 text: "Private consultation is unavailable in this board invocation.".into(),
             }]),
             retained_bytes: "Private consultation is unavailable in this board invocation.".len(),
+            partial: None,
             history_truncated: false,
             phase: ChatPhase::Failed,
             command_sender: None,
@@ -942,6 +973,7 @@ impl ChatState {
             return;
         }
         let question = self.input.trim().to_owned();
+        self.partial = None;
         self.push_line(ChatRole::You, question.clone());
         self.input.clear();
         self.input_limit_reached = false;
@@ -1024,7 +1056,13 @@ impl ChatState {
                 );
             }
             ConsultationEvent::Progress(message) => self.push_line(ChatRole::Pika, message),
+            ConsultationEvent::Partial(text) => {
+                if self.phase == ChatPhase::Waiting && !self.close_requested {
+                    self.partial = Some(text);
+                }
+            }
             ConsultationEvent::Answer(answer) => {
+                self.partial = None;
                 self.push_line(ChatRole::Expert, answer);
                 if !self.close_requested {
                     self.phase = ChatPhase::Ready;
@@ -2341,6 +2379,17 @@ impl Board {
             rendered.push(String::new());
         }
         let first_row = 5_usize;
+        if let Some(partial) = &chat.partial {
+            rendered.push(
+                if chat.phase == ChatPhase::Waiting {
+                    "PARTIAL · awaiting completed answer"
+                } else {
+                    "PARTIAL · no completed answer"
+                }
+                .into(),
+            );
+            rendered.extend(wrap(partial, available));
+        }
         let composer_row = usize::from(height.saturating_sub(5));
         let rows = composer_row.saturating_sub(first_row).max(1);
         let end = rendered
@@ -3533,6 +3582,43 @@ mod tests {
         assert!(chat.retained_bytes <= 256 * 1024);
         assert!(chat.history_truncated);
         assert!(chat.lines.back().unwrap().text.starts_with("999:"));
+    }
+
+    #[test]
+    fn consultation_preview_is_provisional_and_final_answer_replaces_it() {
+        let mut chat = ChatState::unavailable("stream".into());
+        chat.phase = ChatPhase::Waiting;
+        chat.accept(ConsultationEvent::Partial("unfinished".into()));
+        assert_eq!(chat.phase, ChatPhase::Waiting);
+        assert_eq!(chat.partial.as_deref(), Some("unfinished"));
+        chat.accept(ConsultationEvent::Answer("complete".into()));
+        assert_eq!(chat.phase, ChatPhase::Ready);
+        assert!(chat.partial.is_none());
+        assert_eq!(chat.lines.back().unwrap().text, "complete");
+    }
+
+    #[test]
+    fn consultation_preview_coalesces_without_blocking_a_slow_board() {
+        let (send, receive) = mpsc::sync_channel(1);
+        let output = consultation_preview_observer(send);
+        let delta = |text: &str| crate::consult_telemetry::AnswerDelta {
+            turn: 1,
+            item_id: "a".into(),
+            text: text.into(),
+        };
+        assert!(output(delta("one")));
+        assert!(output(delta(" two")));
+        assert_eq!(
+            receive.recv().unwrap(),
+            ConsultationEvent::Partial("one".into())
+        );
+        assert!(output(delta(" three")));
+        assert_eq!(
+            receive.recv().unwrap(),
+            ConsultationEvent::Partial("one two three".into())
+        );
+        drop(receive);
+        assert!(!output(delta(" closed")));
     }
 
     #[test]

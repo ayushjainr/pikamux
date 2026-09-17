@@ -1810,6 +1810,95 @@ fn remote_consultation_reuses_one_connection_and_requires_v2_cleanup() {
 }
 
 #[test]
+fn remote_consultation_streams_and_rejects_foreign_turn_preview() {
+    let _process = fake_process_guard();
+    for (wrong_turn, capable) in [(false, true), (true, true), (false, false)] {
+        let temp = TempDir::new().unwrap();
+        let fake = temp.path().join("ssh");
+        let opened = opened_receipt(CODEX_PARENT_ID, CODEX_PARENT_ID);
+        let preview = json!({"type":"answer_delta","stage":"turn","delivery":"confirmed",
+            "turn":1,"partial":true,"output":{"turn":if wrong_turn {2} else {1},"item_id":"a","text":"early"}});
+        let answer = json!({"type":"answer","text":"finished answer","turn_metrics":{
+            "provider_ack_seconds":0.1,"first_text_seconds":0.2,"completed_seconds":0.5,
+            "usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":20,"reasoning_output_tokens":5}}});
+        executable(
+            &fake,
+            &format!(
+                "printf '%s\\n' '{opened}'\nwhile IFS= read -r line; do\ncase \"$line\" in\n*\\\"close\\\"*) printf '%s\\n' '{{\"type\":\"closed\",\"receipt_version\":2,\"discarded\":true,\"cleanup\":\"complete\"}}'; exit 0 ;;\n*) printf '%s\\n' '{preview}'; sleep 0.15; printf '%s\\n' '{answer}' ;;\nesac\ndone"
+            ),
+        );
+        let id = Uuid::new_v4().to_string();
+        let remote = FleetSession {
+            node_id: id.clone(),
+            node_name: "atlas".into(),
+            session: session(Provider::Codex, CODEX_PARENT_ID, "expert"),
+            stale: false,
+            remote_error: None,
+            seen_at: now(),
+            card_status: None,
+            card_detail: None,
+            expert_scope: None,
+            expert_current_work: None,
+            expert_topics: Vec::new(),
+            watched: true,
+            availability: Some("source-available".into()),
+            scope_updated_at: None,
+            current_state_updated_at: None,
+            current_state_status: None,
+        };
+        let mut trusted = node(&id, "atlas");
+        if !capable {
+            trusted
+                .capabilities
+                .retain(|value| value != "consultation-output-v1");
+        }
+        let mut side = RemoteConsultation::open(
+            &SshTransport::new(&fake, Duration::from_secs(1), Duration::from_secs(2)),
+            trusted,
+            remote,
+            ConsultationPolicy {
+                consultation_mode: "default".into(),
+                model: "gpt-test".into(),
+                effort: "low".into(),
+            },
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        side.set_output_observer(std::sync::Arc::new(move |delta| send.send(delta).is_ok()));
+        let worker = std::thread::spawn(move || {
+            let answer = side.ask("question");
+            (side, answer)
+        });
+        if wrong_turn || !capable {
+            let (_, answer) = worker.join().unwrap();
+            assert_eq!(answer.unwrap_err().kind, FleetErrorKind::Incompatible);
+            assert!(receive.try_recv().is_err());
+        } else {
+            assert_eq!(
+                receive.recv_timeout(Duration::from_secs(2)).unwrap().text,
+                "early"
+            );
+            assert!(!worker.is_finished());
+            let (mut side, answer) = worker.join().unwrap();
+            assert_eq!(answer.unwrap(), "finished answer");
+            assert_eq!(
+                side.turn_metrics()
+                    .unwrap()
+                    .usage
+                    .as_ref()
+                    .unwrap()
+                    .cached_input_tokens,
+                800
+            );
+            assert_eq!(side.close().unwrap().answers_received, Some(1));
+        }
+    }
+}
+
+#[test]
 fn remote_opening_requires_v2_ephemeral_exact_child_and_provider_isolation() {
     let _process = fake_process_guard();
     let temp = TempDir::new().unwrap();

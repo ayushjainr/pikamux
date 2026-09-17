@@ -380,7 +380,7 @@ The complete command reference follows.
 pika                       open the live operations monitor
 pika NAME                  find, protect, attach, resume, or safely create by name
 pika ask NAME "QUESTION"   ephemeral multi-turn consultation with that parent
-pika ask NAME --fast ...   faster Codex consultation using Luna medium
+pika ask NAME --deep ...   deeper Codex consultation using Sol medium
 pika ask NAME --jsonl      persistent JSON-lines side channel for agents/apps
 pika experts QUERY         find expert threads across projects
 pika experts QUERY --json  stable machine-readable expert matches
@@ -452,15 +452,17 @@ are explicitly marked as infrastructure that must not be killed. No recovery
 subcommand is part of the user model.
 
 `pika ask research-notes "What assumption is weakest here?"` opens a temporary
-side conversation based on that exact provider identity. In a terminal, ask
-follow-ups at the `side>` prompt and type `/close` when finished. Codex defaults
-to `gpt-5.6-sol` with medium reasoning; `--fast` selects the benchmarked
-`gpt-5.6-luna` medium profile. Pika verifies the provider-confirmed model and
-effort before showing them in terminal and JSONL open/close receipts. The inline
-monitor and thread-profile interviews use the same Sol-medium default. Claude
+side conversation based on that exact provider identity. Use `--jsonl` to keep
+one side alive for follow-ups instead of loading the expert again for each ask.
+Codex questions default to `gpt-5.6-luna` with medium reasoning; `--deep` selects
+`gpt-5.6-sol` medium for questions that need deeper reasoning. Pika verifies the
+provider-confirmed model and effort before showing them in JSONL receipts.
+The local and remote boards use the same Luna-medium question default;
+background thread-profile interviews retain Sol-medium. Claude
 and OpenCode remain provider-native because neither has been benchmarked for
 this override; `--fast` therefore fails closed for both.
-Pika's `--fast` means the Luna-medium profile; it is not Codex Fast mode and
+`--fast` remains an explicit alias for the Luna-medium question default and
+cannot be combined with `--deep`. It is not Codex Fast mode and
 does not select a service tier.
 Codex uses an in-memory ephemeral fork. Claude uses one streamed,
 non-persistent fork with its tool surface disabled. For OpenCode, Pika starts an
@@ -537,6 +539,23 @@ active provider conversation that was consulted. A completed answer remains usab
 if cleanup fails; only a terminal `closed` receipt with `discarded: true` confirms
 successful cleanup. EOF or an answer alone does not prove disposal. Unknown
 delivery must never trigger a blind retry.
+
+Add `--stream` to `--jsonl` to receive provisional Codex answer fragments as
+`answer_delta` events. Each contains `partial: true` and an `output` object with
+`turn`, `item_id`, and `text`. Group fragments by turn and item; the final `answer`
+is authoritative and replaces the preview. Partial text followed by an error is
+not a successful answer or permission to retry. Metadata-only progress remains
+separate. Remote streaming requires a peer advertising `consultation-output-v1`;
+older peers still return their completed answers without fragments.
+
+Codex answers also include optional `turn_metrics`: provider acknowledgement,
+first observed text, and provider-confirmed completion times measured from turn submission,
+plus provider-reported input, cached-input, output and reasoning-token counts
+when available. Null means unobserved, not zero. The first-text interval includes
+queueing, input processing and any reasoning before text; it does not isolate
+those components. Pika waits for provider-confirmed turn completion, retaining
+usage received after the final message; absent provider counters remain unavailable.
+These diagnostics do not promise a latency SLA or a prompt-cache hit.
 
 Parent isolation and byte-for-byte verification are different claims. Ordinary
 consultations do not fingerprint the parent transcript: the closing receipt reports

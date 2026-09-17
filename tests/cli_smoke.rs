@@ -294,6 +294,92 @@ fn wait_matches_only_unread_ready_and_uses_timeout_code_124() {
 
 #[cfg(unix)]
 #[test]
+fn ask_selects_fast_by_default_and_deep_only_when_requested() {
+    for (flags, expected_model, expected_mode, jsonl, stream) in [
+        (vec![], "gpt-5.6-luna", "fast", false, false),
+        (vec!["--deep"], "gpt-5.6-sol", "default", false, false),
+        (vec![], "gpt-5.6-luna", "fast", true, false),
+        (vec!["--stream"], "gpt-5.6-luna", "fast", true, true),
+    ] {
+        let (temp, mut command) = wait_command(true);
+        let parent = temp.path().join("parent.jsonl");
+        std::fs::write(&parent, "synthetic history\n").unwrap();
+        let mut session = wait_session(true);
+        session.transcript_path = Some(parent.to_string_lossy().into_owned());
+        Store::at(temp.path().join("state/pika.db"))
+            .upsert_session(&session, true)
+            .unwrap();
+        write_test_executable(
+            &temp.path().join("bin/codex"),
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"thread/fork"'*)
+      model=$(printf '%s' "$line" | sed -n 's/.*"model":"\([^"]*\)".*/\1/p')
+      printf '{"id":%s,"result":{"thread":{"id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","ephemeral":true},"model":"%s","reasoningEffort":"medium"}}\n' "$id" "$model" ;;
+    *'"method":"turn/start"'*)
+      printf '{"id":%s,"result":{"turn":{"id":"one"}}}\n' "$id"
+      printf '{"method":"item/agentMessage/delta","params":{"threadId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","turnId":"one","itemId":"message","delta":"focused "}}\n'
+      printf '{"method":"item/completed","params":{"threadId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","turnId":"one","item":{"type":"agentMessage","phase":"final_answer","text":"focused answer"}}}\n'
+      printf '{"method":"turn/completed","params":{"threadId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","turn":{"id":"one","status":"completed"}}}\n' ;;
+  esac
+done
+"#,
+        );
+        command.args([
+            "ask",
+            "research_thread",
+            if jsonl { "--jsonl" } else { "--json" },
+        ]);
+        if jsonl {
+            command.write_stdin("{\"close\":true}\n");
+        }
+        command.args(flags).args(["--", "focused question"]);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if jsonl {
+            let events = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let fragments = events.iter().position(|e| e["type"] == "answer_delta");
+            assert_eq!(fragments.is_some(), stream);
+            let final_index = events.iter().position(|e| e["type"] == "answer").unwrap();
+            if let Some(index) = fragments {
+                assert!(index < final_index);
+                assert_eq!(events[index]["partial"], true);
+                assert_eq!(events[index]["output"]["text"], "focused ");
+            }
+            assert_eq!(events[final_index]["text"], "focused answer");
+            assert_eq!(events.last().unwrap()["cleanup"], "complete");
+        } else {
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["answer"], "focused answer");
+            assert_eq!(result["receipt"]["model"], expected_model);
+            assert_eq!(result["receipt"]["consultation_mode"], expected_mode);
+            assert_eq!(result["receipt"]["cleanup"], "complete");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&parent).unwrap(),
+            "synthetic history\n"
+        );
+        let saved = Store::at(temp.path().join("state/pika.db"))
+            .get_session(Provider::Codex, &session.session_id)
+            .unwrap()
+            .unwrap();
+        assert!(saved.unread);
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn unavailable_consultation_is_jsonl_only_and_uses_legacy_failure_code() {
     let (_temp, mut command) = wait_command(true);
     let output = command

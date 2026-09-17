@@ -3,6 +3,7 @@
 use pikamux::consult::{
     CancellationToken, Cleanup, Consultation, ConsultationOptions, ConsultationProgress,
     ConsultationStage, Delivery, FAST_CODEX_MODEL, MAX_QUESTION_BYTES, consultation_policy,
+    question_fast_path,
 };
 use pikamux::model::{Provider, Session, Status};
 use rusqlite::{Connection, params};
@@ -81,6 +82,7 @@ case "$mode" in
   parent-child-uppercase) side_id=BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB ;;
 esac
 printf 'ARGV:%s EPHEMERAL:%s\n' "$*" "$PIKA_EPHEMERAL" >> "$log"
+if [ "$mode" = slow-open ]; then sleep 0.2; fi
 turn=0
 while IFS= read -r line; do
   printf 'IN:%s\n' "$line" >> "$log"
@@ -90,6 +92,8 @@ while IFS= read -r line; do
     *'"method":"thread/fork"'*)
       if [ "$mode" = mismatch ]; then
         printf '{{"id":%s,"result":{{"thread":{{"id":"%s","ephemeral":true}},"model":"gpt-5.6-sol","reasoningEffort":"high"}}}}\n' "$id" "$side_id"
+      elif [ "$mode" = fast ]; then
+        printf '{{"id":%s,"result":{{"thread":{{"id":"%s","ephemeral":true}},"model":"gpt-5.6-luna","reasoningEffort":"medium"}}}}\n' "$id" "$side_id"
       else
         printf '{{"id":%s,"result":{{"thread":{{"id":"%s","ephemeral":true}},"model":"gpt-5.6-sol","reasoningEffort":"medium"}}}}\n' "$id" "$side_id"
       fi ;;
@@ -104,8 +108,28 @@ while IFS= read -r line; do
         done
       fi
       printf '{{"id":%s,"result":{{"turn":{{"id":"turn-%s"}}}}}}\n' "$id" "$turn"
+      if [ "$mode" = stream ] || [ "$mode" = stream-error ]; then
+        printf '{{"method":"item/agentMessage/delta","params":{{"threadId":"other","turnId":"turn-%s","itemId":"a","delta":"foreign"}}}}\n' "$turn"
+        printf '{{"method":"item/agentMessage/delta","params":{{"threadId":"%s","turnId":"turn-old","itemId":"a","delta":"old"}}}}\n' "$side_id"
+        printf '{{"method":"item/agentMessage/delta","params":{{"threadId":"%s","turnId":"turn-%s","itemId":"a","delta":"answer-"}}}}\n' "$side_id" "$turn"
+        sleep 0.15
+        printf '{{"method":"thread/tokenUsage/updated","params":{{"threadId":"%s","turnId":"turn-%s","tokenUsage":{{"last":{{"inputTokens":1000,"cachedInputTokens":800,"outputTokens":30,"reasoningOutputTokens":10}}}}}}}}\n' "$side_id" "$turn"
+        if [ "$mode" = stream-error ]; then
+          printf '{{"method":"error","params":{{"threadId":"%s","turnId":"turn-%s","error":{{"message":"provider failed after partial output"}}}}}}\n' "$side_id" "$turn"
+          continue
+        fi
+      fi
       if [ "$mode" != timeout ]; then
         printf '{{"method":"item/completed","params":{{"threadId":"%s","turnId":"turn-%s","item":{{"type":"agentMessage","phase":"final_answer","text":"answer-%s"}}}}}}\n' "$side_id" "$turn" "$turn"
+        printf '{{"method":"thread/status/changed","params":{{"threadId":"%s","status":{{"type":"idle"}}}}}}\n' "$side_id"
+        if [ "$mode" = stream ]; then
+          printf '{{"method":"thread/tokenUsage/updated","params":{{"threadId":"%s","turnId":"turn-%s","tokenUsage":{{"last":{{"inputTokens":1000,"cachedInputTokens":900,"outputTokens":30,"reasoningOutputTokens":10}}}}}}}}\n' "$side_id" "$turn"
+        fi
+        if [ "$mode" = late-error ]; then
+          printf '{{"method":"error","params":{{"threadId":"%s","turnId":"turn-%s","error":{{"message":"late provider failure"}}}}}}\n' "$side_id" "$turn"
+        else
+          printf '{{"method":"turn/completed","params":{{"threadId":"%s","turn":{{"id":"turn-%s","status":"completed"}}}}}}\n' "$side_id" "$turn"
+        fi
       fi ;;
   esac
 done
@@ -183,6 +207,171 @@ fn codex_uses_one_confirmed_ephemeral_child_for_multiple_turns() {
         2
     );
     assert_eq!(log.matches("\"model\":\"gpt-5.6-sol\"").count(), 3);
+    assert!(!log.contains("features.apps"));
+    assert!(!log.contains("features.shell_snapshot"));
+}
+
+#[test]
+fn question_default_pins_fast_profile_and_reuses_the_child() {
+    let root = tempfile::tempdir().unwrap();
+    let (executable, log) = codex_fixture(&root, "fast");
+    let target = session(Provider::Codex, "stable-workstream", root.path());
+    let mut options = ConsultationOptions::new(executable);
+    options.fast = question_fast_path(target.provider, false);
+    options.timeout = Duration::from_secs(2);
+    let mut side = Consultation::open(&target, options).unwrap();
+    assert_eq!(side.policy().mode, "fast");
+    assert_eq!(side.ask("one quick question").unwrap(), "answer-1");
+    assert_eq!(side.ask("related follow-up").unwrap(), "answer-2");
+    side.close().unwrap();
+    let log = fs::read_to_string(log).unwrap();
+    assert_eq!(log.matches("ARGV:app-server --stdio").count(), 1);
+    assert_eq!(log.matches("\"method\":\"thread/fork\"").count(), 1);
+    assert_eq!(log.matches("\"model\":\"gpt-5.6-luna\"").count(), 3);
+    assert!(!log.contains("features.apps"));
+    assert!(!log.contains("features.shell_snapshot"));
+    assert!(log.contains("Answer the specific question directly and concisely"));
+    assert!(log.contains("\"ephemeral\":true"));
+    assert!(log.contains("\"sandbox\":\"read-only\""));
+    assert_eq!(side.receipt().cleanup, Cleanup::Complete);
+}
+
+#[test]
+fn codex_delivers_policy_in_first_input_without_repeating_it_on_followups() {
+    for (mode, fast) in [("normal", false), ("fast", true)] {
+        let root = tempfile::tempdir().unwrap();
+        let (executable, log) = codex_fixture(&root, mode);
+        let mut options = ConsultationOptions::new(executable);
+        options.fast = fast;
+        options.timeout = Duration::from_secs(2);
+        let mut side = Consultation::open(
+            &session(Provider::Codex, "stable-workstream", root.path()),
+            options,
+        )
+        .unwrap();
+        let question = "Keep these bytes: <question>\n\"blue\" — why?";
+        side.ask(question).unwrap();
+        side.ask("Related follow-up, unchanged.").unwrap();
+        side.close().unwrap();
+        let log = fs::read_to_string(log).unwrap();
+        let requests: Vec<serde_json::Value> = log
+            .lines()
+            .filter_map(|line| line.strip_prefix("IN:"))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let forks: Vec<_> = requests
+            .iter()
+            .filter(|request| request["method"] == "thread/fork")
+            .collect();
+        let turns: Vec<_> = requests
+            .iter()
+            .filter(|request| request["method"] == "turn/start")
+            .collect();
+        assert_eq!(forks.len(), 1);
+        assert_eq!(turns.len(), 2, "no policy-only model turn");
+        let policy = forks[0]["params"]["developerInstructions"]
+            .as_str()
+            .unwrap();
+        assert!(policy.contains("without modifying files or external state"));
+        assert_eq!(policy.contains("directly and concisely"), fast);
+        assert_eq!(
+            turns[0]["params"]["input"][0]["text"],
+            format!("{policy}\n\nQuestion:\n{question}")
+        );
+        assert_eq!(
+            turns[1]["params"]["input"][0]["text"],
+            "Related follow-up, unchanged."
+        );
+        assert_eq!(
+            turns[0]["params"]["threadId"],
+            turns[1]["params"]["threadId"]
+        );
+        assert_eq!(forks[0]["params"]["sandbox"], "read-only");
+        assert_eq!(forks[0]["params"]["ephemeral"], true);
+    }
+}
+
+#[test]
+fn preparation_timing_includes_provider_startup() {
+    let root = tempfile::tempdir().unwrap();
+    let (executable, _) = codex_fixture(&root, "slow-open");
+    let mut side = Consultation::open(
+        &session(Provider::Codex, "stable-workstream", root.path()),
+        ConsultationOptions::new(executable),
+    )
+    .unwrap();
+    assert!(side.receipt().stage_durations_seconds["prepare"] >= 0.18);
+    side.ask("one").unwrap();
+    side.close().unwrap();
+    assert!(side.receipt().stage_durations_seconds["prepare"] >= 0.18);
+}
+
+#[test]
+fn codex_streams_before_completion_with_exact_turn_usage() {
+    let root = tempfile::tempdir().unwrap();
+    let (executable, _) = codex_fixture(&root, "stream");
+    let (send, receive) = std::sync::mpsc::channel();
+    let mut options = ConsultationOptions::new(executable);
+    options.output = Some(std::sync::Arc::new(move |delta| send.send(delta).is_ok()));
+    let mut side =
+        Consultation::open(&session(Provider::Codex, "expert", root.path()), options).unwrap();
+    assert!(side.ask("").unwrap_err().receipt.retry_safe);
+    let worker = std::thread::spawn(move || {
+        let answer = side.ask("one").unwrap();
+        (side, answer)
+    });
+    let delta = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(delta.text, "answer-");
+    assert_eq!(
+        delta.turn, 2,
+        "preview ordinal must match receipts after rejected input"
+    );
+    assert!(
+        !worker.is_finished(),
+        "preview must arrive before the completed answer"
+    );
+    let (mut side, answer) = worker.join().unwrap();
+    assert_eq!(answer, "answer-1");
+    assert!(
+        receive.try_recv().is_err(),
+        "foreign and old-turn output must not leak"
+    );
+    let metrics = side.turn_metrics().unwrap();
+    assert!(metrics.completed_seconds.unwrap() > metrics.first_text_seconds.unwrap());
+    assert_eq!(metrics.usage.as_ref().unwrap().cached_input_tokens, 900);
+    assert_eq!(metrics.usage.as_ref().unwrap().reasoning_output_tokens, 10);
+    side.close().unwrap();
+}
+
+#[test]
+fn partial_output_is_not_a_completed_answer_or_retry_permission() {
+    let root = tempfile::tempdir().unwrap();
+    let (executable, _) = codex_fixture(&root, "stream-error");
+    let mut side = Consultation::open(
+        &session(Provider::Codex, "expert", root.path()),
+        ConsultationOptions::new(executable),
+    )
+    .unwrap();
+    let error = side.ask("one").unwrap_err();
+    assert_eq!(error.receipt.answers_received, 0);
+    assert!(!error.receipt.retry_safe);
+    assert!(side.turn_metrics().unwrap().completed_seconds.is_none());
+    side.close().unwrap();
+}
+
+#[test]
+fn final_message_and_idle_before_provider_failure_are_not_success() {
+    let root = tempfile::tempdir().unwrap();
+    let (executable, _) = codex_fixture(&root, "late-error");
+    let mut side = Consultation::open(
+        &session(Provider::Codex, "expert", root.path()),
+        ConsultationOptions::new(executable),
+    )
+    .unwrap();
+    let error = side.ask("one").unwrap_err();
+    assert_eq!(error.receipt.answers_received, 0);
+    assert!(!error.receipt.retry_safe);
+    side.close().unwrap();
 }
 
 #[test]

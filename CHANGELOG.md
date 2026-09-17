@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.21 — Faster expert consultations
+
+- Use Luna-medium for Codex questions on the board and CLI; select Sol-medium
+  explicitly with `pika ask --deep`. Keep Claude and OpenCode provider-native.
+- Show provisional Codex answers while they arrive, locally and across supported
+  fleet hosts. Add opt-in `--jsonl --stream` for agent callers.
+- Wait for confirmed turn completion and report observed timing and token usage;
+  partial output or an idle notification alone never counts as success.
+- Route named consultations directly, without requiring an expert-card refresh.
+  Keep related follow-ups in the same private side conversation.
+- Deliver consultation instructions with the first question while preserving
+  inherited history, read-only isolation and the original conversation.
+
 ## 0.6.20 — Keep the board in sight
 
 - Restore live board counts in the agent return bar on tmux 3.2a, binding the

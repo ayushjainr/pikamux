@@ -106,7 +106,10 @@ pika ask <native-id> --jsonl
 It waits for the opened receipt and answer, then sends `close`. If needed, it
 can ask a targeted follow-up before closing the same process. Remote experts use
 `<native-id>@<machine>` throughout; there is no fallback to a similarly named
-local conversation. The skill uses Pika's default consultation profile.
+local conversation. Codex questions use Luna-medium by default; `--deep` selects
+Sol-medium when a question needs deeper reasoning. Claude and OpenCode keep their
+provider-native profiles. Keep related follow-ups in this same side to avoid
+repeating provider startup and context loading.
 
 Judge the trial on three things:
 

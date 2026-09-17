@@ -11,6 +11,7 @@ pub mod client_bridge;
 pub mod client_cli;
 pub mod config;
 pub mod consult;
+pub mod consult_telemetry;
 pub mod core;
 pub mod doctor;
 pub mod expert_refresh;
