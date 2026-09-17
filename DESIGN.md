@@ -374,6 +374,11 @@ only after its bounded receipt and executable digest validate; this avoids stale
 PowerShell PATH entries reopening the old client. Staged installer probes never
 forward. No agent, pairing, or remote installation is
 changed. Closing the board cancels and reaps its update check.
+On macOS/Linux, approved updates also refresh an unchanged bundled agent-convo
+skill with a backup. Customized, symlinked, or absent copies remain untouched;
+checking for an update does not write skills. The skill component owns this
+policy, shared by the updater and a managed-board compatibility path for older
+updaters. Skill refresh never scans conversations or installs provider hooks.
 The legacy bridge remains optional for openings initiated on a remote console;
 its short connection budget is separate from its bounded launch-receipt budget,
 and a disconnected caller cannot terminate the listener.

@@ -814,6 +814,9 @@ fn observe_board(pika: &Pika, memory: &mut monitor::BoardMemory) -> Result<Board
 }
 
 fn run_board(pika: &Pika) -> Result<i32> {
+    if let Ok(executable) = std::env::current_exe() {
+        update::refresh_board_skill(&executable, &pika.paths);
+    }
     let source = crate::activity_observer::start(pika)?;
     let mut update = None;
     let outcome =
@@ -871,7 +874,9 @@ fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
             };
             if !ui.active() {
                 println!("{}", outcome.message());
-            } else if outcome.disposition != update::UpdateDisposition::Installed {
+            } else if outcome.disposition != update::UpdateDisposition::Installed
+                || outcome.skill_notice.is_some()
+            {
                 ui.details("Pika update", &outcome.message())?;
             }
             drop(ui);

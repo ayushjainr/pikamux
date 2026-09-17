@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.23 — Keep the consultation skill current
+
+- Refresh the installed agent-convo skill after an approved macOS/Linux binary
+  update when its bytes match a known shipped bundle, keeping a backup of the
+  prior copy.
+- Reconcile the skill on first board opening for managed installations updated
+  by older updaters that predate skill refresh.
+- Preserve absent, customized, symlinked, and externally managed copies. Report
+  skill read or refresh failures separately without rolling back a successful
+  binary activation.
+
 ## 0.6.22 — Expert cards with less upkeep
 
 - Limit scheduled interviews to missing cards. New conversation activity no

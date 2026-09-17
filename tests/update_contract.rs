@@ -110,11 +110,27 @@ fn fixture(temp: &Path, version: &str, payload: &[u8]) -> (ReleaseManifest, Path
 }
 
 fn release_bundle(temp: &Path, version: &str) -> PathBuf {
+    release_bundle_with_skill(temp, version, None)
+}
+
+fn release_bundle_with_skill(temp: &Path, version: &str, skill: Option<&str>) -> PathBuf {
     let bundle = temp.join(format!("bundle-{version}"));
     let payload = temp.join(format!("payload-{version}"));
     fs::create_dir(&bundle).unwrap();
     fs::create_dir(&payload).unwrap();
     candidate(&payload.join("pika"), version, true);
+    if let Some(skill) = skill {
+        let binary = payload.join("pika");
+        let script = fs::read_to_string(&binary).unwrap();
+        fs::write(
+            &binary,
+            script.replace(
+                "echo skill",
+                &format!("cat <<'PIKA_SKILL'\n{skill}PIKA_SKILL\n"),
+            ),
+        )
+        .unwrap();
+    }
     let target = native_target().unwrap();
     let name = artifact_name(version, target).unwrap();
     let archive = bundle.join(&name);
@@ -657,6 +673,185 @@ fn public_offline_update_checks_then_installs_native_binary() {
 }
 
 #[test]
+fn managed_cli_update_refreshes_bundled_skill_but_preserves_user_choices() {
+    let temporary = tempfile::tempdir().unwrap();
+    let temp = temporary.path().canonicalize().unwrap();
+    let bundle = temp.join("real-release");
+    let version = env!("CARGO_PKG_VERSION");
+    let packaged = Command::new("bash")
+        .arg("scripts/package-release.sh")
+        .arg(version)
+        .arg(&bundle)
+        .arg(format!(
+            "{}={}",
+            native_target().unwrap(),
+            env!("CARGO_BIN_EXE_pika")
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let new_skill = format!(
+        "{}\nNew release instructions.\n",
+        pikamux::skill::AGENT_CONVO_SKILL
+    );
+    let next = release_bundle_with_skill(&temp, "99.0.0", Some(&new_skill));
+    for choice in ["bundled", "custom", "absent", "symlink", "unreadable"] {
+        let case = temp.join(choice);
+        fs::create_dir(&case).unwrap();
+        // Each independent managed installation needs its own extraction parent.
+        let manifest =
+            ReleaseManifest::parse(&fs::read(bundle.join("pika-native-release.json")).unwrap())
+                .unwrap();
+        let target = native_target().unwrap();
+        let archive = bundle.join(&manifest.artifact_for(target).unwrap().file);
+        let extract = case.join("extract");
+        fs::create_dir(&extract).unwrap();
+        assert!(
+            Command::new("tar")
+                .arg("-xzf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&extract)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let installed = install_staged(InstallRequest {
+            manifest: &manifest,
+            target,
+            artifact: &archive,
+            candidate: &extract.join("pika"),
+            root: &case.join("managed"),
+            bin_dir: &case.join("bin"),
+        })
+        .unwrap();
+        let codex = case.join("codex");
+        let skill_dir = codex.join("skills/agent-convo");
+        let skill_path = skill_dir.join("SKILL.md");
+        let initial = if choice == "custom" {
+            "My custom instructions.\n"
+        } else {
+            pikamux::skill::AGENT_CONVO_SKILL
+        };
+        if choice != "absent" {
+            fs::create_dir_all(&skill_dir).unwrap();
+            if choice == "symlink" {
+                fs::write(case.join("external-skill"), initial).unwrap();
+                symlink(case.join("external-skill"), &skill_path).unwrap();
+            } else if choice == "unreadable" {
+                fs::create_dir(&skill_path).unwrap();
+            } else {
+                fs::write(&skill_path, initial).unwrap();
+            }
+        }
+        let run = |check: bool| {
+            let mut command = Command::new(&installed.launcher);
+            command.arg("update").arg("--bundle").arg(&next);
+            if check {
+                command.arg("--check");
+            }
+            command
+                .env("HOME", case.join("home"))
+                .env("CODEX_HOME", &codex)
+                .env("PIKA_CONFIG_HOME", case.join("config"))
+                .env("PIKA_STATE_HOME", case.join("state"))
+                .env("CLAUDE_CONFIG_DIR", case.join("claude"))
+                .env("OPENCODE_DATA_HOME", case.join("opencode-data"))
+                .env("OPENCODE_CONFIG_DIR", case.join("opencode-config"))
+                .output()
+                .unwrap()
+        };
+        let checked = run(true);
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        assert_eq!(
+            fs::read_link(case.join("managed/current")).unwrap(),
+            installed.release_dir
+        );
+        if choice == "absent" {
+            assert!(!skill_dir.exists());
+        } else if choice != "unreadable" {
+            assert_eq!(fs::read_to_string(&skill_path).unwrap(), initial);
+        }
+        let updated = run(false);
+        assert!(
+            updated.status.success(),
+            "{choice}: {}",
+            String::from_utf8_lossy(&updated.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&updated.stdout);
+        assert!(stdout.contains("99.0.0"), "{stdout}");
+        assert_eq!(
+            Command::new(&installed.launcher)
+                .arg("--version")
+                .output()
+                .unwrap()
+                .stdout,
+            b"pika 99.0.0\n"
+        );
+        match choice {
+            "bundled" => {
+                assert_eq!(fs::read_to_string(&skill_path).unwrap(), new_skill);
+                assert_eq!(fs::read_dir(&skill_dir).unwrap().count(), 2);
+            }
+            "absent" => assert!(!skill_dir.exists()),
+            "unreadable" => {
+                assert!(skill_path.is_dir());
+                assert!(stdout.contains("could not be refreshed"), "{stdout}");
+            }
+            _ => {
+                assert_eq!(fs::read_to_string(&skill_path).unwrap(), initial);
+                assert_eq!(fs::read_dir(&skill_dir).unwrap().count(), 1);
+                assert!(stdout.contains("was kept"), "{stdout}");
+            }
+        }
+    }
+}
+
+#[test]
+fn board_migrates_legacy_bundle_only_from_active_managed_install() {
+    let temporary = tempfile::tempdir().unwrap();
+    let temp = temporary.path().canonicalize().unwrap();
+    let paths = pikamux::paths::Paths {
+        config_dir: temp.join("config"),
+        config: temp.join("config/config.json"),
+        state_dir: temp.join("state"),
+        database: temp.join("state/pika.db"),
+        codex_home: temp.join("codex"),
+        claude_home: temp.join("claude"),
+        opencode_data_home: temp.join("opencode"),
+        opencode_config_home: temp.join("opencode-config"),
+    };
+    let skill_dir = pikamux::skill::default_target(&paths);
+    let skill_path = skill_dir.join("SKILL.md");
+    fs::create_dir_all(&skill_dir).unwrap();
+    let legacy = include_str!("fixtures/skills/agent-convo-0.6.21.md");
+    fs::write(&skill_path, legacy).unwrap();
+    pikamux::update::refresh_board_skill(Path::new(env!("CARGO_BIN_EXE_pika")), &paths);
+    assert_eq!(fs::read_to_string(&skill_path).unwrap(), legacy);
+    let bundle = release_bundle(&temp, "0.6.0-alpha.1");
+    let installed = install_release_bundle(&bundle, &temp.join("managed"), &temp.join("bin"));
+    pikamux::update::refresh_board_skill(&installed.launcher, &paths);
+    assert_eq!(
+        fs::read_to_string(&skill_path).unwrap(),
+        pikamux::skill::AGENT_CONVO_SKILL
+    );
+    pikamux::update::refresh_board_skill(&installed.launcher, &paths);
+    assert_eq!(fs::read_dir(&skill_dir).unwrap().count(), 2);
+    fs::write(&skill_path, "personal changes").unwrap();
+    pikamux::update::refresh_board_skill(&installed.launcher, &paths);
+    assert_eq!(fs::read_to_string(&skill_path).unwrap(), "personal changes");
+    assert_eq!(fs::read_dir(&skill_dir).unwrap().count(), 2);
+}
+
+#[test]
 fn rollback_revalidates_and_atomically_activates_the_prior_release() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("managed");
@@ -1127,6 +1322,7 @@ fn public_cli_installs_and_checks_a_native_bundle_end_to_end() {
     let bundle = temp.path().join("release");
     let root = temp.path().join("managed");
     let bin = temp.path().join("bin");
+    let codex_home = temp.path().join("codex");
     let version = env!("CARGO_PKG_VERSION");
     let target = native_target().unwrap();
     let binary = Path::new(env!("CARGO_BIN_EXE_pika"));
@@ -1152,6 +1348,7 @@ fn public_cli_installs_and_checks_a_native_bundle_end_to_end() {
         .arg(&bin)
         .arg("--no-setup")
         .env("HOME", temp.path().join("home"))
+        .env("CODEX_HOME", &codex_home)
         .output()
         .unwrap();
     assert!(
@@ -1159,10 +1356,15 @@ fn public_cli_installs_and_checks_a_native_bundle_end_to_end() {
         "{}",
         String::from_utf8_lossy(&installed.stderr)
     );
+    let skill_path = codex_home.join("skills/agent-convo/SKILL.md");
+    fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+    let custom_skill = "---\nname: agent-convo\n---\ncustom instructions\n";
+    fs::write(&skill_path, custom_skill).unwrap();
     let checked = Command::new(bin.join("pika"))
         .args(["update", "--bundle"])
         .arg(&bundle)
         .env("HOME", temp.path().join("home"))
+        .env("CODEX_HOME", &codex_home)
         .output()
         .unwrap();
     assert!(
@@ -1172,8 +1374,11 @@ fn public_cli_installs_and_checks_a_native_bundle_end_to_end() {
     );
     assert_eq!(
         String::from_utf8_lossy(&checked.stdout).trim(),
-        format!("Pika {version} is already current.")
+        format!(
+            "Pika {version} is already current.\nYour customized or externally managed agent-convo skill was kept. Review `pika skill show` and merge changes through its owner."
+        )
     );
+    assert_eq!(fs::read_to_string(skill_path).unwrap(), custom_skill);
 
     let (prefix, patch) = version.split('-').next().unwrap().rsplit_once('.').unwrap();
     let newer_version = format!("{prefix}.{}", patch.parse::<u64>().unwrap() + 1);

@@ -1,14 +1,100 @@
 use crate::{paths::Paths, setup::FileChange};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
 
 pub const AGENT_CONVO_SKILL: &str = include_str!("../assets/agent-convo/SKILL.md");
+
+// Published native bundles through 0.6.22. Used only for the first board launch
+// after an older updater (which predates skill refresh) installed this runtime.
+const LEGACY_BUNDLE_SHA256: &[&str] = &[
+    "c78d58e1853f660905b25c291dc64a8ef3146d3c231ddf6161e8bf5d47b4c961",
+    "ba257941cfc9a219c0dcb200ad79b45adbc3f682c5d3a4e3188dfd0b8c4f28eb",
+    "2ae57aeda43bc316466c03f69f8fc8cb007c695a114deaf4c1f1eb846af191f5",
+];
+const MAX_SKILL_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    Current,
+    Updated,
+    Absent,
+    Preserved,
+}
+
+/// Upgrade only a byte-identical bundled copy. Absence is respected (including
+/// --no-setup installs); custom and externally managed skills are never adopted.
+pub fn refresh_managed(target: &Path, replacement: &str) -> Result<RefreshOutcome> {
+    if replacement.len() as u64 > MAX_SKILL_BYTES
+        || !replacement.starts_with("---\nname: agent-convo\n")
+    {
+        bail!("replacement is not a bounded agent-convo skill");
+    }
+    let destination = target.join("SKILL.md");
+    if reject_symlink_components(&destination).is_err() {
+        return Ok(RefreshOutcome::Preserved);
+    }
+    let Some(before) = read_skill(&destination)? else {
+        return Ok(RefreshOutcome::Absent);
+    };
+    if before == replacement {
+        return Ok(RefreshOutcome::Current);
+    }
+    let digest = format!("{:x}", Sha256::digest(before.as_bytes()));
+    if before != AGENT_CONVO_SKILL && !LEGACY_BUNDLE_SHA256.contains(&digest.as_str()) {
+        return Ok(RefreshOutcome::Preserved);
+    }
+    install_content(target, replacement, Some(&before))?;
+    Ok(RefreshOutcome::Updated)
+}
+
+fn read_skill(path: &Path) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.len() > MAX_SKILL_BYTES {
+        bail!("skill is not a bounded regular file");
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            bail!("skill belongs to another user");
+        }
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() > MAX_SKILL_BYTES {
+        bail!("skill changed while opening");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != metadata.dev()
+            || opened.ino() != metadata.ino()
+            || opened.uid() != metadata.uid()
+        {
+            bail!("skill changed while opening");
+        }
+    }
+    let mut text = String::new();
+    file.take(MAX_SKILL_BYTES + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_SKILL_BYTES {
+        bail!("skill exceeds size limit");
+    }
+    Ok(Some(text))
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SkillInstallReceipt {
@@ -41,6 +127,14 @@ pub fn proposed_change(paths: &Paths) -> Result<FileChange> {
 }
 
 pub fn install(target: &Path) -> Result<SkillInstallReceipt> {
+    install_content(target, AGENT_CONVO_SKILL, None)
+}
+
+fn install_content(
+    target: &Path,
+    content: &str,
+    expected: Option<&str>,
+) -> Result<SkillInstallReceipt> {
     if target.as_os_str().is_empty() {
         bail!("skill destination cannot be empty");
     }
@@ -53,7 +147,11 @@ pub fn install(target: &Path) -> Result<SkillInstallReceipt> {
         sync_directory(parent)?;
     }
     reject_symlink_components(&destination)?;
-    if fs::read_to_string(&destination).ok().as_deref() == Some(AGENT_CONVO_SKILL) {
+    let before = read_skill(&destination)?;
+    if expected.is_some() && before.as_deref() != expected {
+        bail!("skill changed during update; kept the user's copy");
+    }
+    if before.as_deref() == Some(content) {
         return Ok(SkillInstallReceipt {
             path: destination,
             changed: false,
@@ -80,9 +178,13 @@ pub fn install(target: &Path) -> Result<SkillInstallReceipt> {
         options.mode(0o600);
     }
     let mut file = options.open(&temporary)?;
-    file.write_all(AGENT_CONVO_SKILL.as_bytes())?;
+    file.write_all(content.as_bytes())?;
     file.sync_all()?;
     reject_symlink_components(&destination)?;
+    if expected.is_some() && read_skill(&destination)?.as_deref() != expected {
+        let _ = fs::remove_file(&temporary);
+        bail!("skill changed during update; kept the user's copy");
+    }
     fs::rename(&temporary, &destination)?;
     sync_directory(target)?;
     Ok(SkillInstallReceipt {
@@ -131,6 +233,96 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn refresh_updates_only_bundled_content_with_backup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let target = root.join("agent-convo");
+        install(&target).unwrap();
+        let newer = format!("{AGENT_CONVO_SKILL}\nUpdated bundled instructions.\n");
+        assert_eq!(
+            refresh_managed(&target, &newer).unwrap(),
+            RefreshOutcome::Updated
+        );
+        assert_eq!(fs::read_to_string(target.join("SKILL.md")).unwrap(), newer);
+        let backup = fs::read_dir(&target)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "pika-backup"))
+            .unwrap();
+        assert_eq!(fs::read_to_string(backup).unwrap(), AGENT_CONVO_SKILL);
+        assert_eq!(
+            refresh_managed(&target, &newer).unwrap(),
+            RefreshOutcome::Current
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn refresh_preserves_custom_or_absent_skills() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let target = root.join("agent-convo");
+        assert_eq!(
+            refresh_managed(&target, AGENT_CONVO_SKILL).unwrap(),
+            RefreshOutcome::Absent
+        );
+        assert!(!target.exists());
+        fs::create_dir(&target).unwrap();
+        let custom = format!("{AGENT_CONVO_SKILL}\nMy personal rule.\n");
+        fs::write(target.join("SKILL.md"), &custom).unwrap();
+        assert_eq!(
+            refresh_managed(&target, AGENT_CONVO_SKILL).unwrap(),
+            RefreshOutcome::Preserved
+        );
+        assert_eq!(fs::read_to_string(target.join("SKILL.md")).unwrap(), custom);
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 1);
+        assert!(install_content(&target, AGENT_CONVO_SKILL, Some("old content")).is_err());
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_preserves_externally_managed_bundle_even_when_bytes_match() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let external = root.join("external");
+        install(&external).unwrap();
+        let linked = root.join("linked");
+        symlink(&external, &linked).unwrap();
+        assert_eq!(
+            refresh_managed(&linked, AGENT_CONVO_SKILL).unwrap(),
+            RefreshOutcome::Preserved
+        );
+        let target = root.join("target");
+        fs::create_dir(&target).unwrap();
+        symlink(external.join("SKILL.md"), target.join("SKILL.md")).unwrap();
+        assert_eq!(
+            refresh_managed(&target, AGENT_CONVO_SKILL).unwrap(),
+            RefreshOutcome::Preserved
+        );
+        assert_eq!(fs::read_dir(&external).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn refresh_rejects_invalid_replacement_and_unbounded_input() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        install(&root).unwrap();
+        assert!(refresh_managed(&root, "untrusted output").is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("SKILL.md")).unwrap(),
+            AGENT_CONVO_SKILL
+        );
+        fs::write(
+            root.join("SKILL.md"),
+            "x".repeat(MAX_SKILL_BYTES as usize + 1),
+        )
+        .unwrap();
+        assert!(refresh_managed(&root, AGENT_CONVO_SKILL).is_err());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
 
     #[test]
     fn install_is_idempotent_and_backs_up_other_content() {

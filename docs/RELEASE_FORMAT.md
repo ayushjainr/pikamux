@@ -139,8 +139,15 @@ new directory components are created atomically with mode 0700. Pika rejects a
 permissive existing root or release directory before writing to it.
 
 Managed native activation and `pika update` do not open Pika's state database,
-scan provider histories, modify hooks or skills, run setup, restart agents, or
-update another machine. Unless `--no-setup` is selected, the public `install.sh`
+scan provider histories, modify hooks, run setup, restart agents, or update
+another machine. After an approved macOS/Linux update, Pika refreshes the default
+agent-convo skill only when its bytes match a known shipped bundle. The prior
+copy is backed up; custom content, symlinks, and missing skills stay untouched.
+`--check` never refreshes skills. Skill failures are reported separately from a
+successful binary activation. For upgrades performed by older updaters, the new
+managed board performs this bounded reconciliation on first opening. Rollback
+does not restore skills; retained skill backups remain available. Unless
+`--no-setup` is selected, the public `install.sh`
 bootstrap then installs the embedded agent-convo skill with backup and symlink
 safeguards before offering the separately previewed `pika setup`; provider hooks
 and configuration still change only through that approved setup flow.

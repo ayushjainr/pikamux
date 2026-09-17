@@ -363,6 +363,7 @@ pub struct UpdateOutcome {
     pub previous_version: String,
     pub version: String,
     pub launcher: PathBuf,
+    pub skill_notice: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -498,7 +499,7 @@ fn write_update_notice_cache(managed: &ManagedInstallation, latest: Option<Strin
 
 impl UpdateOutcome {
     pub fn message(&self) -> String {
-        match self.disposition {
+        let mut message = match self.disposition {
             UpdateDisposition::AlreadyCurrent => {
                 format!("Pika {} is already current.", self.version)
             }
@@ -514,7 +515,12 @@ impl UpdateOutcome {
                 "Rolled Pika back {} → {}. Reopen the board when convenient; running agents were not restarted.",
                 self.previous_version, self.version
             ),
+        };
+        if let Some(notice) = &self.skill_notice {
+            message.push('\n');
+            message.push_str(notice);
         }
+        message
     }
 }
 
@@ -636,6 +642,54 @@ pub fn discover_managed_install(executable: &Path) -> Result<ManagedInstallation
 /// release, archive and candidate verification.
 #[cfg(unix)]
 pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
+    let check = request.check;
+    let mut outcome = update_managed_inner(request)?;
+    if !check
+        && matches!(
+            outcome.disposition,
+            UpdateDisposition::Installed | UpdateDisposition::AlreadyCurrent
+        )
+    {
+        // Binary activation is already committed. A skill failure must not
+        // pretend the runtime update failed or roll back a working executable.
+        outcome.skill_notice = match run_candidate(&outcome.launcher, &["skill", "show"]) {
+            Ok(content) => refresh_skill_notice(&content),
+            Err(_) => Some("Pika is installed, but its bundled skill could not be read. Run `pika skill install` to retry.".into()),
+        };
+    }
+    Ok(outcome)
+}
+
+#[cfg(unix)]
+fn refresh_skill_notice(content: &str) -> Option<String> {
+    let result = crate::paths::Paths::discover().and_then(|paths| {
+        crate::skill::refresh_managed(&crate::skill::default_target(&paths), content)
+    });
+    match result {
+        Ok(crate::skill::RefreshOutcome::Preserved) => Some(
+            "Your customized or externally managed agent-convo skill was kept. Review `pika skill show` and merge changes through its owner.".into()
+        ),
+        Ok(_) => None,
+        Err(_) => Some("Pika is installed, but its skill could not be refreshed. Run `pika skill install` to review and retry with a backup.".into()),
+    }
+}
+
+/// Migration for runtimes installed by an updater predating skill refresh.
+/// Only a proven active managed installation may reconcile an existing bundle.
+/// No output: custom/absent copies are intentional, and board startup must not
+/// nag or claim success. Explicit update reports any preservation/failure.
+#[cfg(unix)]
+pub fn refresh_board_skill(executable: &Path, paths: &crate::paths::Paths) {
+    if discover_managed_install(executable).is_ok() {
+        let _ = crate::skill::refresh_managed(
+            &crate::skill::default_target(paths),
+            crate::skill::AGENT_CONVO_SKILL,
+        );
+    }
+}
+
+#[cfg(unix)]
+fn update_managed_inner(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
     if request.bundle.is_some() && request.release.is_some() {
         return Err(UpdateError::Safety(
             "use --release or --bundle, not both".into(),
@@ -769,6 +823,7 @@ pub fn update_managed(request: UpdateRequest<'_>) -> Result<UpdateOutcome> {
         previous_version: managed.version,
         version: manifest.version,
         launcher: outcome.launcher,
+        skill_notice: None,
     })
 }
 
@@ -846,6 +901,7 @@ pub fn rollback_managed(executable: &Path, requested: Option<&str>) -> Result<Up
         previous_version: managed.version,
         version,
         launcher: managed.bin_dir.join("pika"),
+        skill_notice: None,
     })
 }
 
@@ -940,6 +996,7 @@ fn metadata_update_outcome(
             previous_version: managed.version.clone(),
             version: manifest.version.clone(),
             launcher: managed.bin_dir.join("pika"),
+            skill_notice: None,
         })),
         Ordering::Greater => Ok(None),
     }
@@ -958,6 +1015,7 @@ fn already_current(managed: &ManagedInstallation) -> UpdateOutcome {
         previous_version: managed.version.clone(),
         version: managed.version.clone(),
         launcher: managed.bin_dir.join("pika"),
+        skill_notice: None,
     }
 }
 
