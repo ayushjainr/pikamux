@@ -387,7 +387,7 @@ pika experts QUERY --json  stable machine-readable expert matches
 pika expert status         show current, stale, missing, and unknown profiles
 pika expert refresh NAME   interview one exact conversation now
 pika expert refresh --all  build/update tracked thread profiles now
-pika expert refresh --due  enforce the weekly quota-aware refresh policy
+pika expert refresh --due  bootstrap missing cards within the weekly quota guard
 pika expert publish ...    publish this exact pane's thread profile
 pika expert clear          remove this exact pane's thread profile
 pika .                     open the relevant conversation for this repository
@@ -497,10 +497,11 @@ against the entire inherited conversation.
 
 `pika expert status` reports `CURRENT`, `STALE`, `MISSING`, or `UNKNOWN` without
 reading transcript contents. `pika expert refresh NAME` and `--all` are explicit
-ways to spend quota now. Setup leaves missing and stale profiles to the quota-aware
-policy. A user-level one-shot timer checks every ten minutes,
-but calls at most one changed conversation per provider only during the final
-six hours before that provider's weekly reset and only while more than 10%
+ways to spend quota now. Scheduled upkeep only fills missing cards; a newer
+transcript does not trigger another interview of already-published expertise.
+A user-level one-shot timer checks every ten minutes,
+but interviews at most one missing-card conversation per provider per check,
+only during the final six hours before that provider's weekly reset and while more than 10%
 remains. It reads provider-native reset telemetry, never hard-codes reset times,
 and makes no model call when telemetry is missing or stale. OpenCode can route
 through several model providers and exposes no single weekly account-reset
@@ -508,15 +509,24 @@ contract, so its scheduled interviews stay deferred unless such telemetry can be
 proven; explicit `pika expert refresh NAME` and `--all` remain available. An
 attempted profile is not retried in the same reset cycle.
 
+An agent already participating in Pika maintains its card at meaningful milestones
+during its existing work turn. Use
 `pika expert publish --scope "..." --now "..." --topic "..." --artifact "..."`
-remains an exact-pane correction surface; one agent cannot manually write
-another agent's profile. `--summary` remains an alias for `--scope`. `pika experts
+when durable expertise changes, retaining still-valid topics and artifacts. Use
+`pika expert update --now "..."` when only current work changes. Skip unchanged
+updates; neither command starts a model, and maintenance must not start a new
+model turn. Publication requires the calling agent's exact identity; one agent
+cannot manually write another agent's profile. `--summary` remains an alias for
+`--scope`. `pika experts
 "factor attribution" --json` ranks profiles deterministically from topics, durable
 scope, current state, project, and artifacts, exposes `matched_on` rather than
 pretending the score measures intelligence, and includes profile freshness and
 source. Archived conversations disappear from lookup with the rest of Pika's
-daily surface. Profiles created before the two-horizon contract are marked stale
-until a scheduled or explicit refresh supplies their current state.
+daily surface. Profiles created before the two-horizon contract retain their
+published scope and are marked stale until the owning agent or an explicit
+refresh supplies current work. Transcript changes never erase published expertise;
+failed interviews preserve the last saved card. A stale or missing card does not
+block a named consultation.
 
 The advanced `pika adopt NAME` command resolves the exact provider identity and finds an
 untagged tmux pane that contains its live provider process. It is mainly useful

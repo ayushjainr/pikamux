@@ -61,7 +61,10 @@ the calling conversation's exact Pika pane; it cannot edit another expert's card
 Do not move a live external agent into a new home merely to publish a card—use
 the bounded interview instead. Exclude secrets and transcript excerpts.
 
-The scheduled refresher is quota-gated, not an immediate onboarding service.
+The scheduled refresher fills missing cards only and is quota-gated, not an
+immediate onboarding service. Existing cards can be maintained by their owning
+agent at work milestones, without a separate interview. An older current-work
+snapshot does not invalidate durable expertise or block a named consultation.
 Missing or stale quota telemetry can mean no scheduled interview happens at all.
 
 ## 3. Give your current agent the task—not an expert's name

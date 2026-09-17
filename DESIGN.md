@@ -275,6 +275,17 @@ legacy cards without `now` are stale until refreshed. The selected live-pane
 tail is read-only and never acknowledges unread work; expanding it with p
 retains the existing explicit acknowledgement contract.
 
+Card freshness describes evidence, not permission to spend quota. Transcript
+growth can stale current work without invalidating published durable expertise.
+An agent already participating in Pika maintains its own card at meaningful
+milestones during an existing work turn: publish when its expertise changes,
+update `now` when only current work changes, and skip unchanged content. No
+extra turn or automatic interview is started for this maintenance. Publication
+still requires exact caller proof and never edits another conversation's card.
+Scheduled interviews bootstrap missing cards only; existing cards, including
+legacy scope-only cards, remain discoverable with honest freshness. Explicit
+refresh remains available, and failed interviews retain the previous card.
+
 The first successful scan claims a committed event-ledger watermark and monitor
 visit in one transaction. First use briefly frames the current handoff; a visit
 after a six-hour gap briefly counts finished, decision, and error events committed
@@ -415,8 +426,9 @@ uses the coordinator release's version tag rather than a moving branch.
 
 Commissioning and expert interviews are separate latency boundaries. `pika
 setup` may discover and adopt conversations, but never opens provider-side
-consultations. Missing and stale cards are left to the quota-aware refresh policy
-unless the user explicitly runs an expert refresh command. `pika adopt` may
+consultations. Missing cards are left to the quota-aware bootstrap policy;
+existing cards are maintained by their owning agent or an explicit expert
+refresh command, not a transcript-change-triggered interview. `pika adopt` may
 interview only the single exact UUID it just adopted.
 
 Commissioning finishes with a transcript-free operational reconciliation so

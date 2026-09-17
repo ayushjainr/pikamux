@@ -2,8 +2,9 @@
 //!
 //! The scheduler is deliberately synchronous: an explicit `--all` refresh may
 //! visit several conversations, but Pika never has more than one interview in
-//! flight. Scheduled refreshes are stricter still and claim at most one changed
-//! card per provider and weekly reset cycle before making a provider call.
+//! flight. Scheduled upkeep only bootstraps missing cards: transcript growth is
+//! not evidence that durable expertise changed. It claims at most one missing
+//! card per provider per invocation, and each card at most once per weekly reset.
 
 use crate::config::Config;
 #[cfg(unix)]
@@ -418,7 +419,9 @@ impl<'a, Q: QuotaSource, I: InterviewRunner> ExpertRefresh<'a, Q, I> {
         self.refresh_selected(&selected)
     }
 
-    /// Quota-gated upkeep: at most one stale/missing card for each provider.
+    /// Quota-gated bootstrap: at most one missing card for each provider.
+    /// Published expertise survives activity changes; explicit refresh remains
+    /// available for users who want to re-interview an existing conversation.
     pub fn refresh_due(
         &mut self,
         sessions: &[Session],
@@ -441,11 +444,11 @@ impl<'a, Q: QuotaSource, I: InterviewRunner> ExpertRefresh<'a, Q, I> {
             let mut pending = Vec::new();
             let mut unavailable = false;
             for (session, state) in &states {
-                if !matches!(state.status, CardStatus::Missing | CardStatus::Stale) {
+                if state.status != CardStatus::Missing {
                     continue;
                 }
                 match self.interviews.require_available(session) {
-                    Ok(()) => pending.push((*session, state.status)),
+                    Ok(()) => pending.push(*session),
                     Err(error) => {
                         unavailable = true;
                         output.push(ExpertRefreshResult::session(
@@ -463,13 +466,22 @@ impl<'a, Q: QuotaSource, I: InterviewRunner> ExpertRefresh<'a, Q, I> {
                 let unknown = states
                     .iter()
                     .any(|(_, state)| state.status == CardStatus::Unknown);
+                let stale = states
+                    .iter()
+                    .any(|(_, state)| state.status == CardStatus::Stale);
                 output.push(ExpertRefreshResult::provider(
                     provider,
-                    if unknown { "UNKNOWN" } else { "CURRENT" },
+                    if unknown {
+                        "UNKNOWN"
+                    } else if stale {
+                        "PUBLISHED"
+                    } else {
+                        "CURRENT"
+                    },
                     if unknown {
                         "one or more cards lack a durable transcript"
                     } else {
-                        "no changed thread profiles"
+                        "no missing cards; existing expertise retained without an interview"
                     },
                 ));
                 continue;
@@ -518,17 +530,15 @@ impl<'a, Q: QuotaSource, I: InterviewRunner> ExpertRefresh<'a, Q, I> {
                 continue;
             }
 
-            pending.sort_by(|(left, left_state), (right, right_state)| {
-                let left_missing = *left_state == CardStatus::Missing;
-                let right_missing = *right_state == CardStatus::Missing;
-                right_missing
-                    .cmp(&left_missing)
-                    .then_with(|| right.live.cmp(&left.live))
+            pending.sort_by(|left, right| {
+                right
+                    .live
+                    .cmp(&left.live)
                     .then_with(|| right.last_activity_at.total_cmp(&left.last_activity_at))
                     .then_with(|| left.session_id.cmp(&right.session_id))
             });
             let mut selected = None;
-            for (session, _) in pending {
+            for session in pending {
                 if self
                     .store
                     .get_expert_refresh_attempt(provider, &session.session_id, quota.reset_at)?
@@ -543,7 +553,7 @@ impl<'a, Q: QuotaSource, I: InterviewRunner> ExpertRefresh<'a, Q, I> {
                     ExpertRefreshResult::provider(
                         provider,
                         "DEFERRED",
-                        "changed cards already attempted in this reset cycle",
+                        "missing cards already attempted in this reset cycle",
                     )
                     .with_quota(&quota),
                 );
@@ -564,7 +574,7 @@ impl<'a, Q: QuotaSource, I: InterviewRunner> ExpertRefresh<'a, Q, I> {
                         ExpertRefreshResult::provider(
                             provider,
                             "DEFERRED",
-                            "changed card was claimed by another refresher in this reset cycle",
+                            "missing card was claimed by another refresher in this reset cycle",
                         )
                         .with_quota(&quota),
                     );
@@ -1334,6 +1344,137 @@ mod tests {
             .unwrap();
         assert_eq!(second[0].status, "REFRESHED");
         assert_eq!(second[0].session_id.as_deref(), Some("exact-0"));
+    }
+
+    #[test]
+    fn due_retains_published_expertise_without_quota_reads_or_interviews() {
+        for provider in [Provider::Codex, Provider::Claude] {
+            for legacy in [false, true] {
+                let fixture = Fixture::new(&[provider]);
+                let session = &fixture.sessions[0];
+                let proof = crate::experts::PublisherProof::from_verified_identity(
+                    session,
+                    provider,
+                    &session.session_id,
+                    session.provider_thread_id(),
+                )
+                .unwrap();
+                let published = crate::experts::publish(
+                    &fixture.store,
+                    session,
+                    &proof,
+                    PublishInput {
+                        scope: "Owns exact identity recovery.".into(),
+                        current_state: if legacy {
+                            String::new()
+                        } else {
+                            "Recovery stable.".into()
+                        },
+                        topics: vec!["identity".into()],
+                        ..PublishInput::default()
+                    },
+                )
+                .unwrap();
+                fs::write(
+                    session.transcript_path.as_ref().unwrap(),
+                    "history\nnew activity\n",
+                )
+                .unwrap();
+                assert_eq!(
+                    card_state(session, Some(&published)).status,
+                    CardStatus::Stale
+                );
+                let mut refresh = ExpertRefresh::new(
+                    &fixture.store,
+                    FakeQuota {
+                        values: BTreeMap::new(),
+                        calls: 0,
+                    },
+                    FakeInterview::valid(),
+                );
+                let result = refresh
+                    .refresh_due(&fixture.sessions, Some(provider), 1000.0)
+                    .unwrap();
+                assert_eq!(result[0].status, "PUBLISHED");
+                assert_eq!(refresh.quota.calls, 0);
+                assert!(refresh.interviews.calls.is_empty());
+                let retained = fixture
+                    .store
+                    .get_stored_expert_profile(provider, &session.session_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(retained, published);
+                assert_eq!(
+                    card_state(session, Some(&retained)).status,
+                    CardStatus::Stale
+                );
+                assert!(
+                    fixture
+                        .store
+                        .get_expert_refresh_attempt(provider, &session.session_id, 2000)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn due_bootstraps_missing_card_instead_of_more_active_published_card() {
+        let fixture = Fixture::new(&[Provider::Codex, Provider::Codex]);
+        let mut refresh = ExpertRefresh::new(
+            &fixture.store,
+            FakeQuota {
+                values: BTreeMap::from([(
+                    Provider::Codex,
+                    Some(snapshot(Provider::Codex, 80.0, 2000, 1000.0)),
+                )]),
+                calls: 0,
+            },
+            FakeInterview::valid(),
+        );
+        refresh.refresh_one(&fixture.sessions[1]).unwrap();
+        fs::write(
+            fixture.sessions[1].transcript_path.as_ref().unwrap(),
+            "new activity\n",
+        )
+        .unwrap();
+        refresh.interviews.calls.clear();
+        let results = refresh
+            .refresh_due(&fixture.sessions, Some(Provider::Codex), 1000.0)
+            .unwrap();
+        assert_eq!(results[0].status, "REFRESHED");
+        assert_eq!(refresh.interviews.calls, ["exact-0"]);
+        assert_eq!(refresh.quota.calls, 1);
+    }
+
+    #[test]
+    fn failed_explicit_refresh_preserves_previous_card() {
+        let fixture = Fixture::new(&[Provider::Codex]);
+        let mut refresh = ExpertRefresh::new(
+            &fixture.store,
+            FakeQuota {
+                values: BTreeMap::new(),
+                calls: 0,
+            },
+            FakeInterview::valid(),
+        );
+        refresh.refresh_one(&fixture.sessions[0]).unwrap();
+        let original = fixture.store.list_stored_expert_profiles().unwrap()[0].clone();
+        fs::write(
+            fixture.sessions[0].transcript_path.as_ref().unwrap(),
+            "new activity\n",
+        )
+        .unwrap();
+        for answer in [Err("provider failed".into()), Ok("invalid card".into())] {
+            refresh.interviews.answer = answer;
+            let results = refresh.refresh_one(&fixture.sessions[0]).unwrap();
+            assert_eq!(results[0].status, "FAILED");
+            assert_eq!(
+                fixture.store.list_stored_expert_profiles().unwrap()[0],
+                original
+            );
+        }
     }
 
     #[test]

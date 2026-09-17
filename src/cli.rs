@@ -476,7 +476,7 @@ enum ExpertCommand {
         /// Refresh every eligible card now, regardless of quota observations.
         #[arg(long)]
         all: bool,
-        /// Refresh only the next quota-eligible stale or missing card.
+        /// Bootstrap only the next quota-eligible missing card.
         #[arg(long)]
         due: bool,
         /// Limit refresh to one provider.

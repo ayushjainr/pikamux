@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.22 — Expert cards with less upkeep
+
+- Limit scheduled interviews to missing cards. New conversation activity no
+  longer triggers another interview of already-published expertise.
+- Guide participating agents to maintain their cards at meaningful milestones
+  during existing work, keeping durable expertise separate from current work.
+- Streamline the bundled consultation skill: direct named routing, reuse of
+  relevant discovery results, focused questions, and related follow-up reuse.
+- Preserve honest freshness, explicit refresh, quota guards, and saved cards
+  when a refresh fails. Card age never blocks a named consultation.
+
 ## 0.6.21 — Faster expert consultations
 
 - Use Luna-medium for Codex questions on the board and CLI; select Sol-medium

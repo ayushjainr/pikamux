@@ -1,18 +1,20 @@
-Ask an expert and see its answer arrive.
+Keep expertise discoverable without repeatedly interviewing the same agents.
 
-- **Faster Codex questions.** The board and CLI use Luna-medium by default.
-  Choose `pika ask NAME --deep` for Sol-medium. Claude and OpenCode keep their
-  native profiles.
-- **Answers as they arrive.** Codex consultations show provisional text on the
-  board. Agent callers can use `--jsonl --stream`; supported remote hosts stream
-  too, while older hosts continue returning completed answers.
-- **Less unnecessary work.** Named experts are consulted directly without a
-  card refresh. Related follow-ups reuse the same private conversation.
-- **Clear completion.** Pika waits for a confirmed completed turn and reports
-  observed timing and token usage. Partial text is never presented as success.
+- **Less background work.** Scheduled interviews fill missing expert cards only.
+  Ordinary conversation activity no longer triggers another card interview.
+- **Cards maintained alongside work.** The bundled skill guides participating
+  agents to publish meaningful milestones during existing work turns, updating
+  current work separately from durable expertise.
+- **Focused consultations.** Leaner instructions avoid repeated discovery,
+  unnecessary interviews, automatic escalation, and idle cache-warming sides.
+- **Knowledge retained.** Existing cards remain discoverable with honest
+  freshness. Explicit refresh still works; a failed refresh keeps the saved card.
 
 Update from the board's **Update now? [y/N]** offer, or run `pika update`.
 Reopen the board after updating. Existing agents keep running.
+To refresh an existing installed agent-convo skill, run `pika skill install`.
+The binary updater does not overwrite installed skills; setup also offers the
+updated skill as a previewable change.
 
 Windows packages remain unsigned in this release. Managed endpoint security may
 still block installation or launch; this release does not resolve that limitation.

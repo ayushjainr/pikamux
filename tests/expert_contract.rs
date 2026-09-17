@@ -232,7 +232,17 @@ fn transcript_growth_stales_work_but_not_durable_publication_age() {
     let freshness = profile_freshness(&current, Some(&profile), scope_time + 50.0);
     assert_eq!(freshness.scope_updated_at, Some(scope_time));
     assert_eq!(freshness.scope_age_seconds, Some(50.0));
+    assert_eq!(freshness.scope_status, "PUBLISHED");
     assert_eq!(freshness.current_state_status, CardStatus::Stale);
+
+    // A milestone update refreshes only current work, not the durable mandate.
+    let updated = publish_current_work(&store, &current, &proof, "Awaiting review.").unwrap();
+    let freshness = profile_freshness(&current, Some(&updated), scope_time + 50.0);
+    assert_eq!(freshness.scope_updated_at, Some(scope_time));
+    assert_eq!(freshness.current_state_status, CardStatus::Current);
+    assert_eq!(updated.profile.summary, profile.profile.summary);
+    assert_eq!(updated.profile.topics, profile.profile.topics);
+    assert_eq!(updated.profile.artifacts, profile.profile.artifacts);
 }
 
 #[test]
