@@ -2669,7 +2669,7 @@ fn sort_items(items: &mut [BoardItem]) {
     });
 }
 
-fn status_color(status: Status) -> Color {
+pub(crate) fn status_color(status: Status) -> Color {
     match status {
         Status::NeedsYou | Status::Error | Status::OpenTwice => Color::Red,
         Status::Working | Status::Starting => Color::Cyan,

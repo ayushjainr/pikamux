@@ -635,7 +635,7 @@ fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
         Some(Command::Setup(a)) => setup_command(pika, a),
         Some(Command::Doctor(a)) => doctor(pika, a),
         Some(Command::Open(a) | Command::RecoverClosed(a)) => open_name(pika, &a.name, false),
-        Some(Command::New(a)) => new(pika, a),
+        Some(Command::New(a)) => with_open_activity(pika, || new(pika, a)),
         Some(Command::Adopt(a)) => adopt(pika, &a.name),
         Some(Command::Ask(a)) => ask(pika, a),
         Some(Command::Machines(a)) => machines(pika, a),
@@ -939,6 +939,10 @@ fn open_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
 }
 
 fn open_local_session(pika: &Pika, session: Session) -> Result<i32> {
+    with_open_activity(pika, || open_local_session_inner(pika, session))
+}
+
+fn open_local_session_inner(pika: &Pika, session: Session) -> Result<i32> {
     match pika.open_session(session.clone(), true) {
         Ok(receipt) => finish_local_open(pika, &receipt),
         Err(error)
@@ -1530,6 +1534,105 @@ fn local_wait_target(name: &str, target: Option<NamedTarget>) -> Result<Session>
 }
 
 fn open_name(pika: &Pika, name: &str, allow_create: bool) -> Result<i32> {
+    with_open_activity(pika, || open_name_inner(pika, name, allow_create))
+}
+
+/// Standalone interactive openings use the same producer as the board. An
+/// opening from a board or a forwarded feed keeps its existing source; the
+/// return label never creates a second observer for an existing subscription.
+fn with_open_activity<T>(pika: &Pika, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    with_open_activity_using(
+        monitor::interactive_terminal(),
+        || crate::activity_observer::start_for_open(pika),
+        || pika.invalidate_local_reconciliation(),
+        action,
+    )
+}
+
+fn with_open_activity_using<T>(
+    interactive: bool,
+    start: impl FnOnce() -> Result<crate::activity_feed::Source>,
+    fence: impl FnOnce(),
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if crate::activity_feed::current().is_some() || !interactive {
+        return action();
+    }
+    let Ok(source) = start() else {
+        // Presentation failure must not prevent an independently verified open.
+        return action();
+    };
+    crate::activity_feed::with(Some(crate::activity_feed::Context::Source(source)), || {
+        let result = action();
+        fence();
+        result
+    })
+}
+
+#[cfg(test)]
+mod open_activity_tests {
+    use super::with_open_activity_using;
+    use crate::activity_feed::{self, Context, Source};
+    use std::cell::Cell;
+
+    #[test]
+    fn existing_source_and_noninteractive_open_do_not_start_an_observer() {
+        let run = |interactive| {
+            with_open_activity_using(
+                interactive,
+                || panic!("unexpected second observer"),
+                || panic!("existing source belongs to its caller"),
+                || Ok(7),
+            )
+            .unwrap()
+        };
+        assert_eq!(run(false), 7);
+        activity_feed::with(Some(Context::Source(Source::default())), || {
+            assert_eq!(run(true), 7);
+            assert!(activity_feed::current().is_some());
+        });
+        assert!(activity_feed::current().is_none());
+    }
+
+    #[test]
+    fn standalone_open_owns_one_source_and_fences_it_on_error() {
+        let starts = Cell::new(0);
+        let fences = Cell::new(0);
+        let result: anyhow::Result<()> = with_open_activity_using(
+            true,
+            || {
+                starts.set(starts.get() + 1);
+                Ok(Source::default())
+            },
+            || fences.set(fences.get() + 1),
+            || {
+                assert!(matches!(activity_feed::current(), Some(Context::Source(_))));
+                anyhow::bail!("original open failure")
+            },
+        );
+        assert_eq!(result.unwrap_err().to_string(), "original open failure");
+        assert_eq!(starts.get(), 1);
+        assert_eq!(fences.get(), 1);
+        assert!(activity_feed::current().is_none());
+    }
+
+    #[test]
+    fn unavailable_presentation_does_not_block_the_open() {
+        let value = with_open_activity_using(
+            true,
+            || anyhow::bail!("feed unavailable"),
+            || panic!("no source to fence"),
+            || {
+                assert!(activity_feed::current().is_none());
+                Ok(9)
+            },
+        )
+        .unwrap();
+        assert_eq!(value, 9);
+    }
+}
+
+fn open_name_inner(pika: &Pika, name: &str, allow_create: bool) -> Result<i32> {
     if name == "-" {
         let (provider, session_id) = pika
             .store
@@ -5207,8 +5310,10 @@ fn fleet_open(pika: &Pika, a: FleetOpenArgs) -> Result<i32> {
     verify_local_node(pika, &a.expected_node_id)?;
     let session = exact_local_session(pika, a.provider, &a.session_id, true)?;
     let receipt = crate::activity_feed::with(
-        a.board_feed.map(crate::activity_feed::Context::Remote),
-        || pika.open_session(session, true),
+        a.board_feed
+            .map(crate::activity_feed::Context::Remote)
+            .or_else(crate::activity_feed::current),
+        || with_open_activity(pika, || pika.open_session(session, true)),
     )?;
     finish_local_open(pika, &receipt)
 }

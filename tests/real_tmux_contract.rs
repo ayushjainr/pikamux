@@ -5,6 +5,7 @@ use pikamux::{
     core::{OpenTarget, Pika},
     model::{Provider, Session, Status},
     paths::Paths,
+    process,
     store::Store,
     tmux::{ReceiptDelivery, Tmux},
 };
@@ -100,6 +101,392 @@ fn saved(provider: Provider, identity: &str, name: &str, cwd: &std::path::Path) 
         total_tokens: None,
         estimated_cost_usd: None,
         active_thread_id: None,
+    }
+}
+
+fn wait_for_provider_identity(provider: Provider, identity: &str) {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let observed = process::observe();
+        if observed
+            .require_complete("wait for the fake provider identity")
+            .ok()
+            .is_some_and(|processes| {
+                process::find_session_processes(identity, provider, processes).len() == 1
+            })
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fake {provider} identity {identity} did not become observable"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn fake_provider_pika(
+    temp: &tempfile::TempDir,
+    socket: &str,
+    executable: &std::path::Path,
+) -> Pika {
+    let paths = paths(temp.path());
+    let store = Store::from_paths(&paths);
+    store.initialize().unwrap();
+    let mut config = Config {
+        provider_executables: BTreeMap::from([(
+            "claude".to_owned(),
+            executable.to_string_lossy().into_owned(),
+        )]),
+        ..Config::default()
+    };
+    config.alerts = "none".into();
+    Pika::with_components(
+        paths,
+        config,
+        store,
+        Tmux::with_executable("tmux", Some(socket.to_owned())),
+    )
+}
+
+fn wait_for_exact_session(pika: &Pika, identity: &str) -> Session {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let session = pika
+            .reconcile_local()
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|session| session.provider == Provider::Claude && session.session_id == identity)
+            .unwrap();
+        if session.home_state == "exact" {
+            return session;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fake provider never became exact: {session:#?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn real_isolated_tmux_reopens_unique_uuid_owner_beside_inert_stale_tag() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("tmux unavailable; exact ownership integration not exercised");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let socket = format!("pika-rust-stale-tag-{}", std::process::id());
+    let _guard = IsolatedTmux(socket.clone());
+    let claude = temp.path().join("claude");
+    fs::write(
+        &claude,
+        "#!/bin/sh\nprintf 'unique UUID owner ready\\n'\nwhile :; do sleep 1; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let identity = "01a03a1f-a350-74b0-9e6f-902784af83e5";
+    let pika = fake_provider_pika(&temp, &socket, &claude);
+    pika.store
+        .upsert_session(
+            &saved(Provider::Claude, identity, "stale_tag", temp.path()),
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        pika.open_session(
+            pika.store
+                .get_session(Provider::Claude, identity)
+                .unwrap()
+                .unwrap(),
+            false,
+        )
+        .unwrap()
+        .kind,
+        "RESUMED EXACT"
+    );
+    wait_for_provider_identity(Provider::Claude, identity);
+    let exact = wait_for_exact_session(&pika, identity);
+    let exact_pane = exact.tmux_pane.clone().unwrap();
+
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-s",
+                "stale-shell",
+                "sleep 30",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let tmux = Tmux::with_executable("tmux", Some(socket.clone()));
+    let stale = tmux.get_pane("stale-shell").unwrap().unwrap();
+    for (key, value) in [
+        ("@pika_provider", "claude"),
+        ("@pika_session_id", identity),
+        ("@pika_name", "stale_tag"),
+    ] {
+        assert!(
+            Command::new("tmux")
+                .args([
+                    "-L",
+                    &socket,
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &stale.pane_id,
+                    key,
+                    value,
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    let reconciled = pika
+        .reconcile_local()
+        .unwrap()
+        .sessions
+        .into_iter()
+        .find(|session| session.provider == Provider::Claude && session.session_id == identity)
+        .unwrap();
+    assert_eq!(reconciled.home_state, "exact");
+    assert_eq!(reconciled.tmux_pane.as_deref(), Some(exact_pane.as_str()));
+    assert_ne!(reconciled.status, Status::OpenTwice);
+
+    let reopened = pika.open_session(reconciled.clone(), false).unwrap();
+    assert_eq!(reopened.kind, "ATTACHED LIVE");
+    let output_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let output = pika.capture_exact(&reconciled, 20).unwrap();
+        if output.contains("unique UUID owner ready") {
+            break;
+        }
+        assert!(Instant::now() < output_deadline, "{output:?}");
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let panes = tmux.list_panes().unwrap();
+    let same_uuid: Vec<_> = panes
+        .iter()
+        .filter(|pane| pane.pika_session_id.as_deref() == Some(identity))
+        .collect();
+    assert_eq!(
+        same_uuid.len(),
+        2,
+        "the inert stale tag was deleted or duplicated"
+    );
+    let stale_after = tmux.get_pane(&stale.pane_id).unwrap().unwrap();
+    assert_eq!(stale_after.current_command, "sleep");
+    assert_eq!(stale_after.pika_provider, Some(Provider::Claude));
+    assert_eq!(stale_after.pika_session_id.as_deref(), Some(identity));
+    let observation = process::observe();
+    let processes = observation
+        .require_complete("count unique fake provider owner")
+        .unwrap();
+    assert_eq!(
+        process::find_session_processes(identity, Provider::Claude, processes),
+        vec![reconciled.root_pid.unwrap()]
+    );
+}
+
+#[test]
+fn real_isolated_tmux_blocks_unproven_competing_live_uuid_pane() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("tmux unavailable; competing ownership integration not exercised");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let socket = format!("pika-rust-competing-{}", std::process::id());
+    let _guard = IsolatedTmux(socket.clone());
+    let claude = temp.path().join("claude");
+    fs::write(
+        &claude,
+        "#!/bin/sh\nprintf 'live UUID %s\\n' \"$3\"\nwhile :; do sleep 1; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = "11111111-1111-4111-8111-111111111111";
+    let competitor = "22222222-2222-4222-8222-222222222222";
+    let pika = fake_provider_pika(&temp, &socket, &claude);
+    pika.store
+        .upsert_session(
+            &saved(Provider::Claude, identity, "competing", temp.path()),
+            false,
+        )
+        .unwrap();
+    let session = pika
+        .store
+        .get_session(Provider::Claude, identity)
+        .unwrap()
+        .unwrap();
+    pika.open_session(session, false).unwrap();
+    wait_for_provider_identity(Provider::Claude, identity);
+
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-s",
+                "competitor",
+                &format!("{} resume {}", claude.display(), competitor),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_for_provider_identity(Provider::Claude, competitor);
+    let tmux = Tmux::with_executable("tmux", Some(socket.clone()));
+    let competitor_pane = tmux.get_pane("competitor").unwrap().unwrap();
+    for (key, value) in [
+        ("@pika_provider", "claude"),
+        ("@pika_session_id", identity),
+        ("@pika_name", "competing"),
+    ] {
+        assert!(
+            Command::new("tmux")
+                .args([
+                    "-L",
+                    &socket,
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &competitor_pane.pane_id,
+                    key,
+                    value,
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let current = pika
+        .store
+        .get_session(Provider::Claude, identity)
+        .unwrap()
+        .unwrap();
+    let error = pika.capture_exact(&current, 20).unwrap_err().to_string();
+    assert!(
+        error.contains("unverified live")
+            || error.contains("one exact pane")
+            || error.contains("found 2"),
+        "{error}"
+    );
+    assert!(pika.open_session(current, false).is_err());
+
+    let observation = process::observe();
+    let processes = observation
+        .require_complete("prove competing UUID clients")
+        .unwrap();
+    assert_eq!(
+        process::find_session_processes(identity, Provider::Claude, processes).len(),
+        1
+    );
+    assert_eq!(
+        process::find_session_processes(competitor, Provider::Claude, processes).len(),
+        1
+    );
+    let retained = tmux.get_pane(&competitor_pane.pane_id).unwrap().unwrap();
+    assert_eq!(retained.pika_session_id.as_deref(), Some(identity));
+}
+
+#[test]
+fn real_isolated_tmux_nested_provider_helper_does_not_steal_uuid_owner() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("tmux unavailable; nested-helper integration not exercised");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let socket = format!("pika-rust-nested-helper-{}", std::process::id());
+    let _guard = IsolatedTmux(socket.clone());
+    let helper = temp.path().join("nested/claude");
+    fs::create_dir_all(helper.parent().unwrap()).unwrap();
+    fs::write(&helper, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let claude = temp.path().join("claude");
+    fs::write(
+        &claude,
+        format!(
+        "#!/bin/sh\n{} helper-without-uuid >/dev/null 2>&1 &\nwhile :; do printf 'UUID owner output\\n'; sleep 0.1; done\n",
+            helper.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = "33333333-3333-4333-8333-333333333333";
+    let pika = fake_provider_pika(&temp, &socket, &claude);
+    pika.store
+        .upsert_session(
+            &saved(Provider::Claude, identity, "nested", temp.path()),
+            false,
+        )
+        .unwrap();
+    pika.open_session(
+        pika.store
+            .get_session(Provider::Claude, identity)
+            .unwrap()
+            .unwrap(),
+        false,
+    )
+    .unwrap();
+    wait_for_provider_identity(Provider::Claude, identity);
+    let helper_argv = helper.to_string_lossy().into_owned();
+    let helper_deadline = Instant::now() + Duration::from_secs(2);
+    let owner_pid = loop {
+        let observation = process::observe();
+        if let Ok(processes) = observation.require_complete("observe nested provider helper") {
+            let owners = process::find_session_processes(identity, Provider::Claude, processes);
+            if owners.len() == 1 {
+                let tree = process::process_tree(owners[0], processes);
+                if tree.iter().any(|pid| {
+                    processes
+                        .get(pid)
+                        .is_some_and(|record| record.argv.iter().any(|arg| arg == &helper_argv))
+                }) {
+                    break owners[0];
+                }
+            }
+        }
+        assert!(
+            Instant::now() < helper_deadline,
+            "nested helper {helper_argv:?} never appeared beneath the UUID owner"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    let session = pika
+        .store
+        .get_session(Provider::Claude, identity)
+        .unwrap()
+        .unwrap();
+    let binding = pika
+        .exact_pane_binding(&session, session.tmux_pane.as_deref())
+        .unwrap();
+    assert_eq!(binding.provider_pid, owner_pid);
+    let observation = process::observe();
+    let processes = observation
+        .require_complete("prove nested helper ownership")
+        .unwrap();
+    let owners = process::find_session_processes(identity, Provider::Claude, processes);
+    assert_eq!(owners, vec![binding.provider_pid]);
+    let output_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let output = pika.capture_exact(&session, 20).unwrap();
+        if output.contains("UUID owner output") {
+            break;
+        }
+        assert!(Instant::now() < output_deadline, "{output:?}");
+        thread::sleep(Duration::from_millis(25));
     }
 }
 

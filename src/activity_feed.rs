@@ -2,14 +2,14 @@
 use crate::{
     consult::{CancellablePipe, CancellationToken, OwnedChild},
     fleet::{FleetError, SshTransport},
-    model::FleetNode,
+    model::{FleetNode, Provider, Status},
     monitor::BoardItem,
     tmux::Tmux,
 };
 use anyhow::{Result, bail};
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     io::Write,
     process::Stdio,
     sync::{Arc, Mutex, atomic::AtomicBool, mpsc},
@@ -25,22 +25,134 @@ pub(crate) struct Summary {
     pub counts: [usize; 4],
     pub colors: bool,
     pub latest_attention: Option<String>,
-    pub warning: Option<AttentionWarning>,
+    pub attention: Option<AttentionKind>,
+}
+
+const MAX_RETURN_INTERESTS: usize = 64;
+const MAX_RETURN_SESSION_ID: usize = 96;
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ReturnInterest {
+    node_id: Option<String>,
+    provider: Provider,
+    session_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReturnStatus {
+    pub provider: Provider,
+    pub session_id: String,
+    pub status: Option<Status>,
+    pub colors: bool,
+}
+
+fn valid_return_session_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_RETURN_SESSION_ID
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+}
+
+fn status_wire(status: Option<Status>) -> &'static str {
+    match status {
+        None => "unknown",
+        Some(Status::Starting) => "starting",
+        Some(Status::NeedsYou) => "needs-you",
+        Some(Status::OpenTwice) => "open-twice",
+        Some(Status::Working) => "working",
+        Some(Status::Ready) => "ready",
+        Some(Status::Parked) => "parked",
+        Some(Status::Unbound) => "unbound",
+        Some(Status::Error) => "error",
+    }
+}
+
+#[cfg(any(unix, test))]
+fn parse_status_wire(value: &str) -> Option<Option<Status>> {
+    Some(match value {
+        "unknown" => None,
+        "starting" => Some(Status::Starting),
+        "needs-you" => Some(Status::NeedsYou),
+        "open-twice" => Some(Status::OpenTwice),
+        "working" => Some(Status::Working),
+        "ready" => Some(Status::Ready),
+        "parked" => Some(Status::Parked),
+        "unbound" => Some(Status::Unbound),
+        "error" => Some(Status::Error),
+        _ => return None,
+    })
+}
+
+impl ReturnStatus {
+    fn encode(&self) -> String {
+        format!(
+            "s1|{}|{}|{}|{}",
+            self.provider.as_str(),
+            self.session_id,
+            status_wire(self.status),
+            usize::from(self.colors)
+        )
+    }
+
+    #[cfg(any(unix, test))]
+    fn decode(value: &str) -> Result<Self> {
+        if value.len() > MAX_FRAME_BYTES {
+            bail!("Invalid return status frame");
+        }
+        let mut fields = value.split('|');
+        if fields.next() != Some("s1") {
+            bail!("Invalid return status frame");
+        }
+        let provider = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Missing return status provider"))?
+            .parse::<Provider>()
+            .map_err(|_| anyhow::anyhow!("Invalid return status provider"))?;
+        let session_id = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Missing return status identity"))?;
+        if !valid_return_session_id(session_id) {
+            bail!("Invalid return status identity");
+        }
+        let status = parse_status_wire(
+            fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Missing return status value"))?,
+        )
+        .ok_or_else(|| anyhow::anyhow!("Invalid return status value"))?;
+        let colors = match fields.next() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => bail!("Invalid return status colors"),
+        };
+        if fields.next().is_some() {
+            bail!("Invalid return status frame");
+        }
+        Ok(Self {
+            provider,
+            session_id: session_id.to_owned(),
+            status,
+            colors,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AttentionWarning {
+pub(crate) enum AttentionKind {
     OpenTwice,
     Error,
     Unbound,
+    Ready,
 }
 
-impl AttentionWarning {
+impl AttentionKind {
     fn label(self) -> &'static str {
         match self {
             Self::OpenTwice => "open twice",
             Self::Error => "error",
             Self::Unbound => "outside Pika",
+            Self::Ready => "ready",
         }
     }
     fn wire(self) -> &'static str {
@@ -48,6 +160,7 @@ impl AttentionWarning {
             Self::OpenTwice => "open-twice",
             Self::Error => "error",
             Self::Unbound => "unbound",
+            Self::Ready => "ready",
         }
     }
 }
@@ -80,6 +193,7 @@ struct State {
     summary: Option<Summary>,
     health: Vec<String>,
     revision: u64,
+    return_interests: BTreeSet<ReturnInterest>,
 }
 #[derive(Clone)]
 pub(crate) struct Snapshot {
@@ -149,6 +263,7 @@ struct Owner {
     observer: Mutex<Option<Box<dyn Send>>>,
     refresh: Mutex<Option<mpsc::SyncSender<()>>>,
     delayed: Arc<AtomicBool>,
+    observation_enabled: Arc<AtomicBool>,
 }
 struct ObserverStop(Option<Box<dyn FnOnce() + Send>>);
 impl Drop for ObserverStop {
@@ -180,10 +295,16 @@ impl Default for Source {
             observer: Mutex::new(None),
             refresh: Mutex::new(None),
             delayed: Arc::new(AtomicBool::new(false)),
+            observation_enabled: Arc::new(AtomicBool::new(true)),
         }))
     }
 }
 impl Source {
+    pub(crate) fn local_token(&self, tmux: &Tmux) -> String {
+        self.local(tmux.clone());
+        self.0.token.clone()
+    }
+
     pub fn publisher(&self) -> Publisher {
         Publisher {
             state: self.0.state.clone(),
@@ -201,6 +322,57 @@ impl Source {
     }
     pub fn summary(&self) -> Option<Summary> {
         self.0.state.lock().unwrap().summary.clone()
+    }
+    pub(crate) fn register_return_interest(
+        &self,
+        node_id: Option<&str>,
+        provider: Provider,
+        session_id: &str,
+    ) -> bool {
+        if node_id.is_some_and(|value| !valid_return_session_id(value))
+            || !valid_return_session_id(session_id)
+        {
+            return false;
+        }
+        let mut state = self.0.state.lock().unwrap();
+        let interest = ReturnInterest {
+            node_id: node_id.map(str::to_owned),
+            provider,
+            session_id: session_id.to_owned(),
+        };
+        if state.return_interests.contains(&interest) {
+            return true;
+        }
+        if state.return_interests.len() >= MAX_RETURN_INTERESTS {
+            return false;
+        }
+        state.return_interests.insert(interest);
+        state.revision = state.revision.saturating_add(1);
+        true
+    }
+    fn return_statuses(state: &Arc<Mutex<State>>, node_id: Option<&str>) -> Vec<ReturnStatus> {
+        let state = state.lock().unwrap();
+        state
+            .return_interests
+            .iter()
+            .filter(|interest| interest.node_id.as_deref() == node_id)
+            .map(|interest| {
+                let status = state.items.iter().find(|item| {
+                    item.node_id.as_deref() == node_id
+                        && item.session.provider == interest.provider
+                        && item.session.session_id == interest.session_id
+                        && !item.stale
+                        && item.pending_token.is_none()
+                        && item.session.live
+                });
+                ReturnStatus {
+                    provider: interest.provider,
+                    session_id: interest.session_id.clone(),
+                    status: status.map(|item| item.session.status),
+                    colors: state.summary.as_ref().is_some_and(|summary| summary.colors),
+                }
+            })
+            .collect()
     }
     pub fn own_observer(
         &self,
@@ -221,6 +393,21 @@ impl Source {
     }
     pub fn delayed(&self) -> Arc<AtomicBool> {
         self.0.delayed.clone()
+    }
+    #[cfg(not(windows))]
+    pub(crate) fn observation_gate(&self) -> Arc<AtomicBool> {
+        self.0.observation_enabled.clone()
+    }
+    #[cfg(not(windows))]
+    pub(crate) fn pause_observation(&self) {
+        self.0
+            .observation_enabled
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn activate_observation(&self) {
+        self.0
+            .observation_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
     }
     pub fn filter(&self, filter: &str) {
         let mut state = self.0.state.lock().unwrap();
@@ -244,16 +431,23 @@ impl Source {
         let stop = self.0.stop.clone();
         self.0.workers.lock().unwrap().push(thread::spawn(move || {
             let mut previous = None;
+            let mut previous_revision = None;
             let mut sent = Instant::now() - Duration::from_secs(10);
             while !stop.is_cancelled() {
-                let summary = state.lock().unwrap().summary.clone();
+                let (summary, revision) = {
+                    let state = state.lock().unwrap();
+                    (state.summary.clone(), state.revision)
+                };
                 if summary.is_some()
-                    && (summary != previous || sent.elapsed() >= Duration::from_secs(5))
+                    && (summary != previous
+                        || Some(revision) != previous_revision
+                        || sent.elapsed() >= Duration::from_secs(5))
                 {
                     // Reconnection is read-only presentation, never another
                     // agent launch. Retry at the heartbeat cadence after loss.
                     let _ = sink(summary.clone());
                     previous = summary;
+                    previous_revision = Some(revision);
                     sent = Instant::now();
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -263,8 +457,13 @@ impl Source {
     }
     fn local(&self, tmux: Tmux) {
         let token = self.0.token.clone();
+        let state = self.0.state.clone();
         self.start("local".into(), move |summary| {
-            tmux.publish_board_summary(&token, summary)
+            tmux.publish_board_summary_with_statuses(
+                &token,
+                summary,
+                Some(&Self::return_statuses(&state, None)),
+            )
         });
     }
     fn remote(&self, ssh: &SshTransport, node: &FleetNode) -> std::result::Result<(), FleetError> {
@@ -290,6 +489,13 @@ impl Source {
         let stop = self.0.stop.clone();
         let extended = node.capabilities.iter().any(|cap| cap == "board-feed-v2");
         let warnings = node.capabilities.iter().any(|cap| cap == "board-feed-v3");
+        let attention = node.capabilities.iter().any(|cap| cap == "board-feed-v4");
+        let return_status = node
+            .capabilities
+            .iter()
+            .any(|cap| cap == "return-bar-status-v1");
+        let state = self.0.state.clone();
+        let node_id = node.node_id.clone();
         // Spawning is lazy and off the board renderer. The owned child is reaped
         // on disconnect or board shutdown; its pipe never shares agent input.
         let mut child = None;
@@ -308,7 +514,9 @@ impl Source {
                 )?);
                 child = Some(owned);
             }
-            let frame = if warnings {
+            let frame = if attention {
+                summary.encode_attention_v4()
+            } else if warnings {
                 summary.encode_attention()
             } else if extended {
                 summary.encode_extended()
@@ -319,6 +527,15 @@ impl Source {
                 pipe.take();
                 child.take();
                 return Err(error.into());
+            }
+            if return_status {
+                for status in Self::return_statuses(&state, Some(&node_id)) {
+                    if let Err(error) = writeln!(pipe.as_mut().unwrap(), "{}", status.encode()) {
+                        pipe.take();
+                        child.take();
+                        return Err(error.into());
+                    }
+                }
             }
             Ok(())
         });
@@ -348,7 +565,19 @@ pub(crate) fn forward(
         && let Some(Context::Source(source)) = current()
     {
         source.remote(ssh, node)?;
+        source.activate_observation();
         arguments.extend(["--board-feed".into(), source.0.token.clone()]);
+        if node
+            .capabilities
+            .iter()
+            .any(|cap| cap == "return-bar-status-v1")
+            && let (Some(provider), Some(session_id)) = (
+                arguments.get(4).and_then(|value| value.parse().ok()),
+                arguments.get(6),
+            )
+        {
+            source.register_return_interest(Some(&node.node_id), provider, session_id);
+        }
     }
     Ok(())
 }
@@ -363,8 +592,39 @@ pub(crate) fn token(value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-// This endpoint receives bounded counts and an inert display label, after the CLI has proved
-// the expected node UUID. EOF, silence or malformed input clears the live feed.
+pub(crate) fn return_option_name(
+    token_value: &str,
+    provider: Provider,
+    session_id: &str,
+) -> Option<String> {
+    token(token_value).ok()?;
+    if !valid_return_session_id(session_id) {
+        return None;
+    }
+    let encoded = session_id
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Some(format!(
+        "@pika_return_{token_value}_{}_{}",
+        provider.as_str(),
+        encoded
+    ))
+}
+
+pub(crate) fn return_bar_color(status: Status) -> &'static str {
+    match crate::monitor::status_color(status) {
+        crossterm::style::Color::Red => "red",
+        crossterm::style::Color::Cyan => "cyan",
+        crossterm::style::Color::Green => "green",
+        crossterm::style::Color::Magenta => "magenta",
+        crossterm::style::Color::DarkGrey => "brightblack",
+        _ => "default",
+    }
+}
+
+// This endpoint receives bounded counts plus optional exact-target status frames, after the CLI
+// has proved the expected node UUID. EOF, silence or malformed input clears the live feed.
 #[cfg(unix)]
 pub(crate) fn receive(tmux: &Tmux, token: &str) -> Result<()> {
     use std::io::Read;
@@ -410,10 +670,16 @@ pub(crate) fn receive(tmux: &Tmux, token: &str) -> Result<()> {
         }
         for byte in &bytes[..read] {
             if *byte == b'\n' {
-                let summary = Summary::decode(std::str::from_utf8(&pending)?)?;
-                // The first frame can arrive before the exact opening creates
-                // a tmux server. A later heartbeat retries presentation only.
-                let _ = tmux.publish_board_summary(token, Some(summary));
+                let frame = std::str::from_utf8(&pending)?;
+                if frame.starts_with("s1|") {
+                    let status = ReturnStatus::decode(frame)?;
+                    let _ = tmux.publish_return_status(token, status);
+                } else {
+                    let summary = Summary::decode(frame)?;
+                    // The first frame can arrive before the exact opening creates
+                    // a tmux server. A later heartbeat retries presentation only.
+                    let _ = tmux.publish_board_summary(token, Some(summary));
+                }
                 pending.clear();
                 last = Instant::now();
             } else {
@@ -465,62 +731,64 @@ pub(crate) fn summarize(items: &[BoardItem], filter: &str) -> Summary {
             })
             .count()
     });
-    let (latest_attention, warning) = latest_attention(items, &needle)
-        .map_or((None, None), |(label, warning)| (Some(label), warning));
+    let (latest_attention, attention) = latest_attention(items, &needle)
+        .map_or((None, None), |(label, attention)| (Some(label), attention));
     Summary {
         counts,
         colors: std::env::var_os("NO_COLOR").is_none(),
         latest_attention,
-        warning,
+        attention,
     }
 }
 
-fn latest_attention(
-    items: &[BoardItem],
-    needle: &str,
-) -> Option<(String, Option<AttentionWarning>)> {
-    let latest = items
-        .iter()
-        .filter(|item| {
-            !item.stale
-                && item.pending_token.is_none()
-                && group(item.session.status, false) == "NEEDS YOU"
-                && matches_filter(item, needle)
-        })
-        .max_by(|a, b| {
-            let time = |item: &BoardItem| {
-                let value = item.session.last_event_at;
-                if value.is_finite() && value > 0.0 {
-                    value
-                } else {
-                    0.0
-                }
-            };
-            time(a).total_cmp(&time(b)).then_with(|| {
-                (
-                    &a.node_id,
-                    a.session.provider.as_str(),
-                    &a.session.session_id,
-                )
-                    .cmp(&(
-                        &b.node_id,
-                        b.session.provider.as_str(),
-                        &b.session.session_id,
-                    ))
+fn latest_attention(items: &[BoardItem], needle: &str) -> Option<(String, Option<AttentionKind>)> {
+    let latest = |category| {
+        items
+            .iter()
+            .filter(|item| {
+                !item.stale
+                    && item.pending_token.is_none()
+                    && group(item.session.status, false) == category
+                    && matches_filter(item, needle)
             })
-        })?;
+            .max_by(|a, b| {
+                let time = |item: &BoardItem| {
+                    let value = item.session.last_event_at;
+                    if value.is_finite() && value > 0.0 {
+                        value
+                    } else {
+                        0.0
+                    }
+                };
+                time(a).total_cmp(&time(b)).then_with(|| {
+                    (
+                        &a.node_id,
+                        a.session.provider.as_str(),
+                        &a.session.session_id,
+                    )
+                        .cmp(&(
+                            &b.node_id,
+                            b.session.provider.as_str(),
+                            &b.session.session_id,
+                        ))
+                })
+            })
+    };
+    let (latest, suffix) = latest("NEEDS YOU")
+        .map(|item| (item, None))
+        .or_else(|| latest("READY").map(|item| (item, Some(AttentionKind::Ready))))?;
     let mut label = latest.session.display_name();
     if let Some(machine) = latest.node_name.as_ref().or(latest.node_id.as_ref()) {
         label.push_str(" @");
         label.push_str(machine);
     }
     let label = safe_label(&label);
-    let warning = match latest.session.status {
-        crate::model::Status::OpenTwice => Some(AttentionWarning::OpenTwice),
-        crate::model::Status::Error => Some(AttentionWarning::Error),
-        crate::model::Status::Unbound => Some(AttentionWarning::Unbound),
+    let warning = suffix.or(match latest.session.status {
+        crate::model::Status::OpenTwice => Some(AttentionKind::OpenTwice),
+        crate::model::Status::Error => Some(AttentionKind::Error),
+        crate::model::Status::Unbound => Some(AttentionKind::Unbound),
         _ => None,
-    };
+    });
     (!label.is_empty()).then_some((label, warning))
 }
 
@@ -550,7 +818,7 @@ impl Summary {
         format!(
             "v2|{}|{}",
             self.encode(),
-            if self.warning.is_none() {
+            if self.attention.is_none() {
                 self.latest_attention.as_deref().unwrap_or_default()
             } else {
                 // Older receivers always draw an agent-request arrow.
@@ -559,10 +827,23 @@ impl Summary {
         )
     }
     pub fn encode_attention(&self) -> String {
+        let (kind, label) = if self.attention == Some(AttentionKind::Ready) {
+            // v3 peers must never receive the new Ready suffix kind. Keep the
+            // counts while omitting the label they would render as a request.
+            ("request", "")
+        } else {
+            (
+                self.attention.map_or("request", AttentionKind::wire),
+                self.latest_attention.as_deref().unwrap_or_default(),
+            )
+        };
+        format!("v3|{}|{}|{}", self.encode(), kind, label,)
+    }
+    pub fn encode_attention_v4(&self) -> String {
         format!(
-            "v3|{}|{}|{}",
+            "v4|{}|{}|{}",
             self.encode(),
-            self.warning.map_or("request", AttentionWarning::wire),
+            self.attention.map_or("request", AttentionKind::wire),
             self.latest_attention.as_deref().unwrap_or_default()
         )
     }
@@ -571,14 +852,29 @@ impl Summary {
         if value.len() > MAX_FRAME_BYTES {
             bail!("Invalid board summary");
         }
-        let (value, warning) = if let Some(value) = value.strip_prefix("v3|") {
+        let (value, warning) = if let Some(value) = value.strip_prefix("v4|") {
             let mut parts = value.splitn(3, '|');
             let counts = parts.next().unwrap_or_default();
             let warning = match parts.next() {
                 Some("request") => None,
-                Some("open-twice") => Some(AttentionWarning::OpenTwice),
-                Some("error") => Some(AttentionWarning::Error),
-                Some("unbound") => Some(AttentionWarning::Unbound),
+                Some("open-twice") => Some(AttentionKind::OpenTwice),
+                Some("error") => Some(AttentionKind::Error),
+                Some("unbound") => Some(AttentionKind::Unbound),
+                Some("ready") => Some(AttentionKind::Ready),
+                _ => bail!("Invalid board attention kind"),
+            };
+            let label = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Missing board attention label"))?;
+            (format!("v2|{counts}|{label}"), warning)
+        } else if let Some(value) = value.strip_prefix("v3|") {
+            let mut parts = value.splitn(3, '|');
+            let counts = parts.next().unwrap_or_default();
+            let warning = match parts.next() {
+                Some("request") => None,
+                Some("open-twice") => Some(AttentionKind::OpenTwice),
+                Some("error") => Some(AttentionKind::Error),
+                Some("unbound") => Some(AttentionKind::Unbound),
                 _ => bail!("Invalid board attention kind"),
             };
             let label = parts
@@ -612,8 +908,11 @@ impl Summary {
         if [a, b, c, d].iter().any(|n| **n > 1_000_000) || *colors > 1 {
             bail!("Invalid board summary");
         }
-        if *a == 0 && latest_attention.is_some() {
+        if *a == 0 && latest_attention.is_some() && warning != Some(AttentionKind::Ready) {
             bail!("Request label without an attention count");
+        }
+        if warning == Some(AttentionKind::Ready) && *c == 0 {
+            bail!("Ready label without a ready count");
         }
         if warning.is_some() && latest_attention.is_none() {
             bail!("Warning without an attention label");
@@ -622,7 +921,7 @@ impl Summary {
             counts: [*a, *b, *c, *d],
             colors: *colors == 1,
             latest_attention,
-            warning,
+            attention: warning,
         })
     }
     pub fn tmux_text(&self) -> String {
@@ -656,16 +955,24 @@ impl Summary {
             // Reserve navigation and separators first. Use three deterministic
             // widths; tmux reevaluates these branches when the client resizes.
             let mut suffix = String::new();
-            let marker = if self.warning.is_some() { "⚠" } else { "↑" };
+            let ready = self.attention == Some(AttentionKind::Ready);
+            let marker = if ready {
+                "✓"
+            } else if self.attention.is_some() {
+                "⚠"
+            } else {
+                "↑"
+            };
+            let marker_color = if ready { "green" } else { "red" };
             let reason = self
-                .warning
+                .attention
                 .map(|warning| format!(" · {}", warning.label()))
                 .unwrap_or_default();
             for width in [8, 20, 48] {
                 let short = shorten_label(&label, width);
                 let minimum = plain.width() + 20 + short.width() + reason.width();
                 let value = if self.colors {
-                    format!(" · #[fg=red]{marker} {short}{reason}#[fg=default]")
+                    format!(" · #[fg={marker_color}]{marker} {short}{reason}#[fg=default]")
                 } else {
                     format!(" · {marker} {short}{reason}")
                 };
@@ -732,7 +1039,7 @@ mod tests {
         let snapshot = source.snapshot().unwrap();
         assert_eq!(snapshot.summary.counts, [3, 0, 1, 1]);
         assert_eq!(snapshot.summary.latest_attention.as_deref(), Some("error"));
-        assert_eq!(snapshot.summary.warning, Some(AttentionWarning::Error));
+        assert_eq!(snapshot.summary.attention, Some(AttentionKind::Error));
         rows.reverse();
         publisher.publish(rows.clone(), vec![]);
         assert_eq!(source.summary().unwrap(), snapshot.summary);
@@ -746,7 +1053,7 @@ mod tests {
             source.summary().unwrap().latest_attention.as_deref(),
             Some("ts_quality @rs2a")
         );
-        assert_eq!(source.summary().unwrap().warning, None);
+        assert_eq!(source.summary().unwrap().attention, None);
         rows.iter_mut()
             .find(|row| row.session.name.as_deref() == Some("ts_quality"))
             .unwrap()
@@ -758,7 +1065,10 @@ mod tests {
             Some("old")
         );
         source.filter("result");
-        assert_eq!(source.summary().unwrap().latest_attention, None);
+        assert_eq!(
+            source.summary().unwrap().latest_attention.as_deref(),
+            Some("result")
+        );
         source.filter("");
         rows.iter_mut()
             .find(|row| row.session.name.as_deref() == Some("old"))
@@ -766,7 +1076,14 @@ mod tests {
             .session
             .status = Status::Working;
         publisher.publish(rows, vec![]);
-        assert_eq!(source.summary().unwrap().latest_attention, None);
+        assert_eq!(
+            source.summary().unwrap().latest_attention.as_deref(),
+            Some("result")
+        );
+        assert_eq!(
+            source.summary().unwrap().attention,
+            Some(AttentionKind::Ready)
+        );
     }
 
     #[test]
@@ -780,18 +1097,67 @@ mod tests {
     }
 
     #[test]
+    fn latest_ready_is_used_only_when_no_needs_you_row_exists() {
+        use crate::model::Status;
+        let mut ready = request("ready", 20.0);
+        ready.session.status = Status::Ready;
+        let mut needs_you = request("needs-you", 1.0);
+        needs_you.session.status = Status::NeedsYou;
+        let summary = summarize(&[ready.clone(), needs_you], "");
+        assert_eq!(summary.latest_attention.as_deref(), Some("needs-you"));
+        assert_eq!(summary.attention, None);
+
+        let summary = summarize(&[ready], "");
+        assert_eq!(summary.latest_attention.as_deref(), Some("ready"));
+        assert_eq!(summary.attention, Some(AttentionKind::Ready));
+        assert!(summary.tmux_text().contains("✓ ready · ready"));
+        assert!(summary.tmux_text().contains("fg=green"));
+        assert!(!summary.tmux_text().contains("⚠"));
+    }
+
+    #[test]
+    fn latest_ready_reuses_filter_tie_break_and_exclusions() {
+        use crate::model::Status;
+        let mut alpha = request("alpha", 5.0);
+        alpha.session.status = Status::Ready;
+        let mut beta = request("beta", 5.0);
+        beta.session.status = Status::Ready;
+        let mut stale = request("stale", 50.0);
+        stale.session.status = Status::Ready;
+        stale.stale = true;
+        let mut pending = request("pending", 60.0);
+        pending.session.status = Status::Ready;
+        pending.pending_token = Some("launch".into());
+        assert_eq!(
+            summarize(&[alpha.clone(), beta.clone(), stale, pending], "")
+                .latest_attention
+                .as_deref(),
+            Some("beta")
+        );
+        assert_eq!(
+            summarize(&[alpha, beta], "alpha")
+                .latest_attention
+                .as_deref(),
+            Some("alpha")
+        );
+        let mut working = request("working", 10.0);
+        working.session.status = Status::Working;
+        assert_eq!(summarize(&[working], "").latest_attention, None);
+    }
+
+    #[test]
     fn warnings_are_typed_and_never_sent_as_requests_to_older_receivers() {
         use crate::model::Status;
         for (status, kind, reason) in [
-            (Status::OpenTwice, AttentionWarning::OpenTwice, "open twice"),
-            (Status::Error, AttentionWarning::Error, "error"),
-            (Status::Unbound, AttentionWarning::Unbound, "outside Pika"),
+            (Status::OpenTwice, AttentionKind::OpenTwice, "open twice"),
+            (Status::Error, AttentionKind::Error, "error"),
+            (Status::Unbound, AttentionKind::Unbound, "outside Pika"),
         ] {
             let mut row = request("ts_quality", 10.0);
             row.session.status = status;
             let summary = summarize(&[row.clone()], "");
             assert_eq!(summary.counts, [1, 0, 0, 0]);
-            assert_eq!(summary.warning, Some(kind));
+            assert_eq!(summary.attention, Some(kind));
             assert_eq!(
                 Summary::decode(&summary.encode_attention()).unwrap(),
                 summary
@@ -799,19 +1165,37 @@ mod tests {
             let legacy = Summary::decode(&summary.encode_extended()).unwrap();
             assert_eq!(legacy.counts, summary.counts);
             assert_eq!(legacy.latest_attention, None);
-            assert_eq!(legacy.warning, None);
+            assert_eq!(legacy.attention, None);
             let rendered = summary.tmux_text();
             assert!(rendered.contains(&format!("⚠ ts_quality · {reason}")));
             assert!(!rendered.contains("↑"));
             row.pending_token = Some("pending".into());
             assert_eq!(summarize(&[row], "").latest_attention, None);
         }
+        let mut ready = request("ready", 10.0);
+        ready.session.status = Status::Ready;
+        let ready = summarize(&[ready], "");
+        assert_eq!(ready.attention, Some(AttentionKind::Ready));
+        assert_eq!(
+            Summary::decode(&ready.encode_attention())
+                .unwrap()
+                .attention,
+            None
+        );
+        assert_eq!(
+            Summary::decode(&ready.encode_attention_v4()).unwrap(),
+            ready
+        );
+        assert!(ready.tmux_text().contains("✓ ready · ready"));
         for frame in [
             "v3|1,0,0,0,0|shell|name",
             "v3|1,0,0,0,0|error|",
             "v3|0,0,0,0,0|error|name",
             "v3|1,0,0,0,0|error|#{client_pid}",
             "v3|1,0,0,0,0|request",
+            "v3|0,0,1,0,0|ready|ready",
+            "v4|0,0,0,0,0|ready|ready",
+            "v4|0,0,1,0,0|ready|",
         ] {
             assert!(Summary::decode(frame).is_err(), "{frame}");
         }
@@ -900,7 +1284,7 @@ mod tests {
             counts: [1, 2, 4, 4],
             colors: false,
             latest_attention: None,
-            warning: None,
+            attention: None,
         }
     }
 
@@ -959,6 +1343,11 @@ mod tests {
         remote_mirror(3);
     }
     #[cfg(unix)]
+    #[test]
+    fn remote_mirror_sends_ready_suffix_only_to_v4_hosts() {
+        remote_mirror(4);
+    }
+    #[cfg(unix)]
     fn remote_mirror(version: u8) {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
@@ -1000,6 +1389,9 @@ mod tests {
             if version >= 3 {
                 node.capabilities.push("board-feed-v3".into());
             }
+            if version >= 4 {
+                node.capabilities.push("board-feed-v4".into());
+            }
             forward(&mut args, &node, &ssh).unwrap();
             assert_eq!(args, ["_fleet-open", "--board-feed", &source.0.token]);
             // A second window shares the same source->destination stream.
@@ -1024,11 +1416,23 @@ mod tests {
         assert_eq!(first.contains("ts_quality"), version >= 2);
         source.0.state.lock().unwrap().summary = Some(Summary {
             latest_attention: Some("warning-only".into()),
-            warning: Some(AttentionWarning::OpenTwice),
+            attention: Some(AttentionKind::OpenTwice),
             ..summary()
         });
         if version == 3 {
             wait("v3|1,2,4,4,0|open-twice|warning-only");
+        } else if version >= 4 {
+            wait("v4|1,2,4,4,0|open-twice|warning-only");
+        }
+        source.0.state.lock().unwrap().summary = Some(Summary {
+            latest_attention: Some("ready-only".into()),
+            attention: Some(AttentionKind::Ready),
+            ..summary()
+        });
+        if version == 3 {
+            wait("v3|1,2,4,4,0|request|");
+        } else if version >= 4 {
+            wait("v4|1,2,4,4,0|ready|ready-only");
         }
         source.0.state.lock().unwrap().summary = Some(Summary {
             counts: [0, 3, 4, 4],
@@ -1039,7 +1443,7 @@ mod tests {
             std::fs::read_to_string(&frames)
                 .unwrap()
                 .contains("warning-only"),
-            version == 3
+            version >= 3
         );
         drop(source);
         let trace = std::fs::read_to_string(trace).unwrap();
@@ -1056,7 +1460,7 @@ mod tests {
             counts: [1, 2, 4, 4],
             colors: true,
             latest_attention: None,
-            warning: None,
+            attention: None,
         };
         assert_eq!(Summary::decode(&summary.encode()).unwrap(), summary);
         for bad in [
@@ -1082,6 +1486,91 @@ mod tests {
             "1 need you · 2 working · 4 ready · 4 parked"
         );
     }
+
+    #[test]
+    fn return_status_frames_are_typed_bounded_and_preserve_no_color() {
+        let status = ReturnStatus {
+            provider: Provider::Codex,
+            session_id: "id-target".into(),
+            status: Some(Status::Ready),
+            colors: true,
+        };
+        assert_eq!(ReturnStatus::decode(&status.encode()).unwrap(), status);
+        let plain = ReturnStatus {
+            colors: false,
+            ..status.clone()
+        };
+        assert_eq!(ReturnStatus::decode(&plain.encode()).unwrap(), plain);
+        for frame in [
+            "s1|codex|id-target|ready|2",
+            "s1|shell|id-target|ready|1",
+            "s1|codex|#{client_pid}|ready|1",
+            "s1|codex|id-target|fg=red|1",
+            "s1|codex|id-target|ready|1|extra",
+        ] {
+            assert!(ReturnStatus::decode(frame).is_err(), "{frame}");
+        }
+    }
+
+    #[test]
+    fn return_interest_projection_tracks_exact_target_without_inventory() {
+        let source = Source::default();
+        let publisher = source.publisher();
+        let mut row = request("target", 1.0);
+        row.session.status = Status::Working;
+        assert!(source.register_return_interest(None, Provider::Codex, "id-target"));
+        publisher.publish(vec![row.clone()], vec![]);
+        let projected = Source::return_statuses(&source.0.state, None);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].status, Some(Status::Working));
+        assert!(projected[0].colors);
+        row.session.status = Status::Ready;
+        publisher.publish(vec![row], vec![]);
+        assert_eq!(
+            Source::return_statuses(&source.0.state, None)[0].status,
+            Some(Status::Ready)
+        );
+        let mut stale = request("target", 2.0);
+        stale.stale = true;
+        publisher.publish(vec![stale], vec![]);
+        assert_eq!(
+            Source::return_statuses(&source.0.state, None)[0].status,
+            None
+        );
+    }
+
+    #[test]
+    fn return_interest_projection_is_node_and_uuid_scoped() {
+        let source = Source::default();
+        let publisher = source.publisher();
+        let mut local = request("same", 1.0);
+        local.session.session_id = "same-id".into();
+        local.session.status = Status::Working;
+        let mut remote = local.clone();
+        remote.node_id = Some("node-a".into());
+        remote.session.status = Status::Ready;
+        let mut other = local.clone();
+        other.node_id = Some("node-b".into());
+        other.session.session_id = "other-id".into();
+        other.session.status = Status::Error;
+        publisher.publish(vec![local, remote, other], vec![]);
+        assert!(source.register_return_interest(None, Provider::Codex, "same-id"));
+        assert!(source.register_return_interest(Some("node-a"), Provider::Codex, "same-id"));
+        assert!(source.register_return_interest(Some("node-b"), Provider::Codex, "other-id"));
+        assert_eq!(
+            Source::return_statuses(&source.0.state, None)[0].status,
+            Some(Status::Working)
+        );
+        assert_eq!(
+            Source::return_statuses(&source.0.state, Some("node-a"))[0].status,
+            Some(Status::Ready)
+        );
+        assert_eq!(
+            Source::return_statuses(&source.0.state, Some("node-b"))[0].status,
+            Some(Status::Error)
+        );
+    }
+
     #[test]
     fn context_is_scoped_to_the_action_not_other_threads() {
         let feed = "a".repeat(32);

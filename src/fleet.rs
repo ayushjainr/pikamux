@@ -64,6 +64,8 @@ pub const CAPABILITIES: &[&str] = &[
     "board-feed-v1",
     "board-feed-v2",
     "board-feed-v3",
+    "board-feed-v4",
+    "return-bar-status-v1",
 ];
 const REQUIRED_CAPABILITIES: &[&str] = &[
     "inventory",

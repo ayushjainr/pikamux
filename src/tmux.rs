@@ -377,11 +377,10 @@ impl Tmux {
             None if mouse.is_some() => "click to return · agent keeps running".into(),
             None => "custom key bindings · use your detach control".into(),
         };
-        let style = if std::env::var_os("NO_COLOR").is_some() {
-            "default"
-        } else {
-            "fg=cyan,bold"
-        };
+        self.register_return_status(pane);
+        // This format is session-wide, but its value is selected by exact
+        // client/pane. A plain or disconnected caller cannot recolor peers.
+        let style = "#{?@pika_return_style,#{T:@pika_return_style},default},bold";
         let range = if mouse.is_some() {
             "range=left"
         } else {
@@ -417,6 +416,20 @@ impl Tmux {
             true,
         )?;
         Ok(())
+    }
+
+    fn register_return_status(&self, pane: &Pane) {
+        let Some(provider) = pane.pika_provider else {
+            return;
+        };
+        let Some(session_id) = pane.pika_session_id.as_deref() else {
+            return;
+        };
+        if let Some(crate::activity_feed::Context::Source(source)) = crate::activity_feed::current()
+            && source.register_return_interest(None, provider, session_id)
+        {
+            source.local_token(self);
+        }
     }
 
     fn return_binding<'a>(
@@ -752,6 +765,10 @@ impl Tmux {
 
     fn deliver_receipt(&self, client: Option<&str>, receipt: &str) -> ReceiptDelivery {
         // Cosmetic and client-scoped: failure cannot change the exact attach.
+        if let Some(crate::activity_feed::Context::Source(source)) = crate::activity_feed::current()
+        {
+            source.activate_observation();
+        }
         let _ = self.bind_board_summary(client);
         if let Some(client) = client
             && self
@@ -828,6 +845,60 @@ impl Tmux {
             }
             clients.insert(pid, (pane.to_owned(), context.token(self).to_owned()));
         }
+        let previous_plain = self.output(
+            [
+                "show-options",
+                "-qv",
+                "-t",
+                pane,
+                "@pika_return_plain_clients",
+            ],
+            false,
+        )?;
+        let mut plain: BTreeMap<u32, bool> = if previous_plain.stdout.len() <= 512 {
+            serde_json::from_slice(&previous_plain.stdout).unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        plain.retain(|client_pid, _| clients.contains_key(client_pid));
+        if clients.contains_key(&pid) {
+            plain.insert(pid, std::env::var_os("NO_COLOR").is_some());
+        }
+        let mut return_style = "default".to_owned();
+        let mut identities = BTreeMap::new();
+        for (client_pid, (client_pane, token)) in clients.iter().rev() {
+            // Tags belong to panes, not sessions. Read each relevant pane once;
+            // splitting a session cannot lend another pane its identity/color.
+            let identity = identities.entry(client_pane).or_insert_with(|| {
+                let read = |option: &str| {
+                    self.output(["show-options", "-pqv", "-t", client_pane, option], false)
+                        .ok()
+                        .filter(|output| output.status.success() && output.stdout.len() <= 256)
+                        .and_then(|output| String::from_utf8(output.stdout).ok())
+                        .map(|value| value.trim().to_owned())
+                };
+                read("@pika_provider")
+                    .and_then(|value| value.parse::<Provider>().ok())
+                    .zip(read("@pika_session_id"))
+            });
+            if let Some((provider, session_id)) = identity {
+                let Some(option) =
+                    crate::activity_feed::return_option_name(token, *provider, session_id)
+                else {
+                    continue;
+                };
+                let pane_number = client_pane.strip_prefix('%').unwrap_or_default();
+                let condition = format!(
+                    "#{{&&:#{{==:#{{client_pid}},{client_pid}}},#{{==:#{{pane_id}},#{{a:37}}{pane_number}}}}}"
+                );
+                let value = if plain.get(client_pid).copied().unwrap_or(false) {
+                    "default".to_owned()
+                } else {
+                    format!("#{{?{option},#{{T:{option}}},default}}")
+                };
+                return_style = format!("#{{?{condition},{value},{return_style}}}");
+            }
+        }
         let mut text = String::new();
         for (pid, (pane, token)) in &clients {
             // A literal %0 is consumed by strftime in status formats. Produce
@@ -848,6 +919,26 @@ impl Tmux {
             true,
         )?;
         self.output(
+            [
+                "set-option",
+                "-t",
+                pane,
+                "@pika_return_plain_clients",
+                &serde_json::to_string(&plain)?,
+            ],
+            true,
+        )?;
+        self.output(
+            [
+                "set-option",
+                "-t",
+                pane,
+                "@pika_return_style",
+                &return_style,
+            ],
+            true,
+        )?;
+        self.output(
             ["set-option", "-t", pane, "@pika_board_summary", &text],
             true,
         )?;
@@ -860,7 +951,21 @@ impl Tmux {
         token: &str,
         summary: Option<crate::activity_feed::Summary>,
     ) -> Result<()> {
+        self.publish_board_summary_with_statuses(token, summary, None)
+    }
+
+    pub(crate) fn publish_board_summary_with_statuses(
+        &self,
+        token: &str,
+        summary: Option<crate::activity_feed::Summary>,
+        statuses: Option<&[crate::activity_feed::ReturnStatus]>,
+    ) -> Result<()> {
         crate::activity_feed::token(token)?;
+        if summary.is_none() {
+            self.clear_return_statuses(token)?;
+        } else if let Some(statuses) = statuses {
+            self.publish_return_statuses(token, statuses)?;
+        }
         let option = format!("@pika_feed_{token}");
         if let Some(summary) = summary {
             let expires = std::time::SystemTime::now()
@@ -875,6 +980,109 @@ impl Tmux {
         } else {
             self.output(["set-option", "-gu", &option], false)?;
         }
+        Ok(())
+    }
+
+    fn return_keys_option(token: &str) -> String {
+        format!("@pika_return_keys_{token}")
+    }
+
+    fn known_return_keys(&self, token: &str) -> Vec<String> {
+        let option = Self::return_keys_option(token);
+        let prefix = format!("@pika_return_{token}_");
+        let Ok(output) = self.output(["show-options", "-gqv", &option], false) else {
+            return Vec::new();
+        };
+        if output.stdout.len() > 32 * 1024 {
+            return Vec::new();
+        }
+        serde_json::from_slice::<Vec<String>>(&output.stdout)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|key| {
+                let Some(rest) = key.strip_prefix(&prefix) else {
+                    return false;
+                };
+                let Some((provider, encoded)) = rest.split_once('_') else {
+                    return false;
+                };
+                matches!(provider, "codex" | "claude" | "opencode")
+                    && !encoded.is_empty()
+                    && encoded.len() <= 2 * 96
+                    && encoded.len().is_multiple_of(2)
+                    && encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .take(64)
+            .collect()
+    }
+
+    fn publish_return_statuses(
+        &self,
+        token: &str,
+        statuses: &[crate::activity_feed::ReturnStatus],
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 15;
+        let mut keys = self.known_return_keys(token);
+        for status in statuses.iter().take(64) {
+            let Some(option) = crate::activity_feed::return_option_name(
+                token,
+                status.provider,
+                &status.session_id,
+            ) else {
+                continue;
+            };
+            if !keys.contains(&option) && keys.len() >= 64 {
+                continue;
+            }
+            let value = status
+                .status
+                .filter(|_| status.colors && std::env::var_os("NO_COLOR").is_none())
+                .map_or_else(
+                    || "default".to_owned(),
+                    |status| {
+                        format!(
+                            "#{{?#{{<=:%s,{now}}},fg={},default}}",
+                            crate::activity_feed::return_bar_color(status)
+                        )
+                    },
+                );
+            self.output(["set-option", "-g", &option, &value], true)?;
+            if !keys.contains(&option) {
+                keys.push(option);
+            }
+        }
+        self.output(
+            [
+                "set-option",
+                "-g",
+                &Self::return_keys_option(token),
+                &serde_json::to_string(&keys)?,
+            ],
+            true,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn publish_return_status(
+        &self,
+        token: &str,
+        status: crate::activity_feed::ReturnStatus,
+    ) -> Result<()> {
+        self.publish_return_statuses(token, &[status])
+    }
+
+    fn clear_return_statuses(&self, token: &str) -> Result<()> {
+        for option in self.known_return_keys(token) {
+            self.output(["set-option", "-gu", &option], false)?;
+        }
+        self.output(
+            ["set-option", "-gu", &Self::return_keys_option(token)],
+            false,
+        )?;
         Ok(())
     }
 
@@ -1796,6 +2004,348 @@ mod tests {
         foreign.session_name = "my-own-session".into();
         assert!(tmux.configure_return_navigation(&foreign).is_err());
         assert_eq!(fs::read_to_string(&trace).unwrap(), calls);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn return_status_updates_are_bounded_leased_and_no_color_neutral() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("trace");
+        let tmux = tmux_fixture(
+            &temp,
+            &format!(
+                "printf '%s\\n' \"$*\" >> {}",
+                shell_words::quote(trace.to_str().unwrap())
+            ),
+        );
+        let token = "a".repeat(32);
+        let status = crate::activity_feed::ReturnStatus {
+            provider: Provider::Codex,
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+            status: Some(crate::model::Status::Ready),
+            colors: true,
+        };
+        tmux.publish_return_status(&token, status.clone()).unwrap();
+        let calls = fs::read_to_string(&trace).unwrap();
+        assert!(calls.contains("set-option -g @pika_return_"));
+        assert!(calls.contains("fg=green"));
+        assert!(calls.contains("%s"));
+        tmux.publish_return_status(
+            &token,
+            crate::activity_feed::ReturnStatus {
+                colors: false,
+                ..status
+            },
+        )
+        .unwrap();
+        let calls = fs::read_to_string(&trace).unwrap();
+        assert!(calls.lines().any(|line| line.ends_with(" default")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn return_style_keeps_same_pane_clients_on_their_exact_feed_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("trace");
+        let first = "a".repeat(32);
+        let second = "b".repeat(32);
+        let previous = serde_json::json!({
+            "12345": ["%1", first],
+            "54321": ["%1", "c".repeat(32)]
+        });
+        let plain = serde_json::json!({"54321": true});
+        let executable = temp.path().join("tmux-fixture");
+        let body = format!(
+            "printf '%s\\n' \"$*\" >> {}\ncase \"$*\" in\n*'list-clients -F '*) printf '/dev/fixture\\03712345\\037%%1\\n';;\n*'@pika_board_clients'*) printf '%s' {};;\n*'@pika_return_plain_clients'*) printf '%s' {};;\n*'@pika_provider'*) printf 'codex';;\n*'@pika_session_id'*) printf '11111111-1111-4111-8111-111111111111';;\nesac",
+            shell_words::quote(trace.to_str().unwrap()),
+            shell_words::quote(&previous.to_string()),
+            shell_words::quote(&plain.to_string())
+        );
+        fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let tmux = Tmux::with_executable(executable.to_string_lossy(), None);
+        crate::activity_feed::with(
+            Some(crate::activity_feed::Context::Remote(second.clone())),
+            || tmux.bind_board_summary(Some("/dev/fixture")),
+        )
+        .unwrap();
+        let calls = fs::read_to_string(trace).unwrap();
+        let second_key = crate::activity_feed::return_option_name(
+            &second,
+            Provider::Codex,
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        assert!(!calls.contains("@pika_return_cccccccccccccccccccccccccccccccc_codex_"));
+        assert!(calls.contains(&second_key));
+        assert!(calls.contains("@pika_return_style"));
+        assert!(
+            calls.contains("#{?#{&&:#{==:#{client_pid},54321},#{==:#{pane_id},#{a:37}1}},default,")
+        );
+        assert!(calls.contains("client_pid},12345"));
+        assert!(calls.contains("client_pid},54321"));
+    }
+
+    #[cfg(unix)]
+    struct IsolatedTmux(Tmux);
+
+    #[cfg(unix)]
+    impl IsolatedTmux {
+        fn new() -> Result<Self> {
+            let socket = format!("pika-return-{}", uuid::Uuid::new_v4().simple());
+            let tmux = Tmux::with_executable("tmux", Some(socket));
+            tmux.output(
+                [
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "pika-c-return-test",
+                    "/bin/sh",
+                ],
+                true,
+            )?;
+            Ok(Self(tmux))
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for IsolatedTmux {
+        fn drop(&mut self) {
+            let _ = self.0.output(["kill-server"], false);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_tmux_return_status_format_resolves_live_palette_and_neutral_expiry() {
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let server = IsolatedTmux::new().unwrap();
+        let tmux = &server.0;
+        let pane = String::from_utf8(
+            tmux.output(
+                [
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "pika-c-return-test",
+                    "#{pane_id}",
+                ],
+                true,
+            )
+            .unwrap()
+            .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let token = "d".repeat(32);
+        let option = crate::activity_feed::return_option_name(
+            &token,
+            Provider::Codex,
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let style = format!("#{{?{option},#{{T:{option}}},default}}");
+        let status_format = "#[#{?@pika_return_style,#{T:@pika_return_style},default},bold] ← Pika";
+        tmux.output(
+            ["set-option", "-t", &pane, "@pika_return_style", &style],
+            true,
+        )
+        .unwrap();
+        tmux.output(
+            ["set-option", "-t", &pane, "status-format[0]", status_format],
+            true,
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let set_status = |color: &str, expiry: u64| {
+            let value = format!("#{{?#{{<=:%s,{expiry}}},fg={color},default}}");
+            tmux.output(["set-option", "-g", &option, &value], true)
+                .unwrap();
+            String::from_utf8(
+                tmux.output(
+                    [
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &pane,
+                        "#{T:status-format[0]}",
+                    ],
+                    true,
+                )
+                .unwrap()
+                .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_owned()
+        };
+        let green = set_status("green", now + 30);
+        assert!(green.contains("#[fg=green,bold]"));
+        assert!(green.contains("Pika"));
+        let cyan = set_status("cyan", now + 30);
+        assert!(cyan.contains("#[fg=cyan,bold]"));
+        let expired = set_status("green", now.saturating_sub(1));
+        assert!(expired.contains("#[default,bold]"));
+        tmux.output(["set-option", "-gu", &option], true).unwrap();
+        let deleted = String::from_utf8(
+            tmux.output(
+                [
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &pane,
+                    "#{T:status-format[0]}",
+                ],
+                true,
+            )
+            .unwrap()
+            .stdout,
+        )
+        .unwrap();
+        assert!(deleted.contains("#[default,bold]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_tmux_binding_reads_pane_local_identity_for_the_exact_client() {
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let server = IsolatedTmux::new().unwrap();
+        let tmux = &server.0;
+        let pane_id = String::from_utf8(
+            tmux.output(
+                [
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "pika-c-return-test",
+                    "#{pane_id}",
+                ],
+                true,
+            )
+            .unwrap()
+            .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let session_id = "22222222-2222-4222-8222-222222222222";
+        tmux.output(
+            [
+                "set-option",
+                "-p",
+                "-t",
+                &pane_id,
+                "@pika_provider",
+                "codex",
+            ],
+            true,
+        )
+        .unwrap();
+        tmux.output(
+            [
+                "set-option",
+                "-p",
+                "-t",
+                &pane_id,
+                "@pika_session_id",
+                session_id,
+            ],
+            true,
+        )
+        .unwrap();
+        let pane = tmux
+            .list_panes()
+            .unwrap()
+            .into_iter()
+            .find(|pane| pane.pane_id == pane_id)
+            .unwrap();
+        tmux.configure_return_navigation(&pane).unwrap();
+
+        let mut client = tmux
+            .command()
+            .args(["-C", "attach-session", "-t", "pika-c-return-test"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let keepalive = client.stdin.take().unwrap();
+        let format = format!(
+            "#{{client_name}}{FORMAT_SEPARATOR}#{{client_pid}}{FORMAT_SEPARATOR}#{{pane_id}}"
+        );
+        let client_name = (0..200).find_map(|_| {
+            let output = tmux.output(["list-clients", "-F", &format], false).ok()?;
+            let name = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| tmux_fields(line).next().filter(|name| !name.is_empty()))
+                .map(str::to_owned);
+            if name.is_none() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            name
+        });
+        let client_name = client_name.unwrap_or_else(|| {
+            panic!(
+                "control-mode tmux client did not attach (status: {:?})",
+                client.try_wait().unwrap()
+            )
+        });
+        let token = "e".repeat(32);
+        crate::activity_feed::with(
+            Some(crate::activity_feed::Context::Remote(token.clone())),
+            || tmux.bind_board_summary(Some(&client_name)),
+        )
+        .unwrap();
+        tmux.publish_return_status(
+            &token,
+            crate::activity_feed::ReturnStatus {
+                provider: Provider::Codex,
+                session_id: session_id.into(),
+                status: Some(crate::model::Status::Ready),
+                colors: true,
+            },
+        )
+        .unwrap();
+        let expanded = String::from_utf8(
+            tmux.output(
+                [
+                    "display-message",
+                    "-p",
+                    "-c",
+                    &client_name,
+                    "#{T:status-format[0]}",
+                ],
+                true,
+            )
+            .unwrap()
+            .stdout,
+        )
+        .unwrap();
+        assert!(
+            expanded.contains("fg=green"),
+            "unexpected status: {expanded}"
+        );
+        drop(keepalive);
+        let _ = client.kill();
+        let _ = client.wait();
     }
 
     #[cfg(unix)]

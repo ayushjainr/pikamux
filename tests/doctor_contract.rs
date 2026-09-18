@@ -197,6 +197,37 @@ fn genuine_second_identity_is_reported_as_duplicate_and_outside() {
 }
 
 #[test]
+fn unproven_tagged_provider_is_mismatched_not_a_second_proven_owner() {
+    let (_temp, paths, store, binary, mut runtime) = commissioned_fixture();
+    runtime.panes.push(pane("%2", 20, None));
+    runtime
+        .processes
+        .insert(20, process(20, None, 20, &["zsh"]));
+    runtime.processes.insert(
+        21,
+        process(21, Some(20), 21, &["codex", "app-server", "--stdio"]),
+    );
+
+    let report = inspect_with_evidence(&paths, &store, &binary, &runtime, 100.0);
+    assert!(!report.safe_to_disconnect);
+    assert_eq!(report.recovery.exact_homes, 0);
+    assert_eq!(report.recovery.duplicates, 0);
+    assert_eq!(report.recovery.mismatched_homes, 1);
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| { check.code == "identity.mismatch" && check.level == CheckLevel::Error })
+    );
+    assert!(
+        !report
+            .checks
+            .iter()
+            .any(|check| check.code == "identity.duplicates")
+    );
+}
+
+#[test]
 fn missing_hook_observation_and_unsafe_permissions_block_certificate() {
     let (_temp, paths, store, binary, runtime) = commissioned_fixture();
     store

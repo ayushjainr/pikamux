@@ -34,6 +34,12 @@ failure behind a successful-looking attachment.
   short UUID fingerprint. Full identity evidence is available through `d`.
 - Exact/protected language requires current UUID-to-PID pane evidence. Tags,
   attachment, and liveness alone never earn it.
+- Pane selection follows the proven conversation owner, not the last
+  provider-looking descendant. A helper process cannot displace its parent
+  conversation's owner. Inert duplicate pane labels cannot veto a unique
+  proven live home; competing live or uncertain ownership still fails closed.
+  Reconciliation, exact actions, and diagnostics use the same selection rules.
+  Selection does not erase stale labels or stop any process.
 - Provider launcher/native-child aliases count as one logical client. Shared
   app-server hook leases are advisory when direct UUID-bearing client evidence
   exists; distinct UUID-bearing process trees remain `OPEN TWICE`.
@@ -154,6 +160,13 @@ freshly checking identity on the next opening. Separate Windows agent windows
 close their attachment and leave the original board running; native window
 focus remains the terminal/OS's responsibility.
 
+The return label's color belongs to the exact conversation currently open, not
+the board's aggregate attention count. It follows the board's status palette
+through the shared activity service. Missing, stale, or expired status is neutral;
+`NO_COLOR` remains authoritative. Standalone interactive openings reuse that
+same producer for the attachment lifetime, while board-originated openings keep
+their existing subscription. A label never owns a second observer.
+
 An activity service owns local/fleet observation and publishes revisioned
 snapshots independently of terminal views. The board and return strip consume
 the same four counts and color setting, including the shared filter and remote
@@ -167,14 +180,22 @@ opening warnings use `⚠ name · reason` (`open twice`, `error`, or `outside Pi
 Counts and suffix share the same attention categories, without implying that an
 ownership problem is an agent-authored question. It uses the winning event
 time with an immutable-identity tie-breaker, never row order or cache refresh time.
-READY, pending launches and stale rows cannot become this label.
+If no eligible NEEDS YOU item exists, the newest READY item becomes the suffix,
+visually distinguished from an attention request. It uses the identical filter,
+event-time ordering and immutable-identity tie-breaker. Pending launches and
+stale rows cannot become either suffix.
 It remains until resolved or superseded; no animation or extra observation is
 needed. Narrow clients shorten the label, then omit it before navigation/counts.
 There is no second inventory on the destination. Across SSH, one service-owned
 stream per destination sends bounded counts and, with `board-feed-v2`, an inert
 request name; `board-feed-v3` additionally carries an allowlisted warning kind to an exact-node-verified
-endpoint. Its random feed identity is bound to the exact tmux client and pane;
-concurrent boards cannot borrow each other's counts. Heartbeats renew a
+endpoint. `board-feed-v4` adds the typed READY suffix; older peers omit that
+suffix without losing counts or attention requests. Peers advertising
+`return-bar-status-v1` also receive bounded typed
+status frames for explicitly opened identities on that destination, over the
+same stream. These frames carry no transcript or executable format. Its random
+feed identity is bound to the exact tmux client and pane; concurrent boards
+cannot borrow each other's counts or current-conversation color. Heartbeats renew a
 15-second display lease; an absent or expired feed says `Board disconnected`,
 not frozen live counts. Dropping one view does not stop other subscribers;
 dropping the last subscription stops owned observers and streams, while agents

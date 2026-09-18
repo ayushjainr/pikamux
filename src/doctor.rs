@@ -405,6 +405,17 @@ fn inspect_identity(
             .collect();
         let direct = direct_identity_pids(session, &evidence.processes);
         let mut identities = direct.clone();
+        let recovery_owner = store
+            .get_recovery_owner(session.provider, &session.session_id)
+            .ok()
+            .flatten()
+            .filter(|owner| {
+                evidence.processes.get(&owner.pid).is_some_and(|record| {
+                    u64::try_from(owner.start_time).ok() == Some(record.start_time)
+                        && record.provider() == Some(session.provider)
+                }) && store.get_launch_binding(&owner.launch_token).ok().flatten()
+                    == Some((session.provider, session.session_id.clone()))
+            });
         if let Ok(owners) = store.live_owners(session.provider, &session.session_id) {
             for owner in owners {
                 let Some(record) = evidence.processes.get(&owner.pid) else {
@@ -418,48 +429,46 @@ fn inspect_identity(
                 if valid_generation
                     && record.provider() == Some(session.provider)
                     && !expired_shared
+                    && !(session.provider == Provider::Codex
+                        && (!direct.is_empty() || recovery_owner.is_some())
+                        && process::shared_provider_process(record, session.provider))
                 {
                     identities.insert(owner.pid);
                 }
             }
         }
-        if let Ok(Some(owner)) = store.get_recovery_owner(session.provider, &session.session_id) {
-            let valid = evidence.processes.get(&owner.pid).is_some_and(|record| {
-                u64::try_from(owner.start_time).ok() == Some(record.start_time)
-                    && record.provider() == Some(session.provider)
-            }) && store.get_launch_binding(&owner.launch_token).ok().flatten()
-                == Some((session.provider, session.session_id.clone()));
-            if valid {
-                identities.insert(owner.pid);
-            }
+        if let Some(owner) = &recovery_owner {
+            identities.insert(owner.pid);
         }
-        let outside_pids: BTreeSet<_> = identities.difference(&owned).copied().collect();
-        let candidate_panes: Vec<_> = tagged
-            .iter()
-            .filter(|pane| {
-                process::provider_process(
-                    pane.pane_pid,
-                    Some(session.provider),
-                    &evidence.processes,
-                )
-                .is_some_and(|pid| identities.contains(&pid))
-            })
+        identities = process::canonical_identity_pids(&identities, &evidence.processes)
+            .into_iter()
             .collect();
-        for pane in &tagged {
-            let expected = process::provider_process(
-                pane.pane_pid,
-                Some(session.provider),
-                &evidence.processes,
-            );
-            if expected.is_none_or(|pid| !identities.contains(&pid)) {
-                mismatched.push(subject.clone());
-            }
+        let outside_pids: BTreeSet<_> = identities.difference(&owned).copied().collect();
+        let pane_selection = process::identity_pane_candidates(
+            tagged.iter().copied(),
+            session.provider,
+            &identities,
+            &evidence.processes,
+            |pid, pane| {
+                direct.contains(&pid)
+                    || recovery_owner.as_ref().is_some_and(|owner| {
+                        owner.pid == pid
+                            && pane.pika_launch_token.as_deref()
+                                == Some(owner.launch_token.as_str())
+                    })
+            },
+        );
+        let candidate_panes = pane_selection.candidates;
+        let ambiguous_provider = pane_selection.ambiguous_provider;
+        if ambiguous_provider || pane_selection.incomplete_root {
+            mismatched.push(subject.clone());
         }
         let duplicate = identities.len() > 1
             || candidate_panes.len() > 1
-            || tagged.len() > 1
             || (!candidate_panes.is_empty() && !outside_pids.is_empty());
         let exact = !duplicate
+            && !ambiguous_provider
+            && !pane_selection.incomplete_root
             && candidate_panes.len() == 1
             && outside_pids.is_empty()
             && !identities.is_empty();

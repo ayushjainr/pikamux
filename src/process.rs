@@ -1,8 +1,9 @@
-use crate::model::Provider;
+use crate::model::{Pane, Provider};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::time::Duration;
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ObservationState {
@@ -356,6 +357,115 @@ pub fn provider_process(
             .and_then(ProcessRecord::provider)
             .is_some_and(|found| provider.is_none_or(|expected| found == expected))
     })
+}
+
+/// Select identity-proven provider processes in tagged pane trees. Generic
+/// provider descendants are not identity proof: callers provide the validated
+/// owner set and a predicate for UUID or launch-certificate proof. A provider
+/// descendant of the proven owner may be a helper; an unrelated provider
+/// process is reported as ambiguous. Shell-only stale tags remain inert.
+#[derive(Debug)]
+pub struct IdentityPaneSelection<'a> {
+    pub candidates: Vec<(&'a Pane, i64)>,
+    pub ambiguous_provider: bool,
+    pub incomplete_root: bool,
+}
+
+pub fn identity_pane_candidates<'a, I, F>(
+    panes: I,
+    provider: Provider,
+    identity_pids: &BTreeSet<i64>,
+    processes: &BTreeMap<i64, ProcessRecord>,
+    mut proves_pane: F,
+) -> IdentityPaneSelection<'a>
+where
+    I: IntoIterator<Item = &'a Pane>,
+    F: FnMut(i64, &Pane) -> bool,
+{
+    let mut candidates = Vec::new();
+    let mut ambiguous_provider = false;
+    let mut incomplete_root = false;
+    for pane in panes {
+        if !processes.contains_key(&pane.pane_pid) {
+            incomplete_root = true;
+            continue;
+        }
+        let tree: BTreeSet<i64> = process_tree(pane.pane_pid, processes).into_iter().collect();
+        let provider_pids = tree
+            .iter()
+            .copied()
+            .filter(|pid| processes.get(pid).and_then(ProcessRecord::provider) == Some(provider))
+            .collect::<Vec<_>>();
+        let proven = identity_pids
+            .iter()
+            .copied()
+            .find(|pid| tree.contains(pid) && proves_pane(*pid, pane));
+        match proven {
+            Some(provider_pid) => {
+                if provider_pids.iter().copied().any(|pid| {
+                    pid != provider_pid
+                        && !is_provider_helper(pid, provider_pid, pane.pane_pid, processes)
+                }) {
+                    ambiguous_provider = true;
+                }
+                candidates.push((pane, provider_pid));
+            }
+            None if !provider_pids.is_empty() => {
+                ambiguous_provider = true;
+            }
+            None => {}
+        }
+    }
+    IdentityPaneSelection {
+        candidates,
+        ambiguous_provider,
+        incomplete_root,
+    }
+}
+
+fn is_provider_helper(
+    provider_pid: i64,
+    owner_pid: i64,
+    root: i64,
+    processes: &BTreeMap<i64, ProcessRecord>,
+) -> bool {
+    fn reaches(
+        mut current: i64,
+        target: i64,
+        root: i64,
+        processes: &BTreeMap<i64, ProcessRecord>,
+    ) -> bool {
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert(current) {
+                return false;
+            }
+            if current == target {
+                return true;
+            }
+            if current == root {
+                return false;
+            }
+            let Some(parent) = processes.get(&current).and_then(|record| record.parent_pid) else {
+                return false;
+            };
+            current = parent;
+        }
+    }
+
+    if runtime_launcher_generation(owner_pid, processes)
+        .is_some_and(|launcher| launcher.pid == provider_pid)
+    {
+        return true;
+    }
+    let Some(record) = processes.get(&provider_pid) else {
+        return false;
+    };
+    !record
+        .argv
+        .iter()
+        .any(|argument| Uuid::parse_str(argument).is_ok())
+        && reaches(provider_pid, owner_pid, root, processes)
 }
 
 /// Walk toward the terminal-owning provider process that launched a hook.
@@ -791,6 +901,25 @@ mod tests {
         }
     }
 
+    fn pane(pid: i64, id: &str) -> Pane {
+        Pane {
+            session_name: "pika-test".into(),
+            pane_id: id.into(),
+            pane_pid: pid,
+            cwd: "/tmp".into(),
+            current_command: "sh".into(),
+            attached: false,
+            dead: false,
+            dead_status: None,
+            activity: 0.0,
+            created: 1.0,
+            pika_provider: Some(Provider::Codex),
+            pika_session_id: Some("target".into()),
+            pika_name: Some("target".into()),
+            pika_launch_token: None,
+        }
+    }
+
     #[test]
     fn launcher_and_native_child_are_one_identity() {
         let records = BTreeMap::from([
@@ -830,6 +959,119 @@ mod tests {
                 vec![1, 2]
             );
         }
+    }
+
+    #[test]
+    fn identity_pane_selection_uses_uuid_owner_not_nested_provider_helper() {
+        let processes = BTreeMap::from([
+            (1, record(1, None, &["sh"])),
+            (2, record(2, Some(1), &["codex", "resume", "target"])),
+            (3, record(3, Some(2), &["codex", "app-server", "--stdio"])),
+        ]);
+        let panes = [pane(1, "%1")];
+        let selection = identity_pane_candidates(
+            panes.iter(),
+            Provider::Codex,
+            &BTreeSet::from([2]),
+            &processes,
+            |pid, _| pid == 2,
+        );
+        assert_eq!(selection.candidates.len(), 1);
+        assert_eq!(selection.candidates[0].1, 2);
+        assert!(!selection.ambiguous_provider);
+    }
+
+    #[test]
+    fn identity_pane_selection_rejects_unproven_sibling_provider() {
+        let processes = BTreeMap::from([
+            (1, record(1, None, &["sh"])),
+            (2, record(2, Some(1), &["codex", "resume", "target"])),
+            (3, record(3, Some(1), &["codex", "resume", "other"])),
+        ]);
+        let panes = [pane(1, "%1")];
+        let selection = identity_pane_candidates(
+            panes.iter(),
+            Provider::Codex,
+            &BTreeSet::from([2]),
+            &processes,
+            |pid, _| pid == 2,
+        );
+        assert_eq!(selection.candidates.len(), 1);
+        assert!(selection.ambiguous_provider);
+    }
+
+    #[test]
+    fn identity_pane_selection_rejects_native_codex_parent_with_other_uuid() {
+        let processes = BTreeMap::from([
+            (1, record(1, None, &["sh"])),
+            (2, record(2, Some(1), &["codex", "resume", "other"])),
+            (3, record(3, Some(2), &["codex", "resume", "target"])),
+        ]);
+        let panes = [pane(1, "%1")];
+        let selection = identity_pane_candidates(
+            panes.iter(),
+            Provider::Codex,
+            &BTreeSet::from([3]),
+            &processes,
+            |pid, _| pid == 3,
+        );
+        assert_eq!(selection.candidates.len(), 1);
+        assert!(selection.ambiguous_provider);
+    }
+
+    #[test]
+    fn identity_pane_selection_rejects_nested_provider_with_other_uuid() {
+        let processes = BTreeMap::from([
+            (1, record(1, None, &["sh"])),
+            (2, record(2, Some(1), &["codex", "resume", "target"])),
+            (
+                3,
+                record(
+                    3,
+                    Some(2),
+                    &["codex", "exec", "22222222-2222-4222-8222-222222222222"],
+                ),
+            ),
+        ]);
+        let panes = [pane(1, "%1")];
+        let selection = identity_pane_candidates(
+            panes.iter(),
+            Provider::Codex,
+            &BTreeSet::from([2]),
+            &processes,
+            |pid, _| pid == 2,
+        );
+        assert_eq!(selection.candidates.len(), 1);
+        assert!(selection.ambiguous_provider);
+    }
+
+    #[test]
+    fn identity_pane_selection_ignores_shell_only_stale_tag() {
+        let processes = BTreeMap::from([(1, record(1, None, &["sh"]))]);
+        let panes = [pane(1, "%stale")];
+        let selection = identity_pane_candidates(
+            panes.iter(),
+            Provider::Codex,
+            &BTreeSet::new(),
+            &processes,
+            |_, _| false,
+        );
+        assert!(selection.candidates.is_empty());
+        assert!(!selection.ambiguous_provider);
+    }
+
+    #[test]
+    fn identity_pane_selection_reports_missing_pane_root() {
+        let panes = [pane(99, "%missing")];
+        let selection = identity_pane_candidates(
+            panes.iter(),
+            Provider::Codex,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            |_, _| false,
+        );
+        assert!(selection.candidates.is_empty());
+        assert!(selection.incomplete_root);
     }
 
     #[test]

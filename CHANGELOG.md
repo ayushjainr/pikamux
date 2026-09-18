@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.24 — Reliable returns, live status
+
+- Reopen the verified running conversation even when an old shell retains
+  duplicate Pika labels. Keep stale shells and agent processes untouched.
+- Identify the conversation's actual owner instead of a nested provider helper;
+  continue blocking genuine duplicates and incomplete identity evidence.
+- Match the return bar's Pika label to the current conversation's status using
+  the shared activity feed, with neutral styling when fresh status is unavailable.
+- Show the newest ready conversation in the return bar when nothing needs
+  attention, using the same filtering and selection rules.
+- Distinguish uncertain ownership from multiple proven owners in diagnostics.
+
 ## 0.6.23 — Keep the consultation skill current
 
 - Refresh the installed agent-convo skill after an approved macOS/Linux binary

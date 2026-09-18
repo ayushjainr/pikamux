@@ -25,10 +25,22 @@ fn now() -> f64 {
         .as_secs_f64()
 }
 pub(crate) fn start(pika: &Pika) -> Result<crate::activity_feed::Source> {
+    start_with_mode(pika, false)
+}
+
+pub(crate) fn start_for_open(pika: &Pika) -> Result<crate::activity_feed::Source> {
+    start_with_mode(pika, true)
+}
+
+fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activity_feed::Source> {
     // Paint all bounded durable state immediately, including offline fleet
     // rows. No provider, process, tmux, or SSH observation belongs here.
     let (cached, initial_fleet_health) = board_items(pika)?;
     let summary_source = crate::activity_feed::Source::default();
+    if wait_for_handoff {
+        summary_source.pause_observation();
+    }
+    let observation_enabled = summary_source.observation_gate();
     let summary_worker = summary_source.publisher();
     summary_worker.publish(cached, initial_fleet_health);
     let (refresh_sender, refresh_receiver) = mpsc::sync_channel(1);
@@ -43,7 +55,25 @@ pub(crate) fn start(pika: &Pika) -> Result<crate::activity_feed::Source> {
         let mut store_changes = worker.store.change_watcher().ok();
         let mut next_reconcile = Instant::now();
         let mut consecutive_failures = 0;
+        let mut observing = !wait_for_handoff;
         while !worker_stop.load(Ordering::Relaxed) {
+            if !observation_enabled.load(Ordering::Acquire) {
+                if refresh_receiver.recv_timeout(Duration::from_millis(500))
+                    == Err(mpsc::RecvTimeoutError::Disconnected)
+                {
+                    break;
+                }
+                continue;
+            }
+            if !observing {
+                // The exact open already reconciled. Reuse its committed state
+                // instead of racing it with another provider/process sweep.
+                if let Ok((items, health)) = board_items(&worker) {
+                    summary_worker.publish(items, health);
+                }
+                next_reconcile = Instant::now() + LOCAL_RECONCILE_INTERVAL;
+                observing = true;
+            }
             if Instant::now() >= next_reconcile {
                 let refresh = worker.reconcile_local().and_then(|_| board_items(&worker));
                 worker_refresh_delayed.store(
@@ -91,8 +121,13 @@ pub(crate) fn start(pika: &Pika) -> Result<crate::activity_feed::Source> {
     let remote_cancel = CancellationToken::default();
     let worker_remote_cancel = remote_cancel.clone();
     let remote_worker = pika.clone();
+    let remote_enabled = summary_source.observation_gate();
     let remote_refresh = thread::spawn(move || {
         while !remote_stop.load(Ordering::Relaxed) && !worker_remote_cancel.is_cancelled() {
+            if !remote_enabled.load(Ordering::Acquire) {
+                thread::park_timeout(Duration::from_secs(1));
+                continue;
+            }
             let manager = FleetManager::new(&remote_worker.store, SshTransport::default());
             if let Ok(nodes) = manager.nodes()
                 && let Some(node) = fleet::next_remote_node(&nodes, None, now(), false)
@@ -433,5 +468,169 @@ mod board_refresh_tests {
             .put_remote_snapshot(node_id, &serde_json::json!({"sessions": []}), 2.0)
             .unwrap();
         assert!(fleet_node_health(&store).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod open_observer_tests {
+    use super::start_for_open;
+    use crate::{
+        config::Config,
+        core::{Pika, session_from_candidate},
+        model::{Candidate, Provider, Status},
+        paths::Paths,
+        store::Store,
+        tmux::Tmux,
+    };
+    use std::{
+        fs,
+        path::Path,
+        sync::atomic::Ordering,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn test_pika(root: &Path, tmux_log: &Path) -> Pika {
+        let paths = Paths {
+            config_dir: root.join("config"),
+            state_dir: root.join("state"),
+            config: root.join("config/config.json"),
+            database: root.join("state/pika.db"),
+            codex_home: root.join("codex"),
+            claude_home: root.join("claude"),
+            opencode_data_home: root.join("opencode-data"),
+            opencode_config_home: root.join("opencode-config"),
+        };
+        for path in [
+            &paths.config_dir,
+            &paths.state_dir,
+            &paths.codex_home,
+            &paths.claude_home,
+            &paths.opencode_data_home,
+            &paths.opencode_config_home,
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let store = Store::at(paths.database.clone());
+        store.initialize().unwrap();
+        let tmux = fake_tmux(root, tmux_log);
+        Pika::with_components(paths, Config::default(), store, tmux)
+    }
+
+    fn fake_tmux(root: &Path, log: &Path) -> Tmux {
+        let executable = root.join("fake-tmux");
+        let log_path = log.to_string_lossy();
+        let quoted = shell_words::quote(&log_path);
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted}\nif [ \"$1\" = \"-V\" ]; then printf 'tmux 3.7\\n'; fi\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        Tmux::with_executable(executable.to_string_lossy(), None)
+    }
+
+    fn committed_session() -> crate::model::Session {
+        session_from_candidate(&Candidate {
+            provider: Provider::Codex,
+            session_id: "open-gate-committed".into(),
+            name: Some("open-gate-committed".into()),
+            cwd: Some("/tmp".into()),
+            branch: None,
+            transcript_path: None,
+            model: None,
+            updated_at: 1.0,
+            live: false,
+            pid: None,
+            source: "test".into(),
+            parent_session_id: None,
+            created_at: 1.0,
+            lifecycle_status: Some(Status::Ready),
+        })
+    }
+
+    fn wait_until(deadline: Instant, condition: impl Fn() -> bool) {
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "condition was not observed in time"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn paused_open_observer_does_not_observe_before_handoff() {
+        let root = tempfile::tempdir().unwrap();
+        let tmux_log = root.path().join("tmux.log");
+        let pika = test_pika(root.path(), &tmux_log);
+        let source = start_for_open(&pika).unwrap();
+
+        assert!(!source.observation_gate().load(Ordering::Acquire));
+        thread::sleep(Duration::from_millis(100));
+        assert!(!tmux_log.exists() || fs::read_to_string(&tmux_log).unwrap().is_empty());
+
+        let before_activation_revision = source.snapshot().unwrap().revision;
+        source.activate_observation();
+        wait_until(Instant::now() + Duration::from_secs(2), || {
+            source
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.revision > before_activation_revision)
+        });
+        source.refresh().try_send(()).unwrap();
+        wait_until(Instant::now() + Duration::from_secs(2), || {
+            fs::read_to_string(&tmux_log)
+                .unwrap_or_default()
+                .contains("list-panes")
+        });
+        drop(source);
+    }
+
+    #[test]
+    fn paused_open_reuses_action_commit_without_an_immediate_reconcile() {
+        let root = tempfile::tempdir().unwrap();
+        let tmux_log = root.path().join("tmux.log");
+        let pika = test_pika(root.path(), &tmux_log);
+        let source = start_for_open(&pika).unwrap();
+
+        pika.store
+            .upsert_session(&committed_session(), false)
+            .unwrap();
+        source.activate_observation();
+        wait_until(Instant::now() + Duration::from_secs(2), || {
+            source.snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .items
+                    .iter()
+                    .any(|item| item.session.session_id == "open-gate-committed")
+            })
+        });
+
+        // Activation republishes the action's committed cache, but does not
+        // immediately launch the normal provider/process/tmux sweep.
+        thread::sleep(Duration::from_millis(100));
+        assert!(!tmux_log.exists() || fs::read_to_string(&tmux_log).unwrap().is_empty());
+        drop(source);
+    }
+
+    #[test]
+    fn dropping_a_paused_open_observer_is_bounded_and_safe() {
+        let root = tempfile::tempdir().unwrap();
+        let tmux_log = root.path().join("tmux.log");
+        let pika = test_pika(root.path(), &tmux_log);
+        let source = start_for_open(&pika).unwrap();
+        let started = Instant::now();
+
+        drop(source);
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(100));
+        assert!(!tmux_log.exists() || fs::read_to_string(&tmux_log).unwrap().is_empty());
     }
 }

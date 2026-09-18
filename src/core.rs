@@ -536,16 +536,16 @@ impl Pika {
         let owners = identity_owners(session, processes, ledger, timestamp)?;
         let identities = owners.pids();
         let outside: Vec<i64> = identities.difference(&owned).copied().collect();
-        let candidate_panes: Vec<(&Pane, i64)> = tagged
-            .iter()
-            .filter_map(|pane| {
-                let provider_pid =
-                    process::provider_process(pane.pane_pid, Some(session.provider), processes)?;
-                owners
-                    .proves_pane(provider_pid, pane)
-                    .then_some((*pane, provider_pid))
-            })
-            .collect();
+        let pane_selection = process::identity_pane_candidates(
+            tagged.iter().copied(),
+            session.provider,
+            &identities,
+            processes,
+            |pid, pane| owners.proves_pane(pid, pane),
+        );
+        let candidate_panes = pane_selection.candidates;
+        let ambiguous_provider = pane_selection.ambiguous_provider;
+        let incomplete_root = pane_selection.incomplete_root;
 
         let safety = if !continuation_conflicts.is_empty()
             || identities.len() > 1
@@ -553,6 +553,8 @@ impl Pika {
             || (!candidate_panes.is_empty() && !outside.is_empty())
         {
             Some(Status::OpenTwice)
+        } else if ambiguous_provider || incomplete_root {
+            Some(Status::Error)
         } else {
             None
         };
@@ -568,8 +570,12 @@ impl Pika {
         };
         session.live = exact.is_some() || !outside.is_empty();
         session.attached = exact.is_some_and(|(pane, _)| pane.attached);
-        session.home_state = if safety.is_some() {
+        session.home_state = if safety == Some(Status::OpenTwice) {
             "open_twice"
+        } else if ambiguous_provider {
+            "identity_unproven"
+        } else if incomplete_root {
+            "identity_incomplete"
         } else if exact.is_some() {
             "exact"
         } else if !outside.is_empty() {
@@ -601,7 +607,11 @@ impl Pika {
 
         let mut observations = ledger.status_observations(session.provider, &session.session_id)?;
         if let Some(status) = safety {
-            let error = if continuation_conflicts.is_empty() {
+            let error = if incomplete_root {
+                "a tagged pane's process root was missing from the complete observation".into()
+            } else if ambiguous_provider {
+                "a tagged pane contains an unverified live provider process".into()
+            } else if continuation_conflicts.is_empty() {
                 "the exact conversation has more than one live owner".into()
             } else {
                 format!(
@@ -665,6 +675,15 @@ impl Pika {
                         .join(", ")
                 )
             });
+        } else if ambiguous_provider {
+            session.attention_reason = Some("identity".into());
+            session.error =
+                Some("a tagged pane contains an unverified live provider process".into());
+        } else if incomplete_root {
+            session.attention_reason = Some("identity".into());
+            session.error = Some(
+                "a tagged pane's process root was missing from the complete observation".into(),
+            );
         }
         Ok(())
     }
@@ -918,24 +937,11 @@ impl Pika {
                     && pane.pika_session_id.as_deref() == Some(&session.session_id)
             })
             .collect::<Vec<_>>();
-        if matches.len() != 1
-            || expected_pane.is_some_and(|expected| matches[0].pane_id != expected)
-        {
+        if matches.is_empty() {
             bail!(
-                "Pika cannot bind one exact pane to {} {} (found {}). No pane action was performed.",
+                "Pika cannot bind one exact pane to {} {} (found 0). No pane action was performed.",
                 session.provider,
                 session.session_id,
-                matches.len()
-            );
-        }
-        let pane = matches[0];
-        let pane_generation = processes
-            .get(&pane.pane_pid)
-            .map(ProcessRecord::generation)
-            .context("the tmux pane root disappeared from the complete observation")?;
-        if process::process_generation(pane.pane_pid) != Some(pane_generation) {
-            bail!(
-                "the tmux pane root generation changed after observation; no pane action was performed"
             );
         }
         let owners = self
@@ -956,18 +962,113 @@ impl Pika {
                 shell_words::quote(&format!("{}:{}", session.provider, session.session_id)),
             );
         }
-        if identity_pids.len() != 1 {
+        let pane_selection = process::identity_pane_candidates(
+            matches.iter().copied(),
+            session.provider,
+            &identity_pids,
+            processes,
+            |pid, pane| owners.proves_pane(pid, pane),
+        );
+        let candidate_panes = pane_selection.candidates;
+        let ambiguous_provider = pane_selection.ambiguous_provider;
+        let incomplete_root = pane_selection.incomplete_root;
+        if incomplete_root {
             bail!(
-                "Pika cannot bind the pane to one exact {} process (found {}). No pane action was performed.",
+                "Pika could not verify every tagged pane's process root for {} {}; no pane action was performed.",
                 session.provider,
-                identity_pids.len()
+                session.session_id
             );
         }
-        let provider_pid = *identity_pids.first().expect("one identity PID");
-        if !owners.proves_pane(provider_pid, pane) {
+        if ambiguous_provider {
             bail!(
-                "the exact pane has no UUID argv or matching certified launch generation; no pane action was performed"
+                "Pika found an unverified live {} process in a tagged pane competing with the exact identity; no pane action was performed.",
+                session.provider
             );
+        }
+        if candidate_panes.len() != 1 {
+            bail!(
+                "Pika cannot bind one exact pane to {} {} (found {}). No pane action was performed.",
+                session.provider,
+                session.session_id,
+                candidate_panes.len()
+            );
+        }
+        let (pane, provider_pid) = candidate_panes[0];
+        if expected_pane.is_some_and(|expected| pane.pane_id != expected) {
+            bail!(
+                "Pika cannot bind the expected exact pane {} to {} {}. No pane action was performed.",
+                expected_pane.unwrap_or_default(),
+                session.provider,
+                session.session_id,
+            );
+        }
+        let pane_generation = processes
+            .get(&pane.pane_pid)
+            .map(ProcessRecord::generation)
+            .context("the tmux pane root disappeared from the complete observation")?;
+        if process::process_generation(pane.pane_pid) != Some(pane_generation) {
+            bail!(
+                "the tmux pane root generation changed after observation; no pane action was performed"
+            );
+        }
+        let ignored = matches
+            .iter()
+            .copied()
+            .filter(|other| other.pane_id != pane.pane_id)
+            .collect::<Vec<_>>();
+        if !ignored.is_empty() {
+            let fresh_observation = self.observe_processes();
+            let fresh_processes = require_complete_processes(
+                &fresh_observation,
+                "recheck ignored tagged panes before an exact action",
+            )?;
+            if fresh_processes
+                .get(&provider_pid)
+                .map(ProcessRecord::generation)
+                != processes.get(&provider_pid).map(ProcessRecord::generation)
+            {
+                bail!(
+                    "the exact provider generation changed while ignored tagged panes were rechecked; no pane action was performed"
+                );
+            }
+            for ignored_pane in ignored {
+                let fresh = self
+                    .tmux
+                    .get_pane(&ignored_pane.pane_id)?
+                    .context("an ignored tagged pane disappeared during identity recheck")?;
+                if !same_pane_generation(ignored_pane, &fresh)
+                    || fresh.pika_provider != Some(session.provider)
+                    || fresh.pika_session_id.as_deref() != Some(&session.session_id)
+                    || fresh.pika_launch_token != ignored_pane.pika_launch_token
+                {
+                    bail!(
+                        "an ignored tagged pane changed during identity recheck; no pane action was performed"
+                    );
+                }
+                let fresh_root = fresh_processes
+                    .get(&fresh.pane_pid)
+                    .map(ProcessRecord::generation)
+                    .context("an ignored tagged pane root disappeared during identity recheck")?;
+                let ignored_generation = processes
+                    .get(&ignored_pane.pane_pid)
+                    .map(ProcessRecord::generation)
+                    .context("an ignored tagged pane root disappeared after observation")?;
+                if fresh_root != ignored_generation {
+                    bail!(
+                        "an ignored tagged pane process generation changed during identity recheck; no pane action was performed"
+                    );
+                }
+                let tree = process::process_tree_generation(fresh_root, fresh_processes);
+                if tree.iter().any(|pid| {
+                    fresh_processes.get(pid).and_then(ProcessRecord::provider)
+                        == Some(session.provider)
+                }) {
+                    bail!(
+                        "an ignored tagged pane acquired a live {} process; no pane action was performed",
+                        session.provider
+                    );
+                }
+            }
         }
         let tree = process::process_tree_generation(pane_generation, processes);
         if !tree.contains(&provider_pid) {
@@ -1114,6 +1215,15 @@ impl Pika {
                 session.provider,
                 shell_words::quote(&session.display_name())
             ))
+            .into());
+        }
+        if matches!(
+            session.home_state.as_str(),
+            "identity_unproven" | "identity_incomplete"
+        ) {
+            return Err(OpenError::Identity(
+                "Pika refused to resume because tagged-pane identity evidence is incomplete or unverified; inspect the panes and process ownership first.".into(),
+            )
             .into());
         }
         if session.has_exact_home() {
@@ -2912,6 +3022,129 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exact_binding_chooses_verified_pane_when_stale_duplicate_tag_is_shell_only() {
+        let (root, mut pika) = test_pika();
+        let identity = "15151515-1515-4151-8151-151515151515";
+        let provider_pid = i64::from(std::process::id());
+        let provider_start = process::process_start_time(provider_pid).unwrap();
+        let stale_child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let stale_pid = i64::from(stale_child.id());
+        let stale_start = process::process_start_time(stale_pid).unwrap();
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _stale_guard = Reap(stale_child);
+
+        let mut healthy = tagged_pane(identity);
+        healthy.pane_id = "%29".into();
+        healthy.pane_pid = provider_pid;
+        healthy.current_command = "codex".into();
+        let mut stale = tagged_pane(identity);
+        stale.pane_id = "%stale".into();
+        stale.pane_pid = stale_pid;
+        stale.current_command = "zsh".into();
+        pika.tmux = fixture_tmux(root.path(), &[healthy.clone(), stale]);
+        pika.process_observer = Arc::new(move || {
+            ProcessObservation::complete(BTreeMap::from([
+                (
+                    provider_pid,
+                    record(
+                        provider_pid,
+                        None,
+                        provider_start,
+                        &["codex", "resume", identity],
+                    ),
+                ),
+                (stale_pid, record(stale_pid, None, stale_start, &["zsh"])),
+            ]))
+        });
+        let session = test_session(identity);
+        pika.store.upsert_session(&session, false).unwrap();
+
+        let binding = pika.exact_pane_binding(&session, Some("%29")).unwrap();
+        assert_eq!(binding.pane.pane_id, "%29");
+        assert_eq!(binding.provider_pid, provider_pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_binding_rechecks_ignored_tag_before_accepting_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (root, mut pika) = test_pika();
+        let identity = "16161616-1616-4161-8161-161616161616";
+        let provider_pid = i64::from(std::process::id());
+        let provider_start = process::process_start_time(provider_pid).unwrap();
+        let stale_child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let stale_pid = i64::from(stale_child.id());
+        let stale_start = process::process_start_time(stale_pid).unwrap();
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _stale_guard = Reap(stale_child);
+
+        let mut healthy = tagged_pane(identity);
+        healthy.pane_id = "%29".into();
+        healthy.pane_pid = provider_pid;
+        let mut stale = tagged_pane(identity);
+        stale.pane_id = "%stale".into();
+        stale.pane_pid = stale_pid;
+        stale.current_command = "zsh".into();
+        pika.tmux = fixture_tmux(root.path(), &[healthy, stale]);
+        let phase = Arc::new(AtomicUsize::new(0));
+        let observed_phase = Arc::clone(&phase);
+        pika.process_observer = Arc::new(move || {
+            let mut records = BTreeMap::from([
+                (
+                    provider_pid,
+                    record(
+                        provider_pid,
+                        None,
+                        provider_start,
+                        &["codex", "resume", identity],
+                    ),
+                ),
+                (stale_pid, record(stale_pid, None, stale_start, &["zsh"])),
+            ]);
+            if observed_phase.fetch_add(1, Ordering::SeqCst) > 0 {
+                records.insert(
+                    stale_pid + 1,
+                    record(
+                        stale_pid + 1,
+                        Some(stale_pid),
+                        stale_start + 1,
+                        &["codex", "app-server", "--stdio"],
+                    ),
+                );
+            }
+            ProcessObservation::complete(records)
+        });
+        let session = test_session(identity);
+        pika.store.upsert_session(&session, false).unwrap();
+
+        let error = pika
+            .exact_pane_binding(&session, Some("%29"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("acquired a live codex process"), "{error}");
+    }
+
     fn continuation(identity: &str, parent: Option<&str>, updated_at: f64) -> Candidate {
         Candidate {
             provider: Provider::Codex,
@@ -3040,6 +3273,71 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn stale_shell_tag_does_not_veto_one_exact_owner() {
+        let (_root, pika) = test_pika();
+        let identity = "12121212-1212-4121-8121-121212121212";
+        let mut session = test_session(identity);
+        pika.store.upsert_session(&session, false).unwrap();
+        let mut stale = tagged_pane(identity);
+        stale.pane_id = "%stale".into();
+        stale.pane_pid = 4;
+        stale.current_command = "zsh".into();
+        let processes = BTreeMap::from([
+            (1, record(1, None, 10, &["sh"])),
+            (2, record(2, Some(1), 20, &["codex", "resume", identity])),
+            (4, record(4, None, 40, &["zsh"])),
+        ]);
+        pika.reconcile_one(&mut session, &[tagged_pane(identity), stale], &processes)
+            .unwrap();
+        assert_eq!(session.home_state, "exact");
+        assert!(session.live);
+        assert_ne!(session.status, Status::OpenTwice);
+        assert_eq!(session.tmux_pane.as_deref(), Some("%1"));
+        assert_eq!(session.root_pid, Some(2));
+    }
+
+    #[test]
+    fn nested_provider_helper_does_not_steal_exact_owner() {
+        let (_root, pika) = test_pika();
+        let identity = "13131313-1313-4131-8131-131313131313";
+        let mut session = test_session(identity);
+        pika.store.upsert_session(&session, false).unwrap();
+        let processes = BTreeMap::from([
+            (1, record(1, None, 10, &["sh"])),
+            (2, record(2, Some(1), 20, &["codex", "resume", identity])),
+            (
+                3,
+                record(3, Some(2), 30, &["codex", "app-server", "--stdio"]),
+            ),
+        ]);
+        pika.reconcile_one(&mut session, &[tagged_pane(identity)], &processes)
+            .unwrap();
+        assert_eq!(session.home_state, "exact");
+        assert!(session.live);
+        assert_eq!(session.root_pid, Some(2));
+    }
+
+    #[test]
+    fn helper_only_tagged_pane_fails_closed() {
+        let (_root, pika) = test_pika();
+        let identity = "14141414-1414-4141-8141-141414141414";
+        let mut session = test_session(identity);
+        pika.store.upsert_session(&session, false).unwrap();
+        let processes = BTreeMap::from([
+            (1, record(1, None, 10, &["sh"])),
+            (
+                2,
+                record(2, Some(1), 20, &["codex", "app-server", "--stdio"]),
+            ),
+        ]);
+        pika.reconcile_one(&mut session, &[tagged_pane(identity)], &processes)
+            .unwrap();
+        assert_eq!(session.home_state, "identity_unproven");
+        assert_eq!(session.status, Status::Error);
+        assert!(!session.live);
     }
 
     #[test]
