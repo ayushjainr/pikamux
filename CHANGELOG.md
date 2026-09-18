@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.24 — Reliable returns, live status
+## 0.6.25 — Reliable returns, live status
 
 - Reopen the verified running conversation even when an old shell retains
   duplicate Pika labels. Keep stale shells and agent processes untouched.

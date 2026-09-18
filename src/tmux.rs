@@ -946,6 +946,7 @@ impl Tmux {
         Ok(())
     }
 
+    #[cfg(unix)]
     pub(crate) fn publish_board_summary(
         &self,
         token: &str,
@@ -1066,7 +1067,7 @@ impl Tmux {
         Ok(())
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     pub(crate) fn publish_return_status(
         &self,
         token: &str,
