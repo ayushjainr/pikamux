@@ -262,6 +262,7 @@ fn muse_resume_identity(argv: &[String], identity: &str) -> bool {
 
 /// Muse's headless hooks carry the same `source: startup` as its TUI. Their
 /// process command must therefore be excluded before accepting lifecycle data.
+#[cfg(any(not(windows), test))]
 pub(crate) fn muse_interactive_hook_owner(record: &ProcessRecord) -> bool {
     let Some(executable) = muse_executable_index(&record.argv) else {
         return false;
