@@ -131,6 +131,24 @@ impl Journey {
         self.output.clear();
         self.terminal.write_all(bytes).unwrap();
     }
+    fn wait_frame_after(&mut self, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.drain();
+            if let Some(start) = self.output.rfind(text) {
+                if self.output[start..].contains("\x1b[?2026l") {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "incomplete frame: {}",
+                self.output
+            );
+            assert!(self.child.try_wait().unwrap().is_none());
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     fn finish(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -168,10 +186,10 @@ fn files_keyboard_preview_is_inert_and_restores_terminal() {
     let mut j = Journey::start(120, 32);
     j.wait_text("a.rs");
     // The one-shot Git result is a legitimate update, not an idle repaint.
-    j.wait_text("Git status unavailable");
+    j.wait_frame_after("Git status unavailable");
     j.send(b"\r");
-    j.wait_text("FILE_PREVIEW_MARKER");
-    j.wait_text("\x1b[?2026l");
+    // A prior frame's terminator does not prove this preview has finished.
+    j.wait_frame_after("FILE_PREVIEW_MARKER");
     assert!(
         !j.output.contains("\x1b]52"),
         "file content executed terminal command"
