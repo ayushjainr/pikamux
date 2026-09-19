@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.26 — Files beside your agent, Muse on your board
+
+- Open a read-only Files companion from the agent's return bar. Browse the
+  project tree, navigate directories, and inspect workspace changes and diffs
+  without interrupting the agent.
+- Render Markdown and highlight scripts and source code. Toggle wrapping and
+  the tree, scroll with the mouse, and resize the companion or its divider.
+- Add native Muse Code discovery, exact UUID resume, lifecycle status, and the
+  shared return bar and Files companion. Detect Muse during setup and preserve
+  existing user settings when adding hooks.
+- Keep Muse helper sessions out of parent ownership. Muse private consultation
+  and quota reporting remain unavailable.
+
 ## 0.6.25 — Reliable returns, live status
 
 - Reopen the verified running conversation even when an old shell retains
