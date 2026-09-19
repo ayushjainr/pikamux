@@ -252,7 +252,8 @@ fn regular_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
 }
 
-#[cfg(test)]
+// Native Muse hosting and its on-disk session fixtures are Unix-only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs::{create_dir_all, write};

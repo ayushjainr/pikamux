@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.27 — Files beside your agent, Muse on your board
+## 0.6.28 — Files beside your agent, Muse on your board
 
 - Open a read-only Files companion from the agent's return bar. Browse the
   project tree, navigate directories, and inspect workspace changes and diffs
