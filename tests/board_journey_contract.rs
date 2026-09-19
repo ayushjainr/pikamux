@@ -539,16 +539,46 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
         if wide {
             board.send(b"\x1b[20~"); // F9
         } else {
-            board.tmux(&[
-                "resize-window",
-                "-t",
-                "pika-c-aaaaaaaaaa",
-                "-x",
-                "120",
-                "-y",
-                "31",
-            ]);
-            board.send(b"\x1b[<0;134;32M\x1b[<0;134;32m"); // Files click
+            // Resize the client terminal, not just its tmux window. A manually
+            // undersized window leaves padding and platform-dependent mouse
+            // coordinates that do not represent a user resizing their terminal.
+            let size = libc::winsize {
+                ws_row: 32,
+                ws_col: 120,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_eq!(
+                unsafe { libc::ioctl(board.terminal.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+                0
+            );
+            // This test PTY has no controlling-terminal foreground group, so
+            // deliver the resize signal to Pika's outer terminal bridge. It
+            // propagates the dimensions to the attached tmux client's PTY.
+            assert_eq!(
+                unsafe { libc::kill(board.child.id() as i32, libc::SIGWINCH) },
+                0
+            );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while board
+                .tmux(&["display-message", "-p", "#{window_width}"])
+                .trim()
+                != "120"
+            {
+                let mut bytes = [0; 32768];
+                while let Ok(n) = board.terminal.read(&mut bytes) {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "tmux did not observe resized client: {}",
+                    board.tmux(&["list-clients", "-F", "#{client_width}x#{client_height}"])
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            board.send(b"\x1b[<0;116;32M\x1b[<0;116;32m"); // Files click
         }
         board.await_text("q close");
         let viewer = board

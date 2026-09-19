@@ -71,7 +71,10 @@ fn provider_labels_are_not_tracking_and_explicit_choices_survive_renames() {
         assert!(!store.is_watched(provider, "same-id").unwrap());
     }
     assert!(store.list_sessions().unwrap().is_empty());
-    assert_eq!(store.list_unconfirmed_sessions().unwrap().len(), 3);
+    assert_eq!(
+        store.list_unconfirmed_sessions().unwrap().len(),
+        Provider::ALL.len()
+    );
     assert!(store.list_untracked_sessions().unwrap().is_empty());
     store.restore_tracking(Provider::Codex, "same-id").unwrap();
     let mut row = store
@@ -87,7 +90,10 @@ fn provider_labels_are_not_tracking_and_explicit_choices_survive_renames() {
     store.untrack_session(Provider::Codex, "same-id").unwrap();
     store.upsert_session(&row, false).unwrap();
     assert!(store.list_sessions().unwrap().is_empty());
-    assert_eq!(store.list_unconfirmed_sessions().unwrap().len(), 2);
+    assert_eq!(
+        store.list_unconfirmed_sessions().unwrap().len(),
+        Provider::ALL.len() - 1
+    );
     store.restore_tracking(Provider::Codex, "same-id").unwrap();
     assert_eq!(store.list_sessions().unwrap().len(), 1);
 }

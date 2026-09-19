@@ -53,7 +53,7 @@ fn generated_titles_and_inherited_panes_cannot_subscribe_or_alert() {
         assert!(result.tag_request.is_some());
         assert!(store.is_watched(provider, "external-child").unwrap());
     }
-    assert_eq!(store.list_sessions().unwrap().len(), 3);
+    assert_eq!(store.list_sessions().unwrap().len(), Provider::ALL.len());
 }
 
 fn session(provider: Provider, id: &str, status: Status) -> Session {
