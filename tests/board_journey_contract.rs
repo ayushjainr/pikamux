@@ -713,6 +713,12 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
             board.tmux(&["display-message", "-p", "-t", &origin, "#{pane_pid}"]),
             pid
         );
+        if !wide {
+            // tmux 3.4 groups any two button-1 clicks within 300 ms,
+            // even at opposite ends of the status bar. This journey tests
+            // distinct Files/return clicks, not its SecondClick gesture.
+            thread::sleep(Duration::from_millis(350));
+        }
         board.send(return_keys);
         board.await_text("FILTER audit");
         assert!(board.child.try_wait().unwrap().is_none());
