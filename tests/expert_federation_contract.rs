@@ -137,6 +137,8 @@ fn isolated_paths(root: &Path) -> Paths {
         claude_home: root.join("claude"),
         opencode_data_home: root.join("opencode-data"),
         opencode_config_home: root.join("opencode-config"),
+        muse_data_home: root.join("muse-data"),
+        muse_config_home: root.join("muse-config"),
     }
 }
 

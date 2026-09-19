@@ -79,6 +79,9 @@ impl ConsultationPolicy {
 
 pub fn consultation_policy(provider: Provider, fast: bool) -> Result<ConsultationPolicy> {
     match (provider, fast) {
+        (Provider::Muse, _) => bail!(
+            "Muse private consultations are not available yet; open the conversation to continue. No prompt was sent."
+        ),
         (Provider::Codex, false) => Ok(ConsultationPolicy {
             mode: "default".to_owned(),
             model: Some(DEFAULT_CODEX_MODEL.to_owned()),
@@ -262,6 +265,7 @@ impl Consultation {
             None,
         );
         let result = match session.provider {
+            Provider::Muse => unreachable!("unsupported provider rejected by consultation policy"),
             Provider::Codex => CodexSide::open(session, &options, &policy).map(Side::Codex),
             Provider::Claude => ClaudeSide::open(session, &options).map(Side::Claude),
             Provider::Opencode => OpenCodeSide::open(session, &options).map(Side::Opencode),
@@ -2638,6 +2642,13 @@ fn decode_chunked(mut value: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn muse_consultation_is_explicitly_unsupported() {
+        for fast in [true, false] {
+            let error = super::consultation_policy(crate::model::Provider::Muse, fast).unwrap_err();
+            assert!(error.to_string().contains("No prompt was sent"));
+        }
+    }
     use super::*;
     #[cfg(unix)]
     use std::fs;

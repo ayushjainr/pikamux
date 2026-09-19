@@ -125,6 +125,9 @@ impl ProcessRecord {
 }
 
 pub fn process_kind(argv: &[String]) -> Option<Provider> {
+    if muse_executable_index(argv).is_some() {
+        return Some(Provider::Muse);
+    }
     argv.iter().take(4).find_map(|value| {
         let name = Path::new(value)
             .file_name()
@@ -137,6 +140,155 @@ pub fn process_kind(argv: &[String]) -> Option<Provider> {
             "opencode" | "opencode.js" => Some(Provider::Opencode),
             _ => None,
         }
+    })
+}
+
+fn muse_executable_index(argv: &[String]) -> Option<usize> {
+    let name = |index: usize| {
+        Path::new(argv.get(index)?)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .map(str::to_ascii_lowercase)
+    };
+    if matches!(name(0).as_deref(), Some("muse"))
+        || name(0).is_some_and(|value| is_muse_native_name(&value))
+    {
+        return Some(0);
+    }
+    if matches!(name(0).as_deref(), Some("sh" | "bash" | "zsh" | "dash"))
+        && matches!(name(1).as_deref(), Some("muse"))
+    {
+        return Some(1);
+    }
+    None
+}
+
+/// Muse's installed launcher is versionless (`muse`), while the native
+/// executable has a versioned basename (for example
+/// `muse-bin-1.2.1-R2847.1`).  Keep the native-name grammar deliberately
+/// narrow so a prompt/helper argument cannot turn an unrelated process into a
+/// Muse owner.
+fn is_muse_native_name(name: &str) -> bool {
+    let Some(version) = name.strip_prefix("muse-bin-") else {
+        return false;
+    };
+    let (release, build) = version
+        .split_once("-R")
+        .or_else(|| version.split_once("-r"))
+        .unwrap_or(("", ""));
+    let release_parts: Vec<_> = release.split('.').collect();
+    if release_parts.len() != 3
+        || release_parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+    if build.bytes().all(|byte| byte.is_ascii_digit()) {
+        return !build.is_empty();
+    }
+    let Some((build_number, patch)) = build.split_once('.') else {
+        return false;
+    };
+    !build_number.is_empty()
+        && build_number.bytes().all(|byte| byte.is_ascii_digit())
+        && !patch.is_empty()
+        && patch.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn muse_resume_identity(argv: &[String], identity: &str) -> bool {
+    let Some(executable) = muse_executable_index(argv) else {
+        return false;
+    };
+    if Uuid::parse_str(identity).is_err() {
+        return false;
+    }
+    let args = &argv[executable + 1..];
+    let mut index = 0;
+    let mut resumed = false;
+    let mut matched = false;
+    while let Some(arg) = args.get(index) {
+        if arg == "resume" && !resumed {
+            resumed = true;
+        } else if resumed && !matched && arg == identity {
+            matched = true;
+        } else {
+            let (flag, inline) = arg
+                .split_once('=')
+                .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+            match flag {
+                "--provider"
+                | "--preset"
+                | "--model"
+                | "--reasoning-effort"
+                | "--base-url"
+                | "--image"
+                | "--workspace"
+                | "--agents"
+                | "--worktree-base"
+                | "--worktree-existing"
+                | "--approval-mode"
+                | "--permission-profile"
+                | "--approval-judge"
+                | "--sandbox-network"
+                | "--echo-delay-ms" => {
+                    if inline.is_none() {
+                        index += 1;
+                        if args.get(index).is_none() {
+                            return false;
+                        }
+                    }
+                }
+                "--parallel-tool-calls"
+                | "--no-parallel-tool-calls"
+                | "--subagent-worktree-isolation"
+                | "--yolo"
+                | "--trust-workspace"
+                | "--disable-approval"
+                | "--disable-sandbox"
+                | "--disable-write"
+                | "--disable-shell"
+                | "--enable-shell-tool"
+                    if inline.is_none() => {}
+                // Help, exec, serve, pickers and unknown argv cannot prove a
+                // retained interactive conversation, even if they contain its ID.
+                _ => return false,
+            }
+        }
+        index += 1;
+    }
+    resumed && matched
+}
+
+/// Muse's headless hooks carry the same `source: startup` as its TUI. Their
+/// process command must therefore be excluded before accepting lifecycle data.
+pub(crate) fn muse_interactive_hook_owner(record: &ProcessRecord) -> bool {
+    let Some(executable) = muse_executable_index(&record.argv) else {
+        return false;
+    };
+    !record.argv[executable + 1..].iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "exec"
+                | "serve"
+                | "schema"
+                | "export"
+                | "trace"
+                | "config"
+                | "skills"
+                | "sandbox"
+                | "session-message"
+                | "mcp"
+                | "auth"
+                | "login"
+                | "logout"
+                | "init"
+                | "--help"
+                | "-h"
+                | "--version"
+                | "-V"
+                | "--no-session-log"
+        )
     })
 }
 
@@ -499,7 +651,13 @@ pub fn find_session_processes(
     let matches: BTreeSet<i64> = processes
         .values()
         .filter(|record| record.provider() == Some(provider))
-        .filter(|record| record.argv.iter().any(|argument| argument == identity))
+        .filter(|record| {
+            if provider == Provider::Muse {
+                muse_resume_identity(&record.argv, identity)
+            } else {
+                record.argv.iter().any(|argument| argument == identity)
+            }
+        })
         .map(|record| record.pid)
         .collect();
     canonical_identity_pids(&matches, processes)
@@ -546,6 +704,7 @@ pub fn shared_provider_process(record: &ProcessRecord, provider: Provider) -> bo
         Provider::Opencode => true,
         Provider::Codex => record.argv.iter().any(|value| value == "app-server"),
         Provider::Claude => false,
+        Provider::Muse => false,
     }
 }
 
@@ -930,6 +1089,116 @@ mod tests {
             find_session_processes("uuid", Provider::Codex, &records),
             vec![2]
         );
+    }
+
+    #[test]
+    fn muse_headless_hooks_cannot_be_interactive_owners() {
+        for args in [
+            vec!["muse", "exec", "prompt"],
+            vec!["muse", "serve"],
+            vec!["muse", "--no-session-log"],
+            vec!["muse", "schema", "generate-json-schema"],
+        ] {
+            assert!(!muse_interactive_hook_owner(&record(1, None, &args)));
+        }
+        assert!(muse_interactive_hook_owner(&record(1, None, &["muse"])));
+        assert!(muse_interactive_hook_owner(&record(
+            1,
+            None,
+            &[
+                "muse-bin-1.2.1-R2847.1",
+                "resume",
+                "11111111-1111-4111-8111-111111111111"
+            ]
+        )));
+    }
+
+    #[test]
+    fn muse_launcher_and_versioned_native_are_recognized() {
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        let records = BTreeMap::from([
+            (1, record(1, None, &["muse", "resume", uuid])),
+            (
+                2,
+                record(2, None, &["muse-bin-1.2.1-R2847.1", "resume", uuid]),
+            ),
+            (
+                3,
+                record(
+                    3,
+                    None,
+                    &["bash", "/Users/test/.local/bin/muse", "resume", uuid],
+                ),
+            ),
+        ]);
+        assert_eq!(process_kind(&records[&1].argv), Some(Provider::Muse));
+        assert_eq!(process_kind(&records[&2].argv), Some(Provider::Muse));
+        assert_eq!(process_kind(&records[&3].argv), Some(Provider::Muse));
+        assert_eq!(
+            find_session_processes(uuid, Provider::Muse, &records),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn muse_identity_requires_exact_resume_uuid_and_rejects_helpers() {
+        let uuid = "22222222-2222-4222-8222-222222222222";
+        let records = BTreeMap::from([
+            (
+                1,
+                record(
+                    1,
+                    None,
+                    &[
+                        "muse",
+                        "--provider",
+                        "echo",
+                        "resume",
+                        "--workspace",
+                        "/project",
+                        uuid,
+                        "--model=example",
+                    ],
+                ),
+            ),
+            (2, record(2, None, &["muse", "exec", "echo", uuid])),
+            (3, record(3, None, &["muse", "--help", uuid])),
+            (
+                4,
+                record(4, None, &["muse-bin-1.2.1-R2847.1", "resume", "not-a-uuid"]),
+            ),
+            (5, record(5, None, &["muse-bin-evil", "resume", uuid])),
+            (6, record(6, None, &["muse", "resume", uuid, "--help"])),
+            (7, record(7, None, &["muse", "--model", "resume", uuid])),
+            (
+                8,
+                record(8, None, &["muse", "resume", uuid, "another-prompt"]),
+            ),
+        ]);
+        assert_eq!(
+            find_session_processes(uuid, Provider::Muse, &records),
+            vec![1]
+        );
+        assert_eq!(process_kind(&records[&5].argv), None);
+    }
+
+    #[test]
+    fn muse_uuid_in_prompt_or_tool_args_is_not_identity() {
+        let uuid = "33333333-3333-4333-8333-333333333333";
+        let records = BTreeMap::from([
+            (1, record(1, None, &["muse", "chat", "prompt", uuid])),
+            (
+                2,
+                record(2, None, &["muse-bin-1.2.1-R2847.1", "tool", uuid]),
+            ),
+        ]);
+        assert!(find_session_processes(uuid, Provider::Muse, &records).is_empty());
+    }
+
+    #[test]
+    fn muse_name_in_helper_arguments_is_not_provider_identity() {
+        assert_eq!(process_kind(&["echo", "muse"].map(str::to_owned)), None);
+        assert_eq!(process_kind(&["sh", "-c", "muse"].map(str::to_owned)), None);
     }
 
     #[test]

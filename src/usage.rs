@@ -268,6 +268,7 @@ fn usage_source(paths: &Paths, session: &Session) -> Option<std::path::PathBuf> 
     match session.provider {
         Provider::Codex | Provider::Claude => session.transcript_path.as_deref().map(PathBuf::from),
         Provider::Opencode => Some(paths.opencode_data_home.join("opencode.db")),
+        Provider::Muse => None,
     }
 }
 
@@ -313,6 +314,7 @@ pub fn usage_for_session(
         Provider::Codex => codex_usage(store, session),
         Provider::Claude => claude_usage(store, session),
         Provider::Opencode => opencode_usage(&paths.opencode_data_home, store, session),
+        Provider::Muse => Ok(None),
     }
 }
 

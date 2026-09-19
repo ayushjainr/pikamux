@@ -743,6 +743,7 @@ fn check_hook(
         Provider::Codex => &paths.codex_home,
         Provider::Claude => &paths.claude_home,
         Provider::Opencode => &paths.opencode_config_home,
+        Provider::Muse => &paths.muse_config_home,
     };
     let installed = setup::hooks_installed(home, provider, executable);
     if !installed {
@@ -826,6 +827,10 @@ fn durable_identity_present(paths: &Paths, session: &Session) -> bool {
                     })
             }),
         Provider::Opencode => opencode_identity_present(paths, session.provider_thread_id()),
+        Provider::Muse => {
+            crate::muse::source_state(&paths.muse_data_home, session.provider_thread_id())
+                == crate::providers::ProviderSourceState::Present
+        }
     }
 }
 

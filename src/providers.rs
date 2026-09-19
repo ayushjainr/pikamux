@@ -77,7 +77,7 @@ impl<'a> Providers<'a> {
     pub fn import_candidates(&self, provider: Provider) -> Vec<Candidate> {
         match provider {
             Provider::Claude => self.records(provider, None, true),
-            Provider::Codex | Provider::Opencode => Vec::new(),
+            Provider::Codex | Provider::Opencode | Provider::Muse => Vec::new(),
         }
     }
 
@@ -85,7 +85,7 @@ impl<'a> Providers<'a> {
         // Discovery also serves reconciliation, where Codex fork lineage and
         // native rename labels are useful even though their authorship is not
         // proven. Setup must call `import_candidates` instead.
-        if provider == Provider::Opencode {
+        if matches!(provider, Provider::Opencode | Provider::Muse) {
             Vec::new()
         } else {
             self.records(provider, None, true)
@@ -105,6 +105,7 @@ impl<'a> Providers<'a> {
 
     fn records(&self, provider: Provider, query: Option<&str>, named_only: bool) -> Vec<Candidate> {
         match provider {
+            Provider::Muse => crate::muse::records(&self.paths.muse_data_home, query, None),
             Provider::Codex => codex_records(
                 &self.paths.codex_home,
                 self.config,
@@ -134,6 +135,9 @@ impl<'a> Providers<'a> {
             return Vec::new();
         }
         match provider {
+            Provider::Muse => {
+                crate::muse::records(&self.paths.muse_data_home, None, Some(identities))
+            }
             Provider::Codex => codex_records(
                 &self.paths.codex_home,
                 self.config,
@@ -190,7 +194,7 @@ impl<'a> Providers<'a> {
                 Some(&identities),
                 Some(activity),
             ),
-            Provider::Opencode => self.tracked(provider, &identities),
+            Provider::Opencode | Provider::Muse => self.tracked(provider, &identities),
         }
     }
 
@@ -212,6 +216,7 @@ impl<'a> Providers<'a> {
                 }
             }
             Provider::Opencode => opencode_source_state(&self.paths.opencode_data_home, session_id),
+            Provider::Muse => crate::muse::source_state(&self.paths.muse_data_home, session_id),
         }
     }
 
@@ -229,6 +234,28 @@ impl<'a> Providers<'a> {
                 .filter(|session| session.provider == provider)
                 .collect::<Vec<_>>();
             match provider {
+                Provider::Muse => {
+                    let ids = provider_sessions
+                        .iter()
+                        .map(|s| s.session_id.clone())
+                        .collect();
+                    let present =
+                        crate::muse::records(&self.paths.muse_data_home, None, Some(&ids))
+                            .into_iter()
+                            .map(|record| record.session_id)
+                            .collect::<BTreeSet<_>>();
+                    provider_sessions
+                        .iter()
+                        .map(|session| {
+                            let state = if present.contains(&session.session_id) {
+                                ProviderSourceState::Present
+                            } else {
+                                ProviderSourceState::Unknown
+                            };
+                            ((provider, session.session_id.clone()), state)
+                        })
+                        .collect()
+                }
                 Provider::Codex => codex_source_states(&self.paths.codex_home, &provider_sessions),
                 Provider::Claude => provider_sessions
                     .iter()
@@ -266,7 +293,7 @@ impl<'a> Providers<'a> {
     ) -> Vec<String> {
         let executable = self.config.executable(provider);
         match provider {
-            Provider::Codex | Provider::Opencode => vec![executable],
+            Provider::Codex | Provider::Opencode | Provider::Muse => vec![executable],
             Provider::Claude => {
                 let mut argv = vec![executable, "--name".into(), name.into()];
                 if let Some(identity) = session_id {
@@ -280,7 +307,9 @@ impl<'a> Providers<'a> {
     pub fn resume_argv(&self, provider: Provider, session_id: &str) -> Vec<String> {
         let executable = self.config.executable(provider);
         match provider {
-            Provider::Codex => vec![executable, "resume".into(), session_id.into()],
+            Provider::Codex | Provider::Muse => {
+                vec![executable, "resume".into(), session_id.into()]
+            }
             Provider::Claude => vec![executable, "--resume".into(), session_id.into()],
             Provider::Opencode => vec![executable, "--session".into(), session_id.into()],
         }
@@ -2218,6 +2247,8 @@ mod tests {
             claude_home: temp.path().join("claude-home"),
             opencode_data_home: temp.path().join("opencode-data"),
             opencode_config_home: temp.path().join("opencode-config"),
+            muse_data_home: temp.path().join("muse-data"),
+            muse_config_home: temp.path().join("muse-config"),
         };
         let mut config = Config::default();
         config
@@ -2382,6 +2413,8 @@ mod tests {
             claude_home: temp.path().join("claude-home"),
             opencode_data_home: temp.path().join("opencode-data"),
             opencode_config_home: temp.path().join("opencode-config"),
+            muse_data_home: temp.path().join("muse-data"),
+            muse_config_home: temp.path().join("muse-config"),
         };
         let mut config = Config::default();
         config

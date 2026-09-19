@@ -7,16 +7,18 @@ pub enum Provider {
     Codex,
     Claude,
     Opencode,
+    Muse,
 }
 
 impl Provider {
-    pub const ALL: [Self; 3] = [Self::Codex, Self::Claude, Self::Opencode];
+    pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::Opencode, Self::Muse];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Opencode => "opencode",
+            Self::Muse => "muse",
         }
     }
 }
@@ -35,6 +37,7 @@ impl std::str::FromStr for Provider {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
             "opencode" | "oc" => Ok(Self::Opencode),
+            "muse" => Ok(Self::Muse),
             _ => Err(format!("unknown provider: {value}")),
         }
     }

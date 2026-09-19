@@ -1604,7 +1604,14 @@ impl Board {
                     .map(BoardAction::Untrack);
             }
             KeyCode::Char('a') if self.selected().is_some_and(|item| item.actionable()) => {
-                self.begin_chat(driver)
+                if self
+                    .selected()
+                    .is_some_and(|item| item.session.provider == Provider::Muse)
+                {
+                    self.action_notice = Some("Muse private consultations are not available yet.\nEnter opens the conversation; no prompt was sent.".into());
+                } else {
+                    self.begin_chat(driver)
+                }
             }
             KeyCode::Char('r') => return Some(BoardAction::Refresh),
             KeyCode::Char('U') => {
@@ -1765,6 +1772,7 @@ impl Board {
                 Provider::Codex => "C",
                 Provider::Claude => "A",
                 Provider::Opencode => "O",
+                Provider::Muse => "M",
             };
             let age = human_age(session.last_event_at.max(session.last_activity_at));
             let node = item
@@ -2194,6 +2202,8 @@ impl Board {
                 "",
                 if item.stale {
                     "r refresh · d details · ? keys"
+                } else if item.session.provider == Provider::Muse {
+                    "Enter open · p expand preview · d details"
                 } else {
                     "Enter open · p expand preview · a consult · d details"
                 },

@@ -11,6 +11,8 @@ pub struct Paths {
     pub claude_home: PathBuf,
     pub opencode_data_home: PathBuf,
     pub opencode_config_home: PathBuf,
+    pub muse_data_home: PathBuf,
+    pub muse_config_home: PathBuf,
 }
 
 impl Paths {
@@ -45,6 +47,14 @@ impl Paths {
                 std::env::var_os("XDG_CONFIG_HOME").map(|p| PathBuf::from(p).join("opencode"))
             })
             .unwrap_or_else(|| home.home_dir().join(".config/opencode"));
+        let muse_data_home = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.home_dir().join(".local/share"))
+            .join("muse");
+        let muse_config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.home_dir().join(".config"))
+            .join("muse");
         Ok(Self {
             config: config_dir.join("config.json"),
             config_dir,
@@ -54,6 +64,8 @@ impl Paths {
             claude_home,
             opencode_data_home,
             opencode_config_home,
+            muse_data_home,
+            muse_config_home,
         })
     }
 }

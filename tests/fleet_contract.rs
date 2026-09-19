@@ -119,6 +119,7 @@ fn provider_opened_receipt(
     child_id: Option<&str>,
 ) -> Value {
     let isolation = match provider {
+        Provider::Muse => Value::Null,
         Provider::Codex => opened_receipt(parent_id, workstream_id)["isolation"].clone(),
         Provider::Claude => json!({
             "version":1, "mechanism":"claude_fork_process", "evidence":"launch_arguments",

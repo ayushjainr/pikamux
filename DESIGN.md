@@ -1,9 +1,18 @@
 # Pika architecture and interaction design
 
-Pika connects existing Codex, Claude Code, and OpenCode conversations. The board
+Pika connects existing Codex, Claude Code, OpenCode, and Muse Code conversations. The board
 shows where attention is needed and opens the exact selected conversation;
 expert cards let agents discover and consult relevant project experience.
 Provider harnesses remain responsible for their conversations and history.
+
+Native Muse uses bounded root-session metadata discovery, exact UUID resume,
+and user-settings lifecycle hooks. Nested subagent logs and headless hook owners
+are excluded. Muse-generated titles are not evidence of a personal rename;
+existing sessions enter through explicit recent-session selection or exact UUID.
+It consumes the shared board/return/feed/Files services. Private consultations
+remain disabled until isolated forking and cleanup are verified; missing Muse
+quota data is unavailable, never synthesized. Both ends of a fleet connection
+must understand the Muse provider identity.
 
 Board membership is an explicit Pika choice, separate from provider naming.
 An open, creation or adoption keeps watching that exact provider identity;
@@ -159,6 +168,53 @@ the agent. The normal board loop retains selection, filter and viewport, while
 freshly checking identity on the next opening. Separate Windows agent windows
 close their attachment and leave the original board running; native window
 focus remains the terminal/OS's responsibility.
+
+The same return strip offers `Files`, a read-only companion for the open
+conversation's project. It opens on the agent's host, left of a wide agent pane
+or below a tall one. Reopening focuses the existing companion; closing it
+reclaims its space without sending input to or stopping the agent. Keyboard
+controls use only free bindings and the displayed shortcut remains authoritative.
+The file pane is not an agent, never inherits provider identity tags, and does
+not create another board observer. The return strip continues to represent its
+origin conversation while the companion has focus.
+
+Files starts at the project captured from the exact managed home. Its tree and
+text view load on demand. Parent-directory navigation can leave that project;
+Back to project restores the original location without changing the agent's
+working directory. Git markers, Changed files and Diff describe workspace
+changes, not ownership by an agent. Git state is sampled on open or explicit
+refresh, not polled. Directory listings, text reads and Git output are bounded;
+binary and special files are not rendered. Terminal control bytes in paths and
+content are inert. There is no index, model call, filesystem watcher, new
+dependency, or work performed by Files while it is closed.
+
+Files soft-wraps text by default without changing source bytes. `w` switches to
+horizontal scrolling; source line numbers appear only on the first display row
+and continuations retain bounded indentation. Markdown files open in a native
+terminal projection with `m` toggling source. Common headings, emphasis, lists,
+quotes, links, images-as-labels and tables are presented without executing HTML,
+fetching resources or launching links. Fenced code and tables retain literal
+spacing and support horizontal scrolling even when prose wraps. Unsupported
+Markdown remains text; this is not a browser or a complete CommonMark renderer.
+Layout is bounded and cached between content, width and mode changes. Scrolling
+uses display rows; changing modes or resizing retains the source-line location.
+Source files use an in-process lexical highlighter selected by file extension or
+an extensionless script's shebang. Token roles distinguish keywords, strings,
+comments, numbers, function names and types without parsing projects or running
+scripts. Strings and block comments retain their lexical state across lines.
+Unknown languages remain plain. Highlighting precedes wrapping so spans retain
+their styles when reflowed or scrolled; diffs keep their addition/deletion colors.
+The palette uses the terminal's ANSI colors, respects `NO_COLOR`, and requires
+no language server, external executable, grammar download or new dependency.
+`t` hides or reveals the tree without changing its selection, expanded folders,
+or the open file. Hidden-tree reading uses the full pane width. Tab to the tree
+and explicit directory navigation reveal it rather than focusing invisible UI.
+Mouse-wheel input scrolls the hovered region without changing selection or focus.
+The tree has its own viewport; clicking an entry selects and opens it. Dragging
+the internal divider adjusts its width within bounds that keep both views usable;
+that preference survives tree toggles and is clamped during terminal resize.
+The outer pane border stays tmux-owned. Files enables mouse reporting only for
+its interactive lifetime and disables it on ordinary teardown, including errors.
 
 The return label's color belongs to the exact conversation currently open, not
 the board's aggregate attention count. It follows the board's status palette

@@ -176,6 +176,8 @@ impl SetupFixture {
             claude_home: self.root.path().join("claude-home"),
             opencode_data_home: self.root.path().join("opencode-data"),
             opencode_config_home: self.root.path().join("opencode-config"),
+            muse_data_home: self.root.path().join("muse-data"),
+            muse_config_home: self.root.path().join("muse-config"),
         }
     }
 

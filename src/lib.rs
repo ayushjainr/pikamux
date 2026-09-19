@@ -17,10 +17,21 @@ pub mod doctor;
 pub mod expert_refresh;
 mod expert_search;
 pub mod experts;
+#[cfg(not(windows))]
+mod files_data;
+#[cfg(not(windows))]
+mod files_layout;
+#[cfg(not(windows))]
+mod files_markdown;
+#[cfg(not(windows))]
+mod files_syntax;
+#[cfg(not(windows))]
+mod files_view;
 pub mod fleet;
 pub mod hooks;
 pub mod model;
 pub mod monitor;
+mod muse;
 mod onboarding;
 pub mod open_history;
 pub mod paths;

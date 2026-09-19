@@ -235,7 +235,7 @@ impl QuotaSource for SystemQuotaSource {
         match provider {
             Provider::Codex => self.read_codex(now),
             Provider::Claude => self.read_claude(now),
-            Provider::Opencode => Ok(None),
+            Provider::Opencode | Provider::Muse => Ok(None),
         }
     }
 }
@@ -1151,6 +1151,8 @@ mod tests {
             claude_home: root.path().join("claude"),
             opencode_data_home: root.path().join("opencode"),
             opencode_config_home: root.path().join("opencode-config"),
+            muse_data_home: root.path().join("muse-data"),
+            muse_config_home: root.path().join("muse-config"),
         };
         let error = SystemQuotaSource::new(&Config::default(), &paths)
             .with_claude_cache(cache)
@@ -1761,6 +1763,8 @@ mod tests {
             claude_home: root.path().join("claude-home"),
             opencode_data_home: root.path().join("opencode-data"),
             opencode_config_home: root.path().join("opencode-config"),
+            muse_data_home: root.path().join("muse-data"),
+            muse_config_home: root.path().join("muse-config"),
         };
         let mut config = Config::default();
         config.provider_executables.insert(

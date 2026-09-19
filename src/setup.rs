@@ -43,6 +43,20 @@ pub const CLAUDE_EVENTS: &[&str] = &[
     "SessionEnd",
 ];
 
+/// Muse's documented user-hook lifecycle.  Keep this list explicit: unknown
+/// provider events must never silently become Pika identity evidence.
+pub const MUSE_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Notification",
+    "Stop",
+    "SessionEnd",
+];
+
 const CLAUDE_NOTIFICATION_MATCHER: &str =
     "permission_prompt|idle_prompt|elicitation_dialog|agent_needs_input|agent_completed";
 const OPENCODE_TEMPLATE: &str = include_str!("../assets/pika-opencode.js.in");
@@ -160,6 +174,7 @@ pub struct SetupPaths {
     pub codex_home: PathBuf,
     pub claude_home: PathBuf,
     pub opencode_config_home: PathBuf,
+    pub muse_config_home: PathBuf,
 }
 
 impl From<&Paths> for SetupPaths {
@@ -169,6 +184,7 @@ impl From<&Paths> for SetupPaths {
             codex_home: paths.codex_home.clone(),
             claude_home: paths.claude_home.clone(),
             opencode_config_home: paths.opencode_config_home.clone(),
+            muse_config_home: paths.muse_config_home.clone(),
         }
     }
 }
@@ -231,6 +247,7 @@ pub fn commissioning_report(
             Provider::Codex => &paths.codex_home,
             Provider::Claude => &paths.claude_home,
             Provider::Opencode => &paths.opencode_config_home,
+            Provider::Muse => &paths.muse_config_home,
         };
         providers.push(ProviderCommissioning {
             provider,
@@ -458,6 +475,7 @@ fn provider_label(provider: Provider) -> &'static str {
         Provider::Codex => "Codex",
         Provider::Claude => "Claude",
         Provider::Opencode => "OpenCode",
+        Provider::Muse => "Muse",
     }
 }
 
@@ -468,13 +486,56 @@ pub fn proposed_hook_changes(
     if !options.pika_executable.is_absolute() {
         bail!("Pika hook executable must be an absolute path");
     }
-    Ok(vec![
+    let mut changes = vec![
         pika_config_change(&paths.pika_config, options)?,
         codex_hooks_change(&paths.codex_home, &options.pika_executable)?,
         codex_config_change(&paths.codex_home)?,
         claude_settings_change(&paths.claude_home, &options.pika_executable)?,
         opencode_plugin_change(&paths.opencode_config_home, &options.pika_executable)?,
-    ])
+    ];
+    // Muse is an optional native integration. Do not create ~/.config/muse or
+    // claim hooks are commissioned merely because this binary knows its name.
+    let muse_command = options
+        .provider_executables
+        .get("muse")
+        .map_or("muse", String::as_str);
+    let search_path = options
+        .provider_runtime_path
+        .clone()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    if command_available(muse_command, &search_path) {
+        changes.push(muse_settings_change(
+            &paths.muse_config_home,
+            &options.pika_executable,
+        )?);
+    }
+    Ok(changes)
+}
+
+fn command_available(command: &str, search_path: &str) -> bool {
+    let executable = |path: &Path| {
+        let Ok(metadata) = fs::metadata(path) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    };
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        return executable(command_path);
+    }
+    std::env::split_paths(search_path).any(|dir| executable(&dir.join(command)))
 }
 
 pub fn pika_config_change(path: &Path, options: &SetupOptions) -> Result<FileChange> {
@@ -540,6 +601,44 @@ pub fn claude_settings_change(home: &Path, executable: &Path) -> Result<FileChan
         executable,
     )?;
     crate::claude_quota::configure(&mut value, executable)?;
+    let after = pretty_object_preserving_top_order(
+        &before,
+        value.as_object().expect("value is an object"),
+    )?;
+    Ok(FileChange {
+        path: target,
+        before,
+        after,
+        notice: None,
+    })
+}
+
+/// Merge Pika's command into Muse's user settings while retaining unrelated
+/// settings and user-owned hook groups.  Muse uses the same JSON hook shape
+/// as the other lifecycle-hook providers, beneath ~/.config/muse/settings.json.
+pub fn muse_settings_change(home: &Path, executable: &Path) -> Result<FileChange> {
+    validate_executable(executable)?;
+    let target = home.join("settings.json");
+    let before = read_optional_text(&target)?;
+    let mut value = if before.is_empty() {
+        Value::Object(Map::new())
+    } else {
+        parse_object(&target, &before)?
+    };
+    let root = value
+        .as_object_mut()
+        .expect("parse_object always returns an object");
+    match root.get("schema_version") {
+        None => {
+            root.insert("schema_version".into(), json!(1));
+        }
+        Some(Value::Number(version)) if version.as_u64() == Some(1) => {}
+        Some(_) => bail!(
+            "unsupported Muse settings schema_version at {}",
+            target.display()
+        ),
+    }
+    merge_hooks(&target, &mut value, Provider::Muse, MUSE_EVENTS, executable)?;
     let after = pretty_object_preserving_top_order(
         &before,
         value.as_object().expect("value is an object"),
@@ -749,24 +848,16 @@ pub fn hook_spec_fingerprint(provider: Provider, executable: &Path) -> Result<St
     let content = if provider == Provider::Opencode {
         opencode_plugin_source(executable)?
     } else {
-        let events = if provider == Provider::Codex {
-            CODEX_EVENTS
-        } else {
-            CLAUDE_EVENTS
+        let events = match provider {
+            Provider::Codex => CODEX_EVENTS,
+            Provider::Claude => CLAUDE_EVENTS,
+            Provider::Muse => MUSE_EVENTS,
+            Provider::Opencode => unreachable!(),
         };
-        serde_json::to_string(
-            &events
-                .iter()
-                .map(|event| {
-                    json!({
-                        "event": event,
-                        "command": handler_command(executable, provider),
-                        "timeout": handler_timeout(event),
-                        "matcher": event_matcher(provider, event),
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )?
+        serde_json::to_string(&events.iter().map(|event| json!({
+            "event": event, "command": handler_command(executable, provider),
+            "timeout": handler_timeout(event), "matcher": event_matcher(provider, event),
+        })).collect::<Vec<_>>())?
     };
     Ok(format!("{:x}", Sha256::digest(content.as_bytes())))
 }
@@ -798,13 +889,20 @@ pub fn hooks_installed(home: &Path, provider: Provider, executable: &Path) -> bo
     if provider == Provider::Codex && !codex_hooks_enabled(home) {
         return false;
     }
+    if provider == Provider::Muse
+        && (value.get("schema_version").and_then(Value::as_u64) != Some(1)
+            || value.get("disableAllHooks") == Some(&Value::Bool(true)))
+    {
+        return false;
+    }
+    let events = match provider {
+        Provider::Codex => CODEX_EVENTS,
+        Provider::Claude => CLAUDE_EVENTS,
+        Provider::Muse => MUSE_EVENTS,
+        Provider::Opencode => return false,
+    };
     let Some(hooks) = value.get("hooks").and_then(Value::as_object) else {
         return false;
-    };
-    let events = if provider == Provider::Codex {
-        CODEX_EVENTS
-    } else {
-        CLAUDE_EVENTS
     };
     events.iter().all(|event| {
         hooks
@@ -1243,4 +1341,70 @@ fn validate_executable(executable: &Path) -> Result<()> {
         bail!("Pika hook executable path contains a control character");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod muse_tests {
+    use super::*;
+
+    #[test]
+    fn muse_command_detection_uses_path_without_executing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("muse");
+        fs::write(&executable, "not executed").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(command_available("muse", root.path().to_str().unwrap()));
+        assert!(command_available(executable.to_str().unwrap(), ""));
+        assert!(!command_available("missing", root.path().to_str().unwrap()));
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(!command_available("muse", root.path().to_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn muse_settings_preserve_custom_hooks_and_are_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("muse");
+        fs::create_dir_all(&home).unwrap();
+        let target = home.join("settings.json");
+        fs::write(&target, r#"{"theme":"custom","hooks":{"Notification":[{"hooks":[{"type":"command","command":"sh user.sh","timeout":5}]}]}}"#).unwrap();
+        let executable = root.path().join("pika");
+        fs::write(&executable, "native").unwrap();
+        let first = muse_settings_change(&home, &executable).unwrap();
+        let second = {
+            fs::write(&target, &first.after).unwrap();
+            muse_settings_change(&home, &executable).unwrap()
+        };
+        assert_eq!(first.after, second.after);
+        let value: Value = serde_json::from_str(&first.after).unwrap();
+        assert_eq!(value["theme"], "custom");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(
+            value["hooks"]["Notification"][0]["hooks"][0]["command"],
+            "sh user.sh"
+        );
+        assert!(value["hooks"]["PostToolUseFailure"].is_array());
+        assert!(hooks_installed(&home, Provider::Muse, &executable));
+    }
+
+    #[test]
+    fn muse_disabled_or_wrong_timeout_is_not_commissioned() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("muse");
+        fs::create_dir_all(&home).unwrap();
+        let executable = root.path().join("pika");
+        fs::write(&executable, "native").unwrap();
+        let change = muse_settings_change(&home, &executable).unwrap();
+        let mut value: Value = serde_json::from_str(&change.after).unwrap();
+        value["hooks"]["SessionStart"][0]["hooks"][0]["command"] = Value::String("disabled".into());
+        fs::write(
+            home.join("settings.json"),
+            serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
+        assert!(!hooks_installed(&home, Provider::Muse, &executable));
+    }
 }

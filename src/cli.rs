@@ -49,7 +49,7 @@ use std::{
 const JSONL_OPERATIONAL_FAILURE: i32 = 1;
 
 #[derive(Parser, Debug)]
-#[command(name="pika", version=VERSION, about="One home for your Codex, Claude, and OpenCode conversations.", after_help="Run `pika NAME` to find, protect, attach, resume, or create the exact conversation.")]
+#[command(name="pika", version=VERSION, about="One home for your Codex, Claude, OpenCode, and Muse conversations.", after_help="Run `pika NAME` to find, protect, attach, resume, or create the exact conversation.")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -109,6 +109,16 @@ enum Command {
     ProcessExit(ProcessExitArgs),
     #[command(name = "_terminal-bridge", hide = true)]
     TerminalBridge(TerminalBridgeArgs),
+    #[command(name = "_files-open", hide = true)]
+    FilesOpen {
+        #[arg(long)]
+        pane: String,
+    },
+    #[command(name = "_files-view", hide = true)]
+    FilesView {
+        #[arg(long)]
+        project: PathBuf,
+    },
     #[command(name = "_install-native", hide = true)]
     InstallNative(InstallNativeArgs),
     #[command(name = "_fleet", hide = true)]
@@ -288,6 +298,9 @@ struct SetupArgs {
     /// OpenCode executable or command override.
     #[arg(long)]
     opencode_executable: Option<String>,
+    /// Muse executable or command override.
+    #[arg(long)]
+    muse_executable: Option<String>,
     /// Friendly name for this Pika machine.
     #[arg(long)]
     machine_alias: Option<String>,
@@ -605,6 +618,11 @@ where
         Some(Command::ClaudeStatusline { forward }) => crate::claude_quota::run(forward),
         Some(Command::InstallNative(args)) => install_native(args),
         Some(Command::TerminalBridge(args)) => terminal_bridge(args),
+        Some(Command::FilesOpen { pane }) => {
+            crate::tmux::Tmux::default().open_files_companion(&pane)?;
+            Ok(0)
+        }
+        Some(Command::FilesView { project }) => crate::files_view::run(project),
         Some(Command::Hook(args)) => hook(args),
         Some(Command::ProcessExit(args)) => process_exit(args),
         command => dispatch(&Pika::discover()?, command),
@@ -667,6 +685,8 @@ fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
             Command::InstallNative(_)
             | Command::ClaudeStatusline { .. }
             | Command::TerminalBridge(_)
+            | Command::FilesOpen { .. }
+            | Command::FilesView { .. }
             | Command::Hook(_)
             | Command::ProcessExit(_),
         ) => unreachable!(),
@@ -2668,6 +2688,7 @@ fn setup_screen(pika: &Pika, a: SetupArgs, ui: &crate::onboarding::Screen) -> Re
         ("codex", a.codex_executable),
         ("claude", a.claude_executable),
         ("opencode", a.opencode_executable),
+        ("muse", a.muse_executable),
     ] {
         if let Some(v) = value {
             executables.insert(provider.into(), v);
@@ -2714,7 +2735,7 @@ fn setup_screen(pika: &Pika, a: SetupArgs, ui: &crate::onboarding::Screen) -> Re
         changes.extend(scheduler::schedule_changes(request)?);
     }
     println!(
-        "Pika setup · exact recovery for Codex + Claude + OpenCode\nPreview first · existing settings retained · backups before writes\n"
+        "Pika setup · exact recovery for Codex + Claude + OpenCode + Muse\nPreview first · existing settings retained · backups before writes\n"
     );
     let changed = changes.iter().filter(|change| change.changed()).count();
     let preview = changes
@@ -3184,6 +3205,7 @@ fn setup_provider_label(provider: Provider) -> &'static str {
         Provider::Codex => "Codex",
         Provider::Claude => "Claude",
         Provider::Opencode => "OpenCode",
+        Provider::Muse => "Muse",
     }
 }
 fn setup_receipt_text(value: &str) -> String {
@@ -3355,6 +3377,14 @@ fn hook(a: HookArgs) -> Result<i32> {
     };
     let parent = i64::from(unsafe { libc::getppid() });
     context.owner_pid = process::provider_ancestor(parent, a.provider, processes);
+    if a.provider == Provider::Muse
+        && !context
+            .owner_pid
+            .and_then(|pid| processes.get(&pid))
+            .is_some_and(process::muse_interactive_hook_owner)
+    {
+        return Ok(0);
+    }
     context.owner_start_time = context
         .owner_pid
         .and_then(|pid| processes.get(&pid))
@@ -5939,6 +5969,8 @@ mod fleet_consultation_tests {
             claude_home: root.path().join("claude-home"),
             opencode_data_home: root.path().join("opencode-data"),
             opencode_config_home: root.path().join("opencode-config"),
+            muse_data_home: root.path().join("muse-data"),
+            muse_config_home: root.path().join("muse-config"),
         };
         let store = Store::at(&paths.database);
         let mut local = fixture_session(root.path());
@@ -5993,6 +6025,8 @@ mod fleet_consultation_tests {
             claude_home: root.path().join("claude-home"),
             opencode_data_home: root.path().join("opencode-data"),
             opencode_config_home: root.path().join("opencode-config"),
+            muse_data_home: root.path().join("muse-data"),
+            muse_config_home: root.path().join("muse-config"),
         };
         let store = Store::at(&paths.database);
         let mut session = fixture_session(root.path());
@@ -6303,6 +6337,8 @@ done
             claude_home: root.path().join("claude-home"),
             opencode_data_home: root.path().join("opencode-data"),
             opencode_config_home: root.path().join("opencode-config"),
+            muse_data_home: root.path().join("muse-data"),
+            muse_config_home: root.path().join("muse-config"),
         };
         fs::create_dir_all(&paths.codex_home).unwrap();
         fs::write(paths.codex_home.join("state_corrupt.sqlite"), "not sqlite").unwrap();
@@ -6349,6 +6385,8 @@ done
             claude_home: root.path().join("claude-home"),
             opencode_data_home: root.path().join("opencode-data"),
             opencode_config_home: root.path().join("opencode-config"),
+            muse_data_home: root.path().join("muse-data"),
+            muse_config_home: root.path().join("muse-config"),
         };
         let store = Store::at(&paths.database);
         let node_id = uuid::Uuid::new_v4().to_string();

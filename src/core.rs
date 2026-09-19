@@ -2405,6 +2405,8 @@ mod tests {
             claude_home: root.path().join("claude"),
             opencode_data_home: root.path().join("opencode-data"),
             opencode_config_home: root.path().join("opencode-config"),
+            muse_data_home: root.path().join("muse-data"),
+            muse_config_home: root.path().join("muse-config"),
         };
         let store = Store::from_paths(&paths);
         store.initialize().unwrap();

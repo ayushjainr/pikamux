@@ -2,7 +2,7 @@
 
 **One home for your coding agents. A way for their work to connect.**
 
-Bring your **Codex, Claude Code, and OpenCode** conversations into one terminal
+Bring your **Codex, Claude Code, OpenCode, and Muse Code** conversations into one terminal
 board. See what needs you, return to work by name, and let agents consult relevant
 experience from your other projects.
 
@@ -20,7 +20,7 @@ https://github.com/user-attachments/assets/048abf56-d9d3-4a6a-9128-317ec9330d04
 ## Get started
 
 Pika runs on **macOS and Linux**. You need **tmux** and at least one agent CLI
-installed and signed in: Codex, Claude Code, or OpenCode (1.18.21+).
+installed and signed in: Codex, Claude Code, OpenCode (1.18.21+), or Muse Code (1.2.1).
 One machine is enough.
 
 Install:
@@ -38,8 +38,8 @@ for prerequisites and troubleshooting.
    Run `pika setup` if you skipped onboarding. In Codex, review and trust the
    integration through `/hooks`.
 2. **Open the board.** Run `pika`, select a conversation, and press **Enter**.
-   Use **Ctrl-b**, then **d**, to detach and return to Pika while the agent keeps
-   running.
+   Click **← Pika** in the bottom bar or press its displayed shortcut (normally
+   **F12**) to return while the agent keeps running.
 
 ### Windows
 
@@ -80,6 +80,33 @@ steps instead of opening a duplicate.
 Pika checks for updates in the background. When prompted, press **Y** to update
 and reopen the board, or **N** to keep working. Running agents stay running.
 See [installation and updates](docs/installing.md) for other install methods.
+
+### Look through the code
+
+While inside a conversation, choose **Files** in the bottom bar or use its
+displayed shortcut. A read-only companion opens beside or below your agent,
+starting in that conversation's project directory on its host.
+
+Browse the tree, read files, or switch to workspace changes and diffs. Navigate
+up with **Backspace**, return to the project with **b**, and close with **q**.
+The agent keeps working; browsing does not change its directory or files.
+Scripts and source files have syntax highlighting. Text wraps to fit the pane;
+**w** toggles wrapping. Markdown opens rendered,
+with **m** to switch to source. Code blocks and tables keep their spacing;
+use **←/→** to read wide lines.
+Press **t** to hide or show the tree for full-width reading.
+Scroll over the tree or file with your mouse wheel or trackpad, and drag the
+divider to adjust their widths. Drag the outer pane border to resize the whole
+companion.
+
+### Muse Code
+
+Run `pika setup` after installing Muse, then start a named conversation with
+`pika new NAME --agent muse`. It uses the same board, return bar, and Files
+companion. Setup's recent-conversations screen also offers saved Muse sessions.
+
+Muse currently supports monitoring and exact resume; private consultation and
+quota reporting are not yet supported.
 
 ## Let your agents consult prior work
 
@@ -133,6 +160,6 @@ See [security and privacy](SECURITY.md) for the boundaries.
 - [Architecture](DESIGN.md) · [Contributing](CONTRIBUTING.md)
 
 Pika is an independent open-source project, not affiliated with OpenAI, Anthropic,
-or OpenCode.
+OpenCode, or Meta.
 
 Maintained by [Ayush Jain](https://ayushjainr.com). [MIT license](LICENSE).

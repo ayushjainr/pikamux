@@ -1,7 +1,7 @@
 # Installation and updates
 
 Pika runs on macOS and Linux, on ARM64 and x86-64. You need tmux and at least
-one agent CLI installed and signed in: Codex, Claude Code, or OpenCode.
+one agent CLI installed and signed in: Codex, Claude Code, OpenCode, or Muse Code.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ayushjainr/pikamux/main/install.sh | bash

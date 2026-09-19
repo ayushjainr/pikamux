@@ -828,6 +828,8 @@ fn board_migrates_legacy_bundle_only_from_active_managed_install() {
         claude_home: temp.join("claude"),
         opencode_data_home: temp.join("opencode"),
         opencode_config_home: temp.join("opencode-config"),
+        muse_data_home: temp.join("muse-data"),
+        muse_config_home: temp.join("muse-config"),
     };
     let skill_dir = pikamux::skill::default_target(&paths);
     let skill_path = skill_dir.join("SKILL.md");

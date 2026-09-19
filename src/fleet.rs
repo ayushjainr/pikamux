@@ -3699,6 +3699,7 @@ impl RemoteConsultation {
                     && child != self.session.session.session_id
             }),
             Provider::Claude => child_id.is_none(),
+            Provider::Muse => false,
         };
         let isolation = object.get("isolation");
         let valid = object.get("type").and_then(Value::as_str) == Some("opened")
@@ -3933,6 +3934,7 @@ fn validate_opening_isolation(provider: Provider, value: &Value) -> bool {
     }
     let flag = |name: &str| proof.get(name).and_then(Value::as_bool) == Some(true);
     match provider {
+        Provider::Muse => false,
         Provider::Codex => {
             proof.get("mechanism").and_then(Value::as_str) == Some("codex_thread_fork")
                 && proof.get("evidence").and_then(Value::as_str) == Some("provider_confirmed")

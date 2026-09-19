@@ -8,6 +8,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     io::{Read, Write},
+    path::Path,
     process::{Command, Output, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -372,6 +373,14 @@ impl Tmux {
             &["MouseDown1StatusLeft", "MouseUp1StatusLeft"],
             true,
         )?;
+        // Files is deliberately allocated from a separate pool.  A user
+        // binding (including a catch-all) is never replaced.
+        let files_key = self.files_binding(&bindings, &["F9", "F8", "F7"], false)?;
+        let files_mouse = self.files_binding(
+            &bindings,
+            &["MouseDown1StatusRight", "MouseUp1StatusRight"],
+            true,
+        )?;
         let hint = match shortcut {
             Some(key) => format!("{key} · agent keeps running"),
             None if mouse.is_some() => "click to return · agent keeps running".into(),
@@ -387,12 +396,44 @@ impl Tmux {
             "norange"
         };
         let key = shortcut.unwrap_or("click to return");
+        let files_range = if files_mouse.is_some() {
+            "range=right"
+        } else {
+            "norange"
+        };
+        let files = if files_key.is_some() || files_mouse.is_some() {
+            format!(
+                "#[align=right,{files_range}]  Files {} #[default,norange]",
+                files_key.unwrap_or("click")
+            )
+        } else {
+            String::new()
+        };
         let bar = format!(
-            "#[align=left,{range},{style}] ← Pika #[default,norange]  #{{?@pika_board_summary,{key} #{{E:@pika_board_summary}},{hint}}}"
+            "#[align=left,{range},{style}] ← Pika #[default,norange]  #{{?@pika_board_summary,{key} #{{E:@pika_board_summary}},{hint}}} {files}"
         );
         let target = shell_words::quote(&pane.pane_id);
+        let mut callback = vec!["env".to_owned()];
+        if let Some(socket) = &self.socket_name {
+            callback.push(format!("PIKA_TMUX_SOCKET={socket}"));
+        }
+        callback.push(std::env::current_exe()?.to_string_lossy().into_owned());
+        callback.push("_files-open".to_owned());
+        let callback = shell_words::join(callback);
         let mutation = [
             format!("set-option -t {target} @pika_return_navigation 1"),
+            format!(
+                "set-option -t {target} @pika_files_callback {}",
+                shell_words::quote(&callback)
+            ),
+            format!(
+                "set-option -p -t {target} @pika_files_generation {}",
+                shell_words::quote(&pane_generation_condition(pane))
+            ),
+            format!(
+                "set-option -p -t {target} @pika_files_project {}",
+                shell_words::quote(&pane.cwd)
+            ),
             format!("set-option -t {target} status on"),
             format!("set-option -t {target} status-position bottom"),
             format!("set-option -t {target} status-interval 1"),
@@ -413,6 +454,231 @@ impl Tmux {
                 &mutation,
                 "run-shell 'exit 75'",
             ],
+            true,
+        )?;
+        Ok(())
+    }
+
+    fn files_binding<'a>(
+        &self,
+        bindings: &str,
+        candidates: &[&'a str],
+        mouse: bool,
+    ) -> Result<Option<&'a str>> {
+        let parsed: Vec<_> = bindings
+            .lines()
+            .map(|line| {
+                shell_words::split(line)
+                    .unwrap_or_else(|_| line.split_whitespace().map(str::to_owned).collect())
+            })
+            .collect();
+        if parsed
+            .iter()
+            .any(|line| root_binding_key(line) == Some("Any"))
+        {
+            return Ok(None);
+        }
+        for key in candidates {
+            let replay = if mouse {
+                "send-keys -M".to_owned()
+            } else {
+                format!("send-keys {key}")
+            };
+            let action = "run-shell -b '#{@pika_files_callback} --pane #{pane_id}'";
+            let condition = "#{&&:#{@pika_return_navigation},#{@pika_files_callback}}";
+            let command = ["if-shell", "-F", condition, action, &replay];
+            if let Some(existing) = parsed
+                .iter()
+                .find(|line| root_binding_key(line) == Some(*key))
+            {
+                let index = existing.iter().position(|word| word == "-T").unwrap() + 2;
+                if return_command_words(existing[index + 1..].iter().map(String::as_str))
+                    == return_command_words(command.into_iter())
+                {
+                    return Ok(Some(key));
+                }
+                continue;
+            }
+            self.output(
+                [
+                    "bind-key", "-T", "root", key, "if-shell", "-F", condition, action, &replay,
+                ],
+                true,
+            )?;
+            return Ok(Some(key));
+        }
+        Ok(None)
+    }
+
+    fn files_pane_option(&self, pane: &str, option: &str) -> Result<String> {
+        let out = self.output(["show-options", "-pqv", "-t", pane, option], false)?;
+        Ok(if out.status.success() {
+            String::from_utf8(out.stdout)?
+                .trim_end_matches('\n')
+                .to_owned()
+        } else {
+            String::new()
+        })
+    }
+
+    /// Files is a read-only companion of a previously verified managed home.
+    /// The short lease serializes simultaneous callbacks without a daemon or
+    /// lock file. A crashed callback expires instead of leaving a stuck lock.
+    pub fn open_files_companion(&self, target: &str) -> Result<()> {
+        if !valid_pane_id(target) {
+            bail!("invalid Files pane");
+        }
+        let source = self.files_pane_option(target, "@pika_files_source")?;
+        let origin = if source.is_empty() {
+            target
+        } else {
+            source.as_str()
+        };
+        if !valid_pane_id(origin) {
+            bail!("invalid Files origin");
+        }
+        let pane = self
+            .get_pane(origin)?
+            .context("The original agent pane is no longer available")?;
+        if !is_pika_session(&pane.session_name)
+            || pane.pika_provider.is_none()
+            || pane.pika_session_id.is_none()
+            || pane.dead
+        {
+            bail!("Files requires an open Pika conversation");
+        }
+        let grant = self.files_pane_option(origin, "@pika_files_generation")?;
+        if grant.is_empty() || grant != pane_generation_condition(&pane) {
+            bail!("The conversation changed; reopen it from Pika before browsing files");
+        }
+        let project = self.files_pane_option(origin, "@pika_files_project")?;
+        if !Path::new(&project).is_absolute() {
+            bail!("No project directory is available");
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let expired = format!("#{{<=:#{{@pika_files_opening}},{now}}}");
+        let unlocked = format!("#{{||:#{{!:#{{@pika_files_opening}}}},{expired}}}");
+        let condition = format!("#{{&&:{grant},{unlocked}}}");
+        let acquire = format!(
+            "set-option -p -t {origin} @pika_files_opening {} ; display-message -p acquired",
+            now + 15
+        );
+        let lock = self.output(
+            [
+                "if-shell",
+                "-F",
+                "-t",
+                origin,
+                &condition,
+                &acquire,
+                "display-message -p busy",
+            ],
+            true,
+        )?;
+        if String::from_utf8_lossy(&lock.stdout).trim() != "acquired" {
+            return Ok(());
+        }
+        let result = self.open_files_locked(&pane, &grant, &project);
+        let _ = self.output(
+            ["set-option", "-pu", "-t", origin, "@pika_files_opening"],
+            false,
+        );
+        result
+    }
+
+    fn open_files_locked(&self, pane: &Pane, grant: &str, project: &str) -> Result<()> {
+        let origin = &pane.pane_id;
+        let format = [
+            "#{pane_id}",
+            "#{@pika_files_source}",
+            "#{@pika_files_generation}",
+            "#{pane_dead}",
+        ]
+        .join(FORMAT_SEPARATOR);
+        let existing = self.output(["list-panes", "-t", origin, "-F", &format], true)?;
+        for line in String::from_utf8_lossy(&existing.stdout).lines() {
+            let fields: Vec<_> = tmux_fields(line).collect();
+            if fields.len() == 4
+                && fields[1] == origin
+                && fields[2] == grant
+                && fields[3] == "0"
+                && valid_pane_id(fields[0])
+            {
+                self.output(["select-pane", "-t", fields[0]], true)?;
+                return Ok(());
+            }
+        }
+        let dims = self.output(
+            [
+                "display-message",
+                "-p",
+                "-t",
+                origin,
+                "#{pane_width} #{pane_height}",
+            ],
+            true,
+        )?;
+        let dims: Vec<usize> = String::from_utf8_lossy(&dims.stdout)
+            .split_whitespace()
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        let wide = dims.len() == 2 && dims[0] >= 140 && dims[0] >= dims[1].saturating_mul(3);
+        let executable = std::env::current_exe()?.to_string_lossy().into_owned();
+        // Multi-argument split-window execs this argv directly, avoiding shell
+        // startup scripts and interpolation of filenames into shell commands.
+        let cwd_format = project.replace('#', "##");
+        let mut split = vec![
+            "split-window",
+            "-t",
+            origin,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-c",
+            &cwd_format,
+            "-l",
+            "45%",
+        ];
+        if wide {
+            split.extend(["-h", "-b"]);
+        } else {
+            split.push("-v");
+        }
+        split.extend([&executable, "_files-view", "--project", project]);
+        let split = shell_words::join(split);
+        let out = self.output(
+            [
+                "if-shell",
+                "-F",
+                "-t",
+                origin,
+                grant,
+                &split,
+                "run-shell 'exit 75'",
+            ],
+            true,
+        )?;
+        let viewer = String::from_utf8(out.stdout)?.trim().to_owned();
+        if !valid_pane_id(&viewer) {
+            bail!("Files opened but its pane could not be identified");
+        }
+        for (option, value) in [
+            ("@pika_files_source", origin.as_str()),
+            ("@pika_files_generation", grant),
+            // Empty pane-local tags mask any inherited session-level tags.
+            ("@pika_provider", ""),
+            ("@pika_session_id", ""),
+            ("@pika_launch_token", ""),
+            ("@pika_name", ""),
+        ] {
+            self.output(["set-option", "-p", "-t", &viewer, option, value], true)?;
+        }
+        // An ordinary viewer exit must reclaim space, even if the user enables
+        // remain-on-exit globally. This option is scoped to the new pane only.
+        self.output(
+            ["set-option", "-p", "-t", &viewer, "remain-on-exit", "off"],
             true,
         )?;
         Ok(())
@@ -889,7 +1155,7 @@ impl Tmux {
                 };
                 let pane_number = client_pane.strip_prefix('%').unwrap_or_default();
                 let condition = format!(
-                    "#{{&&:#{{==:#{{client_pid}},{client_pid}}},#{{==:#{{pane_id}},#{{a:37}}{pane_number}}}}}"
+                    "#{{&&:#{{==:#{{client_pid}},{client_pid}}},#{{==:#{{?@pika_files_source,#{{@pika_files_source}},#{{pane_id}}}},#{{a:37}}{pane_number}}}}}"
                 );
                 let value = if plain.get(client_pid).copied().unwrap_or(false) {
                     "default".to_owned()
@@ -905,7 +1171,7 @@ impl Tmux {
             // the percent during format expansion instead (after strftime).
             let pane_number = &pane[1..];
             text.push_str(&format!(
-                "#{{?#{{&&:#{{==:#{{client_pid}},{pid}}},#{{==:#{{pane_id}},#{{a:37}}{pane_number}}}}}, │ #{{?#{{@pika_feed_{token}}},#{{T:@pika_feed_{token}}},Board disconnected}},}}"
+                "#{{?#{{&&:#{{==:#{{client_pid}},{pid}}},#{{==:#{{?@pika_files_source,#{{@pika_files_source}},#{{pane_id}}}},#{{a:37}}{pane_number}}}}}, │ #{{?#{{@pika_feed_{token}}},#{{T:@pika_feed_{token}}},Board disconnected}},}}"
             ));
         }
         self.output(
@@ -1007,7 +1273,7 @@ impl Tmux {
                 let Some((provider, encoded)) = rest.split_once('_') else {
                     return false;
                 };
-                matches!(provider, "codex" | "claude" | "opencode")
+                matches!(provider, "codex" | "claude" | "opencode" | "muse")
                     && !encoded.is_empty()
                     && encoded.len() <= 2 * 96
                     && encoded.len().is_multiple_of(2)
@@ -1489,19 +1755,34 @@ impl Tmux {
             Provider::Codex => 'c',
             Provider::Claude => 'a',
             Provider::Opencode => 'o',
+            Provider::Muse => 'm',
         };
         format!("pika-{prefix}-{suffix}")
     }
 }
 
 pub fn is_pika_session(name: &str) -> bool {
-    name.starts_with("pika-c-") || name.starts_with("pika-a-") || name.starts_with("pika-o-")
+    name.starts_with("pika-c-")
+        || name.starts_with("pika-a-")
+        || name.starts_with("pika-o-")
+        || name.starts_with("pika-m-")
 }
 
 /// Noninteractive tmux clients are disposable, but their server and the panes
 /// it owns are not. Only this fresh client process group may be cleaned up.
 /// Pipe pumps are cancellable even when a descendant escapes that group.
-fn bounded_output(command: &mut Command, timeout: Duration) -> Result<Output> {
+pub(crate) fn bounded_output(command: &mut Command, timeout: Duration) -> Result<Output> {
+    bounded_output_cancellable(command, timeout, &CancellationToken::default())
+}
+
+pub(crate) fn bounded_output_cancellable(
+    command: &mut Command,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Output> {
+    if cancel.is_cancelled() {
+        bail!("command cancelled");
+    }
     let deadline = Instant::now() + timeout;
     command
         .stdin(Stdio::null())
@@ -1538,6 +1819,9 @@ fn bounded_output(command: &mut Command, timeout: Duration) -> Result<Output> {
         let mut stderr = None;
         let mut status = None;
         loop {
+            if cancel.is_cancelled() {
+                bail!("command cancelled");
+            }
             while let Ok((is_stdout, result)) = receiver.try_recv() {
                 let bytes = result.context("cannot read tmux output")?;
                 let limit = if is_stdout {
@@ -1698,6 +1982,12 @@ fn format_literal(value: &str) -> String {
         .replace('#', "##")
         .replace(',', "#,")
         .replace('}', "#}")
+}
+
+fn valid_pane_id(value: &str) -> bool {
+    value.strip_prefix('%').is_some_and(|id| {
+        !id.is_empty() && id.len() <= 16 && id.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 fn agent_wrapper(
@@ -1996,6 +2286,9 @@ mod tests {
         assert!(calls.contains("#{session_created}"));
         assert!(calls.contains("status-format[0]"));
         assert!(calls.contains("← Pika"));
+        assert!(calls.contains("Files F9"));
+        assert!(calls.contains("MouseDown1StatusRight"));
+        assert!(calls.contains("@pika_files_generation"));
         assert!(calls.contains("F12 · agent keeps running"));
         assert!(calls.contains("fg=default,bg=default"));
         assert!(!calls.contains("window-style"));
@@ -2005,6 +2298,69 @@ mod tests {
         foreign.session_name = "my-own-session".into();
         assert!(tmux.configure_return_navigation(&foreign).is_err());
         assert_eq!(fs::read_to_string(&trace).unwrap(), calls);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_controls_preserve_custom_bindings_and_reuse_exact_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("trace");
+        let tmux = tmux_fixture(
+            &temp,
+            &format!(
+                "printf '%s\\n' \"$*\" >> {}",
+                shell_words::quote(trace.to_str().unwrap())
+            ),
+        );
+        assert_eq!(
+            tmux.files_binding(
+                "bind-key -T root F9 display-message custom",
+                &["F9", "F8"],
+                false
+            )
+            .unwrap(),
+            Some("F8")
+        );
+        let calls = fs::read_to_string(&trace).unwrap();
+        assert!(calls.contains("send-keys F8"));
+        assert!(!calls.contains("root F9"));
+        assert_eq!(
+            tmux.files_binding("bind-key -T root Any send-keys", &["F9"], false)
+                .unwrap(),
+            None
+        );
+        let own = format!(
+            "bind-key -T root F9 if-shell -F {} {} 'send-keys F9'",
+            shell_words::quote("#{&&:#{@pika_return_navigation},#{@pika_files_callback}}"),
+            shell_words::quote("run-shell -b '#{@pika_files_callback} --pane #{pane_id}'")
+        );
+        assert_eq!(
+            tmux.files_binding(&own, &["F9"], false).unwrap(),
+            Some("F9")
+        );
+        assert_eq!(fs::read_to_string(trace).unwrap(), calls);
+        assert!(!valid_pane_id("%1; kill-server"));
+        assert!(tmux.open_files_companion("not-a-pane").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_git_worker_cancels_owned_process_promptly() {
+        let cancel = CancellationToken::default();
+        let stop = cancel.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            stop.cancel();
+        });
+        let start = Instant::now();
+        let result = bounded_output_cancellable(
+            Command::new("/bin/sh").args(["-c", "sleep 30"]),
+            Duration::from_secs(5),
+            &cancel,
+        );
+        worker.join().unwrap();
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[cfg(unix)]
@@ -2081,7 +2437,7 @@ mod tests {
         assert!(calls.contains(&second_key));
         assert!(calls.contains("@pika_return_style"));
         assert!(
-            calls.contains("#{?#{&&:#{==:#{client_pid},54321},#{==:#{pane_id},#{a:37}1}},default,")
+            calls.contains("#{?#{&&:#{==:#{client_pid},54321},#{==:#{?@pika_files_source,#{@pika_files_source},#{pane_id}},#{a:37}1}},default,")
         );
         assert!(calls.contains("client_pid},12345"));
         assert!(calls.contains("client_pid},54321"));
@@ -2369,7 +2725,10 @@ mod tests {
         let calls = fs::read_to_string(trace).unwrap();
         assert!(calls.contains("set-option -t %1 @pika_board_summary"));
         assert!(calls.contains("#{==:#{client_pid},12345}"));
-        assert!(calls.contains("#{==:#{pane_id},#{a:37}1}"));
+        assert!(
+            calls
+                .contains("#{==:#{?@pika_files_source,#{@pika_files_source},#{pane_id}},#{a:37}1}")
+        );
         assert!(calls.contains("@pika_feed_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         assert!(calls.contains("Board disconnected"));
         assert!(!calls.contains("list-panes"));

@@ -407,6 +407,7 @@ fn full_preview_is_read_only_then_applies_idempotently() {
         codex_home: temp.path().join("codex"),
         claude_home: temp.path().join("claude"),
         opencode_config_home: temp.path().join("opencode"),
+        muse_config_home: temp.path().join("muse-config"),
     };
     let planned = proposed_hook_changes(&roots, &options(binary.clone())).unwrap();
     assert_eq!(planned.len(), 5);

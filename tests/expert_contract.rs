@@ -331,6 +331,8 @@ fn batched_source_index_maps_active_leaves_back_to_stable_workstreams() {
         claude_home: root.path().join("claude"),
         opencode_data_home: root.path().join("opencode-data"),
         opencode_config_home: root.path().join("opencode-config"),
+        muse_data_home: root.path().join("muse-data"),
+        muse_config_home: root.path().join("muse-config"),
     };
     fs::create_dir_all(&paths.codex_home).unwrap();
     let transcript = root.path().join("leaf.jsonl");

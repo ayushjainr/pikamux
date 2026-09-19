@@ -64,6 +64,8 @@ fn paths(root: &std::path::Path) -> Paths {
         claude_home: root.join("claude-home"),
         opencode_data_home: root.join("opencode-data"),
         opencode_config_home: root.join("opencode-config"),
+        muse_data_home: root.join("muse-data"),
+        muse_config_home: root.join("muse-config"),
     }
 }
 
@@ -737,6 +739,11 @@ fn real_isolated_tmux_resumes_all_providers_and_reuses_each_exact_home() {
             "tmux_claude",
         ),
         (Provider::Opencode, "ses_444444444444", "tmux_opencode"),
+        (
+            Provider::Muse,
+            "77777777-7777-4777-8777-777777777777",
+            "tmux_muse",
+        ),
     ];
     for (provider, identity, name) in fixtures {
         store
@@ -822,6 +829,24 @@ fn real_isolated_tmux_resumes_all_providers_and_reuses_each_exact_home() {
         assert_eq!(pika.tmux.list_panes().unwrap().len(), index + 1);
     }
 
+    // Completed resume/reuse fixtures need not consume PTYs during fresh-launch
+    // tests. Keep peak terminal use bounded on developer hosts as providers grow.
+    for pane in pika.tmux.list_panes().unwrap() {
+        assert!(
+            fixtures
+                .iter()
+                .any(|(provider, id, _)| pane.pika_provider == Some(*provider)
+                    && pane.pika_session_id.as_deref() == Some(*id))
+        );
+        assert!(
+            Command::new("tmux")
+                .args(["-L", &_guard.0, "kill-session", "-t", &pane.session_name])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
     let fresh = pika
         .new_session("fresh_claude", Provider::Claude, false)
         .unwrap();
@@ -875,11 +900,13 @@ fn real_isolated_tmux_resumes_all_providers_and_reuses_each_exact_home() {
             tracked.clone()
         } else {
             let name = format!("fresh_{provider}");
-            let receipt = pika.new_session(&name, provider, false).unwrap();
+            let receipt = pika
+                .new_session(&name, provider, false)
+                .unwrap_or_else(|error| panic!("new {provider} failed: {error:#}"));
             let OpenTarget::Pending(pending) = receipt.target else {
                 panic!("new provider did not retain its launch identity")
             };
-            let identity = if provider == Provider::Codex {
+            let identity = if matches!(provider, Provider::Codex | Provider::Muse) {
                 "66666666-6666-4666-8666-666666666666"
             } else {
                 "ses_freshfixture"

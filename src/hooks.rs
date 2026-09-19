@@ -217,7 +217,9 @@ pub fn event_state(provider: Provider, payload: &HookPayload) -> StatusObservati
             if (provider == Provider::Codex
                 && payload.tool_name.as_deref() == Some("request_user_input"))
                 || (provider == Provider::Claude
-                    && payload.tool_name.as_deref() == Some("AskUserQuestion")) =>
+                    && payload.tool_name.as_deref() == Some("AskUserQuestion"))
+                || (provider == Provider::Muse
+                    && payload.tool_name.as_deref() == Some("request_user_input")) =>
         {
             (Status::NeedsYou, true, Some("question"), None)
         }
@@ -245,6 +247,12 @@ pub fn event_state(provider: Provider, payload: &HookPayload) -> StatusObservati
             true,
             Some("failed"),
             Some(payload.error.as_deref().unwrap_or("Claude turn failed")),
+        ),
+        "PostToolUseFailure" => (
+            Status::Error,
+            true,
+            Some("failed"),
+            Some(payload.error.as_deref().unwrap_or("Muse tool failed")),
         ),
         "SessionEnd" => (Status::Parked, false, None, None),
         "SessionStart" => (Status::Ready, false, None, None),
@@ -306,7 +314,7 @@ fn handle_hook_with_checkpoints(
             "inherited provider identity does not match",
         ));
     }
-    if provider == Provider::Claude
+    if matches!(provider, Provider::Claude | Provider::Muse)
         && context
             .expected_session_id
             .as_deref()
@@ -315,7 +323,7 @@ fn handle_hook_with_checkpoints(
         return Ok(HookResult::ignored(
             provider,
             Some(payload.session_id.clone()),
-            "inherited Claude identity does not match",
+            "inherited conversation identity does not match",
         ));
     }
 
@@ -337,6 +345,17 @@ fn handle_hook_transaction(
     context: &HookContext,
     after_projection: impl FnOnce() -> Result<()>,
 ) -> Result<HookResult> {
+    if provider == Provider::Muse
+        && let Some(token) = context.launch_token.as_deref()
+        && let Some((bound_provider, bound_id)) = store.get_launch_binding(token)?
+        && (bound_provider != provider || bound_id != payload.session_id)
+    {
+        return Ok(HookResult::ignored(
+            provider,
+            Some(payload.session_id.clone()),
+            "Muse helper cannot claim its parent's launch",
+        ));
+    }
     if store.is_untracked(provider, &payload.session_id)? {
         store.delete_live_owners(provider, &payload.session_id, None, None)?;
         return Ok(HookResult::ignored(
@@ -767,6 +786,7 @@ pub fn enrich_hook_payload(provider: Provider, payload: &HookPayload) -> HookPay
         Provider::Codex => enrich_codex_payload(path, payload),
         Provider::Claude => enrich_claude_payload(path, payload),
         Provider::Opencode => payload.clone(),
+        Provider::Muse => payload.clone(),
     }
 }
 
@@ -1318,6 +1338,7 @@ fn worker_originator<'a>(
                 .find(|prefix| title.to_lowercase().starts_with(&prefix.to_lowercase()))
                 .map(String::as_str)
         }
+        Provider::Muse => payload.parent_session_id.as_deref(),
     }
 }
 
@@ -1347,6 +1368,7 @@ fn valid_event(provider: Provider, event: &str) -> bool {
                     | "QuestionReply"
                     | "StopFailure"
             ),
+            Provider::Muse => matches!(event, "PostToolUseFailure" | "Notification"),
         }
 }
 
@@ -1543,6 +1565,42 @@ mod tests {
         context.owner_start_time = Some(7);
         context.owner_token = "exact-owner".into();
         context
+    }
+
+    #[test]
+    fn muse_helper_cannot_rebind_parent_launch_or_change_its_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::at(temp.path().join("pika.db"));
+        store.restore_tracking(Provider::Muse, "exact").unwrap();
+        handle_hook(
+            &store,
+            Provider::Muse,
+            &payload(Provider::Muse, "SessionStart"),
+            &context(1.0),
+        )
+        .unwrap();
+        assert!(
+            store
+                .bind_launch("parent-launch", Provider::Muse, "exact")
+                .unwrap()
+        );
+        let before = store.get_session(Provider::Muse, "exact").unwrap().unwrap();
+        let mut child = payload(Provider::Muse, "UserPromptSubmit");
+        child.session_id = "child".into();
+        let mut inherited = context(2.0);
+        inherited.launch_token = Some("parent-launch".into());
+        let result = handle_hook(&store, Provider::Muse, &child, &inherited).unwrap();
+        assert!(result.tag_request.is_none());
+        assert!(
+            store
+                .get_session(Provider::Muse, "child")
+                .unwrap()
+                .is_none()
+        );
+        let after = store.get_session(Provider::Muse, "exact").unwrap().unwrap();
+        assert_eq!(before.status, after.status);
+        assert_eq!(before.unread, after.unread);
+        assert_eq!(before.updated_at, after.updated_at);
     }
 
     #[test]

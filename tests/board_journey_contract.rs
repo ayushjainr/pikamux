@@ -133,6 +133,7 @@ impl BoardProcess {
         let mut command = Command::new(env!("CARGO_BIN_EXE_pika"));
         command
             .env_clear()
+            .current_dir(root.path().join("home"))
             .env("HOME", root.path().join("home"))
             .env("XDG_CONFIG_HOME", root.path().join("config"))
             .env("XDG_STATE_HOME", root.path().join("state"))
@@ -532,6 +533,156 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
             }
             assert!(board.child.try_wait().unwrap().is_none());
         }
+        // The actual configured bottom-bar key opens Files without leaving
+        // this attachment or sending any input to the fake provider.
+        let wide = return_keys == b"\x1b[24~";
+        if wide {
+            board.send(b"\x1b[20~"); // F9
+        } else {
+            board.tmux(&[
+                "resize-window",
+                "-t",
+                "pika-c-aaaaaaaaaa",
+                "-x",
+                "120",
+                "-y",
+                "31",
+            ]);
+            board.send(b"\x1b[<0;134;32M\x1b[<0;134;32m"); // Files click
+        }
+        board.await_text("q close");
+        let viewer = board
+            .tmux(&["display-message", "-p", "#{pane_id}"])
+            .trim()
+            .to_owned();
+        let origin = board
+            .tmux(&["show-options", "-pqv", "-t", &viewer, "@pika_files_source"])
+            .trim()
+            .to_owned();
+        assert!(origin.starts_with('%'), "not a Files companion: {viewer}");
+        let pid = board.tmux(&["display-message", "-p", "-t", &origin, "#{pane_pid}"]);
+        let axis = if wide { "#{pane_left}" } else { "#{pane_top}" };
+        let viewer_axis: usize = board
+            .tmux(&["display-message", "-p", "-t", &viewer, axis])
+            .trim()
+            .parse()
+            .unwrap();
+        let origin_axis: usize = board
+            .tmux(&["display-message", "-p", "-t", &origin, axis])
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            if wide {
+                viewer_axis < origin_axis
+            } else {
+                viewer_axis > origin_axis
+            },
+            "companion opened on wrong side"
+        );
+        assert_eq!(
+            board.tmux(&["list-panes", "-t", &origin]).lines().count(),
+            2
+        );
+        let reopen = board
+            .endpoint(&["_files-open", "--pane", &origin])
+            .output()
+            .unwrap();
+        assert!(
+            reopen.status.success(),
+            "{}",
+            String::from_utf8_lossy(&reopen.stderr)
+        );
+        assert_eq!(
+            board.tmux(&["list-panes", "-t", &origin]).lines().count(),
+            2
+        );
+        assert!(
+            board
+                .tmux(&["show-options", "-pqv", "-t", &viewer, "@pika_provider"])
+                .trim()
+                .is_empty()
+        );
+        let summary = board.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            &viewer,
+            "#{E:@pika_board_summary}",
+        ]);
+        assert!(
+            summary.contains("working"),
+            "companion lost live feed: {summary}"
+        );
+        if wide {
+            // Files captures mouse input, but the outer border must remain
+            // tmux-owned and resize the companion without touching the agent.
+            let before: u16 = board
+                .tmux(&["display-message", "-p", "-t", &viewer, "#{pane_width}"])
+                .trim()
+                .parse()
+                .unwrap();
+            let border = before + 1; // SGR coordinates are one based; pane starts at zero.
+            board.send(format!("\x1b[<0;{border};8M").as_bytes());
+            board.send(
+                format!(
+                    "\x1b[<32;{};8M\x1b[<32;{};8M\x1b[<0;{};8m",
+                    border + 3,
+                    border + 6,
+                    border + 6
+                )
+                .as_bytes(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let mut bytes = [0; 32768];
+                while let Ok(n) = board.terminal.read(&mut bytes) {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let after: u16 = board
+                    .tmux(&["display-message", "-p", "-t", &viewer, "#{pane_width}"])
+                    .trim()
+                    .parse()
+                    .unwrap();
+                if after > before {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "outer tmux border did not resize the viewer"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        board.send(b"q");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while board.tmux(&["list-panes", "-t", &origin]).lines().count() != 1 {
+            let mut bytes = [0; 32768];
+            while let Ok(n) = board.terminal.read(&mut bytes) {
+                if n == 0 {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "companion did not close: {}\n{}",
+                board.tmux(&[
+                    "list-panes",
+                    "-t",
+                    &origin,
+                    "-F",
+                    "#{pane_id}:#{pane_active}:#{pane_current_command}:#{pane_dead}"
+                ]),
+                board.tmux(&["capture-pane", "-p", "-t", &viewer])
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            board.tmux(&["display-message", "-p", "-t", &origin, "#{pane_pid}"]),
+            pid
+        );
         board.send(return_keys);
         board.await_text("FILTER audit");
         assert!(board.child.try_wait().unwrap().is_none());
