@@ -5,10 +5,10 @@ use pikamux::assistant_investigation::{
 use pikamux::assistant_memory::{Scope, Store};
 use pikamux::assistant_policy::{AssistantPolicy, PolicyConfig};
 use pikamux::assistant_provider::{
-    MainAssistant, MainProfile, ProviderError, RpcTransport, ServerEvent,
+    DEFAULT_MODEL, MainAssistant, MainProfile, ProviderError, RpcTransport, ServerEvent,
 };
 use pikamux::assistant_recovery::recover_after_services_dropped;
-use pikamux::assistant_runtime::{AssistantRuntime, RuntimeConfig, RuntimeState};
+use pikamux::assistant_runtime::{AssistantRuntime, RuntimeConfig, RuntimeError, RuntimeState};
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -45,7 +45,7 @@ impl RpcTransport for RpcFake {
             "thread/start" | "thread/resume" => json!({
                 "thread":{"id":if method == "thread/start" { "fresh-thread" } else { "old-thread" }},
                 "activePermissionProfile":{"id":"pika-assistant","extends":null},
-                "sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","model":"gpt-5.6-luna"
+                "sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","model":DEFAULT_MODEL
             }),
             "turn/start" => json!({"turn":{"id":"turn-1"}}),
             _ => json!({}),
@@ -170,6 +170,10 @@ fn dispatched_investigation_is_quarantined_on_reopen_without_replay() {
 fn runtime_recovery_requires_fresh_thread_and_preserves_old_request_charge() {
     let (_dir, private, memory_path, policy_path, _investigation_path) = paths();
     let journal_path = private.join("runtime.sqlite");
+    let new_scope = Scope {
+        project: Some("pika".into()),
+        ..Default::default()
+    };
     let memory = Store::open(&memory_path).unwrap();
     let profile = memory.profile_id().to_owned();
     let policy = AssistantPolicy::open(&policy_path).unwrap();
@@ -206,7 +210,35 @@ fn runtime_recovery_requires_fresh_thread_and_preserves_old_request_charge() {
         RuntimeState::UnknownDelivery { .. }
     ));
     drop(runtime);
+    let attempted_switch = AssistantRuntime::open(
+        MainAssistant::new(
+            RpcFake::default(),
+            MainProfile {
+                profile_id: profile.clone(),
+                thread_id: None,
+            },
+        ),
+        Store::open(&memory_path).unwrap(),
+        AssistantPolicy::open(&policy_path).unwrap(),
+        &journal_path,
+        new_scope.clone(),
+    );
+    assert!(matches!(attempted_switch, Err(RuntimeError::Denied(_))));
     recover_after_services_dropped(&private, "33333333-3333-4333-8333-333333333333", 0).unwrap();
+    let stale_identity = AssistantRuntime::open(
+        MainAssistant::new(
+            RpcFake::default(),
+            MainProfile {
+                profile_id: profile.clone(),
+                thread_id: Some("old-thread".into()),
+            },
+        ),
+        Store::open(&memory_path).unwrap(),
+        AssistantPolicy::open(&policy_path).unwrap(),
+        &journal_path,
+        new_scope.clone(),
+    );
+    assert!(matches!(stale_identity, Err(RuntimeError::Denied(_))));
     let memory = Store::open(&memory_path).unwrap();
     let policy = AssistantPolicy::open(&policy_path).unwrap();
     let mut fresh = AssistantRuntime::open(
@@ -220,10 +252,7 @@ fn runtime_recovery_requires_fresh_thread_and_preserves_old_request_charge() {
         memory,
         policy,
         &journal_path,
-        Scope {
-            project: Some("personal".into()),
-            ..Default::default()
-        },
+        new_scope.clone(),
     )
     .unwrap();
     fresh
@@ -238,6 +267,18 @@ fn runtime_recovery_requires_fresh_thread_and_preserves_old_request_charge() {
             .begin_user_turn("old-request", "must reject", &[], 5)
             .is_err()
     );
+    fresh
+        .begin_user_turn("new-request", "new scope", &[], 6)
+        .unwrap();
+    let journal = rusqlite::Connection::open(&journal_path).unwrap();
+    let recorded_scope: String = journal
+        .query_row(
+            "SELECT scope FROM assistant_runtime_scope WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded_scope, serde_json::to_string(&new_scope).unwrap());
     assert_eq!(
         fresh
             .provider()

@@ -9,7 +9,7 @@
 use serde_json::{Value, json};
 use std::fmt;
 
-pub const DEFAULT_MODEL: &str = "gpt-5.6-luna";
+pub const DEFAULT_MODEL: &str = "gpt-6-luna";
 pub const DEFAULT_EFFORT: &str = "medium";
 /// The provider-owned profile installed by the isolated transport.  Keeping
 /// this identifier in one place prevents a caller from silently selecting a

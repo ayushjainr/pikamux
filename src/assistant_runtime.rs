@@ -130,10 +130,14 @@ fn bind_profile_and_scope<T: RpcTransport>(
             "memory and runtime profiles do not match".into(),
         ));
     }
-    bind_scope(journal, scope)
+    bind_scope(journal, scope, provider.profile().thread_id.is_none())
 }
 
-fn bind_scope(journal: &Connection, scope: &Scope) -> Result<(), RuntimeError> {
+fn bind_scope(
+    journal: &Connection,
+    scope: &Scope,
+    provider_thread_absent: bool,
+) -> Result<(), RuntimeError> {
     let scope_json =
         serde_json::to_string(scope).map_err(|e| RuntimeError::Denied(e.to_string()))?;
     journal.execute(
@@ -145,12 +149,43 @@ fn bind_scope(journal: &Connection, scope: &Scope) -> Result<(), RuntimeError> {
         [],
         |r| r.get(0),
     )?;
-    if stored_scope != scope_json {
+    if stored_scope == scope_json {
+        return Ok(());
+    }
+    if !provider_thread_absent || !retired_context_allows_scope_change(journal)? {
         return Err(RuntimeError::Denied(
-            "runtime scope differs from its persisted provider context".into(),
+            "Previous provider context belongs to another scope. Retire it with /fresh-context before switching scopes.".into(),
+        ));
+    }
+    let updated = journal.execute(
+        "UPDATE assistant_runtime_scope SET scope=? WHERE id=1 AND scope=?",
+        rusqlite::params![scope_json, stored_scope],
+    )?;
+    if updated != 1 {
+        return Err(RuntimeError::Denied(
+            "assistant scope changed while opening provider context".into(),
         ));
     }
     Ok(())
+}
+
+fn retired_context_allows_scope_change(journal: &Connection) -> Result<bool, RuntimeError> {
+    let thread_id: Option<String> = journal.query_row(
+        "SELECT thread_id FROM assistant_runtime_profile WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let blocked: i64 = journal.query_row(
+        "SELECT blocked FROM assistant_runtime_guard WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let retained_context: i64 = journal.query_row(
+        "SELECT EXISTS(SELECT 1 FROM assistant_runtime_turns WHERE state IN ('reserved','dispatch_intent','in_flight','unknown') OR prompt <> '' OR COALESCE(reply,'') <> '')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(thread_id.is_none() && blocked == 0 && retained_context == 0)
 }
 
 fn restore_state(journal: &Connection, memory_epoch: u64) -> Result<RuntimeState, RuntimeError> {
@@ -1000,11 +1035,11 @@ mod tests {
                 "thread/start" => Ok(
                     json!({ "thread": { "id": self.thread_id.as_deref().unwrap_or("thread-main") },
                         "activePermissionProfile": {"id": "pika-assistant", "extends": null},
-                        "sandbox": {"type": "readOnly", "networkAccess": false}, "approvalPolicy": "never", "model": "gpt-5.6-luna" }),
+                        "sandbox": {"type": "readOnly", "networkAccess": false}, "approvalPolicy": "never", "model": crate::assistant_provider::DEFAULT_MODEL }),
                 ),
                 "thread/resume" => Ok(json!({ "thread": { "id": "thread-main" },
                     "activePermissionProfile": {"id": "pika-assistant", "extends": null},
-                    "sandbox": {"type": "readOnly", "networkAccess": false}, "approvalPolicy": "never", "model": "gpt-5.6-luna" })),
+                    "sandbox": {"type": "readOnly", "networkAccess": false}, "approvalPolicy": "never", "model": crate::assistant_provider::DEFAULT_MODEL })),
                 "turn/start" if self.fail_turn => Err(ProviderError::Transport("lost".into())),
                 "turn/start" => Ok(json!({ "turn": { "id": "turn-main" } })),
                 _ => Ok(json!({})),
