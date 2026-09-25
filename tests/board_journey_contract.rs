@@ -26,6 +26,14 @@ struct BoardProcess {
     real_tmux: bool,
 }
 
+fn real_tmux_binary() -> std::path::PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|path| path.join("tmux"))
+        .find(|path| path.is_file())
+        .and_then(|path| fs::canonicalize(path).ok())
+        .expect("tmux is required for the real terminal board journey")
+}
+
 impl Drop for BoardProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -384,14 +392,7 @@ fn remote_board_feed_verifies_node_bounds_frames_and_clears_on_disconnect() {
 
 #[test]
 fn unverified_terminal_requires_choice_and_never_relaunches_or_acknowledges() {
-    let real_tmux = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|path| path.join("tmux"))
-        .find(|path| path.is_file())
-        .map(|path| fs::canonicalize(path).unwrap());
-    let Some(real_tmux) = real_tmux else {
-        eprintln!("tmux unavailable; unverified terminal journey was not exercised");
-        return;
-    };
+    let real_tmux = real_tmux_binary();
     let mut board = BoardProcess::start();
     fs::write(
         board.root.path().join("bin/tmux"),
@@ -492,14 +493,7 @@ fn unverified_terminal_requires_choice_and_never_relaunches_or_acknowledges() {
 
 #[test]
 fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
-    let real_tmux = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|path| path.join("tmux"))
-        .find(|path| path.is_file())
-        .map(|path| fs::canonicalize(path).unwrap());
-    let Some(real_tmux) = real_tmux else {
-        eprintln!("tmux unavailable; real board handoff was not exercised");
-        return;
-    };
+    let real_tmux = real_tmux_binary();
     let mut board = BoardProcess::start();
     fs::write(
         board.root.path().join("bin/tmux"),
@@ -1298,14 +1292,7 @@ fn overdue_launch_can_be_hidden_without_deleting_recovery_or_untracking_a_conver
 #[test]
 fn client_update_exit_keeps_one_reopenable_startup_home_and_an_actionable_board_row() {
     use pikamux::model::Provider;
-    let real_tmux = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|path| path.join("tmux"))
-        .find(|path| path.is_file())
-        .map(|path| fs::canonicalize(path).unwrap());
-    let Some(real_tmux) = real_tmux else {
-        eprintln!("tmux unavailable; client updater exit journey was not exercised");
-        return;
-    };
+    let real_tmux = real_tmux_binary();
     let mut board = BoardProcess::start();
     fs::write(
         board.root.path().join("bin/tmux"),

@@ -2408,27 +2408,64 @@ mod tests {
 
         let mut first = original.clone();
         hydrate_codex_lifecycle(&mut first, Some(&first_activity));
-        assert_eq!(
-            first
-                .iter()
-                .filter(|candidate| candidate.lifecycle_status == Some(Status::Ready))
-                .count(),
-            MAX_CODEX_LIFECYCLE_RECORDS
-        );
+        let first_ready = first
+            .iter()
+            .filter(|candidate| candidate.lifecycle_status == Some(Status::Ready))
+            .map(|candidate| candidate.session_id.clone())
+            .collect::<BTreeSet<_>>();
+        let expected_first = (4..20)
+            .map(|index| format!("00000000-0000-4000-8000-{index:012}"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(first_ready, expected_first);
+        for candidate in &first {
+            if candidate.updated_at <= 4.0 {
+                assert_eq!(candidate.updated_at, 0.0, "deferred cursor advanced");
+                assert_eq!(candidate.lifecycle_status, None);
+            } else {
+                assert!(candidate.updated_at > 0.0);
+                assert_eq!(candidate.lifecycle_status, Some(Status::Ready));
+            }
+        }
+        // Simulate the reconciler committing only the records whose lifecycle
+        // evidence was read; deferred identities retain their old cursor.
         let second_activity = first
             .iter()
-            .map(|candidate| (candidate.session_id.clone(), candidate.updated_at))
+            .map(|candidate| {
+                (
+                    candidate.session_id.clone(),
+                    if candidate.lifecycle_status.is_some() {
+                        candidate.updated_at
+                    } else {
+                        0.0
+                    },
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let mut second = original;
         hydrate_codex_lifecycle(&mut second, Some(&second_activity));
-        assert_eq!(
-            second
-                .iter()
-                .filter(|candidate| candidate.lifecycle_status == Some(Status::Ready))
-                .count(),
-            20 - MAX_CODEX_LIFECYCLE_RECORDS
-        );
-        assert!(second.iter().all(|candidate| candidate.updated_at > 0.0));
+        let second_ready = second
+            .iter()
+            .filter(|candidate| candidate.lifecycle_status == Some(Status::Ready))
+            .map(|candidate| candidate.session_id.clone())
+            .collect::<BTreeSet<_>>();
+        let expected_second = (0..4)
+            .map(|index| format!("00000000-0000-4000-8000-{index:012}"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(second_ready, expected_second);
+        for candidate in &second {
+            assert!(candidate.updated_at > 0.0);
+            let index = candidate
+                .session_id
+                .rsplit('-')
+                .next()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert_eq!(
+                candidate.lifecycle_status,
+                (index < 4).then_some(Status::Ready)
+            );
+        }
     }
 
     #[test]
@@ -2602,13 +2639,16 @@ mod tests {
     #[test]
     fn native_name_stdout_flood_is_rejected_before_deadline() {
         let temp = tempfile::tempdir().unwrap();
-        let (paths, config) = native_name_fixture(&temp, "exec /usr/bin/yes flood");
+        let (child, output) = ready_native_name_fixture(&temp, "exec /usr/bin/yes flood");
         let started = Instant::now();
-        assert!(
-            !Providers::new(&paths, &config)
-                .set_codex_native_name("11111111-1111-4111-8111-111111111111", "name")
-        );
+        assert!(!finish_codex_native_name(
+            child,
+            "11111111-1111-4111-8111-111111111111",
+            "name",
+            started + Duration::from_secs(5)
+        ));
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert_naming_descendants_closed(&output);
     }
 
     #[cfg(unix)]
@@ -2618,6 +2658,20 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("codex");
         let log = temp.path().join("requests.jsonl");
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(codex_home.join("config.toml"), b"model = 'fixture'\n").unwrap();
+        std::fs::write(codex_home.join("state_5.sqlite"), b"fixture-state-bytes").unwrap();
+        let state_before = fs::read_dir(&codex_home)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         std::fs::write(
             &executable,
             format!(
@@ -2634,7 +2688,7 @@ mod tests {
             state_dir: temp.path().join("state"),
             config: temp.path().join("config/config.json"),
             database: temp.path().join("state/pika.db"),
-            codex_home: temp.path().join("codex-home"),
+            codex_home: codex_home.clone(),
             claude_home: temp.path().join("claude-home"),
             opencode_data_home: temp.path().join("opencode-data"),
             opencode_config_home: temp.path().join("opencode-config"),
@@ -2647,9 +2701,42 @@ mod tests {
             .insert("codex".into(), executable.to_string_lossy().into_owned());
         let id = "11111111-1111-4111-8111-111111111111";
         assert!(Providers::new(&paths, &config).set_codex_native_name(id, "research_pipeline"));
-        let requests = std::fs::read_to_string(log).unwrap();
-        assert!(requests.contains("thread/name/set"));
-        assert!(requests.contains(id));
-        assert!(requests.contains("research_pipeline"));
+        let requests = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["method"], "initialize");
+        assert_eq!(requests[0]["id"], 1);
+        assert_eq!(requests[0]["params"]["clientInfo"]["name"], "pikamux");
+        assert_eq!(
+            requests[0]["params"]["clientInfo"]["version"],
+            crate::VERSION
+        );
+        assert_eq!(
+            requests[0]["params"]["capabilities"]["experimentalApi"],
+            true
+        );
+        assert_eq!(requests[1], serde_json::json!({"method":"initialized"}));
+        assert_eq!(
+            requests[2],
+            serde_json::json!({
+                "method":"thread/name/set",
+                "id":2,
+                "params":{"threadId":id,"name":"research_pipeline"}
+            })
+        );
+        let state_after = fs::read_dir(&codex_home)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(state_after, state_before, "provider-owned state was edited");
     }
 }

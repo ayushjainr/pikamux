@@ -1,5 +1,5 @@
 #[test]
-fn shipped_third_party_notices_cover_binary_distribution_obligations() {
+fn shipped_third_party_notices_keep_known_required_sections() {
     let notices = include_str!("../THIRD_PARTY.md");
     assert!(notices.contains("Cargo.lock SHA-256"));
     assert!(notices.contains("Declared authors"));

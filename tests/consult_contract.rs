@@ -768,11 +768,11 @@ for arg in "$@"; do
   if [ "$arg" = "delete" ]; then mode=delete; fi
 done
 case "$mode" in
-  serve) PIKA_FAKE_DB="$db" PIKA_FAKE_PORT="$port" PIKA_FAKE_CWD={cwd} PIKA_FAKE_CHILD={returned_child} "$bin" --exact fake_opencode_server --nocapture ;;
-  run) PIKA_FAKE_DB="$db" PIKA_FAKE_SESSION="$sid" "$bin" --exact fake_opencode_turn --nocapture ;;
+  serve) PIKA_FAKE_DB="$db" PIKA_FAKE_PORT="$port" PIKA_FAKE_CWD={cwd} PIKA_FAKE_CHILD={returned_child} "$bin" --exact fake_opencode_server --ignored --nocapture ;;
+  run) PIKA_FAKE_DB="$db" PIKA_FAKE_SESSION="$sid" "$bin" --exact fake_opencode_turn --ignored --nocapture ;;
   delete)
     if [ {delete_child} = yes ]; then
-      PIKA_FAKE_DB="$db" PIKA_FAKE_SESSION="$sid" "$bin" --exact fake_opencode_delete --nocapture
+      PIKA_FAKE_DB="$db" PIKA_FAKE_SESSION="$sid" "$bin" --exact fake_opencode_delete --ignored --nocapture
     fi ;;
 esac
 "#,
@@ -882,6 +882,7 @@ fn opencode_unknown_fork_identity_is_not_retry_safe_or_guessed_for_deletion() {
 }
 
 #[test]
+#[ignore = "subprocess fixture entrypoint"]
 fn fake_opencode_server() {
     let Ok(port) = std::env::var("PIKA_FAKE_PORT") else {
         return;
@@ -921,6 +922,7 @@ fn fake_opencode_server() {
 }
 
 #[test]
+#[ignore = "subprocess fixture entrypoint"]
 fn fake_opencode_turn() {
     let Ok(database) = std::env::var("PIKA_FAKE_DB") else {
         return;
@@ -962,6 +964,7 @@ fn fake_opencode_turn() {
 }
 
 #[test]
+#[ignore = "subprocess fixture entrypoint"]
 fn fake_opencode_delete() {
     let Ok(database) = std::env::var("PIKA_FAKE_DB") else {
         return;

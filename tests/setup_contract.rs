@@ -184,35 +184,114 @@ fn invalid_json_fails_closed_before_a_change_is_planned() {
 }
 
 #[test]
-fn opencode_plugin_maps_attention_and_verifies_native_rename() {
+fn installed_opencode_plugin_maps_attention_and_verifies_native_rename() {
     let temp = tempfile::tempdir().unwrap();
     let binary = executable(temp.path());
     let home = temp.path().join("opencode");
     let change = opencode_plugin_change(&home, &binary).unwrap();
-    assert!(change.after.contains("QuestionRequest"));
-    assert!(change.after.contains("SessionHeartbeat"));
-    assert!(change.after.contains("client.session.update"));
-    assert!(change.after.contains("observedTitle !== desired"));
-    assert!(change.after.contains("p.info.parentID"));
-    assert!(
-        change
-            .after
-            .contains(&serde_json::to_string(&binary.to_string_lossy()).unwrap())
-    );
     apply_changes(&[change], "plugin").unwrap();
     assert!(hooks_installed(&home, Provider::Opencode, &binary));
-    if Command::new("node").arg("--version").output().is_ok() {
-        let output = Command::new("node")
-            .arg("--check")
-            .arg(home.join("plugins/pika.js"))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    fs::write(temp.path().join("package.json"), r#"{"type":"module"}"#).unwrap();
+    fs::write(temp.path().join("check.mjs"), r#"
+import assert from 'node:assert/strict';
+import { Pika } from './opencode/plugins/pika.js';
+
+const sent = [];
+const updates = [];
+const sessions = new Map([
+  ['root', { id: 'root', title: 'Untitled' }],
+  ['child', { id: 'child', parentID: 'root', title: 'Child' }],
+  ['failure', { id: 'failure', title: 'Old title' }],
+  ['first', { id: 'first', title: 'Untitled' }],
+  ['second', { id: 'second', title: 'Untitled' }],
+  ['wrong', { id: 'wrong', title: 'Other conversation' }],
+  ['expected', { id: 'expected', title: 'Untitled' }],
+]);
+let retainRename = true;
+globalThis.Bun = { spawn: ({ cmd }) => {
+  assert.deepEqual(cmd, [process.argv[2], 'hook', '--provider', 'opencode']);
+  return { stdin: { write: payload => sent.push(JSON.parse(payload)), end() {} }, exited: Promise.resolve(0) };
+} };
+const client = { session: {
+  get: async ({ path }) => ({ data: sessions.get(path.id) }),
+  update: async ({ path, body }) => {
+    updates.push({ id: path.id, title: body.title });
+    if (retainRename) sessions.set(path.id, { ...sessions.get(path.id), title: body.title });
+    return { data: sessions.get(path.id) };
+  },
+} };
+const created = (id, info = sessions.get(id)) => ({ event: { type: 'session.created', properties: { info } } });
+
+process.env.PIKA_NAME = 'My work';
+process.env.PIKA_SESSION_ID = 'root';
+const exact = await Pika({ client, directory: '/fixture' });
+await exact.event(created('root'));
+assert.deepEqual(updates, [{ id: 'root', title: 'My work' }]);
+assert.deepEqual(sent.findLast(p => p.hook_event_name === 'SessionStart'), {
+  session_id: 'root', hook_event_name: 'SessionStart', cwd: '/fixture', source: 'opencode-plugin',
+  session_title: 'My work', desired_name: 'My work', native_name_error: null,
+});
+await exact.event(created('child'));
+assert.equal(updates.length, 1, 'child sessions must not inherit the launch name');
+assert(!sent.some(p => p.session_id === 'child'));
+for (const [type, expectedEvent, extra] of [
+  ['session.status', 'UserPromptSubmit', { status: { type: 'busy' } }],
+  ['session.status', 'Stop', { status: { type: 'idle' } }],
+  ['session.idle', 'Stop', {}],
+  ['permission.asked', 'PermissionRequest', {}],
+  ['permission.replied', 'PermissionReply', {}],
+  ['question.asked', 'QuestionRequest', {}],
+  ['question.replied', 'QuestionReply', {}],
+  ['question.rejected', 'QuestionReply', {}],
+]) {
+  await exact.event({ event: { type, properties: { sessionID: 'root', ...extra } } });
+  assert.equal(sent.at(-1).hook_event_name, expectedEvent, type);
+  assert.equal(sent.at(-1).session_id, 'root', type);
+}
+assert.equal(updates.length, 1, 'ordinary root activity must not reapply the launch name');
+
+retainRename = false;
+process.env.PIKA_SESSION_ID = 'failure';
+const failed = await Pika({ client, directory: '/fixture' });
+await failed.event(created('failure'));
+assert.deepEqual(updates.at(-1), { id: 'failure', title: 'My work' });
+assert.deepEqual(sent.findLast(p => p.session_id === 'failure' && p.hook_event_name === 'SessionStart'), {
+  session_id: 'failure', hook_event_name: 'SessionStart', cwd: '/fixture', source: 'opencode-plugin',
+  session_title: 'Old title', desired_name: 'My work',
+  native_name_error: 'OpenCode did not retain the requested title',
+});
+
+retainRename = true;
+delete process.env.PIKA_SESSION_ID;
+const unbound = await Pika({ client, directory: '/fixture' });
+await unbound.event(created('first'));
+await unbound.event(created('second'));
+assert.deepEqual(updates.slice(2), [{ id: 'first', title: 'My work' }],
+  'an unbound launch may name only its first root session');
+assert.equal(sent.findLast(p => p.session_id === 'second' && p.hook_event_name === 'SessionStart').desired_name, null);
+
+process.env.PIKA_SESSION_ID = 'expected';
+const mismatched = await Pika({ client, directory: '/fixture' });
+const beforeMismatch = updates.length;
+await mismatched.event(created('wrong'));
+assert.equal(updates.length, beforeMismatch, 'another root must not receive the exact launch name');
+assert.equal(sent.findLast(p => p.session_id === 'wrong' && p.hook_event_name === 'SessionStart').desired_name, null);
+await mismatched.event(created('expected'));
+assert.deepEqual(updates.at(-1), { id: 'expected', title: 'My work' });
+"#).unwrap();
+    let output = Command::new("node")
+        .arg(temp.path().join("check.mjs"))
+        .arg(&binary)
+        .env_remove("PIKA_EPHEMERAL")
+        .env_remove("PIKA_SESSION_ID")
+        .env_remove("PIKA_NAME")
+        .output()
+        .expect("Node is required to exercise the provider-owned plugin");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

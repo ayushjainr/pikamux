@@ -71,12 +71,25 @@ jobs:
         run: |
           rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy --component rust-docs
           rustup override set 1.88.0
+      - name: Provide native terminal test dependencies
+        shell: bash
+        run: |
+          if ! command -v tmux >/dev/null || ! command -v script >/dev/null; then
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              sudo apt-get update
+              sudo apt-get install -y tmux util-linux
+            else
+              brew install tmux
+            fi
+          fi
+          command -v tmux
+          command -v script
       - name: Format
         run: cargo fmt --all --check
       - name: Lint
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
-        run: cargo test --locked --all-targets --no-fail-fast -- --test-threads=1
+        run: scripts/with-test-home.sh env -u PIKA_DB_PATH -u PIKA_UPDATE_CHECK cargo test --locked --all-targets --no-fail-fast -- --test-threads=1
       - name: Dependency license inventory
         shell: bash
         run: |

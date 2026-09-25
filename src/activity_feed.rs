@@ -1094,6 +1094,13 @@ mod tests {
             summarize(&[a.clone(), b.clone()], ""),
             summarize(&[b, a], "")
         );
+        assert_eq!(
+            summarize(&[request("a", 5.0), request("b", 5.0)], "")
+                .latest_attention
+                .as_deref(),
+            Some("b"),
+            "equal timestamps use the greatest stable identity key"
+        );
     }
 
     #[test]

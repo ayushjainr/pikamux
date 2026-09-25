@@ -313,6 +313,12 @@ fn wire_never_exports_transcript_tmux_or_process_identity() {
     for secret in ["transcript", "tmux_pane", "tmux_session", "root_pid"] {
         assert!(!encoded.contains(secret), "leaked {secret}");
     }
+    for private_value in ["/secret/provider.jsonl", "pika-c-1", "\"%9\"", "999"] {
+        assert!(
+            !encoded.contains(private_value),
+            "leaked private value {private_value}"
+        );
+    }
 }
 
 #[test]
@@ -1433,10 +1439,13 @@ fn mutation_timeout_reuses_durable_idempotency_key() {
     let store = initialized_store(&temp, "state.db");
     let remote = Uuid::new_v4().to_string();
     store.upsert_fleet_node(&node(&remote, "atlas")).unwrap();
-    let fake = FakeTransport::with(vec![Err(FleetError::new(
-        FleetErrorKind::OutcomeUnknown,
-        "lost",
-    ))]);
+    let fake = FakeTransport::with(vec![
+        Err(FleetError::new(FleetErrorKind::OutcomeUnknown, "lost")),
+        Err(FleetError::new(
+            FleetErrorKind::OutcomeUnknown,
+            "lost again",
+        )),
+    ]);
     let manager = FleetManager::new(&store, &fake);
     let candidate = Candidate {
         provider: Provider::Codex,
@@ -1463,6 +1472,15 @@ fn mutation_timeout_reuses_durable_idempotency_key() {
         .unwrap()
         .unwrap();
     assert!(Uuid::parse_str(&saved).is_ok());
+    let retry = manager
+        .adopt(&node(&remote, "atlas"), &candidate, None)
+        .unwrap_err();
+    assert_eq!(retry.kind, FleetErrorKind::OutcomeUnknown);
+    let requests = fake.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|(_, payload, mutating)| {
+        *mutating && payload["op"] == "adopt" && payload["request_id"] == saved
+    }));
 }
 
 #[derive(Default)]
@@ -1601,6 +1619,9 @@ fn server_rejects_changed_node_without_service_action() {
     .unwrap();
     let value: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(value["kind"], "quarantined");
+    assert!(service.acknowledgement_events.is_empty());
+    assert_eq!(service.untracks, 0);
+    assert_eq!(service.quota_reads, 0);
 }
 
 #[test]

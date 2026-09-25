@@ -2173,14 +2173,15 @@ mod peek_ack_tests {
     use super::ensure_peek_acknowledged;
 
     #[test]
-    fn stale_event_acknowledgement_is_never_reported_as_success() {
+    fn stale_event_acknowledgement_reports_newer_unread_event_and_retry_command() {
         assert!(ensure_peek_acknowledged(true, "returns_tracker").is_ok());
-        let error = ensure_peek_acknowledged(false, "returns_tracker")
+        let error = ensure_peek_acknowledged(false, "returns tracker")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("newer event"));
-        assert!(error.contains("remains unread"));
-        assert!(error.contains("pika peek returns_tracker --ack"));
+        assert_eq!(
+            error,
+            "A newer event arrived for returns tracker while its output was being read. That newer event remains unread; run exactly: `pika peek 'returns tracker' --ack` to inspect and acknowledge it."
+        );
     }
 }
 fn untrack(pika: &Pika, name: &str) -> Result<i32> {
@@ -4279,11 +4280,30 @@ mod consultation_jsonl_schema_tests {
             cleanup: Some("pending".into()),
             answers_received: Some(0),
             turn: Some(1),
-            retry_safe: Some(true),
+            retry_safe: Some(false),
         }));
-        assert!(run.receipt().retry_safe);
+        assert!(
+            !run.receipt().retry_safe,
+            "remote refusal overrides local safety inference"
+        );
         run.begin_turn();
         assert!(run.retry_safe_override.is_none());
+        assert!(
+            run.receipt().retry_safe,
+            "a new turn drops the prior remote refusal"
+        );
+        run.absorb_remote_receipt(Some(&crate::fleet::ConsultationReceipt {
+            stage: Some("response".into()),
+            delivery: Some("confirmed".into()),
+            cleanup: Some("pending".into()),
+            answers_received: Some(1),
+            turn: Some(2),
+            retry_safe: Some(true),
+        }));
+        assert!(
+            run.receipt().retry_safe,
+            "remote approval overrides local unsafe inference"
+        );
     }
 
     #[test]
@@ -5842,19 +5862,25 @@ mod fleet_consultation_tests {
             BoardAction::Open(item),
             BoardAction::Quit,
         ]);
-        let mut opens = 0;
+        let mut applied = Vec::new();
         let code = drive_board(
             |_| Ok(actions.pop_front().expect("quit must stop")),
             |action| {
-                if matches!(action, BoardAction::Open(_)) {
-                    opens += 1;
+                match action {
+                    BoardAction::Open(opened) => {
+                        assert_eq!(opened.session.provider, Provider::Codex);
+                        assert_eq!(opened.session.session_id, "workstream");
+                        applied.push("open");
+                    }
+                    BoardAction::Quit => applied.push("quit"),
+                    other => panic!("unexpected board action: {other:?}"),
                 }
                 Ok(0)
             },
         )
         .unwrap();
         assert_eq!(code, 0);
-        assert_eq!(opens, 2);
+        assert_eq!(applied, ["open", "open", "quit"]);
         assert!(actions.is_empty());
     }
 
@@ -6533,7 +6559,7 @@ done
     }
 
     #[test]
-    fn oversized_fleet_cache_preserves_local_rows_and_adds_an_honest_notice() {
+    fn fleet_cache_error_preserves_local_rows_and_surfaces_the_error() {
         let root = tempfile::tempdir().unwrap();
         let local = BoardItem::local(fixture_session(root.path()));
         let mut items = vec![local.clone()];
@@ -6549,7 +6575,10 @@ done
         assert_eq!(items.len(), 1);
         assert_eq!(items[0], local);
         assert_eq!(health.len(), 1);
-        assert!(health[0].contains("safety limit"));
+        assert_eq!(
+            health[0],
+            "Cached fleet exceeds the 8000-row board safety limit"
+        );
     }
 
     #[test]
