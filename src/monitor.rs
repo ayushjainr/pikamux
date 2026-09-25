@@ -199,6 +199,7 @@ impl FleetHealthFeed {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BoardAction {
+    Assistant,
     Open(BoardItem),
     Peek(BoardItem),
     Untrack(BoardItem),
@@ -759,7 +760,7 @@ fn route_board_action(
 /// protects frames larger than one terminal write. Unsupported terminals ignore
 /// the mode and still receive a prebuilt frame rather than incremental drawing.
 #[derive(Default)]
-struct FramePresenter {
+pub(crate) struct FramePresenter {
     previous: Vec<u8>,
     scratch: Vec<u8>,
     dimensions: Option<(u16, u16)>,
@@ -767,7 +768,7 @@ struct FramePresenter {
 }
 
 impl FramePresenter {
-    fn present(
+    pub(crate) fn present(
         &mut self,
         output: &mut impl Write,
         dimensions: (u16, u16),
@@ -1501,6 +1502,10 @@ impl Board {
         }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.select(-1),
+            #[cfg(unix)]
+            KeyCode::Char('P') if key.kind != KeyEventKind::Repeat => {
+                return Some(BoardAction::Assistant);
+            }
             KeyCode::Down | KeyCode::Char('j') => self.select(1),
             KeyCode::PageUp => self.select(-8),
             KeyCode::PageDown => self.select(8),
@@ -1512,6 +1517,12 @@ impl Board {
             KeyCode::Char('?') => {
                 self.action_scroll = 0;
                 self.action_notice = Some("PIKA KEYS\n\n↑↓ / j k · select a conversation\nEnter · open the selected exact conversation\np · preview live Pika pane output; unread preserved\na · private expert consultation in this panel\nd · identity details and full expert card\nx · stop watching, after confirmation; agent stays intact\nn · open the oldest attention item\n/ · filter by name or machine\nr · refresh observations\nu · cumulative usage for the selected conversation\nU · review an available update\nPageUp / PageDown · scroll a preview or help\nEsc · dismiss panel or clear filter\nq · leave Pika\n\nInside an agent: use the visible Pika return control.\nPrivate consultation: Enter sends, Ctrl+J adds a newline,\nCtrl+U clears the draft, Esc closes the private side.".into());
+                #[cfg(unix)]
+                if let Some(help) = &mut self.action_notice {
+                    help.push_str(
+                        "\nP · main Pika assistant (independent of the selected conversation)",
+                    );
+                }
             }
             KeyCode::Char('u') => {
                 self.action_scroll = 0;
@@ -1912,7 +1923,11 @@ impl Board {
             queue!(
                 output,
                 Print(fit(
-                    "↑↓ move · enter open · p peek · a ask · x unwatch · / filter · r refresh · ? keys · q leave",
+                    if cfg!(unix) {
+                        "↑↓ move · enter open · p peek · a ask · P Pika · x unwatch · / filter · r refresh · ? keys · q leave"
+                    } else {
+                        "↑↓ move · enter open · p peek · a ask · x unwatch · / filter · r refresh · ? keys · q leave"
+                    },
                     width
                 ))
             )?;
@@ -3313,6 +3328,28 @@ mod tests {
         let mut board = board(Status::Parked);
         assert_eq!(board.key(key(KeyCode::Down), None), None);
         assert_eq!(board.key(key(KeyCode::Up), None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_assistant_shortcut_works_on_empty_board_and_not_in_filter() {
+        let mut empty = Board::new(vec![]);
+        assert_eq!(
+            empty.key(key(KeyCode::Char('P')), None),
+            Some(BoardAction::Assistant)
+        );
+        let mut board = board(Status::Ready);
+        let before = board.summary();
+        let selected = board.selected_key.clone();
+        assert_eq!(
+            board.key(key(KeyCode::Char('P')), None),
+            Some(BoardAction::Assistant)
+        );
+        assert_eq!(board.summary(), before);
+        assert_eq!(board.selected_key, selected);
+        board.key(key(KeyCode::Char('/')), None);
+        assert_eq!(board.key(key(KeyCode::Char('P')), None), None);
+        assert_eq!(board.filter, "P");
     }
 
     #[test]

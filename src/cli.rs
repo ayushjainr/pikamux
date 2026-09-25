@@ -57,6 +57,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Open your persistent Pika assistant (offline foundation preview).
+    Pika(crate::assistant::Args),
+    #[command(name = "_assistant-host", hide = true)]
+    AssistantHost {
+        #[arg(long)]
+        root: PathBuf,
+    },
     #[command(name = "_claude-statusline", hide = true)]
     ClaudeStatusline {
         #[arg(long)]
@@ -615,6 +622,8 @@ where
 {
     let cli = Cli::try_parse_from(args)?;
     match cli.command {
+        Some(Command::Pika(args)) => crate::assistant::run(args),
+        Some(Command::AssistantHost { root }) => crate::assistant::serve(&root),
         Some(Command::ClaudeStatusline { forward }) => crate::claude_quota::run(forward),
         Some(Command::InstallNative(args)) => install_native(args),
         Some(Command::TerminalBridge(args)) => terminal_bridge(args),
@@ -683,6 +692,8 @@ fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
         }
         Some(
             Command::InstallNative(_)
+            | Command::Pika(_)
+            | Command::AssistantHost { .. }
             | Command::ClaudeStatusline { .. }
             | Command::TerminalBridge(_)
             | Command::FilesOpen { .. }
@@ -754,6 +765,12 @@ fn drive_board(
     let mut memory = monitor::BoardMemory::default();
     loop {
         let action = observe(&mut memory)?;
+        if action == BoardAction::Assistant {
+            memory.notice = apply(action)
+                .err()
+                .map(|error| format!("PIKA · {error}\nYour project agents were not changed."));
+            continue;
+        }
         if let BoardAction::Open(item) = &action {
             let identity = format!(
                 "{} · {} · {}{}",
@@ -862,6 +879,7 @@ fn run_board(pika: &Pika) -> Result<i32> {
 
 fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
     match action {
+        BoardAction::Assistant => crate::assistant::run(crate::assistant::Args::default()),
         BoardAction::Open(item) => open_board_item(pika, item),
         BoardAction::Peek(item) => peek_board_item(pika, item),
         BoardAction::Untrack(item) => untrack_board_item(pika, item),

@@ -1,6 +1,38 @@
 mod activity_feed;
 #[cfg(not(windows))]
 mod activity_observer;
+#[cfg(unix)]
+mod assistant;
+#[cfg(unix)]
+mod assistant_author;
+pub mod assistant_briefing;
+pub mod assistant_coordinator;
+pub mod assistant_evolution;
+#[cfg(unix)]
+mod assistant_host;
+pub mod assistant_investigation;
+#[cfg(unix)]
+pub mod assistant_investigation_provider;
+#[cfg(unix)]
+pub mod assistant_investigation_service;
+#[cfg(unix)]
+mod assistant_investigation_ui;
+pub mod assistant_learning;
+pub mod assistant_memory;
+pub mod assistant_policy;
+pub mod assistant_provider;
+pub mod assistant_recovery;
+pub mod assistant_recovery_service;
+pub mod assistant_retention;
+pub mod assistant_runtime;
+pub mod assistant_service;
+#[cfg(unix)]
+mod assistant_session;
+mod assistant_storage;
+#[cfg(unix)]
+pub mod assistant_transport;
+pub mod assistant_workshop;
+pub mod assistant_workshop_ui;
 #[cfg(not(windows))]
 pub mod attention;
 mod claude_quota;
