@@ -133,6 +133,8 @@ impl BoardProcess {
         let mut command = Command::new(env!("CARGO_BIN_EXE_pika"));
         command
             .env_clear()
+            // Keep only the coverage destination, not caller credentials/state.
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
             .current_dir(root.path().join("home"))
             .env("HOME", root.path().join("home"))
             .env("XDG_CONFIG_HOME", root.path().join("config"))
@@ -185,6 +187,7 @@ impl BoardProcess {
         let mut command = Command::new(env!("CARGO_BIN_EXE_pika"));
         command
             .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
             .args(args)
             .env("HOME", root.join("home"))
             .env("XDG_CONFIG_HOME", root.join("config"))
@@ -377,6 +380,114 @@ fn remote_board_feed_verifies_node_bounds_frames_and_clears_on_disconnect() {
             .unwrap()
             .contains("11111111111111111111111111111111111111111")
     );
+}
+
+#[test]
+fn unverified_terminal_requires_choice_and_never_relaunches_or_acknowledges() {
+    let real_tmux = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|path| path.join("tmux"))
+        .find(|path| path.is_file())
+        .map(|path| fs::canonicalize(path).unwrap());
+    let Some(real_tmux) = real_tmux else {
+        eprintln!("tmux unavailable; unverified terminal journey was not exercised");
+        return;
+    };
+    let mut board = BoardProcess::start();
+    fs::write(
+        board.root.path().join("bin/tmux"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexec {} -f /dev/null \"$@\"\n",
+            shell_words::quote(board.root.path().join("tmux-trace").to_str().unwrap()),
+            shell_words::quote(real_tmux.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    board.real_tmux = true;
+    let launches = board.root.path().join("launches");
+    let provider = board.root.path().join("bin/codex");
+    fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\n[ \"$*\" = 'app-server --stdio' ] && exit 97\nprintf '%s\\n' \"$*\" >> {}\nprintf 'EXISTING FAKE AGENT\\n'\nwhile :; do sleep 1; done\n",
+            shell_words::quote(launches.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    // Simulate an existing provider picker: a genuine process, but no UUID
+    // in its arguments. Neither tags nor liveness prove a conversation.
+    board.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "pika-c-unverified",
+        "-c",
+        board.root.path().join("home").to_str().unwrap(),
+        &format!(
+            "exec {} resume",
+            shell_words::quote(provider.to_str().unwrap())
+        ),
+    ]);
+    for (key, value) in [
+        ("@pika_provider", "codex"),
+        ("@pika_session_id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        ("@pika_name", "audit_saved"),
+        ("@pika_launch_token", "fixture-existing-terminal"),
+    ] {
+        board.tmux(&["set-option", "-p", "-t", "pika-c-unverified", key, value]);
+    }
+    board.tmux(&["bind-key", "-T", "root", "F12", "detach-client"]);
+    let before = board.tmux(&[
+        "display-message",
+        "-p",
+        "-t",
+        "pika-c-unverified",
+        "#{pane_pid}",
+    ]);
+    board.send(b"/audit\r");
+    board.await_text("FILTER audit");
+    board.send(b"\r");
+    board.await_text("Open existing terminal");
+    board.send(b"\r"); // Cancel is the default, never an implicit attachment.
+    board.await_text("FILTER audit");
+    assert!(board.tmux(&["list-clients"]).trim().is_empty());
+    board.send(b"\r");
+    board.await_text("Open existing terminal");
+    board.send(b"\x1b[B\r");
+    board.await_text("UNVERIFIED TERMINAL");
+    assert!(!board.output.contains("CONTINUITY PROVEN"));
+    board.send(b"\x1b[24~");
+    board.await_text("FILTER audit");
+    assert_eq!(
+        board.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            "pika-c-unverified",
+            "#{pane_pid}"
+        ]),
+        before
+    );
+    assert_eq!(fs::read_to_string(launches).unwrap(), "resume\n");
+    let store = Store::at(board.root.path().join("state/pika.db"));
+    let session = store
+        .get_session(
+            pikamux::model::Provider::Codex,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        session.unread,
+        "unverified terminal acknowledged the conversation"
+    );
+    assert!(
+        store
+            .get_recovery_owner(session.provider, &session.session_id)
+            .unwrap()
+            .is_none()
+    );
+    board.send(b"q");
+    assert!(board.child.wait().unwrap().success());
 }
 
 #[test]
@@ -867,6 +978,164 @@ fn failed_open_returns_to_filtered_board_without_replaying_the_action() {
 }
 
 #[test]
+fn add_named_native_conversation_without_setup_preserves_unread_and_cancel() {
+    let mut board = BoardProcess::start();
+    let identity = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    let generated_claude = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let generated_codex = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    fs::create_dir_all(board.root.path().join("claude/sessions")).unwrap();
+    fs::create_dir_all(board.root.path().join("claude/projects/p")).unwrap();
+    let claude_session = board
+        .root
+        .path()
+        .join(format!("claude/sessions/{identity}.json"));
+    fs::write(
+        &claude_session,
+        serde_json::to_vec(&serde_json::json!({
+            "kind":"interactive", "sessionId":identity, "name":"native_renamed",
+            "nameSource":"custom", "cwd":"/project", "updatedAt":50
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let transcript = board
+        .root
+        .path()
+        .join(format!("claude/projects/p/{identity}.jsonl"));
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "sessionId":identity, "isSidechain":false, "entrypoint":"cli"
+            })
+        ),
+    )
+    .unwrap();
+    let generated_claude_session = board
+        .root
+        .path()
+        .join(format!("claude/sessions/{generated_claude}.json"));
+    fs::write(
+        &generated_claude_session,
+        serde_json::to_vec(&serde_json::json!({
+            "kind":"interactive", "sessionId":generated_claude,
+            "name":"Generated Claude title", "nameSource":"derived",
+            "cwd":"/project", "updatedAt":90
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let generated_claude_transcript = board
+        .root
+        .path()
+        .join(format!("claude/projects/p/{generated_claude}.jsonl"));
+    fs::write(
+        &generated_claude_transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type":"ai-title", "aiTitle":"Generated Claude title"
+            })
+        ),
+    )
+    .unwrap();
+    let codex_transcript = board
+        .root
+        .path()
+        .join(format!("codex/{generated_codex}.jsonl"));
+    fs::write(
+        &codex_transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{}})
+        ),
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(board.root.path().join("codex/state_1.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,name TEXT,cwd TEXT,rollout_path TEXT,created_at INTEGER,updated_at INTEGER,archived INTEGER)").unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES(?1,'Generated Codex title','/project',?2,1,90,0)",
+        rusqlite::params![generated_codex, codex_transcript.to_string_lossy()],
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::at(board.root.path().join("state/pika.db"));
+    let db = rusqlite::Connection::open(store.path()).unwrap();
+    db.execute(
+        "INSERT INTO sessions(provider,session_id,name,status,unread,managed,source,created_at,updated_at,last_event_at,last_activity_at) VALUES ('claude',?1,'native_renamed','READY',1,0,'external',1,1,1,1)",
+        [identity],
+    )
+    .unwrap();
+    drop(db);
+    store
+        .untrack_session(pikamux::model::Provider::Claude, identity)
+        .unwrap();
+    // A new provider event can arrive while the identity remains untracked.
+    // Seed that unread projection after the tombstone so the explicit restore
+    // must not acknowledge or replace it.
+    let db = rusqlite::Connection::open(store.path()).unwrap();
+    db.execute(
+        "UPDATE sessions SET status='READY',unread=1,last_event_at=50,last_activity_at=50 WHERE provider='claude' AND session_id=?",
+        [identity],
+    )
+    .unwrap();
+    drop(db);
+    assert!(
+        store
+            .is_untracked(pikamux::model::Provider::Claude, identity)
+            .unwrap()
+    );
+    board.send(b"+");
+    board.await_text("native_renamed");
+    assert!(!board.output.contains("Generated Claude title"));
+    assert!(!board.output.contains("Generated Codex title"));
+    board.send(b"native_renamed\r");
+    // The UUID is already visible in the candidate list. Differential rendering
+    // need not emit that unchanged line again when confirmation opens.
+    board.await_text("Confirm add");
+    board.send(b"\x1b");
+    board.await_text("candidate(s)");
+    assert!(
+        !store
+            .is_watched(pikamux::model::Provider::Claude, identity)
+            .unwrap()
+    );
+    assert!(
+        store
+            .is_untracked(pikamux::model::Provider::Claude, identity)
+            .unwrap()
+    );
+    board.send(b"\r");
+    board.await_text("Confirm add");
+    board.send(b"\r");
+    board.await_text("Added to board");
+    assert!(
+        store
+            .is_watched(pikamux::model::Provider::Claude, identity)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .is_untracked(pikamux::model::Provider::Claude, identity)
+            .unwrap()
+    );
+    assert!(
+        store
+            .get_session(pikamux::model::Provider::Claude, identity)
+            .unwrap()
+            .unwrap()
+            .unread
+    );
+    assert!(!board.root.path().join("config/pika/config.json").exists());
+    assert!(!board.root.path().join("codex/hooks.json").exists());
+    assert!(!board.root.path().join("claude/settings.json").exists());
+    board.send(b"\x1b");
+    board.await_text("+ add");
+    board.finish();
+}
+
+#[test]
 fn board_excludes_unconfirmed_provider_titles_without_deleting_the_record() {
     let mut board = BoardProcess::start();
     assert!(!board.output.contains("Generated provider title"));
@@ -968,5 +1237,227 @@ fn unwatch_can_be_cancelled_and_then_confirmed_without_leaving_the_board() {
             .unwrap()
     );
     assert!(board.child.try_wait().unwrap().is_none());
+    board.finish();
+}
+
+#[test]
+fn overdue_launch_can_be_hidden_without_deleting_recovery_or_untracking_a_conversation() {
+    use pikamux::{model::Provider, store::PendingLaunch};
+    let mut board = BoardProcess::start();
+    let store = Store::at(board.root.path().join("state/pika.db"));
+    let pending = PendingLaunch {
+        launch_token: "fixture-stuck-launch".into(),
+        provider: Provider::Codex,
+        name: "stuck_launch".into(),
+        cwd: board
+            .root
+            .path()
+            .join("home")
+            .to_string_lossy()
+            .into_owned(),
+        tmux_session: None,
+        tmux_pane: None,
+        expected_session_id: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
+        root_pid: None,
+        root_pid_start: None,
+        preexisting_session_ids: None,
+        candidate_session_id: None,
+        candidate_observed_at: None,
+        created_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            - 3600.0,
+    };
+    store.add_pending(&pending).unwrap();
+    board.send(b"/stuck\r");
+    board.await_text("Pika has not confirmed this launch");
+    board.send(b"x");
+    board.await_text("Hide launch entry for stuck_launch");
+    board.send(b"\x1b");
+    board.await_text("stuck_launch");
+    assert_eq!(store.list_visible_pending().unwrap().len(), 1);
+    board.send(b"x");
+    board.await_text("Hide launch entry for stuck_launch");
+    board.send(b"\r");
+    board.await_text("Launch entry hidden");
+    assert!(store.list_visible_pending().unwrap().is_empty());
+    assert_eq!(
+        store.get_pending(&pending.launch_token).unwrap(),
+        Some(pending)
+    );
+    assert!(
+        !store
+            .is_untracked(Provider::Codex, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+            .unwrap()
+    );
+    assert!(board.child.try_wait().unwrap().is_none());
+    board.finish();
+}
+
+#[test]
+fn client_update_exit_keeps_one_reopenable_startup_home_and_an_actionable_board_row() {
+    use pikamux::model::Provider;
+    let real_tmux = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|path| path.join("tmux"))
+        .find(|path| path.is_file())
+        .map(|path| fs::canonicalize(path).unwrap());
+    let Some(real_tmux) = real_tmux else {
+        eprintln!("tmux unavailable; client updater exit journey was not exercised");
+        return;
+    };
+    let mut board = BoardProcess::start();
+    fs::write(
+        board.root.path().join("bin/tmux"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexec {} -f /dev/null \"$@\"\n",
+            shell_words::quote(board.root.path().join("tmux-trace").to_str().unwrap()),
+            shell_words::quote(real_tmux.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    board.real_tmux = true;
+    let store = Store::at(board.root.path().join("state/pika.db"));
+    for (provider, code) in [(Provider::Codex, 0), (Provider::Claude, 1)] {
+        let launches = board.root.path().join(format!("{provider}-launches"));
+        fs::write(board.root.path().join("bin").join(provider.as_str()), format!(
+            "#!/bin/sh\n[ \"$*\" = 'app-server --stdio' ] && exit 97\nprintf launched\\n >> {}\nprintf 'Updater finished; restart the client.\\n'\nexit {code}\n",
+            shell_words::quote(launches.to_str().unwrap())
+        )).unwrap();
+        let name = format!("updating_{provider}");
+        // Exercise the actual executable/wrapper callback, not a simulated
+        // store write. The noninteractive caller cannot attach, but the new
+        // private pane must survive and remain openable from the real board.
+        let mut launch = board
+            .endpoint(&[
+                "new",
+                &name,
+                "--agent",
+                provider.as_str(),
+                "--cwd",
+                board.root.path().join("home").to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while launch.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = launch.kill();
+                let _ = launch.wait();
+                panic!("new client did not return after updater exit");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let launch_output = launch.wait_with_output().unwrap();
+        let pending = store
+            .list_pending()
+            .unwrap()
+            .into_iter()
+            .find(|pending| pending.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing {provider} pending launch: stdout={} stderr={}",
+                    String::from_utf8_lossy(&launch_output.stdout),
+                    String::from_utf8_lossy(&launch_output.stderr)
+                )
+            });
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let exit = loop {
+            if let Some(exit) = store.get_pending_exit(&pending.launch_token).unwrap() {
+                break exit;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing wrapper exit receipt for {provider}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(exit.code, code);
+        assert_eq!(exit.provider, provider);
+        let retry = board
+            .endpoint(&[&name])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&retry.stderr).contains("already starting"));
+        let retry_trace = fs::read_to_string(board.root.path().join("tmux-trace")).unwrap();
+        assert_eq!(
+            retry_trace
+                .lines()
+                .filter(|line| line.contains(" new-session "))
+                .count(),
+            if provider == Provider::Codex { 1 } else { 2 }
+        );
+        board.send(format!("/{name}\r").as_bytes());
+        board.await_text(&format!("{provider} exited during startup"));
+        board.send(b"\r");
+        board.await_text("STARTUP EXITED");
+        board.send(b"\x1b[24~"); // F12 returns without killing the retained shell.
+        board.await_text(&format!("{provider} exited during startup"));
+        assert_eq!(
+            fs::read_to_string(&launches)
+                .unwrap()
+                .matches("launched")
+                .count(),
+            1
+        );
+        assert_eq!(
+            store.get_pending(&pending.launch_token).unwrap(),
+            Some(pending.clone())
+        );
+        board.send(b"x");
+        board.await_text(&format!("Hide launch entry for {name}"));
+        board.send(b"\x1b");
+        board.await_text(&format!("{provider} exited during startup"));
+        assert!(
+            store
+                .list_visible_pending()
+                .unwrap()
+                .iter()
+                .any(|row| row.launch_token == pending.launch_token)
+        );
+        board.send(b"x");
+        board.await_text(&format!("Hide launch entry for {name}"));
+        board.send(b"\r");
+        board.await_text("Launch entry hidden");
+        assert!(
+            !store
+                .list_visible_pending()
+                .unwrap()
+                .iter()
+                .any(|row| row.launch_token == pending.launch_token)
+        );
+        assert!(
+            board
+                .tmux(&["list-panes", "-a", "-F", "#{pane_id}"])
+                .lines()
+                .any(|pane| Some(pane) == pending.tmux_pane.as_deref())
+        );
+        assert_eq!(
+            store.get_pending(&pending.launch_token).unwrap(),
+            Some(pending)
+        );
+        assert!(
+            !store
+                .list_sessions()
+                .unwrap()
+                .iter()
+                .any(|session| session.name.as_deref() == Some(&name))
+        );
+        assert!(
+            store
+                .get_session(Provider::Codex, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+                .unwrap()
+                .unwrap()
+                .unread
+        );
+        board.send(b"\x1b");
+        board.await_text("No conversations match this filter");
+        board.send(b"\x1b");
+        board.await_text("audit_saved");
+    }
     board.finish();
 }

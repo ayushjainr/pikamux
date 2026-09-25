@@ -46,6 +46,9 @@ pub struct HookContext {
     pub owner_token: String,
     pub owner_pid: Option<i64>,
     pub owner_start_time: Option<i64>,
+    /// Set from observed process ancestry, never provider payload or environment.
+    /// A shared Codex server reports activity, not an exclusive terminal owner.
+    pub codex_shared_owner: bool,
     pub pane_id: Option<String>,
     pub pane_session: Option<String>,
     pub pane_attached: bool,
@@ -68,6 +71,7 @@ impl HookContext {
             owner_token: String::new(),
             owner_pid: None,
             owner_start_time: None,
+            codex_shared_owner: false,
             pane_id: None,
             pane_session: None,
             pane_attached: false,
@@ -304,6 +308,28 @@ fn handle_hook_with_checkpoints(
             "ephemeral consultation",
         ));
     }
+    // A long-lived shared server may retain the environment of the terminal
+    // that originally started it while delivering hooks for other clients.
+    // Retain its advisory liveness lease (to prevent duplicate app launches),
+    // but never let that inherited environment claim or rename a terminal.
+    let shared_context;
+    let context = if provider == Provider::Codex && context.codex_shared_owner {
+        shared_context = HookContext {
+            expected_provider: None,
+            expected_session_id: None,
+            desired_name: None,
+            launch_token: None,
+            owner_token: String::new(),
+            pane_id: None,
+            pane_session: None,
+            pane_attached: false,
+            exact_home_verified: false,
+            ..context.clone()
+        };
+        &shared_context
+    } else {
+        context
+    };
     if context
         .expected_provider
         .is_some_and(|expected| expected != provider)
@@ -476,6 +502,18 @@ fn handle_hook_transaction(
         LaunchDecision::Use(value) => value,
         LaunchDecision::Ignore(_) => unreachable!(),
     };
+    // A PIKA_NAME/desired_name claim is an initialization instruction, not a
+    // permanent rename policy. Only a fresh SessionStart admitted by its exact
+    // still-pending Pika launch may write the provider-native title. Once the
+    // UUID has a stored row, later activity/resume hooks cannot restore a
+    // stale launch label over a user rename.
+    let fresh_launch_start = is_fresh_launch_start(
+        store,
+        provider,
+        payload,
+        launch_token.as_deref(),
+        existing.as_ref(),
+    )?;
 
     update_owner(store, provider, &canonical_id, payload, context)?;
     let session_live = payload.hook_event_name != "SessionEnd"
@@ -640,9 +678,16 @@ fn handle_hook_transaction(
                 .as_ref()
                 .and_then(|session| session.tmux_pane.clone())
         }),
-        root_pid: context
-            .owner_pid
-            .or_else(|| existing.as_ref().and_then(|session| session.root_pid)),
+        root_pid: if provider == Provider::Codex && context.codex_shared_owner {
+            existing
+                .as_ref()
+                .and_then(|session| session.root_pid)
+                .filter(|pid| Some(*pid) != context.owner_pid)
+        } else {
+            context
+                .owner_pid
+                .or_else(|| existing.as_ref().and_then(|session| session.root_pid))
+        },
         status: projection.status,
         unread: projection.unread,
         model: payload
@@ -680,6 +725,12 @@ fn handle_hook_transaction(
     });
     after_projection()?;
     store.upsert_session(&session, true)?;
+    if provider == Provider::Codex
+        && context.codex_shared_owner
+        && let Some(pid) = context.owner_pid
+    {
+        store.clear_shared_root_pid(provider, &canonical_id, pid)?;
+    }
     if let Some(placeholder) = placeholder
         && placeholder.session_id != canonical_id
     {
@@ -720,32 +771,10 @@ fn handle_hook_transaction(
         }
     }
 
-    let provider_output = if provider == Provider::Claude
-        && payload.hook_event_name == "SessionStart"
-        && context.expected_session_id.as_deref() == Some(payload.session_id.as_str())
-        && payload.session_title.is_none()
-    {
-        context.desired_name.as_ref().map(|name| {
-            json!({"hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "sessionTitle": name,
-            }})
-        })
-    } else {
-        None
-    };
-    let native_name_request = if provider == Provider::Codex
-        && context.desired_name.is_some()
-        && payload.session_title.is_none()
-    {
-        Some(HookNativeNameRequest {
-            provider,
-            session_id: payload.session_id.clone(),
-            name: context.desired_name.clone().expect("checked desired name"),
-        })
-    } else {
-        None
-    };
+    let provider_output =
+        initial_provider_name_output(provider, payload, context, fresh_launch_start);
+    let native_name_request =
+        initial_native_name_request(provider, payload, context, fresh_launch_start);
     let alert = (watched
         && session.unread
         && newly_actionable
@@ -925,20 +954,31 @@ pub fn handle_process_exit(
     observed_at: f64,
 ) -> Result<bool> {
     store.reconcile_transaction(|ledger| {
-        let binding = match launch_token {
-            Some(token) => ledger.get_launch_binding(token)?,
-            None => None,
-        };
+        let binding = launch_token
+            .map(|token| ledger.get_launch_binding(token))
+            .transpose()?
+            .flatten();
         let target_id = binding
             .filter(|(bound_provider, _)| *bound_provider == provider)
             .map(|(_, id)| id)
             .or_else(|| session_id.map(str::to_owned));
-        let Some(target_id) = target_id else {
-            return Ok(false);
+        let target = target_id
+            .as_deref()
+            .map(|id| ledger.get_session(provider, id))
+            .transpose()?
+            .flatten();
+        let Some(mut target) = target else {
+            return record_unbound_process_exit(
+                ledger,
+                launch_token,
+                provider,
+                session_id,
+                owner_token_value,
+                code,
+                observed_at,
+            );
         };
-        let Some(mut target) = ledger.get_session(provider, &target_id)? else {
-            return Ok(false);
-        };
+        let target_id = target.session_id.clone();
         if ledger.is_untracked(provider, &target_id)? {
             if let Some(token) = launch_token {
                 ledger.delete_launch_binding_if(token, provider, &target_id)?;
@@ -1042,9 +1082,91 @@ pub fn handle_process_exit(
     })
 }
 
+fn record_unbound_process_exit(
+    ledger: &ReconcileLedger<'_>,
+    launch_token: Option<&str>,
+    provider: Provider,
+    session_id: Option<&str>,
+    owner_token: Option<&str>,
+    code: i32,
+    observed_at: f64,
+) -> Result<bool> {
+    let Some(token) = launch_token else {
+        return Ok(false);
+    };
+    ledger.record_pending_launch_exit(token, provider, session_id, owner_token, code, observed_at)
+}
+
 enum LaunchDecision {
     Ignore(String),
     Use(Option<String>),
+}
+
+fn is_fresh_launch_start(
+    store: &ReconcileLedger<'_>,
+    provider: Provider,
+    payload: &HookPayload,
+    launch_token: Option<&str>,
+    existing: Option<&Session>,
+) -> Result<bool> {
+    if payload.hook_event_name != "SessionStart"
+        || existing.is_some_and(|session| {
+            session.source != "pending-launch" || session.session_id != payload.session_id
+        })
+    {
+        return Ok(false);
+    }
+    let Some(token) = launch_token else {
+        return Ok(false);
+    };
+    Ok(store.get_pending(token)?.is_some_and(|pending| {
+        pending.provider == provider
+            && pending
+                .expected_session_id
+                .as_deref()
+                .is_none_or(|expected| expected == payload.session_id)
+    }))
+}
+
+fn initial_provider_name_output(
+    provider: Provider,
+    payload: &HookPayload,
+    context: &HookContext,
+    fresh_launch_start: bool,
+) -> Option<Value> {
+    if provider != Provider::Claude
+        || !fresh_launch_start
+        || context.expected_session_id.as_deref() != Some(payload.session_id.as_str())
+        || payload.session_title.is_some()
+    {
+        return None;
+    }
+    context.desired_name.as_ref().map(|name| {
+        json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "sessionTitle": name,
+        }})
+    })
+}
+
+fn initial_native_name_request(
+    provider: Provider,
+    payload: &HookPayload,
+    context: &HookContext,
+    fresh_launch_start: bool,
+) -> Option<HookNativeNameRequest> {
+    if provider != Provider::Codex
+        || !fresh_launch_start
+        || context.desired_name.is_none()
+        || payload.session_title.is_some()
+    {
+        return None;
+    }
+    Some(HookNativeNameRequest {
+        provider,
+        session_id: payload.session_id.clone(),
+        name: context.desired_name.clone().expect("checked desired name"),
+    })
 }
 
 fn validate_launch(

@@ -19,6 +19,45 @@ env:
   CARGO_PROFILE_TEST_DEBUG: '0'
 
 jobs:
+  quality:
+    name: Complexity ratchet
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install pinned development analyzer
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pika-quality"
+          "$RUNNER_TEMP/pika-quality/bin/pip" install --require-hashes -r scripts/quality-requirements.txt
+      - name: Test quality gates and measure complexity
+        run: |
+          "$RUNNER_TEMP/pika-quality/bin/python" -m unittest discover -s tests/quality -p 'test_*.py' -v
+          "$RUNNER_TEMP/pika-quality/bin/python" scripts/check-complexity.py
+
+  recovery-coverage:
+    name: Recovery branch coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install pinned coverage tools and terminal fixtures
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup toolchain install nightly-2025-06-27 --profile minimal --component llvm-tools-preview
+          rustup override set 1.88.0
+          cargo +1.88.0 install cargo-llvm-cov --locked --version 0.6.18
+          sudo apt-get update
+          sudo apt-get install -y tmux util-linux
+      - name: Measure recovery branches in disposable state
+        run: scripts/check-coverage.sh
+      - name: Publish measured summary
+        run: cat target/recovery-coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: recovery-branch-coverage
+          path: target/recovery-coverage/
+          if-no-files-found: error
+
   test:
     timeout-minutes: 20
     strategy:

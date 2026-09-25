@@ -334,16 +334,18 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
             _ => bail!("This action is not available in the client board"),
         }
     });
-    let actions = actions.with_preview(move |item, cancellation| {
-        let store = Store::at(&preview_path);
-        let remote = exact_remote(&store, &item)?;
-        FleetManager::new(
-            &store,
-            SshTransport::new("ssh.exe", Duration::from_secs(5), Duration::from_secs(10)),
-        )
-        .capture_cancellable(&remote, 100, &cancellation)
-        .map_err(anyhow::Error::from)
-    });
+    let actions = actions
+        .with_preview(move |item, cancellation| {
+            let store = Store::at(&preview_path);
+            let remote = exact_remote(&store, &item)?;
+            FleetManager::new(
+                &store,
+                SshTransport::new("ssh.exe", Duration::from_secs(5), Duration::from_secs(10)),
+            )
+            .capture_cancellable(&remote, 100, &cancellation)
+            .map_err(anyhow::Error::from)
+        })
+        .with_add(crate::board_catalog::client(store.clone()));
     let side_path = cache_path.to_owned();
     let driver = ConsultationDriver::new(move |io| {
         remote_consultation(

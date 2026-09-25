@@ -171,7 +171,13 @@ provenance attestations. See [releasing](releasing.md).
 The root `install.ps1` installs the Windows client from the stable release
 manifest and matching checksum sidecar. It pins download paths to that version,
 bounds downloads and extraction, allows only the three declared archive files,
-and probes the verified executable before activation. Versioned directories under
+and checks the extracted x64 PE identity before activation. A valid, timestamped
+Authenticode signature is checked without executing the staged candidate. The
+version binding comes from the pinned release manifest and checksum-verified
+archive; the native CI job checks the executable version before and after signing.
+Legacy unsigned releases retain the bounded version probe. An invalid signature
+never falls back to execution. Installation integrity is not proof that the
+endpoint will permit a later launch. Versioned directories under
 `%LOCALAPPDATA%\Pika\Client\releases` avoid replacing an executable used by a
 running bridge. The per-user PATH selects the installed version. The board offers
 confirmed in-client updates and restarts itself after verification; `pika update`
@@ -186,3 +192,10 @@ Interactive `pika` then offers a
 multi-machine chooser and renders their combined fleet locally. Existing
 pairings remain selected. Normal opens launch Windows Terminal directly, without
 the optional bridge or reverse SSH forwarding.
+
+Windows signing is an enrollment-gated publisher operation, not an end-user
+certificate installation. When enabled, CI requires a trusted, timestamped
+signature from the configured certificate before uploading the final binary.
+Packaging, checksums and provenance all consume those exact signed bytes.
+A signing error fails the release; it never silently selects the unsigned input.
+See [Windows signing](windows-signing.md) for enrollment and validation status.

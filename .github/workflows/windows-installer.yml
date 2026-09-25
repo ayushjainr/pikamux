@@ -3,9 +3,9 @@ name: Windows installer
 on:
   push:
     branches: [main]
-    paths: ['install.ps1', 'tests/windows-installer.ps1', '.github/workflows/windows-installer.yml']
+    paths: ['install.ps1', 'tests/windows-*.ps1', '.github/workflows/windows-installer.yml']
   pull_request:
-    paths: ['install.ps1', 'tests/windows-installer.ps1', '.github/workflows/windows-installer.yml']
+    paths: ['install.ps1', 'tests/windows-*.ps1', '.github/workflows/windows-installer.yml']
   workflow_dispatch:
 
 permissions:
@@ -19,7 +19,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Windows PowerShell 5.1 installer contracts
         shell: powershell
-        run: ./tests/windows-installer.ps1
+        run: |
+          ./tests/windows-candidate.ps1
+          ./tests/windows-installer.ps1
       - name: PowerShell 7 installer contracts
         shell: pwsh
-        run: ./tests/windows-installer.ps1
+        run: |
+          ./tests/windows-candidate.ps1
+          ./tests/windows-installer.ps1

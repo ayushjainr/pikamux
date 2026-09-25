@@ -199,6 +199,8 @@ impl FleetHealthFeed {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BoardAction {
+    /// Explicit discovery; handled inside the board, never by setup.
+    Add,
     Open(BoardItem),
     Peek(BoardItem),
     Untrack(BoardItem),
@@ -219,6 +221,7 @@ pub(crate) struct ActionDriver {
     pending: Option<Receiver<Result<String>>>,
     inline_open: bool,
     preview: Option<crate::preview::Driver>,
+    add: Option<crate::board_add::Driver>,
 }
 
 impl ActionDriver {
@@ -230,6 +233,7 @@ impl ActionDriver {
             pending: None,
             inline_open: true,
             preview: None,
+            add: None,
         }
     }
 
@@ -238,6 +242,11 @@ impl ActionDriver {
         worker: impl Fn(BoardItem, CancellationToken) -> Result<String> + Send + Sync + 'static,
     ) -> Self {
         self.preview = Some(crate::preview::Driver::new(worker));
+        self
+    }
+
+    pub(crate) fn with_add(mut self, driver: crate::board_add::Driver) -> Self {
+        self.add = Some(driver);
         self
     }
 
@@ -638,21 +647,15 @@ fn run_loop_with_actions(
             dirty |= board.replace_fleet_health(health);
         }
         dirty |= board.drain_consultation();
+        if let Some(panel) = board.add.as_mut() {
+            dirty |= panel.poll();
+        }
         dirty |= board.offer_update();
         if let Some(preview) = actions
             .as_mut()
             .and_then(|actions| actions.preview.as_mut())
         {
-            let selected = if board.chat.is_none()
-                && board.action_notice.is_none()
-                && board.confirm_untrack.is_none()
-                && !board.filtering
-                && !board.update_prompt
-            {
-                board.selected()
-            } else {
-                None
-            };
+            let selected = board.preview_target();
             if preview.tick(selected, std::mem::take(&mut preview_refresh)) {
                 board.preview = preview.view();
                 dirty = true;
@@ -669,12 +672,16 @@ fn run_loop_with_actions(
         if board.quit_when_chat_closes && board.chat.is_none() {
             return Ok(BoardAction::Quit);
         }
-        let animated = board.chat.as_ref().is_some_and(|chat| {
-            matches!(
-                chat.phase,
-                ChatPhase::Opening | ChatPhase::Waiting | ChatPhase::Closing
-            )
-        });
+        let animated = board
+            .add
+            .as_ref()
+            .is_some_and(crate::board_add::Panel::busy)
+            || board.chat.as_ref().is_some_and(|chat| {
+                matches!(
+                    chat.phase,
+                    ChatPhase::Opening | ChatPhase::Waiting | ChatPhase::Closing
+                )
+            });
         let paint_interval = if animated {
             Duration::from_millis(150)
         } else {
@@ -710,10 +717,23 @@ fn run_loop_with_actions(
         match event::read()? {
             Event::Resize(_, _) => dirty = true,
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if key.code == KeyCode::Char('r') && !board.filtering && board.chat.is_none() {
+                let (width, height) = size().unwrap_or((100, 30));
+                if board.add_key_blocked(key, width, height) {
+                    continue;
+                }
+                if key.code == KeyCode::Char('r')
+                    && !board.filtering
+                    && board.chat.is_none()
+                    && board.add.is_none()
+                {
                     preview_refresh = true;
                 }
                 if let Some(action) = board.key(key, driver.as_ref()) {
+                    if action == BoardAction::Add {
+                        board.begin_add(actions.as_ref());
+                        dirty = true;
+                        continue;
+                    }
                     if let Some(action) = route_board_action(action, refresh_request.as_ref()) {
                         if let Some(actions) = actions.as_mut()
                             && actions.handles(&action)
@@ -1135,6 +1155,7 @@ struct Board {
     filtering: bool,
     offset: usize,
     chat: Option<ChatState>,
+    add: Option<crate::board_add::Panel>,
     quit_when_chat_closes: bool,
     update_version: Option<String>,
     update_prompt: bool,
@@ -1192,6 +1213,7 @@ impl Board {
             filtering: false,
             offset: 0,
             chat: None,
+            add: None,
             quit_when_chat_closes: false,
             update_version: None,
             update_prompt: false,
@@ -1217,6 +1239,7 @@ impl Board {
     fn offer_update(&mut self) -> bool {
         if self.update_offer_pending
             && self.chat.is_none()
+            && self.add.is_none()
             && !self.filtering
             && self.confirm_untrack.is_none()
             && self.action_notice.is_none()
@@ -1400,7 +1423,55 @@ impl Board {
         changed || leave
     }
 
+    fn preview_target(&self) -> Option<BoardItem> {
+        if self.chat.is_none()
+            && self.add.is_none()
+            && self.action_notice.is_none()
+            && self.confirm_untrack.is_none()
+            && !self.filtering
+            && !self.update_prompt
+        {
+            self.selected()
+        } else {
+            None
+        }
+    }
+
+    fn begin_add(&mut self, actions: Option<&ActionDriver>) {
+        if actions.is_some_and(|driver| driver.pending.is_some()) {
+            self.action_notice =
+                Some("An action is already in progress; try Add when it finishes.".into());
+        } else if let Some(driver) = actions.and_then(|driver| driver.add.clone()) {
+            self.action_notice = None;
+            self.action_scroll = 0;
+            self.add = Some(crate::board_add::Panel::new(driver));
+        } else {
+            self.action_notice = Some("Adding conversations is unavailable in this view.".into());
+        }
+    }
+
+    fn add_key_blocked(&self, key: KeyEvent, width: u16, height: u16) -> bool {
+        self.add.is_some()
+            && (width < 60 || height < 20)
+            && key.code != KeyCode::Esc
+            && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    }
+
+    fn handle_add_key(&mut self, key: KeyEvent) -> bool {
+        let Some(panel) = self.add.as_mut() else {
+            return false;
+        };
+        if panel.key(key) {
+            self.action_notice = panel.closing_notice();
+            self.add = None;
+        }
+        true
+    }
+
     fn key(&mut self, key: KeyEvent, driver: Option<&ConsultationDriver>) -> Option<BoardAction> {
+        if self.handle_add_key(key) {
+            return None;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if let Some(chat) = &mut self.chat {
                 if chat.close_requested {
@@ -1424,7 +1495,10 @@ impl Board {
         // and ordinary typing in the private panel/filter remain available.
         if !self.filtering
             && key.kind == KeyEventKind::Repeat
-            && matches!(key.code, KeyCode::Enter | KeyCode::Char('x' | 'n' | 'U'))
+            && matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::Char('x' | 'n' | 'U' | '+')
+            )
         {
             return None;
         }
@@ -1500,6 +1574,7 @@ impl Board {
             return None;
         }
         match key.code {
+            KeyCode::Char('+') => return Some(BoardAction::Add),
             KeyCode::Up | KeyCode::Char('k') => self.select(-1),
             KeyCode::Down | KeyCode::Char('j') => self.select(1),
             KeyCode::PageUp => self.select(-8),
@@ -1511,7 +1586,7 @@ impl Board {
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Char('?') => {
                 self.action_scroll = 0;
-                self.action_notice = Some("PIKA KEYS\n\n↑↓ / j k · select a conversation\nEnter · open the selected exact conversation\np · preview live Pika pane output; unread preserved\na · private expert consultation in this panel\nd · identity details and full expert card\nx · stop watching, after confirmation; agent stays intact\nn · open the oldest attention item\n/ · filter by name or machine\nr · refresh observations\nu · cumulative usage for the selected conversation\nU · review an available update\nPageUp / PageDown · scroll a preview or help\nEsc · dismiss panel or clear filter\nq · leave Pika\n\nInside an agent: use the visible Pika return control.\nPrivate consultation: Enter sends, Ctrl+J adds a newline,\nCtrl+U clears the draft, Esc closes the private side.".into());
+                self.action_notice = Some("PIKA KEYS\n\n+ · add an existing conversation; choose machine, search, confirm\n↑↓ / j k · select a conversation\nEnter · open the selected exact conversation\np · preview live Pika pane output; unread preserved\na · private expert consultation in this panel\nd · identity details and full expert card\nx · stop watching, after confirmation; agent stays intact\nn · open the oldest attention item\n/ · filter by name or machine\nr · refresh observations\nu · cumulative usage for the selected conversation\nU · review an available update\nPageUp / PageDown · scroll a preview or help\nEsc · dismiss panel or clear filter\nq · leave Pika\n\nInside an agent: use the visible Pika return control.\nPrivate consultation: Enter sends, Ctrl+J adds a newline,\nCtrl+U clears the draft, Esc closes the private side.".into());
             }
             KeyCode::Char('u') => {
                 self.action_scroll = 0;
@@ -1587,13 +1662,20 @@ impl Board {
             KeyCode::Char('x') => {
                 if self.client_actions {
                     if let Some(item) = self.selected().filter(|item| item.actionable()) {
-                        self.action_notice = Some(format!(
-                            "Stop watching {} @{}?\n{} · {}\nThe agent and its conversation stay intact.\nEnter / x confirm · Esc cancel",
-                            item.session.display_name(),
-                            item.node_label().unwrap_or("here"),
-                            item.session.provider,
-                            item.session.session_id
-                        ));
+                        self.action_notice = Some(if item.pending_token.is_some() {
+                            format!(
+                                "Hide launch entry for {}?\nThe agent, terminal, and any confirmed conversation stay intact.\nEnter / x confirm · Esc cancel",
+                                item.session.display_name()
+                            )
+                        } else {
+                            format!(
+                                "Stop watching {} @{}?\n{} · {}\nThe agent and its conversation stay intact.\nEnter / x confirm · Esc cancel",
+                                item.session.display_name(),
+                                item.node_label().unwrap_or("here"),
+                                item.session.provider,
+                                item.session.session_id
+                            )
+                        });
                         self.confirm_untrack = Some(item);
                     }
                     return None;
@@ -1781,7 +1863,13 @@ impl Board {
                 .unwrap_or_default();
             let stale = if item.stale { " ◌" } else { "" };
             let pending = if item.pending_token.is_some() {
-                " starting"
+                if session.home_state == "startup-exited" {
+                    " startup exited"
+                } else if session.status == Status::Starting {
+                    " starting"
+                } else {
+                    " unconfirmed"
+                }
             } else {
                 ""
             };
@@ -1814,7 +1902,11 @@ impl Board {
             line += 1;
         }
 
-        if visible.is_empty() && self.action_notice.is_none() && self.chat.is_none() {
+        if visible.is_empty()
+            && self.action_notice.is_none()
+            && self.chat.is_none()
+            && self.add.is_none()
+        {
             let lines = if !self.filter.is_empty() {
                 [
                     "No conversations match this filter.",
@@ -1825,7 +1917,7 @@ impl Board {
                 [
                     "Your board is ready for your work.",
                     "Run pika NAME to find or start a conversation.",
-                    "Use pika setup to choose existing work or connect machines.",
+                    "Press + to add an existing conversation. Setup connects machines.",
                 ]
             };
             for (index, text) in lines.iter().enumerate() {
@@ -1844,27 +1936,18 @@ impl Board {
                 }
             }
         }
+        let add_text = self.add.as_ref().map(|panel| {
+            if width < 60 || terminal_height < 20 {
+                "Resize to at least 60 × 20 to add a conversation.\nEsc returns without selecting hidden choices.".into()
+            } else {
+                let x = if width >= 100 { list_width + 2 } else { 0 };
+                panel.text(width.saturating_sub(x), usize::from(height.saturating_sub(5)))
+            }
+        });
         if let Some(chat) = &self.chat {
             self.draw_chat(output, chat, list_width, width, height)?;
-        } else if let Some(report) = &self.action_notice {
-            let x = if width >= 100 { list_width + 2 } else { 0 };
-            let available = width.saturating_sub(x);
-            let lines = report
-                .lines()
-                .flat_map(|line| wrap(&crate::fleet::sanitize_terminal_text(line), available))
-                .collect::<Vec<_>>();
-            let rows = usize::from(height.saturating_sub(5));
-            let offset = self.action_scroll.min(lines.len().saturating_sub(rows));
-            for y in 2..height.saturating_sub(2) {
-                queue!(output, MoveTo(x as u16, y), Print(" ".repeat(available)))?;
-            }
-            for (index, line) in lines.iter().skip(offset).take(rows).enumerate() {
-                queue!(
-                    output,
-                    MoveTo(x as u16, 2 + index as u16),
-                    Print(fit(line, available))
-                )?;
-            }
+        } else if let Some(report) = add_text.as_ref().or(self.action_notice.as_ref()) {
+            self.draw_notice_panel(output, report, list_width, width, height)?;
         } else if width >= 100
             && let Some(selected) = self.selected()
         {
@@ -1877,7 +1960,9 @@ impl Board {
             MoveTo(0, height.saturating_sub(2)),
             SetForegroundColor(Color::DarkGrey)
         )?;
-        if let Some(chat) = &self.chat {
+        if let Some(panel) = &self.add {
+            queue!(output, Print(fit(panel.help(), width)))?;
+        } else if let Some(chat) = &self.chat {
             let help = match chat.phase {
                 ChatPhase::Ready => "enter send · ^j newline · ↑↓ scroll · esc close + discard",
                 ChatPhase::Opening | ChatPhase::Waiting => {
@@ -1912,7 +1997,7 @@ impl Board {
             queue!(
                 output,
                 Print(fit(
-                    "↑↓ move · enter open · p peek · a ask · x unwatch · / filter · r refresh · ? keys · q leave",
+                    "+ add · ↑↓ move · enter open · p peek · a ask · x unwatch · / filter · r refresh · ? keys · q leave",
                     width
                 ))
             )?;
@@ -2050,6 +2135,39 @@ impl Board {
         content.clamp(30, 48).min(width / 3)
     }
 
+    fn draw_notice_panel(
+        &self,
+        output: &mut impl Write,
+        report: &str,
+        list_width: usize,
+        width: usize,
+        height: u16,
+    ) -> Result<()> {
+        let x = if width >= 100 { list_width + 2 } else { 0 };
+        let available = width.saturating_sub(x);
+        let lines = report
+            .lines()
+            .flat_map(|line| wrap(&crate::fleet::sanitize_terminal_text(line), available))
+            .collect::<Vec<_>>();
+        let rows = usize::from(height.saturating_sub(5));
+        let offset = if self.add.is_some() {
+            0
+        } else {
+            self.action_scroll.min(lines.len().saturating_sub(rows))
+        };
+        for y in 2..height.saturating_sub(2) {
+            queue!(output, MoveTo(x as u16, y), Print(" ".repeat(available)))?;
+        }
+        for (index, line) in lines.iter().skip(offset).take(rows).enumerate() {
+            queue!(
+                output,
+                MoveTo(x as u16, 2 + index as u16),
+                Print(fit(line, available))
+            )?;
+        }
+        Ok(())
+    }
+
     fn draw_detail(
         &self,
         output: &mut impl Write,
@@ -2072,6 +2190,8 @@ impl Board {
         styled(output, Color::Reset, true, &truncate(&title, available))?;
         let state = if item.stale {
             "CACHED"
+        } else if item.pending_token.is_some() && session.status == Status::Error {
+            "LAUNCH UNCONFIRMED"
         } else {
             session.status.as_str()
         };
@@ -2566,6 +2686,14 @@ fn briefing_message(item: &BoardItem) -> (&'static str, &str) {
         );
     }
     let s = &item.session;
+    if item.pending_token.is_some() && s.status == Status::Error {
+        return (
+            "Launch not confirmed",
+            s.error
+                .as_deref()
+                .unwrap_or("Enter checks the existing terminal. X hides this launch entry."),
+        );
+    }
     let reason = s.attention_reason.as_deref().filter(|text| {
         !text.trim().is_empty() && !matches!(*text, "completed" | "working" | "[object Object]")
     });

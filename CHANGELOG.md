@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.29 — Named conversations, safer recovery
+
+- Add provider-evidenced personal names to the board automatically. Claude
+  custom names qualify; Codex requires a later distinct saved-name change.
+  Generated titles, helpers, and inherited fork labels do not join on sight.
+- Narrow the board's `+` picker to named conversations, including explicit
+  restoration after `x`, without changing unread state or launching an agent.
+- Recover stranded startup and terminal homes when exact identity can be
+  proved. Preserve the live terminal and offer an explicitly unverified handoff
+  when it cannot; never relaunch or acknowledge on a guess.
+- Keep Ctrl+C and provider updates from silently closing or renaming another
+  conversation. Mark overdue starts as unconfirmed instead of working forever.
+- Request read-only quota from trusted hosts even when the board's cached
+  capability list predates their upgrade, so Claude usage can appear again.
+- Add measured complexity and recovery checks. Prepare signed Windows
+  publishing without claiming an unsigned build will pass enterprise policy.
+
 ## 0.6.28 — Files beside your agent, Muse on your board
 
 - Open a read-only Files companion from the agent's return bar. Browse the

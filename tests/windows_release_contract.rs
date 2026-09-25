@@ -43,6 +43,14 @@ fn release_packager_emits_a_single_executable_windows_client_zip() {
         String::from_utf8(listing.stdout).unwrap().trim(),
         "LICENSE\nTHIRD_PARTY.md\npika.exe"
     );
+    let extracted = Command::new("unzip")
+        .arg("-p")
+        .arg(output.join(&artifact.file))
+        .arg("pika.exe")
+        .output()
+        .unwrap();
+    assert!(extracted.status.success());
+    assert_eq!(extracted.stdout, fs::read(&binary).unwrap());
 }
 
 #[test]

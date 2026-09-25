@@ -59,6 +59,7 @@ pub const CAPABILITIES: &[&str] = &[
     "expert-directory-v1",
     "expert-directory-notices-v1",
     "setup-explicit-names-v1",
+    "adopt-preserves-state-v1",
     "client-board-v1",
     "quota-v1",
     "board-feed-v1",
@@ -2953,6 +2954,31 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
                     "Remote untracked receipt has an invalid pane count",
                 )
             })
+    }
+
+    /// Board admission requires the owning node's state-preserving contract.
+    /// Older setup-adoption implementations may overwrite unread/lifecycle
+    /// state. Never guess this capability from a cached package version.
+    pub(crate) fn adopt_preserving_state(
+        &self,
+        node: &FleetNode,
+        candidate: &Candidate,
+    ) -> Result<Session, FleetError> {
+        if !self
+            .node_hello(node)?
+            .capabilities
+            .iter()
+            .any(|value| value == "adopt-preserves-state-v1")
+        {
+            return Err(FleetError::new(
+                FleetErrorKind::Incompatible,
+                format!(
+                    "Update Pika on {} to add conversations from the board without changing unread state. Nothing was added.",
+                    node.alias
+                ),
+            ));
+        }
+        self.adopt(node, candidate, None)
     }
 
     pub fn adopt(

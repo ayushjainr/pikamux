@@ -3,6 +3,8 @@ mod activity_feed;
 mod activity_observer;
 #[cfg(not(windows))]
 pub mod attention;
+mod board_add;
+mod board_catalog;
 mod claude_quota;
 #[cfg(not(windows))]
 pub mod cli;
@@ -32,6 +34,7 @@ pub mod hooks;
 pub mod model;
 pub mod monitor;
 mod muse;
+mod named_discovery;
 mod onboarding;
 pub mod open_history;
 pub mod paths;

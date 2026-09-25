@@ -21,3 +21,6 @@ See [release format](RELEASE_FORMAT.md) for validation and activation details.
 Apple Developer ID signing and notarization are not currently configured.
 The terminal installer verifies release checksums; provenance attestations are
 published alongside the assets.
+
+Windows Authenticode signing is prepared but requires publisher enrollment.
+See [Windows signing](windows-signing.md) before enabling the release gate.

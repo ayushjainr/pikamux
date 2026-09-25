@@ -14,17 +14,47 @@ remain disabled until isolated forking and cleanup are verified; missing Muse
 quota data is unavailable, never synthesized. Both ends of a fleet connection
 must understand the Muse provider identity.
 
-Board membership is an explicit Pika choice, separate from provider naming.
-An open, creation or adoption keeps watching that exact provider identity;
+Personally naming a conversation is intended to add it to the board without
+setup or a separate Add action. Automatic admission requires provider evidence
+of an explicit name, not just the presence or spelling of a title. Claude custom
+name metadata supplies this distinction. Codex uses the same setter for its
+automatic title and later renames. The append-only title index can establish a
+later *change* between two distinct nonempty titles for the exact same root
+conversation; that transition is admitted, while a lone title is not. The
+index does not record the actor. Older or incomplete index histories may leave
+a personally renamed Codex thread unconfirmed; `pika NAME` remains the exact
+recovery path. Generated titles, worker sessions and inherited fork names do
+not become board rows merely for being present.
+A shared, bounded discovery cache checks supported providers every five seconds
+while local reconciliation is running, including when no conversations are yet
+watched. Admission preserves existing lifecycle, ownership and unread state;
+explicit unwatch tombstones always win. There is no model call or new daemon.
+An open, creation or adoption also keeps watching that exact provider identity;
 provider-generated names, hook events and inherited pane tags alone do not.
 Explicit selection and exact attachment receipts persist independently of later
 renames and lifecycle events. Existing managed records and historical exact
 launch/attach evidence remain watched. Other legacy external observations remain
 stored but are excluded from the board, attention queue and alerts. Setup offers
-them for selection (named first, recent unnamed second); exact-name/UUID opening
+them for selection (verified names first, recent history second); exact-name/UUID opening
 also restores them. This is not archival, deletion or an explicit-unwatch tombstone.
-Provider names are labels, not proof that a human renamed a conversation. Hooks
+Provider names alone are labels, not proof of a later rename. Hooks
 must not grant tracking to a new fork merely by inheriting its parent's pane.
+Launch naming is initialization, not an enduring policy: only the exact fresh
+pending SessionStart can request its initial native name. Later hooks and resumes
+must never reapply a stale launch name over a provider-native rename.
+
+The board's `+` action adds existing conversations without running setup. It
+opens a searchable, bounded personally-named-conversation picker for this machine or one
+explicitly selected trusted machine. A confirmation freezes the provider, UUID
+and machine; only that selection becomes watched. Picker discovery is asynchronous
+and never changes hooks or configuration, launches an agent,
+interviews an expert, or acknowledges unread work. Cancellation before approval
+does nothing; cancelling an already-dispatched remote addition may leave an
+unknown outcome and never triggers an automatic retry. The same picker serves
+the native Windows fleet client; it does not scan local Windows provider homes.
+Remote board admission negotiates `adopt-preserves-state-v1` before writing;
+older nodes without explicit-name filtering need an upgrade before their board
+picker can safely list candidates.
 
 ## Design principles
 
@@ -52,6 +82,10 @@ failure behind a successful-looking attachment.
 - Provider launcher/native-child aliases count as one logical client. Shared
   app-server hook leases are advisory when direct UUID-bearing client evidence
   exists; distinct UUID-bearing process trees remain `OPEN TWICE`.
+  Shared Codex server hooks retain advisory liveness to prevent duplicate
+  launches, but their inherited terminal, launch, and name environment cannot
+  claim a pane or overwrite its interactive owner. Activity remains useful even
+  when terminal identity cannot be proved.
 - Terminal handoff may advance from a verified runtime launcher to its exact
   native child, provided the launcher generation, pane and launch identity are
   unchanged and the forwarded arguments match. Native-client replacement and
@@ -120,6 +154,25 @@ Operations while leaving the agent process, provider conversation, and expert
 card intact. The action is reversible through explicit opening or adoption,
 and a durable tombstone prevents lifecycle hooks from silently adding the
 workstream back before then.
+
+Unconfirmed launch entries are distinct from conversations. After two minutes
+without confirmation they say `unconfirmed`, not `starting` or `working`;
+elapsed time never proves exit or identity. X explicitly hides only that launch
+entry. Its recovery record, live terminal, and any confirmed conversation stay
+intact. Hidden records remain available to launch recovery and diagnostics.
+An authenticated wrapper exit before identity confirmation is recorded against
+the pending launch generation and its separately registered owner token. It is
+shown immediately as `startup exited`, including clean exits, without inventing
+a conversation, acknowledging unread work, or deleting the recovery handle.
+Exit zero does not prove an update occurred or authorize an automatic relaunch.
+`pika NAME` reopens an existing exact-name pending terminal before considering
+creation; provider/name ambiguity is never resolved by launching another client.
+Enter returns to the retained startup terminal, not a claimed live agent.
+During ordinary reconciliation, an independently proven exact home can complete
+a stranded startup record with the same expected conversation, pane, launch
+token, binding, and phase. Only its confirmed process generation replaces the
+temporary holder generation. This records no opening, clears no unread event,
+and never executes or restarts a provider. Unknown identities stay unresolved.
 
 Pressing a replaces only the inspector with an inline side conversation; the
 workstream rail and live operations header remain visible. On narrow terminals,
@@ -282,6 +335,15 @@ An unbound live process cannot be opened as if managed. Refresh errors retain
 the last good screen and identify the failure. Empty, loading, narrow, overflow,
 unread, working, ready, parked, error, unbound, remote, and cached-offline states
 are first-class.
+
+An ordinary open first attempts bounded identity recovery from fresh evidence;
+it never retries a provider launch to recover a lost attachment. When exact
+conversation identity remains unknown, an interactive user may explicitly choose
+to open the existing terminal instead. This is terminal navigation, not proof of
+conversation continuity: Pika freezes and rechecks the unique owned pane and its
+process generation, labels the attachment unverified, preserves unread state,
+and creates no agent or recovery certificate. Missing, changed, or ambiguous
+panes stay blocked. Cancellation and noninteractive callers never opt in.
 
 Public state is a projection, not a stored assertion. Pika persists provider
 lifecycle, identity-safety, and runtime observations as separate latest facts.

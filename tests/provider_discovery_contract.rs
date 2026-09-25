@@ -9,7 +9,11 @@ use pikamux::{
 };
 use rusqlite::{Connection, params};
 use std::collections::{BTreeMap, BTreeSet};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    io::{Seek, SeekFrom, Write},
+    path::Path,
+};
 
 fn paths(root: &Path) -> Paths {
     let config_dir = root.join("config/pika");
@@ -35,6 +39,24 @@ fn json_line(path: &Path, value: serde_json::Value) {
         format!("{}\n", serde_json::to_string(&value).unwrap()),
     )
     .unwrap();
+}
+
+fn sparse_title_transcript(path: &Path, title: &str, size: u64, modified_at: u64) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let event = serde_json::to_vec(&serde_json::json!({
+        "type":"custom-title", "customTitle":title
+    }))
+    .unwrap();
+    let prefix = size - event.len() as u64 - 2;
+    let mut file = fs::File::create(path).unwrap();
+    file.set_len(prefix).unwrap();
+    file.seek(SeekFrom::End(0)).unwrap();
+    file.write_all(b"\n").unwrap();
+    file.write_all(&event).unwrap();
+    file.write_all(b"\n").unwrap();
+    file.set_len(size).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_at))
+        .unwrap();
 }
 
 fn saved_codex(identity: &str, name: &str) -> Session {
@@ -194,6 +216,254 @@ fn codex_first_screen_requires_proven_authorship_but_browse_preserves_safe_label
             .iter()
             .any(|candidate| candidate.session_id == archived)
     );
+}
+
+#[test]
+fn codex_later_name_change_appears_without_importing_generated_or_helper_titles() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    fs::create_dir_all(&paths.codex_home).unwrap();
+    let db = Connection::open(paths.codex_home.join("state_1.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY,name TEXT,cwd TEXT,rollout_path TEXT,created_at INTEGER,updated_at INTEGER,archived INTEGER);",
+    )
+    .unwrap();
+    let renamed = "11111111-1111-4111-8111-111111111111";
+    let generated = "22222222-2222-4222-8222-222222222222";
+    let duplicate = "33333333-3333-4333-8333-333333333333";
+    let stale = "44444444-4444-4444-8444-444444444444";
+    let archived = "55555555-5555-4555-8555-555555555555";
+    let helper = "66666666-6666-4666-8666-666666666666";
+    let fork = "77777777-7777-4777-8777-777777777777";
+    let rows = [
+        (renamed, "cf_perf", "cli", false, None),
+        (generated, "Automatic title", "cli", false, None),
+        (duplicate, "Same title", "cli", false, None),
+        (stale, "newer database title", "cli", false, None),
+        (archived, "archived rename", "cli", true, None),
+        (helper, "helper rename", "feature", false, None),
+        (fork, "fork rename", "cli", false, Some(renamed)),
+    ];
+    for (id, name, source, archived, parent) in rows {
+        let transcript = paths.codex_home.join(format!("{id}.jsonl"));
+        json_line(
+            &transcript,
+            serde_json::json!({"type":"session_meta","payload":{
+                "id":id,"source":source,"forked_from_id":parent
+            }}),
+        );
+        db.execute(
+            "INSERT INTO threads VALUES(?1,?2,'/project',?3,1,100,?4)",
+            params![id, name, transcript.to_string_lossy(), i64::from(archived)],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let mut index = String::new();
+    for (id, first, last) in [
+        (renamed, "Automatic title", Some("cf_perf")),
+        (generated, "Automatic title", None),
+        (duplicate, "Same title", Some("Same title")),
+        (stale, "Automatic title", Some("stale index rename")),
+        (archived, "Automatic title", Some("archived rename")),
+        (helper, "Automatic title", Some("helper rename")),
+        (fork, "Automatic title", Some("fork rename")),
+    ] {
+        index.push_str(&format!(
+            "{}\n",
+            serde_json::json!({"id":id,"thread_name":first,"updated_at":1})
+        ));
+        if let Some(last) = last {
+            index.push_str(&format!(
+                "{}\n",
+                serde_json::json!({"id":id,"thread_name":last,"updated_at":2})
+            ));
+        }
+    }
+    fs::write(paths.codex_home.join("session_index.jsonl"), index).unwrap();
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let names = providers.import_candidates(Provider::Codex);
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[0].session_id, renamed);
+    assert_eq!(names[0].name.as_deref(), Some("cf_perf"));
+
+    let store = Store::from_paths(&paths);
+    let rows = Pika::with_components(
+        paths,
+        Config::default(),
+        store.clone(),
+        Tmux::with_executable("/usr/bin/false", Some("isolated".into())),
+    )
+    .reconcile_local()
+    .unwrap()
+    .sessions;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id, renamed);
+    assert!(!store.is_watched(Provider::Codex, generated).unwrap());
+    assert!(!store.is_watched(Provider::Codex, helper).unwrap());
+}
+
+#[test]
+fn codex_database_name_wins_over_older_index_label() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    fs::create_dir_all(&paths.codex_home).unwrap();
+    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let transcript = paths.codex_home.join(format!("{id}.jsonl"));
+    json_line(
+        &transcript,
+        serde_json::json!({"type":"session_meta","payload":{}}),
+    );
+    let db = Connection::open(paths.codex_home.join("state_1.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(
+            id TEXT PRIMARY KEY, name TEXT, cwd TEXT, git_branch TEXT,
+            rollout_path TEXT, model TEXT, created_at INTEGER,
+            updated_at INTEGER, archived INTEGER
+         );",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES(?1,'new provider rename','/project','main',?2,'gpt',1,200,0)",
+        params![id, transcript.to_string_lossy()],
+    )
+    .unwrap();
+    drop(db);
+    fs::write(
+        paths.codex_home.join("session_index.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({"id":id,"thread_name":"old index label","updated_at":100})
+        ),
+    )
+    .unwrap();
+
+    let candidate = Providers::new(&paths, &Config::default())
+        .discover(Provider::Codex)
+        .into_iter()
+        .find(|candidate| candidate.session_id == id)
+        .unwrap();
+    assert_eq!(candidate.name.as_deref(), Some("new provider rename"));
+}
+
+#[test]
+fn claude_title_refresh_uses_provider_file_change_not_hook_activity_clock() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let sessions = paths.claude_home.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join(format!("{id}.json")),
+        serde_json::to_vec(&serde_json::json!({
+            "kind":"interactive", "sessionId":id, "name":"old Pika name",
+            "nameSource":"custom", "cwd":"/project", "updatedAt":10
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let transcript = paths.claude_home.join(format!("projects/p/{id}.jsonl"));
+    json_line(
+        &transcript,
+        serde_json::json!({"type":"custom-title","customTitle":"new provider rename"}),
+    );
+    fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100))
+        .unwrap();
+
+    let activity = BTreeMap::from([(id.to_owned(), 200.0)]);
+    let candidate = Providers::new(&paths, &Config::default())
+        .reconcile_records(Provider::Claude, &activity)
+        .into_iter()
+        .find(|candidate| candidate.session_id == id)
+        .unwrap();
+    assert_eq!(candidate.name.as_deref(), Some("new provider rename"));
+}
+
+#[test]
+fn claude_title_scan_round_robins_past_the_first_batch() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let sessions = paths.claude_home.join("sessions");
+    let transcripts = paths.claude_home.join("projects/p");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&transcripts).unwrap();
+    let mut target = String::new();
+    for index in 0..40 {
+        let id = format!("cccccccc-cccc-4ccc-8ccc-{index:012}");
+        if index == 39 {
+            target.clone_from(&id);
+        }
+        fs::write(
+            sessions.join(format!("{id}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "kind":"interactive", "sessionId":id, "name":"old name",
+                "nameSource":"custom", "cwd":"/project", "updatedAt":10
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let transcript = transcripts.join(format!("{id}.jsonl"));
+        sparse_title_transcript(
+            &transcript,
+            if index == 39 {
+                "provider rename"
+            } else {
+                "old name"
+            },
+            2 * 1024 * 1024,
+            2_000 - index as u64,
+        );
+    }
+
+    let config = Config::default();
+    let store = Store::from_paths(&paths);
+    store.initialize().unwrap();
+    for index in 0..40 {
+        let id = format!("cccccccc-cccc-4ccc-8ccc-{index:012}");
+        let mut saved = saved_codex(&id, "old name");
+        saved.provider = Provider::Claude;
+        store.upsert_session(&saved, false).unwrap();
+    }
+    let pika = Pika::with_components(
+        paths.clone(),
+        config,
+        store.clone(),
+        Tmux::with_executable("/usr/bin/false", Some("isolated".into())),
+    );
+    let mut observed = false;
+    for _ in 0..12 {
+        pika.reconcile_local().unwrap();
+        let current = store
+            .get_session(Provider::Claude, &target)
+            .unwrap()
+            .unwrap();
+        if current.name.as_deref() == Some("provider rename") {
+            observed = true;
+            break;
+        }
+    }
+    assert!(
+        observed,
+        "the watched rename outside the initial batch starved"
+    );
+    for _ in 0..12 {
+        pika.reconcile_local().unwrap();
+        assert_eq!(
+            store
+                .get_session(Provider::Claude, &target)
+                .unwrap()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("provider rename"),
+            "an unobserved title refresh reverted the watched rename"
+        );
+    }
 }
 
 #[test]
@@ -614,8 +884,14 @@ fn renamed_independent_codex_fork_requires_its_own_tracking_choice() {
     );
     let rows = pika.reconcile_local().unwrap().sessions;
     assert_eq!(rows.len(), 1);
-    let candidates = pika.import_named().unwrap();
-    let fork = candidates
+    let named = pika.import_named().unwrap();
+    assert!(
+        named
+            .iter()
+            .all(|candidate| candidate.session_id != fork_id)
+    );
+    let recent = pika.import_recent_unnamed(20).unwrap();
+    let fork = recent
         .iter()
         .find(|candidate| candidate.session_id == fork_id)
         .unwrap();
@@ -776,13 +1052,13 @@ fn claude_reconciliation_defers_changed_titles_beyond_its_cycle_budget() {
             .iter()
             .filter(|candidate| candidate.name.is_some() && candidate.updated_at > 0.0)
             .count(),
-        16
+        8
     );
     assert_eq!(
         records
             .iter()
             .filter(|candidate| candidate.updated_at == 0.0)
             .count(),
-        2_000 - 16
+        2_000 - 8
     );
 }

@@ -218,6 +218,9 @@ impl Drop for Driver {
 fn absence(item: &BoardItem) -> Option<&'static str> {
     if item.stale {
         Some("Preview paused · machine information is out of date.")
+    } else if item.pending_token.is_some() && item.session.status != crate::model::Status::Starting
+    {
+        Some("Preview needs a confirmed conversation. Enter checks the existing terminal.")
     } else if item.pending_token.is_some() || item.session.session_id.trim().is_empty() {
         Some("Preview available after the conversation starts.")
     } else if item.session.session_id.starts_with("unbound:") {

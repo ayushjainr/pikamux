@@ -73,8 +73,19 @@ pika research-notes
 If no conversation exists with that name, Pika can create one. If a live copy
 cannot be handed over safely, Pika explains the next step. No tmux session name
 is part of the daily workflow. Existing installations open the board directly;
-run `pika setup` when you want to revisit configuration or `pika setup --browse-all`
-to choose more work. `--details` uses the detailed text interface; `--dry-run`
+Claude custom names and Codex names changed after an earlier saved title appear
+automatically on refresh, without setup or Add. Initial automatic titles stay
+out of the board. Conversations removed with `x` remain removed. Codex does
+not record who changed a name, and old or incomplete title histories may not
+show a rename; `pika NAME` watches that exact conversation when needed.
+Press `+` for an optional picker of verified personally named conversations,
+including restoring one removed on this machine. Choose its machine, type to filter, then
+review and confirm the exact identity. Broad recent history is not shown here.
+This does not launch another agent, change hooks, or mark output read. The same
+picker works in the Windows client; older hosts need an explicit Pika update
+before they support state-preserving board admission.
+Run `pika setup` to revisit configuration; `pika setup --browse-all` remains
+available too. `--details` uses the detailed text interface; `--dry-run`
 previews settings without applying them. `--yes` and redirected commands remain
 non-screen interfaces suitable for automation.
 
@@ -141,7 +152,8 @@ stored but no longer appear on the board or emit alerts. Setup offers these
 unconfirmed records for selection, including on a later commissioning run.
 `pika NAME` or `pika open UUID` also restores the exact selected conversation.
 Nothing is deleted, and existing expert cards remain discoverable independently
-of board membership. Renaming alone cannot subscribe a new independent fork.
+of board membership. A provider-verified rename of an independent root can
+subscribe it; an inherited or automatic fork label cannot.
 
 Use `--browse-all` to include the second screen, `--import-all` to select eligible
 named candidates, or both to include recent unnamed candidates too. Use
@@ -158,7 +170,7 @@ Installations can extend `codex_worker_originators` in Pika's `config.json` for
 their own runners. The parent conversation or run remains the visible workstream.
 OpenCode sessions with a non-null `parent_id` are likewise subordinate workers:
 their root remains the board item, and it stays `WORKING` while any descendant
-has an incomplete turn. Nothing is imported silently. The final
+has an incomplete turn. Setup does not silently import broad recent history. The final
 connection notices and detailed commissioning ledger distinguish active hook definitions from observed live
 events. Codex requires one extra trust step: open
 `/hooks`, approve the Pika definitions, and use Codex once so `pika doctor` can
@@ -739,7 +751,10 @@ they differ.
 Renaming an adopted conversation remains provider-owned. The next ordinary
 reconciliation, including `pika`, `pika NAME`, or `pika list`, updates the
 tracked display name and the pane's recovery metadata when the provider exposes
-the new name.
+the new name. `pika NAME` uses that name to initialize a new conversation; it is
+not a permanent override. Later activity or resuming cannot restore that launch
+name over a provider-native rename. Claude title checks are bounded and rotate
+through watched conversations, so large boards can take several refreshes.
 
 Live hook ownership is bound to both a PID and its native process birth stamp, so
 a recycled PID cannot counterfeit exact identity. A shared Codex app-server is

@@ -8,13 +8,13 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsStr,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{Mutex, OnceLock, mpsc},
     time::{Duration, Instant, UNIX_EPOCH},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -37,9 +37,16 @@ const MAX_CLAUDE_PROJECT_ENTRIES: usize = 10_000;
 const MAX_CLAUDE_EXACT_PATH_CHECKS: usize = 100_000;
 const MAX_CLAUDE_METADATA_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CLAUDE_TITLE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_CLAUDE_CHANGED_TITLES: usize = 16;
+const MAX_CLAUDE_TITLE_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+// Eight maximum-size title windows fit within the aggregate 16 MiB budget,
+// regardless of transcript mtimes or scan ordering.
+const MAX_CLAUDE_CHANGED_TITLES: usize =
+    (MAX_CLAUDE_TITLE_TOTAL_BYTES / MAX_CLAUDE_TITLE_WINDOW_BYTES) as usize;
+const MAX_CLAUDE_TITLE_CURSOR_HOMES: usize = 64;
 const PROVIDER_SQLITE_DEADLINE: Duration = Duration::from_millis(400);
 const PROVIDER_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+
+static CLAUDE_TITLE_CURSORS: OnceLock<Mutex<VecDeque<(PathBuf, usize)>>> = OnceLock::new();
 
 pub struct Providers<'a> {
     paths: &'a Paths,
@@ -68,23 +75,21 @@ impl<'a> Providers<'a> {
         self.records(provider, None, false)
     }
 
-    /// Return only conversations whose provider metadata proves that a human
-    /// explicitly chose the displayed name. This is deliberately narrower
-    /// than [`Self::discover`]: Codex currently persists a title but not its
-    /// author, so a DB/index title can support exact lookup and the opt-in
-    /// recent browser without being advertised as a personal name during
-    /// setup. Existing Pika names remain authoritative in Pika's own store.
+    /// Return names with provider evidence beyond an initial generated title.
+    /// Claude marks custom names directly. Codex records only name changes,
+    /// not the actor: a later distinct index entry is useful rename evidence,
+    /// while a lone title cannot distinguish automatic naming from `/rename`.
     pub fn import_candidates(&self, provider: Provider) -> Vec<Candidate> {
         match provider {
             Provider::Claude => self.records(provider, None, true),
-            Provider::Codex | Provider::Opencode | Provider::Muse => Vec::new(),
+            Provider::Codex => codex_named_import_candidates(&self.paths.codex_home, self.config),
+            Provider::Opencode | Provider::Muse => Vec::new(),
         }
     }
 
     pub fn discover(&self, provider: Provider) -> Vec<Candidate> {
         // Discovery also serves reconciliation, where Codex fork lineage and
-        // native rename labels are useful even though their authorship is not
-        // proven. Setup must call `import_candidates` instead.
+        // native title labels are useful without proving a later name change.
         if matches!(provider, Provider::Opencode | Provider::Muse) {
             Vec::new()
         } else {
@@ -696,8 +701,7 @@ fn codex_records(
     }
     for indexed in indexed_records {
         if let Some(position) = positions.get(&indexed.session_id).copied() {
-            output[position].name = indexed.name;
-            output[position].updated_at = output[position].updated_at.max(indexed.updated_at);
+            merge_codex_index_candidate(&mut output[position], indexed);
         } else if !worker_ids.contains(&indexed.session_id) {
             positions.insert(indexed.session_id.clone(), output.len());
             output.push(indexed);
@@ -714,6 +718,16 @@ fn codex_records(
     output.sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at));
     hydrate_codex_lifecycle(&mut output, reconcile_activity);
     output
+}
+
+fn merge_codex_index_candidate(current: &mut Candidate, indexed: Candidate) {
+    // The state DB is the current thread record; the index can lag a rename.
+    if indexed.name.is_some()
+        && (indexed.updated_at >= current.updated_at || current.name.is_none())
+    {
+        current.name = indexed.name;
+    }
+    current.updated_at = current.updated_at.max(indexed.updated_at);
 }
 
 fn retain_reconciliation_index(records: &mut Vec<Candidate>, identities: &BTreeSet<String>) {
@@ -785,6 +799,119 @@ fn codex_index_records(home: &Path) -> Vec<Candidate> {
         );
     }
     records.into_values().collect()
+}
+
+/// The Codex TUI saves its first automatic title and later renames through the
+/// same API. Its append-only index can still establish a *change* from a prior
+/// nonempty title. It cannot establish who performed that change.
+fn codex_changed_index_names(home: &Path) -> BTreeMap<String, String> {
+    const WINDOW_BYTES: u64 = 16 * 1024 * 1024;
+    let Ok(mut file) = File::open(home.join("session_index.jsonl")) else {
+        return BTreeMap::new();
+    };
+    let Ok(size) = file.metadata().map(|metadata| metadata.len()) else {
+        return BTreeMap::new();
+    };
+    let offset = size.saturating_sub(WINDOW_BYTES);
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return BTreeMap::new();
+    }
+    let mut bytes = Vec::new();
+    if file.take(WINDOW_BYTES).read_to_end(&mut bytes).is_err() {
+        return BTreeMap::new();
+    }
+    let start = if offset == 0 {
+        0
+    } else {
+        bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |at| at + 1)
+    };
+    let end = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1);
+    if start >= end {
+        return BTreeMap::new();
+    }
+    let mut names = BTreeMap::<String, (String, bool)>::new();
+    for line in bytes[start..end]
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .filter(|line| !line.is_empty())
+        .take(MAX_CODEX_INDEX_RECORDS)
+    {
+        if line.len() > MAX_CODEX_METADATA_LINE_BYTES as usize {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        let (Some(id), Some(name)) = (
+            value.get("id").and_then(Value::as_str),
+            value.get("thread_name").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if !Providers::valid_id(Provider::Codex, id) || name.trim().is_empty() || name.len() > 4096
+        {
+            continue;
+        }
+        names
+            .entry(id.to_owned())
+            .and_modify(|(latest, changed)| *changed |= latest != name)
+            .or_insert_with(|| (name.to_owned(), false));
+    }
+    names
+        .into_iter()
+        .filter_map(|(id, (latest, changed))| changed.then_some((id, latest)))
+        .collect()
+}
+
+fn codex_named_import_candidates(home: &Path, config: &Config) -> Vec<Candidate> {
+    let changed = codex_changed_index_names(home);
+    if changed.is_empty() {
+        return Vec::new();
+    }
+    let mut metadata_budget = MAX_CODEX_METADATA_TOTAL_BYTES;
+    codex_records(home, config, None, false, None, false, None)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.source == "codex-state"
+                && candidate.name.as_deref()
+                    == changed.get(&candidate.session_id).map(String::as_str)
+                && candidate.transcript_path.as_deref().is_some_and(|path| {
+                    read_first_json_budgeted(path, &mut metadata_budget)
+                        .as_ref()
+                        .is_some_and(|meta| codex_interactive_root(meta, &candidate.session_id))
+                })
+        })
+        .map(|mut candidate| {
+            // The remote board must distinguish this stronger evidence from
+            // an older host's broad Codex title inventory.
+            candidate.source = "codex-name-change".into();
+            candidate
+        })
+        .collect()
+}
+
+fn codex_interactive_root(metadata: &Value, id: &str) -> bool {
+    if metadata.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return false;
+    }
+    let payload = &metadata["payload"];
+    payload.get("id").and_then(Value::as_str) == Some(id)
+        && matches!(
+            payload.get("source").and_then(Value::as_str),
+            Some("cli" | "vscode" | "appServer" | "app-server")
+        )
+        && payload
+            .get("forked_from_id")
+            .and_then(Value::as_str)
+            .is_none()
+        && payload.get("thread_source").and_then(Value::as_str) != Some("subagent")
+        && payload.get("originator").is_none()
 }
 
 fn codex_archived_index_ids(
@@ -965,6 +1092,75 @@ fn codex_lifecycle(path: &str, byte_budget: &mut u64) -> Option<Status> {
     })
 }
 
+fn next_claude_title_batch(
+    home: &Path,
+    transcripts: &[PathBuf],
+    identities: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let ordered = transcripts
+        .iter()
+        .filter_map(|path| path.file_stem().and_then(OsStr::to_str))
+        .filter(|identity| identities.contains(*identity))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if ordered.is_empty() {
+        return BTreeSet::new();
+    }
+    let cursors = CLAUDE_TITLE_CURSORS.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut cursors = cursors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cursor = cursors
+        .iter()
+        .position(|(known_home, _)| known_home == home)
+        .map(|index| cursors.remove(index).expect("cursor position exists").1)
+        .unwrap_or(0)
+        % ordered.len();
+    let count = MAX_CLAUDE_CHANGED_TITLES.min(ordered.len());
+    let selected = (0..count)
+        .map(|offset| ordered[(cursor + offset) % ordered.len()].clone())
+        .collect();
+    let step = coprime_scan_step(count, ordered.len());
+    let next = (cursor + step) % ordered.len();
+    if cursors.len() == MAX_CLAUDE_TITLE_CURSOR_HOMES {
+        cursors.pop_front();
+    }
+    cursors.push_back((home.to_path_buf(), next));
+    selected
+}
+
+fn coprime_scan_step(batch: usize, population: usize) -> usize {
+    let mut step = batch.max(1);
+    while greatest_common_divisor(step, population) != 1 {
+        step += 1;
+    }
+    step
+}
+
+fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
+
+fn should_scan_claude_title(
+    full_discovery: bool,
+    exact_identity: bool,
+    changed: bool,
+    scheduled: bool,
+    scanned_this_cycle: usize,
+) -> bool {
+    full_discovery
+        || if exact_identity {
+            scheduled
+        } else {
+            changed && scanned_this_cycle < MAX_CLAUDE_CHANGED_TITLES
+        }
+}
+
 fn claude_records(
     home: &Path,
     query: Option<&str>,
@@ -1068,6 +1264,9 @@ fn claude_records(
     }
 
     transcripts.sort_by_key(|path| std::cmp::Reverse(modified(path).to_bits()));
+    let title_scan_ids = identities.map_or_else(BTreeSet::new, |wanted| {
+        next_claude_title_batch(home, &transcripts, wanted)
+    });
     let mut title_budget = MAX_CLAUDE_TITLE_TOTAL_BYTES;
     let mut changed_titles = 0_usize;
     for (index, path) in transcripts.into_iter().enumerate() {
@@ -1090,8 +1289,18 @@ fn claude_records(
             .copied()
             .unwrap_or(0.0);
         let changed = reconcile_activity.is_none() || source_updated_at > previous_activity;
-        let scan_title =
-            reconcile_activity.is_none() || (changed && changed_titles < MAX_CLAUDE_CHANGED_TITLES);
+        // Hook activity is not a provider-file version. A later Pika hook can
+        // advance last_activity_at after a title edit, so exact watched UUIDs
+        // can be checked against the bounded provider title window even when
+        // that unrelated clock is later than the transcript. Keep the per-
+        // cycle scan cap and aggregate byte budget in force.
+        let scan_title = should_scan_claude_title(
+            reconcile_activity.is_none(),
+            exact_identity,
+            changed,
+            title_scan_ids.contains(&identity),
+            changed_titles,
+        );
         let title = if scan_title {
             changed_titles += usize::from(reconcile_activity.is_some());
             transcript_title(&path, explicit_only, &mut title_budget)
@@ -1123,9 +1332,11 @@ fn claude_records(
         records
             .entry(identity.clone())
             .and_modify(|existing| {
-                if title.is_some() {
-                    existing.name = title.clone();
-                }
+                update_claude_provider_name(
+                    existing,
+                    title.as_deref(),
+                    reconcile_activity.is_some() && exact_identity,
+                );
                 existing.transcript_path = Some(path.to_string_lossy().into_owned());
                 existing.updated_at = existing.updated_at.max(effective_updated_at);
                 existing.source = if explicit_only {
@@ -1178,6 +1389,21 @@ fn claude_records(
     }
     output.sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at));
     output
+}
+
+fn update_claude_provider_name(
+    candidate: &mut Candidate,
+    observed_title: Option<&str>,
+    clear_unobserved_cached_title: bool,
+) {
+    if let Some(title) = observed_title {
+        candidate.name = Some(title.to_owned());
+    } else if clear_unobserved_cached_title {
+        // For watched UUIDs, sessions/*.json is only a cached projection and
+        // may lag the transcript's custom-title event. Do not export it as a
+        // fresh name when this bounded refresh didn't observe a title.
+        candidate.name = None;
+    }
 }
 
 fn claude_exact_identities(
@@ -1309,7 +1535,6 @@ fn claude_session_paths(
 }
 
 fn transcript_title(path: &Path, explicit_only: bool, byte_budget: &mut u64) -> Option<String> {
-    const MAX_BYTES: u64 = 2 * 1024 * 1024;
     const MAX_LINES: usize = 16_384;
     const MAX_LINE_BYTES: usize = 64 * 1024;
     let deadline = Instant::now() + Duration::from_millis(100);
@@ -1317,7 +1542,7 @@ fn transcript_title(path: &Path, explicit_only: bool, byte_budget: &mut u64) -> 
         return None;
     }
     let mut file = File::open(path).ok()?;
-    let limit = MAX_BYTES.min(*byte_budget);
+    let limit = MAX_CLAUDE_TITLE_WINDOW_BYTES.min(*byte_budget);
     // Provider title events are append-only; inspect a bounded recent window.
     // An unavailable title is not authority to rename an existing Pika row.
     let offset = file.metadata().ok()?.len().saturating_sub(limit);

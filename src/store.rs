@@ -265,6 +265,24 @@ pub struct PendingLaunch {
     pub created_at: f64,
 }
 
+/// An exact-token receipt that a wrapper exited before a conversation UUID
+/// could be certified. This is recovery evidence only; it never implies that
+/// the provider identity is known or that the launch may be restarted.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingLaunchExit {
+    pub provider: Provider,
+    pub pending_created_at: f64,
+    pub code: i32,
+    pub observed_at: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PendingLaunchWrapperOwner {
+    provider: Provider,
+    pending_created_at: f64,
+    owner_token: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchPhase {
     Reserved,
@@ -1075,6 +1093,41 @@ impl Store {
         Ok(restored)
     }
 
+    /// Explicit selection changes membership and metadata, not observed work.
+    /// Keep adoption atomic with hooks: a discovery snapshot must never clear
+    /// unread output, ownership, or a newer lifecycle event on an existing row.
+    pub fn adopt_session(&self, candidate: &Session) -> Result<bool> {
+        self.reconcile_transaction(|ledger| {
+            let existing = ledger.get_session_by_thread(candidate.provider, &candidate.session_id)?;
+            if let Some(row) = &existing && row.session_id != candidate.session_id {
+                bail!("This conversation belongs to saved workstream {} ({}). Select that workstream instead; nothing was added.", row.display_name(), row.session_id);
+            }
+            let identity = candidate.session_id.as_str();
+            ledger.tx.execute(
+                "DELETE FROM untracked_sessions WHERE provider=? AND session_id=?",
+                params![candidate.provider.as_str(), identity],
+            )?;
+            ledger.tx.execute("DELETE FROM meta WHERE key=?", [provider_hidden_key(candidate.provider, identity)])?;
+            set_meta_tx(ledger.tx, &format!("tracking-choice:{}:{identity}", candidate.provider), "explicit-selection")?;
+            if existing.is_some() {
+                ledger.tx.execute(
+                    "UPDATE sessions SET name=COALESCE(?,name),cwd=COALESCE(?,cwd),branch=COALESCE(?,branch),transcript_path=COALESCE(?,transcript_path),model=COALESCE(?,model) WHERE provider=? AND session_id=?",
+                    params![candidate.name, candidate.cwd, candidate.branch, candidate.transcript_path, candidate.model, candidate.provider.as_str(), identity],
+                )?;
+                Ok(true)
+            } else {
+                ledger.upsert_session(candidate, false)
+            }
+        })
+    }
+
+    /// Admit a provider-verified personally named conversation without
+    /// changing an existing row's observed state. Callers must establish that
+    /// the name is personal rather than generated before invoking this.
+    pub fn watch_named_session(&self, candidate: &Session) -> Result<bool> {
+        self.reconcile_transaction(|ledger| ledger.watch_named_session(candidate))
+    }
+
     pub fn delete_session(
         &self,
         provider: Provider,
@@ -1346,6 +1399,13 @@ impl Store {
             "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![launch_phase_key(&pending.launch_token), LaunchPhase::Reserved.as_str()],
         )?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN (?,?)",
+            params![
+                pending_launch_exit_key(&pending.launch_token),
+                pending_launch_wrapper_owner_key(&pending.launch_token)
+            ],
+        )?;
         tx.commit()?;
         Ok(true)
     }
@@ -1361,6 +1421,31 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Presentation filtering only: hidden launches retain all recovery data.
+    pub fn list_visible_pending(&self) -> Result<Vec<PendingLaunch>> {
+        if !self.exists() {
+            return Ok(Vec::new());
+        }
+        let db = self.open_read()?;
+        let mut statement = db.prepare("SELECT * FROM pending_launches p WHERE NOT EXISTS (SELECT 1 FROM meta WHERE key='hidden_launch:' || p.launch_token) ORDER BY created_at")?;
+        Ok(statement
+            .query_map([], pending_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Hide only the launch selected in the confirmation, never its terminal or
+    /// a conversation that may have resolved while the confirmation was open.
+    pub fn hide_pending(&self, token: &str, provider: Provider, created_at: f64) -> Result<bool> {
+        self.reconcile_transaction(|ledger| {
+            let pending = ledger.get_pending(token)?;
+            if pending.is_none_or(|p| p.provider != provider || p.created_at != created_at) {
+                return Ok(false);
+            }
+            ledger.set_meta(&format!("hidden_launch:{token}"), "1")?;
+            Ok(true)
+        })
+    }
+
     pub fn delete_pending_if_created(&self, launch_token: &str, created_at: f64) -> Result<bool> {
         let mut db = self.open_write()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1372,6 +1457,13 @@ impl Store {
             tx.execute(
                 "DELETE FROM meta WHERE key=?",
                 [launch_phase_key(launch_token)],
+            )?;
+            tx.execute(
+                "DELETE FROM meta WHERE key IN (?,?)",
+                params![
+                    pending_launch_exit_key(launch_token),
+                    pending_launch_wrapper_owner_key(launch_token)
+                ],
             )?;
         }
         tx.commit()?;
@@ -1390,6 +1482,37 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Return an exit receipt only while it still belongs to the current exact
+    /// pending launch. Old meta rows cannot bleed into a later token reuse.
+    pub fn get_pending_exit(&self, launch_token: &str) -> Result<Option<PendingLaunchExit>> {
+        let Some(pending) = self.get_pending(launch_token)? else {
+            return Ok(None);
+        };
+        let Some(encoded) = self.get_meta(&pending_launch_exit_key(launch_token))? else {
+            return Ok(None);
+        };
+        let Ok(receipt) = serde_json::from_str::<PendingLaunchExit>(&encoded) else {
+            return Ok(None);
+        };
+        Ok((receipt.provider == pending.provider
+            && receipt.pending_created_at == pending.created_at
+            && receipt.observed_at.is_finite()
+            && receipt.observed_at >= pending.created_at)
+            .then_some(receipt))
+    }
+
+    /// Register the wrapper capability before launching provider code. A
+    /// repeated exact registration is harmless; rebinding is refused.
+    pub fn register_pending_wrapper_owner(
+        &self,
+        launch_token: &str,
+        owner_token: &str,
+    ) -> Result<bool> {
+        self.reconcile_transaction(|ledger| {
+            ledger.register_pending_wrapper_owner(launch_token, owner_token)
+        })
     }
 
     pub fn find_pending_for_pane(&self, pane: &str) -> Result<Option<PendingLaunch>> {
@@ -1542,6 +1665,13 @@ impl Store {
         )?;
         for token in stale_tokens {
             tx.execute("DELETE FROM meta WHERE key=?", [launch_phase_key(&token)])?;
+            tx.execute(
+                "DELETE FROM meta WHERE key IN (?,?)",
+                params![
+                    pending_launch_exit_key(&token),
+                    pending_launch_wrapper_owner_key(&token)
+                ],
+            )?;
         }
         tx.execute(
             "DELETE FROM launch_bindings WHERE created_at<?",
@@ -3199,6 +3329,14 @@ fn launch_phase_key(launch_token: &str) -> String {
     format!("launch_phase:{launch_token}")
 }
 
+fn pending_launch_exit_key(launch_token: &str) -> String {
+    format!("pending_launch_exit:{launch_token}")
+}
+
+fn pending_launch_wrapper_owner_key(launch_token: &str) -> String {
+    format!("pending_launch_wrapper_owner:{launch_token}")
+}
+
 fn provider_hidden_key(provider: Provider, session_id: &str) -> String {
     format!("provider-hidden:{}:{session_id}", provider.as_str())
 }
@@ -3207,9 +3345,69 @@ fn nonzero_or(value: f64, fallback: f64) -> f64 {
     if value == 0.0 { fallback } else { value }
 }
 
+fn pending_exit_binding_matches(
+    pending: &PendingLaunch,
+    provider: Provider,
+    reported_session_id: Option<&str>,
+    binding: &Option<(Provider, String)>,
+) -> bool {
+    if binding.as_ref().is_some_and(|(bound_provider, id)| {
+        *bound_provider != provider
+            || pending
+                .expected_session_id
+                .as_deref()
+                .is_some_and(|expected| expected != id.as_str())
+            || reported_session_id.is_some_and(|reported| reported != id.as_str())
+    }) {
+        return false;
+    }
+    binding.is_some() || (pending.expected_session_id.is_none() && reported_session_id.is_none())
+}
+
+fn pending_exit_owner_matches(
+    owner: &PendingLaunchWrapperOwner,
+    pending: &PendingLaunch,
+    provider: Provider,
+    owner_token: Option<&str>,
+) -> bool {
+    owner.provider == provider
+        && owner.pending_created_at == pending.created_at
+        && owner_token == Some(owner.owner_token.as_str())
+}
+
 impl ReconcileLedger<'_> {
     pub(crate) fn is_watched(&self, provider: Provider, session_id: &str) -> Result<bool> {
         is_watched_connection(self.tx, provider, session_id)
+    }
+
+    pub(crate) fn watch_named_session(&self, candidate: &Session) -> Result<bool> {
+        let provider = candidate.provider;
+        let identity = candidate.session_id.as_str();
+        if self.is_untracked(provider, identity)?
+            || self
+                .get_meta(&provider_hidden_key(provider, identity))?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        if self
+            .get_session_by_thread(provider, identity)?
+            .is_some_and(|row| row.session_id != identity)
+        {
+            return Ok(false);
+        }
+        let was_watched = self.is_watched(provider, identity)?;
+        if self.get_session(provider, identity)?.is_none() {
+            let mut observed = candidate.clone();
+            observed.source = "external".into();
+            observed.managed = false;
+            self.upsert_session(&observed, false)?;
+        }
+        let choice_key = format!("tracking-choice:{provider}:{identity}");
+        if self.get_meta(&choice_key)?.is_none() {
+            self.set_meta(&choice_key, "provider-explicit-name")?;
+        }
+        Ok(!was_watched)
     }
 
     pub(crate) fn hide_provider_session(
@@ -3334,7 +3532,175 @@ impl ReconcileLedger<'_> {
             "DELETE FROM meta WHERE key=?",
             [launch_phase_key(launch_token)],
         )?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN (?,?)",
+            params![
+                pending_launch_exit_key(launch_token),
+                pending_launch_wrapper_owner_key(launch_token)
+            ],
+        )?;
         Ok(deleted)
+    }
+
+    pub(crate) fn record_pending_launch_exit(
+        &self,
+        launch_token: &str,
+        provider: Provider,
+        reported_session_id: Option<&str>,
+        owner_token: Option<&str>,
+        code: i32,
+        observed_at: f64,
+    ) -> Result<bool> {
+        let Some(pending) = self.get_pending(launch_token)? else {
+            return Ok(false);
+        };
+        if !self.pending_exit_request_matches(
+            launch_token,
+            &pending,
+            provider,
+            reported_session_id,
+            observed_at,
+        )? {
+            return Ok(false);
+        }
+        let Some(wrapper_owner) = self.pending_exit_wrapper_owner(launch_token)? else {
+            return Ok(false);
+        };
+        if !pending_exit_owner_matches(&wrapper_owner, &pending, provider, owner_token) {
+            return Ok(false);
+        }
+        let binding = launch_binding_tx(self.tx, launch_token)?;
+        if !pending_exit_binding_matches(&pending, provider, reported_session_id, &binding) {
+            return Ok(false);
+        }
+        if !self.pending_exit_identity_is_available(provider, &pending, binding.as_ref())? {
+            return Ok(false);
+        }
+        if let Some(replayed) = self.pending_exit_replay_matches(
+            launch_token,
+            provider,
+            pending.created_at,
+            code,
+            observed_at,
+        )? {
+            return Ok(replayed);
+        }
+        let receipt = PendingLaunchExit {
+            provider,
+            pending_created_at: pending.created_at,
+            code,
+            observed_at,
+        };
+        self.set_meta(
+            &pending_launch_exit_key(launch_token),
+            &serde_json::to_string(&receipt)?,
+        )?;
+        Ok(true)
+    }
+
+    fn pending_exit_request_matches(
+        &self,
+        launch_token: &str,
+        pending: &PendingLaunch,
+        provider: Provider,
+        reported_session_id: Option<&str>,
+        observed_at: f64,
+    ) -> Result<bool> {
+        Ok(pending.provider == provider
+            && (reported_session_id.is_none()
+                || pending.expected_session_id.as_deref() == reported_session_id)
+            && observed_at.is_finite()
+            && observed_at >= pending.created_at
+            && matches!(
+                self.get_meta(&launch_phase_key(launch_token))?.as_deref(),
+                Some("provider_starting" | "provider_observed")
+            ))
+    }
+
+    fn pending_exit_wrapper_owner(
+        &self,
+        launch_token: &str,
+    ) -> Result<Option<PendingLaunchWrapperOwner>> {
+        let Some(encoded) = self.get_meta(&pending_launch_wrapper_owner_key(launch_token))? else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_str(&encoded).ok())
+    }
+
+    fn pending_exit_identity_is_available(
+        &self,
+        provider: Provider,
+        pending: &PendingLaunch,
+        binding: Option<&(Provider, String)>,
+    ) -> Result<bool> {
+        let session_id = binding
+            .map(|(_, session_id)| session_id.as_str())
+            .or(pending.expected_session_id.as_deref());
+        let Some(session_id) = session_id else {
+            return Ok(true);
+        };
+        Ok(!self.is_untracked(provider, session_id)?
+            && self.get_session(provider, session_id)?.is_none())
+    }
+
+    fn pending_exit_replay_matches(
+        &self,
+        launch_token: &str,
+        provider: Provider,
+        pending_created_at: f64,
+        code: i32,
+        observed_at: f64,
+    ) -> Result<Option<bool>> {
+        let Some(encoded) = self.get_meta(&pending_launch_exit_key(launch_token))? else {
+            return Ok(None);
+        };
+        let Ok(existing) = serde_json::from_str::<PendingLaunchExit>(&encoded) else {
+            return Ok(Some(false));
+        };
+        // The first valid receipt is immutable. A byte-for-byte logical
+        // replay succeeds; a different code or older callback is stale.
+        Ok(Some(
+            existing.provider == provider
+                && existing.pending_created_at == pending_created_at
+                && existing.code == code
+                && observed_at >= existing.observed_at,
+        ))
+    }
+
+    pub(crate) fn register_pending_wrapper_owner(
+        &self,
+        launch_token: &str,
+        owner_token: &str,
+    ) -> Result<bool> {
+        let Some(pending) = self.get_pending(launch_token)? else {
+            return Ok(false);
+        };
+        if owner_token.is_empty()
+            || owner_token.len() > 512
+            || owner_token.contains('\0')
+            || !matches!(
+                self.get_meta(&launch_phase_key(launch_token))?.as_deref(),
+                Some("reserved" | "pane_prepared")
+            )
+        {
+            return Ok(false);
+        }
+        let key = pending_launch_wrapper_owner_key(launch_token);
+        if let Some(existing) = self.get_meta(&key)? {
+            let Ok(existing) = serde_json::from_str::<PendingLaunchWrapperOwner>(&existing) else {
+                return Ok(false);
+            };
+            return Ok(existing.provider == pending.provider
+                && existing.pending_created_at == pending.created_at
+                && existing.owner_token == owner_token);
+        }
+        let wrapper_owner = PendingLaunchWrapperOwner {
+            provider: pending.provider,
+            pending_created_at: pending.created_at,
+            owner_token: owner_token.to_owned(),
+        };
+        self.set_meta(&key, &serde_json::to_string(&wrapper_owner)?)?;
+        Ok(true)
     }
 
     pub(crate) fn bind_launch(
@@ -3399,7 +3765,56 @@ impl ReconcileLedger<'_> {
             "DELETE FROM meta WHERE key=?",
             [launch_phase_key(launch_token)],
         )?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN (?,?)",
+            params![
+                pending_launch_exit_key(launch_token),
+                pending_launch_wrapper_owner_key(launch_token)
+            ],
+        )?;
         Ok(true)
+    }
+
+    /// Finish an interrupted startup only after reconciliation independently
+    /// proves its exact live pane. The temporary holder PID is not identity.
+    pub(crate) fn recover_confirmed_launch(
+        &self,
+        token: &str,
+        session: &Session,
+        pid: i64,
+        start_time: i64,
+    ) -> Result<bool> {
+        let Some(pending) = self.get_pending(token)? else {
+            return Ok(false);
+        };
+        if pending.provider != session.provider
+            || pending.expected_session_id.as_deref() != Some(session.session_id.as_str())
+            || pending.tmux_pane != session.tmux_pane
+            || pending.tmux_session != session.tmux_session
+            || self.is_untracked(session.provider, &session.session_id)?
+            || self.get_launch_binding(token)?
+                != Some((session.provider, session.session_id.clone()))
+        {
+            return Ok(false);
+        }
+        let phase = self.get_meta(&launch_phase_key(token))?;
+        if !matches!(
+            phase.as_deref(),
+            Some("provider_starting" | "provider_observed")
+        ) {
+            return Ok(false);
+        }
+        self.tx.execute(
+            "UPDATE pending_launches SET root_pid=?,root_pid_start=? WHERE launch_token=?",
+            params![pid, start_time, token],
+        )?;
+        self.certify_launch(
+            token,
+            session.provider,
+            &session.session_id,
+            pid,
+            start_time,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3690,6 +4105,20 @@ impl ReconcileLedger<'_> {
         Ok(self.tx.execute(
             "UPDATE sessions SET root_pid=NULL,updated_at=? WHERE provider=? AND session_id=?",
             params![observed_at, provider.as_str(), session_id],
+        )? == 1)
+    }
+
+    /// Remove a shared daemon mistakenly stored as an exclusive terminal owner.
+    /// Called inside the hook transaction; a different terminal owner wins.
+    pub(crate) fn clear_shared_root_pid(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        shared_pid: i64,
+    ) -> Result<bool> {
+        Ok(self.tx.execute(
+            "UPDATE sessions SET root_pid=NULL WHERE provider=? AND session_id=? AND root_pid=?",
+            params![provider.as_str(), session_id, shared_pid],
         )? == 1)
     }
 

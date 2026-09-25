@@ -2,7 +2,7 @@
 
 use std::{
     fs::{self, File},
-    io::Read,
+    io::{Read, Write},
     os::{fd::FromRawFd, unix::process::CommandExt},
     process::{Child, Command, Stdio},
     thread,
@@ -83,7 +83,7 @@ fn real_terminal_bridge_forwards_signals_and_restores_caller_tty() {
     fs::write(
         &child_script,
         format!(
-            "#!/bin/sh\ntrap 'printf winch\\n >> {signals}' WINCH\ntrap 'printf tstp\\n >> {signals}' TSTP\ntrap 'printf cont\\n >> {signals}' CONT\ntrap 'printf term\\n >> {signals}; exit 0' TERM\nprintf '\\033[?1000h\\033[?1006h'\nprintf '%s' \"$$\" > {pid}\nwhile :; do :; done\n",
+            "#!/bin/sh\ntrap 'printf interrupt\\n >> {signals}' INT\ntrap 'printf winch\\n >> {signals}' WINCH\ntrap 'printf tstp\\n >> {signals}' TSTP\ntrap 'printf cont\\n >> {signals}' CONT\ntrap 'printf term\\n >> {signals}; exit 0' TERM\nprintf '\\033[?1000h\\033[?1006h'\nprintf '%s' \"$$\" > {pid}\nwhile :; do :; done\n",
             signals = shell_words::quote(&signal_log.to_string_lossy()),
             pid = shell_words::quote(&child_pid_file.to_string_lossy()),
         ),
@@ -156,6 +156,37 @@ fn real_terminal_bridge_forwards_signals_and_restores_caller_tty() {
         || terminal_flags(slave_fd) & (libc::ICANON | libc::ECHO) == 0,
         "bridge never entered raw terminal mode",
     );
+
+    // Actual keyboard Ctrl+C must reach the child once, not terminate Pika's
+    // bridge. The fixture handles cancellation and stays alive like an agent
+    // cancelling a turn. This deliberately does not suppress provider-owned exit.
+    master.write_all(&[3]).unwrap();
+    wait_for(
+        Instant::now() + Duration::from_secs(3),
+        || {
+            fs::read_to_string(&signal_log)
+                .unwrap_or_default()
+                .matches("interrupt")
+                .count()
+                == 1
+        },
+        "keyboard Ctrl+C did not reach the child exactly once",
+    );
+    assert!(bridge.0.try_wait().unwrap().is_none());
+    // An externally delivered SIGINT follows the same ownership boundary.
+    assert_eq!(unsafe { libc::kill(bridge_pid, libc::SIGINT) }, 0);
+    wait_for(
+        Instant::now() + Duration::from_secs(3),
+        || {
+            fs::read_to_string(&signal_log)
+                .unwrap_or_default()
+                .matches("interrupt")
+                .count()
+                == 2
+        },
+        "SIGINT did not reach the child exactly once",
+    );
+    assert!(bridge.0.try_wait().unwrap().is_none());
 
     assert_eq!(unsafe { libc::kill(bridge_pid, libc::SIGWINCH) }, 0);
     wait_for(

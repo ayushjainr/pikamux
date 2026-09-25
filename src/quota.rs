@@ -186,9 +186,13 @@ fn read_remote(
     let node = store
         .get_fleet_node(node_id)?
         .ok_or_else(|| anyhow::anyhow!("Machine no longer paired"))?;
-    if node.status == "quarantined" || !node.capabilities.iter().any(|v| v == "quota-v1") {
-        bail!("Host does not advertise quota support");
+    if node.status == "quarantined" {
+        bail!("Host is quarantined");
     }
+    // Cached capabilities can lag an already-upgraded host indefinitely.
+    // This read-only request is versioned and identity-bound; let the host
+    // reject an unsupported operation instead of treating stale inventory as
+    // proof that the feature is absent.
     let value = transport.request_cancellable(
         &node.ssh_target,
         &json!({
@@ -520,13 +524,22 @@ mod tests {
         );
         transport.response["node_id"] = json!(uuid::Uuid::new_v4().to_string());
         assert!(read_remote(&store, &transport, &id, &cancel).is_err());
+        transport.response["node_id"] = json!(id);
+        node.package_version = Some("0.6.6".into());
         node.capabilities.retain(|v| v != "quota-v1");
+        store.upsert_fleet_node(&node).unwrap();
+        assert_eq!(
+            read_remote(&store, &transport, &id, &cancel).unwrap()[0].remaining_percent(),
+            63.0,
+            "stale capability cache must not suppress a newer host's reading"
+        );
+        node.status = "quarantined".into();
         store.upsert_fleet_node(&node).unwrap();
         assert!(read_remote(&store, &transport, &id, &cancel).is_err());
         assert_eq!(
             *transport.calls.lock().unwrap(),
-            2,
-            "Old hosts must not receive unsupported requests"
+            3,
+            "quarantined hosts must not receive requests"
         );
         assert!(store.list_sessions().unwrap().is_empty());
     }

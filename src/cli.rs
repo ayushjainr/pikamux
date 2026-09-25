@@ -730,7 +730,8 @@ fn bare(pika: &Pika) -> Result<i32> {
             inventory
                 .pending
                 .iter()
-                .map(crate::core::session_from_pending),
+                .map(|pending| pika.pending_session(pending))
+                .collect::<Result<Vec<_>>>()?,
         );
         return print_sessions(inventory.sessions, true);
     }
@@ -862,6 +863,7 @@ fn run_board(pika: &Pika) -> Result<i32> {
 
 fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
     match action {
+        BoardAction::Add => unreachable!("adding conversations is handled inside the board"),
         BoardAction::Open(item) => open_board_item(pika, item),
         BoardAction::Peek(item) => peek_board_item(pika, item),
         BoardAction::Untrack(item) => untrack_board_item(pika, item),
@@ -1017,8 +1019,59 @@ fn open_local_session_inner(pika: &Pika, session: Session) -> Result<i32> {
                 }
             }
         }
+        Err(error) if identity_unproven_error(&error) => {
+            // One bounded fresh reconciliation absorbs a pane/process startup
+            // race. It never retries provider execution; only proven exact
+            // handoffs can acknowledge the selected event.
+            match pika.recover_existing_session(session.clone(), true) {
+                Ok(receipt) => finish_local_open(pika, &receipt),
+                Err(retry) if identity_unproven_error(&retry) => {
+                    open_unverified_existing_terminal(pika, session, retry)
+                }
+                Err(retry) => Err(retry),
+            }
+        }
         Err(error) => Err(error),
     }
+}
+
+fn identity_unproven_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<OpenError>()
+        .is_some_and(|error| matches!(error, OpenError::IdentityUnproven))
+}
+
+fn open_unverified_existing_terminal(
+    pika: &Pika,
+    session: Session,
+    error: anyhow::Error,
+) -> Result<i32> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !crate::onboarding::supported()
+    {
+        return Err(error);
+    }
+    // Capture one unique tagged live pane and its current process generation
+    // before showing the choice. Tags select the terminal only; they do not
+    // certify that it contains this provider UUID.
+    let proof = match pika.unverified_pane_binding(&session) {
+        Ok(proof) => proof,
+        Err(_) => return Err(error),
+    };
+    let ui = crate::onboarding::Screen::new(true)?;
+    let choice = ui.choice(
+        "Existing terminal is unverified",
+        "Your agent is still running, but Pika could not confirm which conversation this terminal contains.\n\nOpen it without restarting anything? Unread will stay unchanged.",
+        &["Cancel (recommended)", "Open existing terminal (unverified)"],
+    )?;
+    drop(ui);
+    if choice != Some(1) {
+        eprintln!(
+            "pika: Cancelled. The existing terminal was not opened; unread state is unchanged."
+        );
+        return Ok(0);
+    }
+    let receipt = pika.open_unverified_terminal(session, proof)?;
+    finish_local_open(pika, &receipt)
 }
 
 fn maybe_open_client_window(
@@ -1060,11 +1113,12 @@ fn peek_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
 
 fn board_action_driver(pika: Pika) -> monitor::ActionDriver {
     let preview_pika = pika.clone();
+    let add = crate::board_catalog::host(pika.clone());
     monitor::ActionDriver::local(move |action| match action {
         BoardAction::Peek(item) => board_peek_report(&pika, &item),
         BoardAction::Untrack(item) => {
             if item.pending_token.is_some() {
-                bail!("This conversation is still starting; its exact identity is not yet known.");
+                return pending_untrack_report(&pika, &item);
             }
             if item.node_id.is_some() {
                 let remote = exact_remote(&pika, &item)?;
@@ -1096,6 +1150,25 @@ fn board_action_driver(pika: Pika) -> monitor::ActionDriver {
         }
         preview_pika.capture_exact(&item.session, 100)
     })
+    .with_add(add)
+}
+
+fn pending_untrack_report(pika: &Pika, item: &BoardItem) -> Result<String> {
+    let token = item
+        .pending_token
+        .as_deref()
+        .context("This is not a pending launch entry.")?;
+    if item.node_id.is_some() {
+        bail!("Remove this launch entry on its own machine.");
+    }
+    if pika
+        .store
+        .hide_pending(token, item.session.provider, item.session.created_at)?
+    {
+        Ok("Launch entry hidden. The agent, terminal, and any confirmed conversation are unchanged.".into())
+    } else {
+        Ok("This launch has already changed. Refresh the board to see its current state; nothing was removed.".into())
+    }
 }
 
 fn board_peek_report(pika: &Pika, item: &BoardItem) -> Result<String> {
@@ -1107,7 +1180,7 @@ fn board_peek_report(pika: &Pika, item: &BoardItem) -> Result<String> {
     );
     if item.pending_token.is_some() {
         return Ok(format!(
-            "PEEK · {identity}\nStill starting · press Esc, then Enter to see provider output.\nUnread preserved."
+            "PEEK · {identity}\nLaunch not yet confirmed · press Esc, then Enter to check its existing terminal.\nUnread preserved."
         ));
     }
     if item.node_id.is_some() {
@@ -1149,7 +1222,8 @@ fn board_peek_report(pika: &Pika, item: &BoardItem) -> Result<String> {
 
 fn untrack_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
     if item.pending_token.is_some() {
-        bail!("A starting conversation cannot be unwatched until its exact identity is known.")
+        println!("{}", pending_untrack_report(pika, &item)?);
+        return Ok(0);
     }
     if item.node_id.is_some() {
         let remote = exact_remote(pika, &item)?;
@@ -1254,7 +1328,8 @@ fn list(pika: &Pika, a: ListArgs) -> Result<i32> {
         inventory
             .pending
             .iter()
-            .map(crate::core::session_from_pending),
+            .map(|pending| pika.pending_session(pending))
+            .collect::<Result<Vec<_>>>()?,
     );
     if !a.no_usage {
         let _ = usage::hydrate_sessions(&pika.paths, &pika.store, &mut sessions);
@@ -1452,19 +1527,16 @@ fn resolve_expert_local(pika: &Pika, name: &str) -> Result<Vec<Session>> {
 /// Resolve one user-supplied name across both local daily names and explicit
 /// remote routes. A literal local `name@alias` never loses merely because the
 /// suffix is also an adopted machine alias.
-fn resolve_named_target(
+fn local_target_candidates(
     pika: &Pika,
     name: &str,
-    fresh_remote: bool,
     domain: LocalTargetDomain,
-    choose_collisions: bool,
-) -> Result<Option<NamedTarget>> {
-    let manager = FleetManager::new(&pika.store, SshTransport::default());
+) -> Result<(Vec<Session>, Option<anyhow::Error>)> {
     let local_result = match domain {
         LocalTargetDomain::Daily => pika.resolve_local(name),
         LocalTargetDomain::Expert => resolve_expert_local(pika, name),
     };
-    let (local, local_unavailable) = match local_result {
+    Ok(match local_result {
         Ok(local) => (local, None),
         Err(error)
             if error.downcast_ref::<NameResolutionError>()
@@ -1473,20 +1545,39 @@ fn resolve_named_target(
             (resolve_structural_local(pika, name, true)?, Some(error))
         }
         Err(error) => return Err(error),
-    };
+    })
+}
+
+fn resolve_named_target(
+    pika: &Pika,
+    name: &str,
+    fresh_remote: bool,
+    domain: LocalTargetDomain,
+    choose_collisions: bool,
+) -> Result<Option<NamedTarget>> {
+    let manager = FleetManager::new(&pika.store, SshTransport::default());
+    let (local, local_unavailable) = local_target_candidates(pika, name, domain)?;
+    let pending_local = matches!(domain, LocalTargetDomain::Daily)
+        && local.is_empty()
+        && !pika.resolve_pending(name)?.is_empty();
     // A literal local name containing `@` is proven without a network call.
     // Cached remote truth is still combined to expose known collisions; only
     // a name with no local identity may trigger a fresh SSH resolution.
     let remote_result = manager.resolve_candidates(
         name,
-        fresh_remote && local.is_empty(),
+        fresh_remote && local.is_empty() && !pending_local,
         domain.includes_remote_experts(),
     );
     let remote = match remote_result {
         Ok(remote) => remote,
-        Err(error) if error.kind == FleetErrorKind::NotFound && !local.is_empty() => None,
+        Err(error)
+            if error.kind == FleetErrorKind::NotFound && (!local.is_empty() || pending_local) =>
+        {
+            None
+        }
         Err(error) => return Err(error.into()),
     };
+    reject_pending_remote_collision(name, pending_local, remote.as_deref())?;
     if remote.as_ref().is_none_or(Vec::is_empty)
         && let Some(error) = local_unavailable
     {
@@ -1495,6 +1586,19 @@ fn resolve_named_target(
     let combined =
         combine_named_targets(name, local, remote.unwrap_or_default(), choose_collisions)?;
     Ok(combined)
+}
+
+fn reject_pending_remote_collision(
+    name: &str,
+    pending_local: bool,
+    remote: Option<&[fleet::FleetSession]>,
+) -> Result<()> {
+    if pending_local && remote.is_some_and(|matches| !matches.is_empty()) {
+        bail!(
+            "{name:?} names both a local pending launch and a remote conversation. Choose the intended row in `pika`; no new client was launched."
+        )
+    }
+    Ok(())
 }
 
 fn combine_named_targets(
@@ -1739,7 +1843,9 @@ fn open_name_inner(pika: &Pika, name: &str, allow_create: bool) -> Result<i32> {
 }
 
 fn finish_local_open(pika: &Pika, receipt: &crate::core::OpenReceipt) -> Result<i32> {
-    let _ = pika;
+    if receipt.kind == "UNVERIFIED TERMINAL" {
+        eprintln!("pika: Returned from the unverified terminal. Unread state is unchanged.");
+    }
     if receipt.receipt_delivery == Some(crate::tmux::ReceiptDelivery::Failed) {
         let _ = writeln!(
             io::stderr().lock(),
@@ -1751,9 +1857,38 @@ fn finish_local_open(pika: &Pika, receipt: &crate::core::OpenReceipt) -> Result<
             crate::core::OpenTarget::Session(session) => session.display_name(),
             crate::core::OpenTarget::Pending(pending) => pending.name.clone(),
         };
-        println!("{}", return_guidance(&name));
+        if let crate::core::OpenTarget::Pending(pending) = &receipt.target {
+            // Its first hook may have certified it while the terminal was
+            // attached. Do not keep describing that conversation as pending.
+            let exited = if pika.store.get_pending(&pending.launch_token)?.is_some() {
+                Some(
+                    pika.store
+                        .get_pending_exit(&pending.launch_token)?
+                        .is_some(),
+                )
+            } else {
+                None
+            };
+            println!("{}", pending_return_guidance(&name, exited));
+        } else {
+            println!("{}", return_guidance(&name));
+        }
     }
     Ok(receipt.exit_code)
+}
+
+fn pending_return_guidance(name: &str, exited: Option<bool>) -> String {
+    let state = match exited {
+        Some(true) => "The launcher exited before Pika confirmed a conversation",
+        Some(false) => "Conversation identity is still pending",
+        None => "Returned from the conversation terminal",
+    };
+    let action = if exited.is_some() {
+        "reopen its existing terminal"
+    } else {
+        "return with"
+    };
+    format!("{state} · {action}: pika {}", shell_words::quote(name))
 }
 
 fn return_guidance(name: &str) -> String {
@@ -3377,6 +3512,11 @@ fn hook(a: HookArgs) -> Result<i32> {
     };
     let parent = i64::from(unsafe { libc::getppid() });
     context.owner_pid = process::provider_ancestor(parent, a.provider, processes);
+    context.codex_shared_owner = a.provider == Provider::Codex
+        && context
+            .owner_pid
+            .and_then(|pid| processes.get(&pid))
+            .is_some_and(|record| process::shared_provider_process(record, Provider::Codex));
     if a.provider == Provider::Muse
         && !context
             .owner_pid
@@ -5339,13 +5479,12 @@ fn fleet_stdio(pika: &Pika, a: FleetInternalArgs) -> Result<i32> {
 fn fleet_open(pika: &Pika, a: FleetOpenArgs) -> Result<i32> {
     verify_local_node(pika, &a.expected_node_id)?;
     let session = exact_local_session(pika, a.provider, &a.session_id, true)?;
-    let receipt = crate::activity_feed::with(
+    crate::activity_feed::with(
         a.board_feed
             .map(crate::activity_feed::Context::Remote)
             .or_else(crate::activity_feed::current),
-        || with_open_activity(pika, || pika.open_session(session, true)),
-    )?;
-    finish_local_open(pika, &receipt)
+        || with_open_activity(pika, || open_local_session_inner(pika, session)),
+    )
 }
 fn client_fleet_open(pika: &Pika, a: ClientFleetOpenArgs) -> Result<i32> {
     verify_local_node(pika, &a.expected_node_id)?;
@@ -5753,6 +5892,194 @@ mod fleet_consultation_tests {
         assert_eq!(code, 0);
         assert_eq!(observed, 2);
         assert_eq!(opens, 1);
+    }
+
+    #[test]
+    fn pending_untrack_routes_share_generation_safe_hide_and_never_touch_the_home() {
+        let root = tempfile::tempdir().unwrap();
+        let (pika, marker) = pending_untrack_fixture(root.path());
+        let first = pending_untrack_item(root.path(), "action-route", 10.0, None);
+        seed_pending_untrack(&pika, &first);
+        let mut confirmed = first.session.clone();
+        confirmed.status = Status::NeedsYou;
+        confirmed.unread = true;
+        confirmed.attention_reason = Some("question".into());
+        confirmed.tmux_session = Some("pika-c-confirmed".into());
+        confirmed.tmux_pane = Some("%7".into());
+        confirmed.root_pid = Some(77);
+        pika.store.upsert_session(&confirmed, true).unwrap();
+
+        // The asynchronous ActionDriver route delegates to this same report
+        // helper; the compatibility/fallback route must produce the same
+        // state transition and user-facing success.
+        assert_eq!(
+            pending_untrack_report(&pika, &first).unwrap(),
+            "Launch entry hidden. The agent, terminal, and any confirmed conversation are unchanged."
+        );
+        assert_pending_hide_preserved(&pika, &first, &confirmed);
+
+        let second = pending_untrack_item(root.path(), "fallback-route", 20.0, None);
+        seed_pending_untrack(&pika, &second);
+        assert_eq!(untrack_board_item(&pika, second.clone()).unwrap(), 0);
+        assert_pending_hide_preserved(&pika, &second, &confirmed);
+
+        let changed = pending_untrack_item(root.path(), "changed-generation", 30.0, None);
+        seed_pending_untrack(&pika, &changed);
+        let mut stale_item = changed.clone();
+        stale_item.session.created_at += 1.0;
+        assert!(
+            pending_untrack_report(&pika, &stale_item)
+                .unwrap()
+                .contains("already changed")
+        );
+        assert_eq!(
+            pika.store.list_visible_pending().unwrap(),
+            vec![pending_from_board_item(&changed)]
+        );
+        assert_eq!(
+            pika.store
+                .get_pending(&changed.pending_token.clone().unwrap())
+                .unwrap(),
+            Some(pending_from_board_item(&changed))
+        );
+
+        let remote = pending_untrack_item(
+            root.path(),
+            "remote-pending",
+            40.0,
+            Some("remote-node".into()),
+        );
+        seed_pending_untrack(&pika, &remote);
+        assert!(
+            pending_untrack_report(&pika, &remote)
+                .unwrap_err()
+                .to_string()
+                .contains("own machine")
+        );
+        assert_eq!(pika.store.list_visible_pending().unwrap().len(), 2);
+        assert!(
+            !marker.exists(),
+            "untrack must not launch tmux or a provider"
+        );
+    }
+
+    fn pending_untrack_fixture(root: &std::path::Path) -> (Pika, std::path::PathBuf) {
+        let marker = root.join("must-not-run");
+        let command = root.join("forbidden-command");
+        fs::write(
+            &command,
+            format!("#!/bin/sh\nprintf invoked >> {}\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&command).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&command, permissions).unwrap();
+        let config_dir = root.join("config");
+        let state_dir = root.join("state");
+        let paths = Paths {
+            config: config_dir.join("config.json"),
+            database: state_dir.join("pika.db"),
+            config_dir,
+            state_dir,
+            codex_home: root.join("codex-home"),
+            claude_home: root.join("claude-home"),
+            opencode_data_home: root.join("opencode-data"),
+            opencode_config_home: root.join("opencode-config"),
+            muse_data_home: root.join("muse-data"),
+            muse_config_home: root.join("muse-config"),
+        };
+        let mut config = Config::default();
+        config.provider_executables.insert(
+            Provider::Codex.as_str().to_owned(),
+            command.to_string_lossy().into_owned(),
+        );
+        let store = Store::at(&paths.database);
+        let pika = Pika::with_components(
+            paths,
+            config,
+            store,
+            crate::tmux::Tmux::with_executable(
+                command.to_string_lossy().into_owned(),
+                Some("isolated".into()),
+            ),
+        );
+        (pika, marker)
+    }
+
+    fn pending_untrack_item(
+        root: &std::path::Path,
+        token: &str,
+        created_at: f64,
+        node_id: Option<String>,
+    ) -> BoardItem {
+        let mut session = fixture_session(root);
+        session.session_id = "confirmed-id".into();
+        session.name = Some(token.into());
+        session.status = Status::Starting;
+        session.created_at = created_at;
+        BoardItem {
+            session,
+            node_id,
+            node_name: None,
+            stale: false,
+            pending_token: Some(token.into()),
+            expert: None,
+        }
+    }
+
+    fn pending_from_board_item(item: &BoardItem) -> crate::store::PendingLaunch {
+        crate::store::PendingLaunch {
+            launch_token: item.pending_token.clone().unwrap(),
+            provider: item.session.provider,
+            name: item.session.display_name(),
+            cwd: item.session.cwd.clone().unwrap(),
+            tmux_session: None,
+            tmux_pane: None,
+            expected_session_id: Some(item.session.session_id.clone()),
+            root_pid: None,
+            root_pid_start: None,
+            preexisting_session_ids: None,
+            candidate_session_id: None,
+            candidate_observed_at: None,
+            created_at: item.session.created_at,
+        }
+    }
+
+    fn seed_pending_untrack(pika: &Pika, item: &BoardItem) {
+        let pending = pending_from_board_item(item);
+        assert!(pika.store.add_pending(&pending).unwrap());
+        assert!(
+            pika.store
+                .bind_launch(
+                    &pending.launch_token,
+                    pending.provider,
+                    pending.expected_session_id.as_deref().unwrap()
+                )
+                .unwrap()
+        );
+    }
+
+    fn assert_pending_hide_preserved(pika: &Pika, item: &BoardItem, confirmed: &Session) {
+        let token = item.pending_token.as_deref().unwrap();
+        assert!(pika.store.list_visible_pending().unwrap().is_empty());
+        assert_eq!(
+            pika.store.get_pending(token).unwrap(),
+            Some(pending_from_board_item(item))
+        );
+        let persisted = pika
+            .store
+            .get_session(confirmed.provider, &confirmed.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (persisted.status, persisted.unread),
+            (confirmed.status, true)
+        );
+        assert_eq!(persisted.tmux_pane, confirmed.tmux_pane);
+        assert_eq!(
+            pika.store.get_launch_binding(token).unwrap(),
+            Some((confirmed.provider, confirmed.session_id.clone()))
+        );
     }
 
     fn fixture_session(root: &std::path::Path) -> Session {
@@ -6304,6 +6631,17 @@ done
             return_guidance("strategy dashboard's review"),
             "Left strategy dashboard's review running in Pika tmux · return with: pika 'strategy dashboard'\\''s review'"
         );
+    }
+
+    #[test]
+    fn pending_return_guidance_never_claims_an_agent_is_running() {
+        for exited in [None, Some(false), Some(true)] {
+            let message = pending_return_guidance("client's update", exited);
+            assert!(!message.contains("running"));
+            assert!(message.contains(": pika 'client'\\''s update'"));
+            assert_eq!(message.contains("launcher exited"), exited == Some(true));
+            assert_eq!(message.contains("pending"), exited == Some(false));
+        }
     }
 
     #[test]

@@ -34,6 +34,9 @@ jobs:
             os: windows-2022
             executable: target/x86_64-pc-windows-msvc/release/pika.exe
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install pinned Rust toolchain
@@ -62,6 +65,61 @@ jobs:
           $help = (& '${{ matrix.executable }}' --help | Out-String)
           if ($help -notmatch 'Native Windows agent hosting is unsupported') { throw 'missing client-only support boundary' }
           if ($help -match '(?m)^  (list|new|ask|experts|doctor)\s') { throw 'Windows artifact exposed an agent-hosting command' }
+      - name: Validate Windows signing configuration
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          SIGNING_MODE: ${{ vars.PIKA_WINDOWS_SIGNING }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          SIGNPATH_CERTIFICATE_THUMBPRINT: ${{ vars.SIGNPATH_CERTIFICATE_THUMBPRINT }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          if ($env:SIGNING_MODE -eq '') {
+            Write-Warning 'Signing is not enrolled yet; this Windows artifact remains unsigned.'
+          } elseif ($env:SIGNING_MODE -ne 'signpath') {
+            throw 'Unknown Windows signing mode; refusing an unsigned fallback.'
+          } else {
+            foreach ($name in @('SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG', 'SIGNPATH_SIGNING_POLICY_SLUG', 'SIGNPATH_API_TOKEN')) {
+              if (-not [Environment]::GetEnvironmentVariable($name)) { throw "Missing $name" }
+            }
+            if ($env:SIGNPATH_CERTIFICATE_THUMBPRINT -notmatch '\A[0-9A-Fa-f]{40}\z') { throw 'Missing or invalid signing certificate thumbprint' }
+          }
+      - name: Upload Windows signing input
+        if: runner.os == 'Windows' && vars.PIKA_WINDOWS_SIGNING == 'signpath'
+        id: unsigned-windows
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-windows
+          path: ${{ matrix.executable }}
+          if-no-files-found: error
+          retention-days: 7
+      - name: Sign Windows executable
+        if: runner.os == 'Windows' && vars.PIKA_WINDOWS_SIGNING == 'signpath'
+        uses: SignPath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2.3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned-windows.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed-windows
+      - name: Verify and select signed Windows bytes
+        if: runner.os == 'Windows' && vars.PIKA_WINDOWS_SIGNING == 'signpath'
+        shell: pwsh
+        env:
+          EXPECTED_SIGNER: ${{ vars.SIGNPATH_CERTIFICATE_THUMBPRINT }}
+        run: |
+          $files = @(Get-ChildItem -LiteralPath signed-windows -Recurse -File)
+          if ($files.Count -ne 1 -or $files[0].FullName -ne [IO.Path]::GetFullPath((Join-Path $PWD 'signed-windows/pika.exe'))) { throw 'Unexpected signing output' }
+          $signed = $files[0].FullName
+          $signature = Get-AuthenticodeSignature -LiteralPath $signed
+          if ($signature.Status -ne 'Valid' -or -not $signature.TimeStamperCertificate -or $signature.SignerCertificate.Thumbprint -ine $env:EXPECTED_SIGNER) { throw 'Invalid signing identity, chain or timestamp' }
+          if ((& $signed --version) -cne ('pika ' + $env:GITHUB_REF_NAME.TrimStart('v'))) { throw 'Signed executable version mismatch' }
+          Copy-Item -LiteralPath $signed -Destination '${{ matrix.executable }}' -Force
+          if ((Get-FileHash $signed).Hash -cne (Get-FileHash '${{ matrix.executable }}').Hash) { throw 'Signed bytes changed' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binary-${{ matrix.target }}

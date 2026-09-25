@@ -281,14 +281,16 @@ fn board_items_from_inventory(
             }
         })
         .collect::<Vec<_>>();
-    items.extend(inventory.pending.into_iter().map(|pending| BoardItem {
-        session: crate::core::session_from_pending(&pending),
-        node_id: None,
-        node_name: None,
-        stale: false,
-        pending_token: Some(pending.launch_token),
-        expert: None,
-    }));
+    for pending in inventory.pending {
+        items.push(BoardItem {
+            session: pika.pending_session(&pending)?,
+            node_id: None,
+            node_name: None,
+            stale: false,
+            pending_token: Some(pending.launch_token),
+            expert: None,
+        });
+    }
     let mut fleet_health = Vec::new();
     append_cached_fleet(
         &mut items,
