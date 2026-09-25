@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.30 — Recover duplicate warnings and keep Claude usage visible
+
+- Clear an old `OPEN TWICE` warning once complete process evidence proves that
+  the extra conversation owner is gone. A real duplicate still blocks opening.
+- Keep Claude's last weekly quota reading visible as stale until its reset.
+  After reset, say that no current-week reading exists instead of implying
+  that usage is still loading. Expert upkeep still requires fresh quota data.
+- Harden test oracles and keep the full native validation suite green.
+
 ## 0.6.29 — Named conversations, safer recovery
 
 - Add provider-evidenced personal names to the board automatically. Claude
