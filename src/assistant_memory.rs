@@ -4,7 +4,7 @@
 //! operational store.  Callers supply already-authorized, bounded records.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -143,6 +143,155 @@ pub struct Store {
     profile_id: String,
 }
 
+fn create_memory_schema(connection: &Connection) -> Result<(), MemoryError> {
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\nCREATE TABLE IF NOT EXISTS memory_records (id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, kind TEXT NOT NULL, origin TEXT NOT NULL, project TEXT, provider TEXT, conversation TEXT, body TEXT NOT NULL, provenance TEXT NOT NULL, timestamp INTEGER NOT NULL, supersedes TEXT, dependencies TEXT NOT NULL, decision_state TEXT, protected_policy INTEGER NOT NULL);\nCREATE TABLE IF NOT EXISTS memory_receipts (request_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, record_id TEXT, timestamp INTEGER NOT NULL);\nCREATE INDEX IF NOT EXISTS memory_records_time ON memory_records(timestamp DESC);\nCREATE INDEX IF NOT EXISTS memory_records_profile ON memory_records(profile_id);\nCREATE INDEX IF NOT EXISTS memory_records_supersedes ON memory_records(profile_id,supersedes);")?;
+    Ok(())
+}
+
+fn migrate_memory_schema(tx: &Transaction<'_>) -> Result<String, MemoryError> {
+    let version: Option<String> = tx
+        .query_row(
+            "SELECT value FROM memory_meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    validate_schema_version(version.as_deref())?;
+    add_node_column_if_missing(tx)?;
+    update_schema_version(tx, version.as_deref())?;
+    load_or_create_profile(tx)
+}
+
+fn validate_schema_version(version: Option<&str>) -> Result<(), MemoryError> {
+    if version.is_some_and(|v| v != "1" && v != "2" && v != SCHEMA_VERSION.to_string().as_str()) {
+        return Err(MemoryError::Invalid(
+            "unsupported assistant memory schema".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn add_node_column_if_missing(tx: &Transaction<'_>) -> Result<(), MemoryError> {
+    let has_node: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('memory_records') WHERE name='node')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_node {
+        tx.execute("ALTER TABLE memory_records ADD COLUMN node TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn update_schema_version(tx: &Transaction<'_>, version: Option<&str>) -> Result<(), MemoryError> {
+    if version.is_some_and(|v| v == "1" || v == "2") {
+        tx.execute(
+            "UPDATE memory_meta SET value=? WHERE key='schema_version'",
+            [SCHEMA_VERSION.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_or_create_profile(tx: &Transaction<'_>) -> Result<String, MemoryError> {
+    let profile: Option<String> = tx
+        .query_row(
+            "SELECT value FROM memory_meta WHERE key='profile_id'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match profile {
+        Some(value) => {
+            Uuid::parse_str(&value)
+                .map_err(|_| MemoryError::Invalid("stored profile identity is invalid".into()))?;
+            Ok(value)
+        }
+        None => {
+            let value = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO memory_meta(key,value) VALUES ('schema_version',?), ('profile_id',?)",
+                params![SCHEMA_VERSION, value],
+            )?;
+            Ok(value)
+        }
+    }
+}
+
+fn ensure_memory_search_index(tx: &Transaction<'_>) -> Result<(), MemoryError> {
+    tx.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(body, content='memory_records', content_rowid='rowid', tokenize='unicode61');
+         CREATE TRIGGER IF NOT EXISTS memory_records_fts_ai AFTER INSERT ON memory_records BEGIN
+             INSERT INTO memory_fts(rowid, body) VALUES (new.rowid, new.body);
+         END;
+         CREATE TRIGGER IF NOT EXISTS memory_records_fts_ad AFTER DELETE ON memory_records BEGIN
+             INSERT INTO memory_fts(memory_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
+         END;
+         CREATE TRIGGER IF NOT EXISTS memory_records_fts_au AFTER UPDATE ON memory_records BEGIN
+             INSERT INTO memory_fts(memory_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
+             INSERT INTO memory_fts(rowid, body) VALUES (new.rowid, new.body);
+         END;",
+    )?;
+    backfill_search_index_if_needed(tx)
+}
+
+fn backfill_search_index_if_needed(tx: &Transaction<'_>) -> Result<(), MemoryError> {
+    let version: Option<String> = tx
+        .query_row(
+            "SELECT value FROM memory_meta WHERE key='memory_search_index_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if version.as_deref() == Some(MEMORY_SEARCH_INDEX_VERSION) {
+        return Ok(());
+    }
+    // Rebuild and marker share the migration transaction; failures retry on reopen.
+    tx.execute("INSERT INTO memory_fts(memory_fts) VALUES ('rebuild')", [])?;
+    tx.execute(
+        "INSERT INTO memory_meta(key,value) VALUES('memory_search_index_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [MEMORY_SEARCH_INDEX_VERSION],
+    )?;
+    Ok(())
+}
+
+fn validate_request_id(request_id: &str) -> Result<(), MemoryError> {
+    if request_id.is_empty() || request_id.len() > 256 {
+        return Err(MemoryError::Invalid("invalid request id".into()));
+    }
+    Ok(())
+}
+
+fn existing_idempotent_record(
+    tx: &Transaction<'_>,
+    request_id: &str,
+    hash: &str,
+    profile_id: &str,
+) -> Result<Option<Record>, MemoryError> {
+    let receipt = tx
+        .query_row(
+            "SELECT payload_hash,record_id FROM memory_receipts WHERE request_id=?",
+            [request_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((old_hash, old_record)) = receipt else {
+        return Ok(None);
+    };
+    if old_hash != hash {
+        return Err(MemoryError::Invalid(
+            "request id was reused with different content".into(),
+        ));
+    }
+    let id = old_record.ok_or_else(|| MemoryError::NotFound(request_id.into()))?;
+    let record = tx.query_row(
+        "SELECT id,profile_id,kind,origin,project,provider,conversation,body,provenance,timestamp,supersedes,dependencies,decision_state,protected_policy,node FROM memory_records WHERE id=? AND profile_id=?",
+        params![id, profile_id],
+        row_to_record,
+    ).optional()?.ok_or_else(|| MemoryError::NotFound(request_id.into()))?;
+    Ok(Some(record))
+}
+
 impl Store {
     /// Open (or create) a private assistant database at an explicit path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
@@ -151,93 +300,11 @@ impl Store {
         let mut connection = Connection::open(&path)?;
         connection.busy_timeout(std::time::Duration::from_millis(500))?;
         connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\nCREATE TABLE IF NOT EXISTS memory_records (id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, kind TEXT NOT NULL, origin TEXT NOT NULL, project TEXT, provider TEXT, conversation TEXT, body TEXT NOT NULL, provenance TEXT NOT NULL, timestamp INTEGER NOT NULL, supersedes TEXT, dependencies TEXT NOT NULL, decision_state TEXT, protected_policy INTEGER NOT NULL);\nCREATE TABLE IF NOT EXISTS memory_receipts (request_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, record_id TEXT, timestamp INTEGER NOT NULL);\nCREATE INDEX IF NOT EXISTS memory_records_time ON memory_records(timestamp DESC);\nCREATE INDEX IF NOT EXISTS memory_records_profile ON memory_records(profile_id);\nCREATE INDEX IF NOT EXISTS memory_records_supersedes ON memory_records(profile_id,supersedes);" )?;
+        create_memory_schema(&connection)?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let version = transaction
-            .query_row(
-                "SELECT value FROM memory_meta WHERE key='schema_version'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?;
-        if version
-            .as_ref()
-            .is_some_and(|v| v != "1" && v != "2" && v != &SCHEMA_VERSION.to_string())
-        {
-            return Err(MemoryError::Invalid(
-                "unsupported assistant memory schema".into(),
-            ));
-        }
-        let has_node: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('memory_records') WHERE name='node')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_node {
-            transaction.execute("ALTER TABLE memory_records ADD COLUMN node TEXT", [])?;
-        }
-        if version.as_deref().is_some_and(|v| v == "1" || v == "2") {
-            transaction.execute(
-                "UPDATE memory_meta SET value=? WHERE key='schema_version'",
-                [SCHEMA_VERSION.to_string()],
-            )?;
-        }
-        let profile = transaction
-            .query_row(
-                "SELECT value FROM memory_meta WHERE key='profile_id'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?;
-        let profile_id = match profile {
-            Some(value) => {
-                Uuid::parse_str(&value).map_err(|_| {
-                    MemoryError::Invalid("stored profile identity is invalid".into())
-                })?;
-                value
-            }
-            None => {
-                let value = Uuid::new_v4().to_string();
-                transaction.execute("INSERT INTO memory_meta(key,value) VALUES ('schema_version',?), ('profile_id',?)", params![SCHEMA_VERSION, value])?;
-                value
-            }
-        };
-
-        // The FTS table is external-content: memory_records remains the source
-        // of truth and these triggers keep the lexical index transactional with
-        // every insert/update/delete.  A version marker makes the bounded
-        // backfill one-time across reopen, while keeping migration atomic.
-        transaction.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(body, content='memory_records', content_rowid='rowid', tokenize='unicode61');
-             CREATE TRIGGER IF NOT EXISTS memory_records_fts_ai AFTER INSERT ON memory_records BEGIN
-                 INSERT INTO memory_fts(rowid, body) VALUES (new.rowid, new.body);
-             END;
-             CREATE TRIGGER IF NOT EXISTS memory_records_fts_ad AFTER DELETE ON memory_records BEGIN
-                 INSERT INTO memory_fts(memory_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
-             END;
-             CREATE TRIGGER IF NOT EXISTS memory_records_fts_au AFTER UPDATE ON memory_records BEGIN
-                 INSERT INTO memory_fts(memory_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
-                 INSERT INTO memory_fts(rowid, body) VALUES (new.rowid, new.body);
-             END;",
-        )?;
-        let index_version: Option<String> = transaction
-            .query_row(
-                "SELECT value FROM memory_meta WHERE key='memory_search_index_version'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if index_version.as_deref() != Some(MEMORY_SEARCH_INDEX_VERSION) {
-            // FTS5's rebuild command reads every current memory record.  It is
-            // inside the migration transaction, so a failed backfill leaves no
-            // marker and is safely retried on the next open.
-            transaction.execute("INSERT INTO memory_fts(memory_fts) VALUES ('rebuild')", [])?;
-            transaction.execute(
-                "INSERT INTO memory_meta(key,value) VALUES('memory_search_index_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                [MEMORY_SEARCH_INDEX_VERSION],
-            )?;
-        }
+        let profile_id = migrate_memory_schema(&transaction)?;
+        ensure_memory_search_index(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             path,
@@ -417,29 +484,14 @@ impl Store {
         request_id: &str,
         input: NewRecord,
     ) -> Result<Record, MemoryError> {
-        if request_id.is_empty() || request_id.len() > 256 {
-            return Err(MemoryError::Invalid("invalid request id".into()));
-        }
+        validate_request_id(request_id)?;
         Self::validate_input(&input)?;
         let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&input)?));
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if let Some((old_hash, old_record)) = tx
-            .query_row(
-                "SELECT payload_hash,record_id FROM memory_receipts WHERE request_id=?",
-                [request_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
-            )
-            .optional()?
+        if let Some(record) = existing_idempotent_record(&tx, request_id, &hash, &self.profile_id)?
         {
-            if old_hash != hash {
-                return Err(MemoryError::Invalid(
-                    "request id was reused with different content".into(),
-                ));
-            }
-            let id = old_record.ok_or_else(|| MemoryError::NotFound(request_id.into()))?;
-            let record = tx.query_row("SELECT id,profile_id,kind,origin,project,provider,conversation,body,provenance,timestamp,supersedes,dependencies,decision_state,protected_policy,node FROM memory_records WHERE id=? AND profile_id=?", params![id, self.profile_id], row_to_record).optional()?.ok_or_else(|| MemoryError::NotFound(request_id.into()))?;
             tx.commit()?;
             return Ok(record);
         }
@@ -458,13 +510,11 @@ fn append_in_tx(
     input: NewRecord,
 ) -> Result<Record, MemoryError> {
     Store::validate_input(&input)?;
-    let deps = serde_json::to_string(&input.dependencies)?;
-    let kind = serde_json::to_string(&input.kind)?;
-    let origin = serde_json::to_string(&input.origin)?;
-    let state = input
-        .decision_state
-        .map(|s| serde_json::to_string(&s))
-        .transpose()?;
+    validate_dependency_scopes(tx, &input)?;
+    insert_record(tx, profile_id, id, input)
+}
+
+fn validate_dependency_scopes(tx: &Transaction<'_>, input: &NewRecord) -> Result<(), MemoryError> {
     for dependency in &input.dependencies {
         let existing =
             load_scope(tx, dependency)?.ok_or_else(|| MemoryError::NotFound(dependency.clone()))?;
@@ -483,6 +533,22 @@ fn append_in_tx(
             ));
         }
     }
+    Ok(())
+}
+
+fn insert_record(
+    tx: &Transaction<'_>,
+    profile_id: &str,
+    id: String,
+    input: NewRecord,
+) -> Result<Record, MemoryError> {
+    let deps = serde_json::to_string(&input.dependencies)?;
+    let kind = serde_json::to_string(&input.kind)?;
+    let origin = serde_json::to_string(&input.origin)?;
+    let state = input
+        .decision_state
+        .map(|s| serde_json::to_string(&s))
+        .transpose()?;
     tx.execute("INSERT INTO memory_records (id,profile_id,kind,origin,project,provider,conversation,body,provenance,timestamp,supersedes,dependencies,decision_state,protected_policy,node) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![id, profile_id, kind, origin, input.scope.project, input.scope.provider, input.scope.conversation, input.body, input.provenance, input.timestamp, input.supersedes, deps, state, input.protected_policy as i64,input.scope.node])?;
     Ok(Record {
         id,
@@ -787,36 +853,16 @@ fn lexical_match_query(query: &str) -> String {
 }
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
-    let parse = |column: usize| -> rusqlite::Result<String> { row.get(column) };
-    let deps: String = row.get(11)?;
-    let kind: RecordKind = serde_json::from_str(&parse(2)?).map_err(|e| {
-        rusqlite::Error::InvalidColumnType(2, e.to_string(), rusqlite::types::Type::Text)
-    })?;
-    let origin: Origin = serde_json::from_str(&parse(3)?).map_err(|e| {
-        rusqlite::Error::InvalidColumnType(3, e.to_string(), rusqlite::types::Type::Text)
-    })?;
-    let dependencies: Vec<String> = serde_json::from_str(&deps).map_err(|e| {
-        rusqlite::Error::InvalidColumnType(11, e.to_string(), rusqlite::types::Type::Text)
-    })?;
-    let decision_state: Option<DecisionState> = row
-        .get::<_, Option<String>>(12)?
-        .map(|v| {
-            serde_json::from_str(&v).map_err(|e| {
-                rusqlite::Error::InvalidColumnType(12, e.to_string(), rusqlite::types::Type::Text)
-            })
-        })
-        .transpose()?;
+    let kind = decode_json_column(row, 2)?;
+    let origin = decode_json_column(row, 3)?;
+    let dependencies = decode_json_column(row, 11)?;
+    let decision_state = decode_optional_json_column(row, 12)?;
     Ok(Record {
         id: row.get(0)?,
         profile_id: row.get(1)?,
         kind,
         origin,
-        scope: Scope {
-            node: row.get(14)?,
-            project: row.get(4)?,
-            provider: row.get(5)?,
-            conversation: row.get(6)?,
-        },
+        scope: row_to_scope(row)?,
         body: row.get(7)?,
         provenance: row.get(8)?,
         timestamp: row.get(9)?,
@@ -825,6 +871,42 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
         decision_state,
         protected_policy: row.get::<_, i64>(13)? != 0,
     })
+}
+
+fn row_to_scope(row: &rusqlite::Row<'_>) -> rusqlite::Result<Scope> {
+    Ok(Scope {
+        node: row.get(14)?,
+        project: row.get(4)?,
+        provider: row.get(5)?,
+        conversation: row.get(6)?,
+    })
+}
+
+fn decode_json_column<T: DeserializeOwned>(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<T> {
+    let value: String = row.get(column)?;
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::InvalidColumnType(column, error.to_string(), rusqlite::types::Type::Text)
+    })
+}
+
+fn decode_optional_json_column<T: DeserializeOwned>(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<T>> {
+    row.get::<_, Option<String>>(column)?
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::InvalidColumnType(
+                    column,
+                    error.to_string(),
+                    rusqlite::types::Type::Text,
+                )
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]

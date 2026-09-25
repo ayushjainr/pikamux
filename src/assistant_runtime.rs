@@ -85,6 +85,121 @@ pub struct AssistantRuntime<T: RpcTransport> {
     memory_epoch: u64,
 }
 
+fn open_journal(path: &Path) -> Result<Connection, RuntimeError> {
+    if path.exists() && std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(RuntimeError::Denied(
+            "assistant journal may not be a symlink".into(),
+        ));
+    }
+    crate::assistant_storage::database(path)?;
+    let journal = Connection::open(path)?;
+    journal.busy_timeout(std::time::Duration::from_secs(5))?;
+    journal.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS assistant_runtime_profile (id INTEGER PRIMARY KEY CHECK(id=1), profile_id TEXT NOT NULL, thread_id TEXT, updated_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS assistant_runtime_scope (id INTEGER PRIMARY KEY CHECK(id=1), scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS assistant_runtime_epoch (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS assistant_runtime_turns (request_id TEXT PRIMARY KEY, reservation_id TEXT NOT NULL, thread_id TEXT, turn_id TEXT, prompt TEXT NOT NULL, state TEXT NOT NULL, reply TEXT, dependencies TEXT NOT NULL, updated_at INTEGER NOT NULL);")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    journal.execute_batch("CREATE TABLE IF NOT EXISTS assistant_runtime_guard(id INTEGER PRIMARY KEY CHECK(id=1),blocked INTEGER NOT NULL); INSERT OR IGNORE INTO assistant_runtime_guard VALUES(1,0);")?;
+    Ok(journal)
+}
+
+fn bind_profile_and_scope<T: RpcTransport>(
+    journal: &Connection,
+    provider: &MainAssistant<T>,
+    memory: &MemoryStore,
+    scope: &Scope,
+) -> Result<(), RuntimeError> {
+    let profile_id = memory.profile_id();
+    if provider.profile().profile_id != profile_id {
+        return Err(RuntimeError::Denied(
+            "provider and memory profile identities differ".into(),
+        ));
+    }
+    journal.execute(
+        "INSERT OR IGNORE INTO assistant_runtime_profile(id,profile_id,updated_at) VALUES(1,?,0)",
+        [profile_id],
+    )?;
+    let stored: String = journal.query_row(
+        "SELECT profile_id FROM assistant_runtime_profile WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if stored != profile_id {
+        return Err(RuntimeError::Denied(
+            "memory and runtime profiles do not match".into(),
+        ));
+    }
+    bind_scope(journal, scope)
+}
+
+fn bind_scope(journal: &Connection, scope: &Scope) -> Result<(), RuntimeError> {
+    let scope_json =
+        serde_json::to_string(scope).map_err(|e| RuntimeError::Denied(e.to_string()))?;
+    journal.execute(
+        "INSERT OR IGNORE INTO assistant_runtime_scope(id,scope) VALUES(1,?)",
+        [&scope_json],
+    )?;
+    let stored_scope: String = journal.query_row(
+        "SELECT scope FROM assistant_runtime_scope WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if stored_scope != scope_json {
+        return Err(RuntimeError::Denied(
+            "runtime scope differs from its persisted provider context".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn restore_state(journal: &Connection, memory_epoch: u64) -> Result<RuntimeState, RuntimeError> {
+    journal.execute(
+        "INSERT OR IGNORE INTO assistant_runtime_epoch(id,epoch) VALUES(1,?)",
+        [memory_epoch as i64],
+    )?;
+    let stored_epoch: u64 = journal
+        .query_row(
+            "SELECT epoch FROM assistant_runtime_epoch WHERE id=1",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|v| v as u64)?;
+    let unresolved: Option<(String, Option<String>)> = journal.query_row(
+        "SELECT reservation_id,turn_id FROM assistant_runtime_turns WHERE state IN ('reserved','dispatch_intent','in_flight','unknown') ORDER BY updated_at DESC LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    let blocked: bool = journal.query_row(
+        "SELECT blocked FROM assistant_runtime_guard WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if stored_epoch != memory_epoch || blocked {
+        journal.execute("UPDATE assistant_runtime_turns SET prompt='',reply='',dependencies='[]',state='unknown',updated_at=updated_at", [])?;
+        journal.execute(
+            "UPDATE assistant_runtime_guard SET blocked=1 WHERE id=1",
+            [],
+        )?;
+        journal.execute(
+            "UPDATE assistant_runtime_epoch SET epoch=? WHERE id=1",
+            [memory_epoch as i64],
+        )?;
+        return Ok(RuntimeState::UnknownDelivery {
+            reservation_id: "forget-epoch".into(),
+            turn_id: None,
+        });
+    }
+    Ok(
+        unresolved.map_or(RuntimeState::Ready, |(reservation_id, turn_id)| {
+            RuntimeState::UnknownDelivery {
+                reservation_id,
+                turn_id,
+            }
+        }),
+    )
+}
+
 impl<T: RpcTransport> AssistantRuntime<T> {
     pub fn open(
         provider: MainAssistant<T>,
@@ -94,102 +209,10 @@ impl<T: RpcTransport> AssistantRuntime<T> {
         scope: Scope,
     ) -> Result<Self, RuntimeError> {
         let journal_path = journal_path.as_ref().to_path_buf();
-        if journal_path.exists()
-            && std::fs::symlink_metadata(&journal_path)?
-                .file_type()
-                .is_symlink()
-        {
-            return Err(RuntimeError::Denied(
-                "assistant journal may not be a symlink".into(),
-            ));
-        }
-        crate::assistant_storage::database(&journal_path)?;
-        let journal = Connection::open(&journal_path)?;
-        journal.busy_timeout(std::time::Duration::from_secs(5))?;
-        journal.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS assistant_runtime_profile (id INTEGER PRIMARY KEY CHECK(id=1), profile_id TEXT NOT NULL, thread_id TEXT, updated_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS assistant_runtime_scope (id INTEGER PRIMARY KEY CHECK(id=1), scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS assistant_runtime_epoch (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS assistant_runtime_turns (request_id TEXT PRIMARY KEY, reservation_id TEXT NOT NULL, thread_id TEXT, turn_id TEXT, prompt TEXT NOT NULL, state TEXT NOT NULL, reply TEXT, dependencies TEXT NOT NULL, updated_at INTEGER NOT NULL);")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        let profile_id = memory.profile_id().to_owned();
-        journal.execute_batch("CREATE TABLE IF NOT EXISTS assistant_runtime_guard(id INTEGER PRIMARY KEY CHECK(id=1),blocked INTEGER NOT NULL); INSERT OR IGNORE INTO assistant_runtime_guard VALUES(1,0);")?;
-        if provider.profile().profile_id != profile_id {
-            return Err(RuntimeError::Denied(
-                "provider and memory profile identities differ".into(),
-            ));
-        }
-        journal.execute("INSERT OR IGNORE INTO assistant_runtime_profile(id,profile_id,updated_at) VALUES(1,?,0)", [&profile_id])?;
-        let stored: String = journal.query_row(
-            "SELECT profile_id FROM assistant_runtime_profile WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?;
-        if stored != profile_id {
-            return Err(RuntimeError::Denied(
-                "memory and runtime profiles do not match".into(),
-            ));
-        }
-        let scope_json =
-            serde_json::to_string(&scope).map_err(|e| RuntimeError::Denied(e.to_string()))?;
-        journal.execute(
-            "INSERT OR IGNORE INTO assistant_runtime_scope(id,scope) VALUES(1,?)",
-            [&scope_json],
-        )?;
-        let stored_scope: String = journal.query_row(
-            "SELECT scope FROM assistant_runtime_scope WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?;
-        if stored_scope != scope_json {
-            return Err(RuntimeError::Denied(
-                "runtime scope differs from its persisted provider context".into(),
-            ));
-        }
+        let journal = open_journal(&journal_path)?;
+        bind_profile_and_scope(&journal, &provider, &memory, &scope)?;
         let memory_epoch = memory.forget_epoch()?;
-        journal.execute(
-            "INSERT OR IGNORE INTO assistant_runtime_epoch(id,epoch) VALUES(1,?)",
-            [memory_epoch as i64],
-        )?;
-        let stored_epoch: u64 = journal
-            .query_row(
-                "SELECT epoch FROM assistant_runtime_epoch WHERE id=1",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|v| v as u64)?;
-        let unresolved: Option<(String, Option<String>)> = journal.query_row(
-            "SELECT reservation_id,turn_id FROM assistant_runtime_turns WHERE state IN ('reserved','dispatch_intent','in_flight','unknown') ORDER BY updated_at DESC LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).optional()?;
-        let blocked: bool = journal.query_row(
-            "SELECT blocked FROM assistant_runtime_guard WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?;
-        let state = if stored_epoch != memory_epoch || blocked {
-            journal.execute("UPDATE assistant_runtime_turns SET prompt='',reply='',dependencies='[]',state='unknown',updated_at=updated_at", [])?;
-            journal.execute(
-                "UPDATE assistant_runtime_guard SET blocked=1 WHERE id=1",
-                [],
-            )?;
-            journal.execute(
-                "UPDATE assistant_runtime_epoch SET epoch=? WHERE id=1",
-                [memory_epoch as i64],
-            )?;
-            RuntimeState::UnknownDelivery {
-                reservation_id: "forget-epoch".into(),
-                turn_id: None,
-            }
-        } else {
-            unresolved.map_or(RuntimeState::Ready, |(reservation_id, turn_id)| {
-                RuntimeState::UnknownDelivery {
-                    reservation_id,
-                    turn_id,
-                }
-            })
-        };
+        let state = restore_state(&journal, memory_epoch)?;
         Ok(Self {
             provider,
             memory,
@@ -303,6 +326,49 @@ impl<T: RpcTransport> AssistantRuntime<T> {
         dependencies: &[String],
         now: i64,
     ) -> Result<ActiveTurn, RuntimeError> {
+        self.validate_new_turn(request_id, prompt, dependencies)?;
+        let reservation_id = format!("assistant:{request_id}");
+        let deadline = now.saturating_add(self.policy.config()?.default_deadline_seconds as i64);
+        let thread_id = self.provider.profile().thread_id.clone().ok_or_else(|| {
+            RuntimeError::Denied("start_or_resume is required before a turn".into())
+        })?;
+        let (prepared, actual_dependencies) = self.prepare_turn_prompt(prompt, dependencies)?;
+        self.record_turn(
+            request_id,
+            &reservation_id,
+            &thread_id,
+            None,
+            &prepared,
+            "reserved",
+            "",
+            &actual_dependencies,
+            now,
+        )?;
+        if let Err(error) = self
+            .policy
+            .reserve_root(&reservation_id, 1, false, now, Some(deadline))
+        {
+            self.record_turn_state(request_id, "denied", now)?;
+            return Err(error.into());
+        }
+        let turn_id = self.dispatch_reserved_turn(request_id, &reservation_id, &prepared, now)?;
+        self.journal.execute("UPDATE assistant_runtime_turns SET turn_id=?,state='in_flight',updated_at=? WHERE request_id=?", params![&turn_id, now, request_id])?;
+        let active = ActiveTurn {
+            request_id: request_id.into(),
+            reservation_id,
+            thread_id,
+            turn_id,
+        };
+        self.state = RuntimeState::InFlight(active.clone());
+        Ok(active)
+    }
+
+    fn validate_new_turn(
+        &mut self,
+        request_id: &str,
+        prompt: &str,
+        dependencies: &[String],
+    ) -> Result<(), RuntimeError> {
         if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
             return Err(RuntimeError::Denied(
                 "prompt is empty or exceeds the bounded input size".into(),
@@ -349,26 +415,17 @@ impl<T: RpcTransport> AssistantRuntime<T> {
         {
             return Err(RuntimeError::Denied("request id was already used".into()));
         }
-        let reservation_id = format!("assistant:{request_id}");
-        let deadline = now.saturating_add(self.policy.config()?.default_deadline_seconds as i64);
-        let thread_id = self.provider.profile().thread_id.clone().ok_or_else(|| {
-            RuntimeError::Denied("start_or_resume is required before a turn".into())
-        })?;
+        Ok(())
+    }
+
+    fn prepare_turn_prompt(
+        &self,
+        prompt: &str,
+        dependencies: &[String],
+    ) -> Result<(String, Vec<String>), RuntimeError> {
         let mut prepared = String::from(BEHAVIORAL_SEED);
         prepared.push_str(MEMORY_INTRO);
-        let mut records = Vec::new();
-        for id in dependencies {
-            let record = self
-                .memory
-                .get(id)?
-                .ok_or_else(|| RuntimeError::Denied("missing explicit dependency".into()))?;
-            if !record.scope.permits(&self.scope) || record.kind == RecordKind::Draft {
-                return Err(RuntimeError::Denied(
-                    "explicit dependency is outside scope or an unsent draft".into(),
-                ));
-            }
-            records.push(record);
-        }
+        let mut records = self.required_records(dependencies)?;
         let recalled = recall_for_turn(&self.memory, &self.scope, prompt, &records)?;
         records.extend(recalled);
         let mut actual_dependencies = Vec::new();
@@ -421,28 +478,37 @@ impl<T: RpcTransport> AssistantRuntime<T> {
                 "scoped prepared prompt exceeds the bounded input size".into(),
             ));
         }
-        self.record_turn(
-            request_id,
-            &reservation_id,
-            &thread_id,
-            None,
-            &prepared,
-            "reserved",
-            "",
-            &actual_dependencies,
-            now,
-        )?;
-        if let Err(error) = self
-            .policy
-            .reserve_root(&reservation_id, 1, false, now, Some(deadline))
-        {
-            self.record_turn_state(request_id, "denied", now)?;
-            return Err(error.into());
+        Ok((prepared, actual_dependencies))
+    }
+
+    fn required_records(&self, dependencies: &[String]) -> Result<Vec<Record>, RuntimeError> {
+        let mut records = Vec::new();
+        for id in dependencies {
+            let record = self
+                .memory
+                .get(id)?
+                .ok_or_else(|| RuntimeError::Denied("missing explicit dependency".into()))?;
+            if !record.scope.permits(&self.scope) || record.kind == RecordKind::Draft {
+                return Err(RuntimeError::Denied(
+                    "explicit dependency is outside scope or an unsent draft".into(),
+                ));
+            }
+            records.push(record);
         }
+        Ok(records)
+    }
+
+    fn dispatch_reserved_turn(
+        &mut self,
+        request_id: &str,
+        reservation_id: &str,
+        prepared: &str,
+        now: i64,
+    ) -> Result<String, RuntimeError> {
         // Any later failure is uncertain delivery, including journal I/O after
         // the provider accepts a turn. Never leave an in-memory Ready state.
         self.state = RuntimeState::UnknownDelivery {
-            reservation_id: reservation_id.clone(),
+            reservation_id: reservation_id.to_owned(),
             turn_id: None,
         };
         let mut dispatched = false;
@@ -452,24 +518,24 @@ impl<T: RpcTransport> AssistantRuntime<T> {
         // never model generation or polling. An epoch recheck without this
         // writer fence would still allow disclosure after a concurrent forget.
         let dispatch = self.memory.dispatch_at_epoch(self.memory_epoch, || {
-            policy.mark_dispatched(&reservation_id, now)?;
+            policy.mark_dispatched(reservation_id, now)?;
             dispatched = true;
-            provider.begin_turn(&prepared).map_err(RuntimeError::from)
+            provider.begin_turn(prepared).map_err(RuntimeError::from)
         });
         let turn_id = match dispatch {
             Ok(Ok(id)) => id,
             Ok(Err(error)) if dispatched => {
                 self.policy
-                    .record_outcome(&reservation_id, DeliveryOutcome::Unknown, now)?;
+                    .record_outcome(reservation_id, DeliveryOutcome::Unknown, now)?;
                 self.record_turn_state(request_id, "unknown", now)?;
                 self.state = RuntimeState::UnknownDelivery {
-                    reservation_id,
+                    reservation_id: reservation_id.to_owned(),
                     turn_id: None,
                 };
                 return Err(error);
             }
             Ok(Err(error)) => {
-                let _ = self.policy.release_before_dispatch(&reservation_id, now);
+                let _ = self.policy.release_before_dispatch(reservation_id, now);
                 self.record_turn_state(request_id, "denied", now)?;
                 self.state = RuntimeState::Ready;
                 return Err(error);
@@ -477,21 +543,13 @@ impl<T: RpcTransport> AssistantRuntime<T> {
             Err(error) => {
                 // No provider call occurred: refund the reservation, but fence
                 // the old provider context until explicit recovery.
-                let _ = self.policy.release_before_dispatch(&reservation_id, now);
+                let _ = self.policy.release_before_dispatch(reservation_id, now);
                 self.scrub_context()?;
                 self.record_turn_state(request_id, "denied", now)?;
                 return Err(error.into());
             }
         };
-        self.journal.execute("UPDATE assistant_runtime_turns SET turn_id=?,state='in_flight',updated_at=? WHERE request_id=?", params![&turn_id, now, request_id])?;
-        let active = ActiveTurn {
-            request_id: request_id.into(),
-            reservation_id,
-            thread_id,
-            turn_id,
-        };
-        self.state = RuntimeState::InFlight(active.clone());
-        Ok(active)
+        Ok(turn_id)
     }
     /// Poll one provider batch. A `None` result means the turn remains active.
     pub fn poll_turn(&mut self, now: i64) -> Result<Option<TurnResult>, RuntimeError> {
@@ -499,6 +557,19 @@ impl<T: RpcTransport> AssistantRuntime<T> {
             RuntimeState::InFlight(active) => active.clone(),
             _ => return Err(RuntimeError::Denied("no turn is in flight".into())),
         };
+        self.check_turn_deadline(&active, now)?;
+        self.check_forget_before_poll(&active, now)?;
+        let result = self.poll_provider_batch(&active, now)?;
+        self.check_forget_after_poll(&active, now)?;
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        self.settle_turn_result(&active, &result, now)?;
+        self.state = RuntimeState::Ready;
+        Ok(Some(result))
+    }
+
+    fn check_turn_deadline(&mut self, active: &ActiveTurn, now: i64) -> Result<(), RuntimeError> {
         if let Some(reservation) = self.policy.reservation(&active.reservation_id)? {
             if now >= reservation.deadline_at {
                 let _ = self.provider.cancel();
@@ -510,14 +581,22 @@ impl<T: RpcTransport> AssistantRuntime<T> {
                 self.scrub_turn(&active.request_id)?;
                 self.record_turn_state(&active.request_id, "unknown", now)?;
                 self.state = RuntimeState::UnknownDelivery {
-                    reservation_id: active.reservation_id,
-                    turn_id: Some(active.turn_id),
+                    reservation_id: active.reservation_id.clone(),
+                    turn_id: Some(active.turn_id.clone()),
                 };
                 return Err(RuntimeError::Denied(
                     "turn deadline expired; delivery is unknown".into(),
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn check_forget_before_poll(
+        &mut self,
+        active: &ActiveTurn,
+        now: i64,
+    ) -> Result<(), RuntimeError> {
         if self.memory.forget_epoch()? != self.memory_epoch {
             let _ = self.provider.cancel();
             self.scrub_context()?;
@@ -533,6 +612,14 @@ impl<T: RpcTransport> AssistantRuntime<T> {
                 "memory was forgotten during the turn".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn poll_provider_batch(
+        &mut self,
+        active: &ActiveTurn,
+        now: i64,
+    ) -> Result<Option<TurnResult>, RuntimeError> {
         let result = match self.provider.poll_turn() {
             Ok(result) => result,
             Err(error) => {
@@ -543,12 +630,20 @@ impl<T: RpcTransport> AssistantRuntime<T> {
                 )?;
                 self.record_turn_state(&active.request_id, "unknown", now)?;
                 self.state = RuntimeState::UnknownDelivery {
-                    reservation_id: active.reservation_id,
-                    turn_id: Some(active.turn_id),
+                    reservation_id: active.reservation_id.clone(),
+                    turn_id: Some(active.turn_id.clone()),
                 };
                 return Err(error.into());
             }
         };
+        Ok(result)
+    }
+
+    fn check_forget_after_poll(
+        &mut self,
+        active: &ActiveTurn,
+        now: i64,
+    ) -> Result<(), RuntimeError> {
         // Memory may be forgotten while the provider was polling. Re-check the
         // epoch before accepting or publishing any provider result.
         if self.memory.forget_epoch()? != self.memory_epoch {
@@ -558,17 +653,23 @@ impl<T: RpcTransport> AssistantRuntime<T> {
                 .record_outcome(&active.reservation_id, DeliveryOutcome::Unknown, now)?;
             self.record_turn_state(&active.request_id, "unknown", now)?;
             self.state = RuntimeState::UnknownDelivery {
-                reservation_id: active.reservation_id,
-                turn_id: Some(active.turn_id),
+                reservation_id: active.reservation_id.clone(),
+                turn_id: Some(active.turn_id.clone()),
             };
             return Err(RuntimeError::Denied(
                 "memory was forgotten while polling; provider result was fenced".into(),
             ));
         }
-        let Some(result) = result else {
-            return Ok(None);
-        };
-        let (reply, state) = match &result {
+        Ok(())
+    }
+
+    fn settle_turn_result(
+        &mut self,
+        active: &ActiveTurn,
+        result: &TurnResult,
+        now: i64,
+    ) -> Result<(), RuntimeError> {
+        let (reply, state) = match result {
             TurnResult::Complete { text, .. } => (text.as_str(), "completed"),
             TurnResult::Failed { text, .. } => (text.as_str(), "failed"),
         };
@@ -589,8 +690,8 @@ impl<T: RpcTransport> AssistantRuntime<T> {
                 )?;
                 self.record_turn_state(&active.request_id, "unknown", now)?;
                 self.state = RuntimeState::UnknownDelivery {
-                    reservation_id: active.reservation_id,
-                    turn_id: Some(active.turn_id),
+                    reservation_id: active.reservation_id.clone(),
+                    turn_id: Some(active.turn_id.clone()),
                 };
                 return Err(RuntimeError::Denied(
                     "completed finding could not be durably scoped".into(),
@@ -618,8 +719,8 @@ impl<T: RpcTransport> AssistantRuntime<T> {
                 )?;
                 self.record_turn_state(&active.request_id, "unknown", now)?;
                 self.state = RuntimeState::UnknownDelivery {
-                    reservation_id: active.reservation_id,
-                    turn_id: Some(active.turn_id),
+                    reservation_id: active.reservation_id.clone(),
+                    turn_id: Some(active.turn_id.clone()),
                 };
                 return Err(error.into());
             }
@@ -631,8 +732,7 @@ impl<T: RpcTransport> AssistantRuntime<T> {
                 .record_outcome(&active.reservation_id, DeliveryOutcome::Failed, now)?;
             self.record_turn_state_reply(&active.request_id, state, reply, now)?;
         }
-        self.state = RuntimeState::Ready;
-        Ok(Some(result))
+        Ok(())
     }
     pub fn cancel(&mut self, now: i64) -> Result<(), RuntimeError> {
         let active = match &self.state {
@@ -793,20 +893,13 @@ fn recall_for_turn(
     prompt: &str,
     required: &[Record],
 ) -> Result<Vec<Record>, RuntimeError> {
-    let cost = |record: &Record| -> Result<usize, RuntimeError> {
-        Ok(serde_json::to_vec(record)
-            .map_err(|e| RuntimeError::Denied(e.to_string()))?
-            .len()
-            + MEMORY_PREFIX.len()
-            + 1)
-    };
     let mut budget = MAX_PROMPT_BYTES.saturating_sub(
         prompt.len() + BEHAVIORAL_SEED.len() + MEMORY_INTRO.len() + USER_TURN_PREFIX.len() + 128,
     );
     let mut accounted = std::collections::HashSet::new();
     for record in required {
         if accounted.insert(record.id.clone()) {
-            budget = budget.saturating_sub(cost(record)?);
+            budget = budget.saturating_sub(recall_record_cost(record)?);
         }
     }
     let cap = MAX_AUTOMATIC_MEMORIES.min(MAX_DEPENDENCIES.saturating_sub(accounted.len()));
@@ -823,12 +916,7 @@ fn recall_for_turn(
     });
     let mut selected = Vec::with_capacity(cap);
     for record in standing {
-        let bytes = cost(record)?;
-        if !accounted.contains(&record.id) && bytes <= budget {
-            budget -= bytes;
-            accounted.insert(record.id.clone());
-            selected.push(record.clone());
-        }
+        include_recall_record(record, &mut selected, &mut accounted, &mut budget)?;
         if selected.len() == cap {
             return Ok(selected);
         }
@@ -845,17 +933,35 @@ fn recall_for_turn(
         &accounted,
     )?;
     for record in relevant.iter().chain(recent.iter()) {
-        let bytes = cost(record)?;
-        if !accounted.contains(&record.id) && bytes <= budget {
-            budget -= bytes;
-            accounted.insert(record.id.clone());
-            selected.push(record.clone());
-        }
+        include_recall_record(record, &mut selected, &mut accounted, &mut budget)?;
         if selected.len() == cap {
             break;
         }
     }
     Ok(selected)
+}
+
+fn recall_record_cost(record: &Record) -> Result<usize, RuntimeError> {
+    Ok(serde_json::to_vec(record)
+        .map_err(|e| RuntimeError::Denied(e.to_string()))?
+        .len()
+        + MEMORY_PREFIX.len()
+        + 1)
+}
+
+fn include_recall_record(
+    record: &Record,
+    selected: &mut Vec<Record>,
+    accounted: &mut std::collections::HashSet<String>,
+    budget: &mut usize,
+) -> Result<(), RuntimeError> {
+    let bytes = recall_record_cost(record)?;
+    if !accounted.contains(&record.id) && bytes <= *budget {
+        *budget -= bytes;
+        accounted.insert(record.id.clone());
+        selected.push(record.clone());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

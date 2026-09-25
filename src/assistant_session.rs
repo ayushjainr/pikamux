@@ -115,67 +115,17 @@ impl Session {
         executable: PathBuf,
         calls: u64,
     ) -> Result<()> {
-        if self.service.is_some() {
-            bail!(
-                "Pika already has a foreground provider; close all assistant views before changing it"
-            );
-        }
-        if crate::assistant_recovery_service::has_unfinished(root)? {
-            bail!(
-                "An earlier recovery did not finish. Use /fresh-context acknowledge before enabling another provider; no old request will be replayed."
-            );
-        }
-        if calls == 0 || calls > 100 {
-            bail!("Choose a total allowance of 1–100 calls; this is not a monetary ceiling");
-        }
-        let root = root.to_path_buf();
-        // Provider auth is separately provisioned here, never copied from the
-        // user's existing provider profile. User input cannot redirect it.
-        let home = root.join("provider-home");
-        let scratch = root.join("scratch");
-        crate::assistant_storage::directory(&home)?;
-        crate::assistant_storage::directory(&scratch)?;
-        let config = TransportConfig {
-            executable: executable.clone(),
-            codex_home: home,
-            scratch,
-        };
-        config.validate()?;
-        let scope = Scope {
-            project: Some(name.to_owned()),
-            ..Scope::default()
-        };
-        let workshop_root = root.clone();
+        validate_enable(self, root, calls)?;
+        let config = transport_config(root, &executable)?;
+        let scope = project_scope(name);
         self.author_config = Some(crate::assistant_author::AuthorConfig {
-            root: root.clone(),
+            root: root.to_path_buf(),
             executable,
             scope: scope.clone(),
         });
-        self.service = Some(AssistantService::spawn(move || {
-            let make = || -> Result<AssistantRuntime<CodexTransport>> {
-                let memory = Store::open(root.join("memory.sqlite"))?;
-                let policy = AssistantPolicy::open(root.join("policy.sqlite"))?;
-                let journal = root.join("runtime.sqlite");
-                let thread_id = persisted_thread(&journal)?;
-                let provider = MainAssistant::new(
-                    CodexTransport::spawn(config)?,
-                    MainProfile {
-                        profile_id: memory.profile_id().into(),
-                        thread_id,
-                    },
-                );
-                let mut runtime = AssistantRuntime::open(provider, memory, policy, journal, scope)?;
-                runtime.configure_explicit(RuntimeConfig {
-                    max_calls: calls,
-                    ..RuntimeConfig::default()
-                })?;
-                runtime.start_or_resume(now())?;
-                Ok(runtime)
-            };
-            make().map_err(|error| format!("{error:#}"))
-        }));
+        self.service = Some(spawn_main_service(root.to_path_buf(), config, scope, calls));
         self.scope = Some(name.into());
-        self.workshop_root = Some(workshop_root);
+        self.workshop_root = Some(root.to_path_buf());
         Ok(())
     }
     pub(crate) fn begin(&self, name: &str, id: &str, prompt: &str) -> Result<()> {
@@ -240,6 +190,22 @@ impl Session {
         request_id: &str,
         spec_json: &str,
     ) -> Result<()> {
+        self.prepare_evolution(root, scope, request_id, spec_json)?;
+        let spec = parse_evolution_spec(spec_json)?;
+        validate_evolution_scope(&spec, scope)?;
+        let experiment = experiment_id(scope, &spec.cases)?;
+        persist_evolution_cases(self, root, scope, request_id, &experiment, &spec)?;
+        let prompt = evolution_prompt(scope, &spec.need);
+        self.dispatch_evolution_author(root, scope, request_id, experiment, prompt)
+    }
+
+    fn prepare_evolution(
+        &mut self,
+        root: &Path,
+        scope: &str,
+        request_id: &str,
+        spec_json: &str,
+    ) -> Result<()> {
         if self.redacted {
             bail!("Memory was forgotten; evolution is blocked")
         }
@@ -282,63 +248,17 @@ impl Session {
         if spec_json.len() > 16 * 1024 {
             bail!("evolution specification exceeds 16 KiB")
         }
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct EvolutionSpec {
-            need: String,
-            cases: Vec<crate::assistant_evolution::EvaluationCase>,
-            #[serde(default)]
-            correction_id: Option<String>,
-        }
-        let spec: EvolutionSpec = serde_json::from_str(spec_json)
-            .map_err(|error| anyhow::anyhow!("invalid evolution specification: {error}"))?;
-        if spec.need.trim().is_empty()
-            || spec.need.len() > 4096
-            || !(2..=8).contains(&spec.cases.len())
-        {
-            bail!("need and 2–8 contrasting cases are required")
-        }
-        let assigned = ToolScope::new([scope.to_owned()]);
-        if spec
-            .cases
-            .iter()
-            .flat_map(|case| case.inputs.iter())
-            .any(|input| input.scope != assigned)
-        {
-            bail!("every case input must exactly match the assigned scope")
-        }
-        let encoded = serde_json::to_vec(&spec.cases)?;
-        let mut digest = sha2::Sha256::new();
-        digest.update(scope.as_bytes());
-        digest.update(&encoded);
-        let experiment = format!("evolve-{:x}", digest.finalize());
-        let protected_cases = json!({"experiment": experiment, "cases": spec.cases});
-        persist_pending(root, request_id, scope, &experiment, None)?;
-        if let Err(error) = self
-            .workshop
-            .as_ref()
-            .expect("workshop initialized")
-            .protect_cases_json(&protected_cases.to_string())
-        {
-            let _ = mark_pending_terminal(root, request_id, "cases_failed");
-            return Err(anyhow::anyhow!(error.to_string()));
-        }
-        if let Some(correction_id) = spec.correction_id.as_deref() {
-            if let Err(error) = crate::assistant_learning::register_hypothesis(
-                root,
-                scope,
-                request_id,
-                correction_id,
-                &spec.need,
-            ) {
-                mark_pending_terminal(root, request_id, "hypothesis_failed")?;
-                return Err(error.into());
-            }
-        }
-        let prompt = format!(
-            "Generate exactly one CandidateManifest JSON object with definition.name string, version integer, input_scope {{values: [string]}}, expression, and authoring_evidence string. The expression AST grammar is tagged JSON: {{op: \"input\"}}, {{op: \"current\"}}, {{op: \"field\",path:string}}, {{op: \"current_field\",path:string}}, {{op: \"literal\",value:any}}, {{op: \"map\",input:Expr,expr:Expr}}, {{op: \"filter\",input:Expr,predicate:Expr}}, {{op: \"compare\",comparison: \"eq\"|\"ne\"|\"lt\"|\"lte\"|\"gt\"|\"gte\",left:Expr,right:Expr}}, {{op: \"and\"|\"or\",items:[Expr]}}, or {{op: \"not\",input:Expr}}. For assigned scope [\"{scope}\"], solve this need: {need}. Do not return evaluator cases or expected values, approvals, grants, commands, tools, or prose.",
-            need = spec.need
-        );
+        Ok(())
+    }
+
+    fn dispatch_evolution_author(
+        &mut self,
+        root: &Path,
+        scope: &str,
+        request_id: &str,
+        experiment: String,
+        prompt: String,
+    ) -> Result<()> {
         if let Some(config) = self.author_config.clone() {
             self.author = match crate::assistant_author::spawn(config) {
                 Ok(author) => Some(author),
@@ -487,53 +407,43 @@ impl Session {
         if self.redacted {
             return json!({"state":"unavailable","provider":"none","background_calls":0,"notice":"Cached provider context hidden after forgetting; explicit recovery required."});
         }
-        let author = if self.scope.as_deref() == Some(scope) {
-            self.author
-                .as_ref()
-                .map(|author| {
-                    let snap = author.snapshot();
-                    let error = snap.error.or(match snap.result {
-                        Some(TurnResult::Failed { text, .. }) => Some(text),
-                        _ => None,
-                    });
-                    json!({"state":format!("{:?}",snap.state),"error":error})
-                })
-                .unwrap_or(Value::Null)
-        } else {
-            Value::Null
-        };
+        let author = self.author_snapshot(scope);
         if self.service.is_none() || self.scope.as_deref() != Some(scope) {
-            let _ = self.ensure_workshop_stored();
-            let scope_matches_pending = self
-                .pending_evolution
-                .as_ref()
-                .is_none_or(|pending| pending.scope == scope);
-            let (report, needs_approval, state, error) = self
-                .workshop
-                .as_ref()
-                .map(|workshop| {
-                    let snapshot = workshop.snapshot();
-                    let report = scope_matches_pending.then_some(snapshot.report).flatten();
-                    let needs = matches!(
-                        snapshot.state,
-                        crate::assistant_workshop_ui::UiState::Complete
-                    ) && report.as_ref().is_some_and(|item| item.passed)
-                        && report.as_ref().is_some_and(|item| {
-                            !workshop
-                                .is_active_hash(&item.tool_hash, ToolScope::new([scope.to_owned()]))
-                                .unwrap_or(false)
-                        });
-                    let state = format!("{:?}", snapshot.state).to_lowercase();
-                    if scope_matches_pending {
-                        (report, needs, state, snapshot.error)
-                    } else {
-                        (None, false, "idle".into(), None)
-                    }
-                })
-                .unwrap_or((None, false, "idle".into(), None));
-            let comparison = self.comparison_snapshot(scope, report.as_ref());
-            return json!({"state":"not_enabled","provider":"none","background_calls":0,"author":author,"workshop_state":state,"workshop_error":error,"workshop_report":report,"workshop_comparison":comparison,"needs_approval":needs_approval});
+            return self.snapshot_without_provider(scope, author);
         }
+        self.snapshot_with_provider(scope, author)
+    }
+
+    fn author_snapshot(&self, scope: &str) -> Value {
+        if self.scope.as_deref() != Some(scope) {
+            return Value::Null;
+        }
+        self.author
+            .as_ref()
+            .map(|author| {
+                let snap = author.snapshot();
+                let error = snap.error.or(match snap.result {
+                    Some(TurnResult::Failed { text, .. }) => Some(text),
+                    _ => None,
+                });
+                json!({"state":format!("{:?}",snap.state),"error":error})
+            })
+            .unwrap_or(Value::Null)
+    }
+
+    fn snapshot_without_provider(&mut self, scope: &str, author: Value) -> Value {
+        let _ = self.ensure_workshop_stored();
+        let scope_matches_pending = self.pending_scope_matches(scope);
+        let (report, needs_approval, state, error) = self
+            .workshop
+            .as_ref()
+            .map(|workshop| empty_provider_workshop_state(workshop, scope, scope_matches_pending))
+            .unwrap_or((None, false, "idle".into(), None));
+        let comparison = self.comparison_snapshot(scope, report.as_ref());
+        json!({"state":"not_enabled","provider":"none","background_calls":0,"author":author,"workshop_state":state,"workshop_error":error,"workshop_report":report,"workshop_comparison":comparison,"needs_approval":needs_approval})
+    }
+
+    fn snapshot_with_provider(&self, scope: &str, author: Value) -> Value {
         let service = self.service.as_ref().expect("service checked above");
         let snapshot = service.snapshot();
         let mut workshop_report: Option<EvaluationReport> = None;
@@ -544,11 +454,7 @@ impl Session {
             let ws = workshop.snapshot();
             workshop_state = format!("{:?}", ws.state).to_lowercase();
             workshop_error = ws.error;
-            if self
-                .pending_evolution
-                .as_ref()
-                .is_none_or(|pending| pending.scope == scope)
-            {
+            if self.pending_scope_matches(scope) {
                 workshop_report = ws.report;
             } else {
                 workshop_state = "idle".into();
@@ -579,6 +485,12 @@ impl Session {
         }, "provider":"codex", "background_calls":0, "author":author,"request_id":snapshot.request_id, "partial":text, "error":error, "cost":"unknown; count and deadline bounded", "workshop_state": workshop_state, "workshop_error": workshop_error, "workshop_report": workshop_report,"workshop_comparison":comparison, "needs_approval": needs_approval})
     }
 
+    fn pending_scope_matches(&self, scope: &str) -> bool {
+        self.pending_evolution
+            .as_ref()
+            .is_none_or(|pending| pending.scope == scope)
+    }
+
     fn comparison_snapshot(&self, scope: &str, report: Option<&EvaluationReport>) -> Value {
         if self
             .pending_evolution
@@ -601,6 +513,13 @@ impl Session {
         if self.redacted {
             return Ok(());
         }
+        self.restore_candidate_workshop()?;
+        self.settle_authoring()?;
+        self.settle_evaluation()?;
+        self.submit_pending_candidate()
+    }
+
+    fn restore_candidate_workshop(&mut self) -> Result<()> {
         if self
             .pending_evolution
             .as_ref()
@@ -609,6 +528,10 @@ impl Session {
         {
             self.ensure_workshop_stored()?;
         }
+        Ok(())
+    }
+
+    fn settle_authoring(&mut self) -> Result<()> {
         let snapshot = self.author.as_ref().map(|service| service.snapshot());
         if let (Some(snapshot), Some(pending)) = (snapshot, self.pending_evolution.as_mut()) {
             if pending.scope == self.scope.as_deref().unwrap_or("")
@@ -638,6 +561,10 @@ impl Session {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn settle_evaluation(&mut self) -> Result<()> {
         if let Some(workshop) = self.workshop.as_ref() {
             let workshop_snapshot = workshop.snapshot();
             if matches!(
@@ -672,7 +599,6 @@ impl Session {
                 }
             }
         }
-        self.submit_pending_candidate()?;
         Ok(())
     }
 
@@ -736,6 +662,184 @@ impl Session {
     }
 }
 
+fn empty_provider_workshop_state(
+    workshop: &WorkshopUi,
+    scope: &str,
+    scope_matches_pending: bool,
+) -> (Option<EvaluationReport>, bool, String, Option<String>) {
+    let snapshot = workshop.snapshot();
+    let report = scope_matches_pending.then_some(snapshot.report).flatten();
+    let needs_approval = matches!(
+        snapshot.state,
+        crate::assistant_workshop_ui::UiState::Complete
+    ) && report.as_ref().is_some_and(|item| item.passed)
+        && report.as_ref().is_some_and(|item| {
+            !workshop
+                .is_active_hash(&item.tool_hash, ToolScope::new([scope.to_owned()]))
+                .unwrap_or(false)
+        });
+    let state = format!("{:?}", snapshot.state).to_lowercase();
+    if scope_matches_pending {
+        (report, needs_approval, state, snapshot.error)
+    } else {
+        (None, false, "idle".into(), None)
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvolutionSpec {
+    need: String,
+    cases: Vec<crate::assistant_evolution::EvaluationCase>,
+    #[serde(default)]
+    correction_id: Option<String>,
+}
+
+fn parse_evolution_spec(source: &str) -> Result<EvolutionSpec> {
+    let spec: EvolutionSpec = serde_json::from_str(source)
+        .map_err(|error| anyhow::anyhow!("invalid evolution specification: {error}"))?;
+    if spec.need.trim().is_empty() || spec.need.len() > 4096 || !(2..=8).contains(&spec.cases.len())
+    {
+        bail!("need and 2–8 contrasting cases are required");
+    }
+    Ok(spec)
+}
+
+fn validate_evolution_scope(spec: &EvolutionSpec, scope: &str) -> Result<()> {
+    let assigned = ToolScope::new([scope.to_owned()]);
+    if spec
+        .cases
+        .iter()
+        .flat_map(|case| case.inputs.iter())
+        .any(|input| input.scope != assigned)
+    {
+        bail!("every case input must exactly match the assigned scope");
+    }
+    Ok(())
+}
+
+fn experiment_id(
+    scope: &str,
+    cases: &[crate::assistant_evolution::EvaluationCase],
+) -> Result<String> {
+    let encoded = serde_json::to_vec(cases)?;
+    let mut digest = sha2::Sha256::new();
+    digest.update(scope.as_bytes());
+    digest.update(&encoded);
+    Ok(format!("evolve-{:x}", digest.finalize()))
+}
+
+fn persist_evolution_cases(
+    session: &Session,
+    root: &Path,
+    scope: &str,
+    request_id: &str,
+    experiment: &str,
+    spec: &EvolutionSpec,
+) -> Result<()> {
+    let protected_cases = json!({"experiment": experiment, "cases": spec.cases});
+    persist_pending(root, request_id, scope, experiment, None)?;
+    if let Err(error) = session
+        .workshop
+        .as_ref()
+        .expect("workshop initialized")
+        .protect_cases_json(&protected_cases.to_string())
+    {
+        let _ = mark_pending_terminal(root, request_id, "cases_failed");
+        return Err(anyhow::anyhow!(error.to_string()));
+    }
+    if let Some(correction_id) = spec.correction_id.as_deref() {
+        if let Err(error) = crate::assistant_learning::register_hypothesis(
+            root,
+            scope,
+            request_id,
+            correction_id,
+            &spec.need,
+        ) {
+            mark_pending_terminal(root, request_id, "hypothesis_failed")?;
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+fn evolution_prompt(scope: &str, need: &str) -> String {
+    format!(
+        "Generate exactly one CandidateManifest JSON object with definition.name string, version integer, input_scope {{values: [string]}}, expression, and authoring_evidence string. The expression AST grammar is tagged JSON: {{op: \"input\"}}, {{op: \"current\"}}, {{op: \"field\",path:string}}, {{op: \"current_field\",path:string}}, {{op: \"literal\",value:any}}, {{op: \"map\",input:Expr,expr:Expr}}, {{op: \"filter\",input:Expr,predicate:Expr}}, {{op: \"compare\",comparison: \"eq\"|\"ne\"|\"lt\"|\"lte\"|\"gt\"|\"gte\",left:Expr,right:Expr}}, {{op: \"and\"|\"or\",items:[Expr]}}, or {{op: \"not\",input:Expr}}. For assigned scope [\"{scope}\"], solve this need: {need}. Do not return evaluator cases or expected values, approvals, grants, commands, tools, or prose."
+    )
+}
+
+fn validate_enable(session: &Session, root: &Path, calls: u64) -> Result<()> {
+    if session.service.is_some() {
+        bail!(
+            "Pika already has a foreground provider; close all assistant views before changing it"
+        );
+    }
+    if crate::assistant_recovery_service::has_unfinished(root)? {
+        bail!(
+            "An earlier recovery did not finish. Use /fresh-context acknowledge before enabling another provider; no old request will be replayed."
+        );
+    }
+    if calls == 0 || calls > 100 {
+        bail!("Choose a total allowance of 1–100 calls; this is not a monetary ceiling");
+    }
+    Ok(())
+}
+
+fn transport_config(root: &Path, executable: &Path) -> Result<TransportConfig> {
+    // Provider auth is separately provisioned here, never copied from the
+    // user's existing provider profile. User input cannot redirect it.
+    let home = root.join("provider-home");
+    let scratch = root.join("scratch");
+    crate::assistant_storage::directory(&home)?;
+    crate::assistant_storage::directory(&scratch)?;
+    let config = TransportConfig {
+        executable: executable.to_path_buf(),
+        codex_home: home,
+        scratch,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+fn project_scope(name: &str) -> Scope {
+    Scope {
+        project: Some(name.to_owned()),
+        ..Scope::default()
+    }
+}
+
+fn spawn_main_service(
+    root: PathBuf,
+    config: TransportConfig,
+    scope: Scope,
+    calls: u64,
+) -> AssistantService {
+    AssistantService::spawn(move || {
+        let make = || -> Result<AssistantRuntime<CodexTransport>> {
+            let memory = Store::open(root.join("memory.sqlite"))?;
+            let policy = AssistantPolicy::open(root.join("policy.sqlite"))?;
+            let journal = root.join("runtime.sqlite");
+            let thread_id = persisted_thread(&journal)?;
+            let provider = MainAssistant::new(
+                CodexTransport::spawn(config)?,
+                MainProfile {
+                    profile_id: memory.profile_id().into(),
+                    thread_id,
+                },
+            );
+            let mut runtime = AssistantRuntime::open(provider, memory, policy, journal, scope)?;
+            runtime.configure_explicit(RuntimeConfig {
+                max_calls: calls,
+                ..RuntimeConfig::default()
+            })?;
+            runtime.start_or_resume(now())?;
+            Ok(runtime)
+        };
+        make().map_err(|error| format!("{error:#}"))
+    })
+}
+
 fn future_expiry() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -783,15 +887,9 @@ fn mark_pending_terminal(root: &Path, request_id: &str, state: &str) -> Result<(
 
 type StoredPending = (String, String, String, Option<String>, String);
 fn load_pending(root: &Path) -> Result<Option<StoredPending>> {
-    let path = root.join("workshop.sqlite");
-    if !path.exists() {
+    let Some(db) = open_pending_database(root)? else {
         return Ok(None);
-    }
-    crate::assistant_storage::database(&path)?;
-    let db = rusqlite::Connection::open(path)?;
-    if !db.query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='assistant_evolution_pending')",[],|r|r.get(0))? {
-        return Ok(None);
-    }
+    };
     let mut query = db.prepare("SELECT request_id,scope,experiment,candidate_json,state FROM assistant_evolution_pending WHERE state IN ('pending','candidate','submitted') ORDER BY updated_at DESC,rowid DESC LIMIT 1")?;
     let Some((request_id, scope, experiment, mut candidate_json, state)): Option<(
         String,
@@ -813,50 +911,85 @@ fn load_pending(root: &Path) -> Result<Option<StoredPending>> {
     else {
         return Ok(None);
     };
-    if candidate_json.is_none() {
-        let runtime = root.join("author-runtime.sqlite");
-        let Some(runtime_state) = (|| -> Result<Option<(String, Option<String>)>> {
-            if !runtime.exists() {
-                return Ok(None);
-            }
-            crate::assistant_storage::database(&runtime)?;
-            let runtime_db = rusqlite::Connection::open(runtime)?;
-            let table_exists: bool = runtime_db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='assistant_runtime_turns')",
-                [],
-                |row| row.get(0),
-            )?;
-            if !table_exists {
-                return Ok(None);
-            }
-            Ok(runtime_db
-                .query_row(
-                    "SELECT state,reply FROM assistant_runtime_turns WHERE request_id=?",
-                    [request_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?)
-        })()?
-        else {
-            // The durable intent exists, but no provider dispatch receipt ever
-            // appeared.  Do not resurrect it or silently spend a retry.
-            db.execute(
-                "UPDATE assistant_evolution_pending SET state='abandoned-unsent',updated_at=strftime('%s','now') WHERE request_id=?",
-                [request_id.as_str()],
-            )?;
-            return Ok(None);
-        };
-        if runtime_state.0 == "completed" {
-            candidate_json = runtime_state.1;
-        } else if matches!(
-            runtime_state.0.as_str(),
-            "failed" | "cancelled" | "denied" | "abandoned"
-        ) {
-            mark_pending_terminal(root, &request_id, "authoring_failed")?;
-            return Ok(None);
-        }
+    if candidate_json.is_none()
+        && !recover_candidate_from_runtime(root, &db, &request_id, &mut candidate_json)?
+    {
+        return Ok(None);
     }
     Ok(Some((request_id, scope, experiment, candidate_json, state)))
+}
+
+fn open_pending_database(root: &Path) -> Result<Option<rusqlite::Connection>> {
+    let path = root.join("workshop.sqlite");
+    if !path.exists() {
+        return Ok(None);
+    }
+    crate::assistant_storage::database(&path)?;
+    let db = rusqlite::Connection::open(path)?;
+    let has_table: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='assistant_evolution_pending')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(has_table.then_some(db))
+}
+
+fn recover_candidate_from_runtime(
+    root: &Path,
+    pending_db: &rusqlite::Connection,
+    request_id: &str,
+    candidate_json: &mut Option<String>,
+) -> Result<bool> {
+    let Some((state, reply)) = read_author_runtime(root, request_id)? else {
+        abandon_unsent(pending_db, request_id)?;
+        return Ok(false);
+    };
+    if state == "completed" {
+        *candidate_json = reply;
+    } else if is_terminal_author_state(&state) {
+        mark_pending_terminal(root, request_id, "authoring_failed")?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn read_author_runtime(root: &Path, request_id: &str) -> Result<Option<(String, Option<String>)>> {
+    let runtime = root.join("author-runtime.sqlite");
+    if !runtime.exists() {
+        return Ok(None);
+    }
+    crate::assistant_storage::database(&runtime)?;
+    let runtime_db = rusqlite::Connection::open(runtime)?;
+    if !runtime_table_exists(&runtime_db)? {
+        return Ok(None);
+    }
+    Ok(runtime_db
+        .query_row(
+            "SELECT state,reply FROM assistant_runtime_turns WHERE request_id=?",
+            [request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+fn runtime_table_exists(db: &rusqlite::Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='assistant_runtime_turns')",
+        [], |row| row.get(0),
+    )?)
+}
+
+fn is_terminal_author_state(state: &str) -> bool {
+    matches!(state, "failed" | "cancelled" | "denied" | "abandoned")
+}
+
+fn abandon_unsent(db: &rusqlite::Connection, request_id: &str) -> Result<()> {
+    // Do not replay an intent with no durable provider dispatch receipt.
+    db.execute(
+        "UPDATE assistant_evolution_pending SET state='abandoned-unsent',updated_at=strftime('%s','now') WHERE request_id=?",
+        [request_id],
+    )?;
+    Ok(())
 }
 
 fn persisted_thread(path: &Path) -> Result<Option<String>> {

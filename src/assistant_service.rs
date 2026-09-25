@@ -247,6 +247,142 @@ fn release_busy(busy: &AtomicBool, cancel: &AtomicBool, gate: &Mutex<()>) {
     busy.store(false, Ordering::Release);
 }
 
+struct WorkerControls<'a> {
+    snapshot: &'a Arc<RwLock<ServiceSnapshot>>,
+    stop: &'a AtomicBool,
+    cancel: &'a AtomicBool,
+    busy: &'a AtomicBool,
+    gate: &'a Mutex<()>,
+}
+
+// True means dispatch was cancelled and this worker iteration is finished.
+fn start_command<R: LiveTurnRuntime>(
+    runtime: &mut R,
+    command: Command,
+    active: &mut Option<String>,
+    controls: &WorkerControls<'_>,
+) -> bool {
+    let Command::Begin { request_id, prompt } = command;
+    if controls.cancel.swap(false, Ordering::AcqRel) || controls.stop.load(Ordering::Acquire) {
+        release_busy(controls.busy, controls.cancel, controls.gate);
+        publish(
+            controls.snapshot,
+            ServiceSnapshot {
+                state: ServiceState::Failed,
+                request_id: Some(request_id),
+                error: Some("cancelled before dispatch".into()),
+                ..Default::default()
+            },
+        );
+        return true;
+    }
+    match runtime.begin_turn(&request_id, &prompt, now()) {
+        Ok(()) => {
+            *active = Some(request_id.clone());
+            publish(
+                controls.snapshot,
+                ServiceSnapshot {
+                    state: ServiceState::Running,
+                    request_id: Some(request_id),
+                    ..Default::default()
+                },
+            );
+        }
+        Err(error) => {
+            release_busy(controls.busy, controls.cancel, controls.gate);
+            publish(
+                controls.snapshot,
+                ServiceSnapshot {
+                    state: ServiceState::Failed,
+                    request_id: Some(request_id),
+                    error: Some(error),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    false
+}
+
+fn publish_polled_result<R: LiveTurnRuntime>(
+    runtime: &mut R,
+    request_id: String,
+    active: &mut Option<String>,
+    controls: &WorkerControls<'_>,
+) {
+    match runtime.poll_turn(now()) {
+        Ok(Some(result)) => {
+            publish(
+                controls.snapshot,
+                ServiceSnapshot {
+                    state: ServiceState::Completed,
+                    request_id: Some(request_id),
+                    partial: runtime.partial_output(),
+                    result: Some(result),
+                    ..Default::default()
+                },
+            );
+            *active = None;
+            release_busy(controls.busy, controls.cancel, controls.gate);
+        }
+        Ok(None) => publish(
+            controls.snapshot,
+            ServiceSnapshot {
+                state: ServiceState::Running,
+                request_id: Some(request_id),
+                partial: runtime.partial_output(),
+                ..Default::default()
+            },
+        ),
+        Err(error) => {
+            publish(
+                controls.snapshot,
+                ServiceSnapshot {
+                    state: ServiceState::Failed,
+                    request_id: Some(request_id),
+                    partial: runtime.partial_output(),
+                    error: Some(error),
+                    ..Default::default()
+                },
+            );
+            *active = None;
+            release_busy(controls.busy, controls.cancel, controls.gate);
+        }
+    }
+}
+
+fn cancel_active<R: LiveTurnRuntime>(
+    runtime: &mut R,
+    request_id: String,
+    active: &mut Option<String>,
+    controls: &WorkerControls<'_>,
+) {
+    publish(
+        controls.snapshot,
+        ServiceSnapshot {
+            state: ServiceState::Cancelling,
+            request_id: Some(request_id.clone()),
+            ..Default::default()
+        },
+    );
+    let error = runtime.cancel(now()).err();
+    publish(
+        controls.snapshot,
+        ServiceSnapshot {
+            state: if error.is_some() {
+                ServiceState::Failed
+            } else {
+                ServiceState::Completed
+            },
+            request_id: Some(request_id),
+            error: error.or_else(|| Some("cancelled".into())),
+            ..Default::default()
+        },
+    );
+    *active = None;
+    release_busy(controls.busy, controls.cancel, controls.gate);
+}
+
 fn worker<F: RuntimeFactory>(
     factory: F,
     commands: mpsc::Receiver<Command>,
@@ -279,166 +415,39 @@ fn worker<F: RuntimeFactory>(
         },
     );
     let mut active: Option<String> = None;
+    let controls = WorkerControls {
+        snapshot: &snapshot,
+        stop: &stop,
+        cancel: &cancel,
+        busy: &busy,
+        gate: &gate,
+    };
     loop {
         if active.is_none() && stop.load(Ordering::Acquire) {
             break;
         }
-        if let Ok(Command::Begin { request_id, prompt }) = commands.try_recv() {
-            if active.is_none() {
-                if cancel.swap(false, Ordering::AcqRel) || stop.load(Ordering::Acquire) {
-                    release_busy(&busy, &cancel, &gate);
-                    publish(
-                        &snapshot,
-                        ServiceSnapshot {
-                            state: ServiceState::Failed,
-                            request_id: Some(request_id),
-                            error: Some("cancelled before dispatch".into()),
-                            ..Default::default()
-                        },
-                    );
-                    continue;
-                }
-                match runtime.begin_turn(&request_id, &prompt, now()) {
-                    Ok(()) => {
-                        active = Some(request_id.clone());
-                        publish(
-                            &snapshot,
-                            ServiceSnapshot {
-                                state: ServiceState::Running,
-                                request_id: Some(request_id),
-                                ..Default::default()
-                            },
-                        );
-                    }
-                    Err(error) => {
-                        release_busy(&busy, &cancel, &gate);
-                        publish(
-                            &snapshot,
-                            ServiceSnapshot {
-                                state: ServiceState::Failed,
-                                request_id: Some(request_id),
-                                error: Some(error),
-                                ..Default::default()
-                            },
-                        )
-                    }
-                }
+        if let Ok(command) = commands.try_recv() {
+            if active.is_none() && start_command(&mut runtime, command, &mut active, &controls) {
+                continue;
             }
         }
         if let Some(request_id) = active.clone() {
             if cancel.swap(false, Ordering::AcqRel) || stop.load(Ordering::Acquire) {
-                publish(
-                    &snapshot,
-                    ServiceSnapshot {
-                        state: ServiceState::Cancelling,
-                        request_id: Some(request_id.clone()),
-                        ..Default::default()
-                    },
-                );
-                let error = runtime.cancel(now()).err();
-                publish(
-                    &snapshot,
-                    ServiceSnapshot {
-                        state: if error.is_some() {
-                            ServiceState::Failed
-                        } else {
-                            ServiceState::Completed
-                        },
-                        request_id: Some(request_id),
-                        error: error.or_else(|| Some("cancelled".into())),
-                        ..Default::default()
-                    },
-                );
-                active = None;
-                release_busy(&busy, &cancel, &gate);
+                cancel_active(&mut runtime, request_id, &mut active, &controls);
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
                 continue;
             }
-            match runtime.poll_turn(now()) {
-                Ok(Some(result)) => {
-                    publish(
-                        &snapshot,
-                        ServiceSnapshot {
-                            state: ServiceState::Completed,
-                            request_id: Some(request_id),
-                            partial: runtime.partial_output(),
-                            result: Some(result),
-                            ..Default::default()
-                        },
-                    );
-                    active = None;
-                    release_busy(&busy, &cancel, &gate);
-                }
-                Ok(None) => publish(
-                    &snapshot,
-                    ServiceSnapshot {
-                        state: ServiceState::Running,
-                        request_id: Some(request_id),
-                        partial: runtime.partial_output(),
-                        ..Default::default()
-                    },
-                ),
-                Err(error) => {
-                    publish(
-                        &snapshot,
-                        ServiceSnapshot {
-                            state: ServiceState::Failed,
-                            request_id: Some(request_id),
-                            partial: runtime.partial_output(),
-                            error: Some(error),
-                            ..Default::default()
-                        },
-                    );
-                    active = None;
-                    release_busy(&busy, &cancel, &gate);
-                }
-            }
+            publish_polled_result(&mut runtime, request_id, &mut active, &controls);
             if active.is_some() {
                 thread::sleep(Duration::from_millis(1));
             }
         } else if stop.load(Ordering::Acquire) {
             break;
         } else if let Ok(command) = commands.recv_timeout(Duration::from_millis(10)) {
-            let Command::Begin { request_id, prompt } = command;
-            if cancel.swap(false, Ordering::AcqRel) || stop.load(Ordering::Acquire) {
-                release_busy(&busy, &cancel, &gate);
-                publish(
-                    &snapshot,
-                    ServiceSnapshot {
-                        state: ServiceState::Failed,
-                        request_id: Some(request_id),
-                        error: Some("cancelled before dispatch".into()),
-                        ..Default::default()
-                    },
-                );
+            if start_command(&mut runtime, command, &mut active, &controls) {
                 continue;
-            }
-            match runtime.begin_turn(&request_id, &prompt, now()) {
-                Ok(()) => {
-                    active = Some(request_id.clone());
-                    publish(
-                        &snapshot,
-                        ServiceSnapshot {
-                            state: ServiceState::Running,
-                            request_id: Some(request_id),
-                            ..Default::default()
-                        },
-                    );
-                }
-                Err(error) => {
-                    release_busy(&busy, &cancel, &gate);
-                    publish(
-                        &snapshot,
-                        ServiceSnapshot {
-                            state: ServiceState::Failed,
-                            request_id: Some(request_id),
-                            error: Some(error),
-                            ..Default::default()
-                        },
-                    )
-                }
             }
         }
     }

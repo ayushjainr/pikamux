@@ -77,18 +77,7 @@ pub fn register_hypothesis(
     let (memory_path, learning_path) = paths(root)?;
     let mut memory = Store::open(memory_path)?;
     let expected_scope = scope_for(scope);
-    let correction = memory
-        .get(correction_id)?
-        .ok_or(LearningError::InvalidCorrection)?;
-    if correction.kind != RecordKind::Correction
-        || correction.origin != Origin::Human
-        || correction.scope != expected_scope
-    {
-        return Err(LearningError::InvalidCorrection);
-    }
-    if memory.get_active(correction_id)?.is_none() {
-        return Err(LearningError::InvalidCorrection);
-    }
+    let correction = validated_correction(&memory, correction_id, &expected_scope)?;
     let epoch = memory.forget_epoch()?;
     let record = memory.append_idempotent(
         request_id,
@@ -115,6 +104,24 @@ pub fn register_hypothesis(
         Ok(())
     })?;
     Ok(record)
+}
+
+fn validated_correction(
+    memory: &Store,
+    correction_id: &str,
+    scope: &Scope,
+) -> Result<Record, LearningError> {
+    let correction = memory
+        .get(correction_id)?
+        .ok_or(LearningError::InvalidCorrection)?;
+    if correction.kind != RecordKind::Correction
+        || correction.origin != Origin::Human
+        || &correction.scope != scope
+        || memory.get_active(correction_id)?.is_none()
+    {
+        return Err(LearningError::InvalidCorrection);
+    }
+    Ok(correction)
 }
 
 /// Bind an evaluated candidate hash to the exact hypothesis request.
@@ -162,33 +169,19 @@ pub fn record_use(
     hash: &str,
     summary: &Value,
 ) -> Result<(), LearningError> {
-    if hash.is_empty() || hash.len() > 128 {
-        return Err(LearningError::TooLarge);
-    }
+    validate_hash(hash)?;
     let (memory_path, learning_path) = paths(root.as_ref())?;
     let mut memory = Store::open(memory_path)?;
     let expected_scope = scope_for(scope);
     let db = metadata(&learning_path)?;
-    let mut statement=db.prepare("SELECT DISTINCT h.record_id FROM learning_hypotheses h JOIN learning_candidates c ON c.request_id=h.request_id WHERE h.scope=? AND c.candidate_hash=? ORDER BY h.record_id LIMIT 33")?;
-    let hypotheses = statement
-        .query_map(params![scope, hash], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
+    let hypotheses = linked_hypotheses(&db, scope, hash)?;
     if hypotheses.is_empty() {
         return Ok(());
     }
     if hypotheses.len() > 32 {
         return Err(LearningError::TooLarge);
     }
-    let serialized = serde_json::to_string(summary).map_err(|_| LearningError::TooLarge)?;
-    let output = if serialized.len() > MAX_TEXT {
-        let mut end = MAX_TEXT;
-        while !serialized.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…[truncated]", &serialized[..end])
-    } else {
-        serialized
-    };
+    let output = bounded_summary(summary)?;
     let body = serde_json::json!({
         "candidate_hash": hash,
         "output": output,
@@ -220,6 +213,36 @@ pub fn record_use(
         Ok(())
     })?;
     Ok(())
+}
+
+fn validate_hash(hash: &str) -> Result<(), LearningError> {
+    if hash.is_empty() || hash.len() > 128 {
+        return Err(LearningError::TooLarge);
+    }
+    Ok(())
+}
+
+fn linked_hypotheses(
+    db: &Connection,
+    scope: &str,
+    hash: &str,
+) -> Result<Vec<String>, LearningError> {
+    let mut statement=db.prepare("SELECT DISTINCT h.record_id FROM learning_hypotheses h JOIN learning_candidates c ON c.request_id=h.request_id WHERE h.scope=? AND c.candidate_hash=? ORDER BY h.record_id LIMIT 33")?;
+    Ok(statement
+        .query_map(params![scope, hash], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn bounded_summary(summary: &Value) -> Result<String, LearningError> {
+    let serialized = serde_json::to_string(summary).map_err(|_| LearningError::TooLarge)?;
+    if serialized.len() <= MAX_TEXT {
+        return Ok(serialized);
+    }
+    let mut end = MAX_TEXT;
+    while !serialized.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(format!("{}…[truncated]", &serialized[..end]))
 }
 
 #[cfg(test)]

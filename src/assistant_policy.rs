@@ -268,82 +268,16 @@ impl AssistantPolicy {
         now: i64,
         deadline_at: Option<i64>,
     ) -> Result<Reservation, PolicyError> {
-        if calls == 0 {
-            return Err(PolicyError::Denied(
-                "reservation must contain at least one call".into(),
-            ));
-        }
-        if calls > i64::MAX as u64 {
-            return Err(PolicyError::Denied(
-                "reservation exceeds SQLite integer range".into(),
-            ));
-        }
+        validate_reservation_calls(calls)?;
         let cfg = self.config()?;
-        let deadline =
-            deadline_at.unwrap_or(now.saturating_add(cfg.default_deadline_seconds as i64));
-        if deadline <= now {
-            return Err(PolicyError::Denied("deadline is expired".into()));
-        }
+        let deadline = validate_deadline(deadline_at, now, cfg.default_deadline_seconds)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let duplicate: Option<String> = tx
-            .query_row(
-                "SELECT id FROM assistant_reservations WHERE id=?",
-                [id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if duplicate.is_some() {
-            return Err(PolicyError::Denied("reservation id already exists".into()));
-        }
-        if let Some(parent) = parent_id {
-            let (parent_root, parent_deadline, parent_state, parent_calls): (String, i64, String, i64) = tx.query_row(
-                "SELECT root_id,deadline_at,state,calls FROM assistant_reservations WHERE id=? AND parent_id IS NULL",
-                [parent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-                .optional()?.ok_or_else(|| PolicyError::UnknownReservation(parent.into()))?;
-            if parent_root != root_id
-                || parent_state != "reserved"
-                || parent_deadline <= now
-                || deadline > parent_deadline
-            {
-                return Err(PolicyError::Denied(
-                    "parent reservation is expired or no longer active".into(),
-                ));
-            }
-            let children: i64 = tx.query_row("SELECT COALESCE(SUM(calls),0) FROM assistant_reservations WHERE root_id=? AND parent_id IS NOT NULL AND state <> 'released'", [root_id], |r| r.get(0))?;
-            if children.saturating_add(calls as i64) > parent_calls {
-                return Err(PolicyError::Denied(
-                    "child reservations exceed the root budget".into(),
-                ));
-            }
-        }
-        if background && parent_id.is_none() {
-            let used: i64 = tx.query_row("SELECT COALESCE(SUM(calls),0) FROM assistant_reservations WHERE background=1 AND parent_id IS NULL AND state <> 'released'", [], |r| r.get(0))?;
-            if used.saturating_add(calls as i64) > cfg.background_calls as i64 {
-                return Err(PolicyError::Denied(
-                    "background allowance exhausted (background is disabled by default)".into(),
-                ));
-            }
-        }
-        if parent_id.is_none() {
-            let total: i64 = tx.query_row("SELECT COALESCE(SUM(calls),0) FROM assistant_reservations WHERE parent_id IS NULL AND state <> 'released'", [], |r| r.get(0))?;
-            if cfg.max_total_calls == 0
-                || total.saturating_add(calls as i64) > cfg.max_total_calls as i64
-            {
-                return Err(PolicyError::Denied("total call allowance exhausted".into()));
-            }
-        }
-        let active: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM assistant_reservations r WHERE state IN ('reserved','dispatched') AND (? IS NULL OR r.id <> ?) AND NOT EXISTS (SELECT 1 FROM assistant_reservations child WHERE child.parent_id=r.id)",
-            params![parent_id, parent_id],
-            |r| r.get(0),
-        )?;
-        if active >= cfg.max_concurrent as i64 {
-            return Err(PolicyError::Denied(
-                "concurrent reservation limit reached".into(),
-            ));
-        }
+        reject_duplicate_reservation(&tx, id)?;
+        validate_child_budget(&tx, parent_id, root_id, calls, now, deadline)?;
+        validate_root_budgets(&tx, &cfg, parent_id, background, calls)?;
+        validate_concurrency(&tx, parent_id, cfg.max_concurrent)?;
         tx.execute("INSERT INTO assistant_reservations(id,root_id,parent_id,calls,deadline_at,background,state,created_at) VALUES (?,?,?,?,?,?,?,?)", params![id, root_id, parent_id, calls as i64, deadline, background as i64, ReservationState::Reserved.as_str(), now])?;
         tx.commit()?;
         Ok(Reservation {
@@ -396,85 +330,12 @@ impl AssistantPolicy {
             )
             .optional()?;
         let (old, deadline) = old.ok_or_else(|| PolicyError::UnknownReservation(id.into()))?;
-        // A root is either a direct call allocation or a non-billable envelope,
-        // never both. Once it delegates, only children may dispatch or refund.
-        let children: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM assistant_reservations WHERE parent_id=?",
-            [id],
-            |r| r.get(0),
-        )?;
-        if children > 0
-            && matches!(
-                state,
-                ReservationState::Released | ReservationState::Dispatched
-            )
-        {
-            return Err(PolicyError::Denied(
-                "a delegated root cannot dispatch or refund its children's allowance".into(),
-            ));
-        }
+        validate_delegated_root_transition(&tx, id, state)?;
         if state == ReservationState::Dispatched {
-            let invalid_parent: i64 = tx.query_row("SELECT COUNT(*) FROM assistant_reservations child JOIN assistant_reservations parent ON parent.id=child.parent_id WHERE child.id=? AND (parent.state <> 'reserved' OR parent.deadline_at <= ?)", params![id, now], |r| r.get(0))?;
-            if invalid_parent > 0 {
-                return Err(PolicyError::Denied("root is no longer active".into()));
-            }
-            let allowed: i64 = tx.query_row(
-                "SELECT max_total_calls FROM policy_config WHERE id=1",
-                [],
-                |r| r.get(0),
-            )?;
-            let total: i64 = tx.query_row("SELECT COALESCE(SUM(calls),0) FROM assistant_reservations WHERE parent_id IS NULL AND state <> 'released'", [], |r| r.get(0))?;
-            if allowed == 0 || total > allowed {
-                return Err(PolicyError::Denied(
-                    "call allowance revoked or reduced".into(),
-                ));
-            }
-            let background: bool = tx.query_row(
-                "SELECT background FROM assistant_reservations WHERE id=?",
-                [id],
-                |r| r.get(0),
-            )?;
-            if background {
-                let allowed: i64 = tx.query_row(
-                    "SELECT background_calls FROM policy_config WHERE id=1",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let charged: i64 = tx.query_row("SELECT COALESCE(SUM(calls),0) FROM assistant_reservations WHERE background=1 AND parent_id IS NULL AND state <> 'released'", [], |r| r.get(0))?;
-                if allowed <= 0 || charged > allowed {
-                    return Err(PolicyError::Denied(
-                        "background allowance revoked or reduced".into(),
-                    ));
-                }
-            }
+            validate_dispatch_budget(&tx, id, now)?;
         }
-        if state == ReservationState::Released && old != "reserved" {
-            return Err(PolicyError::Denied(
-                "only an undispatched reservation can be released".into(),
-            ));
-        }
-        if state == ReservationState::Dispatched && old != "reserved" {
-            return Err(PolicyError::Denied(
-                "reservation was already dispatched or finalized".into(),
-            ));
-        }
-        if state == ReservationState::Dispatched && deadline <= now {
-            return Err(PolicyError::Denied(
-                "reservation deadline has expired".into(),
-            ));
-        }
-        if receipt && !matches!(old.as_str(), "reserved" | "dispatched") {
-            return Err(PolicyError::Denied(
-                "reservation is already finalized".into(),
-            ));
-        }
-        tx.execute("UPDATE assistant_reservations SET state=?, dispatched_at=CASE WHEN ?='dispatched' THEN ? ELSE dispatched_at END, completed_at=CASE WHEN ? IN ('completed','failed','unknown','released') THEN ? ELSE completed_at END, outcome=COALESCE(?,outcome) WHERE id=?", params![state.as_str(), state.as_str(), now, state.as_str(), now, outcome, id])?;
-        if let Some(outcome) = outcome {
-            tx.execute(
-                "INSERT INTO assistant_receipts(reservation_id,outcome,recorded_at) VALUES (?,?,?)",
-                params![id, outcome, now],
-            )?;
-        }
+        validate_transition_state(state, now, receipt, &old, deadline)?;
+        apply_transition(&tx, id, state, now, outcome)?;
         tx.commit()?;
         Ok(())
     }
@@ -539,35 +400,354 @@ impl AssistantPolicy {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: ActionApproval = tx.query_row("SELECT id,grant_id,provider,scope,capability,target,payload_hash,version FROM assistant_approvals WHERE id=? AND used_at IS NULL", [approval_id], |r| Ok(ActionApproval { id:r.get(0)?, grant_id:r.get(1)?, provider:r.get(2)?, scope:r.get(3)?, capability:r.get(4)?, target:r.get(5)?, payload_hash:r.get(6)?, version:r.get(7)? })).optional()?.ok_or_else(|| PolicyError::UnknownApproval(approval_id.into()))?;
-        let grant: Grant = tx.query_row("SELECT id,provider,scope,capability,expires_at,revoked_at FROM assistant_grants WHERE id=?", [&row.grant_id], |r| Ok(Grant { id:r.get(0)?, provider:r.get(1)?, scope:r.get(2)?, capability:r.get(3)?, expires_at:r.get(4)?, revoked_at:r.get(5)? })).optional()?.ok_or_else(|| PolicyError::UnknownGrant(row.grant_id.clone()))?;
-        if !grant_matches(&grant, provider, scope, capability, now)
-            || row.provider != provider
-            || row.scope != scope
-            || row.capability != capability
-            || row.target != target
-            || row.version != version
-            || row.payload_hash != payload_hash(payload)
-        {
-            return Err(PolicyError::Denied(
-                "approval does not exactly match the current action".into(),
-            ));
-        }
-        let changed = tx.execute(
-            "UPDATE assistant_approvals SET used_at=? WHERE id=? AND used_at IS NULL",
-            params![now, approval_id],
+        let row = load_unused_approval(&tx, approval_id)?;
+        let grant = load_approval_grant(&tx, &row.grant_id)?;
+        validate_approval_match(
+            &row, &grant, provider, scope, capability, target, payload, version, now,
         )?;
-        if changed != 1 {
-            return Err(PolicyError::Denied(
-                "approval was concurrently consumed".into(),
-            ));
-        }
+        consume_approval(&tx, approval_id, now)?;
         tx.commit()?;
         Ok(())
     }
     fn grant_row(&self, id: &str) -> Result<Option<Grant>, PolicyError> {
         self.conn.query_row("SELECT id,provider,scope,capability,expires_at,revoked_at FROM assistant_grants WHERE id=?",[id],|r|Ok(Grant{id:r.get(0)?,provider:r.get(1)?,scope:r.get(2)?,capability:r.get(3)?,expires_at:r.get(4)?,revoked_at:r.get(5)?})).optional().map_err(Into::into)
     }
+}
+
+fn validate_reservation_calls(calls: u64) -> Result<(), PolicyError> {
+    if calls == 0 {
+        return Err(PolicyError::Denied(
+            "reservation must contain at least one call".into(),
+        ));
+    }
+    if calls > i64::MAX as u64 {
+        return Err(PolicyError::Denied(
+            "reservation exceeds SQLite integer range".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_deadline(
+    deadline: Option<i64>,
+    now: i64,
+    default_seconds: u64,
+) -> Result<i64, PolicyError> {
+    let deadline = deadline.unwrap_or(now.saturating_add(default_seconds as i64));
+    if deadline <= now {
+        return Err(PolicyError::Denied("deadline is expired".into()));
+    }
+    Ok(deadline)
+}
+
+fn reject_duplicate_reservation(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<(), PolicyError> {
+    let duplicate: Option<String> = tx
+        .query_row(
+            "SELECT id FROM assistant_reservations WHERE id=?",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if duplicate.is_some() {
+        return Err(PolicyError::Denied("reservation id already exists".into()));
+    }
+    Ok(())
+}
+
+fn validate_child_budget(
+    tx: &rusqlite::Transaction<'_>,
+    parent_id: Option<&str>,
+    root_id: &str,
+    calls: u64,
+    now: i64,
+    deadline: i64,
+) -> Result<(), PolicyError> {
+    let Some(parent) = parent_id else {
+        return Ok(());
+    };
+    let (parent_root, parent_deadline, parent_state, parent_calls): (String, i64, String, i64) = tx.query_row(
+        "SELECT root_id,deadline_at,state,calls FROM assistant_reservations WHERE id=? AND parent_id IS NULL",
+        [parent],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).optional()?.ok_or_else(|| PolicyError::UnknownReservation(parent.into()))?;
+    if parent_root != root_id
+        || parent_state != "reserved"
+        || parent_deadline <= now
+        || deadline > parent_deadline
+    {
+        return Err(PolicyError::Denied(
+            "parent reservation is expired or no longer active".into(),
+        ));
+    }
+    let children: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(calls),0) FROM assistant_reservations WHERE root_id=? AND parent_id IS NOT NULL AND state <> 'released'",
+        [root_id],
+        |row| row.get(0),
+    )?;
+    if children.saturating_add(calls as i64) > parent_calls {
+        return Err(PolicyError::Denied(
+            "child reservations exceed the root budget".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_root_budgets(
+    tx: &rusqlite::Transaction<'_>,
+    config: &PolicyConfig,
+    parent_id: Option<&str>,
+    background: bool,
+    calls: u64,
+) -> Result<(), PolicyError> {
+    if parent_id.is_some() {
+        return Ok(());
+    }
+    validate_background_budget(tx, background, calls, config.background_calls)?;
+    let total: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(calls),0) FROM assistant_reservations WHERE parent_id IS NULL AND state <> 'released'",
+        [],
+        |row| row.get(0),
+    )?;
+    if config.max_total_calls == 0
+        || total.saturating_add(calls as i64) > config.max_total_calls as i64
+    {
+        return Err(PolicyError::Denied("total call allowance exhausted".into()));
+    }
+    Ok(())
+}
+
+fn validate_background_budget(
+    tx: &rusqlite::Transaction<'_>,
+    background: bool,
+    calls: u64,
+    allowance: u64,
+) -> Result<(), PolicyError> {
+    if !background {
+        return Ok(());
+    }
+    let used: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(calls),0) FROM assistant_reservations WHERE background=1 AND parent_id IS NULL AND state <> 'released'",
+        [],
+        |row| row.get(0),
+    )?;
+    if used.saturating_add(calls as i64) > allowance as i64 {
+        return Err(PolicyError::Denied(
+            "background allowance exhausted (background is disabled by default)".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_concurrency(
+    tx: &rusqlite::Transaction<'_>,
+    parent_id: Option<&str>,
+    maximum: u64,
+) -> Result<(), PolicyError> {
+    let active: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM assistant_reservations r WHERE state IN ('reserved','dispatched') AND (? IS NULL OR r.id <> ?) AND NOT EXISTS (SELECT 1 FROM assistant_reservations child WHERE child.parent_id=r.id)",
+        params![parent_id, parent_id],
+        |row| row.get(0),
+    )?;
+    if active >= maximum as i64 {
+        return Err(PolicyError::Denied(
+            "concurrent reservation limit reached".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transition_state(
+    state: ReservationState,
+    now: i64,
+    receipt: bool,
+    old: &str,
+    deadline: i64,
+) -> Result<(), PolicyError> {
+    if state == ReservationState::Released && old != "reserved" {
+        return Err(PolicyError::Denied(
+            "only an undispatched reservation can be released".into(),
+        ));
+    }
+    if state == ReservationState::Dispatched && old != "reserved" {
+        return Err(PolicyError::Denied(
+            "reservation was already dispatched or finalized".into(),
+        ));
+    }
+    if state == ReservationState::Dispatched && deadline <= now {
+        return Err(PolicyError::Denied(
+            "reservation deadline has expired".into(),
+        ));
+    }
+    if receipt && !matches!(old, "reserved" | "dispatched") {
+        return Err(PolicyError::Denied(
+            "reservation is already finalized".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_delegated_root_transition(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    state: ReservationState,
+) -> Result<(), PolicyError> {
+    let children: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM assistant_reservations WHERE parent_id=?",
+        [id],
+        |row| row.get(0),
+    )?;
+    if children > 0
+        && matches!(
+            state,
+            ReservationState::Released | ReservationState::Dispatched
+        )
+    {
+        return Err(PolicyError::Denied(
+            "a delegated root cannot dispatch or refund its children's allowance".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dispatch_budget(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    now: i64,
+) -> Result<(), PolicyError> {
+    validate_parent_active(tx, id, now)?;
+    let allowed: i64 = tx.query_row(
+        "SELECT max_total_calls FROM policy_config WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let total: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(calls),0) FROM assistant_reservations WHERE parent_id IS NULL AND state <> 'released'",
+        [],
+        |row| row.get(0),
+    )?;
+    if allowed == 0 || total > allowed {
+        return Err(PolicyError::Denied(
+            "call allowance revoked or reduced".into(),
+        ));
+    }
+    validate_dispatched_background_budget(tx, id)
+}
+
+fn validate_parent_active(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    now: i64,
+) -> Result<(), PolicyError> {
+    let invalid: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM assistant_reservations child JOIN assistant_reservations parent ON parent.id=child.parent_id WHERE child.id=? AND (parent.state <> 'reserved' OR parent.deadline_at <= ?)",
+        params![id, now],
+        |row| row.get(0),
+    )?;
+    if invalid > 0 {
+        return Err(PolicyError::Denied("root is no longer active".into()));
+    }
+    Ok(())
+}
+
+fn validate_dispatched_background_budget(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<(), PolicyError> {
+    let background: bool = tx.query_row(
+        "SELECT background FROM assistant_reservations WHERE id=?",
+        [id],
+        |row| row.get(0),
+    )?;
+    if !background {
+        return Ok(());
+    }
+    let allowed: i64 = tx.query_row(
+        "SELECT background_calls FROM policy_config WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let charged: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(calls),0) FROM assistant_reservations WHERE background=1 AND parent_id IS NULL AND state <> 'released'",
+        [],
+        |row| row.get(0),
+    )?;
+    if allowed <= 0 || charged > allowed {
+        return Err(PolicyError::Denied(
+            "background allowance revoked or reduced".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_transition(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    state: ReservationState,
+    now: i64,
+    outcome: Option<&str>,
+) -> Result<(), PolicyError> {
+    tx.execute("UPDATE assistant_reservations SET state=?, dispatched_at=CASE WHEN ?='dispatched' THEN ? ELSE dispatched_at END, completed_at=CASE WHEN ? IN ('completed','failed','unknown','released') THEN ? ELSE completed_at END, outcome=COALESCE(?,outcome) WHERE id=?", params![state.as_str(), state.as_str(), now, state.as_str(), now, outcome, id])?;
+    if let Some(outcome) = outcome {
+        tx.execute(
+            "INSERT INTO assistant_receipts(reservation_id,outcome,recorded_at) VALUES (?,?,?)",
+            params![id, outcome, now],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_unused_approval(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<ActionApproval, PolicyError> {
+    tx.query_row("SELECT id,grant_id,provider,scope,capability,target,payload_hash,version FROM assistant_approvals WHERE id=? AND used_at IS NULL", [id], |r| Ok(ActionApproval { id:r.get(0)?, grant_id:r.get(1)?, provider:r.get(2)?, scope:r.get(3)?, capability:r.get(4)?, target:r.get(5)?, payload_hash:r.get(6)?, version:r.get(7)? })).optional()?.ok_or_else(|| PolicyError::UnknownApproval(id.into()))
+}
+
+fn load_approval_grant(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<Grant, PolicyError> {
+    tx.query_row("SELECT id,provider,scope,capability,expires_at,revoked_at FROM assistant_grants WHERE id=?", [id], |r| Ok(Grant { id:r.get(0)?, provider:r.get(1)?, scope:r.get(2)?, capability:r.get(3)?, expires_at:r.get(4)?, revoked_at:r.get(5)? })).optional()?.ok_or_else(|| PolicyError::UnknownGrant(id.into()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_approval_match(
+    row: &ActionApproval,
+    grant: &Grant,
+    provider: &str,
+    scope: &str,
+    capability: &str,
+    target: &str,
+    payload: &str,
+    version: &str,
+    now: i64,
+) -> Result<(), PolicyError> {
+    let matches = grant_matches(grant, provider, scope, capability, now)
+        && row.provider == provider
+        && row.scope == scope
+        && row.capability == capability
+        && row.target == target
+        && row.version == version
+        && row.payload_hash == payload_hash(payload);
+    if !matches {
+        return Err(PolicyError::Denied(
+            "approval does not exactly match the current action".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn consume_approval(tx: &rusqlite::Transaction<'_>, id: &str, now: i64) -> Result<(), PolicyError> {
+    let changed = tx.execute(
+        "UPDATE assistant_approvals SET used_at=? WHERE id=? AND used_at IS NULL",
+        params![now, id],
+    )?;
+    if changed != 1 {
+        return Err(PolicyError::Denied(
+            "approval was concurrently consumed".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn grant_matches(g: &Grant, provider: &str, scope: &str, capability: &str, now: i64) -> bool {

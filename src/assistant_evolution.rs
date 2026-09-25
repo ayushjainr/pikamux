@@ -559,6 +559,23 @@ fn eval(
 ) -> Result<Value, EvolutionError> {
     budget.check(1)?;
     let result = match expr {
+        Expr::Map { .. } | Expr::Filter { .. } => eval_collection(expr, root, current, budget)?,
+        Expr::Compare { .. } | Expr::And { .. } | Expr::Or { .. } | Expr::Not { .. } => {
+            eval_logic(expr, root, current, budget)?
+        }
+        _ => eval_atom(expr, root, current, budget)?,
+    };
+    budget.charge(0)?;
+    Ok(result)
+}
+
+fn eval_atom(
+    expr: &Expr,
+    root: &Value,
+    current: Option<&Value>,
+    budget: &mut Budget<'_>,
+) -> Result<Value, EvolutionError> {
+    Ok(match expr {
         Expr::Input => budget.clone_value(root, 0)?,
         Expr::Current => budget.clone_value(
             current.ok_or_else(|| {
@@ -577,32 +594,70 @@ fn eval(
             budget,
         )?,
         Expr::Literal { value } => budget.clone_value(value, 0)?,
-        Expr::Map { input, expr } => {
-            let evaluated = eval(input, root, current, budget)?;
-            let array = evaluated.as_array().ok_or_else(|| {
-                EvolutionError::InvalidDefinition("map input must be an array".into())
-            })?;
-            budget.charge(array.len().saturating_mul(std::mem::size_of::<Value>()))?;
-            let mut out = Vec::with_capacity(array.len());
-            for value in array {
-                out.push(eval(expr, root, Some(value), budget)?);
-            }
-            Value::Array(out)
+        _ => unreachable!("compound expression dispatched separately"),
+    })
+}
+
+fn eval_collection(
+    expr: &Expr,
+    root: &Value,
+    current: Option<&Value>,
+    budget: &mut Budget<'_>,
+) -> Result<Value, EvolutionError> {
+    match expr {
+        Expr::Map { input, expr } => eval_map(input, expr, root, current, budget),
+        Expr::Filter { input, predicate } => eval_filter(input, predicate, root, current, budget),
+        _ => unreachable!("non-collection expression dispatched separately"),
+    }
+}
+
+fn eval_map(
+    input: &Expr,
+    expr: &Expr,
+    root: &Value,
+    current: Option<&Value>,
+    budget: &mut Budget<'_>,
+) -> Result<Value, EvolutionError> {
+    let evaluated = eval(input, root, current, budget)?;
+    let array = evaluated
+        .as_array()
+        .ok_or_else(|| EvolutionError::InvalidDefinition("map input must be an array".into()))?;
+    budget.charge(array.len().saturating_mul(std::mem::size_of::<Value>()))?;
+    let mut out = Vec::with_capacity(array.len());
+    for value in array {
+        out.push(eval(expr, root, Some(value), budget)?);
+    }
+    Ok(Value::Array(out))
+}
+
+fn eval_filter(
+    input: &Expr,
+    predicate: &Expr,
+    root: &Value,
+    current: Option<&Value>,
+    budget: &mut Budget<'_>,
+) -> Result<Value, EvolutionError> {
+    let evaluated = eval(input, root, current, budget)?;
+    let array = evaluated
+        .as_array()
+        .ok_or_else(|| EvolutionError::InvalidDefinition("filter input must be an array".into()))?;
+    budget.charge(array.len().saturating_mul(std::mem::size_of::<Value>()))?;
+    let mut out = Vec::new();
+    for value in array {
+        if eval(predicate, root, Some(value), budget)?.as_bool() == Some(true) {
+            out.push(budget.clone_value(value, 0)?);
         }
-        Expr::Filter { input, predicate } => {
-            let evaluated = eval(input, root, current, budget)?;
-            let array = evaluated.as_array().ok_or_else(|| {
-                EvolutionError::InvalidDefinition("filter input must be an array".into())
-            })?;
-            budget.charge(array.len().saturating_mul(std::mem::size_of::<Value>()))?;
-            let mut out = Vec::new();
-            for value in array {
-                if eval(predicate, root, Some(value), budget)?.as_bool() == Some(true) {
-                    out.push(budget.clone_value(value, 0)?);
-                }
-            }
-            Value::Array(out)
-        }
+    }
+    Ok(Value::Array(out))
+}
+
+fn eval_logic(
+    expr: &Expr,
+    root: &Value,
+    current: Option<&Value>,
+    budget: &mut Budget<'_>,
+) -> Result<Value, EvolutionError> {
+    Ok(match expr {
         Expr::Compare {
             comparison,
             left,
@@ -643,9 +698,8 @@ fn eval(
                 .as_bool()
                 .unwrap_or(false),
         ),
-    };
-    budget.charge(0)?;
-    Ok(result)
+        _ => unreachable!("non-logic expression dispatched separately"),
+    })
 }
 
 fn lookup<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
@@ -904,31 +958,14 @@ impl Registry {
             .optional()?
             .ok_or_else(|| EvolutionError::NotFound(suite_id.into()))?;
         let cases: Vec<EvaluationCase> = serde_json::from_slice(&cases_json)?;
-        let mut failures = Vec::new();
-        let started = Instant::now();
-        for (index, case) in cases.iter().enumerate() {
-            if started.elapsed() > MAX_EXECUTION
-                || cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
-            {
-                failures.push(
-                    "suite cancelled or deadline exceeded; remaining cases were not passed".into(),
-                );
-                break;
-            }
-            match execute(&candidate.definition, &case.inputs, cancel) {
-                Ok(result) if result.value == case.expected => {}
-                Ok(_) => failures.push(format!("case {index}: output mismatch")),
-                Err(error) => failures.push(format!("case {index}: {error}")),
-            }
-        }
+        let failures = evaluate_cases(&candidate.definition, &cases, cancel);
         let report = EvaluationReport {
             tool_hash: hash.into(),
             passed: failures.is_empty() && !cases.is_empty(),
             cases: cases.len(),
             failures,
         };
-        let encoded = serde_json::to_vec(&report)?;
-        self.connection.lock().unwrap().execute("INSERT INTO tool_evaluations(hash,suite_id,report_json,passed,created_at) VALUES(?,?,?,?,strftime('%s','now'))", params![hash, suite_id, encoded, report.passed])?;
+        persist_evaluation(&self.connection, hash, suite_id, &report)?;
         Ok(report)
     }
 
@@ -963,49 +1000,15 @@ impl Registry {
         // The active grant is the only baseline authority.  A same-name tool
         // with a different scope is not a valid comparison and is reported as
         // no baseline rather than being silently widened.
-        let baseline_hash: Option<String> = {
-            let db = self.connection.lock().unwrap();
-            let mut statement = db.prepare(
-                "SELECT a.hash,g.scope_json,g.expires_at,g.revoked FROM tool_activations a JOIN tool_grants g ON g.grant_id=a.grant_id WHERE a.name=? AND a.active=1",
-            )?;
-            let mut rows = statement.query(params![candidate.definition.name])?;
-            let mut found = None;
-            while let Some(row) = rows.next()? {
-                let hash: String = row.get(0)?;
-                let scope: Scope = serde_json::from_slice(&row.get::<_, Vec<u8>>(1)?)?;
-                let expiry: Option<f64> = row.get(2)?;
-                let revoked: i64 = row.get(3)?;
-                if hash != candidate_hash
-                    && scope == candidate.definition.input_scope
-                    && revoked == 0
-                    && expiry.is_none_or(|value| value > now())
-                {
-                    found = Some(hash);
-                    break;
-                }
-            }
-            found
-        };
+        let baseline_hash = self.comparison_baseline_hash(&candidate, candidate_hash)?;
         let baseline = baseline_hash
             .as_deref()
             .map(|hash| self.candidate(hash))
             .transpose()?
             .flatten();
-        let (baseline_passed, baseline_fuel, baseline_operations) = match baseline {
-            Some(record) if record.definition.input_scope == candidate.definition.input_scope => {
-                let (passed, fuel, operations) =
-                    run_comparison_cases(&record.definition, &cases, cancel)?;
-                (Some(passed), Some(fuel), Some(operations))
-            }
-            _ => (None, None, None),
-        };
-        let verdict = match baseline_passed {
-            None => "first_candidate",
-            Some(previous) if candidate_passed > previous => "improvement",
-            Some(previous) if candidate_passed < previous => "regression",
-            Some(_) => "equivalent",
-        }
-        .to_owned();
+        let (baseline_passed, baseline_fuel, baseline_operations) =
+            compare_baseline(baseline, &candidate, &cases, cancel)?;
+        let verdict = comparison_verdict(baseline_passed, candidate_passed);
         let receipt = ComparisonReceipt {
             candidate_hash: candidate_hash.into(),
             baseline_hash,
@@ -1018,25 +1021,38 @@ impl Registry {
             baseline_operations,
             verdict,
         };
-        let encoded = serde_json::to_vec(&receipt)?;
-        self.connection.lock().unwrap().execute(
-            "INSERT INTO tool_comparisons(candidate_hash,baseline_hash,suite_id,scope_json,candidate_passed,baseline_passed,candidate_fuel,baseline_fuel,candidate_operations,baseline_operations,verdict,receipt_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'))",
-            params![
-                &receipt.candidate_hash,
-                &receipt.baseline_hash,
-                &receipt.suite_id,
-                serde_json::to_vec(&candidate.definition.input_scope)?,
-                receipt.candidate_passed as i64,
-                receipt.baseline_passed.map(|value| value as i64),
-                receipt.candidate_fuel as i64,
-                receipt.baseline_fuel.map(|value| value as i64),
-                receipt.candidate_operations as i64,
-                receipt.baseline_operations.map(|value| value as i64),
-                &receipt.verdict,
-                encoded,
-            ],
+        persist_comparison(
+            &self.connection,
+            &receipt,
+            &candidate.definition.input_scope,
         )?;
         Ok(receipt)
+    }
+
+    fn comparison_baseline_hash(
+        &self,
+        candidate: &CandidateRecord,
+        candidate_hash: &str,
+    ) -> Result<Option<String>, EvolutionError> {
+        let db = self.connection.lock().unwrap();
+        let mut statement = db.prepare(
+            "SELECT a.hash,g.scope_json,g.expires_at,g.revoked FROM tool_activations a JOIN tool_grants g ON g.grant_id=a.grant_id WHERE a.name=? AND a.active=1",
+        )?;
+        let mut rows = statement.query(params![candidate.definition.name])?;
+        while let Some(row) = rows.next()? {
+            let hash: String = row.get(0)?;
+            let scope: Scope = serde_json::from_slice(&row.get::<_, Vec<u8>>(1)?)?;
+            let expiry: Option<f64> = row.get(2)?;
+            let revoked: i64 = row.get(3)?;
+            if hash != candidate_hash
+                && scope == candidate.definition.input_scope
+                && revoked == 0
+                && expiry.is_none_or(|value| value > now())
+            {
+                return Ok(Some(hash));
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn active_baseline_hash(
@@ -1125,14 +1141,12 @@ impl Registry {
             return Err(EvolutionError::ApprovalMismatch);
         };
         let stored_scope: Scope = serde_json::from_slice(&scope_json)?;
-        if hash != grant.tool_hash
-            || stored_scope != grant.scope
-            || revoked != 0
-            || expires_at.is_some_and(|value| value <= now())
-            || !stored_scope.contains(&candidate.definition.input_scope)
-        {
-            return Err(EvolutionError::ApprovalMismatch);
-        }
+        validate_grant_activation(grant, &candidate, &hash, &stored_scope, expires_at, revoked)?;
+        self.ensure_candidate_eligible(&hash)?;
+        self.store_activation(&candidate, &hash, grant)
+    }
+
+    fn ensure_candidate_eligible(&self, hash: &str) -> Result<(), EvolutionError> {
         let eligibility: (i64, i64) = self.connection.lock().unwrap().query_row(
             "SELECT COUNT(*), COALESCE(SUM(CASE WHEN EXISTS(SELECT 1 FROM tool_evaluations e WHERE e.hash=r.hash AND e.suite_id=r.suite_id AND e.passed=1) AND NOT EXISTS(SELECT 1 FROM tool_evaluations f WHERE f.hash=r.hash AND f.suite_id=r.suite_id AND f.passed=0) THEN 1 ELSE 0 END),0) FROM candidate_required_suites r WHERE r.hash=?",
             params![hash],
@@ -1143,6 +1157,15 @@ impl Registry {
                 "all mandatory protected evaluator suites must pass with no failure history".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn store_activation(
+        &self,
+        candidate: &CandidateRecord,
+        hash: &str,
+        grant: &ApprovalGrant,
+    ) -> Result<(), EvolutionError> {
         self.connection.lock().unwrap().execute("INSERT INTO tool_activations(name,hash,grant_id,active) VALUES(?,?,?,1) ON CONFLICT(name) DO UPDATE SET hash=excluded.hash,grant_id=excluded.grant_id,active=1", params![candidate.definition.name, hash, grant.grant_id])?;
         Ok(())
     }
@@ -1163,8 +1186,21 @@ impl Registry {
         inputs: &[ScopedInput],
         cancel: Option<&AtomicBool>,
     ) -> Result<ToolResult, EvolutionError> {
-        let (hash, grant_id): (String, String) = self
-            .connection
+        let (hash, grant_id) = self.active_tool_grant(name)?;
+        let candidate = self
+            .candidate(&hash)?
+            .ok_or_else(|| EvolutionError::NotFound(hash.clone()))?;
+        let scope = self.invocation_scope(&grant_id, inputs, &candidate)?;
+        let result = execute(&candidate.definition, inputs, cancel)?;
+        if !scope.contains(&result.output_scope) {
+            return Err(EvolutionError::ApprovalMismatch);
+        }
+        self.ensure_grant_still_valid(&grant_id)?;
+        Ok(result)
+    }
+
+    fn active_tool_grant(&self, name: &str) -> Result<(String, String), EvolutionError> {
+        self.connection
             .lock()
             .unwrap()
             .query_row(
@@ -1173,10 +1209,15 @@ impl Registry {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
-            .ok_or_else(|| EvolutionError::NotFound(name.into()))?;
-        let candidate = self
-            .candidate(&hash)?
-            .ok_or_else(|| EvolutionError::NotFound(hash.clone()))?;
+            .ok_or_else(|| EvolutionError::NotFound(name.into()))
+    }
+
+    fn invocation_scope(
+        &self,
+        grant_id: &str,
+        inputs: &[ScopedInput],
+        candidate: &CandidateRecord,
+    ) -> Result<Scope, EvolutionError> {
         let (scope_json, expires_at, revoked): (Vec<u8>, Option<f64>, i64) =
             self.connection.lock().unwrap().query_row(
                 "SELECT scope_json,expires_at,revoked FROM tool_grants WHERE grant_id=?",
@@ -1192,15 +1233,15 @@ impl Registry {
         {
             return Err(EvolutionError::ApprovalMismatch);
         }
-        let result = execute(&candidate.definition, inputs, cancel)?;
-        if !scope.contains(&result.output_scope) {
-            return Err(EvolutionError::ApprovalMismatch);
-        }
+        Ok(scope)
+    }
+
+    fn ensure_grant_still_valid(&self, grant_id: &str) -> Result<(), EvolutionError> {
         let still_valid: bool = self.connection.lock().unwrap().query_row("SELECT revoked=0 AND (expires_at IS NULL OR expires_at>?) FROM tool_grants WHERE grant_id=?", params![now(), grant_id], |row| row.get(0))?;
         if !still_valid {
             return Err(EvolutionError::ApprovalMismatch);
         }
-        Ok(result)
+        Ok(())
     }
 
     pub(crate) fn is_active_hash(
@@ -1311,6 +1352,116 @@ impl Registry {
         })
         .transpose()
     }
+}
+
+fn evaluate_cases(
+    definition: &ToolDefinition,
+    cases: &[EvaluationCase],
+    cancel: Option<&AtomicBool>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let started = Instant::now();
+    for (index, case) in cases.iter().enumerate() {
+        if started.elapsed() > MAX_EXECUTION
+            || cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            failures.push(
+                "suite cancelled or deadline exceeded; remaining cases were not passed".into(),
+            );
+            break;
+        }
+        match execute(definition, &case.inputs, cancel) {
+            Ok(result) if result.value == case.expected => {}
+            Ok(_) => failures.push(format!("case {index}: output mismatch")),
+            Err(error) => failures.push(format!("case {index}: {error}")),
+        }
+    }
+    failures
+}
+
+fn persist_evaluation(
+    connection: &Mutex<Connection>,
+    hash: &str,
+    suite_id: &str,
+    report: &EvaluationReport,
+) -> Result<(), EvolutionError> {
+    let encoded = serde_json::to_vec(report)?;
+    connection.lock().unwrap().execute(
+        "INSERT INTO tool_evaluations(hash,suite_id,report_json,passed,created_at) VALUES(?,?,?,?,strftime('%s','now'))",
+        params![hash, suite_id, encoded, report.passed],
+    )?;
+    Ok(())
+}
+
+fn validate_grant_activation(
+    grant: &ApprovalGrant,
+    candidate: &CandidateRecord,
+    stored_hash: &str,
+    stored_scope: &Scope,
+    expires_at: Option<f64>,
+    revoked: i64,
+) -> Result<(), EvolutionError> {
+    let exact_grant = stored_hash == grant.tool_hash && stored_scope == &grant.scope;
+    let valid_state = revoked == 0 && expires_at.is_none_or(|value| value > now());
+    let scope_is_sufficient = stored_scope.contains(&candidate.definition.input_scope);
+    if exact_grant && valid_state && scope_is_sufficient {
+        Ok(())
+    } else {
+        Err(EvolutionError::ApprovalMismatch)
+    }
+}
+
+type BaselineMetrics = (Option<usize>, Option<u64>, Option<u64>);
+
+fn compare_baseline(
+    baseline: Option<CandidateRecord>,
+    candidate: &CandidateRecord,
+    cases: &[EvaluationCase],
+    cancel: Option<&AtomicBool>,
+) -> Result<BaselineMetrics, EvolutionError> {
+    let Some(record) =
+        baseline.filter(|record| record.definition.input_scope == candidate.definition.input_scope)
+    else {
+        return Ok((None, None, None));
+    };
+    let (passed, fuel, operations) = run_comparison_cases(&record.definition, cases, cancel)?;
+    Ok((Some(passed), Some(fuel), Some(operations)))
+}
+
+fn comparison_verdict(baseline_passed: Option<usize>, candidate_passed: usize) -> String {
+    match baseline_passed {
+        None => "first_candidate",
+        Some(previous) if candidate_passed > previous => "improvement",
+        Some(previous) if candidate_passed < previous => "regression",
+        Some(_) => "equivalent",
+    }
+    .to_owned()
+}
+
+fn persist_comparison(
+    connection: &Mutex<Connection>,
+    receipt: &ComparisonReceipt,
+    scope: &Scope,
+) -> Result<(), EvolutionError> {
+    let encoded = serde_json::to_vec(receipt)?;
+    connection.lock().unwrap().execute(
+        "INSERT INTO tool_comparisons(candidate_hash,baseline_hash,suite_id,scope_json,candidate_passed,baseline_passed,candidate_fuel,baseline_fuel,candidate_operations,baseline_operations,verdict,receipt_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'))",
+        params![
+            &receipt.candidate_hash,
+            &receipt.baseline_hash,
+            &receipt.suite_id,
+            serde_json::to_vec(scope)?,
+            receipt.candidate_passed as i64,
+            receipt.baseline_passed.map(|value| value as i64),
+            receipt.candidate_fuel as i64,
+            receipt.baseline_fuel.map(|value| value as i64),
+            receipt.candidate_operations as i64,
+            receipt.baseline_operations.map(|value| value as i64),
+            &receipt.verdict,
+            encoded,
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -81,20 +81,7 @@ impl Owner {
             UnixListener::bind(&endpoint).context("Cannot bind the private assistant endpoint")?;
         fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
-        let epoch = root.join("owner.sqlite");
-        crate::assistant_storage::database(&epoch)?;
-        let mut db = rusqlite::Connection::open(epoch)?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS owner_epoch(id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL); INSERT OR IGNORE INTO owner_epoch VALUES(1,0);")?;
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let previous: i64 =
-            tx.query_row("SELECT epoch FROM owner_epoch WHERE id=1", [], |row| {
-                row.get(0)
-            })?;
-        let generation = previous
-            .checked_add(1)
-            .context("Assistant owner generation exhausted")?;
-        tx.execute("UPDATE owner_epoch SET epoch=? WHERE id=1", [generation])?;
-        tx.commit()?;
+        let generation = next_owner_generation(root)?;
         Ok(Self {
             _lock: lock,
             listener,
@@ -154,6 +141,23 @@ impl Owner {
     }
 }
 
+fn next_owner_generation(root: &Path) -> Result<i64> {
+    let epoch = root.join("owner.sqlite");
+    crate::assistant_storage::database(&epoch)?;
+    let mut db = rusqlite::Connection::open(epoch)?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS owner_epoch(id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL); INSERT OR IGNORE INTO owner_epoch VALUES(1,0);")?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let previous: i64 = tx.query_row("SELECT epoch FROM owner_epoch WHERE id=1", [], |row| {
+        row.get(0)
+    })?;
+    let generation = previous
+        .checked_add(1)
+        .context("Assistant owner generation exhausted")?;
+    tx.execute("UPDATE owner_epoch SET epoch=? WHERE id=1", [generation])?;
+    tx.commit()?;
+    Ok(generation)
+}
+
 impl Drop for Owner {
     fn drop(&mut self) {
         // Still hold the lock: a successor cannot have bound this path yet.
@@ -176,19 +180,7 @@ impl View {
         handle: &mut impl FnMut(Value) -> Result<Value>,
     ) -> Result<()> {
         if self.output.is_empty() {
-            let mut chunk = [0; 4096];
-            match self.stream.read(&mut chunk) {
-                Ok(0) => bail!("View closed"),
-                Ok(count) => {
-                    if self.input.len() + count > MAX_FRAME {
-                        bail!("Assistant frame too large");
-                    }
-                    self.input.extend_from_slice(&chunk[..count]);
-                    self.touched = Instant::now();
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
-            }
+            self.read_input()?;
             if let Some(end) = self.input.iter().position(|byte| *byte == b'\n') {
                 let result = decode(&self.input[..end], generation).and_then(handle);
                 self.input.drain(..=end);
@@ -211,20 +203,42 @@ impl View {
             }
         }
         if !self.output.is_empty() {
-            match self.stream.write(&self.output[self.written..]) {
-                Ok(0) => bail!("View closed"),
-                Ok(count) => self.written += count,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
-            }
-            if self.written == self.output.len() {
-                self.output.clear();
-            }
+            self.write_output()?;
         }
         if (!self.input.is_empty() || !self.output.is_empty())
             && self.touched.elapsed() > Duration::from_secs(2)
         {
             bail!("Slow or incomplete assistant frame");
+        }
+        Ok(())
+    }
+
+    fn read_input(&mut self) -> Result<()> {
+        let mut chunk = [0; 4096];
+        match self.stream.read(&mut chunk) {
+            Ok(0) => bail!("View closed"),
+            Ok(count) => {
+                if self.input.len() + count > MAX_FRAME {
+                    bail!("Assistant frame too large");
+                }
+                self.input.extend_from_slice(&chunk[..count]);
+                self.touched = Instant::now();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    fn write_output(&mut self) -> Result<()> {
+        match self.stream.write(&self.output[self.written..]) {
+            Ok(0) => bail!("View closed"),
+            Ok(count) => self.written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+        if self.written == self.output.len() {
+            self.output.clear();
         }
         Ok(())
     }

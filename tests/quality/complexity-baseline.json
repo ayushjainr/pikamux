@@ -224,13 +224,13 @@
       46
     ],
     "src/monitor.rs::draw_frame": [
-      62
+      55
     ],
     "src/monitor.rs::draw_quota": [
       17
     ],
     "src/monitor.rs::key": [
-      36
+      35
     ],
     "src/monitor.rs::present": [
       18

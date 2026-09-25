@@ -111,6 +111,16 @@ struct QueuedJob {
     forget_epoch: u64,
 }
 
+struct ChildIntent<'a> {
+    request: &'a WorkerRequest,
+    root_id: &'a str,
+    child_id: &'a str,
+    scope_json: &'a str,
+    dependency_json: &'a str,
+    forget_epoch: u64,
+    now: i64,
+}
+
 pub struct AssistantCoordinator {
     memory: Store,
     policy: AssistantPolicy,
@@ -135,211 +145,13 @@ impl AssistantCoordinator {
         Ok(())
     }
     pub fn new(memory: Store, mut policy: AssistantPolicy) -> Result<Self, CoordinatorError> {
-        let path = memory.path().with_extension("observations.sqlite");
-        crate::assistant_storage::database(&path).map_err(MemoryError::Filesystem)?;
-        let observation_db = Connection::open(path).map_err(MemoryError::Database)?;
-        observation_db.execute_batch("CREATE TABLE IF NOT EXISTS assistant_observations (node_id TEXT NOT NULL, provider TEXT NOT NULL, conversation_id TEXT NOT NULL, project TEXT, status TEXT NOT NULL, summary TEXT NOT NULL, observed_at INTEGER NOT NULL, material_revision INTEGER NOT NULL, payload_hash TEXT NOT NULL, PRIMARY KEY(node_id,provider,conversation_id));").map_err(MemoryError::Database)?;
-        let mut observations = HashMap::new();
-        let queue_path = memory.path().with_extension("queue.sqlite");
-        crate::assistant_storage::database(&queue_path).map_err(MemoryError::Filesystem)?;
-        let queue_db = Connection::open(queue_path).map_err(MemoryError::Database)?;
-        queue_db.execute_batch("CREATE TABLE IF NOT EXISTS assistant_jobs (job_id TEXT PRIMARY KEY, root_id TEXT NOT NULL, scope_json TEXT NOT NULL, prompt TEXT NOT NULL, dependency_json TEXT NOT NULL DEFAULT '[]', forget_epoch INTEGER NOT NULL DEFAULT 0, child_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL CHECK(state IN ('intent','reserved','dispatched','completed','failed','unknown')), created_at INTEGER NOT NULL)").map_err(MemoryError::Database)?;
-        let has_dependency_column: bool = queue_db
-            .prepare("PRAGMA table_info(assistant_jobs)")
-            .map_err(MemoryError::Database)?
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(MemoryError::Database)?
-            .filter_map(Result::ok)
-            .any(|name| name == "dependency_json");
-        if !has_dependency_column {
-            queue_db.execute("ALTER TABLE assistant_jobs ADD COLUMN dependency_json TEXT NOT NULL DEFAULT '[]'", []).map_err(MemoryError::Database)?;
-        }
-        let has_forget_epoch: bool = queue_db
-            .prepare("PRAGMA table_info(assistant_jobs)")
-            .map_err(MemoryError::Database)?
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(MemoryError::Database)?
-            .filter_map(Result::ok)
-            .any(|name| name == "forget_epoch");
-        if !has_forget_epoch {
-            queue_db
-                .execute(
-                    "ALTER TABLE assistant_jobs ADD COLUMN forget_epoch INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )
-                .map_err(MemoryError::Database)?;
-        }
+        let observation_db =
+            open_observation_db(memory.path().with_extension("observations.sqlite"))?;
+        let queue_db = open_queue_db(memory.path().with_extension("queue.sqlite"))?;
         let current_forget_epoch = memory.forget_epoch()?;
-        queue_db
-            .execute(
-                "UPDATE assistant_jobs SET state='unknown' WHERE state='dispatched'",
-                [],
-            )
-            .map_err(MemoryError::Database)?;
-        let mut quarantined = Vec::new();
-        {
-            let mut statement = queue_db
-                .prepare("SELECT job_id,child_id FROM assistant_jobs WHERE state='unknown'")
-                .map_err(MemoryError::Database)?;
-            for row in statement
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-                .map_err(MemoryError::Database)?
-            {
-                let (job, child) = row.map_err(MemoryError::Database)?;
-                if policy
-                    .reservation(&child)?
-                    .is_some_and(|r| r.state == ReservationState::Dispatched)
-                {
-                    policy.record_outcome(&child, DeliveryOutcome::Unknown, 0)?;
-                }
-                quarantined.push(job);
-            }
-        }
-        {
-            let mut statement = queue_db
-                .prepare("SELECT job_id,child_id FROM assistant_jobs WHERE state='intent'")
-                .map_err(MemoryError::Database)?;
-            let ids: Vec<(String, String)> = statement
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map_err(MemoryError::Database)?
-                .filter_map(Result::ok)
-                .collect();
-            for (job_id, child_id) in ids {
-                if let Some(reservation) = policy.reservation(&child_id)? {
-                    match reservation.state {
-                        ReservationState::Reserved => {
-                            policy.release_before_dispatch(&child_id, 0)?;
-                        }
-                        ReservationState::Dispatched => {
-                            policy.record_outcome(&child_id, DeliveryOutcome::Unknown, 0)?;
-                            queue_db.execute("UPDATE assistant_jobs SET state='unknown',prompt='',dependency_json='[]' WHERE job_id=?", [&job_id]).map_err(MemoryError::Database)?;
-                            quarantined.push(job_id.clone());
-                        }
-                        ReservationState::Unknown => {
-                            queue_db.execute("UPDATE assistant_jobs SET state='unknown',prompt='',dependency_json='[]' WHERE job_id=?", [&job_id]).map_err(MemoryError::Database)?;
-                            quarantined.push(job_id.clone());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        queue_db
-            .execute("DELETE FROM assistant_jobs WHERE state='intent'", [])
-            .map_err(MemoryError::Database)?;
-        {
-            let mut statement = queue_db.prepare("SELECT job_id,child_id FROM assistant_jobs WHERE state='reserved' AND forget_epoch<>?").map_err(MemoryError::Database)?;
-            let stale: Vec<(String, String)> = statement
-                .query_map([current_forget_epoch as i64], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
-                .map_err(MemoryError::Database)?
-                .filter_map(Result::ok)
-                .collect();
-            for (job_id, child_id) in stale {
-                if let Some(reservation) = policy.reservation(&child_id)? {
-                    if matches!(
-                        reservation.state,
-                        ReservationState::Dispatched | ReservationState::Unknown
-                    ) {
-                        if reservation.state == ReservationState::Dispatched {
-                            policy.record_outcome(&child_id, DeliveryOutcome::Unknown, 0)?;
-                        }
-                        queue_db.execute("UPDATE assistant_jobs SET state='unknown',prompt='',dependency_json='[]' WHERE job_id=?", [&job_id]).map_err(MemoryError::Database)?;
-                        quarantined.push(job_id);
-                        continue;
-                    }
-                    if reservation.state == ReservationState::Reserved {
-                        policy.release_before_dispatch(&child_id, 0)?;
-                    }
-                }
-                queue_db
-                    .execute(
-                        "DELETE FROM assistant_jobs WHERE job_id=? AND state='reserved'",
-                        [&job_id],
-                    )
-                    .map_err(MemoryError::Database)?;
-            }
-        }
-        {
-            let mut rows = observation_db.prepare("SELECT node_id,provider,conversation_id,project,status,summary,observed_at,material_revision FROM assistant_observations").map_err(MemoryError::Database)?;
-            for row in rows
-                .query_map([], |r| {
-                    Ok(OperationalObservation {
-                        node_id: r.get(0)?,
-                        provider: r.get(1)?,
-                        conversation_id: r.get(2)?,
-                        project: r.get(3)?,
-                        status: parse_status(&r.get::<_, String>(4)?),
-                        summary: r.get(5)?,
-                        observed_at: r.get(6)?,
-                        material_revision: r.get::<_, i64>(7)? as u64,
-                    })
-                })
-                .map_err(MemoryError::Database)?
-            {
-                let item = row.map_err(MemoryError::Database)?;
-                observations.insert(
-                    ObservationKey {
-                        node_id: item.node_id.clone(),
-                        provider: item.provider.clone(),
-                        conversation_id: item.conversation_id.clone(),
-                    },
-                    item,
-                );
-            }
-        }
-        let mut jobs = VecDeque::new();
-        {
-            let mut stmt = queue_db.prepare("SELECT job_id,root_id,scope_json,prompt,dependency_json,child_id FROM assistant_jobs WHERE state='reserved' AND forget_epoch=? ORDER BY created_at,job_id").map_err(MemoryError::Database)?;
-            let rows = stmt
-                .query_map([current_forget_epoch as i64], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, String>(5)?,
-                    ))
-                })
-                .map_err(MemoryError::Database)?;
-            for row in rows {
-                let (job_id, root_id, scope_json, prompt, dependency_json, child_id) =
-                    row.map_err(MemoryError::Database)?;
-                let reservation = policy.reservation(&child_id)?;
-                if !reservation
-                    .as_ref()
-                    .is_some_and(|r| r.state == ReservationState::Reserved)
-                {
-                    if reservation
-                        .as_ref()
-                        .is_some_and(|r| r.state == ReservationState::Dispatched)
-                    {
-                        policy.record_outcome(&child_id, DeliveryOutcome::Unknown, 0)?;
-                    }
-                    queue_db.execute("UPDATE assistant_jobs SET state='unknown',prompt='',dependency_json='[]' WHERE job_id=?", [&job_id]).map_err(MemoryError::Database)?;
-                    quarantined.push(job_id);
-                    continue;
-                }
-                let scope: Scope =
-                    serde_json::from_str(&scope_json).map_err(MemoryError::Serialization)?;
-                let dependency_ids: Vec<String> =
-                    serde_json::from_str(&dependency_json).map_err(MemoryError::Serialization)?;
-                jobs.push_back(QueuedJob {
-                    request: WorkerRequest {
-                        job_id,
-                        root_id,
-                        scope,
-                        prompt,
-                        dependency_ids,
-                    },
-                    child_id,
-                    cancelled: Arc::new(AtomicBool::new(false)),
-                    forget_epoch: current_forget_epoch,
-                });
-            }
-        }
+        let (jobs, quarantined) =
+            recover_queued_jobs(&queue_db, &mut policy, current_forget_epoch)?;
+        let observations = load_observations(&observation_db)?;
         Ok(Self {
             memory,
             policy,
@@ -477,6 +289,39 @@ impl AssistantCoordinator {
         request: WorkerRequest,
         now: i64,
     ) -> Result<(), CoordinatorError> {
+        self.validate_child_request(root_id, &request)?;
+        let child_id = format!("{}:child:{}", root_id, request.job_id);
+        let scope_json =
+            serde_json::to_string(&request.scope).map_err(MemoryError::Serialization)?;
+        let dependency_json =
+            serde_json::to_string(&request.dependency_ids).map_err(MemoryError::Serialization)?;
+        let forget_epoch = self.memory.forget_epoch()?;
+        self.persist_child_intent(ChildIntent {
+            request: &request,
+            root_id,
+            child_id: &child_id,
+            scope_json: &scope_json,
+            dependency_json: &dependency_json,
+            forget_epoch,
+            now,
+        })?;
+        self.policy
+            .reserve_child(&child_id, root_id, 1, now, None)?;
+        self.mark_child_reserved(&request.job_id)?;
+        self.jobs.push_back(QueuedJob {
+            request,
+            child_id,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            forget_epoch,
+        });
+        Ok(())
+    }
+
+    fn validate_child_request(
+        &self,
+        root_id: &str,
+        request: &WorkerRequest,
+    ) -> Result<(), CoordinatorError> {
         if self.jobs.len() >= MAX_JOBS {
             return Err(CoordinatorError::QueueFull);
         }
@@ -491,6 +336,12 @@ impl AssistantCoordinator {
         if self.jobs.iter().any(|j| j.request.job_id == request.job_id) {
             return Err(CoordinatorError::DuplicateJob);
         }
+        self.validate_child_dependencies(request)?;
+        self.validate_root_envelope(root_id)?;
+        Ok(())
+    }
+
+    fn validate_child_dependencies(&self, request: &WorkerRequest) -> Result<(), CoordinatorError> {
         let records = self.memory.recent(&request.scope, 256)?;
         if request.dependency_ids.len() > 64
             || request
@@ -502,6 +353,10 @@ impl AssistantCoordinator {
                 "worker dependency is outside exact memory scope".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn validate_root_envelope(&self, root_id: &str) -> Result<(), CoordinatorError> {
         let root = self
             .policy
             .reservation(root_id)?
@@ -509,27 +364,21 @@ impl AssistantCoordinator {
         if root.parent_id.is_some() || root.state != ReservationState::Reserved {
             return Err(CoordinatorError::RootDispatch);
         }
-        let child_id = format!("{}:child:{}", root_id, request.job_id);
-        let scope_json =
-            serde_json::to_string(&request.scope).map_err(MemoryError::Serialization)?;
-        let dependency_json =
-            serde_json::to_string(&request.dependency_ids).map_err(MemoryError::Serialization)?;
-        let forget_epoch = self.memory.forget_epoch()?;
-        self.queue_db.execute("INSERT INTO assistant_jobs(job_id,root_id,scope_json,prompt,dependency_json,forget_epoch,child_id,state,created_at) VALUES(?,?,?,?,?,?,?,'intent',?)", params![&request.job_id, root_id, scope_json, &request.prompt, dependency_json, forget_epoch as i64, &child_id, now]).map_err(MemoryError::Database)?;
-        self.policy
-            .reserve_child(&child_id, root_id, 1, now, None)?;
+        Ok(())
+    }
+
+    fn persist_child_intent(&self, intent: ChildIntent<'_>) -> Result<(), CoordinatorError> {
+        self.queue_db.execute("INSERT INTO assistant_jobs(job_id,root_id,scope_json,prompt,dependency_json,forget_epoch,child_id,state,created_at) VALUES(?,?,?,?,?,?,?,'intent',?)", params![&intent.request.job_id, intent.root_id, intent.scope_json, &intent.request.prompt, intent.dependency_json, intent.forget_epoch as i64, intent.child_id, intent.now]).map_err(MemoryError::Database)?;
+        Ok(())
+    }
+
+    fn mark_child_reserved(&self, job_id: &str) -> Result<(), CoordinatorError> {
         self.queue_db
             .execute(
                 "UPDATE assistant_jobs SET state='reserved' WHERE job_id=? AND state='intent'",
-                [&request.job_id],
+                [job_id],
             )
             .map_err(MemoryError::Database)?;
-        self.jobs.push_back(QueuedJob {
-            request,
-            child_id,
-            cancelled: Arc::new(AtomicBool::new(false)),
-            forget_epoch,
-        });
         Ok(())
     }
 
@@ -588,6 +437,13 @@ impl AssistantCoordinator {
         worker: &mut W,
         now: i64,
     ) -> Result<Option<WorkerResult>, CoordinatorError> {
+        let Some(job) = self.take_ready_job(now)? else {
+            return Ok(None);
+        };
+        self.run_ready_job(worker, job, now).map(Some)
+    }
+
+    fn take_ready_job(&mut self, now: i64) -> Result<Option<QueuedJob>, CoordinatorError> {
         if self.active >= MAX_WORKERS {
             return Ok(None);
         }
@@ -595,13 +451,7 @@ impl AssistantCoordinator {
             return Ok(None);
         };
         if self.memory.forget_epoch()? != job.forget_epoch {
-            let _ = self.policy.release_before_dispatch(&job.child_id, now);
-            self.queue_db
-                .execute(
-                    "DELETE FROM assistant_jobs WHERE job_id=? AND state='reserved'",
-                    [&job.request.job_id],
-                )
-                .map_err(MemoryError::Database)?;
+            self.release_and_delete_job(&job, now)?;
             return Ok(None);
         }
         let records = self.memory.recent(&job.request.scope, 256)?;
@@ -611,25 +461,43 @@ impl AssistantCoordinator {
             .iter()
             .any(|id| !records.iter().any(|record| &record.id == id))
         {
-            let _ = self.policy.release_before_dispatch(&job.child_id, now);
-            self.queue_db
-                .execute(
-                    "DELETE FROM assistant_jobs WHERE job_id=? AND state='reserved'",
-                    [&job.request.job_id],
-                )
-                .map_err(MemoryError::Database)?;
+            self.release_and_delete_job(&job, now)?;
             return Ok(None);
         }
         if job.cancelled.load(Ordering::Acquire) {
-            let _ = self.policy.release_before_dispatch(&job.child_id, now);
-            self.queue_db
-                .execute(
-                    "DELETE FROM assistant_jobs WHERE job_id=? AND state='reserved'",
-                    [&job.request.job_id],
-                )
-                .map_err(MemoryError::Database)?;
+            self.release_and_delete_job(&job, now)?;
             return Ok(None);
         }
+        Ok(Some(job))
+    }
+
+    fn release_and_delete_job(
+        &mut self,
+        job: &QueuedJob,
+        now: i64,
+    ) -> Result<(), CoordinatorError> {
+        let _ = self.policy.release_before_dispatch(&job.child_id, now);
+        self.queue_db
+            .execute(
+                "DELETE FROM assistant_jobs WHERE job_id=? AND state='reserved'",
+                [&job.request.job_id],
+            )
+            .map_err(MemoryError::Database)?;
+        Ok(())
+    }
+
+    fn run_ready_job<W: CancellableWorker>(
+        &mut self,
+        worker: &mut W,
+        job: QueuedJob,
+        now: i64,
+    ) -> Result<WorkerResult, CoordinatorError> {
+        self.begin_dispatch(&job, now)?;
+        let result = worker.execute(&job.request, &job.cancelled);
+        self.finish_dispatch(&job, result, now)
+    }
+
+    fn begin_dispatch(&mut self, job: &QueuedJob, now: i64) -> Result<(), CoordinatorError> {
         self.active += 1;
         self.running
             .insert(job.request.job_id.clone(), job.cancelled.clone());
@@ -649,7 +517,15 @@ impl AssistantCoordinator {
             self.active -= 1;
             return Err(MemoryError::Database(error).into());
         }
-        let result = worker.execute(&job.request, &job.cancelled);
+        Ok(())
+    }
+
+    fn finish_dispatch(
+        &mut self,
+        job: &QueuedJob,
+        result: WorkerResult,
+        now: i64,
+    ) -> Result<WorkerResult, CoordinatorError> {
         let outcome = match result {
             WorkerResult::Completed { .. } => DeliveryOutcome::Completed,
             WorkerResult::Failed { .. } => DeliveryOutcome::Failed,
@@ -675,7 +551,7 @@ impl AssistantCoordinator {
         }
         self.running.remove(&job.request.job_id);
         self.active -= 1;
-        Ok(Some(result))
+        Ok(result)
     }
 
     pub fn record_user_correction(
@@ -725,6 +601,316 @@ impl AssistantCoordinator {
             },
         )?)
     }
+}
+
+type JobIdentity = (String, String);
+type StoredJob = (String, String, String, String, String, String);
+
+fn open_observation_db(path: std::path::PathBuf) -> Result<Connection, CoordinatorError> {
+    crate::assistant_storage::database(&path).map_err(MemoryError::Filesystem)?;
+    let connection = Connection::open(path).map_err(MemoryError::Database)?;
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS assistant_observations (node_id TEXT NOT NULL, provider TEXT NOT NULL, conversation_id TEXT NOT NULL, project TEXT, status TEXT NOT NULL, summary TEXT NOT NULL, observed_at INTEGER NOT NULL, material_revision INTEGER NOT NULL, payload_hash TEXT NOT NULL, PRIMARY KEY(node_id,provider,conversation_id));").map_err(MemoryError::Database)?;
+    Ok(connection)
+}
+
+fn open_queue_db(path: std::path::PathBuf) -> Result<Connection, CoordinatorError> {
+    crate::assistant_storage::database(&path).map_err(MemoryError::Filesystem)?;
+    let connection = Connection::open(path).map_err(MemoryError::Database)?;
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS assistant_jobs (job_id TEXT PRIMARY KEY, root_id TEXT NOT NULL, scope_json TEXT NOT NULL, prompt TEXT NOT NULL, dependency_json TEXT NOT NULL DEFAULT '[]', forget_epoch INTEGER NOT NULL DEFAULT 0, child_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL CHECK(state IN ('intent','reserved','dispatched','completed','failed','unknown')), created_at INTEGER NOT NULL)").map_err(MemoryError::Database)?;
+    migrate_queue_column(
+        &connection,
+        "dependency_json",
+        "ALTER TABLE assistant_jobs ADD COLUMN dependency_json TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    migrate_queue_column(
+        &connection,
+        "forget_epoch",
+        "ALTER TABLE assistant_jobs ADD COLUMN forget_epoch INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(connection)
+}
+
+fn migrate_queue_column(
+    connection: &Connection,
+    column: &str,
+    migration: &str,
+) -> Result<(), CoordinatorError> {
+    let has_column = connection
+        .prepare("PRAGMA table_info(assistant_jobs)")
+        .map_err(MemoryError::Database)?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(MemoryError::Database)?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    if !has_column {
+        connection
+            .execute(migration, [])
+            .map_err(MemoryError::Database)?;
+    }
+    Ok(())
+}
+
+fn recover_queued_jobs(
+    queue_db: &Connection,
+    policy: &mut AssistantPolicy,
+    forget_epoch: u64,
+) -> Result<(VecDeque<QueuedJob>, Vec<String>), CoordinatorError> {
+    queue_db
+        .execute(
+            "UPDATE assistant_jobs SET state='unknown' WHERE state='dispatched'",
+            [],
+        )
+        .map_err(MemoryError::Database)?;
+    let mut quarantined = quarantine_unknown(queue_db, policy)?;
+    recover_intents(queue_db, policy, &mut quarantined)?;
+    queue_db
+        .execute("DELETE FROM assistant_jobs WHERE state='intent'", [])
+        .map_err(MemoryError::Database)?;
+    recover_stale_reservations(queue_db, policy, forget_epoch, &mut quarantined)?;
+    let jobs = restore_reserved_jobs(queue_db, policy, forget_epoch, &mut quarantined)?;
+    Ok((jobs, quarantined))
+}
+
+fn quarantine_unknown(
+    queue_db: &Connection,
+    policy: &mut AssistantPolicy,
+) -> Result<Vec<String>, CoordinatorError> {
+    let mut statement = queue_db
+        .prepare("SELECT job_id,child_id FROM assistant_jobs WHERE state='unknown'")
+        .map_err(MemoryError::Database)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(MemoryError::Database)?;
+    let mut quarantined = Vec::new();
+    for row in rows {
+        let (job, child) = row.map_err(MemoryError::Database)?;
+        if policy
+            .reservation(&child)?
+            .is_some_and(|reservation| reservation.state == ReservationState::Dispatched)
+        {
+            policy.record_outcome(&child, DeliveryOutcome::Unknown, 0)?;
+        }
+        quarantined.push(job);
+    }
+    Ok(quarantined)
+}
+
+fn recover_intents(
+    queue_db: &Connection,
+    policy: &mut AssistantPolicy,
+    quarantined: &mut Vec<String>,
+) -> Result<(), CoordinatorError> {
+    let mut statement = queue_db
+        .prepare("SELECT job_id,child_id FROM assistant_jobs WHERE state='intent'")
+        .map_err(MemoryError::Database)?;
+    let ids: Vec<JobIdentity> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(MemoryError::Database)?
+        .filter_map(Result::ok)
+        .collect();
+    for (job_id, child_id) in ids {
+        recover_intent(queue_db, policy, &job_id, &child_id, quarantined)?;
+    }
+    Ok(())
+}
+
+fn recover_intent(
+    queue_db: &Connection,
+    policy: &mut AssistantPolicy,
+    job_id: &str,
+    child_id: &str,
+    quarantined: &mut Vec<String>,
+) -> Result<(), CoordinatorError> {
+    let Some(reservation) = policy.reservation(child_id)? else {
+        return Ok(());
+    };
+    match reservation.state {
+        ReservationState::Reserved => policy.release_before_dispatch(child_id, 0)?,
+        ReservationState::Dispatched => {
+            policy.record_outcome(child_id, DeliveryOutcome::Unknown, 0)?;
+            quarantine_job(queue_db, job_id)?;
+            quarantined.push(job_id.into());
+        }
+        ReservationState::Unknown => {
+            quarantine_job(queue_db, job_id)?;
+            quarantined.push(job_id.into());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn recover_stale_reservations(
+    queue_db: &Connection,
+    policy: &mut AssistantPolicy,
+    forget_epoch: u64,
+    quarantined: &mut Vec<String>,
+) -> Result<(), CoordinatorError> {
+    let mut statement = queue_db
+        .prepare(
+            "SELECT job_id,child_id FROM assistant_jobs WHERE state='reserved' AND forget_epoch<>?",
+        )
+        .map_err(MemoryError::Database)?;
+    let stale: Vec<JobIdentity> = statement
+        .query_map([forget_epoch as i64], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(MemoryError::Database)?
+        .filter_map(Result::ok)
+        .collect();
+    for (job_id, child_id) in stale {
+        recover_stale_reservation(queue_db, policy, &job_id, &child_id, quarantined)?;
+    }
+    Ok(())
+}
+
+fn recover_stale_reservation(
+    queue_db: &Connection,
+    policy: &mut AssistantPolicy,
+    job_id: &str,
+    child_id: &str,
+    quarantined: &mut Vec<String>,
+) -> Result<(), CoordinatorError> {
+    if let Some(reservation) = policy.reservation(child_id)? {
+        if matches!(
+            reservation.state,
+            ReservationState::Dispatched | ReservationState::Unknown
+        ) {
+            if reservation.state == ReservationState::Dispatched {
+                policy.record_outcome(child_id, DeliveryOutcome::Unknown, 0)?;
+            }
+            quarantine_job(queue_db, job_id)?;
+            quarantined.push(job_id.into());
+            return Ok(());
+        }
+        if reservation.state == ReservationState::Reserved {
+            policy.release_before_dispatch(child_id, 0)?;
+        }
+    }
+    queue_db
+        .execute(
+            "DELETE FROM assistant_jobs WHERE job_id=? AND state='reserved'",
+            [job_id],
+        )
+        .map_err(MemoryError::Database)?;
+    Ok(())
+}
+
+fn quarantine_job(queue_db: &Connection, job_id: &str) -> Result<(), CoordinatorError> {
+    queue_db
+        .execute(
+            "UPDATE assistant_jobs SET state='unknown',prompt='',dependency_json='[]' WHERE job_id=?",
+            [job_id],
+        )
+        .map_err(MemoryError::Database)?;
+    Ok(())
+}
+
+fn restore_reserved_jobs(
+    queue_db: &Connection,
+    policy: &mut AssistantPolicy,
+    forget_epoch: u64,
+    quarantined: &mut Vec<String>,
+) -> Result<VecDeque<QueuedJob>, CoordinatorError> {
+    let mut stmt = queue_db.prepare("SELECT job_id,root_id,scope_json,prompt,dependency_json,child_id FROM assistant_jobs WHERE state='reserved' AND forget_epoch=? ORDER BY created_at,job_id").map_err(MemoryError::Database)?;
+    let rows = stmt
+        .query_map([forget_epoch as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(MemoryError::Database)?;
+    let mut jobs = VecDeque::new();
+    for row in rows {
+        restore_reserved_job(
+            queue_db,
+            policy,
+            row.map_err(MemoryError::Database)?,
+            forget_epoch,
+            &mut jobs,
+            quarantined,
+        )?;
+    }
+    Ok(jobs)
+}
+
+fn restore_reserved_job(
+    queue_db: &Connection,
+    policy: &mut AssistantPolicy,
+    (job_id, root_id, scope_json, prompt, dependency_json, child_id): StoredJob,
+    forget_epoch: u64,
+    jobs: &mut VecDeque<QueuedJob>,
+    quarantined: &mut Vec<String>,
+) -> Result<(), CoordinatorError> {
+    let reservation = policy.reservation(&child_id)?;
+    if !reservation
+        .as_ref()
+        .is_some_and(|reservation| reservation.state == ReservationState::Reserved)
+    {
+        if reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.state == ReservationState::Dispatched)
+        {
+            policy.record_outcome(&child_id, DeliveryOutcome::Unknown, 0)?;
+        }
+        quarantine_job(queue_db, &job_id)?;
+        quarantined.push(job_id);
+        return Ok(());
+    }
+    let scope: Scope = serde_json::from_str(&scope_json).map_err(MemoryError::Serialization)?;
+    let dependency_ids: Vec<String> =
+        serde_json::from_str(&dependency_json).map_err(MemoryError::Serialization)?;
+    jobs.push_back(QueuedJob {
+        request: WorkerRequest {
+            job_id,
+            root_id,
+            scope,
+            prompt,
+            dependency_ids,
+        },
+        child_id,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        forget_epoch,
+    });
+    Ok(())
+}
+
+fn load_observations(
+    observation_db: &Connection,
+) -> Result<HashMap<ObservationKey, OperationalObservation>, CoordinatorError> {
+    let mut observations = HashMap::new();
+    let mut rows = observation_db.prepare("SELECT node_id,provider,conversation_id,project,status,summary,observed_at,material_revision FROM assistant_observations").map_err(MemoryError::Database)?;
+    let rows = rows
+        .query_map([], |row| {
+            Ok(OperationalObservation {
+                node_id: row.get(0)?,
+                provider: row.get(1)?,
+                conversation_id: row.get(2)?,
+                project: row.get(3)?,
+                status: parse_status(&row.get::<_, String>(4)?),
+                summary: row.get(5)?,
+                observed_at: row.get(6)?,
+                material_revision: row.get::<_, i64>(7)? as u64,
+            })
+        })
+        .map_err(MemoryError::Database)?;
+    for row in rows {
+        let item = row.map_err(MemoryError::Database)?;
+        observations.insert(
+            ObservationKey {
+                node_id: item.node_id.clone(),
+                provider: item.provider.clone(),
+                conversation_id: item.conversation_id.clone(),
+            },
+            item,
+        );
+    }
+    Ok(observations)
 }
 
 fn validate_observation(o: &OperationalObservation) -> Result<(), CoordinatorError> {

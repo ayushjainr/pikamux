@@ -148,36 +148,7 @@ impl ServerEvent {
                     .unwrap_or_default()
                     .to_owned(),
             }),
-            "turn/completed" => {
-                let id = turn_id
-                    .ok_or_else(|| ProviderError::Protocol("completion missing turnId".into()))?;
-                let status = params
-                    .get("turn")
-                    .and_then(|v| v.get("status"))
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ProviderError::Protocol("completion missing status".into()))?;
-                if status != "completed" {
-                    return Ok(Self::Failed {
-                        thread_id,
-                        turn_id: id,
-                        message: status.to_owned(),
-                    });
-                }
-                let usage = params
-                    .get("turn")
-                    .and_then(|v| v.get("usage"))
-                    .and_then(|v| {
-                        Some(Usage {
-                            input_tokens: v.get("inputTokens")?.as_u64()?,
-                            output_tokens: v.get("outputTokens")?.as_u64()?,
-                        })
-                    });
-                Ok(Self::Completed {
-                    thread_id,
-                    turn_id: id,
-                    usage,
-                })
-            }
+            "turn/completed" => parse_completed_event(params, thread_id, turn_id),
             "error" | "turn/error" => Ok(Self::Failed {
                 thread_id,
                 turn_id: turn_id
@@ -203,6 +174,40 @@ impl ServerEvent {
             _ => Ok(Self::Other { thread_id, turn_id }),
         }
     }
+}
+
+fn parse_completed_event(
+    params: &Value,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+) -> Result<ServerEvent, ProviderError> {
+    let id = turn_id.ok_or_else(|| ProviderError::Protocol("completion missing turnId".into()))?;
+    let status = params
+        .get("turn")
+        .and_then(|v| v.get("status"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProviderError::Protocol("completion missing status".into()))?;
+    if status != "completed" {
+        return Ok(ServerEvent::Failed {
+            thread_id,
+            turn_id: id,
+            message: status.to_owned(),
+        });
+    }
+    let usage = params
+        .get("turn")
+        .and_then(|v| v.get("usage"))
+        .and_then(|v| {
+            Some(Usage {
+                input_tokens: v.get("inputTokens")?.as_u64()?,
+                output_tokens: v.get("outputTokens")?.as_u64()?,
+            })
+        });
+    Ok(ServerEvent::Completed {
+        thread_id,
+        turn_id: id,
+        usage,
+    })
 }
 
 /// Implement this over an already-approved app-server process/socket.  The
@@ -310,18 +315,7 @@ impl<T: RpcTransport> MainAssistant<T> {
             ),
         };
         let response = self.transport.request(method, params)?;
-        let thread = response
-            .get("thread")
-            .or_else(|| response.get("result").and_then(|v| v.get("thread")))
-            .ok_or_else(|| ProviderError::Protocol("thread response missing thread".into()))?;
-        verify_active_permission_profile(&response)?;
-        verify_thread_sandbox(&response)?;
-        verify_thread_settings(&response, &self.config)?;
-        let id = thread
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ProviderError::Protocol("thread response missing exact id".into()))?
-            .to_owned();
+        let id = verified_thread_id(&response, &self.config)?;
         if let Some(expected) = self.profile.thread_id.as_deref() {
             if expected != id {
                 return Err(ProviderError::Protocol(
@@ -491,6 +485,21 @@ impl<T: RpcTransport> MainAssistant<T> {
         self.state = AssistantState::UnknownDelivery { turn_id: turn };
         Err(ProviderError::UnknownDelivery)
     }
+}
+
+fn verified_thread_id(response: &Value, config: &ProviderConfig) -> Result<String, ProviderError> {
+    let thread = response
+        .get("thread")
+        .or_else(|| response.get("result").and_then(|v| v.get("thread")))
+        .ok_or_else(|| ProviderError::Protocol("thread response missing thread".into()))?;
+    verify_active_permission_profile(response)?;
+    verify_thread_sandbox(response)?;
+    verify_thread_settings(response, config)?;
+    Ok(thread
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProviderError::Protocol("thread response missing exact id".into()))?
+        .to_owned())
 }
 
 fn verify_active_permission_profile(response: &Value) -> Result<(), ProviderError> {

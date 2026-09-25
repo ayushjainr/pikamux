@@ -76,24 +76,7 @@ pub fn cleanup(root: impl AsRef<Path>, epoch: u64) -> Result<CleanupReport, Rete
             changed: 0,
         });
     }
-    let previous = if let Some(conn) = open_known(&marker)? {
-        if !table_exists(&conn, "retention_meta")? {
-            None
-        } else {
-            let value = conn
-                .query_row("SELECT epoch FROM retention_meta WHERE id=1", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .optional()?
-                .unwrap_or(0);
-            if value < 0 {
-                return Err(RetentionError::UnsafePath("invalid retention epoch".into()));
-            }
-            Some(value as u64)
-        }
-    } else {
-        None
-    };
+    let previous = previous_epoch(&marker)?;
     if previous.is_some_and(|value| value >= epoch) {
         return Ok(CleanupReport {
             epoch,
@@ -104,72 +87,108 @@ pub fn cleanup(root: impl AsRef<Path>, epoch: u64) -> Result<CleanupReport, Rete
     let mut databases = Vec::new();
     let mut changed = 0;
     for path in known {
-        let Some(conn) = open_known(&path)? else {
-            continue;
-        };
-        conn.busy_timeout(std::time::Duration::from_millis(500))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        let tx = conn.unchecked_transaction()?;
-        // Runtime: preserve rows and receipts, but make replay impossible.
-        changed += execute_if_present(
-            &tx,
-            "assistant_runtime_turns",
-            "UPDATE assistant_runtime_turns SET prompt='',reply='',dependencies='[]',state='unknown'",
-        )?;
-        changed += execute_if_present(
-            &tx,
-            "assistant_runtime_guard",
-            "UPDATE assistant_runtime_guard SET blocked=1 WHERE id=1",
-        )?;
-        changed += execute_if_present(
-            &tx,
-            "assistant_runtime_epoch",
-            &format!("UPDATE assistant_runtime_epoch SET epoch=MAX(epoch, {epoch}) WHERE id=1"),
-        )?;
-        // Investigation: retain reservation/job identities but remove assignments/evidence.
-        changed += execute_if_present(
-            &tx,
-            "investigation_jobs",
-            &format!(
-                "UPDATE investigation_jobs SET task_json='',finding=NULL,state='unknown',forget_epoch=MAX(forget_epoch, {epoch})"
-            ),
-        )?;
-        changed += execute_if_present(
-            &tx,
-            "investigation_roots",
-            "UPDATE investigation_roots SET state='unknown'",
-        )?;
-        // Workshop registries are derived experiments; clear them in FK order.
-        for table in [
-            "assistant_evolution_pending",
-            "learning_uses",
-            "learning_candidates",
-            "learning_hypotheses",
-            "tool_comparisons",
-            "tool_activations",
-            "tool_grants",
-            "tool_evaluations",
-            "candidate_required_suites",
-            "tool_candidates",
-            "protected_suites",
-        ] {
-            changed += execute_if_present(&tx, table, &format!("DELETE FROM {table}"))?;
+        if let Some(count) = scrub_database(&path, epoch)? {
+            changed += count;
+            databases.push(path);
         }
-        tx.commit()?;
-        databases.push(path);
     }
     // Marker is written last. A crash before this point safely causes an
     // idempotent repeat on the next startup.
-    let marker_conn = crate::assistant_storage::database(&marker)
-        .map_err(RetentionError::Filesystem)
-        .and_then(|_| Ok(Connection::open(&marker)?))?;
-    marker_conn.execute_batch("CREATE TABLE IF NOT EXISTS retention_meta(id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL)")?;
-    marker_conn.execute("INSERT INTO retention_meta(id,epoch) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET epoch=MAX(epoch,excluded.epoch)", [epoch as i64])?;
+    write_epoch(&marker, epoch)?;
     Ok(CleanupReport {
         epoch,
         databases,
         changed,
     })
+}
+
+fn previous_epoch(marker: &Path) -> Result<Option<u64>, RetentionError> {
+    let Some(conn) = open_known(marker)? else {
+        return Ok(None);
+    };
+    if !table_exists(&conn, "retention_meta")? {
+        return Ok(None);
+    }
+    let value = conn
+        .query_row("SELECT epoch FROM retention_meta WHERE id=1", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()?
+        .unwrap_or(0);
+    if value < 0 {
+        return Err(RetentionError::UnsafePath("invalid retention epoch".into()));
+    }
+    Ok(Some(value as u64))
+}
+
+fn scrub_database(path: &Path, epoch: u64) -> Result<Option<usize>, RetentionError> {
+    let Some(conn) = open_known(path)? else {
+        return Ok(None);
+    };
+    conn.busy_timeout(std::time::Duration::from_millis(500))?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    let tx = conn.unchecked_transaction()?;
+    let mut changed = scrub_derived_tables(&tx, epoch)?;
+    for table in [
+        "assistant_evolution_pending",
+        "learning_uses",
+        "learning_candidates",
+        "learning_hypotheses",
+        "tool_comparisons",
+        "tool_activations",
+        "tool_grants",
+        "tool_evaluations",
+        "candidate_required_suites",
+        "tool_candidates",
+        "protected_suites",
+    ] {
+        changed += execute_if_present(&tx, table, &format!("DELETE FROM {table}"))?;
+    }
+    tx.commit()?;
+    Ok(Some(changed))
+}
+
+fn scrub_derived_tables(tx: &Connection, epoch: u64) -> Result<usize, RetentionError> {
+    let mut changed = 0;
+    // Runtime: preserve rows and receipts, but make replay impossible.
+    changed += execute_if_present(
+        tx,
+        "assistant_runtime_turns",
+        "UPDATE assistant_runtime_turns SET prompt='',reply='',dependencies='[]',state='unknown'",
+    )?;
+    changed += execute_if_present(
+        tx,
+        "assistant_runtime_guard",
+        "UPDATE assistant_runtime_guard SET blocked=1 WHERE id=1",
+    )?;
+    changed += execute_if_present(
+        tx,
+        "assistant_runtime_epoch",
+        &format!("UPDATE assistant_runtime_epoch SET epoch=MAX(epoch, {epoch}) WHERE id=1"),
+    )?;
+    // Investigation: retain reservation/job identities but remove assignments/evidence.
+    changed += execute_if_present(
+        tx,
+        "investigation_jobs",
+        &format!(
+            "UPDATE investigation_jobs SET task_json='',finding=NULL,state='unknown',forget_epoch=MAX(forget_epoch, {epoch})"
+        ),
+    )?;
+    changed += execute_if_present(
+        tx,
+        "investigation_roots",
+        "UPDATE investigation_roots SET state='unknown'",
+    )?;
+    Ok(changed)
+}
+
+fn write_epoch(marker: &Path, epoch: u64) -> Result<(), RetentionError> {
+    let marker_conn = crate::assistant_storage::database(marker)
+        .map_err(RetentionError::Filesystem)
+        .and_then(|_| Ok(Connection::open(marker)?))?;
+    marker_conn.execute_batch("CREATE TABLE IF NOT EXISTS retention_meta(id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL)")?;
+    marker_conn.execute("INSERT INTO retention_meta(id,epoch) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET epoch=MAX(epoch,excluded.epoch)", [epoch as i64])?;
+    Ok(())
 }
 
 #[cfg(test)]

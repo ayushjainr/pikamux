@@ -16,7 +16,7 @@ use std::{
         process::CommandExt,
     },
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant},
@@ -175,33 +175,7 @@ impl CodexTransport {
     /// the isolated Codex home before using a real provider account.
     pub fn spawn(config: TransportConfig) -> Result<Self, TransportError> {
         config.validate()?;
-        let mut command = Command::new(&config.executable);
-        command
-            .env_clear()
-            .env("HOME", &config.codex_home)
-            .env("CODEX_HOME", &config.codex_home)
-            .env("PATH", "/usr/bin:/bin")
-            .env("NO_COLOR", "1")
-            .current_dir(&config.scratch)
-            .arg("app-server")
-            .arg("--stdio");
-        for flag in DISABLE_FLAGS {
-            command.arg(flag);
-        }
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn()?;
+        let mut child = spawn_provider(&config)?;
         let stdin = child
             .stdin
             .take()
@@ -210,55 +184,15 @@ impl CodexTransport {
             .stdout
             .take()
             .ok_or_else(|| TransportError::Isolation("provider stdout unavailable".into()))?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or_else(|| TransportError::Isolation("provider stderr unavailable".into()))?;
-        let (sender, frames) = mpsc::sync_channel(MAX_PENDING_FRAMES);
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut line = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                match reader.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(count) => {
-                        for byte in &chunk[..count] {
-                            line.push(*byte);
-                            if line.len() > MAX_FRAME_BYTES {
-                                let _ = sender.send(Err(TransportError::Protocol(
-                                    "RPC frame exceeds 1 MiB".into(),
-                                )));
-                                return;
-                            }
-                            if *byte == b'\n' {
-                                let frame = parse_frame(line.strip_suffix(b"\n").unwrap_or(&line));
-                                if sender.send(frame).is_err() {
-                                    return;
-                                }
-                                line.clear();
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        let _ = sender.send(Err(TransportError::Io(error)));
-                        return;
-                    }
-                }
-            }
-        });
-        thread::spawn(move || {
-            let mut bounded = Vec::new();
-            let mut chunk = [0u8; 4096];
-            while let Ok(count) = stderr.read(&mut chunk) {
-                if count == 0 {
-                    break;
-                }
-                let remaining = MAX_STDERR_BYTES.saturating_sub(bounded.len());
-                bounded.extend_from_slice(&chunk[..count.min(remaining)]);
-            }
-        });
-        let transport = Self {
+        let frames = spawn_frame_reader(stdout);
+        drain_stderr(stderr);
+        // MainAssistant owns the protocol handshake; readiness is set only after
+        // the provider's effective disabled-capability report has been checked.
+        Ok(Self {
             child,
             stdin,
             frames,
@@ -266,11 +200,7 @@ impl CodexTransport {
             notification_bytes: 0,
             next_id: 1,
             ready: false,
-        };
-        // MainAssistant owns the protocol handshake. The request adapter below
-        // adds the mandatory effective-config gate; no guessed provider response
-        // is fabricated here.
-        Ok(transport)
+        })
     }
 
     pub fn cancel(&mut self) -> Result<(), TransportError> {
@@ -365,6 +295,87 @@ impl CodexTransport {
         }
         Ok(())
     }
+}
+
+fn spawn_provider(config: &TransportConfig) -> Result<Child, TransportError> {
+    let mut command = Command::new(&config.executable);
+    command
+        .env_clear()
+        .env("HOME", &config.codex_home)
+        .env("CODEX_HOME", &config.codex_home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("NO_COLOR", "1")
+        .current_dir(&config.scratch)
+        .arg("app-server")
+        .arg("--stdio");
+    for flag in DISABLE_FLAGS {
+        command.arg(flag);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(command.spawn()?)
+}
+
+fn spawn_frame_reader(stdout: ChildStdout) -> Receiver<Result<Frame, TransportError>> {
+    let (sender, frames) = mpsc::sync_channel(MAX_PENDING_FRAMES);
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    for byte in &chunk[..count] {
+                        line.push(*byte);
+                        if line.len() > MAX_FRAME_BYTES {
+                            let _ = sender.send(Err(TransportError::Protocol(
+                                "RPC frame exceeds 1 MiB".into(),
+                            )));
+                            return;
+                        }
+                        if *byte == b'\n' {
+                            let frame = parse_frame(line.strip_suffix(b"\n").unwrap_or(&line));
+                            if sender.send(frame).is_err() {
+                                return;
+                            }
+                            line.clear();
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(TransportError::Io(error)));
+                    return;
+                }
+            }
+        }
+    });
+    frames
+}
+
+fn drain_stderr(mut stderr: ChildStderr) {
+    thread::spawn(move || {
+        let mut bounded = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(count) = stderr.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            let remaining = MAX_STDERR_BYTES.saturating_sub(bounded.len());
+            bounded.extend_from_slice(&chunk[..count.min(remaining)]);
+        }
+    });
 }
 
 fn write_bounded(
@@ -512,6 +523,12 @@ fn verify_assistant_permission_profile(effective: &Value) -> Result<(), Transpor
                 "effective config omitted the assistant permission profile".into(),
             )
         })?;
+    verify_profile_metadata(profile)?;
+    verify_filesystem_profile(profile)?;
+    verify_network_profile(profile)
+}
+
+fn verify_profile_metadata(profile: &Value) -> Result<(), TransportError> {
     if profile.get("description") != Some(&Value::Null)
         || profile.get("extends") != Some(&Value::Null)
         || profile.get("workspace_roots") != Some(&Value::Null)
@@ -520,7 +537,10 @@ fn verify_assistant_permission_profile(effective: &Value) -> Result<(), Transpor
             "assistant permission profile inherits or grants workspace access".into(),
         ));
     }
+    Ok(())
+}
 
+fn verify_filesystem_profile(profile: &Value) -> Result<(), TransportError> {
     let filesystem = profile
         .get("filesystem")
         .and_then(Value::as_object)
@@ -537,7 +557,10 @@ fn verify_assistant_permission_profile(effective: &Value) -> Result<(), Transpor
             "assistant permission profile grants filesystem access".into(),
         ));
     }
+    Ok(())
+}
 
+fn verify_network_profile(profile: &Value) -> Result<(), TransportError> {
     let network = profile
         .get("network")
         .and_then(Value::as_object)

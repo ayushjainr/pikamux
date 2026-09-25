@@ -105,15 +105,7 @@ pub fn recover_after_services_dropped(
     memory_epoch: u64,
 ) -> Result<RecoveryReceipt, RecoveryError> {
     let root = root.as_ref();
-    if !root.is_absolute() {
-        return Err(RecoveryError::RelativeRoot);
-    }
-    if uuid::Uuid::parse_str(request_id).is_err() {
-        return Err(RecoveryError::InvalidRequestId);
-    }
-    if memory_epoch > i64::MAX as u64 {
-        return Err(RecoveryError::EpochOverflow);
-    }
+    validate_request(root, request_id, memory_epoch)?;
     crate::assistant_storage::directory(root).map_err(RecoveryError::Filesystem)?;
     let receipt_path = root.join("recovery.sqlite");
     let receipt_conn = crate::assistant_storage::database(&receipt_path)
@@ -133,34 +125,90 @@ pub fn recover_after_services_dropped(
             databases: Vec::new(),
         });
     }
-    let mut databases = Vec::new();
     // Quarantine first. Then retire concurrency claims as unknown, retaining
     // their full call charges and immutable IDs in the policy receipt ledger.
+    let reservation_ids = quarantine_and_collect_reservations(root)?;
+    settle_unknown_reservations(root, reservation_ids)?;
+    let databases = scrub_owned_databases(root, memory_epoch)?;
+    receipt_conn.execute("INSERT OR IGNORE INTO recovery_receipts(id,epoch,completed_at) VALUES(?,?,strftime('%s','now'))", rusqlite::params![receipt_id, memory_epoch as i64])?;
+    // This is intentionally the final mutation. If anything above crashes,
+    // the guard may remain blocked. A new explicit recovery request is then
+    // required; replaying an old receipt must never unblock later unknown work.
+    unblock_runtime_guards(root)?;
+    Ok(RecoveryReceipt {
+        receipt_id,
+        epoch: memory_epoch,
+        databases,
+    })
+}
+
+fn validate_request(root: &Path, request_id: &str, memory_epoch: u64) -> Result<(), RecoveryError> {
+    if !root.is_absolute() {
+        return Err(RecoveryError::RelativeRoot);
+    }
+    if uuid::Uuid::parse_str(request_id).is_err() {
+        return Err(RecoveryError::InvalidRequestId);
+    }
+    if memory_epoch > i64::MAX as u64 {
+        return Err(RecoveryError::EpochOverflow);
+    }
+    Ok(())
+}
+
+fn quarantine_and_collect_reservations(
+    root: &Path,
+) -> Result<std::collections::BTreeSet<String>, RecoveryError> {
     let mut reservation_ids = std::collections::BTreeSet::new();
     for name in ["runtime.sqlite", "author-runtime.sqlite"] {
-        if let Some(conn) = open_known(&root.join(name))? {
-            if table_exists(&conn, "assistant_runtime_guard")? {
-                conn.execute(
-                    "UPDATE assistant_runtime_guard SET blocked=1 WHERE id=1",
-                    [],
-                )?;
-            }
-            if column_exists(&conn, "assistant_runtime_turns", "reservation_id")? {
-                let mut stmt=conn.prepare("SELECT reservation_id FROM assistant_runtime_turns WHERE state IN ('reserved','dispatch_intent','in_flight','unknown')")?;
-                for id in stmt.query_map([], |r| r.get::<_, String>(0))? {
-                    reservation_ids.insert(id?);
-                }
-            }
+        collect_runtime_reservations(root, name, &mut reservation_ids)?;
+    }
+    collect_investigation_reservations(root, &mut reservation_ids)?;
+    Ok(reservation_ids)
+}
+
+fn collect_runtime_reservations(
+    root: &Path,
+    name: &str,
+    reservation_ids: &mut std::collections::BTreeSet<String>,
+) -> Result<(), RecoveryError> {
+    let Some(conn) = open_known(&root.join(name))? else {
+        return Ok(());
+    };
+    if table_exists(&conn, "assistant_runtime_guard")? {
+        conn.execute(
+            "UPDATE assistant_runtime_guard SET blocked=1 WHERE id=1",
+            [],
+        )?;
+    }
+    if column_exists(&conn, "assistant_runtime_turns", "reservation_id")? {
+        let mut stmt=conn.prepare("SELECT reservation_id FROM assistant_runtime_turns WHERE state IN ('reserved','dispatch_intent','in_flight','unknown')")?;
+        for id in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            reservation_ids.insert(id?);
         }
     }
-    if let Some(conn) = open_known(&root.join("investigation.sqlite"))? {
-        if table_exists(&conn, "investigation_jobs")? {
-            let mut stmt=conn.prepare("SELECT reservation_id FROM investigation_jobs WHERE state IN ('queued','intent','dispatched','running','unknown') UNION SELECT root_id FROM investigation_jobs WHERE state IN ('queued','intent','dispatched','running','unknown')")?;
-            for id in stmt.query_map([], |r| r.get::<_, String>(0))? {
-                reservation_ids.insert(id?);
-            }
+    Ok(())
+}
+
+fn collect_investigation_reservations(
+    root: &Path,
+    reservation_ids: &mut std::collections::BTreeSet<String>,
+) -> Result<(), RecoveryError> {
+    let Some(conn) = open_known(&root.join("investigation.sqlite"))? else {
+        return Ok(());
+    };
+    if table_exists(&conn, "investigation_jobs")? {
+        let mut stmt=conn.prepare("SELECT reservation_id FROM investigation_jobs WHERE state IN ('queued','intent','dispatched','running','unknown') UNION SELECT root_id FROM investigation_jobs WHERE state IN ('queued','intent','dispatched','running','unknown')")?;
+        for id in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            reservation_ids.insert(id?);
         }
     }
+    Ok(())
+}
+
+fn settle_unknown_reservations(
+    root: &Path,
+    reservation_ids: std::collections::BTreeSet<String>,
+) -> Result<(), RecoveryError> {
     if !reservation_ids.is_empty() && root.join("policy.sqlite").exists() {
         let mut policy =
             crate::assistant_policy::AssistantPolicy::open(root.join("policy.sqlite"))?;
@@ -185,61 +233,87 @@ pub fn recover_after_services_dropped(
             }
         }
     }
+    Ok(())
+}
+
+fn scrub_owned_databases(root: &Path, memory_epoch: u64) -> Result<Vec<PathBuf>, RecoveryError> {
+    let mut databases = Vec::new();
     for path in [
         root.join("runtime.sqlite"),
         root.join("author-runtime.sqlite"),
         root.join("investigation.sqlite"),
         root.join("workshop.sqlite"),
     ] {
-        let Some(conn) = open_known(&path)? else {
-            continue;
-        };
-        let tx = conn.unchecked_transaction()?;
-        if table_exists(&tx, "assistant_runtime_guard")? {
-            tx.execute(
-                "UPDATE assistant_runtime_guard SET blocked=1 WHERE id=1",
-                [],
-            )?;
+        if scrub_database(&path, memory_epoch)? {
+            databases.push(path);
         }
-        if table_exists(&tx, "assistant_runtime_turns")? {
-            tx.execute(
-                "UPDATE assistant_runtime_turns SET prompt='',reply='',dependencies='[]'",
-                [],
-            )?;
-            tx.execute("UPDATE assistant_runtime_turns SET state='abandoned' WHERE state IN ('reserved','dispatch_intent','in_flight','unknown')", [])?;
-        }
-        if table_exists(&tx, "assistant_runtime_profile")? {
-            tx.execute("UPDATE assistant_runtime_profile SET thread_id=NULL", [])?;
-        }
-        if table_exists(&tx, "assistant_runtime_epoch")? {
-            tx.execute(
-                "UPDATE assistant_runtime_epoch SET epoch=? WHERE id=1",
-                [memory_epoch as i64],
-            )?;
-        }
-        if table_exists(&tx, "investigation_jobs")? {
-            tx.execute(
-                "UPDATE investigation_jobs SET task_json='',finding=NULL",
-                [],
-            )?;
-            tx.execute("UPDATE investigation_jobs SET state='abandoned' WHERE state IN ('queued','intent','dispatched','running','unknown')", [])?;
-        }
-        if table_exists(&tx, "investigation_roots")? {
-            tx.execute("UPDATE investigation_roots SET state='abandoned' WHERE state IN ('queued','active','running','unknown','intent')", [])?;
-        }
-        if column_exists(&tx, "assistant_evolution_pending", "state")? {
-            tx.execute("UPDATE assistant_evolution_pending SET state='abandoned' WHERE state IN ('pending','candidate','submitted','queued','running')", [])?;
-            if column_exists(&tx, "assistant_evolution_pending", "candidate_json")? {
-                tx.execute("UPDATE assistant_evolution_pending SET candidate_json=NULL WHERE state='abandoned'", [])?;
-            }
-        }
-        tx.commit()?;
-        databases.push(path);
     }
-    receipt_conn.execute("INSERT OR IGNORE INTO recovery_receipts(id,epoch,completed_at) VALUES(?,?,strftime('%s','now'))", rusqlite::params![receipt_id, memory_epoch as i64])?;
-    // This is intentionally the final mutation. If anything above crashes,
-    // the guard may remain blocked. A new explicit recovery request is then
-    // required; replaying an old receipt must never unblock later unknown work.
+    Ok(databases)
+}
+
+fn scrub_database(path: &Path, memory_epoch: u64) -> Result<bool, RecoveryError> {
+    let Some(conn) = open_known(path)? else {
+        return Ok(false);
+    };
+    let tx = conn.unchecked_transaction()?;
+    scrub_runtime_tables(&tx, memory_epoch)?;
+    scrub_investigation_tables(&tx)?;
+    scrub_evolution_tables(&tx)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn scrub_runtime_tables(conn: &Connection, memory_epoch: u64) -> Result<(), RecoveryError> {
+    if table_exists(conn, "assistant_runtime_guard")? {
+        conn.execute(
+            "UPDATE assistant_runtime_guard SET blocked=1 WHERE id=1",
+            [],
+        )?;
+    }
+    if table_exists(conn, "assistant_runtime_turns")? {
+        conn.execute(
+            "UPDATE assistant_runtime_turns SET prompt='',reply='',dependencies='[]'",
+            [],
+        )?;
+        conn.execute("UPDATE assistant_runtime_turns SET state='abandoned' WHERE state IN ('reserved','dispatch_intent','in_flight','unknown')", [])?;
+    }
+    if table_exists(conn, "assistant_runtime_profile")? {
+        conn.execute("UPDATE assistant_runtime_profile SET thread_id=NULL", [])?;
+    }
+    if table_exists(conn, "assistant_runtime_epoch")? {
+        conn.execute(
+            "UPDATE assistant_runtime_epoch SET epoch=? WHERE id=1",
+            [memory_epoch as i64],
+        )?;
+    }
+    Ok(())
+}
+
+fn scrub_investigation_tables(conn: &Connection) -> Result<(), RecoveryError> {
+    if table_exists(conn, "investigation_jobs")? {
+        conn.execute(
+            "UPDATE investigation_jobs SET task_json='',finding=NULL",
+            [],
+        )?;
+        conn.execute("UPDATE investigation_jobs SET state='abandoned' WHERE state IN ('queued','intent','dispatched','running','unknown')", [])?;
+    }
+    if table_exists(conn, "investigation_roots")? {
+        conn.execute("UPDATE investigation_roots SET state='abandoned' WHERE state IN ('queued','active','running','unknown','intent')", [])?;
+    }
+    Ok(())
+}
+
+fn scrub_evolution_tables(conn: &Connection) -> Result<(), RecoveryError> {
+    if column_exists(conn, "assistant_evolution_pending", "state")? {
+        conn.execute("UPDATE assistant_evolution_pending SET state='abandoned' WHERE state IN ('pending','candidate','submitted','queued','running')", [])?;
+        if column_exists(conn, "assistant_evolution_pending", "candidate_json")? {
+            conn.execute("UPDATE assistant_evolution_pending SET candidate_json=NULL WHERE state='abandoned'", [])?;
+        }
+    }
+    Ok(())
+}
+
+fn unblock_runtime_guards(root: &Path) -> Result<(), RecoveryError> {
     for name in ["runtime.sqlite", "author-runtime.sqlite"] {
         if let Some(conn) = open_known(&root.join(name))? {
             if table_exists(&conn, "assistant_runtime_guard")? {
@@ -250,11 +324,7 @@ pub fn recover_after_services_dropped(
             }
         }
     }
-    Ok(RecoveryReceipt {
-        receipt_id,
-        epoch: memory_epoch,
-        databases,
-    })
+    Ok(())
 }
 
 #[cfg(test)]
