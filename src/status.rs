@@ -52,6 +52,16 @@ pub fn project_status(
     {
         return from_observation(item, item.status, item.unread, "safety_precedence");
     }
+    if home_state == "open_twice" {
+        return synthetic(
+            Status::OpenTwice,
+            true,
+            fallback.observed_at,
+            "ownership",
+            "safety",
+            "duplicate_owner_without_safety_observation",
+        );
+    }
 
     let runtime = newest(ObservationKind::Runtime);
     if let Some(item) =
@@ -67,9 +77,13 @@ pub fn project_status(
 
     if let Some(item) = newest(ObservationKind::Lifecycle) {
         match item.status {
-            Status::NeedsYou | Status::Error | Status::OpenTwice => {
+            Status::NeedsYou | Status::Error => {
                 return from_observation(item, item.status, item.unread, "lifecycle");
             }
+            // OPEN TWICE is process-identity safety, never a provider
+            // lifecycle. Older SessionEnd hooks copied it here; current
+            // reconciliation may clear safety without rewriting lifecycle.
+            Status::OpenTwice => {}
             Status::Working if live => {
                 return from_observation(item, item.status, item.unread, "lifecycle");
             }
@@ -111,7 +125,7 @@ pub fn project_status(
     }
     if matches!(
         fallback.status,
-        Status::NeedsYou | Status::Ready | Status::Error | Status::OpenTwice
+        Status::NeedsYou | Status::Ready | Status::Error
     ) {
         return StatusProjection {
             status: fallback.status,
@@ -214,6 +228,37 @@ mod tests {
             project(&values, true, "exact-live").status,
             Status::OpenTwice
         );
+    }
+
+    #[test]
+    fn copied_open_twice_lifecycle_cannot_outlive_live_safety_evidence() {
+        let copied = obs(ObservationKind::Lifecycle, Status::OpenTwice, true, 1.0);
+        let safety = obs(ObservationKind::Safety, Status::OpenTwice, true, 1.0);
+        let fallback = ProjectionFallback {
+            status: Status::OpenTwice,
+            unread: true,
+            attention_reason: Some("identity"),
+            error: Some("old duplicate"),
+            observed_at: 1.0,
+        };
+        assert_eq!(
+            project_status(
+                &[copied.clone(), safety],
+                true,
+                "open_twice",
+                fallback.clone()
+            )
+            .status,
+            Status::OpenTwice
+        );
+        assert_eq!(
+            project_status(&[copied.clone()], true, "open_twice", fallback.clone()).status,
+            Status::OpenTwice
+        );
+        let recovered = project_status(&[copied], true, "exact", fallback);
+        assert_eq!(recovered.status, Status::Ready);
+        assert!(!recovered.unread);
+        assert_eq!(recovered.error, None);
     }
 
     #[test]

@@ -293,7 +293,13 @@ pub(crate) fn row(provider: Provider, view: &View, at: f64, bars: bool) -> Strin
     else {
         return format!(
             "{name} — {}",
-            view.unavailable.as_deref().unwrap_or("awaiting usage")
+            view.unavailable
+                .as_deref()
+                .unwrap_or(if provider == Provider::Claude {
+                    "no current-week reading"
+                } else {
+                    "awaiting usage"
+                })
         );
     };
     let age = (at - reading.observed_at).max(0.0);
@@ -370,7 +376,7 @@ mod tests {
         let rendered = row(Provider::Codex, &view, AT, true);
         assert!(rendered.contains("██████░░░░ 63%"));
         assert!(rendered.contains("seen 0m"));
-        assert!(row(Provider::Claude, &view, AT, true).contains("— awaiting usage"));
+        assert!(row(Provider::Claude, &view, AT, true).contains("— no current-week reading"));
         view.readings[0].used_percent = 100.0;
         assert!(row(Provider::Codex, &view, AT, true).contains("░░░░░░░░░░ 0%"));
         view.readings[0].used_percent = 99.9;
@@ -425,6 +431,20 @@ mod tests {
         };
         assert!(row(Provider::Codex, &view, AT, true).contains("stale 0m"));
         assert!(!row(Provider::Claude, &view, AT, true).contains('%'));
+    }
+
+    #[test]
+    fn claude_keeps_last_weekly_reading_visible_but_marks_it_stale() {
+        let view = View {
+            readings: vec![QuotaSnapshot {
+                provider: Provider::Claude,
+                observed_at: AT - 1801.0,
+                ..reading(37.0)
+            }],
+            ..View::default()
+        };
+        assert!(row(Provider::Claude, &view, AT, true).contains("63%"));
+        assert!(row(Provider::Claude, &view, AT, true).contains("stale 30m"));
     }
 
     #[test]

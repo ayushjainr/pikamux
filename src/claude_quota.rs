@@ -11,6 +11,9 @@ use std::{
 };
 
 const CACHE: &str = ".pika-quota.json";
+// A weekly reading remains informative until its own reset. Expert upkeep
+// separately requires a fresh (<30m) reading before it can spend quota.
+pub(crate) const DISPLAY_MAX_AGE_SECONDS: f64 = 7.0 * 86400.0;
 #[cfg_attr(not(unix), allow(dead_code))]
 const MAX_INPUT: u64 = 1024 * 1024;
 
@@ -136,7 +139,7 @@ pub(crate) fn read(home: &Path, at: f64) -> Option<QuotaSnapshot> {
     let row: QuotaSnapshot = serde_json::from_slice(&bytes).ok()?;
     if row.provider != Provider::Claude
         || !row.observed_at.is_finite()
-        || !(0.0..=1800.0).contains(&(at - row.observed_at))
+        || !(0.0..=DISPLAY_MAX_AGE_SECONDS).contains(&(at - row.observed_at))
     {
         return None;
     }
@@ -205,7 +208,11 @@ mod tests {
                 && !content.contains("transcript")
                 && !content.contains("session_id")
         );
-        assert!(read(root.path(), AT + 1801.0).is_none());
+        assert_eq!(
+            read(root.path(), AT + 1801.0).unwrap().remaining_percent(),
+            72.0
+        );
+        assert!(read(root.path(), AT + 86400.0).is_none());
     }
     #[test]
     fn missing_malformed_and_expired_quota_never_make_up_a_reading() {

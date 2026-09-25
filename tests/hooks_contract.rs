@@ -443,6 +443,36 @@ fn session_end_preserves_an_unread_completion_and_its_event_time() {
 }
 
 #[test]
+fn session_end_does_not_turn_identity_safety_into_a_lifecycle_fact() {
+    let (_temp, store) = store();
+    let mut current = session(Provider::Codex, "exact", Status::OpenTwice);
+    current.unread = true;
+    current.attention_reason = Some("identity".into());
+    current.error = Some("two live owners".into());
+    store.upsert_session(&current, false).unwrap();
+
+    let result = handle_hook(
+        &store,
+        Provider::Codex,
+        &event(Provider::Codex, "exact", "SessionEnd"),
+        &HookContext::at(20.0),
+    )
+    .unwrap();
+    assert_eq!(result.status, Some(Status::OpenTwice));
+    let observations = store.status_observations(Provider::Codex, "exact").unwrap();
+    assert!(
+        observations.iter().any(|item| {
+            item.kind == ObservationKind::Lifecycle && item.status == Status::Parked
+        })
+    );
+    assert!(
+        observations.iter().any(|item| {
+            item.kind == ObservationKind::Safety && item.status == Status::OpenTwice
+        })
+    );
+}
+
+#[test]
 fn older_session_end_preserves_a_newer_exact_owner_and_live_projection() {
     let (_temp, store) = store();
     let mut context = HookContext::at(20.0);

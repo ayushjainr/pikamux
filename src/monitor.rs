@@ -4349,6 +4349,7 @@ mod tests {
         let text = String::from_utf8(rendered).unwrap();
         assert!(!text.contains("63%"));
         assert!(text.contains("awaiting usage"));
+        assert!(text.contains("no current-week reading"));
     }
 
     #[test]
