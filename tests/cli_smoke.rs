@@ -499,6 +499,23 @@ fn setup_separates_proven_names_from_bounded_recent_labels_and_routine_is_quiet(
     assert!(first_output.contains("personally_named"));
     assert!(!first_output.contains("provider-label-24"));
     assert!(!first_output.contains("generated-summary"));
+    // Routine inventory refresh, not setup selection, admits the name.
+    let mut list = fixture.command();
+    let list = list
+        .args(["list", "--json", "--no-usage"])
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(
+        Store::at(paths.database.clone())
+            .is_watched(Provider::Claude, "20000000-0000-4000-8000-000000000001")
+            .unwrap(),
+        "the custom-named conversation should reach the board without setup selection"
+    );
 
     let mut routine = fixture.command();
     let output = routine
@@ -511,7 +528,7 @@ fn setup_separates_proven_names_from_bounded_recent_labels_and_routine_is_quiet(
         String::from_utf8_lossy(&output.stderr)
     );
     let routine_output = String::from_utf8_lossy(&output.stdout);
-    assert!(routine_output.contains("Reconciled 0 tracked conversation name(s)."));
+    assert!(routine_output.contains("Reconciled "));
     assert!(!routine_output.contains("Named conversations available"));
     assert!(!routine_output.contains("Recent unnamed conversations"));
     assert!(!routine_output.contains("personally_named"));
@@ -534,7 +551,10 @@ fn setup_separates_proven_names_from_bounded_recent_labels_and_routine_is_quiet(
         String::from_utf8_lossy(&output.stderr)
     );
     let browse_output = String::from_utf8_lossy(&output.stdout);
-    assert!(browse_output.contains("personally_named"));
+    assert!(
+        !browse_output.contains("personally_named"),
+        "an auto-watched name must not be offered again for setup selection"
+    );
     assert!(browse_output.contains("Recent unnamed conversations"));
     assert!(browse_output.contains("provider-label-24"));
     assert!(!browse_output.contains("provider-label-00"));

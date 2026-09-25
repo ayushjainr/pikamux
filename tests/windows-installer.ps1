@@ -23,6 +23,19 @@ function Reject([scriptblock]$Action, [string]$Pattern) {
 }
 
 try {
+    # Exercise the real launch-denied branch without changing ACLs or policy.
+    # Windows cannot execute a directory. Extract only the probe function so
+    # this check cannot download, install, or change PATH.
+    $parseTokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($installer, [ref]$parseTokens, [ref]$parseErrors)
+    Check ($parseErrors.Count -eq 0) 'installer parses without errors'
+    $probe = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-Version' }, $true)
+    Invoke-Expression $probe.Extent.Text
+    $blockedExe = Join-Path $testRoot 'blocked-pika.exe'
+    [void][IO.Directory]::CreateDirectory($blockedExe)
+    Reject { Assert-Version $blockedExe '0.0.0' } 'Windows blocked Pika.*native error 5.*Nothing activated.*Protection history'
+
     # Real released executable, isolated directories; no provider binaries/state.
     $env:LOCALAPPDATA = Join-Path $testRoot 'user'
     [void][IO.Directory]::CreateDirectory($env:LOCALAPPDATA)
@@ -49,6 +62,18 @@ try {
     & $installer -Bundle $bundle -NoPath
     Check (@(Get-ChildItem (Join-Path $root 'releases')).Count -eq 1) 'repeat install is idempotent'
     Check ([IO.File]::ReadAllText($receiptPath) -ceq $receiptBytes) 'repeat install preserves receipt'
+    # A signed candidate whose trust check fails must not activate, execute or
+    # fall back to the legacy unsigned path. Do not modify machine trust stores.
+    function Get-AuthenticodeSignature([string]$LiteralPath) {
+        return [pscustomobject]@{ Status = 'HashMismatch'; SignerCertificate = $null; TimeStamperCertificate = $null }
+    }
+    try {
+        Reject { & $installer -Bundle $bundle -NoPath } 'signature or timestamp validation failed'
+        Check ([IO.File]::ReadAllText($receiptPath) -ceq $receiptBytes) 'bad signature preserves installed receipt'
+        Check ($env:PATH -ceq $oldPath) 'bad signature preserves current PATH'
+        Check ([Environment]::GetEnvironmentVariable('Path', 'User') -ceq $oldUserPath) 'bad signature preserves user PATH'
+        Check (@(Get-ChildItem -LiteralPath $root -Filter '.stage-*' -Force).Count -eq 0) 'bad signature cleans only disposable stage'
+    } finally { Remove-Item Function:\Get-AuthenticodeSignature }
     Reject { & $installer -PikaInstallVersion '1.2.3;exit' -NoPath } 'Invalid requested stable release version'
     Check ([IO.File]::ReadAllText($receiptPath) -ceq $receiptBytes) 'invalid pinned version preserves installation'
     $earlier = $receiptBytes | ConvertFrom-Json

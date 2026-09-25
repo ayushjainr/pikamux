@@ -916,6 +916,23 @@ impl Tmux {
         self.attach_exact_with_started_mode(pane, std::env::var_os("TMUX").is_some(), on_started)
     }
 
+    /// Attach to a user-confirmed existing pane while checking only its
+    /// generation and current Pika tags. This intentionally skips exact-home
+    /// and return-navigation configuration: an unverified handoff must not
+    /// grant identity-bound controls or mutate the pane's navigation state.
+    pub fn attach_unverified_with_started<F>(&self, pane: &Pane, on_started: F) -> Result<i32>
+    where
+        F: FnOnce() -> Result<Option<String>>,
+    {
+        self.attach_guarded_with_started_mode(
+            pane,
+            std::env::var_os("TMUX").is_some(),
+            false,
+            true,
+            on_started,
+        )
+    }
+
     /// Prove the exact pane, commit the caller's identity/attention update, and
     /// make the continuity receipt observable. If tmux cannot show the targeted
     /// client message, the same invoking terminal receives an explicit fallback.
@@ -1378,10 +1395,26 @@ impl Tmux {
     where
         F: FnOnce() -> Result<Option<String>>,
     {
+        self.attach_guarded_with_started_mode(pane, inside_tmux, true, wants_receipt, on_started)
+    }
+
+    fn attach_guarded_with_started_mode<F>(
+        &self,
+        pane: &Pane,
+        inside_tmux: bool,
+        configure_navigation: bool,
+        wants_receipt: bool,
+        on_started: F,
+    ) -> Result<i32>
+    where
+        F: FnOnce() -> Result<Option<String>>,
+    {
         self.ensure_terminal_reply_guard();
         self.ensure_rgb();
-        self.configure_exact_home(pane)?;
-        self.configure_return_navigation(pane)?;
+        if configure_navigation {
+            self.configure_exact_home(pane)?;
+            self.configure_return_navigation(pane)?;
+        }
         let condition = pane_generation_condition(pane);
         let attach = if inside_tmux {
             format!("switch-client -t {}", shell_words::quote(&pane.pane_id))

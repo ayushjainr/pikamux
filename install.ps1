@@ -99,7 +99,20 @@ param(
         $start.CreateNoWindow = $true
         $start.RedirectStandardOutput = $true
         $start.RedirectStandardError = $true
-        $process = [Diagnostics.Process]::Start($start)
+        try {
+            $process = [Diagnostics.Process]::Start($start)
+        } catch {
+            $cause = $_.Exception
+            while ($cause.InnerException) { $cause = $cause.InnerException }
+            if ($cause -is [ComponentModel.Win32Exception]) {
+                $code = $cause.NativeErrorCode
+                if ($code -eq 5 -or $code -eq 577 -or $code -eq 1260) {
+                    throw "Windows blocked Pika's startup check (native error $code). Nothing activated; any existing Pika installation is unchanged. Windows Security > Protection history may identify the rule. Reinstalling or running as administrator is not a reliable fix; do not disable protection. Executable: $Executable."
+                }
+                throw "Pika's startup check could not launch (native error $code): $($cause.Message). Executable: $Executable. Nothing activated; any existing Pika installation is unchanged."
+            }
+            throw
+        }
         try {
             $stdout = $process.StandardOutput.ReadToEndAsync()
             $stderr = $process.StandardError.ReadToEndAsync()
@@ -112,6 +125,37 @@ param(
                 throw 'The downloaded client failed its version check. Nothing activated.'
             }
         } finally { $process.Dispose() }
+    }
+
+    function Assert-Candidate([string]$Executable, [string]$Version) {
+        # The containing archive is already bound to the pinned release by its
+        # manifest, size and checksum. Read PE identity without starting code.
+        $bytes = [IO.File]::ReadAllBytes($Executable)
+        if ($bytes.Length -lt 65536 -or $bytes.Length -gt 52428800 -or
+            $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            throw 'Invalid Windows executable. Nothing activated.'
+        }
+        $pe = [BitConverter]::ToUInt32($bytes, 0x3C)
+        if ($pe -gt ($bytes.Length - 26) -or
+            [BitConverter]::ToUInt32($bytes, [int]$pe) -ne 0x00004550 -or
+            [BitConverter]::ToUInt16($bytes, [int]$pe + 4) -ne 0x8664 -or
+            [BitConverter]::ToUInt16($bytes, [int]$pe + 24) -ne 0x020B) {
+            throw 'Expected an x64 Windows executable. Nothing activated.'
+        }
+        $signature = Get-AuthenticodeSignature -LiteralPath $Executable
+        if ($signature.Status -eq 'Valid' -and $signature.SignerCertificate -and
+            $signature.TimeStamperCertificate) {
+            # CI verifies --version before signing; the release archive binds
+            # those final signed bytes to Version. No staged execution needed.
+            # This verifies installation integrity, not endpoint launch policy.
+            return
+        }
+        if ($signature.Status -ne 'NotSigned') {
+            throw 'Pika signature or timestamp validation failed. Nothing activated.'
+        }
+        # Compatibility with existing unsigned releases. Do not convert a
+        # blocked unsigned startup into a successful-looking installation.
+        Assert-Version $Executable $Version
     }
 
     $scratch = Join-Path ([IO.Path]::GetTempPath()) ('pika-install-' + [Guid]::NewGuid().ToString('N'))
@@ -217,7 +261,7 @@ param(
                 } finally { $output.Dispose(); $stream.Dispose() }
             }
         } finally { $zip.Dispose() }
-        Assert-Version (Join-Path $stage 'pika.exe') $version
+        Assert-Candidate (Join-Path $stage 'pika.exe') $version
         if (Test-Path -LiteralPath $destination) {
             foreach ($name in @('pika.exe', 'LICENSE', 'THIRD_PARTY.md')) {
                 $existing = Join-Path $destination $name

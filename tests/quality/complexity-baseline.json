@@ -1,0 +1,423 @@
+{
+  "schema": 1,
+  "analyzer": "lizard 1.24.0 + pika Rust char-literal tokenizer fix 1",
+  "new_function_limit": 15,
+  "hotspots": {
+    "src/activity_feed.rs::decode": [
+      26
+    ],
+    "src/activity_feed.rs::receive": [
+      16
+    ],
+    "src/activity_observer.rs::start_with_mode": [
+      23
+    ],
+    "src/claude_quota.rs::capture": [
+      17
+    ],
+    "src/cli.rs::ask": [
+      27
+    ],
+    "src/cli.rs::ask_jsonl": [
+      18
+    ],
+    "src/cli.rs::ask_remote": [
+      26
+    ],
+    "src/cli.rs::ask_remote_jsonl": [
+      27
+    ],
+    "src/cli.rs::choose_session_with_io": [
+      19
+    ],
+    "src/cli.rs::expert": [
+      53
+    ],
+    "src/cli.rs::experts": [
+      20
+    ],
+    "src/cli.rs::hook": [
+      28
+    ],
+    "src/cli.rs::machines": [
+      29
+    ],
+    "src/cli.rs::open_name_inner": [
+      28
+    ],
+    "src/cli.rs::setup_screen": [
+      136
+    ],
+    "src/cli.rs::wait": [
+      16
+    ],
+    "src/client_board.rs::run_exact": [
+      16
+    ],
+    "src/client_bridge.rs::handle_at": [
+      16
+    ],
+    "src/client_bridge.rs::request_client_launch": [
+      21
+    ],
+    "src/client_cli.rs::home": [
+      44
+    ],
+    "src/client_cli.rs::run_with": [
+      26
+    ],
+    "src/client_cli.rs::setup": [
+      19
+    ],
+    "src/client_cli.rs::ssh_json": [
+      36
+    ],
+    "src/consult.rs::ask": [
+      31,
+      20
+    ],
+    "src/consult.rs::fork": [
+      25
+    ],
+    "src/consult.rs::http_json": [
+      23
+    ],
+    "src/consult.rs::run_output_bounded_cancellable": [
+      19
+    ],
+    "src/core.rs::continuation_candidate": [
+      20
+    ],
+    "src/core.rs::exact_pane_binding": [
+      44
+    ],
+    "src/core.rs::identity_owners": [
+      21
+    ],
+    "src/core.rs::new_session": [
+      26
+    ],
+    "src/core.rs::open_session": [
+      26
+    ],
+    "src/core.rs::reconcile_local_with_candidates": [
+      54
+    ],
+    "src/core.rs::reconcile_one_in": [
+      35
+    ],
+    "src/core.rs::resume_session": [
+      45
+    ],
+    "src/doctor.rs::inspect_identity": [
+      60
+    ],
+    "src/doctor.rs::repair_stale": [
+      19
+    ],
+    "src/expert_refresh.rs::parse_claude_quota": [
+      16
+    ],
+    "src/expert_refresh.rs::refresh_due": [
+      27
+    ],
+    "src/files_data.rs::git_snapshot_cancellable": [
+      17
+    ],
+    "src/files_data.rs::read_text": [
+      20
+    ],
+    "src/files_layout.rs::layout": [
+      19
+    ],
+    "src/files_markdown.rs::inline": [
+      33
+    ],
+    "src/files_markdown.rs::parse": [
+      30
+    ],
+    "src/files_markdown.rs::table_lines": [
+      18
+    ],
+    "src/files_syntax.rs::scan": [
+      65
+    ],
+    "src/files_view.rs::handle_key": [
+      23
+    ],
+    "src/files_view.rs::handle_mouse": [
+      29
+    ],
+    "src/files_view.rs::render": [
+      96
+    ],
+    "src/files_view.rs::run": [
+      16
+    ],
+    "src/fleet.rs::bound_snapshot_for_transport": [
+      38
+    ],
+    "src/fleet.rs::cached_sessions_with_notices": [
+      45
+    ],
+    "src/fleet.rs::close": [
+      16
+    ],
+    "src/fleet.rs::expert_directory": [
+      32
+    ],
+    "src/fleet.rs::handle_request": [
+      43
+    ],
+    "src/fleet.rs::open_cancellable": [
+      17
+    ],
+    "src/fleet.rs::read_nonprogress": [
+      21
+    ],
+    "src/fleet.rs::remote_candidates": [
+      23
+    ],
+    "src/fleet.rs::request_cancellable": [
+      22
+    ],
+    "src/fleet.rs::run_bounded_command_inner": [
+      35
+    ],
+    "src/fleet.rs::sanitize_terminal_lines": [
+      26
+    ],
+    "src/fleet.rs::session_from_wire": [
+      42
+    ],
+    "src/fleet.rs::validate_cards": [
+      17
+    ],
+    "src/fleet.rs::validate_opened": [
+      22
+    ],
+    "src/fleet.rs::validate_opening_isolation": [
+      18
+    ],
+    "src/fleet.rs::validate_profiles": [
+      20
+    ],
+    "src/fleet.rs::validate_snapshot": [
+      24
+    ],
+    "src/hooks.rs::handle_hook_transaction": [
+      122
+    ],
+    "src/hooks.rs::handle_process_exit": [
+      30
+    ],
+    "src/hooks.rs::parse_hook_payload": [
+      24
+    ],
+    "src/hooks.rs::validate_launch": [
+      33
+    ],
+    "src/monitor.rs::draw_chat": [
+      21
+    ],
+    "src/monitor.rs::draw_detail": [
+      46
+    ],
+    "src/monitor.rs::draw_frame": [
+      62
+    ],
+    "src/monitor.rs::draw_quota": [
+      17
+    ],
+    "src/monitor.rs::key": [
+      36
+    ],
+    "src/monitor.rs::present": [
+      18
+    ],
+    "src/monitor.rs::run_loop_with_actions": [
+      43
+    ],
+    "src/muse.rs::records": [
+      16
+    ],
+    "src/onboarding.rs::render": [
+      28
+    ],
+    "src/onboarding.rs::select": [
+      17
+    ],
+    "src/preview.rs::board_output": [
+      20
+    ],
+    "src/preview.rs::claude_board_output": [
+      19
+    ],
+    "src/preview.rs::claude_footer": [
+      18
+    ],
+    "src/preview.rs::tick_at": [
+      18
+    ],
+    "src/process.rs::process_arguments": [
+      16
+    ],
+    "src/process.rs::read_result": [
+      27,
+      21
+    ],
+    "src/providers.rs::claude_records": [
+      42
+    ],
+    "src/providers.rs::claude_transcript_paths": [
+      16
+    ],
+    "src/providers.rs::codex_name_protocol": [
+      18
+    ],
+    "src/providers.rs::codex_records": [
+      42
+    ],
+    "src/resolve.rs::reduce_name_choices": [
+      28
+    ],
+    "src/setup.rs::apply_changes": [
+      38
+    ],
+    "src/setup.rs::codex_config_change": [
+      23
+    ],
+    "src/setup.rs::top_level_key_order": [
+      17
+    ],
+    "src/skill.rs::install_content": [
+      29
+    ],
+    "src/store.rs::acknowledge_attention": [
+      18
+    ],
+    "src/store.rs::commit_fleet_onboarding_if_current": [
+      25
+    ],
+    "src/store.rs::expert_profile_from_row": [
+      19
+    ],
+    "src/store.rs::fleet_node_from_row": [
+      16
+    ],
+    "src/store.rs::get_remote_board_projection": [
+      60
+    ],
+    "src/store.rs::get_remote_expert_projection": [
+      45
+    ],
+    "src/store.rs::list_activity_events": [
+      19
+    ],
+    "src/store.rs::pending_from_row": [
+      17
+    ],
+    "src/store.rs::prepare_remote_board_cache": [
+      16
+    ],
+    "src/store.rs::prepare_remote_expert_cache": [
+      17
+    ],
+    "src/store.rs::put_expert_profile": [
+      28
+    ],
+    "src/store.rs::put_remote_snapshot_if_current": [
+      16
+    ],
+    "src/store.rs::session_from_row": [
+      26
+    ],
+    "src/store.rs::status_observations": [
+      17
+    ],
+    "src/store.rs::usage_from_row": [
+      16
+    ],
+    "src/terminal.rs::bridge_parent": [
+      39
+    ],
+    "src/terminal_frame.rs::rows": [
+      40
+    ],
+    "src/tmux.rs::attach_guarded_with_started_mode": [
+      20
+    ],
+    "src/tmux.rs::bind_board_summary": [
+      35
+    ],
+    "src/tmux.rs::bounded_output_cancellable": [
+      21
+    ],
+    "src/tmux.rs::configure_return_navigation": [
+      17
+    ],
+    "src/tmux.rs::open_files_companion": [
+      19
+    ],
+    "src/tmux.rs::open_files_locked": [
+      20
+    ],
+    "src/update.rs::discover_managed_install": [
+      19
+    ],
+    "src/update.rs::extract_candidate": [
+      24
+    ],
+    "src/update.rs::initialize_or_validate_root": [
+      20
+    ],
+    "src/update.rs::install_staged": [
+      66
+    ],
+    "src/update.rs::normalized_install_path": [
+      17
+    ],
+    "src/update.rs::parse_version": [
+      20
+    ],
+    "src/update.rs::prepare_release": [
+      24
+    ],
+    "src/update.rs::prepare_remote_install_bundle": [
+      31
+    ],
+    "src/update.rs::read_archive_notices": [
+      20
+    ],
+    "src/update.rs::rollback_managed": [
+      28
+    ],
+    "src/update.rs::run_command_bounded": [
+      22
+    ],
+    "src/update.rs::update_managed_inner": [
+      45
+    ],
+    "src/update.rs::validate_existing_release": [
+      47
+    ],
+    "src/update.rs::validate_retained_release": [
+      22
+    ],
+    "src/usage.rs::claude_usage": [
+      19
+    ],
+    "src/usage.rs::codex_usage": [
+      16
+    ],
+    "src/usage.rs::opencode_usage": [
+      34
+    ],
+    "src/windows_update.rs::active": [
+      18
+    ],
+    "src/windows_update.rs::install": [
+      23
+    ]
+  }
+}

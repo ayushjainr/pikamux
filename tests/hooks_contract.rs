@@ -3,7 +3,7 @@ use pikamux::hooks::{
     event_state, handle_hook, handle_process_exit, hook_stdout, parse_hook_payload,
 };
 use pikamux::model::{ObservationKind, Provider, Session, Status, StatusObservation};
-use pikamux::store::{LiveOwner, PendingLaunch, Store};
+use pikamux::store::{LiveOwner, PendingLaunch, PendingLaunchExit, Store};
 use std::io::Cursor;
 use tempfile::TempDir;
 
@@ -54,6 +54,32 @@ fn generated_titles_and_inherited_panes_cannot_subscribe_or_alert() {
         assert!(store.is_watched(provider, "external-child").unwrap());
     }
     assert_eq!(store.list_sessions().unwrap().len(), Provider::ALL.len());
+}
+
+#[test]
+fn stale_pika_name_environment_does_not_revert_provider_rename() {
+    let (_temp, store) = store();
+    let mut current = session(Provider::Codex, "exact-renamed", Status::Working);
+    current.name = Some("new provider name".into());
+    store.upsert_session(&current, false).unwrap();
+
+    let mut context = HookContext::at(20.0);
+    context.desired_name = Some("old launch name".into());
+    let result = handle_hook(
+        &store,
+        Provider::Codex,
+        &event(Provider::Codex, "exact-renamed", "SessionStart"),
+        &context,
+    )
+    .unwrap();
+    assert!(result.native_name_request.is_none());
+
+    let after = store
+        .get_session(Provider::Codex, "exact-renamed")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.name.as_deref(), Some("new provider name"));
+    assert!(store.is_watched(Provider::Codex, "exact-renamed").unwrap());
 }
 
 fn session(provider: Provider, id: &str, status: Status) -> Session {
@@ -567,6 +593,131 @@ fn unnamed_external_hook_records_only_an_exact_owner_lease() {
     );
 }
 
+fn shared_codex_context(now: f64, pid: i64) -> HookContext {
+    let mut context = HookContext::at(now);
+    context.codex_shared_owner = true;
+    context.owner_pid = Some(pid);
+    context.owner_start_time = Some(7);
+    context.owner_token = "shared-daemon".into();
+    context
+}
+
+#[test]
+fn shared_codex_daemon_updates_lifecycle_without_claiming_the_terminal_root() {
+    for (id, previous_root, expected_root) in [
+        ("daemon-root", Some(42), None),
+        ("interactive-root", Some(99), Some(99)),
+    ] {
+        let (_temp, store) = store();
+        let mut current = session(Provider::Codex, id, Status::Working);
+        current.root_pid = previous_root;
+        current.live = true;
+        store.upsert_session(&current, true).unwrap();
+
+        let result = handle_hook(
+            &store,
+            Provider::Codex,
+            &event(Provider::Codex, id, "Stop"),
+            &shared_codex_context(20.0, 42),
+        )
+        .unwrap();
+        assert_eq!(result.disposition, HookDisposition::Updated);
+        assert_eq!(result.status, Some(Status::Ready));
+        assert!(result.tag_request.is_none());
+
+        let updated = store.get_session(Provider::Codex, id).unwrap().unwrap();
+        assert_eq!(updated.root_pid, expected_root);
+        assert_eq!(updated.status, Status::Ready);
+        assert!(updated.unread);
+
+        // The shared server remains advisory liveness evidence, preventing a
+        // duplicate app-hosted launch without becoming an exact pane owner.
+        let owners = store.live_owners(Provider::Codex, id).unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(
+            (owners[0].pid, owners[0].start_time, owners[0].last_seen),
+            (42, Some(7), 20.0)
+        );
+    }
+}
+
+#[test]
+fn shared_codex_daemon_strips_inherited_terminal_and_launch_claims() {
+    let (_temp, store) = store();
+    let parent_id = "parent";
+    let child_id = "child";
+    let mut parent = session(Provider::Codex, parent_id, Status::Ready);
+    parent.tmux_pane = Some("%9".into());
+    parent.tmux_session = Some("inherited-pane".into());
+    store.upsert_session(&parent, true).unwrap();
+
+    store
+        .add_pending(&PendingLaunch {
+            launch_token: "inherited-launch".into(),
+            provider: Provider::Codex,
+            name: "inherited-name".into(),
+            cwd: "/project".into(),
+            tmux_session: Some("inherited-pane".into()),
+            tmux_pane: Some("%9".into()),
+            expected_session_id: Some(child_id.into()),
+            root_pid: Some(42),
+            root_pid_start: Some(7),
+            preexisting_session_ids: Some(Vec::new()),
+            candidate_session_id: None,
+            candidate_observed_at: None,
+            created_at: 1.0,
+        })
+        .unwrap();
+
+    let mut payload = event(Provider::Codex, child_id, "SessionStart");
+    payload.parent_session_id = Some(parent_id.into());
+    payload.session_title = Some("provider-title".into());
+    let mut context = shared_codex_context(20.0, 42);
+    context.expected_provider = Some(Provider::Claude);
+    context.expected_session_id = Some("inherited-thread".into());
+    context.desired_name = Some("inherited-name".into());
+    context.launch_token = Some("inherited-launch".into());
+    context.pane_id = Some("%9".into());
+    context.pane_session = Some("inherited-pane".into());
+    context.pane_attached = true;
+    context.exact_home_verified = true;
+
+    let result = handle_hook(&store, Provider::Codex, &payload, &context).unwrap();
+    assert_eq!(result.disposition, HookDisposition::Updated);
+    assert_eq!(result.status, Some(Status::Ready));
+    assert!(result.tag_request.is_none());
+    assert!(result.native_name_request.is_none());
+    assert!(!result.launch_certified);
+
+    // The event remains useful lifecycle evidence, but inherited pane,
+    // launch, expected-thread and name claims cannot adopt the parent home.
+    let child = store
+        .get_session(Provider::Codex, child_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.name.as_deref(), Some("provider-title"));
+    assert_eq!(child.tmux_pane, None);
+    assert_eq!(child.tmux_session, None);
+    assert_eq!(child.root_pid, None);
+    assert!(store.get_pending("inherited-launch").unwrap().is_some());
+    assert!(
+        store
+            .get_launch_binding("inherited-launch")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.live_owners(Provider::Codex, child_id).unwrap()[0].pid,
+        42
+    );
+    assert!(
+        store
+            .live_owners(Provider::Codex, parent_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn wrong_launch_identity_fails_closed_and_exact_home_can_certify() {
     let (_temp, store) = store();
@@ -683,9 +834,59 @@ fn attached_completion_is_read_but_permission_remains_unread() {
 #[test]
 fn claude_title_output_and_codex_noop_stdout_are_protocol_safe() {
     let (_temp, store) = store();
+    for (provider, id, token) in [
+        (Provider::Claude, "claude-id", "claude-launch"),
+        (Provider::Codex, "codex-id", "codex-launch"),
+    ] {
+        store
+            .add_pending(&PendingLaunch {
+                launch_token: token.into(),
+                provider,
+                name: "named".into(),
+                cwd: "/project".into(),
+                tmux_session: Some("pika-c-test".into()),
+                tmux_pane: Some(
+                    if provider == Provider::Claude {
+                        "%1"
+                    } else {
+                        "%2"
+                    }
+                    .into(),
+                ),
+                expected_session_id: Some(id.into()),
+                root_pid: Some(42),
+                root_pid_start: Some(7),
+                preexisting_session_ids: Some(Vec::new()),
+                candidate_session_id: None,
+                candidate_observed_at: None,
+                created_at: 1.0,
+            })
+            .unwrap();
+        let mut provisional = session(provider, id, Status::Starting);
+        provisional.name = Some(
+            if provider == Provider::Claude {
+                "named"
+            } else {
+                "codex"
+            }
+            .into(),
+        );
+        provisional.source = "pending-launch".into();
+        provisional.tmux_pane = Some(
+            if provider == Provider::Claude {
+                "%1"
+            } else {
+                "%2"
+            }
+            .into(),
+        );
+        store.upsert_session(&provisional, false).unwrap();
+    }
     let mut context = HookContext::at(10.0);
     context.expected_session_id = Some("claude-id".into());
     context.desired_name = Some("named".into());
+    context.launch_token = Some("claude-launch".into());
+    context.pane_id = Some("%1".into());
     let result = handle_hook(
         &store,
         Provider::Claude,
@@ -698,8 +899,34 @@ fn claude_title_output_and_codex_noop_stdout_are_protocol_safe() {
         "named"
     );
     assert!(hook_stdout(Provider::Claude, &result).contains("sessionTitle"));
+    let mut claude_renamed = store
+        .get_session(Provider::Claude, "claude-id")
+        .unwrap()
+        .unwrap();
+    claude_renamed.name = Some("Claude provider rename".into());
+    store.upsert_session(&claude_renamed, false).unwrap();
+    context.now = 10.5;
+    let resumed_claude = handle_hook(
+        &store,
+        Provider::Claude,
+        &event(Provider::Claude, "claude-id", "SessionStart"),
+        &context,
+    )
+    .unwrap();
+    assert!(resumed_claude.provider_output.is_none());
+    assert_eq!(
+        store
+            .get_session(Provider::Claude, "claude-id")
+            .unwrap()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("Claude provider rename")
+    );
     let mut codex_context = HookContext::at(11.0);
     codex_context.desired_name = Some("codex".into());
+    codex_context.launch_token = Some("codex-launch".into());
+    codex_context.pane_id = Some("%2".into());
     let codex = handle_hook(
         &store,
         Provider::Codex,
@@ -709,6 +936,31 @@ fn claude_title_output_and_codex_noop_stdout_are_protocol_safe() {
     .unwrap();
     assert_eq!(hook_stdout(Provider::Codex, &codex), "{}");
     assert_eq!(codex.native_name_request.as_ref().unwrap().name, "codex");
+
+    let mut renamed = store
+        .get_session(Provider::Codex, "codex-id")
+        .unwrap()
+        .unwrap();
+    renamed.name = Some("provider-native rename".into());
+    store.upsert_session(&renamed, false).unwrap();
+    codex_context.now = 12.0;
+    let resumed = handle_hook(
+        &store,
+        Provider::Codex,
+        &event(Provider::Codex, "codex-id", "SessionStart"),
+        &codex_context,
+    )
+    .unwrap();
+    assert!(resumed.native_name_request.is_none());
+    assert_eq!(
+        store
+            .get_session(Provider::Codex, "codex-id")
+            .unwrap()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("provider-native rename")
+    );
 }
 
 #[test]
@@ -783,6 +1035,376 @@ fn process_exit_uses_binding_and_nonzero_status_becomes_actionable() {
     assert_eq!((result.status, result.unread), (Status::Error, true));
     assert_eq!(result.attention_reason.as_deref(), Some("exited"));
     assert!(store.get_launch_binding("token").unwrap().is_none());
+}
+
+#[test]
+fn identityless_wrapper_exit_records_only_an_authenticated_pending_receipt() {
+    for (code, phase) in [
+        (9, pikamux::store::LaunchPhase::ProviderStarting),
+        (0, pikamux::store::LaunchPhase::ProviderObserved),
+        (130, pikamux::store::LaunchPhase::ProviderStarting),
+    ] {
+        let (_temp, store) = store();
+        let pending = PendingLaunch {
+            launch_token: format!("unbound-{code}"),
+            provider: Provider::Codex,
+            name: "new work".into(),
+            cwd: "/project".into(),
+            tmux_session: Some("pika-c-token".into()),
+            tmux_pane: Some("%42".into()),
+            expected_session_id: None,
+            root_pid: Some(42),
+            root_pid_start: Some(7),
+            preexisting_session_ids: None,
+            candidate_session_id: None,
+            candidate_observed_at: None,
+            created_at: 10.0,
+        };
+        assert!(store.add_pending(&pending).unwrap());
+        let owner_token = format!("owner-{code}");
+        assert!(
+            store
+                .register_pending_wrapper_owner(&pending.launch_token, &owner_token)
+                .unwrap()
+        );
+        store
+            .set_launch_phase(&pending.launch_token, phase)
+            .unwrap();
+        let mut existing = session(Provider::Codex, "unrelated", Status::NeedsYou);
+        existing.unread = true;
+        existing.attention_reason = Some("question".into());
+        store.upsert_session(&existing, true).unwrap();
+
+        assert!(
+            handle_process_exit(
+                &store,
+                Provider::Codex,
+                code,
+                None,
+                Some(&pending.launch_token),
+                Some(&owner_token),
+                11.0,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store.get_pending(&pending.launch_token).unwrap(),
+            Some(pending.clone())
+        );
+        assert_eq!(
+            store.get_pending_exit(&pending.launch_token).unwrap(),
+            Some(PendingLaunchExit {
+                provider: Provider::Codex,
+                pending_created_at: 10.0,
+                code,
+                observed_at: 11.0,
+            })
+        );
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "unrelated");
+        assert_eq!(
+            (sessions[0].status, sessions[0].unread),
+            (Status::NeedsYou, true)
+        );
+        assert_eq!(sessions[0].attention_reason.as_deref(), Some("question"));
+
+        // A replay is idempotent and leaves the first observation intact.
+        assert!(
+            handle_process_exit(
+                &store,
+                Provider::Codex,
+                code,
+                None,
+                Some(&pending.launch_token),
+                Some(&owner_token),
+                12.0,
+            )
+            .unwrap()
+        );
+        assert!(
+            !handle_process_exit(
+                &store,
+                Provider::Codex,
+                code,
+                None,
+                Some(&pending.launch_token),
+                Some(&owner_token),
+                10.5,
+            )
+            .unwrap()
+        );
+        assert!(
+            !handle_process_exit(
+                &store,
+                Provider::Codex,
+                code.saturating_add(1),
+                None,
+                Some(&pending.launch_token),
+                Some(&owner_token),
+                12.0,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_pending_exit(&pending.launch_token)
+                .unwrap()
+                .unwrap()
+                .observed_at,
+            11.0
+        );
+    }
+}
+
+#[test]
+fn identityless_wrapper_exit_rejects_forged_stale_and_unmatched_receipts() {
+    let (_temp, store) = store();
+    let pending = PendingLaunch {
+        launch_token: "pending-exit-auth".into(),
+        provider: Provider::Codex,
+        name: "new work".into(),
+        cwd: "/project".into(),
+        tmux_session: Some("pika-c-token".into()),
+        tmux_pane: Some("%42".into()),
+        expected_session_id: None,
+        root_pid: Some(42),
+        root_pid_start: Some(7),
+        preexisting_session_ids: None,
+        candidate_session_id: None,
+        candidate_observed_at: None,
+        created_at: 10.0,
+    };
+    assert!(store.add_pending(&pending).unwrap());
+    assert!(
+        store
+            .register_pending_wrapper_owner(&pending.launch_token, "real-owner")
+            .unwrap()
+    );
+    store
+        .set_launch_phase(
+            &pending.launch_token,
+            pikamux::store::LaunchPhase::ProviderStarting,
+        )
+        .unwrap();
+
+    for (provider, session_id, token, owner, observed_at) in [
+        (
+            Provider::Claude,
+            None,
+            Some("pending-exit-auth"),
+            Some("real-owner"),
+            11.0,
+        ),
+        (
+            Provider::Codex,
+            Some("wrong-id"),
+            Some("pending-exit-auth"),
+            Some("real-owner"),
+            11.0,
+        ),
+        (
+            Provider::Codex,
+            None,
+            Some("pending-exit-auth"),
+            Some("forged-owner"),
+            11.0,
+        ),
+        (
+            Provider::Codex,
+            None,
+            Some("pending-exit-auth"),
+            Some("real-owner"),
+            9.0,
+        ),
+        (
+            Provider::Codex,
+            None,
+            Some("unknown-token"),
+            Some("unknown-owner"),
+            11.0,
+        ),
+    ] {
+        assert!(
+            !handle_process_exit(&store, provider, 9, session_id, token, owner, observed_at,)
+                .unwrap()
+        );
+    }
+    assert_eq!(store.get_pending_exit(&pending.launch_token).unwrap(), None);
+    assert_eq!(
+        store.get_pending(&pending.launch_token).unwrap(),
+        Some(pending.clone())
+    );
+
+    store
+        .set_launch_phase(
+            &pending.launch_token,
+            pikamux::store::LaunchPhase::PanePrepared,
+        )
+        .unwrap();
+    assert!(
+        !handle_process_exit(
+            &store,
+            Provider::Codex,
+            9,
+            None,
+            Some(&pending.launch_token),
+            Some("real-owner"),
+            11.0,
+        )
+        .unwrap()
+    );
+    assert_eq!(store.get_pending_exit(&pending.launch_token).unwrap(), None);
+
+    store.delete_pending(&pending.launch_token).unwrap();
+    assert!(
+        !handle_process_exit(
+            &store,
+            Provider::Codex,
+            9,
+            None,
+            Some(&pending.launch_token),
+            Some(&pending.launch_token),
+            11.0,
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn identityless_exit_for_reserved_uuid_needs_matching_binding_and_no_session() {
+    let (_temp, first_store) = store();
+    let pending = PendingLaunch {
+        launch_token: "reserved-exit".into(),
+        provider: Provider::Claude,
+        name: "new work".into(),
+        cwd: "/project".into(),
+        tmux_session: Some("pika-h-thread".into()),
+        tmux_pane: Some("%43".into()),
+        expected_session_id: Some("expected-id".into()),
+        root_pid: Some(43),
+        root_pid_start: Some(8),
+        preexisting_session_ids: None,
+        candidate_session_id: None,
+        candidate_observed_at: None,
+        created_at: 10.0,
+    };
+    first_store.add_pending(&pending).unwrap();
+    first_store
+        .register_pending_wrapper_owner(&pending.launch_token, "reserved-owner")
+        .unwrap();
+    first_store
+        .set_launch_phase(
+            &pending.launch_token,
+            pikamux::store::LaunchPhase::ProviderStarting,
+        )
+        .unwrap();
+    first_store
+        .bind_launch(&pending.launch_token, Provider::Claude, "expected-id")
+        .unwrap();
+    assert!(
+        handle_process_exit(
+            &first_store,
+            Provider::Claude,
+            1,
+            Some("expected-id"),
+            Some(&pending.launch_token),
+            Some("reserved-owner"),
+            11.0,
+        )
+        .unwrap()
+    );
+
+    let (_other_temp, other) = store();
+    other.add_pending(&pending).unwrap();
+    other
+        .register_pending_wrapper_owner(&pending.launch_token, "reserved-owner")
+        .unwrap();
+    other
+        .set_launch_phase(
+            &pending.launch_token,
+            pikamux::store::LaunchPhase::ProviderStarting,
+        )
+        .unwrap();
+    other
+        .bind_launch(&pending.launch_token, Provider::Claude, "different-id")
+        .unwrap();
+    assert!(
+        !handle_process_exit(
+            &other,
+            Provider::Claude,
+            1,
+            Some("expected-id"),
+            Some(&pending.launch_token),
+            Some("reserved-owner"),
+            11.0,
+        )
+        .unwrap()
+    );
+    other
+        .upsert_session(
+            &session(Provider::Claude, "expected-id", Status::Working),
+            true,
+        )
+        .unwrap();
+    other.delete_launch_binding(&pending.launch_token).unwrap();
+    other
+        .bind_launch(&pending.launch_token, Provider::Claude, "expected-id")
+        .unwrap();
+    assert!(
+        !handle_process_exit(
+            &other,
+            Provider::Claude,
+            1,
+            None,
+            Some(&pending.launch_token),
+            Some("reserved-owner"),
+            12.0,
+        )
+        .unwrap()
+    );
+
+    let (_certified_temp, certified) = store();
+    certified.add_pending(&pending).unwrap();
+    certified
+        .register_pending_wrapper_owner(&pending.launch_token, "reserved-owner")
+        .unwrap();
+    certified
+        .set_launch_phase(
+            &pending.launch_token,
+            pikamux::store::LaunchPhase::ProviderStarting,
+        )
+        .unwrap();
+    certified
+        .bind_launch(&pending.launch_token, Provider::Claude, "expected-id")
+        .unwrap();
+    assert!(
+        certified
+            .certify_launch(
+                &pending.launch_token,
+                Provider::Claude,
+                "expected-id",
+                43,
+                8
+            )
+            .unwrap()
+    );
+    assert!(
+        !handle_process_exit(
+            &certified,
+            Provider::Claude,
+            1,
+            Some("expected-id"),
+            Some(&pending.launch_token),
+            Some("reserved-owner"),
+            13.0,
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        certified.get_pending_exit(&pending.launch_token).unwrap(),
+        None
+    );
 }
 
 #[test]

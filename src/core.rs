@@ -1,6 +1,7 @@
 use crate::{
     config::Config,
     model::{Candidate, ObservationKind, Pane, Provider, Session, Status},
+    named_discovery::NamedDiscovery,
     open_history,
     paths::Paths,
     process::{self, ProcessObservation, ProcessRecord},
@@ -82,6 +83,18 @@ pub struct ExactPaneBinding {
     provider_launcher: Option<process::ProcessGeneration>,
 }
 
+/// A tagged, live Pika pane whose provider process is present but whose
+/// provider identity is not currently provable. This is deliberately weaker
+/// than [`ExactPaneBinding`]: it is only safe for an explicit terminal
+/// handoff, never for resume, state updates, or identity certification.
+#[derive(Clone, Debug)]
+pub struct UnverifiedPaneBinding {
+    pub pane: Pane,
+    pub pane_start_time: u64,
+    pub provider_pid: i64,
+    pub provider_start_time: u64,
+}
+
 #[derive(Default)]
 struct IdentityOwners {
     direct: BTreeSet<i64>,
@@ -116,6 +129,10 @@ pub enum OpenError {
     Ambiguous(String),
     #[error("{0}")]
     OutsideLive(String),
+    #[error(
+        "Pika could not safely identify this conversation's existing terminal. Nothing was restarted and unread state is unchanged."
+    )]
+    IdentityUnproven,
     #[error("{0}")]
     Identity(String),
 }
@@ -128,12 +145,41 @@ pub struct Pika {
     pub tmux: Tmux,
     process_observer: Arc<dyn Fn() -> ProcessObservation + Send + Sync>,
     local_reconcile_fence: Arc<LocalReconcileFence>,
+    named_discovery: Arc<NamedDiscovery>,
 }
 
 #[derive(Default)]
 struct LocalReconcileFence {
     generation: AtomicU64,
     write_gate: Mutex<()>,
+}
+
+fn exclusive_outside_owner(
+    provider: Provider,
+    pid: i64,
+    processes: &BTreeMap<i64, ProcessRecord>,
+) -> bool {
+    processes.get(&pid).is_none_or(|record| {
+        provider != Provider::Codex || !process::shared_provider_process(record, provider)
+    })
+}
+
+fn distinct_fork_name(candidate: &Candidate, parent: &Session) -> bool {
+    candidate
+        .name
+        .as_deref()
+        .zip(parent.name.as_deref())
+        .is_some_and(|(child, parent)| !child.eq_ignore_ascii_case(parent))
+}
+
+fn skip_independent_codex_fork(
+    candidate: &Candidate,
+    parent: &Session,
+    known: &BTreeSet<(Provider, String)>,
+) -> bool {
+    !distinct_fork_name(candidate, parent)
+        || known.contains(&(Provider::Codex, candidate.session_id.clone()))
+        || parent.active_thread_id.as_deref() == Some(&candidate.session_id)
 }
 
 impl Pika {
@@ -148,6 +194,7 @@ impl Pika {
             tmux: Tmux::default(),
             process_observer: Arc::new(process::observe),
             local_reconcile_fence: Arc::default(),
+            named_discovery: Arc::default(),
         })
     }
 
@@ -159,6 +206,7 @@ impl Pika {
             tmux,
             process_observer: Arc::new(process::observe),
             local_reconcile_fence: Arc::default(),
+            named_discovery: Arc::default(),
         }
     }
 
@@ -171,7 +219,7 @@ impl Pika {
     pub fn cached_inventory(&self) -> Result<Inventory> {
         Ok(Inventory {
             sessions: self.store.list_sessions()?,
-            pending: self.store.list_pending()?,
+            pending: self.store.list_visible_pending()?,
         })
     }
 
@@ -281,6 +329,14 @@ impl Pika {
         stored.retain(|session| {
             !removed_keys.contains(&(session.provider, session.session_id.clone()))
         });
+        let named_candidates = self.named_discovery.candidates(&providers);
+        self.admit_named_candidates(
+            reconcile_generation,
+            &mut store_reconcile,
+            &mut stored,
+            &named_candidates,
+            &provider_hidden_keys,
+        )?;
         // Provider-proven archive or deletion removes the row from daily
         // observation. Retain any exact pane tag as dormant recovery evidence:
         // reconciliation must never hold SQLite's writer lock across tmux I/O,
@@ -324,15 +380,7 @@ impl Pika {
                 continue;
             };
             let parent = &stored[parent_index];
-            let distinct_name = candidate
-                .name
-                .as_deref()
-                .zip(parent.name.as_deref())
-                .is_some_and(|(child, parent)| !child.eq_ignore_ascii_case(parent));
-            if !distinct_name
-                || known.contains(&(Provider::Codex, candidate.session_id.clone()))
-                || parent.active_thread_id.as_deref() == Some(&candidate.session_id)
-            {
+            if skip_independent_codex_fork(candidate, parent, &known) {
                 continue;
             }
             let same_pane = panes
@@ -458,6 +506,7 @@ impl Pika {
                             ledger,
                             &continuation_conflicts,
                         )?;
+                        recover_confirmed_pending(&session, &panes, processes, ledger)?;
                         ledger.upsert_session(&session, false)?;
                         projected.push(session);
                     }
@@ -494,10 +543,66 @@ impl Pika {
         Ok(ReconciledInventory {
             inventory: Inventory {
                 sessions,
-                pending: self.store.list_pending()?,
+                pending: self.store.list_visible_pending()?,
             },
             candidates: candidate_map,
         })
+    }
+
+    /// Grant watched membership to provider-verified personal names only.
+    /// Membership writes use the same generation-fenced, small transactions as
+    /// the rest of reconciliation; the provider cache is evidence, never a
+    /// lifecycle/state snapshot to replay over a session that already exists.
+    fn admit_named_candidates(
+        &self,
+        generation: u64,
+        store_reconcile: &mut ReconcileSession,
+        stored: &mut Vec<Session>,
+        candidates: &[Candidate],
+        provider_hidden: &BTreeSet<(Provider, String)>,
+    ) -> Result<()> {
+        let mut known = stored
+            .iter()
+            .flat_map(|session| {
+                identity_strings(session)
+                    .into_iter()
+                    .map(move |identity| (session.provider, identity.to_owned()))
+            })
+            .collect::<BTreeSet<_>>();
+        let eligible = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| !name.trim().is_empty())
+                    && !provider_hidden
+                        .contains(&(candidate.provider, candidate.session_id.clone()))
+                    && known.insert((candidate.provider, candidate.session_id.clone()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for batch in eligible.chunks(RECONCILE_WRITE_BATCH) {
+            let results = self.reconciled_write(generation, store_reconcile, |ledger| {
+                let mut admitted = Vec::new();
+                for candidate in batch {
+                    let session = session_from_candidate(candidate);
+                    if ledger.watch_named_session(&session)? {
+                        if let Some(existing) =
+                            ledger.get_session(candidate.provider, &candidate.session_id)?
+                        {
+                            admitted.push(existing);
+                        }
+                    }
+                }
+                Ok(admitted)
+            })?;
+            // The ledger snapshot retains an existing external observation's
+            // unread, lifecycle, and ownership state for this projection.
+            stored.extend(results);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -589,10 +694,15 @@ impl Pika {
             session.tmux_pane = Some(pane.pane_id.clone());
             session.root_pid = Some(pid);
         } else {
-            if let Some(pid) = outside.first() {
-                session.root_pid = Some(*pid);
+            if let Some(pid) = outside
+                .iter()
+                .copied()
+                .find(|pid| exclusive_outside_owner(session.provider, *pid, processes))
+            {
+                session.root_pid = Some(pid);
             } else {
                 session.root_pid = None;
+                // Clear the exclusive root projection, not advisory leases.
                 ledger.clear_session_runtime(session.provider, &session.session_id, timestamp)?;
             }
             if tagged.is_empty() {
@@ -695,7 +805,13 @@ impl Pika {
             .list_sessions()?
             .into_iter()
             .chain(self.store.list_untracked_sessions()?)
-            .map(|session| (session.provider, session.session_id))
+            .flat_map(|session| {
+                let mut identities = vec![(session.provider, session.session_id)];
+                if let Some(active) = session.active_thread_id {
+                    identities.push((session.provider, active));
+                }
+                identities
+            })
             .collect();
         let mut candidates = Vec::new();
         for provider in Provider::ALL {
@@ -703,17 +819,6 @@ impl Pika {
                 |candidate| !excluded.contains(&(candidate.provider, candidate.session_id.clone())),
             ));
         }
-        candidates.extend(
-            self.unconfirmed_candidates()?
-                .into_iter()
-                .filter(|candidate| {
-                    candidate
-                        .name
-                        .as_deref()
-                        .is_some_and(|name| !name.trim().is_empty())
-                        && !excluded.contains(&(candidate.provider, candidate.session_id.clone()))
-                }),
-        );
         let mut seen = BTreeSet::new();
         candidates
             .retain(|candidate| seen.insert((candidate.provider, candidate.session_id.clone())));
@@ -799,10 +904,7 @@ impl Pika {
 
     pub fn adopt_candidate(&self, candidate: &Candidate) -> Result<bool> {
         self.store.initialize()?;
-        self.store
-            .restore_tracking(candidate.provider, &candidate.session_id)?;
-        self.store
-            .upsert_session(&session_from_candidate(candidate), false)
+        self.store.adopt_session(&session_from_candidate(candidate))
     }
 
     pub fn resolve_local(&self, query: &str) -> Result<Vec<Session>> {
@@ -1185,10 +1287,56 @@ impl Pika {
             }
             return self.open_session(session, attach);
         }
+        let pending = self.resolve_pending(query)?;
+        match pending.as_slice() {
+            [pending] => return self.open_pending(&pending.launch_token, attach),
+            [] => {}
+            _ => bail!(
+                "{query:?} matches several pending launches. Use `pika PROVIDER:NAME` or choose the existing terminal in the board. No new client was launched."
+            ),
+        }
         if !allow_create {
             return Err(OpenError::NotFound(query.to_owned()).into());
         }
         self.new_session(query, self.config.default_provider, attach)
+    }
+
+    /// Pending launches are recovery handles, not fabricated conversations.
+    /// Hidden launches remain addressable by their exact daily name.
+    pub fn resolve_pending(&self, query: &str) -> Result<Vec<PendingLaunch>> {
+        let (provider, name) = split_provider_query(query);
+        Ok(self
+            .store
+            .list_pending()?
+            .into_iter()
+            .filter(|pending| {
+                provider.is_none_or(|provider| provider == pending.provider)
+                    && pending.name.eq_ignore_ascii_case(name)
+            })
+            .collect())
+    }
+
+    /// Shared pending-state projection for the board, activity feed and CLI.
+    pub fn pending_session(&self, pending: &PendingLaunch) -> Result<Session> {
+        let mut session = session_from_pending(pending);
+        if let Some(exit) = self
+            .store
+            .get_pending_exit(&pending.launch_token)?
+            .filter(|exit| {
+                exit.provider == pending.provider && exit.pending_created_at == pending.created_at
+            })
+        {
+            session.status = Status::Error;
+            session.home_state = "startup-exited".into();
+            session.attention_reason = Some("startup exited before confirmation".into());
+            session.error = Some(format!(
+                "{} exited during startup (code {}). Enter reopens the existing terminal to inspect or finish the update. No second client was started; the conversation identity is still unconfirmed.",
+                pending.provider, exit.code
+            ));
+            session.last_event_at = exit.observed_at;
+            session.updated_at = exit.observed_at;
+        }
+        Ok(session)
     }
 
     pub fn open_session(&self, mut session: Session, attach: bool) -> Result<OpenReceipt> {
@@ -1221,10 +1369,7 @@ impl Pika {
             session.home_state.as_str(),
             "identity_unproven" | "identity_incomplete"
         ) {
-            return Err(OpenError::Identity(
-                "Pika refused to resume because tagged-pane identity evidence is incomplete or unverified; inspect the panes and process ownership first.".into(),
-            )
-            .into());
+            return Err(OpenError::IdentityUnproven.into());
         }
         if session.has_exact_home() {
             let binding = self.exact_pane_binding(&session, session.tmux_pane.as_deref())?;
@@ -1326,6 +1471,48 @@ impl Pika {
         self.resume_session(session, attach)
     }
 
+    /// Reconcile once and attach only if the existing pane becomes exactly
+    /// provable. This recovery path never reserves, launches, or resumes.
+    /// Only a proven exact handoff records the open and acknowledges its event.
+    pub fn recover_existing_session(&self, session: Session, attach: bool) -> Result<OpenReceipt> {
+        let inventory = self.reconcile_for_action()?;
+        let session = inventory
+            .sessions
+            .into_iter()
+            .find(|candidate| {
+                candidate.provider == session.provider && candidate.session_id == session.session_id
+            })
+            .ok_or_else(|| OpenError::NotFound(session.display_name()))?;
+        if session.status == Status::OpenTwice {
+            return Err(OpenError::Identity(
+                "Pika still sees multiple live clients for this conversation; no provider was launched."
+                    .into(),
+            )
+            .into());
+        }
+        if !session.has_exact_home() {
+            return Err(OpenError::IdentityUnproven.into());
+        }
+        let binding = self.exact_pane_binding(&session, session.tmux_pane.as_deref())?;
+        let (exit_code, receipt_delivery) = if attach {
+            let receipt = continuity_receipt(&session, "ATTACHED LIVE");
+            let handoff =
+                self.tmux
+                    .attach_exact_with_observed_receipt(&binding.pane, &receipt, || {
+                        self.record_exact_handoff(&session, &binding, session.last_event_at)
+                    })?;
+            (handoff.exit_code, handoff.delivery)
+        } else {
+            (0, None)
+        };
+        Ok(OpenReceipt {
+            target: OpenTarget::Session(Box::new(session)),
+            kind: "ATTACHED LIVE",
+            exit_code,
+            receipt_delivery,
+        })
+    }
+
     /// Return dedicated UUID-bearing processes that are outside every tmux
     /// pane, with their platform-native birth stamps. This is evidence for an
     /// explicit clean-and-attach choice, never an automatic takeover.
@@ -1359,6 +1546,107 @@ impl Pika {
                 Ok((pid, record.start_time))
             })
             .collect()
+    }
+
+    /// Capture one tagged live pane for an explicit, unverified terminal
+    /// handoff. Provider UUIDs, leases and launch tokens are intentionally not
+    /// treated as identity proof here; they only select the already-tagged
+    /// terminal the user may choose to inspect.
+    pub fn unverified_pane_binding(&self, session: &Session) -> Result<UnverifiedPaneBinding> {
+        let observation = self.observe_processes();
+        let processes = require_complete_processes(&observation, "inspect the existing terminal")?;
+        let panes = self.tmux.list_panes().context(
+            "Pika refused to inspect the existing terminal because tmux could not be observed",
+        )?;
+        let tagged = panes
+            .iter()
+            .filter(|pane| {
+                crate::tmux::is_pika_session(&pane.session_name)
+                    && !pane.dead
+                    && pane.pika_provider == Some(session.provider)
+                    && pane.pika_session_id.as_deref() == Some(&session.session_id)
+            })
+            .collect::<Vec<_>>();
+        if tagged.len() != 1 {
+            bail!(
+                "Pika found {} tagged terminals for this conversation; it will not offer an unverified handoff",
+                tagged.len()
+            );
+        }
+        let pane = tagged[0];
+        let pane_record = processes
+            .get(&pane.pane_pid)
+            .context("the tagged terminal root is no longer live")?;
+        let pane_generation = pane_record.generation();
+        let provider_candidates = process::process_tree(pane.pane_pid, processes)
+            .into_iter()
+            .filter(|pid| {
+                processes.get(pid).and_then(ProcessRecord::provider) == Some(session.provider)
+                    && processes.get(pid).is_none_or(|record| {
+                        !process::shared_provider_process(record, session.provider)
+                    })
+            })
+            .collect::<BTreeSet<_>>();
+        let provider_pids = process::canonical_identity_pids(&provider_candidates, processes);
+        if provider_pids.len() != 1 {
+            bail!(
+                "Pika could not find one unique non-helper provider process in the tagged terminal"
+            );
+        }
+        let provider_pid = provider_pids[0];
+        let provider_record = processes
+            .get(&provider_pid)
+            .context("the provider process disappeared during terminal inspection")?;
+        process::revalidate_ancestry(pane_generation, provider_record.generation(), processes)
+            .map_err(anyhow::Error::msg)
+            .context("the tagged terminal changed during inspection")?;
+        Ok(UnverifiedPaneBinding {
+            pane: pane.clone(),
+            pane_start_time: pane_generation.start_time,
+            provider_pid,
+            provider_start_time: provider_record.start_time,
+        })
+    }
+
+    fn revalidate_unverified_pane(
+        &self,
+        session: &Session,
+        expected: &UnverifiedPaneBinding,
+    ) -> Result<()> {
+        let current = self.unverified_pane_binding(session)?;
+        if !same_unverified_binding(expected, &current) {
+            bail!("the existing terminal changed; Pika refused the unverified handoff")
+        }
+        Ok(())
+    }
+
+    /// Attach to a user-confirmed existing terminal without launching a
+    /// provider or mutating Pika identity/attention state.
+    pub fn open_unverified_terminal(
+        &self,
+        session: Session,
+        expected: UnverifiedPaneBinding,
+    ) -> Result<OpenReceipt> {
+        self.revalidate_unverified_pane(&session, &expected)?;
+        let receipt = format!(
+            "UNVERIFIED TERMINAL · {} · conversation identity not certified",
+            receipt_text(&session.display_name())
+        );
+        let exit_code = self
+            .tmux
+            .attach_unverified_with_started(&expected.pane, || {
+                // The tmux generation guard closes the check/use gap for the
+                // pane. Recheck process ancestry at the actual handoff too;
+                // failure is reported after attach and never auto-recovered.
+                self.revalidate_unverified_pane(&session, &expected)?;
+                Ok(Some(receipt))
+            })?;
+        Ok(OpenReceipt {
+            target: OpenTarget::Session(Box::new(session)),
+            kind: "UNVERIFIED TERMINAL",
+            exit_code,
+            receipt_delivery: None,
+        })
     }
 
     /// Gracefully stop one explicitly selected, generation-pinned outside
@@ -1408,6 +1696,15 @@ impl Pika {
         {
             return self.open_session(session, attach);
         }
+        self.open_pending_terminal(pending, launch_token, attach)
+    }
+
+    fn open_pending_terminal(
+        &self,
+        pending: PendingLaunch,
+        launch_token: &str,
+        attach: bool,
+    ) -> Result<OpenReceipt> {
         let pane_id = pending
             .tmux_pane
             .as_deref()
@@ -1423,8 +1720,13 @@ impl Pika {
         {
             bail!("Pika refused a pending home whose exact launch identity changed")
         }
+        let kind = if self.store.get_pending_exit(launch_token)?.is_some() {
+            "STARTUP TERMINAL"
+        } else {
+            "ATTACHED STARTING"
+        };
         let (code, receipt_delivery) = if attach {
-            let receipt = pending_receipt(&pending, "ATTACHED STARTING");
+            let receipt = pending_receipt(&pending, kind);
             let handoff = self
                 .tmux
                 .attach_exact_with_observed_receipt(&pane, &receipt, || {
@@ -1436,7 +1738,7 @@ impl Pika {
         };
         Ok(OpenReceipt {
             target: OpenTarget::Pending(Box::new(pending)),
-            kind: "ATTACHED STARTING",
+            kind,
             exit_code: code,
             receipt_delivery,
         })
@@ -1527,33 +1829,22 @@ impl Pika {
             }
             if !exact_pids.is_empty() {
                 let binding = self.exact_pane_binding(&session, None)?;
-                self.store.delete_pending(&token)?;
-                let (code, receipt_delivery) = if attach {
-                    let receipt = continuity_receipt(&session, "ATTACHED LIVE");
-                    let handoff = self.tmux.attach_exact_with_observed_receipt(
-                        &binding.pane,
-                        &receipt,
-                        || self.record_exact_handoff(&session, &binding, selected_event),
-                    )?;
-                    (handoff.exit_code, handoff.delivery)
-                } else {
-                    (0, None)
-                };
-                return Ok(OpenReceipt {
-                    target: OpenTarget::Session(Box::new(session.clone())),
-                    kind: "ATTACHED LIVE",
-                    exit_code: code,
-                    receipt_delivery,
-                });
+                return self.attach_existing_reserved(
+                    &session,
+                    &binding,
+                    selected_event,
+                    &token,
+                    attach,
+                );
             }
             let providers = Providers::new(&self.paths, &self.config);
             let argv = providers.resume_argv(session.provider, &identity);
-            let environment = launch_environment(
+            let environment = self.register_launch_wrapper(
                 session.provider,
                 Some(&session.session_id),
                 &token,
                 &session.display_name(),
-            );
+            )?;
             let cwd = existing_cwd(session.cwd.as_deref())?;
             // Never destructively reuse a pane that has been exposed outside
             // this launch. A fresh private holder makes `respawn-pane -k`
@@ -1728,66 +2019,7 @@ impl Pika {
         // the recovery handle if tmux accepted provider execution before a
         // later readback/store operation failed.
         (|| {
-            let environment = launch_environment(provider, reserved.as_deref(), &token, name);
-            let allocated = self.tmux.create_holding_session(&internal, &cwd)?;
-            self.store.finalize_pending_pane(
-                &token,
-                &allocated.session_name,
-                &allocated.pane_id,
-                Some(allocated.pane_pid),
-                process::process_start_time(allocated.pane_pid)
-                    .and_then(|value| i64::try_from(value).ok()),
-            )?;
-            self.tmux.configure_exact_home(&allocated)?;
-            let prepared = self.tmux.prepare_agent_pane(
-                &allocated,
-                provider,
-                reserved.as_deref(),
-                name,
-                &token,
-            )?;
-            if !self
-                .store
-                .set_launch_phase(&token, crate::store::LaunchPhase::PanePrepared)?
-            {
-                bail!("the recoverable launch record disappeared before provider execution")
-            }
-            if let Some(session_id) = reserved.as_deref()
-                && !self.store.bind_launch(&token, provider, session_id)?
-            {
-                bail!("the recoverable launch token was already bound to another conversation")
-            }
-            if !self
-                .store
-                .set_launch_phase(&token, crate::store::LaunchPhase::ProviderStarting)?
-            {
-                bail!("the recoverable launch record disappeared before provider execution")
-            }
-            let ready_observation = self.observe_processes();
-            let ready_processes = require_complete_processes(
-                &ready_observation,
-                "execute the reserved provider launch",
-            )?;
-            if let Some(session_id) = reserved.as_deref() {
-                let appeared =
-                    process::find_session_processes(session_id, provider, ready_processes);
-                if !appeared.is_empty() {
-                    bail!(
-                        "the reserved conversation UUID acquired another owner before provider execution. No second provider was launched."
-                    )
-                }
-            }
-            require_idle_pane(&prepared, ready_processes, true)?;
-            let pane = self.tmux.start_prepared_agent(
-                &prepared,
-                &cwd,
-                provider,
-                &argv,
-                &environment,
-                reserved.as_deref(),
-                name,
-                &token,
-            )?;
+            let pane = self.start_new_provider(&pending, &internal, &argv)?;
             let mut exact_new_home = None;
             if let Some(session_id) = reserved.as_deref() {
                 let mut provisional = Session {
@@ -1884,9 +2116,148 @@ impl Pika {
             })
         })()
     }
+
+    fn register_launch_wrapper(
+        &self,
+        provider: Provider,
+        session_id: Option<&str>,
+        token: &str,
+        name: &str,
+    ) -> Result<BTreeMap<String, String>> {
+        let environment = launch_environment(provider, session_id, token, name);
+        if !self
+            .store
+            .register_pending_wrapper_owner(token, &environment["PIKA_OWNER_TOKEN"])?
+        {
+            bail!("the launch reservation changed before its wrapper could be registered")
+        }
+        Ok(environment)
+    }
+
+    fn attach_existing_reserved(
+        &self,
+        session: &Session,
+        binding: &ExactPaneBinding,
+        selected_event: f64,
+        token: &str,
+        attach: bool,
+    ) -> Result<OpenReceipt> {
+        self.store.delete_pending(token)?;
+        let (code, receipt_delivery) = if attach {
+            let receipt = continuity_receipt(session, "ATTACHED LIVE");
+            let handoff =
+                self.tmux
+                    .attach_exact_with_observed_receipt(&binding.pane, &receipt, || {
+                        self.record_exact_handoff(session, binding, selected_event)
+                    })?;
+            (handoff.exit_code, handoff.delivery)
+        } else {
+            (0, None)
+        };
+        Ok(OpenReceipt {
+            target: OpenTarget::Session(Box::new(session.clone())),
+            kind: "ATTACHED LIVE",
+            exit_code: code,
+            receipt_delivery,
+        })
+    }
+
+    fn set_required_launch_phase(
+        &self,
+        token: &str,
+        phase: crate::store::LaunchPhase,
+    ) -> Result<()> {
+        if !self.store.set_launch_phase(token, phase)? {
+            bail!("the recoverable launch record disappeared before provider execution")
+        }
+        Ok(())
+    }
+
+    fn start_new_provider(
+        &self,
+        pending: &PendingLaunch,
+        internal: &str,
+        argv: &[String],
+    ) -> Result<Pane> {
+        let provider = pending.provider;
+        let reserved = pending.expected_session_id.as_deref();
+        let token = pending.launch_token.as_str();
+        let name = pending.name.as_str();
+        let cwd = pending.cwd.as_str();
+        let environment = self.register_launch_wrapper(provider, reserved, token, name)?;
+        let allocated = self.tmux.create_holding_session(internal, cwd)?;
+        self.store.finalize_pending_pane(
+            token,
+            &allocated.session_name,
+            &allocated.pane_id,
+            Some(allocated.pane_pid),
+            process::process_start_time(allocated.pane_pid)
+                .and_then(|value| i64::try_from(value).ok()),
+        )?;
+        self.tmux.configure_exact_home(&allocated)?;
+        let prepared = self
+            .tmux
+            .prepare_agent_pane(&allocated, provider, reserved, name, token)?;
+        self.set_required_launch_phase(token, crate::store::LaunchPhase::PanePrepared)?;
+        if let Some(session_id) = reserved
+            && !self.store.bind_launch(token, provider, session_id)?
+        {
+            bail!("the recoverable launch token was already bound to another conversation")
+        }
+        self.set_required_launch_phase(token, crate::store::LaunchPhase::ProviderStarting)?;
+        let observation = self.observe_processes();
+        let processes =
+            require_complete_processes(&observation, "execute the reserved provider launch")?;
+        ensure_new_identity_unowned(reserved, provider, processes)?;
+        require_idle_pane(&prepared, processes, true)?;
+        let pane = self.tmux.start_prepared_agent(
+            &prepared,
+            cwd,
+            provider,
+            argv,
+            &environment,
+            reserved,
+            name,
+            token,
+        )?;
+        Ok(pane)
+    }
+}
+
+fn recover_confirmed_pending(
+    session: &Session,
+    panes: &[Pane],
+    processes: &BTreeMap<i64, ProcessRecord>,
+    ledger: &crate::store::ReconcileLedger<'_>,
+) -> Result<bool> {
+    if !session.has_exact_home() {
+        return Ok(false);
+    }
+    let Some(pane) = panes.iter().find(|pane| {
+        session.tmux_pane.as_deref() == Some(pane.pane_id.as_str())
+            && session.tmux_session.as_deref() == Some(pane.session_name.as_str())
+            && !pane.dead
+            && pane.pika_provider == Some(session.provider)
+            && pane.pika_session_id.as_deref() == Some(session.session_id.as_str())
+    }) else {
+        return Ok(false);
+    };
+    let Some(token) = pane.pika_launch_token.as_deref() else {
+        return Ok(false);
+    };
+    let Some(owner) = session.root_pid.and_then(|pid| processes.get(&pid)) else {
+        return Ok(false);
+    };
+    let Ok(start) = i64::try_from(owner.start_time) else {
+        return Ok(false);
+    };
+    ledger.recover_confirmed_launch(token, session, owner.pid, start)
 }
 
 pub fn session_from_pending(pending: &PendingLaunch) -> Session {
+    // Age can prove that startup is overdue, never that a provider has stopped
+    // or that a conversation identity is known. Keep the recovery row intact.
+    let overdue = now() - pending.created_at > 120.0;
     Session {
         provider: pending.provider,
         session_id: pending
@@ -1900,13 +2271,13 @@ pub fn session_from_pending(pending: &PendingLaunch) -> Session {
         tmux_session: pending.tmux_session.clone(),
         tmux_pane: pending.tmux_pane.clone(),
         root_pid: pending.root_pid,
-        status: Status::Starting,
+        status: if overdue { Status::Error } else { Status::Starting },
         unread: false,
         model: None,
         source: "pending-launch".into(),
         managed: true,
-        error: None,
-        attention_reason: Some("starting provider conversation".into()),
+        error: overdue.then(|| "Pika has not confirmed this launch. Enter checks its existing terminal; X hides this launch entry without stopping the agent.".into()),
+        attention_reason: Some(if overdue { "launch not confirmed" } else { "starting provider conversation" }.into()),
         created_at: pending.created_at,
         updated_at: pending.created_at,
         last_event_at: pending.created_at,
@@ -2088,6 +2459,17 @@ fn same_pane_generation(left: &Pane, right: &Pane) -> bool {
 
 fn same_exact_binding(left: &ExactPaneBinding, right: &ExactPaneBinding) -> bool {
     same_pane_generation(&left.pane, &right.pane)
+        && left.pane_start_time == right.pane_start_time
+        && left.provider_pid == right.provider_pid
+        && left.provider_start_time == right.provider_start_time
+}
+
+fn same_unverified_binding(left: &UnverifiedPaneBinding, right: &UnverifiedPaneBinding) -> bool {
+    same_pane_generation(&left.pane, &right.pane)
+        && left.pane.pika_provider == right.pane.pika_provider
+        && left.pane.pika_session_id == right.pane.pika_session_id
+        && left.pane.pika_name == right.pane.pika_name
+        && left.pane.pika_launch_token == right.pane.pika_launch_token
         && left.pane_start_time == right.pane_start_time
         && left.provider_pid == right.provider_pid
         && left.provider_start_time == right.provider_start_time
@@ -2307,7 +2689,12 @@ fn continuity_receipt(session: &Session, kind: &str) -> String {
 
 fn pending_receipt(pending: &PendingLaunch, kind: &str) -> String {
     let mut parts = vec![
-        "PIKA HOME READY".to_owned(),
+        if kind == "STARTUP TERMINAL" {
+            "STARTUP EXITED · existing terminal only"
+        } else {
+            "PIKA HOME READY"
+        }
+        .to_owned(),
         receipt_text(&pending.name),
         kind.to_owned(),
         "identity pending".to_owned(),
@@ -2377,6 +2764,21 @@ fn launch_environment(
     values
 }
 
+fn ensure_new_identity_unowned(
+    reserved: Option<&str>,
+    provider: Provider,
+    processes: &BTreeMap<i64, ProcessRecord>,
+) -> Result<()> {
+    if let Some(session_id) = reserved
+        && !process::find_session_processes(session_id, provider, processes).is_empty()
+    {
+        bail!(
+            "the reserved conversation UUID acquired another owner before provider execution. No second provider was launched."
+        )
+    }
+    Ok(())
+}
+
 fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2438,8 +2840,94 @@ mod tests {
         })
     }
 
+    fn pending_fixture(token: &str, provider: Provider) -> PendingLaunch {
+        PendingLaunch {
+            launch_token: token.into(),
+            provider,
+            name: "update_test".into(),
+            cwd: "/tmp".into(),
+            tmux_session: Some("pika-startup".into()),
+            tmux_pane: Some("%1".into()),
+            expected_session_id: None,
+            root_pid: None,
+            root_pid_start: None,
+            preexisting_session_ids: Some(vec![]),
+            candidate_session_id: None,
+            candidate_observed_at: None,
+            created_at: now(),
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn unconfirmed_legacy_rows_are_selectable_without_automatic_board_membership() {
+    fn daily_name_reopens_pending_home_without_spawning_or_requiring_create() {
+        let (root, mut pika) = test_pika();
+        let pending = pending_fixture("update-launch", Provider::Codex);
+        let mut pane = tagged_pane("unused");
+        pane.session_name = "pika-startup".into();
+        pane.pika_session_id = None;
+        pane.pika_launch_token = Some(pending.launch_token.clone());
+        pika.tmux = fixture_tmux(root.path(), &[pane]);
+        pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
+        pika.store.add_pending(&pending).unwrap();
+        pika.store
+            .hide_pending(&pending.launch_token, pending.provider, pending.created_at)
+            .unwrap();
+        for query in ["update_test", "UPDATE_TEST", "codex:update_test"] {
+            let receipt = pika.open_name(query, false, false).unwrap();
+            assert_eq!(receipt.kind, "ATTACHED STARTING");
+            let OpenTarget::Pending(opened) = receipt.target else {
+                panic!("fabricated session")
+            };
+            assert_eq!(opened.launch_token, pending.launch_token);
+        }
+        assert!(pika.store.list_sessions().unwrap().is_empty());
+        assert_eq!(pika.store.list_pending().unwrap(), vec![pending]);
+    }
+
+    #[test]
+    fn pending_daily_name_requires_exact_name_and_provider_disambiguation() {
+        let (_root, mut pika) = test_pika();
+        pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
+        for (token, provider) in [("one", Provider::Codex), ("two", Provider::Claude)] {
+            pika.store
+                .add_pending(&pending_fixture(token, provider))
+                .unwrap();
+        }
+        assert_eq!(pika.resolve_pending("update_test").unwrap().len(), 2);
+        assert_eq!(
+            pika.resolve_pending("claude:update_test").unwrap()[0].launch_token,
+            "two"
+        );
+        assert!(pika.resolve_pending("update").unwrap().is_empty());
+        assert!(pika.resolve_pending("muse:update_test").unwrap().is_empty());
+        let error = pika.open_name("update_test", false, true).unwrap_err();
+        assert!(
+            error.to_string().contains("several pending launches"),
+            "{error:#}"
+        );
+        assert_eq!(pika.store.list_pending().unwrap().len(), 2);
+        assert!(pika.store.list_sessions().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_retry_refuses_a_reused_terminal_token() {
+        let (root, mut pika) = test_pika();
+        let pending = pending_fixture("old-launch", Provider::Codex);
+        let mut pane = tagged_pane("unused");
+        pane.pika_launch_token = Some("replacement-launch".into());
+        pika.tmux = fixture_tmux(root.path(), &[pane]);
+        pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
+        pika.store.add_pending(&pending).unwrap();
+        let error = pika.open_name("update_test", false, true).unwrap_err();
+        assert!(error.to_string().contains("exact launch identity changed"));
+        assert_eq!(pika.store.list_pending().unwrap(), vec![pending]);
+        assert!(pika.store.list_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unconfirmed_labels_stay_in_recent_history_until_selected() {
         let (_root, pika) = test_pika();
         let mut named = test_session("named");
         named.managed = false;
@@ -2451,12 +2939,11 @@ mod tests {
         pika.store.upsert_session(&unnamed, false).unwrap();
         assert!(pika.store.list_sessions().unwrap().is_empty());
         let choices = pika.import_named().unwrap();
-        assert_eq!(choices.len(), 1);
-        assert_eq!(choices[0].session_id, "named");
+        assert!(choices.is_empty());
         let recent = pika.import_recent_unnamed(20).unwrap();
-        assert_eq!(recent.len(), 1);
-        assert_eq!(recent[0].session_id, "unnamed");
-        pika.adopt_candidate(&choices[0]).unwrap();
+        assert_eq!(recent.len(), 2);
+        let named = recent.iter().find(|row| row.session_id == "named").unwrap();
+        pika.adopt_candidate(named).unwrap();
         assert_eq!(pika.store.list_sessions().unwrap().len(), 1);
         assert!(pika.import_named().unwrap().is_empty());
         assert_eq!(pika.import_recent_unnamed(20).unwrap().len(), 1);
@@ -2572,6 +3059,290 @@ mod tests {
             pika_name: Some("portfolio_review".into()),
             pika_launch_token: None,
         }
+    }
+
+    #[cfg(unix)]
+    fn unverified_fixture(identity: &str) -> (tempfile::TempDir, Pika, Session) {
+        let (root, mut pika) = test_pika();
+        let session = test_session(identity);
+        pika.store.upsert_session(&session, false).unwrap();
+        let pid = i64::from(std::process::id());
+        let start_time = process::process_start_time(pid).unwrap();
+        let mut pane = tagged_pane(identity);
+        pane.pane_pid = pid;
+        pika.tmux = fixture_tmux(root.path(), &[pane]);
+        pika.process_observer = Arc::new(move || {
+            ProcessObservation::complete(BTreeMap::from([(
+                pid,
+                record(pid, None, start_time, &["codex", "resume"]),
+            )]))
+        });
+        (root, pika, session)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverified_binding_accepts_one_tagged_live_provider_without_uuid_argv() {
+        let (_root, pika, session) = unverified_fixture("abababab-abab-4bab-8bab-abababababab");
+        let binding = pika.unverified_pane_binding(&session).unwrap();
+        assert_eq!(binding.pane.pane_id, "%1");
+        assert_eq!(binding.provider_pid, i64::from(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_completes_only_an_independently_proven_pending_launch() {
+        for case in [
+            "exact",
+            "unknown",
+            "wrong-token",
+            "wrong-binding",
+            "duplicate",
+        ] {
+            let identity = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
+            let (root, mut pika, mut session) = unverified_fixture(identity);
+            let pid = i64::from(std::process::id());
+            let start = process::process_start_time(pid).unwrap();
+            let mut pane = tagged_pane(identity);
+            pane.pane_pid = pid;
+            pane.pika_launch_token = Some(
+                if case == "wrong-token" {
+                    "other"
+                } else {
+                    "stuck"
+                }
+                .into(),
+            );
+            pika.tmux = fixture_tmux(root.path(), &[pane.clone()]);
+            let duplicate = case == "duplicate";
+            pika.process_observer = Arc::new(move || {
+                let mut records = BTreeMap::from([(
+                    pid,
+                    record(pid, None, start, &["codex", "resume", identity]),
+                )]);
+                if duplicate {
+                    records.insert(
+                        999_998,
+                        record(999_998, None, 88, &["codex", "resume", identity]),
+                    );
+                }
+                ProcessObservation::complete(records)
+            });
+            session.status = Status::Ready;
+            session.unread = true;
+            pika.store.upsert_session(&session, false).unwrap();
+            pika.store
+                .record_status_observation(
+                    session.provider,
+                    identity,
+                    &crate::model::StatusObservation {
+                        kind: ObservationKind::Lifecycle,
+                        status: Status::Ready,
+                        unread: true,
+                        attention_reason: Some("completed".into()),
+                        error: None,
+                        observed_at: 42.0,
+                        source: "fixture".into(),
+                    },
+                )
+                .unwrap();
+            let pending = PendingLaunch {
+                launch_token: "stuck".into(),
+                provider: session.provider,
+                name: "delayed".into(),
+                cwd: "/tmp".into(),
+                tmux_session: Some(pane.session_name),
+                tmux_pane: Some(pane.pane_id),
+                expected_session_id: (case != "unknown").then(|| identity.into()),
+                root_pid: Some(999_999),
+                root_pid_start: Some(10),
+                preexisting_session_ids: None,
+                candidate_session_id: None,
+                candidate_observed_at: None,
+                created_at: 1.0,
+            };
+            pika.store.add_pending(&pending).unwrap();
+            pika.store
+                .bind_launch(
+                    "stuck",
+                    session.provider,
+                    if case == "wrong-binding" {
+                        "other"
+                    } else {
+                        identity
+                    },
+                )
+                .unwrap();
+            pika.store
+                .set_launch_phase("stuck", crate::store::LaunchPhase::ProviderStarting)
+                .unwrap();
+            pika.reconcile_for_action().unwrap();
+            if case == "exact" {
+                assert!(pika.store.get_pending("stuck").unwrap().is_none());
+                let owner = pika
+                    .store
+                    .get_recovery_owner(session.provider, identity)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!((owner.pid, owner.start_time), (pid, start as i64));
+                assert!(
+                    pika.store
+                        .get_session(session.provider, identity)
+                        .unwrap()
+                        .unwrap()
+                        .unread
+                );
+                assert!(pika.store.get_meta("last_attached").unwrap().is_none());
+            } else {
+                assert_eq!(
+                    pika.store.get_pending("stuck").unwrap(),
+                    Some(pending),
+                    "{case}"
+                );
+                assert!(
+                    pika.store
+                        .get_recovery_owner(session.provider, identity)
+                        .unwrap()
+                        .is_none(),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverified_binding_rejects_duplicate_tagged_panes() {
+        let (root, mut pika, session) = unverified_fixture("acacacac-acac-4cac-8cac-acacacacacac");
+        let mut duplicate = tagged_pane(&session.session_id);
+        duplicate.pane_id = "%2".into();
+        duplicate.pane_pid = 10;
+        let mut first = tagged_pane(&session.session_id);
+        first.pane_pid = 10;
+        pika.tmux = fixture_tmux(root.path(), &[first, duplicate]);
+        let error = pika.unverified_pane_binding(&session).unwrap_err();
+        assert!(error.to_string().contains("2 tagged terminals"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverified_binding_rejects_dead_or_non_pika_tagged_panes() {
+        let (root, mut pika, session) = unverified_fixture("adadadad-adad-4dad-8dad-adadadadadad");
+        let mut dead = tagged_pane(&session.session_id);
+        dead.dead = true;
+        pika.tmux = fixture_tmux(root.path(), &[dead]);
+        assert!(pika.unverified_pane_binding(&session).is_err());
+
+        let mut non_pika = tagged_pane(&session.session_id);
+        non_pika.session_name = "user-shell".into();
+        pika.tmux = fixture_tmux(root.path(), &[non_pika]);
+        assert!(pika.unverified_pane_binding(&session).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverified_binding_rejects_replaced_process_generation_and_retags() {
+        let (root, mut pika, session) = unverified_fixture("aeaeaeae-aeae-4eae-8eae-aeaeaeaeaeae");
+        let expected = pika.unverified_pane_binding(&session).unwrap();
+        let pid = expected.provider_pid;
+        let start_time = expected.provider_start_time;
+        pika.process_observer = Arc::new(move || {
+            ProcessObservation::complete(BTreeMap::from([(
+                pid,
+                record(pid, None, 999, &["codex", "resume"]),
+            )]))
+        });
+        assert!(
+            pika.revalidate_unverified_pane(&session, &expected)
+                .is_err()
+        );
+
+        let mut retagged = tagged_pane(&session.session_id);
+        retagged.pika_name = Some("different_conversation".into());
+        retagged.pane_pid = pid;
+        let current_start = start_time;
+        pika.tmux = fixture_tmux(root.path(), &[retagged]);
+        pika.process_observer = Arc::new(move || {
+            ProcessObservation::complete(BTreeMap::from([(
+                pid,
+                record(pid, None, current_start, &["codex", "resume"]),
+            )]))
+        });
+        assert!(
+            pika.revalidate_unverified_pane(&session, &expected)
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverified_binding_rejects_shared_codex_daemon_without_terminal_provider() {
+        let (root, mut pika, session) = unverified_fixture("afafafaf-afaf-4faf-8faf-afafafafafaf");
+        let pid = i64::from(std::process::id());
+        let start_time = process::process_start_time(pid).unwrap();
+        pika.process_observer = Arc::new(move || {
+            ProcessObservation::complete(BTreeMap::from([(
+                pid,
+                record(pid, None, start_time, &["codex", "app-server"]),
+            )]))
+        });
+        let mut pane = tagged_pane(&session.session_id);
+        pane.pane_pid = pid;
+        pika.tmux = fixture_tmux(root.path(), &[pane]);
+        assert!(pika.unverified_pane_binding(&session).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recover_existing_session_with_vanished_pane_never_creates_pending_launch() {
+        let (root, mut pika) = test_pika();
+        let identity = "babababa-baba-4bab-8bab-babababababa";
+        let mut session = test_session(identity);
+        session.home_state = "identity_unproven".into();
+        pika.store.upsert_session(&session, false).unwrap();
+        pika.tmux = fixture_tmux(root.path(), &[]);
+        pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
+
+        let error = pika
+            .recover_existing_session(session.clone(), true)
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<OpenError>(),
+            Some(OpenError::IdentityUnproven)
+        ));
+        assert!(pika.store.list_pending().unwrap().is_empty());
+        assert!(
+            pika.store
+                .get_recovery_owner(Provider::Codex, identity)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rejects_a_session_removed_from_fresh_inventory() {
+        let (root, mut pika) = test_pika();
+        let session = test_session("bcbcbcbc-bcbc-4cbc-8cbc-bcbcbcbcbcbc");
+        pika.store.upsert_session(&session, false).unwrap();
+        pika.store
+            .untrack_session(session.provider, &session.session_id)
+            .unwrap();
+        pika.tmux = fixture_tmux(root.path(), &[]);
+        pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
+        let error = pika
+            .recover_existing_session(session.clone(), true)
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<OpenError>(),
+            Some(OpenError::NotFound(_))
+        ));
+        assert!(
+            pika.store
+                .is_untracked(session.provider, &session.session_id)
+                .unwrap()
+        );
+        assert!(pika.store.list_pending().unwrap().is_empty());
     }
 
     #[test]
@@ -2819,7 +3590,7 @@ mod tests {
                     "0".into(),
                     "1".into(),
                     "1".into(),
-                    "0".into(),
+                    if pane.dead { "1" } else { "0" }.into(),
                     String::new(),
                     "1".into(),
                     "1".into(),
@@ -3340,6 +4111,54 @@ mod tests {
         assert_eq!(session.home_state, "identity_unproven");
         assert_eq!(session.status, Status::Error);
         assert!(!session.live);
+    }
+
+    #[test]
+    fn shared_codex_daemon_clears_root_projection_but_keeps_advisory_lease() {
+        let (_root, pika) = test_pika();
+        let identity = "17171717-1717-4171-8171-171717171717";
+        let mut session = test_session(identity);
+        session.root_pid = Some(3);
+        session.tmux_session = None;
+        session.tmux_pane = None;
+        pika.store.upsert_session(&session, false).unwrap();
+        pika.store
+            .set_live_owner(&LiveOwner {
+                provider: Provider::Codex,
+                session_id: identity.into(),
+                pid: 3,
+                start_time: Some(30),
+                owner_token: "shared-daemon-lease".into(),
+                last_seen: now(),
+            })
+            .unwrap();
+        let processes = BTreeMap::from([(
+            3,
+            record(3, None, 30, &["codex", "app-server", "--remote-control"]),
+        )]);
+
+        pika.reconcile_one(&mut session, &[], &processes).unwrap();
+
+        assert!(
+            session.live,
+            "the advisory shared owner still proves liveness"
+        );
+        assert_eq!(
+            session.root_pid, None,
+            "shared daemon is not a terminal root"
+        );
+        assert_eq!(
+            pika.store
+                .get_session(Provider::Codex, identity)
+                .unwrap()
+                .unwrap()
+                .root_pid,
+            None
+        );
+        let leases = pika.store.live_owners(Provider::Codex, identity).unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].pid, 3);
+        assert!(pika.store.list_pending().unwrap().is_empty());
     }
 
     #[test]
@@ -4152,6 +4971,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn proven_exact_attach_acknowledges_only_the_selected_event() {
+        assert_exact_attach_event_boundary(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_exact_attach_records_open_and_preserves_newer_event() {
+        assert_exact_attach_event_boundary(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_exact_attach_event_boundary(recovery: bool) {
         use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -4255,9 +5085,18 @@ mod tests {
             )
             .unwrap();
 
-        let receipt = pika.open_session(session, true).unwrap();
+        let receipt = if recovery {
+            pika.recover_existing_session(session, true)
+        } else {
+            pika.open_session(session, true)
+        }
+        .unwrap();
         assert_eq!(receipt.exit_code, 0);
         assert!(inserted.load(Ordering::SeqCst));
+        assert_eq!(
+            pika.store.get_meta("last_attached").unwrap(),
+            Some(serde_json::to_string(&("codex", identity)).unwrap())
+        );
         let stored = pika
             .store
             .get_session(Provider::Codex, identity)

@@ -1,19 +1,20 @@
-See the work without leaving your agent.
+Pika 0.6.29 makes the board better at finding and returning to your work.
 
-- **Files beside your conversation.** Open **Files** from the bottom bar or use
-  its displayed shortcut. Browse directories, read code, and inspect changes and
-  diffs in a companion pane while your agent keeps working.
-- **Made for reading.** Syntax colors for scripts and source files, rendered
-  Markdown, word-wrap and tree toggles, mouse scrolling, and adjustable panes.
-  The viewer is read-only and runs on the conversation's host.
-- **Muse joins the board.** Discover and resume native Muse Code conversations
-  with the same status tracking, return bar, and Files companion. Run
-  `pika setup` after installing Muse, then `pika new NAME --agent muse`.
+- **Named conversations appear automatically.** Claude custom names and Codex
+  conversations with a later saved-name change join the board on refresh.
+  Generated titles and helper conversations stay out. `+` now offers a focused
+  named-conversation picker instead of every thread you have opened.
+- **Safer recovery.** Pika can reconnect a stranded startup when exact evidence
+  matches. If it cannot prove a live terminal's conversation, it offers an
+  explicitly unverified terminal handoff without launching another agent or
+  marking output read. `x` can hide an unconfirmed start without killing its
+  terminal or deleting recovery information.
+- **Claude usage returns on remote boards.** A stale machine-capability record
+  no longer prevents a read-only quota request to a trusted, upgraded host.
+  The host still proves its identity in the response.
 
-Muse private consultation and quota reporting are not yet supported. Both ends
-of a fleet connection need this version to work with Muse conversations.
-The Windows package remains a client for agents hosted on macOS or Linux;
-enterprise security policies may still block its unsigned executable.
-
-Update from the board's update offer or run `pika update`. Update each host
-where you want the new features; running agents are not stopped automatically.
+This release also strengthens Ctrl+C and rename handling, adds recovery and
+complexity checks, and prepares the Windows signing path. Windows artifacts
+remain unsigned unless publisher signing is enrolled; enterprise policy may
+still block them. Update each host where you want the new board behavior;
+running agents are not stopped automatically.

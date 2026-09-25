@@ -1,0 +1,4 @@
+# Development-only analyzer; never linked into or shipped with Pika.
+lizard==1.24.0 --hash=sha256:a688bc607a891ff4a7836826f25742dc9c1bf648da3075dbd495e199e8848602
+pathspec==1.1.1 --hash=sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189
+pygments==2.21.0 --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9

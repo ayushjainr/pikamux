@@ -59,6 +59,51 @@ fn store_fixture() -> (tempfile::TempDir, Store) {
 }
 
 #[test]
+fn explicit_adoption_preserves_unread_lifecycle_and_exact_home() {
+    let (_temp, store) = store_fixture();
+    let mut observed = session("root", Status::Ready, true, 100.0);
+    observed.managed = false;
+    observed.source = "external".into();
+    store.upsert_session(&observed, false).unwrap();
+    assert!(!store.is_watched(Provider::Codex, "root").unwrap());
+    let mut discovered = session("root", Status::Parked, false, 1.0);
+    discovered.name = Some("Native renamed conversation".into());
+    discovered.tmux_session = None;
+    discovered.tmux_pane = None;
+    discovered.root_pid = None;
+    discovered.active_thread_id = None;
+    let mut aliased = discovered.clone();
+    aliased.session_id = "leaf-root".into();
+    assert!(store.adopt_session(&aliased).is_err());
+    assert!(!store.is_watched(Provider::Codex, "root").unwrap());
+    store.adopt_session(&discovered).unwrap();
+    let watched = store.list_sessions().unwrap();
+    assert_eq!(watched.len(), 1);
+    let row = &watched[0];
+    assert_eq!(row.session_id, "root");
+    assert_eq!(row.name, discovered.name);
+    assert_eq!(row.status, Status::Ready);
+    assert!(row.unread);
+    assert_eq!(row.last_event_at, 100.0);
+    assert_eq!(row.tmux_pane, observed.tmux_pane);
+    assert_eq!(row.root_pid, observed.root_pid);
+    store.adopt_session(&discovered).unwrap();
+    assert!(
+        store
+            .get_session(Provider::Codex, "root")
+            .unwrap()
+            .unwrap()
+            .unread
+    );
+    assert!(
+        store
+            .get_session(Provider::Codex, "leaf-root")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn provider_labels_are_not_tracking_and_explicit_choices_survive_renames() {
     let (_temp, store) = store_fixture();
     for provider in Provider::ALL {
@@ -292,6 +337,163 @@ fn tombstone_blocks_resurrection_but_retains_expertise() {
 
     assert!(store.restore_tracking(Provider::Codex, "one").unwrap());
     assert_eq!(store.list_sessions().unwrap().len(), 1);
+}
+
+#[test]
+fn personally_named_observation_is_watched_without_replacing_existing_state() {
+    let (_temp, store) = store_fixture();
+    let mut observed = session("named", Status::Ready, true, 100.0);
+    observed.name = Some("Current provider name".into());
+    observed.source = "external".into();
+    observed.managed = false;
+    store.upsert_session(&observed, false).unwrap();
+    let owner = pikamux::store::LiveOwner {
+        provider: Provider::Codex,
+        session_id: "named".into(),
+        pid: 42,
+        start_time: Some(7),
+        owner_token: "owner".into(),
+        last_seen: 100.0,
+    };
+    store.set_live_owner(&owner).unwrap();
+    let before = store
+        .get_session(Provider::Codex, "named")
+        .unwrap()
+        .unwrap();
+    let db = Connection::open(store.path()).unwrap();
+    let events_before: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM session_events WHERE provider='codex' AND session_id='named'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(db);
+
+    let mut candidate = session("named", Status::Parked, false, 2.0);
+    candidate.name = Some("Potentially stale rename".into());
+    candidate.tmux_session = None;
+    candidate.tmux_pane = None;
+    candidate.root_pid = None;
+    candidate.managed = false;
+    candidate.source = "external".into();
+    assert!(store.watch_named_session(&candidate).unwrap());
+    assert!(!store.watch_named_session(&candidate).unwrap());
+
+    let after = store
+        .get_session(Provider::Codex, "named")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.name, before.name);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.unread, before.unread);
+    assert_eq!(after.last_event_at, before.last_event_at);
+    assert_eq!(after.tmux_session, before.tmux_session);
+    assert_eq!(after.tmux_pane, before.tmux_pane);
+    assert_eq!(after.root_pid, before.root_pid);
+    assert_eq!(
+        store.live_owners(Provider::Codex, "named").unwrap(),
+        [owner]
+    );
+    let db = Connection::open(store.path()).unwrap();
+    let events_after: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM session_events WHERE provider='codex' AND session_id='named'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(events_after, events_before);
+    assert_eq!(
+        store
+            .get_meta("tracking-choice:codex:named")
+            .unwrap()
+            .as_deref(),
+        Some("provider-explicit-name")
+    );
+    assert!(store.is_watched(Provider::Codex, "named").unwrap());
+}
+
+#[test]
+fn personally_named_new_rows_are_unmanaged_and_unwatch_is_durable() {
+    let (_temp, store) = store_fixture();
+    let mut candidate = session("new-named", Status::Parked, false, 2.0);
+    candidate.managed = true;
+    assert!(store.watch_named_session(&candidate).unwrap());
+    let row = store
+        .get_session(Provider::Codex, "new-named")
+        .unwrap()
+        .unwrap();
+    assert!(!row.managed);
+    assert_eq!(row.source, "external");
+    assert!(store.is_watched(Provider::Codex, "new-named").unwrap());
+    assert_eq!(
+        store
+            .get_meta("tracking-choice:codex:new-named")
+            .unwrap()
+            .as_deref(),
+        Some("provider-explicit-name")
+    );
+
+    store.untrack_session(Provider::Codex, "new-named").unwrap();
+    assert!(!store.watch_named_session(&candidate).unwrap());
+    assert!(!store.watch_named_session(&candidate).unwrap());
+    assert!(!store.is_watched(Provider::Codex, "new-named").unwrap());
+    assert_eq!(store.list_untracked_sessions().unwrap().len(), 1);
+}
+
+#[test]
+fn personally_named_leaf_already_owned_by_another_root_is_not_duplicated() {
+    let (_temp, store) = store_fixture();
+    let mut root = session("root", Status::Working, false, 10.0);
+    root.active_thread_id = Some("named-leaf".into());
+    store.upsert_session(&root, false).unwrap();
+    let mut candidate = session("named-leaf", Status::Parked, false, 2.0);
+    candidate.active_thread_id = None;
+    assert!(!store.watch_named_session(&candidate).unwrap());
+    assert!(
+        store
+            .get_session(Provider::Codex, "named-leaf")
+            .unwrap()
+            .is_none()
+    );
+    assert!(!store.is_watched(Provider::Codex, "named-leaf").unwrap());
+    assert!(
+        store
+            .get_meta("tracking-choice:codex:named-leaf")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn personally_named_candidate_does_not_clear_provider_hidden_state() {
+    let (_temp, store) = store_fixture();
+    let mut candidate = session("provider-hidden", Status::Parked, false, 2.0);
+    candidate.managed = false;
+    store.upsert_session(&candidate, false).unwrap();
+    store
+        .set_meta("provider-hidden:codex:provider-hidden", "gone")
+        .unwrap();
+    assert!(!store.watch_named_session(&candidate).unwrap());
+    assert_eq!(
+        store
+            .get_meta("provider-hidden:codex:provider-hidden")
+            .unwrap()
+            .as_deref(),
+        Some("gone")
+    );
+    assert!(
+        !store
+            .is_watched(Provider::Codex, "provider-hidden")
+            .unwrap()
+    );
+    assert!(
+        store
+            .get_meta("tracking-choice:codex:provider-hidden")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -926,6 +1128,28 @@ fn launch_phase_and_provider_generation_advance_atomically_with_pending_state() 
         created_at: 1.0,
     };
     assert!(store.add_pending(&pending).unwrap());
+    assert!(
+        !store
+            .hide_pending(&pending.launch_token, Provider::Codex, pending.created_at)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .hide_pending(
+                &pending.launch_token,
+                pending.provider,
+                pending.created_at + 1.0
+            )
+            .unwrap()
+    );
+    assert_eq!(store.list_visible_pending().unwrap(), vec![pending.clone()]);
+    assert!(
+        store
+            .hide_pending(&pending.launch_token, pending.provider, pending.created_at)
+            .unwrap()
+    );
+    assert!(store.list_visible_pending().unwrap().is_empty());
+    assert_eq!(store.list_pending().unwrap(), vec![pending.clone()]);
     assert_eq!(
         store.get_launch_phase(&pending.launch_token).unwrap(),
         Some(LaunchPhase::Reserved)
@@ -969,4 +1193,110 @@ fn launch_phase_and_provider_generation_advance_atomically_with_pending_state() 
     );
     store.delete_pending(&pending.launch_token).unwrap();
     assert_eq!(store.get_launch_phase(&pending.launch_token).unwrap(), None);
+}
+
+#[test]
+fn pending_wrapper_owner_registration_is_phase_and_generation_scoped() {
+    let (_temp, store) = store_fixture();
+    let pending = PendingLaunch {
+        launch_token: "wrapper-owner-launch".into(),
+        provider: Provider::Codex,
+        name: "wrapper".into(),
+        cwd: "/tmp".into(),
+        tmux_session: Some("pika-c-wrapper".into()),
+        tmux_pane: Some("%8".into()),
+        expected_session_id: None,
+        root_pid: Some(8),
+        root_pid_start: Some(80),
+        preexisting_session_ids: None,
+        candidate_session_id: None,
+        candidate_observed_at: None,
+        created_at: 8.0,
+    };
+    assert!(store.add_pending(&pending).unwrap());
+    assert!(
+        store
+            .register_pending_wrapper_owner(&pending.launch_token, "owner-capability")
+            .unwrap()
+    );
+    assert!(
+        store
+            .register_pending_wrapper_owner(&pending.launch_token, "owner-capability")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .register_pending_wrapper_owner(&pending.launch_token, "different-owner")
+            .unwrap()
+    );
+    assert!(
+        store
+            .set_launch_phase(&pending.launch_token, LaunchPhase::PanePrepared)
+            .unwrap()
+    );
+    assert!(
+        store
+            .register_pending_wrapper_owner(&pending.launch_token, "owner-capability")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .register_pending_wrapper_owner(&pending.launch_token, "different-owner")
+            .unwrap()
+    );
+    assert!(
+        store
+            .set_launch_phase(&pending.launch_token, LaunchPhase::ProviderStarting)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .register_pending_wrapper_owner(&pending.launch_token, "owner-capability")
+            .unwrap()
+    );
+    store.delete_pending(&pending.launch_token).unwrap();
+    assert!(
+        !store
+            .register_pending_wrapper_owner(&pending.launch_token, "owner-capability")
+            .unwrap()
+    );
+}
+
+#[test]
+fn pending_exit_read_rejects_stale_receipts_and_reuse_clears_them() {
+    let (_temp, store) = store_fixture();
+    let mut pending = PendingLaunch {
+        launch_token: "pending-exit-stale".into(),
+        provider: Provider::Codex,
+        name: "old launch".into(),
+        cwd: "/tmp".into(),
+        tmux_session: None,
+        tmux_pane: None,
+        expected_session_id: None,
+        root_pid: None,
+        root_pid_start: None,
+        preexisting_session_ids: None,
+        candidate_session_id: None,
+        candidate_observed_at: None,
+        created_at: 9.0,
+    };
+    store.add_pending(&pending).unwrap();
+    store
+        .set_meta(
+            "pending_launch_exit:pending-exit-stale",
+            &json!({
+                "provider": "codex",
+                "pending_created_at": 8.0,
+                "code": 9,
+                "observed_at": 10.0
+            })
+            .to_string(),
+        )
+        .unwrap();
+    assert_eq!(store.get_pending_exit(&pending.launch_token).unwrap(), None);
+
+    pending.created_at = 10.0;
+    pending.name = "new launch".into();
+    store.add_pending(&pending).unwrap();
+    assert_eq!(store.get_pending_exit(&pending.launch_token).unwrap(), None);
 }
