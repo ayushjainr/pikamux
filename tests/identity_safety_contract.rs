@@ -281,7 +281,9 @@ fn pane_replacement_between_readback_and_respawn_never_starts_provider() {
         .list_panes()
         .unwrap();
     assert_eq!(panes.len(), 1);
-    assert_eq!(panes[0].current_command, "sleep");
+    // The replacement's shell may still be execing `sleep` when tmux is read.
+    // The changed root generation is the safety-relevant fact here.
+    assert_ne!(Some(panes[0].pane_pid), pending[0].root_pid);
     let observed = process::observe();
     let processes = observed.require_complete("test respawn race").unwrap();
     assert!(
