@@ -19,6 +19,14 @@ use std::{
 
 struct IsolatedTmux(String);
 
+fn require_tmux() {
+    let output = Command::new("tmux")
+        .arg("-V")
+        .output()
+        .expect("tmux is required for exact identity contracts");
+    assert!(output.status.success(), "tmux -V failed");
+}
+
 impl Drop for IsolatedTmux {
     fn drop(&mut self) {
         let _ = Command::new("tmux")
@@ -66,9 +74,7 @@ fn executable(path: &Path, contents: &str) {
 
 #[test]
 fn guarded_tag_removal_rejects_a_replaced_pane_generation() {
-    if Command::new("tmux").arg("-V").output().is_err() {
-        return;
-    }
+    require_tmux();
     let (guard, tmux) = isolated();
     assert!(
         raw_tmux(
@@ -109,9 +115,7 @@ fn guarded_tag_removal_rejects_a_replaced_pane_generation() {
 
 #[test]
 fn terminal_guard_never_overwrites_an_existing_user_key_binding() {
-    if Command::new("tmux").arg("-V").output().is_err() {
-        return;
-    }
+    require_tmux();
     let (guard, tmux) = isolated();
     assert!(
         raw_tmux(&guard.0, &["new-session", "-d", "-s", "keys", "sleep 30"])
@@ -207,9 +211,7 @@ fn launch_fixture(temp: &tempfile::TempDir, socket: &str, tmux_executable: PathB
 
 #[test]
 fn tag_failure_occurs_before_provider_execution_and_keeps_recovery_record() {
-    if Command::new("tmux").arg("-V").output().is_err() {
-        return;
-    }
+    require_tmux();
     let temp = tempfile::tempdir().unwrap();
     let socket = format!("pika-tag-failure-{}", uuid::Uuid::new_v4());
     let _guard = IsolatedTmux(socket.clone());
@@ -253,9 +255,7 @@ fn tag_failure_occurs_before_provider_execution_and_keeps_recovery_record() {
 
 #[test]
 fn pane_replacement_between_readback_and_respawn_never_starts_provider() {
-    if Command::new("tmux").arg("-V").output().is_err() {
-        return;
-    }
+    require_tmux();
     let temp = tempfile::tempdir().unwrap();
     let socket = format!("pika-respawn-race-{}", uuid::Uuid::new_v4());
     let _guard = IsolatedTmux(socket.clone());
@@ -300,9 +300,7 @@ fn pane_replacement_between_readback_and_respawn_never_starts_provider() {
 
 #[test]
 fn post_execution_readback_failure_retains_exact_pending_generation() {
-    if Command::new("tmux").arg("-V").output().is_err() {
-        return;
-    }
+    require_tmux();
     let temp = tempfile::tempdir().unwrap();
     let socket = format!("pika-readback-failure-{}", uuid::Uuid::new_v4());
     let _guard = IsolatedTmux(socket.clone());

@@ -3810,6 +3810,15 @@ mod tests {
         assert!(chat.retained_bytes <= 256 * 1024);
         assert!(chat.history_truncated);
         assert!(chat.lines.back().unwrap().text.starts_with("999:"));
+        let mut board = board(Status::Working);
+        board.chat = Some(chat);
+        let mut rendered = Vec::new();
+        board.draw(&mut rendered, 120, 30).unwrap();
+        assert!(
+            String::from_utf8(rendered)
+                .unwrap()
+                .contains("earlier lines omitted")
+        );
     }
 
     #[test]
@@ -3923,15 +3932,17 @@ mod tests {
     }
 
     #[test]
-    fn second_escape_cancels_slow_close_without_changing_selection() {
-        let driver = ConsultationDriver::new(|io| {
+    fn second_escape_detaches_slow_close_after_signalling_cancellation() {
+        let (observed_sender, observed_receiver) = mpsc::channel();
+        let driver = ConsultationDriver::new(move |io| {
             io.events.send(ConsultationEvent::Opened {
                 child_id: None,
                 policy: None,
                 proof: None,
             })?;
-            let _ = io.commands.recv();
+            let command = io.commands.recv()?;
             thread::sleep(Duration::from_millis(50));
+            observed_sender.send((command, io.cancellation.is_cancelled()))?;
             Ok(ConsultationOutcome::discarded())
         });
         let mut board = board(Status::Working);
@@ -3941,6 +3952,12 @@ mod tests {
         board.key(key(KeyCode::Esc), Some(&driver));
         assert!(board.chat.is_none());
         assert_eq!(board.selected_key, selected);
+        assert_eq!(
+            observed_receiver
+                .recv_timeout(Duration::from_millis(250))
+                .unwrap(),
+            (ConsultationInput::Close, true)
+        );
     }
 
     #[test]
@@ -4422,6 +4439,7 @@ mod tests {
         let text = String::from_utf8(rendered).unwrap();
         assert!(!text.contains("63%"));
         assert!(text.contains("awaiting usage"));
+        assert!(text.contains("no current-week reading"));
     }
 
     #[test]

@@ -618,7 +618,7 @@ fn handle_hook_transaction(
     }
     if payload.hook_event_name == "SessionEnd"
         && let Some(current) = &existing
-        && current.unread
+        && preserve_unread_on_session_end(current)
     {
         observation.status = current.status;
         observation.unread = true;
@@ -803,6 +803,15 @@ fn handle_hook_transaction(
         alert,
         launch_certified,
     })
+}
+
+fn preserve_unread_on_session_end(current: &Session) -> bool {
+    // Identity safety is observed separately. Copying it into a provider
+    // lifecycle event keeps OPEN TWICE alive after its second owner exits.
+    current.unread
+        && current.status != Status::OpenTwice
+        && !(current.status == Status::Error
+            && current.attention_reason.as_deref() == Some("identity"))
 }
 
 /// Add only immutable provider metadata needed for identity and worker provenance.

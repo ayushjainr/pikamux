@@ -4802,7 +4802,7 @@ mod receiver_clock_tests {
         write_executable(
             &ssh,
             &format!(
-                "printf '%s\\n' {}\nPIKA_TEST_ESCAPED_PID={} PIKA_TEST_ESCAPED_RELEASE={} PIKA_TEST_ESCAPED_DONE={} exec {} --exact consult::tests::escaped_pipe_holder_fixture --nocapture",
+                "printf '%s\\n' {}\nPIKA_TEST_ESCAPED_PID={} PIKA_TEST_ESCAPED_RELEASE={} PIKA_TEST_ESCAPED_DONE={} exec {} --exact consult::tests::escaped_pipe_holder_fixture --ignored --nocapture",
                 shell_words::quote(&opened_fixture()),
                 shell_words::quote(&pid_path.to_string_lossy()),
                 shell_words::quote(&release_path.to_string_lossy()),

@@ -4274,6 +4274,48 @@ mod tests {
     }
 
     #[test]
+    fn old_session_end_open_twice_stops_blocking_after_duplicate_is_gone() {
+        let (_root, pika) = test_pika();
+        let identity = "33333333-3333-4333-8333-333333333333";
+        let mut session = test_session(identity);
+        session.status = Status::OpenTwice;
+        session.unread = true;
+        session.attention_reason = Some("identity".into());
+        session.error = Some("the exact conversation has more than one live owner".into());
+        pika.store.upsert_session(&session, false).unwrap();
+        pika.store
+            .record_status_observation(
+                Provider::Codex,
+                identity,
+                &crate::model::StatusObservation {
+                    kind: ObservationKind::Lifecycle,
+                    status: Status::OpenTwice,
+                    unread: true,
+                    attention_reason: Some("identity".into()),
+                    error: session.error.clone(),
+                    observed_at: 1.0,
+                    source: "hook:SessionEnd".into(),
+                },
+            )
+            .unwrap();
+        let mut processes = BTreeMap::from([
+            (1, record(1, None, 10, &["sh"])),
+            (2, record(2, Some(1), 20, &["codex", "resume", identity])),
+            (4, record(4, None, 40, &["codex", "resume", identity])),
+        ]);
+        pika.reconcile_one(&mut session, &[tagged_pane(identity)], &processes)
+            .unwrap();
+        assert_eq!(session.status, Status::OpenTwice);
+        processes.remove(&4);
+        pika.reconcile_one(&mut session, &[tagged_pane(identity)], &processes)
+            .unwrap();
+        assert_eq!(session.home_state, "exact");
+        assert_eq!(session.status, Status::Ready);
+        assert_eq!(session.error, None);
+        assert!(!session.unread);
+    }
+
+    #[test]
     fn absent_process_clears_sticky_live_and_runtime_pid() {
         let (_root, pika) = test_pika();
         let identity = "33333333-3333-4333-8333-333333333333";

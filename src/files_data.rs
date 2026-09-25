@@ -395,12 +395,15 @@ mod tests {
     }
 
     #[test]
-    fn text_cap_is_explicit_and_controls_are_cleaned() {
+    fn text_cap_is_exact_and_truncation_is_explicit() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
         fs::write(dir.join("large"), "x".repeat(MAX_TEXT_BYTES + 1)).unwrap();
         let text = read_text(&dir.join("large")).unwrap();
-        assert!(text.contains("file truncated"));
+        assert_eq!(text.len(), MAX_TEXT_BYTES + TRUNCATION_NOTICE.len());
+        let (prefix, notice) = text.split_at(MAX_TEXT_BYTES);
+        assert!(prefix.bytes().all(|byte| byte == b'x'));
+        assert_eq!(notice, TRUNCATION_NOTICE);
     }
 
     #[test]

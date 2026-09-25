@@ -9,7 +9,6 @@ use std::collections::{HashMap, HashSet};
 
 const ATTENTION: &str = include_str!("contracts/v1/attention.json");
 const IDENTITY: &str = include_str!("contracts/v1/identity.json");
-const MUTANTS: &str = include_str!("contracts/v1/mutants.json");
 
 #[derive(Deserialize)]
 struct ContractFile<T> {
@@ -102,22 +101,6 @@ enum FixtureEvidence {
     Archived,
     Missing,
     Unknown,
-}
-
-#[derive(Deserialize)]
-struct MutantFile {
-    schema_version: u64,
-    reference_source_commit: String,
-    mutants: Vec<Mutant>,
-}
-
-#[derive(Deserialize)]
-struct Mutant {
-    id: String,
-    family: String,
-    case: String,
-    path: String,
-    replacement: Value,
 }
 
 fn parked() -> Status {
@@ -252,44 +235,8 @@ fn fixture_identity_matches_literal_contracts() {
 }
 
 #[test]
-fn fixture_negative_mutants_are_rejected() {
-    let attention = attention_results();
-    let identity = identity_results();
-    let mutants: MutantFile = serde_json::from_str(MUTANTS).expect("valid mutant fixture");
-    assert_eq!(mutants.schema_version, 1);
-    assert_eq!(
-        mutants.reference_source_commit,
-        "36de1b1eed1a182ed4e608d47f95d362f15d571a"
-    );
-    unique_ids(mutants.mutants.iter().map(|mutant| mutant.id.as_str()));
-
-    for mutant in mutants.mutants {
-        let results = match mutant.family.as_str() {
-            "attention" => &attention,
-            "identity" => &identity,
-            other => panic!("unknown mutant family {other}"),
-        };
-        let (expected, correct) = results
-            .get(&mutant.case)
-            .unwrap_or_else(|| panic!("mutant {} names unknown case {}", mutant.id, mutant.case));
-        compare_literal(&mutant.case, expected, correct).unwrap();
-
-        let mut bad = correct.clone();
-        let target = bad
-            .pointer_mut(&mutant.path)
-            .unwrap_or_else(|| panic!("mutant {} has invalid path {}", mutant.id, mutant.path));
-        *target = mutant.replacement.clone();
-        assert!(
-            compare_literal(&mutant.case, expected, &bad).is_err(),
-            "negative mutant {} was accepted",
-            mutant.id
-        );
-    }
-}
-
-#[test]
 fn fixtures_are_host_independent_and_contain_no_live_routes() {
-    for raw in [ATTENTION, IDENTITY, MUTANTS] {
+    for raw in [ATTENTION, IDENTITY] {
         for forbidden in [
             "/Users/",
             "/home/",

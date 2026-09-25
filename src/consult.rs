@@ -2677,6 +2677,7 @@ mod tests {
                 .args([
                     "--exact",
                     "consult::tests::escaped_pipe_holder_fixture",
+                    "--ignored",
                     "--nocapture",
                 ])
                 .env("PIKA_TEST_ESCAPED_PID", &self.pid_path)
@@ -2725,6 +2726,7 @@ mod tests {
     /// The parent tests below own the fixture lifetime; Pika must not signal it.
     #[cfg(unix)]
     #[test]
+    #[ignore = "subprocess fixture entrypoint"]
     fn escaped_pipe_holder_fixture() {
         let (Ok(pid_path), Ok(release_path), Ok(done_path)) = (
             std::env::var("PIKA_TEST_ESCAPED_PID"),

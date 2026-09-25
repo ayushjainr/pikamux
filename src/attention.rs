@@ -115,7 +115,10 @@ mod tests {
             vec![remote("remote", 10.0, false)],
         )
         .unwrap();
-        assert!(matches!(chosen, AttentionTarget::Remote(_)));
+        assert!(matches!(
+            chosen,
+            AttentionTarget::Remote(remote) if remote.session.session_id == "id-remote"
+        ));
     }
 
     #[test]
@@ -128,6 +131,9 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(matches!(chosen, AttentionTarget::Remote(_)));
+        assert!(matches!(
+            chosen,
+            AttentionTarget::Remote(remote) if remote.session.session_id == "id-needs-input"
+        ));
     }
 }

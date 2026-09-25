@@ -20,6 +20,14 @@ use std::{
 
 struct IsolatedTmux(String);
 
+fn require_tmux() {
+    let output = Command::new("tmux")
+        .arg("-V")
+        .output()
+        .expect("tmux is required for isolated terminal contracts");
+    assert!(output.status.success(), "tmux -V failed");
+}
+
 fn recorded_terminal(transcript: &std::path::Path, args: &[&str]) -> Command {
     let mut command = Command::new("script");
     #[cfg(target_os = "linux")]
@@ -174,10 +182,7 @@ fn wait_for_exact_session(pika: &Pika, identity: &str) -> Session {
 
 #[test]
 fn real_isolated_tmux_reopens_unique_uuid_owner_beside_inert_stale_tag() {
-    if Command::new("tmux").arg("-V").output().is_err() {
-        eprintln!("tmux unavailable; exact ownership integration not exercised");
-        return;
-    }
+    require_tmux();
     let temp = tempfile::tempdir().unwrap();
     let socket = format!("pika-rust-stale-tag-{}", std::process::id());
     let _guard = IsolatedTmux(socket.clone());
@@ -304,10 +309,7 @@ fn real_isolated_tmux_reopens_unique_uuid_owner_beside_inert_stale_tag() {
 
 #[test]
 fn real_isolated_tmux_blocks_unproven_competing_live_uuid_pane() {
-    if Command::new("tmux").arg("-V").output().is_err() {
-        eprintln!("tmux unavailable; competing ownership integration not exercised");
-        return;
-    }
+    require_tmux();
     let temp = tempfile::tempdir().unwrap();
     let socket = format!("pika-rust-competing-{}", std::process::id());
     let _guard = IsolatedTmux(socket.clone());
@@ -407,10 +409,7 @@ fn real_isolated_tmux_blocks_unproven_competing_live_uuid_pane() {
 
 #[test]
 fn real_isolated_tmux_nested_provider_helper_does_not_steal_uuid_owner() {
-    if Command::new("tmux").arg("-V").output().is_err() {
-        eprintln!("tmux unavailable; nested-helper integration not exercised");
-        return;
-    }
+    require_tmux();
     let temp = tempfile::tempdir().unwrap();
     let socket = format!("pika-rust-nested-helper-{}", std::process::id());
     let _guard = IsolatedTmux(socket.clone());
@@ -496,12 +495,11 @@ fn real_isolated_tmux_nested_provider_helper_does_not_steal_uuid_owner() {
 
 #[test]
 fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
-    if Command::new("tmux").arg("-V").output().is_err()
-        || Command::new("script").arg("--help").output().is_err()
-    {
-        eprintln!("tmux/script unavailable; exact receipt integration not exercised");
-        return;
-    }
+    require_tmux();
+    Command::new("script")
+        .arg("--help")
+        .output()
+        .expect("script is required for isolated terminal receipt contracts");
     let temp = tempfile::tempdir().unwrap();
     let socket = format!("pika-rust-receipt-{}", std::process::id());
     let _guard = IsolatedTmux(socket.clone());
@@ -557,6 +555,7 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
             std::env::current_exe().unwrap().to_str().unwrap(),
             "--exact",
             "real_isolated_tmux_receipt_helper",
+            "--ignored",
             "--nocapture",
         ],
     )
@@ -584,6 +583,7 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
 }
 
 #[test]
+#[ignore = "subprocess fixture entrypoint"]
 fn real_isolated_tmux_receipt_helper() {
     let Ok(socket) = std::env::var("PIKA_RECEIPT_TEST_SOCKET") else {
         return;
@@ -608,10 +608,7 @@ fn real_isolated_tmux_receipt_helper() {
 
 #[test]
 fn real_isolated_tmux_list_clients_proves_the_exact_selected_pane() {
-    if Command::new("tmux").arg("-V").output().is_err() {
-        eprintln!("tmux unavailable; isolated client format integration not exercised");
-        return;
-    }
+    require_tmux();
     let temp = tempfile::tempdir().unwrap();
     let socket = format!("pika-rust-client-proof-{}", std::process::id());
     let _server = IsolatedTmux(socket.clone());
@@ -657,10 +654,6 @@ fn real_isolated_tmux_list_clients_proves_the_exact_selected_pane() {
     .spawn()
     {
         Ok(child) => child,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("script unavailable; isolated client format integration not exercised");
-            return;
-        }
         Err(error) => panic!("cannot start isolated pseudo-terminal: {error}"),
     };
     // Keeping script's input pipe open keeps its pseudo-terminal client alive
@@ -699,10 +692,7 @@ fn real_isolated_tmux_list_clients_proves_the_exact_selected_pane() {
 
 #[test]
 fn real_isolated_tmux_resumes_all_providers_and_reuses_each_exact_home() {
-    if Command::new("tmux").arg("-V").output().is_err() {
-        eprintln!("tmux unavailable; isolated host integration not exercised");
-        return;
-    }
+    require_tmux();
     let temp = tempfile::tempdir().unwrap();
     let socket = format!("pika-rust-test-{}", std::process::id());
     let _guard = IsolatedTmux(socket.clone());

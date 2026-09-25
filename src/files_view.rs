@@ -1067,6 +1067,12 @@ mod tests {
     #[test]
     fn clipping_is_bounded() {
         assert_eq!(clip("abcdef", 4), "abc…");
+        assert_eq!(clip("文件x", 0), "");
+        assert_eq!(clip("文件x", 1), "…");
+        assert_eq!(clip("文件x", 2), "…");
+        assert_eq!(clip("文件x", 3), "文…");
+        assert_eq!(clip("文件x", 4), "文…");
+        assert_eq!(clip("文件x", 5), "文件x");
         for width in 0..20 {
             assert!(clip("文件👨‍👩‍👧‍👦verylong", width).width() <= width);
         }
@@ -1075,39 +1081,48 @@ mod tests {
     #[test]
     fn nested_files_parent_project_and_refresh_do_not_change_process_cwd() {
         let cwd = std::env::current_dir().unwrap();
+        let assert_cwd = || assert_eq!(std::env::current_dir().unwrap(), cwd);
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("src")).unwrap();
         std::fs::write(temp.path().join("src/code.rs"), "before").unwrap();
         let mut state = State::new(temp.path().to_path_buf()).unwrap();
+        assert_cwd();
         state.open_selected();
+        assert_cwd();
         assert_eq!(state.nodes().len(), 2);
         state.selected = 1;
         state.open_selected();
+        assert_cwd();
         assert_eq!(state.text, "before");
         std::fs::write(temp.path().join("src/code.rs"), "after").unwrap();
         state.refresh();
+        assert_cwd();
         assert_eq!(state.text, "after");
         let project = state.project.clone();
         state.up();
+        assert_cwd();
         assert_eq!(state.current, project.parent().unwrap());
         state.back_project();
+        assert_cwd();
         assert_eq!(state.current, project);
         state.navigate(temp.path().join("missing"));
+        assert_cwd();
         assert_eq!(state.current, project);
         std::os::unix::fs::symlink(project.join("src"), project.join("src-link")).unwrap();
         state.refresh();
+        assert_cwd();
         state.selected = state
             .nodes()
             .iter()
             .position(|node| node.entry.name == "src-link")
             .unwrap();
         state.open_selected();
+        assert_cwd();
         assert_eq!(state.current, project.join("src"));
-        assert_eq!(std::env::current_dir().unwrap(), cwd);
     }
 
     #[test]
-    fn changed_list_and_render_are_bounded_and_inert() {
+    fn changed_list_and_render_keep_osc52_inert_across_sizes() {
         let temp = tempfile::tempdir().unwrap();
         let mut state = State::new(temp.path().to_path_buf()).unwrap();
         state.git_rx = None;
@@ -1355,16 +1370,24 @@ mod tests {
                 .flat_map(|r| &r.spans)
                 .any(|s| s.text == "def" && s.style.syntax == files_markdown::SyntaxInk::Keyword)
         );
-        let string_rows = state
+        let string_rows: Vec<String> = state
             .rows
             .iter()
-            .filter(|r| {
+            .filter(|r| r.source_line == 2)
+            .map(|r| {
                 r.spans
                     .iter()
-                    .any(|s| s.style.syntax == files_markdown::SyntaxInk::String)
+                    .filter(|s| s.style.syntax == files_markdown::SyntaxInk::String)
+                    .map(|s| s.text.as_str())
+                    .collect::<String>()
             })
-            .count();
-        assert!(string_rows > 1);
+            .filter(|text| !text.is_empty())
+            .collect();
+        assert!(string_rows.len() > 1);
+        assert_eq!(
+            string_rows.concat(),
+            "\"a long string whose color must survive wrapping across rows\""
+        );
         handle_key(&mut state, KeyCode::Char('w').into());
         render(&mut state, (40, 16)).unwrap();
         assert_eq!(state.rows.len(), 2);

@@ -426,7 +426,7 @@ fn schema_two_selects_only_exact_target_and_filename() {
 }
 
 #[test]
-fn archive_members_reject_traversal_links_names_and_duplicates() {
+fn archive_member_names_reject_traversal_and_duplicates() {
     let target = native_target().unwrap();
     validate_archive_members(["pika"], target).unwrap();
     for entries in [
@@ -2245,7 +2245,7 @@ fn remote_upgrade_stalled_identity_is_bounded_and_never_receives_install_approva
 }
 
 #[test]
-fn ssh_remote_target_probe_is_fixed_bounded_and_platform_mapped() {
+fn ssh_remote_target_probe_maps_supported_platforms_and_rejects_windows() {
     let temp = tempfile::tempdir().unwrap();
     let ssh = temp.path().join("ssh");
     fs::write(&ssh, "#!/bin/sh\nprintf 'Darwin\\narm64\\n'\n").unwrap();
@@ -2268,7 +2268,7 @@ fn ssh_remote_target_probe_is_fixed_bounded_and_platform_mapped() {
 }
 
 #[test]
-fn ci_actions_are_immutable_and_release_bytes_are_attested() {
+fn github_actions_are_sha_pinned_and_release_workflow_declares_attestation() {
     let workflows = [
         include_str!("../.github/workflows/ci.yml"),
         include_str!("../.github/workflows/release.yml"),

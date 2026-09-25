@@ -357,14 +357,19 @@ mod tests {
                         requests.fetch_add(1, AtomicOrdering::SeqCst);
                         Ok(releases("0.6.8"))
                     })
-                    .unwrap();
+                    .unwrap()
                 })
             })
             .collect::<Vec<_>>();
         gate.wait();
-        for worker in workers {
-            worker.join().unwrap();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        for outcome in &outcomes {
+            assert!(matches!(outcome.as_deref(), None | Some("0.6.8")));
         }
+        assert!(outcomes.iter().any(Option::is_some));
         assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
     }
 
@@ -414,13 +419,17 @@ mod tests {
         assert!(enabled(None));
         assert!(enabled(Some("1")));
         let (_directory, store) = fixture();
+        let requests = AtomicUsize::new(0);
         check(
             &store,
             "release:0.6.7:windows",
             "0.6.7",
             TARGET,
             TIME,
-            || Ok(releases("0.6.8")),
+            || {
+                requests.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(releases("0.6.8"))
+            },
         )
         .unwrap();
         assert_eq!(
@@ -430,11 +439,28 @@ mod tests {
                 "0.6.8",
                 TARGET,
                 TIME,
-                || Ok(releases("0.6.8"))
+                || {
+                    requests.fetch_add(1, AtomicOrdering::SeqCst);
+                    Ok(releases("0.6.8"))
+                }
             )
             .unwrap(),
             None
         );
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 2);
+        check(
+            &store,
+            "release:0.6.8:windows",
+            "0.6.8",
+            TARGET,
+            TIME + 1.0,
+            || {
+                requests.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(releases("0.6.9"))
+            },
+        )
+        .unwrap();
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 2);
         assert!(store.list_sessions().unwrap().is_empty());
     }
 
@@ -443,11 +469,13 @@ mod tests {
         let cancel = CancellationToken::default();
         let worker_cancel = cancel.clone();
         let (started, ready) = mpsc::sync_channel(1);
+        let (exited, finished) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             started.send(()).unwrap();
             while !worker_cancel.is_cancelled() {
                 thread::park_timeout(Duration::from_secs(60));
             }
+            exited.send(()).unwrap();
         });
         ready.recv_timeout(Duration::from_secs(1)).unwrap();
         let checker = Checker {
@@ -457,6 +485,7 @@ mod tests {
         let begin = std::time::Instant::now();
         drop(checker);
         assert!(cancel.is_cancelled());
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(begin.elapsed() < Duration::from_secs(1));
     }
 }

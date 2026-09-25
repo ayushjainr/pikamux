@@ -107,7 +107,7 @@ pub fn parse_codex_quota(data: &Value, observed_at: f64) -> Option<QuotaSnapshot
 pub fn parse_claude_quota(data: &Value, now: f64) -> Option<QuotaSnapshot> {
     let cached = data.get("cachedUsageUtilization")?.as_object()?;
     let observed_at = cached.get("fetchedAtMs").and_then(number)? / 1000.0;
-    if observed_at > now + 60.0 || now - observed_at > OBSERVATION_MAX_AGE_SECONDS {
+    if !claude_observation_in_current_week(observed_at, now) {
         return None;
     }
     let weekly = cached
@@ -121,7 +121,10 @@ pub fn parse_claude_quota(data: &Value, now: f64) -> Option<QuotaSnapshot> {
         .as_str()
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())?
         .unix_timestamp();
-    if !used_percent.is_finite() || !(0.0..=100.0).contains(&used_percent) || reset_at as f64 <= now
+    if !used_percent.is_finite()
+        || !(0.0..=100.0).contains(&used_percent)
+        || reset_at as f64 <= now
+        || reset_at as f64 > observed_at + 8.0 * 86400.0
     {
         return None;
     }
@@ -132,6 +135,10 @@ pub fn parse_claude_quota(data: &Value, now: f64) -> Option<QuotaSnapshot> {
         observed_at,
         source: "Claude usage cache".to_owned(),
     })
+}
+
+fn claude_observation_in_current_week(observed_at: f64, now: f64) -> bool {
+    observed_at <= now + 60.0 && now - observed_at <= crate::claude_quota::DISPLAY_MAX_AGE_SECONDS
 }
 
 pub trait QuotaSource {
@@ -1130,7 +1137,12 @@ mod tests {
         );
         let mut stale = claude;
         stale["cachedUsageUtilization"]["fetchedAtMs"] = json!(1_998_199_000_i64);
-        assert!(parse_claude_quota(&stale, 2_000_000.0).is_none());
+        assert_eq!(
+            parse_claude_quota(&stale, 2_000_000.0)
+                .unwrap()
+                .remaining_percent(),
+            16.0
+        );
     }
 
     #[test]

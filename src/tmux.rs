@@ -1047,6 +1047,15 @@ impl Tmux {
     }
 
     fn deliver_receipt(&self, client: Option<&str>, receipt: &str) -> ReceiptDelivery {
+        self.deliver_receipt_to(client, receipt, &mut std::io::stderr().lock())
+    }
+
+    fn deliver_receipt_to(
+        &self,
+        client: Option<&str>,
+        receipt: &str,
+        terminal: &mut impl Write,
+    ) -> ReceiptDelivery {
         // Cosmetic and client-scoped: failure cannot change the exact attach.
         if let Some(crate::activity_feed::Context::Source(source)) = crate::activity_feed::current()
         {
@@ -1063,7 +1072,6 @@ impl Tmux {
         {
             return ReceiptDelivery::TmuxClient;
         }
-        let mut terminal = std::io::stderr().lock();
         if writeln!(terminal, "\r\nPIKA HANDOFF · {receipt}").is_ok() && terminal.flush().is_ok() {
             ReceiptDelivery::InvokingTerminal
         } else {
@@ -2510,13 +2518,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn real_tmux_return_status_format_resolves_live_palette_and_neutral_expiry() {
-        if !std::process::Command::new("tmux")
-            .arg("-V")
-            .status()
-            .is_ok_and(|status| status.success())
-        {
-            return;
-        }
+        assert!(
+            std::process::Command::new("tmux")
+                .arg("-V")
+                .status()
+                .is_ok_and(|status| status.success()),
+            "tmux is required to exercise the live return-status contract"
+        );
         let server = IsolatedTmux::new().unwrap();
         let tmux = &server.0;
         let pane = String::from_utf8(
@@ -2610,13 +2618,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn real_tmux_binding_reads_pane_local_identity_for_the_exact_client() {
-        if !std::process::Command::new("tmux")
-            .arg("-V")
-            .status()
-            .is_ok_and(|status| status.success())
-        {
-            return;
-        }
+        assert!(
+            std::process::Command::new("tmux")
+                .arg("-V")
+                .status()
+                .is_ok_and(|status| status.success()),
+            "tmux is required to exercise the live client-binding contract"
+        );
         let server = IsolatedTmux::new().unwrap();
         let tmux = &server.0;
         let pane_id = String::from_utf8(
@@ -3121,7 +3129,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn failed_tmux_display_uses_truthful_terminal_fallback_after_commit() {
+    fn failed_tmux_display_writes_truthful_terminal_fallback_after_commit() {
         let temp = tempfile::tempdir().unwrap();
         let committed = temp.path().join("committed");
         let tmux = tmux_fixture(
@@ -3139,6 +3147,12 @@ mod tests {
         assert_eq!(handoff.exit_code, 0);
         assert_eq!(handoff.delivery, Some(ReceiptDelivery::InvokingTerminal));
         assert_eq!(fs::read_to_string(committed).unwrap(), "acknowledged");
+        let mut terminal = Vec::new();
+        assert_eq!(
+            tmux.deliver_receipt_to(Some("invoking-client"), "exact receipt", &mut terminal),
+            ReceiptDelivery::InvokingTerminal
+        );
+        assert_eq!(terminal, b"\r\nPIKA HANDOFF \xc2\xb7 exact receipt\n");
     }
 
     #[cfg(unix)]

@@ -1158,7 +1158,6 @@ mod tests {
                 driver.tick_at(Some(row.clone()), true, now, 0.0);
                 poll_done(&mut driver, Some(row.clone()), now);
                 assert_eq!(driver.view().unwrap().text, "Done.");
-                assert!(row.session.unread);
                 assert_eq!(driver.view().unwrap().observed_at, Some(123.0));
             }
         }

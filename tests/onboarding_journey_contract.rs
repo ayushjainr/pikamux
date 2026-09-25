@@ -98,7 +98,12 @@ impl Journey {
         });
         command.env_clear();
         if windows_fixture {
-            command.args(["--exact", "windows_screen_fixture_entry", "--nocapture"]);
+            command.args([
+                "--exact",
+                "windows_screen_fixture_entry",
+                "--ignored",
+                "--nocapture",
+            ]);
             command.env("PIKA_TEST_WINDOWS_SCREEN", "1");
         } else {
             command.args(args);
@@ -319,6 +324,7 @@ fn choosing_work_keeps_identity_explicit_and_does_not_import_everything() {
 }
 
 #[test]
+#[ignore = "subprocess fixture entrypoint"]
 fn windows_screen_fixture_entry() {
     if std::env::var("PIKA_TEST_WINDOWS_SCREEN").as_deref() != Ok("1") {
         return;

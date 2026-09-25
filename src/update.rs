@@ -3137,7 +3137,7 @@ mod bounded_candidate_tests {
     }
 
     #[test]
-    fn archive_expansion_is_rejected_before_extraction_when_it_exceeds_limit() {
+    fn archive_expanded_size_validation_rejects_oversize_member() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source");
         fs::create_dir(&source).unwrap();
