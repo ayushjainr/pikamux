@@ -287,7 +287,9 @@ fn real_isolated_tmux_reopens_unique_uuid_owner_beside_inert_stale_tag() {
         "the inert stale tag was deleted or duplicated"
     );
     let stale_after = tmux.get_pane(&stale.pane_id).unwrap().unwrap();
-    assert_eq!(stale_after.current_command, "sleep");
+    // tmux may report the startup shell before it execs `sleep`; unchanged
+    // pane identity proves Pika did not replace this inert stale home.
+    assert_eq!(stale_after.pane_pid, stale.pane_pid);
     assert_eq!(stale_after.pika_provider, Some(Provider::Claude));
     assert_eq!(stale_after.pika_session_id.as_deref(), Some(identity));
     let observation = process::observe();
