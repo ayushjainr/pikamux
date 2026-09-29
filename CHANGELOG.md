@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.31 — Your persistent assistant, at home on the board
+
+- Talk to Pika with `P` on the main board, alongside its live filtered workstream
+  rail, or through `pika pika`. Both reuse the selected assistant profile,
+  scope and provider; reopening does not create a new identity or erase memory.
+- Keep scoped memories, preferences, decisions and conversation continuity in
+  native stores, with BM25 recall, separate consolidation and Reflection,
+  and explicit controls for background work and source sharing.
+- Bundle Pika-only self-awareness, maintenance and feedback skills without
+  installing them in personal provider homes. `/feedback TEXT` saves a dated
+  note in the assistant's private `user_feedback.md`, without a model call.
+- Preserve project agents and unread state. Board observation is shared across
+  views; missing authority and uncertain delivery never silently create a
+  substitute or retry a request.
+- Keep native Windows provider hosting deferred; the Windows client can attach
+  to an explicitly bound existing authority. No automatic fleet rollout.
+
 ## 0.6.30 — Recover duplicate warnings and keep Claude usage visible
 
 - Clear an old `OPEN TWICE` warning once complete process evidence proves that

@@ -33,21 +33,20 @@ pub(crate) fn start_for_open(pika: &Pika) -> Result<crate::activity_feed::Source
 }
 
 fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activity_feed::Source> {
-    // Paint all bounded durable state immediately, including offline fleet
-    // rows. No provider, process, tmux, or SSH observation belongs here.
-    let (cached, initial_fleet_health) = board_items(pika)?;
-    let summary_source = crate::activity_feed::Source::default();
-    if wait_for_handoff {
-        summary_source.pause_observation();
-    }
+    let summary_source = cached_source(pika, wait_for_handoff)?;
     let observation_enabled = summary_source.observation_gate();
     let summary_worker = summary_source.publisher();
-    summary_worker.publish(cached, initial_fleet_health);
     let (refresh_sender, refresh_receiver) = mpsc::sync_channel(1);
     let stop = Arc::new(AtomicBool::new(false));
     let local_refresh_delayed = summary_source.delayed();
     let worker_refresh_delayed = Arc::clone(&local_refresh_delayed);
     let worker_stop = Arc::clone(&stop);
+    let lease = Arc::new(crate::activity_lease::ObservationLease::new(
+        &pika.paths.state_dir,
+    )?);
+    let local_lease = lease.clone();
+    let local_inflight = Arc::new(AtomicBool::new(false));
+    let worker_inflight = local_inflight.clone();
     let worker = pika.clone();
     // Only this observer publishes aggregate activity; remote workers commit cache data.
     let (local_done_sender, local_done_receiver) = mpsc::sync_channel(1);
@@ -58,6 +57,7 @@ fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activit
         let mut observing = !wait_for_handoff;
         while !worker_stop.load(Ordering::Relaxed) {
             if !observation_enabled.load(Ordering::Acquire) {
+                local_lease.release();
                 if refresh_receiver.recv_timeout(Duration::from_millis(500))
                     == Err(mpsc::RecvTimeoutError::Disconnected)
                 {
@@ -65,6 +65,13 @@ fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activit
                 }
                 continue;
             }
+            let owner = match local_lease.acquire(true) {
+                Ok(owner) => owner,
+                Err(_) => {
+                    worker_refresh_delayed.store(true, Ordering::Relaxed);
+                    None
+                }
+            };
             if !observing {
                 // The exact open already reconciled. Reuse its committed state
                 // instead of racing it with another provider/process sweep.
@@ -74,14 +81,20 @@ fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activit
                 next_reconcile = Instant::now() + LOCAL_RECONCILE_INTERVAL;
                 observing = true;
             }
-            if Instant::now() >= next_reconcile {
+            if owner.is_some() && Instant::now() >= next_reconcile {
+                worker_inflight.store(true, Ordering::SeqCst);
+                if worker_stop.load(Ordering::SeqCst) {
+                    worker_inflight.store(false, Ordering::SeqCst);
+                    break;
+                }
                 let refresh = worker.reconcile_local().and_then(|_| board_items(&worker));
+                worker_inflight.store(false, Ordering::SeqCst);
                 worker_refresh_delayed.store(
                     record_local_refresh_result(&mut consecutive_failures, refresh.is_ok()),
                     Ordering::Relaxed,
                 );
                 if let Ok((items, fleet_health)) = refresh {
-                    summary_worker.publish(items, fleet_health);
+                    summary_worker.publish_observed(items, fleet_health);
                     // Never consume a coalesced reconcile/hook commit without
                     // re-reading the cache. If this creates the first watcher,
                     // the read also closes the database-creation race window.
@@ -98,9 +111,15 @@ fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activit
                 // bounded fallback for missed hooks and external changes.
                 next_reconcile = Instant::now() + LOCAL_RECONCILE_INTERVAL;
             }
-            let wait = next_reconcile
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(500));
+            // A follower may already be overdue; still wait for cache changes
+            // rather than spinning or independently scanning providers/fleet.
+            let wait = if owner.is_none() {
+                Duration::from_millis(500)
+            } else {
+                next_reconcile
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(500))
+            };
             match refresh_receiver.recv_timeout(wait) {
                 Ok(()) => next_reconcile = Instant::now(),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -115,6 +134,7 @@ fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activit
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        local_lease.release();
         let _ = local_done_sender.send(());
     });
     let remote_stop = Arc::clone(&stop);
@@ -122,38 +142,79 @@ fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activit
     let worker_remote_cancel = remote_cancel.clone();
     let remote_worker = pika.clone();
     let remote_enabled = summary_source.observation_gate();
+    let remote_lease = lease.clone();
     let remote_refresh = thread::spawn(move || {
-        while !remote_stop.load(Ordering::Relaxed) && !worker_remote_cancel.is_cancelled() {
-            if !remote_enabled.load(Ordering::Acquire) {
-                thread::park_timeout(Duration::from_secs(1));
-                continue;
-            }
-            let manager = FleetManager::new(&remote_worker.store, SshTransport::default());
-            if let Ok(nodes) = manager.nodes()
-                && let Some(node) = fleet::next_remote_node(&nodes, None, now(), false)
-            {
-                // refresh_node commits its snapshot to the store. The sole
-                // store-driven local publisher observes that commit and builds
-                // the next complete board, preventing an older remote read
-                // from overwriting a newer local hook state.
-                let _ = manager.refresh_node_cancellable(&node.node_id, &worker_remote_cancel);
-            }
-            // The board unparks this exact worker during shutdown. A single
-            // parked interval avoids periodic cancellation polling while
-            // preserving the one-second fleet cadence.
-            thread::park_timeout(Duration::from_secs(1));
-        }
+        remote_observation_loop(
+            remote_worker,
+            remote_stop,
+            worker_remote_cancel,
+            remote_enabled,
+            remote_lease,
+        )
     });
     let fence = pika.clone();
     summary_source.own_observer(refresh_sender.clone(), move || {
-        fence.invalidate_local_reconciliation();
-        stop.store(true, Ordering::Relaxed);
+        stop.store(true, Ordering::SeqCst);
+        if local_inflight.load(Ordering::SeqCst) {
+            fence.invalidate_local_reconciliation();
+        }
+        lease.release();
         remote_cancel.cancel();
         remote_refresh.thread().unpark();
         let _ = remote_refresh.join();
         finish_board_observer(&stop, &refresh_sender, &local_done_receiver, local_refresh);
     });
     Ok(summary_source)
+}
+
+fn cached_source(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activity_feed::Source> {
+    // Paint bounded durable state immediately. No provider/process/SSH scan.
+    let (cached, health) = board_items(pika)?;
+    let source = crate::activity_feed::Source::default();
+    if wait_for_handoff {
+        source.pause_observation();
+    }
+    source.publisher().publish(cached, health);
+    // The cached first frame is not newly verified. Only the lease owner may
+    // renew the projection once a real observation successfully commits.
+    source.project_assistant_metadata(
+        pika.paths.state_dir.join("activity-feed"),
+        pika.store.ensure_local_node_id()?,
+        Some(pika.store.path().to_path_buf()),
+    );
+    Ok(source)
+}
+
+fn remote_observation_loop(
+    worker: Pika,
+    stop: Arc<AtomicBool>,
+    cancel: CancellationToken,
+    enabled: Arc<AtomicBool>,
+    lease: Arc<crate::activity_lease::ObservationLease>,
+) {
+    while !stop.load(Ordering::Relaxed) && !cancel.is_cancelled() {
+        if !enabled.load(Ordering::Acquire) {
+            thread::park_timeout(Duration::from_secs(1));
+            continue;
+        }
+        let Some(_lease) = lease.current() else {
+            thread::park_timeout(Duration::from_secs(1));
+            continue;
+        };
+        if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
+            break;
+        }
+        let manager = FleetManager::new(&worker.store, SshTransport::default());
+        if let Ok(nodes) = manager.nodes()
+            && let Some(node) = fleet::next_remote_node(&nodes, None, now(), false)
+        {
+            // Remote work commits cache only. The sole local publisher merges
+            // it with current hook state rather than overwriting a newer board.
+            let _ = manager.refresh_node_cancellable(&node.node_id, &cancel);
+        }
+        // Shutdown unparks this exact worker; no periodic cancellation poll.
+        thread::park_timeout(Duration::from_secs(1));
+    }
 }
 
 fn record_local_refresh_result(consecutive_failures: &mut u8, succeeded: bool) -> bool {
@@ -475,7 +536,7 @@ mod board_refresh_tests {
 
 #[cfg(test)]
 mod open_observer_tests {
-    use super::start_for_open;
+    use super::{start, start_for_open};
     use crate::{
         config::Config,
         core::{Pika, session_from_candidate},
@@ -569,6 +630,68 @@ mod open_observer_tests {
         }
     }
 
+    fn scan_count(log: &Path) -> usize {
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("list-panes"))
+            .count()
+    }
+
+    #[test]
+    fn independent_sources_share_one_scanner_and_follower_takes_over() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("tmux.log");
+        let pika = test_pika(root.path(), &log);
+        let owner = start(&pika).unwrap();
+        wait_until(Instant::now() + Duration::from_secs(3), || {
+            scan_count(&log) > 0
+        });
+        thread::sleep(Duration::from_millis(150));
+        let scans = scan_count(&log);
+        let follower = start(&pika).unwrap();
+        let views: Vec<_> = (0..8).map(|_| follower.subscribe()).collect();
+        let paused = start_for_open(&pika).unwrap();
+        pika.store
+            .upsert_session(&committed_session(), false)
+            .unwrap();
+        wait_until(Instant::now() + Duration::from_secs(3), || {
+            follower.snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .items
+                    .iter()
+                    .any(|item| item.session.session_id == "open-gate-committed")
+            })
+        });
+        assert_eq!(
+            scan_count(&log),
+            scans,
+            "a follower, paused source or subscription started a second scan"
+        );
+        drop(paused);
+        drop(views);
+        drop(follower);
+        owner.refresh().try_send(()).unwrap();
+        wait_until(Instant::now() + Duration::from_secs(3), || {
+            scan_count(&log) > scans
+        });
+        thread::sleep(Duration::from_millis(150));
+        let before_takeover = scan_count(&log);
+        let successor = start(&pika).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(scan_count(&log), before_takeover);
+        drop(owner);
+        wait_until(Instant::now() + Duration::from_secs(3), || {
+            scan_count(&log) > before_takeover
+        });
+        drop(successor);
+        // The last Source stops its jobs and ultimately releases the OS lease.
+        let lease = crate::activity_lease::ObservationLease::new(&pika.paths.state_dir).unwrap();
+        wait_until(Instant::now() + Duration::from_secs(3), || {
+            lease.acquire(true).unwrap().is_some()
+        });
+    }
+
     #[test]
     fn paused_open_observer_does_not_observe_before_handoff() {
         let root = tempfile::tempdir().unwrap();
@@ -577,6 +700,13 @@ mod open_observer_tests {
         let source = start_for_open(&pika).unwrap();
 
         assert!(!source.observation_gate().load(Ordering::Acquire));
+        assert!(
+            !pika
+                .paths
+                .state_dir
+                .join("activity-feed/latest.sqlite")
+                .exists()
+        );
         thread::sleep(Duration::from_millis(100));
         assert!(!tmux_log.exists() || fs::read_to_string(&tmux_log).unwrap().is_empty());
 

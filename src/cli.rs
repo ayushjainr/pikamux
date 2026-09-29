@@ -57,12 +57,16 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Open your persistent Pika assistant (offline foundation preview).
+    /// Talk to your persistent Pika assistant.
     Pika(crate::assistant::Args),
+    #[command(name = "_assistant-client", hide = true)]
+    AssistantClient(crate::assistant_remote::Args),
     #[command(name = "_assistant-host", hide = true)]
     AssistantHost {
         #[arg(long)]
         root: PathBuf,
+        #[arg(long)]
+        expected_profile_id: Option<String>,
     },
     #[command(name = "_claude-statusline", hide = true)]
     ClaudeStatusline {
@@ -623,7 +627,11 @@ where
     let cli = Cli::try_parse_from(args)?;
     match cli.command {
         Some(Command::Pika(args)) => crate::assistant::run(args),
-        Some(Command::AssistantHost { root }) => crate::assistant::serve(&root),
+        Some(Command::AssistantClient(args)) => crate::assistant_remote::run(args),
+        Some(Command::AssistantHost {
+            root,
+            expected_profile_id,
+        }) => crate::assistant::serve(&root, expected_profile_id.as_deref()),
         Some(Command::ClaudeStatusline { forward }) => crate::claude_quota::run(forward),
         Some(Command::InstallNative(args)) => install_native(args),
         Some(Command::TerminalBridge(args)) => terminal_bridge(args),
@@ -693,6 +701,7 @@ fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
         Some(
             Command::InstallNative(_)
             | Command::Pika(_)
+            | Command::AssistantClient(_)
             | Command::AssistantHost { .. }
             | Command::ClaudeStatusline { .. }
             | Command::TerminalBridge(_)
@@ -766,7 +775,7 @@ fn drive_board(
     let mut memory = monitor::BoardMemory::default();
     loop {
         let action = observe(&mut memory)?;
-        if action == BoardAction::Assistant {
+        if matches!(action, BoardAction::Assistant(_)) {
             memory.notice = apply(action)
                 .err()
                 .map(|error| format!("PIKA · {error}\nYour project agents were not changed."));
@@ -880,7 +889,7 @@ fn run_board(pika: &Pika) -> Result<i32> {
 
 fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
     match action {
-        BoardAction::Assistant => crate::assistant::run(crate::assistant::Args::default()),
+        BoardAction::Assistant(item) => open_assistant(pika, item),
         BoardAction::Add => unreachable!("adding conversations is handled inside the board"),
         BoardAction::Open(item) => open_board_item(pika, item),
         BoardAction::Peek(item) => peek_board_item(pika, item),
@@ -929,6 +938,30 @@ fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
         }
         BoardAction::Quit => Ok(0),
     }
+}
+
+fn open_assistant(pika: &Pika, item: Option<Box<BoardItem>>) -> Result<i32> {
+    let focus = item
+        .filter(|item| item.pending_token.is_none())
+        .map(|item| {
+            Ok::<_, anyhow::Error>(crate::assistant::Focus {
+                identity: crate::assistant_observation::Identity {
+                    node: match item.node_id {
+                        Some(node) => node,
+                        None => pika.store.ensure_local_node_id()?,
+                    },
+                    provider: item.session.provider.to_string(),
+                    conversation: item.session.session_id.clone(),
+                },
+                label: item.session.display_name().to_owned(),
+            })
+        })
+        .transpose()?;
+    crate::assistant::run(crate::assistant::Args {
+        board: true,
+        focus,
+        ..Default::default()
+    })
 }
 
 fn exact_remote(pika: &Pika, item: &BoardItem) -> Result<fleet::FleetSession> {

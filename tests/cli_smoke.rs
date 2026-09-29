@@ -117,6 +117,9 @@ fn wait_command(unread: bool) -> (tempfile::TempDir, Command) {
         .env("HOME", temp.path().join("home"))
         .env("PIKA_CONFIG_HOME", temp.path().join("config"))
         .env("PIKA_STATE_HOME", &state)
+        // Bind the same database seeded above, not the enclosing test
+        // runner's inherited disposable database override.
+        .env("PIKA_DB_PATH", state.join("pika.db"))
         .env("CODEX_HOME", temp.path().join("codex"))
         .env("CLAUDE_CONFIG_DIR", temp.path().join("claude"))
         .env("OPENCODE_DATA_HOME", temp.path().join("opencode"))
@@ -237,6 +240,7 @@ fn version_is_native_and_side_effect_free() {
     command
         .env("PIKA_CONFIG_HOME", temp.path().join("config"))
         .env("PIKA_STATE_HOME", temp.path().join("state"))
+        .env("PIKA_DB_PATH", temp.path().join("state/pika.db"))
         .arg("--version")
         .assert()
         .success()
@@ -251,6 +255,7 @@ fn empty_list_does_not_create_state() {
         .unwrap()
         .env("PIKA_CONFIG_HOME", temp.path().join("config"))
         .env("PIKA_STATE_HOME", temp.path().join("state"))
+        .env("PIKA_DB_PATH", temp.path().join("state/pika.db"))
         .args(["list", "--json"])
         .assert()
         .success()

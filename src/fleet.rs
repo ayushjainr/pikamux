@@ -44,6 +44,7 @@ pub const MAX_CACHED_FLEET_ROWS: usize = 8_000;
 pub const MAX_CACHED_FLEET_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CACHED_FLEET_NODES: usize = 64;
 pub const CAPABILITIES: &[&str] = &[
+    crate::assistant_client::CAPABILITY,
     "consultation-output-v1",
     "inventory",
     "candidates",

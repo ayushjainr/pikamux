@@ -183,8 +183,19 @@ fn command(root: &Path, marker: &Path) -> Command {
     let mut result = Command::cargo_bin("pika").unwrap();
     result
         .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("xdg-config"))
+        .env("XDG_STATE_HOME", root.join("xdg-state"))
+        .env("XDG_DATA_HOME", root.join("xdg-data"))
+        .env("XDG_CACHE_HOME", root.join("xdg-cache"))
         .env("PIKA_CONFIG_HOME", root.join("config"))
         .env("PIKA_STATE_HOME", root.join("state"))
+        // The hermetic suite supplies its own override. This child must read
+        // the exact database seeded by this fixture, not the suite's empty DB.
+        .env("PIKA_DB_PATH", root.join("state/pika.db"))
+        .env("TMPDIR", root)
+        .env("TMUX_TMPDIR", root.join("tmux"))
+        .env("PIKA_TMUX_SOCKET", "expert-federation-fixture")
+        .env("PIKA_UPDATE_CHECK", "0")
         .env("CODEX_HOME", root.join("codex"))
         .env("CLAUDE_CONFIG_DIR", root.join("claude"))
         .env("OPENCODE_DATA_HOME", root.join("opencode-data"))

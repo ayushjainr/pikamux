@@ -14,18 +14,21 @@ use tempfile::tempdir;
 #[derive(Clone)]
 struct Factory {
     calls: Arc<AtomicUsize>,
+    starts: Arc<AtomicUsize>,
     forget: Option<PathBuf>,
     victim: Option<String>,
 }
 struct Worker {
     id: String,
     calls: Arc<AtomicUsize>,
+    starts: Arc<AtomicUsize>,
     forget: Option<PathBuf>,
     victim: Option<String>,
     done: bool,
 }
 impl DisposableWorker for Worker {
     fn start(&mut self, _: &str, _: &Scope) -> Result<(), String> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     fn poll(&mut self, _: &AtomicBool) -> Result<WorkerPoll, String> {
@@ -48,6 +51,7 @@ impl WorkerFactory for Factory {
         Ok(Box::new(Worker {
             id: id.into(),
             calls: self.calls.clone(),
+            starts: self.starts.clone(),
             forget: self.forget.clone(),
             victim: self.victim.clone(),
             done: false,
@@ -111,6 +115,7 @@ fn two_roots_reuse_task_names_and_three_calls_each() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut f = Factory {
         calls: calls.clone(),
+        starts: Arc::new(AtomicUsize::new(0)),
         forget: None,
         victim: None,
     };
@@ -174,6 +179,7 @@ fn worker_poll_forget_discards_reply_and_no_finding_is_persisted() {
     .unwrap();
     let mut f = Factory {
         calls: Arc::new(AtomicUsize::new(0)),
+        starts: Arc::new(AtomicUsize::new(0)),
         forget: Some(memory_path.clone()),
         victim: Some(victim.id),
     };
@@ -196,13 +202,19 @@ fn worker_poll_forget_discards_reply_and_no_finding_is_persisted() {
 
 #[test]
 fn default_deadline_blocks_next_provider_call() {
+    for (deadline_seconds, expected_starts) in [(1, 0), (10, 1)] {
+        assert_deadline_blocks_dispatch(deadline_seconds, expected_starts);
+    }
+}
+
+fn assert_deadline_blocks_dispatch(deadline_seconds: u64, expected_starts: usize) {
     let d = tempdir().unwrap();
     let mp = d.path().join("private/memory.sqlite");
     let pp = d.path().join("private/policy.sqlite");
     let mut p = AssistantPolicy::open(&pp).unwrap();
     p.configure(&PolicyConfig {
         max_total_calls: 6,
-        default_deadline_seconds: 1,
+        default_deadline_seconds: deadline_seconds,
         ..Default::default()
     })
     .unwrap();
@@ -220,13 +232,25 @@ fn default_deadline_blocks_next_provider_call() {
     )
     .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
+    let starts = Arc::new(AtomicUsize::new(0));
     let mut f = Factory {
         calls: calls.clone(),
+        starts: starts.clone(),
         forget: None,
         victim: None,
     };
-    i.poll(&mut f, 1).unwrap();
-    assert!(i.poll(&mut f, 3).is_err());
+    let first = i.poll(&mut f, 1);
+    if expected_starts == 0 {
+        // Dispatch rounds preparation upward to avoid extending a grant's
+        // integer-second expiry. A one-second remainder can expire safely
+        // before any provider start; polling is not proof of a send.
+        assert!(first.is_err());
+    } else {
+        first.unwrap();
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), expected_starts);
+    assert!(i.poll(&mut f, 2 + deadline_seconds as i64).is_err());
+    assert_eq!(starts.load(Ordering::SeqCst), expected_starts);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 

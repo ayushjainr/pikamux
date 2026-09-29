@@ -194,10 +194,14 @@ struct State {
     health: Vec<String>,
     revision: u64,
     return_interests: BTreeSet<ReturnInterest>,
+    #[cfg(unix)]
+    assistant_projection: Option<(std::path::PathBuf, String, Option<std::path::PathBuf>)>,
 }
 #[derive(Clone)]
 pub(crate) struct Snapshot {
     pub items: Vec<BoardItem>,
+    #[cfg(unix)]
+    pub filter: String,
     pub summary: Summary,
     pub health: Vec<String>,
     pub revision: u64,
@@ -220,14 +224,56 @@ impl Publisher {
         state.revision = state.revision.saturating_add(1);
     }
     pub fn publish(&self, items: Vec<BoardItem>, health: Vec<String>) {
+        self.publish_sample(items, health, false);
+    }
+
+    /// Only the current observation-lease owner calls this after a successful
+    /// fresh reconciliation. Cache-only reads must use `publish` so another
+    /// view cannot turn old operational evidence into a new sample timestamp.
+    #[cfg(unix)]
+    pub(crate) fn publish_observed(&self, items: Vec<BoardItem>, health: Vec<String>) {
+        self.publish_sample(items, health, true);
+    }
+
+    fn publish_sample(&self, items: Vec<BoardItem>, health: Vec<String>, fresh: bool) {
         if self.stop.is_cancelled() {
             return;
         }
         let mut state = self.state.lock().unwrap();
         state.summary = Some(summarize(&items, &state.filter));
+        #[cfg(unix)]
+        let projection = if fresh {
+            state
+                .assistant_projection
+                .clone()
+                .map(|(root, node, store)| (root, node, store, items.clone(), !health.is_empty()))
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let _ = fresh;
         state.items = items;
         state.health = health;
         state.revision = state.revision.saturating_add(1);
+        drop(state);
+        #[cfg(unix)]
+        if let Some((root, node, store, items, partial)) = projection {
+            if self.stop.is_cancelled() {
+                return;
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let _ = crate::assistant_observation::publish(
+                &root,
+                &node,
+                &items,
+                partial,
+                now,
+                store.as_deref(),
+            );
+        }
     }
 }
 
@@ -249,6 +295,8 @@ impl Subscription {
 fn snapshot(state: &State) -> Option<Snapshot> {
     Some(Snapshot {
         items: state.items.clone(),
+        #[cfg(unix)]
+        filter: state.filter.clone(),
         summary: state.summary.clone()?,
         health: state.health.clone(),
         revision: state.revision,
@@ -300,6 +348,15 @@ impl Default for Source {
     }
 }
 impl Source {
+    #[cfg(unix)]
+    pub(crate) fn project_assistant_metadata(
+        &self,
+        root: std::path::PathBuf,
+        local_node: String,
+        store_path: Option<std::path::PathBuf>,
+    ) {
+        self.0.state.lock().unwrap().assistant_projection = Some((root, local_node, store_path));
+    }
     pub(crate) fn local_token(&self, tmux: &Tmux) -> String {
         self.local(tmux.clone());
         self.0.token.clone()
@@ -1016,6 +1073,113 @@ mod tests {
         }))
         .unwrap();
         BoardItem::local(session)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_publications_never_create_or_refresh_verified_assistant_samples() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("activity-feed");
+        let source = Source::default();
+        source.project_assistant_metadata(root.clone(), "exact-local-node".into(), None);
+        let publisher = source.publisher();
+        publisher.publish(vec![request("cached", 1.)], vec![]);
+        assert!(!root.join("latest.sqlite").exists());
+        publisher.publish_observed(vec![request("verified", 2.)], vec![]);
+        let db = rusqlite::Connection::open(root.join("latest.sqlite")).unwrap();
+        db.execute("UPDATE activity_projection SET sampled=1 WHERE id=1", [])
+            .unwrap();
+        publisher.publish(vec![request("cached-again", 3.)], vec![]);
+        let stale = crate::assistant_observation::load(&root, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.sampled_at, 1);
+        assert_eq!(stale.rows[0].identity.conversation, "id-verified");
+        assert!(stale.partial);
+        publisher.publish_observed(vec![request("fresh", 4.)], vec![]);
+        let fresh = crate::assistant_observation::load(
+            &root,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(fresh.sampled_at > 1);
+        assert_eq!(fresh.rows[0].identity.node, "exact-local-node");
+        assert_eq!(fresh.rows[0].identity.conversation, "id-fresh");
+        assert!(!fresh.partial);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assistant_projection_uses_canonical_hooks_not_session_polling_timestamps() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("activity-feed");
+        let store = crate::store::Store::at(temp.path().join("pika.sqlite"));
+        store.initialize().unwrap();
+        let source = Source::default();
+        source.project_assistant_metadata(
+            root.clone(),
+            "node-one".into(),
+            Some(store.path().to_path_buf()),
+        );
+        let publisher = source.publisher();
+        let mut item = request("hook", 10.0);
+        let mut event = crate::model::StatusObservation {
+            kind: crate::model::ObservationKind::Lifecycle,
+            status: Status::NeedsYou,
+            unread: true,
+            attention_reason: Some("question".into()),
+            error: None,
+            observed_at: 10.0,
+            source: "hook:QuestionRequest".into(),
+        };
+        store
+            .record_status_observation(Provider::Codex, "id-hook", &event)
+            .unwrap();
+        publisher.publish_observed(vec![item.clone()], vec![]);
+        let first = crate::assistant_observation::load(&root, crate::assistant::timestamp())
+            .unwrap()
+            .unwrap()
+            .rows
+            .remove(0);
+        assert!(first.event_id.is_some());
+        item.session.last_event_at = 999.0;
+        item.session.updated_at = 1000.0;
+        item.session.last_activity_at = 1001.0;
+        item.session.name = Some("renamed".into());
+        publisher.publish_observed(vec![item.clone()], vec![]);
+        let noise = crate::assistant_observation::load(&root, crate::assistant::timestamp())
+            .unwrap()
+            .unwrap()
+            .rows
+            .remove(0);
+        assert_eq!(first.occurrence, noise.occurrence);
+        event.observed_at = 11.0;
+        store
+            .record_status_observation(Provider::Codex, "id-hook", &event)
+            .unwrap();
+        publisher.publish_observed(vec![item.clone()], vec![]);
+        let next = crate::assistant_observation::load(&root, crate::assistant::timestamp())
+            .unwrap()
+            .unwrap()
+            .rows
+            .remove(0);
+        assert_ne!(first.event_id, next.event_id);
+        assert_ne!(first.occurrence, next.occurrence);
+        item.node_id = Some("different-node".into());
+        publisher.publish_observed(vec![item], vec![]);
+        let remote = crate::assistant_observation::load(&root, crate::assistant::timestamp())
+            .unwrap()
+            .unwrap()
+            .rows
+            .remove(0);
+        assert!(
+            remote.event_id.is_none(),
+            "Equal task IDs on another node cannot inherit a local lifecycle event"
+        );
     }
 
     #[test]

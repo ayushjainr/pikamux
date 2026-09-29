@@ -1,4 +1,6 @@
 mod activity_feed;
+#[cfg(unix)]
+mod activity_lease;
 #[cfg(not(windows))]
 mod activity_observer;
 #[cfg(unix)]
@@ -6,8 +8,19 @@ mod assistant;
 #[cfg(unix)]
 mod assistant_author;
 pub mod assistant_briefing;
+pub mod assistant_client;
+#[cfg(unix)]
+mod assistant_consultation_permissions;
+mod assistant_context;
+mod assistant_continuity;
+#[cfg(unix)]
+mod assistant_control;
 pub mod assistant_coordinator;
+pub mod assistant_decisions;
 pub mod assistant_evolution;
+#[cfg(unix)]
+mod assistant_feedback;
+mod assistant_guidance;
 #[cfg(unix)]
 mod assistant_host;
 pub mod assistant_investigation;
@@ -16,22 +29,46 @@ pub mod assistant_investigation_provider;
 #[cfg(unix)]
 pub mod assistant_investigation_service;
 #[cfg(unix)]
-mod assistant_investigation_ui;
 pub mod assistant_learning;
+pub mod assistant_lifecycle;
+mod assistant_maintenance;
+#[cfg(unix)]
+mod assistant_maintenance_driver;
+#[cfg(unix)]
+mod assistant_maintenance_worker;
 pub mod assistant_memory;
+mod assistant_method;
+#[cfg(unix)]
+mod assistant_method_controls;
+#[cfg(unix)]
+mod assistant_method_service;
+#[cfg(unix)]
+mod assistant_observation;
 pub mod assistant_policy;
+mod assistant_preferences;
+#[cfg(unix)]
+mod assistant_presentation;
+#[cfg(unix)]
+mod assistant_profile_views;
 pub mod assistant_provider;
 pub mod assistant_recovery;
 pub mod assistant_recovery_service;
+#[cfg(unix)]
+mod assistant_remote;
 pub mod assistant_retention;
 pub mod assistant_runtime;
+#[cfg(unix)]
+mod assistant_self_awareness;
 pub mod assistant_service;
 #[cfg(unix)]
 mod assistant_session;
+#[cfg(unix)]
+mod assistant_startup;
 mod assistant_storage;
 #[cfg(unix)]
 pub mod assistant_transport;
 pub mod assistant_workshop;
+mod assistant_workshop_handoff;
 pub mod assistant_workshop_ui;
 #[cfg(not(windows))]
 pub mod attention;

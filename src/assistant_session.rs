@@ -42,6 +42,45 @@ pub(crate) struct Session {
     pending_evolution: Option<PendingEvolution>,
 }
 impl Session {
+    pub(crate) fn tool_catalog(&mut self, scope: &str, hash: Option<&str>) -> Result<Value> {
+        self.require_scope(scope)?;
+        Ok(self
+            .ensure_workshop_stored()?
+            .catalog(&ToolScope::new([scope]), hash)?)
+    }
+
+    pub(crate) fn assess_evolution(
+        &mut self,
+        scope: &str,
+        hash: &str,
+        outcome: &str,
+        evidence: &str,
+        rollback: Option<&str>,
+    ) -> Result<Value> {
+        self.require_scope(scope)?;
+        Ok(self.ensure_workshop_stored()?.assess(
+            &ToolScope::new([scope]),
+            hash,
+            outcome,
+            evidence,
+            rollback,
+        )?)
+    }
+
+    pub(crate) fn prepare_improvement(
+        &self,
+        root: &Path,
+        scope: &str,
+        correction_id: &str,
+    ) -> Result<Value> {
+        self.require_scope(scope)?;
+        let record =
+            crate::assistant_learning::prepare_correction_proposal(root, scope, correction_id)?;
+        Ok(
+            json!({"proposal":record,"sent_to_provider":false,"notice":"Scoped hypothesis saved, not an accepted decision. No model call, test, tool or activation occurred. Review the hypothesis and provide protected contrasting cases with /evolve-json to authorize an experiment."}),
+        )
+    }
+
     pub(crate) fn busy(&self) -> bool {
         self.service.as_ref().is_some_and(|service| service.busy())
             || self.author.as_ref().is_some_and(|service| service.busy())
@@ -115,7 +154,21 @@ impl Session {
         executable: PathBuf,
         calls: u64,
     ) -> Result<()> {
+        self.enable_with_background(root, name, executable, calls, 0)
+    }
+
+    pub(crate) fn enable_with_background(
+        &mut self,
+        root: &Path,
+        name: &str,
+        executable: PathBuf,
+        calls: u64,
+        background_calls: u64,
+    ) -> Result<()> {
         validate_enable(self, root, calls)?;
+        if background_calls > calls {
+            bail!("Background calls cannot exceed the approved lifetime allowance");
+        }
         let config = transport_config(root, &executable)?;
         let scope = project_scope(name);
         self.author_config = Some(crate::assistant_author::AuthorConfig {
@@ -123,11 +176,37 @@ impl Session {
             executable,
             scope: scope.clone(),
         });
-        self.service = Some(spawn_main_service(root.to_path_buf(), config, scope, calls));
+        self.service = Some(spawn_main_service(
+            root.to_path_buf(),
+            config,
+            scope,
+            calls,
+            background_calls,
+        ));
         self.scope = Some(name.into());
         self.workshop_root = Some(root.to_path_buf());
         Ok(())
     }
+    pub(crate) fn permission(&self) -> Option<(Scope, PathBuf)> {
+        if self.redacted {
+            return None;
+        }
+        self.author_config
+            .as_ref()
+            .map(|config| (config.scope.clone(), config.executable.clone()))
+    }
+
+    pub(crate) fn begin_background(&self, name: &str, id: &str, prompt: &str) -> Result<()> {
+        if self.redacted || self.scope.as_deref() != Some(name) || self.busy() {
+            bail!("Background request is not currently eligible");
+        }
+        self.service
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Provider not enabled"))?
+            .begin_background(id, prompt)
+            .map_err(|error| anyhow::anyhow!("Background turn not accepted: {error:?}"))
+    }
+    #[cfg(test)]
     pub(crate) fn begin(&self, name: &str, id: &str, prompt: &str) -> Result<()> {
         if self.author.as_ref().is_some_and(|author| author.busy()) {
             bail!("Wait for or cancel the disposable tool author");
@@ -142,6 +221,45 @@ impl Session {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Provider not enabled"))?
             .begin(id, prompt)
+            .map_err(|error| anyhow::anyhow!("Turn not accepted: {error:?}"))
+    }
+    pub(crate) fn begin_user(
+        &self,
+        name: &str,
+        id: &str,
+        raw_body: &str,
+        prompt: &str,
+        timestamp: i64,
+    ) -> Result<()> {
+        if self.author.as_ref().is_some_and(|author| author.busy()) {
+            bail!("Wait for or cancel the disposable tool author");
+        }
+        if self.redacted {
+            bail!("Memory was forgotten; this provider context is blocked from reuse");
+        }
+        if self.scope.as_deref() != Some(name) {
+            bail!("This scope has no enabled provider; your draft was not sent");
+        }
+        let scope = self
+            .author_config
+            .as_ref()
+            .map(|config| config.scope.clone())
+            .unwrap_or_else(|| Scope {
+                project: Some(name.into()),
+                ..Scope::default()
+            });
+        self.service
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Provider not enabled"))?
+            .begin_user(
+                id,
+                crate::assistant_service::UserTurnInput {
+                    raw_body: raw_body.into(),
+                    prompt: prompt.into(),
+                    scope,
+                    timestamp,
+                },
+            )
             .map_err(|error| anyhow::anyhow!("Turn not accepted: {error:?}"))
     }
     pub(crate) fn cancel(&self) -> Result<()> {
@@ -171,6 +289,14 @@ impl Session {
     }
     /// Queue a bounded, host-scoped evolution request through the same
     /// foreground service and durable assistant allowance as ordinary turns.
+    #[cfg(not(test))]
+    pub(crate) fn evolve(&mut self, _root: &Path, _scope: &str, _request_id: &str) -> Result<()> {
+        bail!(
+            "Use /evolve CORRECTION_ID to prepare a scoped hypothesis without a model call, or /evolve-json with a reviewed need and protected contrasting cases to authorize an experiment"
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn evolve(&mut self, root: &Path, scope: &str, request_id: &str) -> Result<()> {
         let assigned = ToolScope::new([scope.to_owned()]);
         let spec = json!({
@@ -297,7 +423,7 @@ impl Session {
             bail!("invalid exact candidate hash")
         }
         let grant = workshop
-            .approve_exact(hash, tool_scope, future_expiry())
+            .approve_exact(hash, tool_scope)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         Ok(grant)
     }
@@ -318,7 +444,7 @@ impl Session {
         self.require_scope(scope)?;
         let tool_scope = ToolScope::new([scope.to_owned()]);
         self.ensure_workshop_stored()?
-            .rollback_exact(name, hash, tool_scope, future_expiry())
+            .rollback_exact(name, hash, tool_scope)
             .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 
@@ -347,9 +473,12 @@ impl Session {
             .invoke(name, &inputs)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         if let Some(root) = self.workshop_root.as_ref() {
-            if let Err(error) =
-                crate::assistant_learning::record_use(root, scope, &result.tool_hash, &result.value)
-            {
+            if let Err(error) = crate::assistant_learning::record_use(
+                root,
+                scope,
+                &result.tool_hash,
+                &json!({"output":result.value,"fuel_used":result.fuel_used,"operations":result.operations}),
+            ) {
                 result.provenance_warning = Some(format!(
                     "Tool completed; its learning receipt is incomplete (some memory may already be saved): {error}"
                 ));
@@ -482,7 +611,7 @@ impl Session {
         let comparison = self.comparison_snapshot(scope, workshop_report.as_ref());
         json!({"state": match snapshot.state {
             ServiceState::Starting => "starting", ServiceState::Idle => "ready", ServiceState::Running => "working", ServiceState::Cancelling => "cancelling", ServiceState::Completed => "ready", ServiceState::Failed => "unavailable", ServiceState::Stopped => "stopped"
-        }, "provider":"codex", "background_calls":0, "author":author,"request_id":snapshot.request_id, "partial":text, "error":error, "cost":"unknown; count and deadline bounded", "workshop_state": workshop_state, "workshop_error": workshop_error, "workshop_report": workshop_report,"workshop_comparison":comparison, "needs_approval": needs_approval})
+        }, "provider":"codex", "background_calls":0, "author":author,"request_id":snapshot.request_id,"user_record_id":snapshot.user_record_id, "partial":text, "error":error, "cost":"unknown; count and deadline bounded", "workshop_state": workshop_state, "workshop_error": workshop_error, "workshop_report": workshop_report,"workshop_comparison":comparison, "needs_approval": needs_approval})
     }
 
     fn pending_scope_matches(&self, scope: &str) -> bool {
@@ -780,8 +909,8 @@ fn validate_enable(session: &Session, root: &Path, calls: u64) -> Result<()> {
             "An earlier recovery did not finish. Use /fresh-context acknowledge before enabling another provider; no old request will be replayed."
         );
     }
-    if calls == 0 || calls > 100 {
-        bail!("Choose a total allowance of 1–100 calls; this is not a monetary ceiling");
+    if !(1..=100).contains(&calls) && calls != crate::assistant_policy::NO_CALL_LIMIT {
+        bail!("Choose --max-calls 1–100 or --no-call-limit; neither sets a monetary ceiling");
     }
     Ok(())
 }
@@ -814,13 +943,24 @@ fn spawn_main_service(
     config: TransportConfig,
     scope: Scope,
     calls: u64,
+    background_calls: u64,
 ) -> AssistantService {
     AssistantService::spawn(move || {
-        let make = || -> Result<AssistantRuntime<CodexTransport>> {
+        let make = || -> Result<_> {
             let memory = Store::open(root.join("memory.sqlite"))?;
             let policy = AssistantPolicy::open(root.join("policy.sqlite"))?;
             let journal = root.join("runtime.sqlite");
             let thread_id = persisted_thread(&journal)?;
+            let factory =
+                crate::assistant_investigation_provider::ScopedWorkerFactory::from_permission_root(
+                    crate::assistant_investigation_provider::CodexWorkerFactory::new(
+                        config.executable.clone(),
+                        &root,
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                    &root,
+                )
+                .map_err(anyhow::Error::msg)?;
             let provider = MainAssistant::new(
                 CodexTransport::spawn(config)?,
                 MainProfile {
@@ -834,18 +974,20 @@ fn spawn_main_service(
                 ..RuntimeConfig::default()
             })?;
             runtime.start_or_resume(now())?;
-            Ok(runtime)
+            let coordinated = crate::assistant_investigation_service::CoordinatedRuntime::new(
+                runtime, factory, &root,
+            )
+            .map_err(anyhow::Error::msg)?;
+            if background_calls > 0 {
+                Ok(coordinated
+                    .with_background_budget(background_calls)
+                    .map_err(anyhow::Error::msg)?)
+            } else {
+                Ok(coordinated)
+            }
         };
         make().map_err(|error| format!("{error:#}"))
     })
-}
-
-fn future_expiry() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
-        + 3600.0
 }
 
 fn persist_pending(
@@ -1029,6 +1171,19 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    #[test]
+    fn enable_accepts_uncapped_lifetime_only_as_an_explicit_allowance() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("private");
+        let session = Session::new();
+        for calls in [1, 12, 100, crate::assistant_policy::NO_CALL_LIMIT] {
+            validate_enable(&session, &root, calls).unwrap();
+        }
+        for calls in [0, 101, u64::MAX] {
+            assert!(validate_enable(&session, &root, calls).is_err());
+        }
+    }
+
     struct FakeRuntime {
         responses: Vec<String>,
         response: String,
@@ -1088,6 +1243,84 @@ mod tests {
             authoring_evidence: "fake candidate".into(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn project_scoped_authoring_catalog_and_retirement_use_no_main_turn() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("private");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = AssistantService::spawn({
+            let calls = calls.clone();
+            move || {
+                Ok(FakeRuntime {
+                    responses: vec![],
+                    response: candidate_json("alpha", 1),
+                    calls,
+                    done: false,
+                })
+            }
+        });
+        let mut session = Session::with_service_for_test(service, "alpha");
+        let spec = json!({"need":"Select attention titles", "cases":[{"inputs":[{"value":{"status":"needs_you","title":"Yes"},"scope":ToolScope::new(["alpha"])}],"expected":["Yes"]},{"inputs":[],"expected":[]}]});
+        assert!(
+            session
+                .evolve_spec(&root, "beta", "wrong-scope", &spec.to_string())
+                .is_err()
+        );
+        session
+            .evolve_spec(&root, "alpha", "alpha-author", &spec.to_string())
+            .unwrap();
+        for _ in 0..100 {
+            session.tick().unwrap();
+            if session.snapshot("alpha")["workshop_report"].is_object() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let snapshot = session.snapshot("alpha");
+        assert_eq!(snapshot["workshop_report"]["passed"], true);
+        let hash = snapshot["workshop_report"]["tool_hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session.approve_evolution("alpha", &hash).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(session);
+        let mut session = Session::with_workshop_for_test("alpha", &root);
+        session.set_workshop_root(&root).unwrap();
+        let catalog = session.tool_catalog("alpha", Some(&hash)).unwrap();
+        assert_eq!(
+            catalog["tools"][0]["definition"]["name"],
+            "attention-title-alpha"
+        );
+        assert!(session.tool_catalog("beta", None).is_err());
+        assert_eq!(
+            session
+                .invoke_evolution(
+                    "alpha",
+                    "attention-title-alpha",
+                    r#"[{"status":"needs_you","title":"Withheld"}]"#
+                )
+                .unwrap()
+                .value,
+            json!(["Withheld"])
+        );
+        session
+            .assess_evolution(
+                "alpha",
+                &hash,
+                "regression",
+                "Misleading real-world grouping",
+                None,
+            )
+            .unwrap();
+        assert!(
+            session
+                .invoke_evolution("alpha", "attention-title-alpha", "[]")
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
     #[test]
     fn correction_drives_hypothesis_candidate_and_later_use_without_main_turn() {

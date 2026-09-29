@@ -194,6 +194,26 @@ pub struct ConsultationProgress {
 
 pub type ConsultationProgressObserver = Arc<dyn Fn(ConsultationProgress) + Send + Sync>;
 pub type ConsultationOutputObserver = Arc<dyn Fn(AnswerDelta) -> bool + Send + Sync>;
+/// Optional native authority fence. A guard lives only across preparation or
+/// the bounded send handshake, never across answer generation. Model text
+/// cannot supply this callback.
+pub trait ConsultationDispatchGuard {}
+impl<T> ConsultationDispatchGuard for T {}
+pub type ConsultationDispatchFence =
+    Arc<dyn Fn() -> Result<Box<dyn ConsultationDispatchGuard>> + Send + Sync>;
+
+fn acquire_dispatch_fence(
+    fence: &Option<ConsultationDispatchFence>,
+) -> Result<Option<Box<dyn ConsultationDispatchGuard>>> {
+    fence.as_ref().map(|f| f()).transpose()
+}
+fn fenced_deadline(fence: &Option<ConsultationDispatchFence>, deadline: Instant) -> Instant {
+    if fence.is_some() {
+        deadline.min(Instant::now() + Duration::from_secs(10))
+    } else {
+        deadline
+    }
+}
 
 #[derive(Clone)]
 pub struct ConsultationOptions {
@@ -204,6 +224,7 @@ pub struct ConsultationOptions {
     pub cancellation: CancellationToken,
     pub progress: Option<ConsultationProgressObserver>,
     pub output: Option<ConsultationOutputObserver>,
+    pub dispatch_fence: Option<ConsultationDispatchFence>,
 }
 
 impl ConsultationOptions {
@@ -216,6 +237,7 @@ impl ConsultationOptions {
             cancellation: CancellationToken::default(),
             progress: None,
             output: None,
+            dispatch_fence: None,
         }
     }
 }
@@ -980,6 +1002,7 @@ struct CodexSide {
     output: Option<ConsultationOutputObserver>,
     turn: u64,
     metrics: TurnMetrics,
+    dispatch_fence: Option<ConsultationDispatchFence>,
 }
 
 impl CodexSide {
@@ -1007,6 +1030,7 @@ impl CodexSide {
             output: options.output.clone(),
             turn: 0,
             metrics: TurnMetrics::default(),
+            dispatch_fence: options.dispatch_fence.clone(),
         };
         let opened = (|| -> Result<()> {
             side.request(
@@ -1079,15 +1103,37 @@ impl CodexSide {
         Ok(side)
     }
 
+    fn send_request_frame(
+        &mut self,
+        method: &str,
+        params: Value,
+        request_id: u64,
+        deadline: Instant,
+    ) -> Result<()> {
+        let guarded = matches!(method, "thread/fork" | "turn/start");
+        let dispatch_guard = if guarded {
+            acquire_dispatch_fence(&self.dispatch_fence)?
+        } else {
+            None
+        };
+        let send_deadline = if guarded {
+            fenced_deadline(&self.dispatch_fence, deadline)
+        } else {
+            deadline
+        };
+        self.process.send(
+            &json!({"method":method,"id":request_id,"params":params}),
+            send_deadline,
+            &self.cancellation,
+        )?;
+        drop(dispatch_guard);
+        Ok(())
+    }
     fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         self.request_id += 1;
         let request_id = self.request_id;
         let deadline = Instant::now() + timeout;
-        self.process.send(
-            &json!({"method":method,"id":request_id,"params":params}),
-            deadline,
-            &self.cancellation,
-        )?;
+        self.send_request_frame(method, params, request_id, deadline)?;
         loop {
             let message = self.process.receive(deadline, &self.cancellation)?;
             if message.get("id").and_then(Value::as_u64) == Some(request_id)
@@ -1139,6 +1185,13 @@ impl CodexSide {
             .notification_bytes
             .saturating_sub(serde_json::to_vec(&value).map_or(0, |bytes| bytes.len()));
         Some(value)
+    }
+    fn next_notification(&mut self, deadline: Instant) -> Result<Value> {
+        if let Some(message) = self.pop_notification() {
+            Ok(message)
+        } else {
+            self.process.receive(deadline, &self.cancellation)
+        }
     }
 
     fn ask(
@@ -1198,12 +1251,9 @@ impl CodexSide {
         let mut final_text = String::new();
         let mut deltas = String::new();
         loop {
-            let message = if let Some(message) = self.pop_notification() {
-                Ok(message)
-            } else {
-                self.process.receive(deadline, &self.cancellation)
-            }
-            .map_err(|error| SideFailure::turn(error, *delivery))?;
+            let message = self
+                .next_notification(deadline)
+                .map_err(|error| SideFailure::turn(error, *delivery))?;
             if message.get("id").is_some() && message.get("method").is_some() {
                 self.process
                     .send(
@@ -1369,6 +1419,7 @@ struct ClaudeSide {
     process: JsonChild,
     timeout: Duration,
     cancellation: CancellationToken,
+    dispatch_fence: Option<ConsultationDispatchFence>,
 }
 
 impl ClaudeSide {
@@ -1415,13 +1466,17 @@ impl ClaudeSide {
             "--verbose",
         ]);
         set_cwd(&mut command, session.cwd.as_deref());
+        let dispatch_guard = acquire_dispatch_fence(&options.dispatch_fence)
+            .map_err(|error| SideFailure::prepare(error, Cleanup::Complete))?;
         let process = JsonChild::spawn(command)
             .map_err(|error| SideFailure::prepare(error, Cleanup::Complete))?;
+        drop(dispatch_guard);
         Ok(Self {
             parent_id,
             process,
             timeout: options.timeout,
             cancellation: options.cancellation.clone(),
+            dispatch_fence: options.dispatch_fence.clone(),
         })
     }
 
@@ -1431,19 +1486,23 @@ impl ClaudeSide {
         delivery: &mut Delivery,
         progress: &mut dyn FnMut(Delivery),
     ) -> Result<String, SideFailure> {
+        let dispatch_guard = acquire_dispatch_fence(&self.dispatch_fence)
+            .map_err(|error| SideFailure::turn(error, Delivery::NotSent))?;
         *delivery = Delivery::Unknown;
         progress(*delivery);
         let deadline = Instant::now() + self.timeout;
+        let send_deadline = fenced_deadline(&self.dispatch_fence, deadline);
         self.process
             .send(
                 &json!({
                     "type":"user",
                     "message":{"role":"user","content":[{"type":"text","text":question}]}
                 }),
-                deadline,
+                send_deadline,
                 &self.cancellation,
             )
             .map_err(|error| SideFailure::turn(error, *delivery))?;
+        drop(dispatch_guard);
         let mut latest = String::new();
         loop {
             let message = self
@@ -1520,6 +1579,7 @@ struct OpenCodeSide {
     fork_server: Option<OwnedChild>,
     closed: bool,
     cancellation: CancellationToken,
+    dispatch_fence: Option<ConsultationDispatchFence>,
 }
 
 impl OpenCodeSide {
@@ -1559,6 +1619,7 @@ impl OpenCodeSide {
             fork_server: None,
             closed: false,
             cancellation: options.cancellation.clone(),
+            dispatch_fence: options.dispatch_fence.clone(),
         };
         // Establish and validate the exact provider-issued child before Pika
         // emits an opening receipt or accepts a question. This matches the
@@ -1659,18 +1720,7 @@ impl OpenCodeSide {
             percent_encode(&self.parent_id)
         );
         self.fork_uncertain = true;
-        let response = http_json(
-            base,
-            HttpRequest {
-                path: &endpoint,
-                username,
-                password: &password,
-                method: "POST",
-                payload: Some(b"{}"),
-                timeout: Duration::from_secs(30),
-            },
-            &self.cancellation,
-        );
+        let response = self.request_fork(base, &endpoint, username, &password);
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -1721,6 +1771,39 @@ impl OpenCodeSide {
     /// Stop only the process group created for this side turn, then release its
     /// pipe worker cooperatively. A descendant which escaped that group is
     /// foreign: it may retain stderr, but Pika neither signals nor waits for it.
+    fn spawn_question(&self, command: &mut Command) -> Result<OwnedChild> {
+        let guard = acquire_dispatch_fence(&self.dispatch_fence)?;
+        let result = OwnedChild::spawn(command);
+        drop(guard);
+        result.map_err(Into::into)
+    }
+    fn request_fork(
+        &self,
+        base: SocketAddr,
+        endpoint: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<Value> {
+        let guard = acquire_dispatch_fence(&self.dispatch_fence)?;
+        let response = http_json(
+            base,
+            HttpRequest {
+                path: endpoint,
+                username,
+                password,
+                method: "POST",
+                payload: Some(b"{}"),
+                timeout: Duration::from_secs(if self.dispatch_fence.is_some() {
+                    10
+                } else {
+                    30
+                }),
+            },
+            &self.cancellation,
+        );
+        drop(guard);
+        response
+    }
     fn terminate_turn(&mut self) -> Result<String> {
         let result = self.turn_process.as_mut().map_or(Ok(()), terminate_child);
         self.stop_turn_pipes();
@@ -1795,8 +1878,9 @@ impl OpenCodeSide {
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
-        let mut child =
-            OwnedChild::spawn(&mut command).map_err(|error| SideFailure::turn(error, *delivery))?;
+        let mut child = self
+            .spawn_question(&mut command)
+            .map_err(|error| SideFailure::turn(error, *delivery))?;
         *delivery = Delivery::Unknown;
         progress(*delivery);
         let stderr = Arc::new(Mutex::new(Vec::new()));
@@ -2848,6 +2932,7 @@ mod tests {
             fork_server: None,
             closed: false,
             cancellation: CancellationToken::default(),
+            dispatch_fence: None,
         };
         let started = Instant::now();
         side.terminate_turn().unwrap();

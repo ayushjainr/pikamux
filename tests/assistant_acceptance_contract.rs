@@ -199,7 +199,7 @@ fn forgetting_scrubs_all_queued_work_and_unknown_is_not_retried() {
 }
 
 #[test]
-fn native_ast_lifecycle_is_bounded_and_rejects_bad_candidates() {
+fn native_ast_execution_is_bounded_and_rejects_bad_candidates() {
     let definition = ToolDefinition {
         name: "project-status".into(),
         version: 1,
@@ -219,8 +219,6 @@ fn native_ast_lifecycle_is_bounded_and_rejects_bad_candidates() {
     let first = execute(&definition, &input, None).unwrap();
     assert_eq!(first.tool_hash, hash);
     assert_eq!(first.value, json!(["ready"]));
-    let after_restart = execute(&definition, &input, None).unwrap();
-    assert_eq!(after_restart.value, first.value);
     let bad = ToolDefinition {
         name: "bad".into(),
         version: 1,

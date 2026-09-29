@@ -38,12 +38,63 @@ pub enum WorkerPoll {
 /// A fresh disposable provider adapter. Implementations must not reuse a
 /// project-agent thread or infer permissions from worker text.
 pub trait DisposableWorker: Send {
+    /// Deferred native adapters must acquire their own memory/policy fence at
+    /// the eventual send, using bind_dispatch_epoch; scheduling is not delivery.
+    fn dispatches_later(&self) -> bool {
+        false
+    }
+    /// Deferred adapters must carry this exact epoch to their eventual send.
+    fn bind_dispatch_epoch(&mut self, _memory: &Path, _epoch: u64) -> Result<(), String> {
+        Ok(())
+    }
     fn start(&mut self, assignment: &str, scope: &Scope) -> Result<(), String>;
+    fn start_with_cancellation(
+        &mut self,
+        assignment: &str,
+        scope: &Scope,
+        cancellation: &crate::assistant_service::DispatchCancellation,
+    ) -> Result<(), String> {
+        let _admission = cancellation.enter()?;
+        self.start(assignment, scope)
+    }
     fn poll(&mut self, cancel: &AtomicBool) -> Result<WorkerPoll, String>;
     fn cancel(&mut self) -> Result<(), String>;
+    /// Delivery and provider-side deletion are separate. Missing telemetry is
+    /// unknown, never a fabricated zero or a cleanup guarantee.
+    fn receipt(&self) -> WorkerReceipt {
+        WorkerReceipt::default()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerReceipt {
+    pub provider: Option<String>,
+    pub source_node: Option<String>,
+    pub source_conversation: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub delivery: Option<String>,
+    pub cleanup: Option<String>,
 }
 pub trait WorkerFactory: Send {
     fn create(&mut self, task_id: &str) -> Result<Box<dyn DisposableWorker>, String>;
+    fn allowed_context(&mut self, _scope: &Scope, _now: i64) -> Result<String, String> {
+        Ok(String::new())
+    }
+    /// Native planning metadata, never a grant. Default factories have no
+    /// private-conversation capability at all.
+    fn select_consultation(
+        &mut self,
+        _task_id: &str,
+        _allowed_id: &str,
+        _root_id: &str,
+        _scope: &Scope,
+        _now: i64,
+    ) -> Result<(), String> {
+        Err("No exact private consultation is approved for this worker factory".into())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -91,6 +142,9 @@ pub struct Investigation {
     state: InvestigationState,
     forget_epoch: u64,
     synthesis_started: bool,
+    main_synthesis: bool,
+    inherited_dependencies: Vec<String>,
+    cancellation: crate::assistant_service::DispatchCancellation,
 }
 
 #[cfg(test)]
@@ -196,6 +250,74 @@ mod tests {
         }
         assert_eq!(f.starts.load(Ordering::SeqCst), 3);
         assert!(matches!(i.state(), InvestigationState::Complete));
+    }
+    #[test]
+    fn forget_while_factory_prepares_worker_prevents_actual_start() {
+        struct ForgettingFactory {
+            path: std::path::PathBuf,
+            victim: String,
+            sent: Arc<AtomicUsize>,
+        }
+        struct SendCounter(Arc<AtomicUsize>);
+        impl DisposableWorker for SendCounter {
+            fn start(&mut self, _: &str, _: &Scope) -> Result<(), String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn poll(&mut self, _: &AtomicBool) -> Result<WorkerPoll, String> {
+                Ok(WorkerPoll::Pending)
+            }
+            fn cancel(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        impl WorkerFactory for ForgettingFactory {
+            fn create(&mut self, _: &str) -> Result<Box<dyn DisposableWorker>, String> {
+                Store::open(&self.path)
+                    .unwrap()
+                    .forget(&self.victim)
+                    .unwrap();
+                Ok(Box::new(SendCounter(self.sent.clone())))
+            }
+        }
+        let (dir, mut investigation, _) = setup(vec![InvestigationTask {
+            id: "one".into(),
+            assignment: "bounded".into(),
+            dependencies: vec![],
+        }]);
+        let path = dir.path().join("private/memory.sqlite");
+        let victim = Store::open(&path)
+            .unwrap()
+            .append(NewRecord {
+                kind: RecordKind::Finding,
+                origin: Origin::Human,
+                scope: Scope::default(),
+                body: "forget me".into(),
+                provenance: "fixture".into(),
+                timestamp: 1,
+                supersedes: None,
+                dependencies: vec![],
+                decision_state: None,
+                protected_policy: false,
+            })
+            .unwrap();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let mut factory = ForgettingFactory {
+            path,
+            victim: victim.id,
+            sent: sent.clone(),
+        };
+        assert!(
+            investigation
+                .poll(&mut factory, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("forgotten")
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+        assert_eq!(investigation.state(), &InvestigationState::Unknown);
+        assert!(investigation.poll(&mut factory, 3).is_err());
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
     }
     #[test]
     #[should_panic(expected = "missing dependency")]
@@ -374,14 +496,15 @@ mod tests {
     }
 }
 
-fn validate_personal_scope(scope: &Scope) -> Result<(), InvestigationError> {
-    if scope.project.as_deref() != Some("personal")
-        || scope.provider.is_some()
+pub(crate) fn validate_project_scope(scope: &Scope) -> Result<(), InvestigationError> {
+    if scope.project.as_ref().is_none_or(|project| {
+        project.is_empty() || project.len() > 256 || project.chars().any(char::is_control)
+    }) || scope.provider.is_some()
         || scope.conversation.is_some()
         || scope.node.is_some()
     {
         return Err(InvestigationError::Denied(
-            "foreground investigation currently accepts personal scope only".into(),
+            "investigation requires one exact bounded project scope".into(),
         ));
     }
     Ok(())
@@ -469,7 +592,7 @@ fn reject_uncertain_jobs(journal: &Connection) -> Result<(), InvestigationError>
 
 fn reject_unfinished_roots(journal: &Connection) -> Result<(), InvestigationError> {
     let unfinished: i64 = journal.query_row(
-        "SELECT COUNT(*) FROM investigation_roots WHERE state IN ('intent','active','unknown')",
+        "SELECT COUNT(*) FROM investigation_roots WHERE state IN ('planning','intent','active','unknown')",
         [],
         |row| row.get(0),
     )?;
@@ -685,10 +808,18 @@ fn persist_worker_finding(
             origin: Origin::Worker,
             scope: investigation.scope.clone(),
             body: text.to_owned(),
-            provenance: format!("investigation worker {}", task.id),
+            provenance: serde_json::json!({
+                "worker":task.id,
+                "receipt":investigation.current.as_ref().map(|(_,_,_,worker)|worker.receipt()),
+                "uncertainty":"Worker assertions are untrusted evidence, not verified current state"
+            })
+            .to_string(),
             timestamp: now,
             supersedes: None,
-            dependencies: task.dependencies.clone(),
+            dependencies: combined_dependencies(
+                &task.dependencies,
+                &investigation.inherited_dependencies,
+            ),
             decision_state: None,
             protected_policy: false,
         },
@@ -707,8 +838,15 @@ fn finish_synthesis(
 ) -> Result<Option<String>, InvestigationError> {
     investigation.state = InvestigationState::Complete;
     investigation.journal.execute(
-        "UPDATE investigation_roots SET state='completed' WHERE id=?",
-        [&investigation.root_id],
+        "UPDATE investigation_roots SET state=? WHERE id=?",
+        params![
+            if investigation.main_synthesis {
+                "planning"
+            } else {
+                "completed"
+            },
+            &investigation.root_id
+        ],
     )?;
     Ok(Some(text))
 }
@@ -807,7 +945,7 @@ impl Investigation {
         root_id: &str,
         now: i64,
     ) -> Result<Self, InvestigationError> {
-        validate_personal_scope(&plan.scope)?;
+        validate_project_scope(&plan.scope)?;
         validate_root_identity(root_id)?;
         validate_tasks(&plan.tasks)?;
         validate_plan_dependencies(&memory, &plan)?;
@@ -832,7 +970,120 @@ impl Investigation {
             state: InvestigationState::Ready,
             forget_epoch: epoch,
             synthesis_started: false,
+            main_synthesis: false,
+            inherited_dependencies: vec![],
+            cancellation: Default::default(),
         })
+    }
+    /// Reuse the coordinator's active envelope. No extra root or disposable
+    /// synthesis call is created; the main assistant receives finding IDs.
+    pub fn open_children(
+        mut memory: Store,
+        policy: AssistantPolicy,
+        journal_path: impl AsRef<Path>,
+        plan: InvestigationPlan,
+        root_id: &str,
+        now: i64,
+        expected_epoch: u64,
+    ) -> Result<Self, InvestigationError> {
+        validate_project_scope(&plan.scope)?;
+        validate_root_identity(root_id)?;
+        validate_tasks(&plan.tasks)?;
+        validate_plan_dependencies(&memory, &plan)?;
+        validate_coordinator_root(&policy, root_id, now)?;
+        let (path, mut journal) = open_journal(journal_path.as_ref())?;
+        reject_uncertain_jobs(&journal)?;
+        let epoch = memory.forget_epoch()?;
+        if epoch != expected_epoch {
+            return Err(InvestigationError::Denied(
+                "memory changed after investigation planning".into(),
+            ));
+        }
+        let tasks: VecDeque<InvestigationTask> = plan.tasks.into();
+        memory.publish_at_epoch(epoch, || {
+            activate_child_jobs(&mut journal, &tasks, root_id, epoch)
+        })?;
+        Ok(Self {
+            memory,
+            policy,
+            journal,
+            journal_path: path,
+            scope: plan.scope,
+            root_id: root_id.into(),
+            tasks,
+            current: None,
+            findings: Vec::new(),
+            finding_ids: Vec::new(),
+            state: InvestigationState::Ready,
+            forget_epoch: epoch,
+            synthesis_started: false,
+            main_synthesis: true,
+            inherited_dependencies: vec![],
+            cancellation: Default::default(),
+        })
+    }
+    /// Preserve derivation from the planner without exposing all of its recalled
+    /// context to a worker or private source. Only task.dependencies is rendered.
+    pub(crate) fn inherit_lineage(
+        &mut self,
+        dependencies: &[String],
+    ) -> Result<(), InvestigationError> {
+        if self.state != InvestigationState::Ready || dependencies.len() > 64 {
+            return Err(InvestigationError::Denied(
+                "bounded lineage required before dispatch".into(),
+            ));
+        }
+        for id in dependencies {
+            if !self
+                .memory
+                .get(id)?
+                .is_some_and(|r| r.scope.permits(&self.scope) && r.kind != RecordKind::Draft)
+            {
+                return Err(InvestigationError::Denied(
+                    "lineage is unavailable or outside exact scope".into(),
+                ));
+            }
+        }
+        let mut rows = vec![];
+        for task in &self.tasks {
+            let mut durable = task.clone();
+            durable.dependencies = combined_dependencies(&task.dependencies, dependencies);
+            if durable.dependencies.len() > 64 {
+                return Err(InvestigationError::Denied(
+                    "combined lineage exceeds memory bound".into(),
+                ));
+            }
+            rows.push((
+                format!("{}:{}", self.root_id, task.id),
+                serde_json::to_string(&durable)
+                    .map_err(|e| InvestigationError::Denied(e.to_string()))?,
+            ));
+        }
+        // Durable job dependencies include lineage for forget/retention sweeps;
+        // the in-memory assignments retain their narrower disclosed context.
+        let journal = &mut self.journal;
+        self.memory
+            .publish_at_epoch(self.forget_epoch, || -> rusqlite::Result<()> {
+                let tx = journal.transaction()?;
+                for (id, body) in rows {
+                    tx.execute(
+                        "UPDATE investigation_jobs SET task_json=? WHERE id=? AND state='queued'",
+                        params![body, id],
+                    )?;
+                }
+                tx.commit()
+            })?;
+        self.inherited_dependencies = dependencies.to_vec();
+        Ok(())
+    }
+    pub fn finding_ids(&self) -> &[String] {
+        &self.finding_ids
+    }
+    pub(crate) fn set_cancellation(
+        &mut self,
+        cancellation: crate::assistant_service::DispatchCancellation,
+    ) {
+        self.cancellation = cancellation;
     }
     pub fn state(&self) -> &InvestigationState {
         &self.state
@@ -877,6 +1128,9 @@ impl Investigation {
         }
         if let Some(task) = self.tasks.pop_front() {
             return self.start_task(task, factory, now);
+        }
+        if self.main_synthesis {
+            return finish_synthesis(self, self.findings.join("\n"));
         }
         if !self.synthesis_started {
             return self.start_synthesis(factory, now);
@@ -939,6 +1193,7 @@ impl Investigation {
         reservation: &str,
         now: i64,
     ) -> Result<Box<dyn DisposableWorker>, InvestigationError> {
+        let preparation_started = std::time::Instant::now();
         let mut worker = match factory.create(task_id) {
             Ok(worker) => worker,
             Err(error) => {
@@ -946,9 +1201,31 @@ impl Investigation {
                 return Err(InvestigationError::Worker(error));
             }
         };
-        if let Err(error) = worker.start(prompt, &self.scope) {
+        if let Err(error) = worker.bind_dispatch_epoch(self.memory.path(), self.forget_epoch) {
             self.record_unknown_delivery(reservation, now)?;
             return Err(InvestigationError::Worker(error));
+        }
+        let dispatch_policy = AssistantPolicy::open(self.policy.path())?;
+        let started = self.memory.dispatch_at_epoch(self.forget_epoch, || {
+            if !worker.dispatches_later() {
+                dispatch_policy.lock_dispatch().map_err(|e| e.to_string())?;
+                dispatch_policy
+                    .validate_actual_dispatch(
+                        reservation,
+                        crate::assistant_policy::current_dispatch_time(
+                            now,
+                            preparation_started.elapsed(),
+                        ),
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            worker.start_with_cancellation(prompt, &self.scope, &self.cancellation)
+        });
+        drop(dispatch_policy);
+        if let Err(error) = started.and_then(|result| result.map_err(MemoryError::Invalid)) {
+            let _ = worker.cancel();
+            self.record_unknown_delivery(reservation, now)?;
+            return Err(InvestigationError::Worker(error.to_string()));
         }
         Ok(worker)
     }
@@ -973,12 +1250,12 @@ impl Investigation {
         }
         if let Some((_task, reservation, cancel, mut worker)) = self.current.take() {
             cancel.store(true, Ordering::Release);
-            let _ = worker.cancel();
+            let cleanup_error = worker.cancel().err();
             self.policy
                 .record_outcome(&reservation, DeliveryOutcome::Unknown, now)?;
             self.journal.execute(
-                "UPDATE investigation_jobs SET state='unknown' WHERE id=?",
-                [&reservation],
+                "UPDATE investigation_jobs SET state='unknown',finding=? WHERE id=?",
+                params![serde_json::json!({"receipt":worker.receipt(),"cleanup_error":cleanup_error,"delivery":"unknown"}).to_string(), &reservation],
             )?;
         }
         while let Some(task) = self.tasks.pop_front() {
@@ -994,6 +1271,52 @@ impl Investigation {
         self.state = InvestigationState::Cancelled;
         Ok(())
     }
+}
+
+fn combined_dependencies(explicit: &[String], inherited: &[String]) -> Vec<String> {
+    let mut ids = explicit.to_vec();
+    ids.extend_from_slice(inherited);
+    ids.sort();
+    ids.dedup();
+    ids
+}
+fn validate_coordinator_root(
+    policy: &AssistantPolicy,
+    root_id: &str,
+    now: i64,
+) -> Result<(), InvestigationError> {
+    let root = policy
+        .reservation(root_id)?
+        .ok_or_else(|| InvestigationError::Denied("missing coordinator root".into()))?;
+    if root.parent_id.is_some()
+        || root.state != crate::assistant_policy::ReservationState::Reserved
+        || root.deadline_at <= now
+    {
+        return Err(InvestigationError::Denied(
+            "coordinator root unavailable".into(),
+        ));
+    }
+    Ok(())
+}
+fn activate_child_jobs(
+    journal: &mut Connection,
+    tasks: &VecDeque<InvestigationTask>,
+    root_id: &str,
+    epoch: u64,
+) -> rusqlite::Result<()> {
+    let tx = journal.transaction()?;
+    let changed = tx.execute(
+        "UPDATE investigation_roots SET state='active' WHERE id=? AND state='planning'",
+        [root_id],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    for task in tasks {
+        let encoded = serde_json::to_string(task).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        insert_queued_job(&tx, task, &encoded, root_id, epoch)?;
+    }
+    tx.commit()
 }
 
 fn prepared_prompt(

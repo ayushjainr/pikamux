@@ -44,6 +44,8 @@ struct WindowsClientCli {
 
 #[derive(Subcommand, Debug)]
 enum WindowsClientCommand {
+    /// Attach to your one explicitly chosen assistant authority.
+    Pika(crate::assistant_client::Args),
     /// Install the latest verified Pika client on this machine.
     Update,
     /// Show selected machines and optional bridge readiness.
@@ -109,6 +111,15 @@ impl Default for ClientBridgeOptions {
 
 /// OS/process boundary for deterministic Windows-client workflow tests.
 pub trait ClientCliRuntime {
+    fn load_assistant_state(&mut self) -> Result<crate::assistant_client::State> {
+        bail!("Assistant client state is unavailable")
+    }
+    fn save_assistant_state(&mut self, _state: &mut crate::assistant_client::State) -> Result<()> {
+        bail!("Assistant client state is unavailable")
+    }
+    fn launch_assistant(&mut self, _argv: &[String]) -> Result<()> {
+        bail!("Assistant window launcher is unavailable")
+    }
     /// Real terminal presentation is opt-in; injected runtimes stay finite.
     fn styled_setup(&self) -> bool {
         false
@@ -158,6 +169,27 @@ impl SystemClientRuntime {
 }
 
 impl ClientCliRuntime for SystemClientRuntime {
+    fn load_assistant_state(&mut self) -> Result<crate::assistant_client::State> {
+        crate::assistant_client::load(
+            &self
+                .config_path
+                .with_file_name("assistant-client")
+                .join("state.sqlite"),
+        )
+    }
+    fn save_assistant_state(&mut self, state: &mut crate::assistant_client::State) -> Result<()> {
+        crate::assistant_client::save(
+            &self
+                .config_path
+                .with_file_name("assistant-client")
+                .join("state.sqlite"),
+            state,
+        )
+    }
+    fn launch_assistant(&mut self, argv: &[String]) -> Result<()> {
+        use crate::client_bridge::WindowLauncher;
+        ProcessWindowLauncher.launch(argv).map_err(Into::into)
+    }
     fn styled_setup(&self) -> bool {
         crate::onboarding::supported()
     }
@@ -495,6 +527,9 @@ where
 {
     let cli = WindowsClientCli::try_parse_from(args)?;
     match cli.command {
+        Some(WindowsClientCommand::Pika(arguments)) => {
+            crate::assistant_client::run(runtime, arguments, output)
+        }
         Some(WindowsClientCommand::Update) => {
             if !runtime.interactive() {
                 bail!("Run `pika update` in an interactive terminal to confirm the update");
@@ -795,9 +830,7 @@ fn status<R: ClientCliRuntime, W: Write>(runtime: &mut R, output: &mut W) -> Res
         writeln!(
             output,
             "  {:<20} node {} · {}",
-            node.alias,
-            &node.node_id[..8],
-            node.ssh_target
+            node.alias, node.node_id, node.ssh_target
         )?;
     }
     if config.nodes.is_empty() {

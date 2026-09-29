@@ -159,7 +159,11 @@ fn quarantine_and_collect_reservations(
     root: &Path,
 ) -> Result<std::collections::BTreeSet<String>, RecoveryError> {
     let mut reservation_ids = std::collections::BTreeSet::new();
-    for name in ["runtime.sqlite", "author-runtime.sqlite"] {
+    for name in [
+        "runtime.sqlite",
+        "author-runtime.sqlite",
+        "maintenance-runtime.sqlite",
+    ] {
         collect_runtime_reservations(root, name, &mut reservation_ids)?;
     }
     collect_investigation_reservations(root, &mut reservation_ids)?;
@@ -198,6 +202,12 @@ fn collect_investigation_reservations(
     };
     if table_exists(&conn, "investigation_jobs")? {
         let mut stmt=conn.prepare("SELECT reservation_id FROM investigation_jobs WHERE state IN ('queued','intent','dispatched','running','unknown') UNION SELECT root_id FROM investigation_jobs WHERE state IN ('queued','intent','dispatched','running','unknown')")?;
+        for id in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            reservation_ids.insert(id?);
+        }
+    }
+    if table_exists(&conn, "investigation_roots")? {
+        let mut stmt=conn.prepare("SELECT id FROM investigation_roots WHERE state IN ('planning','queued','intent','active','running','unknown')")?;
         for id in stmt.query_map([], |r| r.get::<_, String>(0))? {
             reservation_ids.insert(id?);
         }
@@ -241,6 +251,7 @@ fn scrub_owned_databases(root: &Path, memory_epoch: u64) -> Result<Vec<PathBuf>,
     for path in [
         root.join("runtime.sqlite"),
         root.join("author-runtime.sqlite"),
+        root.join("maintenance-runtime.sqlite"),
         root.join("investigation.sqlite"),
         root.join("workshop.sqlite"),
     ] {
@@ -298,7 +309,7 @@ fn scrub_investigation_tables(conn: &Connection) -> Result<(), RecoveryError> {
         conn.execute("UPDATE investigation_jobs SET state='abandoned' WHERE state IN ('queued','intent','dispatched','running','unknown')", [])?;
     }
     if table_exists(conn, "investigation_roots")? {
-        conn.execute("UPDATE investigation_roots SET state='abandoned' WHERE state IN ('queued','active','running','unknown','intent')", [])?;
+        conn.execute("UPDATE investigation_roots SET state='abandoned' WHERE state IN ('planning','queued','active','running','unknown','intent')", [])?;
     }
     Ok(())
 }
@@ -314,7 +325,11 @@ fn scrub_evolution_tables(conn: &Connection) -> Result<(), RecoveryError> {
 }
 
 fn unblock_runtime_guards(root: &Path) -> Result<(), RecoveryError> {
-    for name in ["runtime.sqlite", "author-runtime.sqlite"] {
+    for name in [
+        "runtime.sqlite",
+        "author-runtime.sqlite",
+        "maintenance-runtime.sqlite",
+    ] {
         if let Some(conn) = open_known(&root.join(name))? {
             if table_exists(&conn, "assistant_runtime_guard")? {
                 conn.execute(
@@ -333,6 +348,39 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    #[test]
+    fn recovery_retires_coordinator_envelope_without_worker_rows() {
+        use crate::assistant_policy::{AssistantPolicy, PolicyConfig, ReservationState};
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("private");
+        let mut policy = AssistantPolicy::open(root.join("policy.sqlite")).unwrap();
+        policy
+            .configure(&PolicyConfig {
+                max_total_calls: 4,
+                max_concurrent: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        policy
+            .reserve_root("coordinator-orphan", 1, false, 1, None)
+            .unwrap();
+        let path = root.join("investigation.sqlite");
+        crate::assistant_storage::database(&path).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE investigation_roots(id TEXT PRIMARY KEY,state TEXT NOT NULL); INSERT INTO investigation_roots VALUES('coordinator-orphan','planning');").unwrap();
+        drop(db);
+        recover_after_services_dropped(&root, "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa", 0).unwrap();
+        let reservation = policy.reservation("coordinator-orphan").unwrap().unwrap();
+        assert_eq!(reservation.state, ReservationState::Unknown);
+        assert_eq!(reservation.calls, 1);
+        let db = Connection::open(path).unwrap();
+        assert_eq!(
+            db.query_row::<String, _, _>("SELECT state FROM investigation_roots", [], |r| r.get(0))
+                .unwrap(),
+            "abandoned"
+        );
+    }
 
     #[test]
     fn recovery_preserves_ids_and_is_repeatable_without_policy_or_provider() {

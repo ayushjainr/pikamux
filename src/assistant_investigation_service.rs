@@ -15,6 +15,10 @@ use crate::assistant_service::LiveTurnRuntime;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
+#[path = "assistant_investigation_coordinator.rs"]
+mod coordinator;
+pub use coordinator::CoordinatedRuntime;
+
 const MAX_DEPENDENCIES: usize = 8;
 const MAX_DEPENDENCY_BYTES: usize = 8 * 1024;
 const MAX_QUESTION_BYTES: usize = 4 * 1024;
@@ -32,6 +36,7 @@ pub struct InvestigationService<F = CodexWorkerFactory> {
     factory: F,
     root_id: Option<String>,
     partial: String,
+    cancellation: crate::assistant_service::DispatchCancellation,
 }
 
 impl InvestigationService<CodexWorkerFactory> {
@@ -53,6 +58,7 @@ impl InvestigationService<CodexWorkerFactory> {
             factory,
             root_id: None,
             partial: String::new(),
+            cancellation: Default::default(),
         })
     }
 }
@@ -75,6 +81,7 @@ impl<F: WorkerFactory> InvestigationService<F> {
             factory,
             root_id: None,
             partial: String::new(),
+            cancellation: Default::default(),
         })
     }
 
@@ -125,8 +132,9 @@ impl<F: WorkerFactory> InvestigationService<F> {
                 },
             ],
         };
-        let engine = Investigation::open(memory, policy, journal_path, plan, &root_id, now)
+        let mut engine = Investigation::open(memory, policy, journal_path, plan, &root_id, now)
             .map_err(|e| e.to_string())?;
+        engine.set_cancellation(self.cancellation.clone());
         self.engine = Some(engine);
         self.root_id = Some(root_id);
         self.partial = "investigation started".into();
@@ -135,6 +143,12 @@ impl<F: WorkerFactory> InvestigationService<F> {
 }
 
 impl<F: WorkerFactory + Send + 'static> LiveTurnRuntime for InvestigationService<F> {
+    fn set_dispatch_cancellation(
+        &mut self,
+        cancellation: crate::assistant_service::DispatchCancellation,
+    ) {
+        self.cancellation = cancellation;
+    }
     fn begin_turn(&mut self, request_id: &str, prompt: &str, now: i64) -> Result<(), String> {
         if request_id.is_empty() || prompt.is_empty() || prompt.len() > MAX_QUESTION_BYTES {
             return Err("investigation request is busy or invalid".into());

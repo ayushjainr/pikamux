@@ -10,6 +10,28 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Explicit opt-out of the lifetime trial ceiling, represented by SQLite's
+/// largest allowance. All reservations, per-turn and background limits remain.
+pub(crate) const NO_CALL_LIMIT: u64 = i64::MAX as u64;
+
+/// Standing human approval, distinct from a job deadline or call allowance.
+pub(crate) const UNTIL_REVOKED: i64 = i64::MAX;
+
+pub(crate) fn permission_expiry(now: i64, hours: u64) -> Result<i64, PolicyError> {
+    if now < 0 {
+        return Err(PolicyError::Denied("invalid approval time".into()));
+    }
+    if hours == 0 {
+        return Ok(UNTIL_REVOKED);
+    }
+    hours
+        .checked_mul(3600)
+        .and_then(|s| i64::try_from(s).ok())
+        .and_then(|s| now.checked_add(s))
+        .filter(|expiry| *expiry < UNTIL_REVOKED)
+        .ok_or_else(|| PolicyError::Denied("approval duration is too large".into()))
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS policy_config (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -197,6 +219,38 @@ impl AssistantPolicy {
     pub fn path(&self) -> &Path {
         &self.path
     }
+    pub(crate) fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<(), PolicyError> {
+        self.conn.busy_timeout(timeout)?;
+        Ok(())
+    }
+    /// Hold this owned policy connection only for a bounded external send.
+    /// Dropping it rolls back the read-only writer fence and permits revocation.
+    pub(crate) fn lock_dispatch(&self) -> Result<(), PolicyError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
+    /// Revalidate under lock_dispatch immediately before external delivery.
+    pub(crate) fn validate_actual_dispatch(&self, id: &str, now: i64) -> Result<(), PolicyError> {
+        let child = self
+            .reservation(id)?
+            .ok_or_else(|| PolicyError::UnknownReservation(id.into()))?;
+        if child.state != ReservationState::Dispatched || child.deadline_at <= now {
+            return Err(PolicyError::Denied(
+                "delivery reservation is no longer dispatched and live".into(),
+            ));
+        }
+        if let Some(parent_id) = &child.parent_id {
+            let parent = self
+                .reservation(parent_id)?
+                .ok_or_else(|| PolicyError::UnknownReservation(parent_id.clone()))?;
+            if parent.state != ReservationState::Reserved || parent.deadline_at <= now {
+                return Err(PolicyError::Denied(
+                    "delivery root is no longer active".into(),
+                ));
+            }
+        }
+        validate_dispatched_background_budget(&self.conn, id)
+    }
     pub fn configure(&mut self, config: &PolicyConfig) -> Result<(), PolicyError> {
         for value in [
             config.background_calls,
@@ -232,6 +286,26 @@ impl AssistantPolicy {
     ) -> Result<Reservation, PolicyError> {
         self.reserve(id, None, id, calls, background, now, deadline_at)
     }
+    /// Reserve a child from an existing root. Children cannot themselves delegate.
+    /// Enlarge a native coordinated-turn envelope only after its completed
+    /// planning child. This does not increase the user's configured allowance.
+    /// The fixed four-call ceiling is one planner, two workers, one synthesis.
+    pub fn extend_root(&mut self, id: &str, additional: u64, now: i64) -> Result<(), PolicyError> {
+        validate_reservation_calls(additional)?;
+        let config = self.config()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let background = validate_root_extension(&tx, id, additional, now)?;
+        validate_root_budgets(&tx, &config, None, background, additional)?;
+        tx.execute(
+            "UPDATE assistant_reservations SET calls=calls+? WHERE id=?",
+            params![additional as i64, id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Reserve a child from an existing root. Children cannot themselves delegate.
     pub fn reserve_child(
         &mut self,
@@ -352,6 +426,26 @@ impl AssistantPolicy {
         self.conn.execute("INSERT INTO assistant_grants(id,provider,scope,capability,expires_at,revoked_at,created_at) VALUES (?,?,?,?,?,?,?)", params![grant.id,grant.provider,grant.scope,grant.capability,grant.expires_at,grant.revoked_at,grant.expires_at])?;
         Ok(())
     }
+    /// Read-only exact grant check for brokered data access. Worker/model text
+    /// cannot create a grant by naming its identifier.
+    pub fn validate_grant(
+        &self,
+        id: &str,
+        provider: &str,
+        scope: &str,
+        capability: &str,
+        now: i64,
+    ) -> Result<(), PolicyError> {
+        let grant = self
+            .grant_row(id)?
+            .ok_or_else(|| PolicyError::UnknownGrant(id.into()))?;
+        if !grant_matches(&grant, provider, scope, capability, now) {
+            return Err(PolicyError::Denied(
+                "grant is expired, revoked, or does not match exact data destination".into(),
+            ));
+        }
+        Ok(())
+    }
     pub fn revoke_grant(&mut self, id: &str, now: i64) -> Result<(), PolicyError> {
         let n = self.conn.execute(
             "UPDATE assistant_grants SET revoked_at=? WHERE id=? AND revoked_at IS NULL",
@@ -412,6 +506,53 @@ impl AssistantPolicy {
     fn grant_row(&self, id: &str) -> Result<Option<Grant>, PolicyError> {
         self.conn.query_row("SELECT id,provider,scope,capability,expires_at,revoked_at FROM assistant_grants WHERE id=?",[id],|r|Ok(Grant{id:r.get(0)?,provider:r.get(1)?,scope:r.get(2)?,capability:r.get(3)?,expires_at:r.get(4)?,revoked_at:r.get(5)?})).optional().map_err(Into::into)
     }
+}
+
+fn validate_root_extension(
+    tx: &Connection,
+    id: &str,
+    additional: u64,
+    now: i64,
+) -> Result<bool, PolicyError> {
+    let root: Option<(i64,i64,bool,String)> = tx.query_row(
+        "SELECT calls,deadline_at,background,state FROM assistant_reservations WHERE id=? AND parent_id IS NULL",
+        [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    ).optional()?;
+    let (calls, deadline, background, state) =
+        root.ok_or_else(|| PolicyError::UnknownReservation(id.into()))?;
+    if state != "reserved"
+        || deadline <= now
+        || calls != 1
+        || calls.saturating_add(additional as i64) > 4
+    {
+        return Err(PolicyError::Denied(
+            "only a bounded active planning root can be extended once".into(),
+        ));
+    }
+    validate_completed_planning_child(tx, id)?;
+    Ok(background)
+}
+/// Advance an injected execution clock by monotonic elapsed time. Round up so
+/// subsecond preparation cannot extend an integer-second authorization expiry.
+pub(crate) fn current_dispatch_time(now: i64, elapsed: std::time::Duration) -> i64 {
+    let seconds = elapsed
+        .as_secs()
+        .saturating_add(u64::from(elapsed.subsec_nanos() != 0));
+    now.saturating_add(seconds.min(i64::MAX as u64) as i64)
+}
+fn validate_completed_planning_child(tx: &Connection, id: &str) -> Result<(), PolicyError> {
+    let invalid:i64 = tx.query_row("SELECT COUNT(*) FROM assistant_reservations WHERE parent_id=? AND state NOT IN ('completed','released')",[id],|r|r.get(0))?;
+    let completed: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM assistant_reservations WHERE parent_id=? AND state='completed'",
+        [id],
+        |r| r.get(0),
+    )?;
+    if invalid != 0 || completed != 1 {
+        return Err(PolicyError::Denied(
+            "only a known completed planning child can extend its bounded active root once".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_reservation_calls(calls: u64) -> Result<(), PolicyError> {
@@ -594,16 +735,14 @@ fn validate_delegated_root_transition(
     id: &str,
     state: ReservationState,
 ) -> Result<(), PolicyError> {
-    let children: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM assistant_reservations WHERE parent_id=?",
+    let (children, unreleased): (i64, i64) = tx.query_row(
+        "SELECT COUNT(*),COALESCE(SUM(state <> 'released'),0) FROM assistant_reservations WHERE parent_id=?",
         [id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     if children > 0
-        && matches!(
-            state,
-            ReservationState::Released | ReservationState::Dispatched
-        )
+        && (state == ReservationState::Dispatched
+            || (state == ReservationState::Released && unreleased > 0))
     {
         return Err(PolicyError::Denied(
             "a delegated root cannot dispatch or refund its children's allowance".into(),
@@ -652,10 +791,7 @@ fn validate_parent_active(
     Ok(())
 }
 
-fn validate_dispatched_background_budget(
-    tx: &rusqlite::Transaction<'_>,
-    id: &str,
-) -> Result<(), PolicyError> {
+fn validate_dispatched_background_budget(tx: &Connection, id: &str) -> Result<(), PolicyError> {
     let background: bool = tx.query_row(
         "SELECT background FROM assistant_reservations WHERE id=?",
         [id],
@@ -765,6 +901,13 @@ pub fn payload_hash(payload: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn standing_permission_is_not_a_deadline_and_duration_overflow_is_rejected() {
+        assert_eq!(permission_expiry(100, 0).unwrap(), UNTIL_REVOKED);
+        assert_eq!(permission_expiry(100, 48).unwrap(), 100 + 48 * 3600);
+        assert!(permission_expiry(100, u64::MAX).is_err());
+        assert!(permission_expiry(-1, 0).is_err());
+    }
     use super::*;
     use tempfile::tempdir;
     fn db() -> AssistantPolicy {
@@ -775,6 +918,175 @@ mod tests {
             path: PathBuf::from("in-memory-fixture"),
             conn,
         }
+    }
+    #[test]
+    fn removing_trial_cap_preserves_history_across_restart_and_allows_further_calls() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private/policy.sqlite");
+        let mut p = AssistantPolicy::open(&path).unwrap();
+        let mut config = PolicyConfig {
+            max_total_calls: 12,
+            ..Default::default()
+        };
+        p.configure(&config).unwrap();
+        for index in 0..12 {
+            let id = format!("trial-{index}");
+            p.reserve_root(&id, 1, false, 1, None).unwrap();
+            p.mark_dispatched(&id, 2).unwrap();
+            let outcome = if index == 11 {
+                DeliveryOutcome::Unknown
+            } else {
+                DeliveryOutcome::Completed
+            };
+            p.record_outcome(&id, outcome, 3).unwrap();
+        }
+        assert!(p.reserve_root("exhausted", 1, false, 4, None).is_err());
+        config.max_total_calls = NO_CALL_LIMIT;
+        p.configure(&config).unwrap();
+        drop(p);
+        let mut p = AssistantPolicy::open(&path).unwrap();
+        assert_eq!(p.config().unwrap(), config);
+        assert_eq!(
+            p.reservation("trial-0").unwrap().unwrap().state,
+            ReservationState::Completed
+        );
+        assert_eq!(
+            p.reservation("trial-11").unwrap().unwrap().state,
+            ReservationState::Unknown
+        );
+        assert!(!p.retry_allowed("trial-11").unwrap());
+        for index in 12..112 {
+            let id = format!("continued-{index}");
+            p.reserve_root(&id, 1, false, 4, None).unwrap();
+            p.record_outcome(&id, DeliveryOutcome::Completed, 5)
+                .unwrap();
+        }
+        let total: i64 = p
+            .conn
+            .query_row(
+                "SELECT SUM(calls) FROM assistant_reservations WHERE parent_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 112);
+    }
+
+    #[test]
+    fn uncapped_lifetime_does_not_disable_background_concurrency_or_child_limits() {
+        let mut p = db();
+        p.configure(&PolicyConfig {
+            max_total_calls: NO_CALL_LIMIT,
+            max_concurrent: 1,
+            default_deadline_seconds: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(p.reserve_root("background", 1, true, 1, None).is_err());
+        let root = p.reserve_root("root", 1, false, 1, None).unwrap();
+        assert_eq!(root.deadline_at, 11);
+        assert!(p.reserve_root("parallel", 1, false, 1, None).is_err());
+        assert!(p.reserve_child("oversized", "root", 2, 2, None).is_err());
+        p.reserve_child("child", "root", 1, 2, None).unwrap();
+        assert!(p.mark_dispatched("child", 11).is_err());
+    }
+
+    #[test]
+    fn coordinated_extension_is_once_bounded_and_shared_across_roots() {
+        let mut p = db();
+        p.configure(&PolicyConfig {
+            max_total_calls: 5,
+            max_concurrent: 2,
+            default_deadline_seconds: 20,
+            ..Default::default()
+        })
+        .unwrap();
+        for root in ["first", "second"] {
+            p.reserve_root(root, 1, false, 1, None).unwrap();
+            let child = format!("{root}-plan");
+            p.reserve_child(&child, root, 1, 2, None).unwrap();
+            p.mark_dispatched(&child, 2).unwrap();
+            p.record_outcome(&child, DeliveryOutcome::Completed, 3)
+                .unwrap();
+        }
+        p.extend_root("first", 2, 4).unwrap();
+        assert_eq!(p.reservation("first").unwrap().unwrap().calls, 3);
+        assert!(p.extend_root("first", 1, 4).is_err());
+        assert!(p.extend_root("second", 2, 4).is_err());
+        p.extend_root("second", 1, 4).unwrap();
+        assert!(p.reserve_root("third", 1, false, 4, None).is_err());
+    }
+    #[test]
+    fn coordinated_extension_denies_unknown_active_and_expired_planners() {
+        for outcome in [
+            None,
+            Some(DeliveryOutcome::Unknown),
+            Some(DeliveryOutcome::Completed),
+        ] {
+            let mut p = db();
+            p.configure(&PolicyConfig {
+                max_total_calls: 10,
+                max_concurrent: 2,
+                default_deadline_seconds: 10,
+                ..Default::default()
+            })
+            .unwrap();
+            p.reserve_root("root", 1, false, 1, None).unwrap();
+            p.reserve_child("plan", "root", 1, 2, None).unwrap();
+            p.mark_dispatched("plan", 2).unwrap();
+            if let Some(outcome) = outcome {
+                p.record_outcome("plan", outcome, 3).unwrap();
+            }
+            let time = if matches!(outcome, Some(DeliveryOutcome::Completed)) {
+                11
+            } else {
+                4
+            };
+            assert!(p.extend_root("root", 1, time).is_err());
+            assert!(p.extend_root("plan", 1, 4).is_err());
+            assert_eq!(p.reservation("root").unwrap().unwrap().calls, 1);
+        }
+    }
+    #[test]
+    fn concurrent_coordinators_cannot_extend_past_shared_allowance() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private/policy.sqlite");
+        let mut p = AssistantPolicy::open(&path).unwrap();
+        p.configure(&PolicyConfig {
+            max_total_calls: 5,
+            max_concurrent: 2,
+            default_deadline_seconds: 20,
+            ..Default::default()
+        })
+        .unwrap();
+        for root in ["first", "second"] {
+            p.reserve_root(root, 1, false, 1, None).unwrap();
+            let child = format!("{root}-planner");
+            p.reserve_child(&child, root, 1, 2, None).unwrap();
+            p.mark_dispatched(&child, 2).unwrap();
+            p.record_outcome(&child, DeliveryOutcome::Completed, 3)
+                .unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let joins = ["first", "second"].map(|root| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut policy = AssistantPolicy::open(path).unwrap();
+                barrier.wait();
+                policy.extend_root(root, 3, 4).is_ok()
+            })
+        });
+        let success = joins
+            .into_iter()
+            .map(|join| usize::from(join.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(success, 1);
+        assert_eq!(
+            p.reservation("first").unwrap().unwrap().calls
+                + p.reservation("second").unwrap().unwrap().calls,
+            5
+        );
     }
     #[test]
     fn zero_background_default_and_nested_rejected() {
@@ -938,6 +1250,27 @@ mod tests {
             .record_outcome("child", DeliveryOutcome::Failed, 5)
             .unwrap();
         assert!(policy.reserve_root("another", 1, false, 6, None).is_err());
+    }
+    #[test]
+    fn delegated_root_can_refund_only_released_children() {
+        let mut policy = db();
+        policy
+            .configure(&PolicyConfig {
+                max_total_calls: 1,
+                max_concurrent: 3,
+                ..PolicyConfig::default()
+            })
+            .unwrap();
+        policy.reserve_root("root", 1, false, 1, Some(100)).unwrap();
+        policy
+            .reserve_child("child", "root", 1, 2, Some(90))
+            .unwrap();
+        assert!(policy.release_before_dispatch("root", 3).is_err());
+        policy.release_before_dispatch("child", 3).unwrap();
+        policy.release_before_dispatch("root", 4).unwrap();
+        policy
+            .reserve_root("replacement", 1, false, 5, Some(100))
+            .unwrap();
     }
     #[test]
     fn background_revocation_blocks_reserved_root_and_child() {

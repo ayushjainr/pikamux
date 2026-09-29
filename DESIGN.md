@@ -613,6 +613,137 @@ This client listener is an explicit exception to Pika's no-daemon server model.
 It cannot read transcripts, mutate the server registry, choose a conversation
 by name, or execute caller-supplied shell text.
 
+# Persistent assistant boundary
+
+`pika pika` and the board's `P` entry attach to one durable assistant profile;
+they do not create a project-provider row, increase the board's agent count, or
+replace the ephemeral `a` consultation. Selecting a project task supplies an
+exact focus reference, not permission to read or control it. A conversation
+named `pika` remains reachable through `pika open pika`.
+
+A local entry may attach to an explicit existing profile directory paired with
+its immutable profile ID. It verifies private storage and identity before host
+startup and the served identity before any user action. Missing or mismatched
+profiles never create a replacement. This selects an existing authority in place;
+it does not copy credentials, reset allowance, relocate state, or select a fleet.
+
+An explicit `--set-default` saves the chosen existing profile, exact identity,
+scope, provider path and allowance for this installation. Normal `pika pika`
+and board `P` reuse that selection and resume its enabled foreground provider;
+an already-running matching provider is reused, never replaced. JSON inspection,
+offline entry, note saving and a different explicit scope do not auto-enable it.
+Missing or changed selected profiles fail visibly without creating a substitute.
+The selected authority reads this installation's existing board projection.
+Selection does not expand metadata sharing, transcript access or background spend.
+
+Board `P` keeps the operational rail and shared counts beside the conversation
+on wide terminals; narrow terminals retain the header and focus the chat panel.
+The same assistant composer, commands and host serve both entry points. Esc/F12
+returns to the retained board selection/filter. This adds no observer or model
+turn for rendering; provider suggestions are not source-task actions.
+
+On macOS/Linux, one OS-locked authority host serves bounded local IPC views.
+Its profile identity and scoped memory survive provider-session and host exit.
+Foreground ownership normally ends when its final view closes; separately
+approved, bounded background lifetime can retain the **same** host. This is a
+narrow assistant exception to foreground-only lifecycle, not an installed
+daemon, reboot launcher, public listener, or always-running model turn.
+Unresolved delivery remains charged and blocks automatic replay across restart.
+Closing or pausing the assistant never terminates project agents.
+
+The observation service remains independent. Compatible observers use a private
+per-profile lease for local reconciliation and fleet refresh; followers consume
+committed caches rather than starting another scanner per view. Assistant
+projection contains bounded exact-identity metadata, not transcripts, cards,
+paths, or credentials. Stale/partial coverage stays explicit. Legacy installed
+boards must not be assumed to participate in the lease protocol.
+
+Board/return surfaces read a dated assistant cue without launching its host or
+waiting for a model. Briefing acknowledgements bind to the displayed profile,
+scope, revision, and memory generation, separately from source-task unread state.
+Memory inspection and paging cannot silently acknowledge source activity.
+
+Self-awareness is an on-demand use of the same scoped owners, not a second
+scanner or a free-standing persona claim. Questions about Pika's access or work
+receive current board-sharing and projection state; an unapproved, missing,
+partial, or stale snapshot cannot become a claimed live inventory. Relevant
+saved records remain bounded recall, and completed actions require native
+receipts rather than model recollection. Hypothetical preferences are not
+standing instructions. Pika bundles its self-awareness workflow as a private
+instruction-only skill selected for these questions. It is carried in the
+bounded turn alongside native state; it is not installed into Codex or Claude
+skill folders and never becomes a source of access or facts. Other turns do not
+load it. The existing consolidation and Reflection assignments are likewise
+separate Pika-owned skill files, selected by the typed maintenance purpose,
+without extra jobs or model calls. There is no generic skill loader or
+additional model selection call.
+
+`/profile` presents read-only virtual Markdown views of IDENTITY, SOUL and
+MEMORY. They render from the current local profile ID, protected orientation,
+applicable scoped guidance and a bounded active-memory selection. They write no
+profile files, run no model, and never acknowledge task activity. A selected
+memory view is not an exhaustive archive; `/memory` retains the existing scoped
+paged inspection path. Disabling guidance or forgetting a source changes the
+next view through the native owners, not through Markdown synchronization.
+
+`/feedback TEXT` explicitly appends the user's note, UTC date and current scope
+to the private profile's `user_feedback.md`. The existing host owns this small
+native write; it works while the provider is unavailable or recovering. Bare
+`/feedback` displays its bundled Pika-only skill and file location. Save receipts
+follow a successful file write. This user-requested product-feedback file is not
+memory/persona authority and is never automatically supplied to the model or
+maintenance workers. It adds no database, model call or background workflow.
+
+Provider enablement, metadata sharing, private consultations, background spend,
+and exact tool activation are separate explicit permissions. Generated tools
+retain exact-version approval without time expiry; revocation, retirement and
+source invalidation still apply. New explicit consultation and background grants
+stand until revoked by default, within the existing scope and allowance; optional
+timed grants and all previously issued expiries retain their meaning. Generated tools
+operate on supplied scoped data through the restricted native runner, without
+ambient I/O or authority to change policy. Windows clients bind to an existing
+node/profile and retain honest offline state; there is no shadow authority or
+automatic failover. Native Windows provider hosting and iOS remain deferred.
+
+See [the assistant guide](docs/ASSISTANT.md) for commands, recovery, storage, and
+deployment limits, and [the Windows client contract](docs/ASSISTANT_CLIENT.md).
+These implementation contracts are not evidence of live usefulness, provider
+cost, or a completed installed-command cutover.
+
+## Assistant continuity: first bounded increment
+
+Standing orientation reminds the assistant that temporary context can reset;
+durable memory has no invented expiry. Saved guidance is scoped and reversible,
+not permission to change purpose, spending, access, or tests. No-change is a
+valid Reflection result; orientation does not schedule or claim maintenance.
+
+Ordinary turns and Reflection may propose plain-English guidance about persona,
+collaboration and working approach, including conditions of applicability. Native
+validation checks source identity, scope and versions, not a preset vocabulary or
+exact human phrase. Semantic interpretation remains fallible and worker-attributed;
+one-off/ambiguous intent remains a proposal. Explicit user instructions outrank
+learned guidance without disabling unrelated lessons. Legacy presentation variants
+remain readable, and evaluated methods may return bounded plain-English advice.
+Neither path grants new execution, access or spending authority.
+
+The trusted human-input adapter recognizes only complete daily-brief bullet-count
+directives beginning “from now on” or “going forward” (one to ten bullets).
+It stores the exact human words as presentation guidance in the current scope,
+not model-generated words presented as human authority. All other wording stays
+conversational evidence; explicit instruction controls remain available.
+Input, receipt, and same-key/same-scope supersession commit together. Failed
+storage never produces a saved receipt or starts a model turn. Identical retries
+return their original record and cannot reactivate an obsolete version.
+Forgetting one recognized preference forgets its revision chain and dependent
+records, so an older version cannot silently return. This is not an undo command.
+
+Recall prioritizes protected orientation and explicitly required sources. It
+searches the full eligible BM25 index for standing guidance before a bounded
+recent-instruction shortlist can crowd out an older relevant instruction. Scope,
+active-version, byte, and record ceilings remain enforced; lexical ranking is
+not authority and cannot guarantee a match for every paraphrase. This increment
+does not implement arbitrary conversational learning or scheduled Reflection.
+
 # Sources
 
 - `src/monitor.rs` is the canonical implementation for layout, styling,

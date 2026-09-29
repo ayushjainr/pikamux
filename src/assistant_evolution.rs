@@ -314,7 +314,13 @@ pub struct CandidateRecord {
 
 /// Validate structure and bounds without executing any user-authored code.
 pub fn validate_definition(definition: &ToolDefinition) -> Result<String, EvolutionError> {
-    if definition.name.trim().is_empty() || definition.name.len() > 256 {
+    if definition.name.trim().is_empty()
+        || definition.name.len() > 256
+        || definition
+            .name
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
         return Err(EvolutionError::InvalidDefinition("invalid name".into()));
     }
     validate_expr(&definition.expression, 0)?;
@@ -793,12 +799,28 @@ pub struct Registry {
 }
 
 impl Registry {
+    pub(crate) fn reject_method_output(&self, hash: &str) -> Result<(), EvolutionError> {
+        let mut db = self.connection.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS method_contract_failures(hash TEXT PRIMARY KEY,reason TEXT NOT NULL,created_at REAL NOT NULL)")?;
+        tx.execute("INSERT OR IGNORE INTO method_contract_failures(hash,reason,created_at) VALUES(?,'noncanonical interaction method output',?)",params![hash,now()])?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tool_retirements(hash,created_at) VALUES(?,?)",
+            params![hash, now()],
+        )?;
+        tx.execute("UPDATE tool_grants SET revoked=1 WHERE hash=?", [hash])?;
+        tx.execute("UPDATE tool_activations SET active=0 WHERE hash=?", [hash])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, EvolutionError> {
         let path = path.as_ref();
         crate::assistant_storage::database(path).map_err(|error| {
             EvolutionError::InvalidDefinition(format!("private assistant database: {error}"))
         })?;
         let connection = Connection::open(path)?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS tool_assessments (assessment_id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT NOT NULL, outcome TEXT NOT NULL, evidence TEXT NOT NULL, created_at REAL NOT NULL); CREATE TABLE IF NOT EXISTS tool_retirements (hash TEXT PRIMARY KEY, created_at REAL NOT NULL);")?;
         connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS tool_candidates (hash TEXT PRIMARY KEY, name TEXT NOT NULL, definition_json BLOB NOT NULL, authoring_evidence TEXT NOT NULL, created_at REAL NOT NULL); CREATE TABLE IF NOT EXISTS protected_suites (suite_id TEXT PRIMARY KEY, cases_json BLOB NOT NULL, suite_hash TEXT NOT NULL UNIQUE); CREATE TABLE IF NOT EXISTS candidate_required_suites (hash TEXT NOT NULL REFERENCES tool_candidates(hash), suite_id TEXT NOT NULL REFERENCES protected_suites(suite_id), PRIMARY KEY(hash,suite_id)); CREATE TABLE IF NOT EXISTS tool_evaluations (evaluation_id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT NOT NULL REFERENCES tool_candidates(hash), suite_id TEXT NOT NULL REFERENCES protected_suites(suite_id), report_json BLOB NOT NULL, passed INTEGER NOT NULL, created_at REAL NOT NULL); CREATE TABLE IF NOT EXISTS tool_grants (grant_id TEXT PRIMARY KEY, hash TEXT NOT NULL REFERENCES tool_candidates(hash), scope_json BLOB NOT NULL, expires_at REAL, revoked INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL); CREATE TABLE IF NOT EXISTS tool_activations (name TEXT PRIMARY KEY, hash TEXT NOT NULL REFERENCES tool_candidates(hash), grant_id TEXT NOT NULL REFERENCES tool_grants(grant_id), active INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS tool_comparisons (comparison_id INTEGER PRIMARY KEY AUTOINCREMENT, candidate_hash TEXT NOT NULL REFERENCES tool_candidates(hash), baseline_hash TEXT, suite_id TEXT NOT NULL REFERENCES protected_suites(suite_id), scope_json BLOB NOT NULL, candidate_passed INTEGER NOT NULL, baseline_passed INTEGER, candidate_fuel INTEGER NOT NULL, baseline_fuel INTEGER, candidate_operations INTEGER NOT NULL, baseline_operations INTEGER, verdict TEXT NOT NULL, receipt_json BLOB NOT NULL, created_at REAL NOT NULL);")?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -1104,7 +1126,14 @@ impl Registry {
         }
         let grant_id = format!("grant-{}", Uuid::new_v4());
         let scope_json = serde_json::to_vec(&scope)?;
-        self.connection.lock().unwrap().execute("INSERT INTO tool_grants(grant_id,hash,scope_json,expires_at,created_at) VALUES(?,?,?,?,strftime('%s','now'))", params![grant_id, hash, scope_json, expires_at])?;
+        // The retirement predicate and insert are one SQLite write, serialized
+        // with assessment's retirement/revocation transaction across connections.
+        let inserted = self.connection.lock().unwrap().execute("INSERT INTO tool_grants(grant_id,hash,scope_json,expires_at,created_at) SELECT ?,?,?,?,strftime('%s','now') WHERE NOT EXISTS(SELECT 1 FROM tool_retirements WHERE hash=?)", params![grant_id, hash, scope_json, expires_at, hash])?;
+        if inserted == 0 {
+            return Err(EvolutionError::NotEligible(
+                "retired candidate cannot receive a new approval grant".into(),
+            ));
+        }
         Ok(ApprovalGrant {
             grant_id,
             tool_hash: hash.into(),
@@ -1147,6 +1176,16 @@ impl Registry {
     }
 
     fn ensure_candidate_eligible(&self, hash: &str) -> Result<(), EvolutionError> {
+        let retired: bool = self.connection.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_retirements WHERE hash=?)",
+            [hash],
+            |row| row.get(0),
+        )?;
+        if retired {
+            return Err(EvolutionError::NotEligible(
+                "human-reported regression or retirement; create and evaluate a new version".into(),
+            ));
+        }
         let eligibility: (i64, i64) = self.connection.lock().unwrap().query_row(
             "SELECT COUNT(*), COALESCE(SUM(CASE WHEN EXISTS(SELECT 1 FROM tool_evaluations e WHERE e.hash=r.hash AND e.suite_id=r.suite_id AND e.passed=1) AND NOT EXISTS(SELECT 1 FROM tool_evaluations f WHERE f.hash=r.hash AND f.suite_id=r.suite_id AND f.passed=0) THEN 1 ELSE 0 END),0) FROM candidate_required_suites r WHERE r.hash=?",
             params![hash],
@@ -1166,7 +1205,26 @@ impl Registry {
         hash: &str,
         grant: &ApprovalGrant,
     ) -> Result<(), EvolutionError> {
-        self.connection.lock().unwrap().execute("INSERT INTO tool_activations(name,hash,grant_id,active) VALUES(?,?,?,1) ON CONFLICT(name) DO UPDATE SET hash=excluded.hash,grant_id=excluded.grant_id,active=1", params![candidate.definition.name, hash, grant.grant_id])?;
+        let mut db = self.connection.lock().unwrap();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let valid: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_grants WHERE grant_id=? AND hash=? AND revoked=0 AND (expires_at IS NULL OR expires_at>?) AND NOT EXISTS(SELECT 1 FROM tool_retirements WHERE hash=?))",
+            params![grant.grant_id, hash, now(), hash], |row| row.get(0),
+        )?;
+        if !valid {
+            return Err(EvolutionError::ApprovalMismatch);
+        }
+        let existing: Option<Vec<u8>> = tx.query_row("SELECT c.definition_json FROM tool_activations a JOIN tool_candidates c ON c.hash=a.hash WHERE a.name=?", [&candidate.definition.name], |r|r.get(0)).optional()?;
+        if let Some(bytes) = existing {
+            let previous: ToolDefinition = serde_json::from_slice(&bytes)?;
+            if previous.input_scope != candidate.definition.input_scope {
+                return Err(EvolutionError::NotEligible(
+                    "tool name belongs to a different scope; author a distinct name".into(),
+                ));
+            }
+        }
+        tx.execute("INSERT INTO tool_activations(name,hash,grant_id,active) VALUES(?,?,?,1) ON CONFLICT(name) DO UPDATE SET hash=excluded.hash,grant_id=excluded.grant_id,active=1", params![candidate.definition.name, hash, grant.grant_id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1199,7 +1257,7 @@ impl Registry {
         Ok(result)
     }
 
-    fn active_tool_grant(&self, name: &str) -> Result<(String, String), EvolutionError> {
+    pub(crate) fn active_tool_grant(&self, name: &str) -> Result<(String, String), EvolutionError> {
         self.connection
             .lock()
             .unwrap()
@@ -1352,6 +1410,123 @@ impl Registry {
         })
         .transpose()
     }
+
+    /// Read-only exact-scope discovery. Definitions and cases require an exact
+    /// hash, keeping ordinary catalogs small and never exposing another scope.
+    pub(crate) fn catalog(
+        &self,
+        scope: &Scope,
+        hash: Option<&str>,
+    ) -> Result<Value, EvolutionError> {
+        let hashes = {
+            let db = self.connection.lock().unwrap();
+            let mut query = db.prepare("SELECT hash FROM tool_candidates WHERE json_extract(CAST(definition_json AS TEXT),'$.input_scope')=json(?) AND (? IS NULL OR hash=?) ORDER BY created_at DESC,hash LIMIT 65")?;
+            query
+                .query_map(params![serde_json::to_string(scope)?, hash, hash], |r| {
+                    r.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let truncated = hashes.len() > 64;
+        let mut entries = Vec::new();
+        for id in hashes.into_iter().take(64) {
+            entries.push(self.catalog_entry(&id, scope, hash.is_some())?);
+        }
+        let catalog = serde_json::json!({"tools":entries,"truncated":truncated,"scope":scope,"notice":"Pure supplied-data transformations only; human assessments are reports, not evaluator proof. No model call."});
+        bounded_json(&catalog, MAX_DEFINITION_BYTES)?;
+        Ok(catalog)
+    }
+
+    fn catalog_entry(
+        &self,
+        hash: &str,
+        scope: &Scope,
+        detail: bool,
+    ) -> Result<Value, EvolutionError> {
+        let candidate = self
+            .candidate(hash)?
+            .ok_or_else(|| EvolutionError::NotFound(hash.into()))?;
+        let mut entry = serde_json::json!({"hash":hash,"name":candidate.definition.name,"version":candidate.definition.version,"scope":scope,"active":self.is_active_hash(hash,scope)?});
+        let tests = if detail {
+            self.catalog_tests(hash)?
+        } else {
+            Value::Array(Vec::new())
+        };
+        let db = self.connection.lock().unwrap();
+        entry["grants"] = catalog_grants(&db, hash)?;
+        if detail {
+            entry["assessments"] = catalog_assessments(&db, hash)?;
+        }
+        entry["retired"] = Value::Bool(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_retirements WHERE hash=?)",
+            [hash],
+            |r| r.get(0),
+        )?);
+        if detail {
+            entry["definition"] = serde_json::to_value(candidate.definition)?;
+            entry["authoring_evidence"] = Value::String(candidate.authoring_evidence);
+            entry["tests"] = tests;
+            entry["limits"] = serde_json::json!({"fuel":MAX_FUEL,"charged_memory_bytes":MAX_CHARGED_MEMORY,"output_bytes":MAX_OUTPUT_BYTES,"deadline_seconds":MAX_EXECUTION.as_secs()});
+        }
+        Ok(entry)
+    }
+
+    fn catalog_tests(&self, hash: &str) -> Result<Value, EvolutionError> {
+        let mut tests = Vec::new();
+        for suite in self.required_suites(hash)? {
+            tests.push(serde_json::json!({"suite":suite,"evaluation":self.latest_evaluation(&suite,hash)?,"comparison":self.latest_comparison(&suite,hash)?}));
+        }
+        Ok(Value::Array(tests))
+    }
+
+    /// Explicit human feedback cannot rewrite evaluator history. Regression or
+    /// retirement revokes all existing grants atomically with its receipt.
+    pub(crate) fn assess(
+        &self,
+        hash: &str,
+        scope: &Scope,
+        outcome: &str,
+        evidence: &str,
+    ) -> Result<(), EvolutionError> {
+        if !matches!(outcome, "helped" | "neutral" | "regression" | "retire")
+            || evidence.trim().is_empty()
+            || evidence.len() > 4096
+        {
+            return Err(EvolutionError::InvalidDefinition("assessment needs helped/neutral/regression/retire and 1–4096 bytes of human evidence".into()));
+        }
+        let candidate = self
+            .candidate(hash)?
+            .ok_or_else(|| EvolutionError::NotFound(hash.into()))?;
+        if &candidate.definition.input_scope != scope {
+            return Err(EvolutionError::ApprovalMismatch);
+        }
+        let mut db = self.connection.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO tool_assessments(hash,outcome,evidence,created_at) VALUES(?,?,?,?)",
+            params![hash, outcome, evidence, now()],
+        )?;
+        if matches!(outcome, "regression" | "retire") {
+            tx.execute(
+                "INSERT OR IGNORE INTO tool_retirements(hash,created_at) VALUES(?,?)",
+                params![hash, now()],
+            )?;
+            tx.execute("UPDATE tool_grants SET revoked=1 WHERE hash=?", [hash])?;
+            tx.execute("UPDATE tool_activations SET active=0 WHERE hash=?", [hash])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+fn catalog_grants(db: &Connection, hash: &str) -> Result<Value, EvolutionError> {
+    let mut query = db.prepare("SELECT grant_id,expires_at,revoked FROM tool_grants WHERE hash=? ORDER BY created_at DESC LIMIT 16")?;
+    Ok(Value::Array(query.query_map([hash], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"expires_at":r.get::<_,Option<f64>>(1)?,"revoked":r.get::<_,i64>(2)? != 0})))?.collect::<Result<Vec<_>,_>>()?))
+}
+
+fn catalog_assessments(db: &Connection, hash: &str) -> Result<Value, EvolutionError> {
+    let mut query = db.prepare("SELECT outcome,evidence,created_at FROM tool_assessments WHERE hash=? ORDER BY assessment_id DESC LIMIT 16")?;
+    Ok(Value::Array(query.query_map([hash], |r| Ok(serde_json::json!({"outcome":r.get::<_,String>(0)?,"evidence":r.get::<_,String>(1)?,"recorded_at":r.get::<_,f64>(2)?})))?.collect::<Result<Vec<_>,_>>()?))
 }
 
 fn evaluate_cases(
@@ -1512,6 +1687,51 @@ mod tests {
         .unwrap();
         assert_eq!(result.value, json!(["a"]));
         assert!(result.output_scope.values.contains("project:b"));
+    }
+
+    #[test]
+    fn retirement_fences_grant_insertion_and_final_activation_across_connections() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("private/registry.sqlite");
+        let registry = Registry::open(&path).unwrap();
+        let hash = registry.author().register(&tool(Expr::Input)).unwrap();
+        let scope = Scope::new(["project:a"]);
+        // General policy issuance still permits approval before evaluation.
+        let grant = registry
+            .policy()
+            .issue_grant(&hash, scope.clone(), None)
+            .unwrap();
+        let candidate = registry.candidate(&hash).unwrap().unwrap();
+        let assessor = Registry::open(&path).unwrap();
+        assessor
+            .assess(&hash, &scope, "retire", "synthetic retirement")
+            .unwrap();
+        // Deterministic interleaving: retirement occurs after earlier validation
+        // but before the final activation write on another connection.
+        assert!(
+            registry
+                .store_activation(&candidate, &hash, &grant)
+                .is_err()
+        );
+        assert!(
+            registry
+                .policy()
+                .issue_grant(&hash, scope.clone(), None)
+                .is_err()
+        );
+        drop(assessor);
+        drop(registry);
+        let registry = Registry::open(&path).unwrap();
+        assert!(registry.policy().issue_grant(&hash, scope, None).is_err());
+        let counts: (i64, i64) = registry.connection.lock().unwrap().query_row(
+            "SELECT COUNT(*),COALESCE(SUM(CASE WHEN revoked=0 THEN 1 ELSE 0 END),0) FROM tool_grants WHERE hash=?", [&hash], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(counts, (1, 0));
+        assert!(
+            registry
+                .active_tool_grant(&candidate.definition.name)
+                .is_err()
+        );
     }
 
     #[test]

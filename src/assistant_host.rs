@@ -1,4 +1,5 @@
-//! Local foreground ownership and bounded IPC. No TCP listener or installed service.
+//! Local ownership and bounded IPC. Foreground by default; separately approved
+//! background lifetime uses the same lock. No TCP listener or installed service.
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -13,13 +14,14 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const PROTOCOL: u32 = 1;
 const MAX_FRAME: usize = 64 * 1024;
 const MAX_REPLY: usize = 1024 * 1024;
 const MAX_VIEWS: usize = 32;
+const ATTACH_HELLO: &str = "__pika_transport_hello";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +43,26 @@ struct Reply {
 /// Refuse symlinks and permissive state roots; never chmod someone else's path.
 pub(crate) fn private_root(root: &Path) -> Result<()> {
     crate::assistant_storage::directory(root)?;
+    Ok(())
+}
+
+pub(crate) fn verify_existing_profile(root: &Path, profile: &str) -> Result<()> {
+    if !root.is_absolute() || uuid::Uuid::parse_str(profile)?.to_string() != profile {
+        bail!("Existing assistant attachment needs an absolute root and canonical profile ID");
+    }
+    let path = root.join("memory.sqlite");
+    crate::assistant_storage::existing_database(&path)?;
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(Duration::from_millis(50))?;
+    let actual: String = db.query_row(
+        "SELECT value FROM memory_meta WHERE key='profile_id'",
+        [],
+        |row| row.get(0),
+    )?;
+    if actual != profile {
+        bail!("Assistant profile changed; existing-authority attachment refused");
+    }
     Ok(())
 }
 
@@ -96,9 +118,20 @@ impl Owner {
         self.serve_with_idle(move |request| request.map(&mut handle).transpose())
     }
 
+    #[cfg(test)]
     pub(crate) fn serve_with_idle(
         self,
+        handle: impl FnMut(Option<Value>) -> Result<Option<Value>>,
+    ) -> Result<()> {
+        self.serve_with_lifetime(handle, crate::assistant_lifecycle::LifetimeGate::default())
+    }
+
+    /// Only the independently approved lifecycle gate can extend ownership
+    /// beyond the last view. Provider text and ordinary view traffic cannot.
+    pub(crate) fn serve_with_lifetime(
+        self,
         mut handle: impl FnMut(Option<Value>) -> Result<Option<Value>>,
+        lifetime: crate::assistant_lifecycle::LifetimeGate,
     ) -> Result<()> {
         let started = Instant::now();
         let mut last_tick = Instant::now();
@@ -130,7 +163,13 @@ impl Owner {
                 .is_ok()
             });
             if views.is_empty() && (seen_view || started.elapsed() > Duration::from_secs(3)) {
-                return Ok(());
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .and_then(|time| i64::try_from(time.as_secs()).ok());
+                if !now.is_some_and(|now| lifetime.keeps_alive(now)) {
+                    return Ok(());
+                }
             }
             if last_tick.elapsed() >= Duration::from_millis(100) {
                 handle(None)?;
@@ -182,7 +221,15 @@ impl View {
         if self.output.is_empty() {
             self.read_input()?;
             if let Some(end) = self.input.iter().position(|byte| *byte == b'\n') {
-                let result = decode(&self.input[..end], generation).and_then(handle);
+                let result = decode(&self.input[..end], generation).and_then(|payload| {
+                    if payload == Value::String(ATTACH_HELLO.into()) {
+                        // Attachment proves this connection reached a serving owner.
+                        // It must never enter the domain handler or start work.
+                        Ok(Value::String(ATTACH_HELLO.into()))
+                    } else {
+                        handle(payload)
+                    }
+                });
                 self.input.drain(..=end);
                 let (payload, error) = match result {
                     Ok(value) => (Some(value), None),
@@ -195,7 +242,12 @@ impl View {
                     error,
                 })?;
                 if self.output.len() > MAX_REPLY {
-                    bail!("Assistant reply exceeds bound");
+                    self.output = serde_json::to_vec(&Reply {
+                        protocol: PROTOCOL,
+                        generation: generation.into(),
+                        payload: None,
+                        error: Some("Response exceeds the display limit. The request may have completed; do not retry it blindly. Use /memory pages or /memory-record ID chunks to inspect saved data.".into()),
+                    })?;
                 }
                 self.output.push(b'\n');
                 self.written = 0;
@@ -278,31 +330,62 @@ impl Client {
     }
 
     pub(crate) fn attach(root: &Path) -> Result<Self> {
+        Self::attach_profile(root, None)
+    }
+
+    pub(crate) fn attach_existing_profile(root: &Path, profile: &str) -> Result<Self> {
+        verify_existing_profile(root, profile)?;
+        Self::attach_profile(root, Some(profile))
+    }
+
+    fn attach_profile(root: &Path, profile: Option<&str>) -> Result<Self> {
         private_root(root)?;
-        if let Ok(client) = Self::connect(root) {
-            return Ok(client);
+        Self::attach_with_start(root, || Self::start_owner(root, profile))
+    }
+
+    fn start_owner(root: &Path, profile: Option<&str>) -> Result<Child> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command.arg("_assistant-host").arg("--root").arg(root);
+        if let Some(profile) = profile {
+            command.arg("--expected-profile-id").arg(profile);
         }
-        let mut child = Command::new(std::env::current_exe()?)
-            .arg("_assistant-host")
-            .arg("--root")
-            .arg(root)
+        Ok(command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()?;
+            .spawn()?)
+    }
+
+    fn connect_ready(root: &Path) -> Result<Self> {
+        let mut client = Self::connect(root)?;
+        if client.request(Value::String(ATTACH_HELLO.into()))? != Value::String(ATTACH_HELLO.into())
+        {
+            bail!("Assistant attachment handshake mismatch");
+        }
+        Ok(client)
+    }
+
+    fn attach_with_start(root: &Path, mut start: impl FnMut() -> Result<Child>) -> Result<Self> {
+        let mut child = None;
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(2) {
-            if let Ok(mut client) = Self::connect(root) {
-                client.child = Some(child);
+            // Retry only an inert hello, before any user operation is sent. A
+            // successful connect alone may be queued on an exiting listener.
+            if let Ok(mut client) = Self::connect_ready(root) {
+                client.child = child;
                 return Ok(client);
+            }
+            if child.is_none() && owner_lock_available(root)? {
+                child = Some(start()?);
             }
             thread::sleep(Duration::from_millis(20));
         }
         // An uncertain owner is never killed or replaced behind its lock.
-        let _ = child.try_wait();
-        thread::spawn(move || {
-            let _ = child.wait();
-        });
+        if let Some(mut child) = child {
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
         bail!("Pika assistant is unavailable. No action was retried; reopen the view to reconnect.")
     }
 
@@ -364,6 +447,27 @@ impl Client {
     }
 }
 
+fn owner_lock_available(root: &Path) -> Result<bool> {
+    let lock = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(root.join("owner.lock"))
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    if !lock.metadata()?.is_file() {
+        bail!("Invalid assistant owner lock");
+    }
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
@@ -379,6 +483,186 @@ impl Drop for Client {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn attachment_hello_is_inert_and_pins_the_serving_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("a");
+        let owner = Owner::acquire(&root).unwrap();
+        let generation = owner.generation.clone();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handled = calls.clone();
+        let server = thread::spawn(move || {
+            owner
+                .serve(move |_| {
+                    handled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(json!("saved once"))
+                })
+                .unwrap();
+        });
+        let mut client = Client::connect_ready(&root).unwrap();
+        assert_eq!(client.generation.as_deref(), Some(generation.as_str()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(client.request(json!("save")).unwrap(), "saved once");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_lost_action_receipt_is_unknown_and_never_replayed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("a");
+        private_root(&root).unwrap();
+        let listener = UnixListener::bind(root.join("view.sock")).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+            let hello: Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(hello.payload, ATTACH_HELLO);
+            let mut receipt = serde_json::to_vec(&Reply {
+                protocol: PROTOCOL,
+                generation: "fixture-owner".into(),
+                payload: Some(json!(ATTACH_HELLO)),
+                error: None,
+            })
+            .unwrap();
+            receipt.push(b'\n');
+            stream.write_all(&receipt).unwrap();
+            line.clear();
+            std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+            let action: Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(action.generation.as_deref(), Some("fixture-owner"));
+            assert_eq!(action.payload, "save exactly once");
+            // Simulate a committed action followed by failure before its receipt.
+            drop(reader);
+            drop(stream);
+            listener
+        });
+        let mut client = Client::connect_ready(&root).unwrap();
+        let error = client
+            .request(json!("save exactly once"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("receipt unknown"), "{error}");
+        let listener = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn attachment_waits_for_closing_owner_then_sends_action_once_to_successor() {
+        struct Cleanup(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+                self.1.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("a");
+        let owner = Owner::acquire(&root).unwrap();
+        let old_generation = owner.generation.clone();
+        let backlog = owner.listener.try_clone().unwrap();
+        let mut first = Client::connect(&root).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cleanup = Cleanup(entered_tx, release_rx);
+        let old_host = thread::spawn(move || {
+            owner
+                .serve(move |_| {
+                    let _cleanup = &cleanup;
+                    Ok(json!("old owner"))
+                })
+                .unwrap();
+        });
+        first.request(json!(null)).unwrap();
+        drop(first);
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!owner_lock_available(&root).unwrap());
+        backlog.set_nonblocking(false).unwrap();
+        let attach_root = root.clone();
+        let (successor_tx, successor_rx) = std::sync::mpsc::channel();
+        let (client_tx, client_rx) = std::sync::mpsc::channel();
+        let attaching = thread::spawn(move || {
+            let client = Client::attach_with_start(&attach_root, || {
+                let owner = Owner::acquire(&attach_root)?;
+                let server = thread::spawn(move || {
+                    let mut calls = 0;
+                    owner
+                        .serve(move |_| {
+                            calls += 1;
+                            Ok(json!(calls))
+                        })
+                        .unwrap();
+                });
+                successor_tx.send(server).unwrap();
+                Ok(Command::new("/bin/sh").args(["-c", "exit 0"]).spawn()?)
+            });
+            client_tx.send(client).unwrap();
+        });
+        // The retiring listener can accept a connection, but only a hello may
+        // enter its backlog. Attachment must not expose it as a ready client.
+        let (mut queued, _) = backlog.accept().unwrap();
+        queued
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut queued), &mut bytes).unwrap();
+        let hello: Request = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(hello.payload, ATTACH_HELLO);
+        assert!(client_rx.try_recv().is_err());
+        assert!(successor_rx.try_recv().is_err());
+        drop(queued);
+        drop(backlog);
+        release_tx.send(()).unwrap();
+        old_host.join().unwrap();
+        let mut client = client_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_ne!(client.generation.as_deref(), Some(old_generation.as_str()));
+        assert_eq!(client.request(json!("save")).unwrap(), 1);
+        drop(client);
+        attaching.join().unwrap();
+        successor_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn oversized_reply_returns_explicit_uncertainty_without_disconnecting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("a");
+        let owner = Owner::acquire(&root).unwrap();
+        let mut client = Client::connect(&root).unwrap();
+        let server = thread::spawn(move || {
+            owner
+                .serve(|input| {
+                    if input == "large" {
+                        Ok(json!("\u{1}".repeat(MAX_REPLY)))
+                    } else {
+                        Ok(json!("still connected"))
+                    }
+                })
+                .unwrap()
+        });
+        let failure = client.request(json!("large")).unwrap_err().to_string();
+        assert!(failure.contains("may have completed"));
+        assert_eq!(client.request(json!("small")).unwrap(), "still connected");
+        drop(client);
+        server.join().unwrap();
+    }
 
     #[test]
     fn two_views_share_one_owner_and_disconnect_independently() {
@@ -480,5 +764,77 @@ mod tests {
         let root = tmp.path().join("a");
         std::os::unix::fs::symlink(tmp.path(), &root).unwrap();
         assert!(Owner::acquire(&root).is_err());
+    }
+
+    #[test]
+    fn approved_background_retains_one_owner_after_detach_until_disabled() {
+        use crate::{
+            assistant_lifecycle::{BackgroundConfig, Lifecycle},
+            assistant_memory::{Origin, Scope},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("private");
+        let owner = Owner::acquire(&root).unwrap();
+        let mut lifecycle = Lifecycle::open(&root).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let scope = Scope {
+            project: Some("fixture".into()),
+            ..Scope::default()
+        };
+        let executable = PathBuf::from("/fake/provider");
+        lifecycle
+            .approve(
+                Origin::Human,
+                BackgroundConfig {
+                    scope: scope.clone(),
+                    executable: executable.clone(),
+                    max_calls: 1,
+                    expires_at: now + 60,
+                    job_timeout_secs: 10,
+                },
+                &scope,
+                &executable,
+                1,
+                now,
+            )
+            .unwrap();
+        let gate = lifecycle.gate();
+        let (idle_tx, idle_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let host = thread::spawn(move || {
+            owner
+                .serve_with_lifetime(
+                    move |request| {
+                        if request.is_none() {
+                            let _ = idle_tx.send(());
+                        }
+                        Ok(request.map(|_| json!("ready")))
+                    },
+                    gate,
+                )
+                .unwrap();
+            exit_tx.send(()).unwrap();
+        });
+        let mut first = Client::connect(&root).unwrap();
+        first.request(json!(null)).unwrap();
+        drop(first);
+        idle_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(exit_rx.try_recv().is_err());
+        assert!(Owner::acquire(&root).is_err());
+        assert_eq!(lifecycle.snapshot(now).unwrap().reserved_calls, 0);
+        // Reasoning pause is independent of lifetime; a new view reconnects to
+        // the same owner without another process or observation service.
+        lifecycle.pause(Origin::Human, now).unwrap();
+        let mut second = Client::connect(&root).unwrap();
+        second.request(json!(null)).unwrap();
+        drop(second);
+        lifecycle.disable(Origin::Human, now).unwrap();
+        exit_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        host.join().unwrap();
+        assert!(!root.join("view.sock").exists());
+        Owner::acquire(&root).unwrap();
     }
 }

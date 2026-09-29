@@ -265,8 +265,41 @@ fn rewrite_release_checksums(bundle: &Path) {
     fs::write(bundle.join("SHA256SUMS"), rows).unwrap();
 }
 
+fn assert_offline_cached_notice(executable: &Path, expected: Option<&str>) {
+    // The suite disables update notices globally. Exercise this strictly
+    // offline helper in its own process with notices enabled, never by mutating
+    // the parallel test runner's environment or starting a board/network check.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "board_update_notice_uses_fresh_managed_cache_without_network",
+            "--nocapture",
+        ])
+        .env("PIKA_UPDATE_CHECK", "1")
+        .env("PIKA_TEST_CACHED_UPDATE_LAUNCHER", executable)
+        .env(
+            "PIKA_TEST_CACHED_UPDATE_EXPECTED",
+            serde_json::to_string(&expected).unwrap(),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "offline cache subprocess failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn board_update_notice_uses_fresh_managed_cache_without_network() {
+    if let Some(executable) = std::env::var_os("PIKA_TEST_CACHED_UPDATE_LAUNCHER") {
+        let expected: Option<String> =
+            serde_json::from_str(&std::env::var("PIKA_TEST_CACHED_UPDATE_EXPECTED").unwrap())
+                .unwrap();
+        assert_eq!(cached_update_notice(Path::new(&executable)), expected);
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("managed");
     let bin = temp.path().join("bin");
@@ -295,10 +328,7 @@ fn board_update_notice_uses_fresh_managed_cache_without_network() {
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        cached_update_notice(&installed.launcher),
-        Some("0.6.0-alpha.2".into())
-    );
+    assert_offline_cached_notice(&installed.launcher, Some("0.6.0-alpha.2"));
     fs::write(
         root.join(".update-check.json"),
         serde_json::to_vec(&json!({
@@ -310,7 +340,7 @@ fn board_update_notice_uses_fresh_managed_cache_without_network() {
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(cached_update_notice(&installed.launcher), None);
+    assert_offline_cached_notice(&installed.launcher, None);
 }
 
 fn fleet_node(id: &str, version: &str) -> FleetNode {
@@ -1447,10 +1477,7 @@ cp "$source" "$output"
         "{}",
         String::from_utf8_lossy(&available.stdout)
     );
-    assert_eq!(
-        cached_update_notice(&bin.join("pika")),
-        Some(newer_version.into())
-    );
+    assert_offline_cached_notice(&bin.join("pika"), Some(newer_version));
     assert_eq!(
         fs::symlink_metadata(root.join(".update-check.json"))
             .unwrap()

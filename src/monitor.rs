@@ -199,7 +199,7 @@ impl FleetHealthFeed {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BoardAction {
-    Assistant,
+    Assistant(Option<Box<BoardItem>>),
     /// Explicit discovery; handled inside the board, never by setup.
     Add,
     Open(BoardItem),
@@ -604,10 +604,12 @@ fn run_loop_with_actions(
     let mut presenter = FramePresenter::default();
     let mut dirty = true;
     let mut preview_refresh = false;
+    let mut last_assistant_cue = Instant::now() - Duration::from_secs(1);
     let mut last_draw = Instant::now()
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
     loop {
+        dirty |= refresh_assistant_cue(&mut board, &mut last_assistant_cue);
         if let Some(note) = actions.as_mut().and_then(ActionDriver::poll) {
             board.action_notice = Some(note);
             dirty = true;
@@ -1145,7 +1147,58 @@ impl Drop for ChatState {
     }
 }
 
+/// Draw the same operational rail from an existing feed while the assistant
+/// owns keyboard focus. This is presentation only, not another observer.
+#[cfg(unix)]
+pub(crate) fn assistant_backdrop(
+    output: &mut impl Write,
+    state: crate::activity_feed::Snapshot,
+    focus: Option<&crate::assistant::Focus>,
+    dimensions: (u16, u16),
+) -> Result<(u16, u16)> {
+    let (width, height) = dimensions;
+    let mut board = Board::new(state.items);
+    board.filter = state.filter;
+    board.feed_summary = Some(state.summary);
+    board.fleet_health = state.health;
+    board.assistant_entry = (
+        "Pika · chatting · Esc returns to board".into(),
+        Color::Magenta,
+    );
+    // Suppress project details: the assistant owns the inspector, not the row.
+    board.action_notice = Some(String::new());
+    if let Some(focus) = focus {
+        board.selected_key = board
+            .items
+            .iter()
+            .find(|item| {
+                item.session.session_id == focus.identity.conversation
+                    && item.session.provider.as_str() == focus.identity.provider
+                    && item
+                        .node_id
+                        .as_ref()
+                        .is_none_or(|id| id == &focus.identity.node)
+            })
+            .map(BoardItem::key);
+    }
+    board.ensure_visible(height);
+    board.draw(output, width, height)?;
+    // The assistant has focus: do not advertise navigation keys that now type.
+    queue!(
+        output,
+        MoveTo(0, height.saturating_sub(2)),
+        Print(" ".repeat(width as usize))
+    )?;
+    let x = if width >= 100 {
+        board.rail_width(width as usize) as u16 + 2
+    } else {
+        0
+    };
+    Ok((x, 2))
+}
+
 struct Board {
+    assistant_entry: (String, Color),
     feed_summary: Option<crate::activity_feed::Summary>,
     preview: Option<crate::preview::View>,
     quota_enabled: bool,
@@ -1205,6 +1258,7 @@ impl Board {
         sort_items(&mut items);
         let selected_key = items.first().map(BoardItem::key);
         Self {
+            assistant_entry: ("P · your assistant".into(), Color::Magenta),
             feed_summary: None,
             quota_enabled: false,
             quota: crate::quota::View::default(),
@@ -1577,9 +1631,8 @@ impl Board {
         match key.code {
             KeyCode::Char('+') => return Some(BoardAction::Add),
             KeyCode::Up | KeyCode::Char('k') => self.select(-1),
-            #[cfg(unix)]
             KeyCode::Char('P') if key.kind != KeyEventKind::Repeat => {
-                return Some(BoardAction::Assistant);
+                return Some(BoardAction::Assistant(self.selected().map(Box::new)));
             }
             KeyCode::Down | KeyCode::Char('j') => self.select(1),
             KeyCode::PageUp => self.select(-8),
@@ -1840,21 +1893,17 @@ impl Board {
         queue!(output, Print("\r\n"))?;
 
         let list_width = self.rail_width(width);
-        #[cfg(unix)]
         {
             styled(
                 output,
-                Color::Magenta,
+                self.assistant_entry.1,
                 false,
-                &fit("P · your assistant", list_width),
+                &fit(&self.assistant_entry.0, width),
             )?;
             queue!(output, Print("\r\n"))?;
         }
         let selected_index = self.selected_index(&visible);
-        #[cfg(unix)]
         let mut line = 2_u16;
-        #[cfg(not(unix))]
-        let mut line = 1_u16;
         let mut prior_group = "";
         for (index, item) in visible.iter().enumerate().skip(self.offset) {
             let session = &item.session;
@@ -2894,26 +2943,76 @@ fn draw_status_summary(
     Ok(())
 }
 
-#[cfg(unix)]
 fn board_idle_help() -> &'static str {
     "+ add · ↑↓ move · enter open · P Pika · p peek · a ask · x unwatch · / filter · ? keys · q leave"
 }
 
-#[cfg(not(unix))]
-fn board_idle_help() -> &'static str {
-    "+ add · ↑↓ move · enter open · p peek · a ask · x unwatch · / filter · r refresh · ? keys · q leave"
-}
-
 fn board_keys_help() -> String {
     let base = "PIKA KEYS\n\n+ · add an existing conversation; choose machine, search, confirm\n↑↓ / j k · select a conversation\nEnter · open the selected exact conversation\np · preview live Pika pane output; unread preserved\na · private expert consultation in this panel\nd · identity details and full expert card\nx · stop watching, after confirmation; agent stays intact\nn · open the oldest attention item\n/ · filter by name or machine\nr · refresh observations\nu · cumulative usage for the selected conversation\nU · review an available update\nPageUp / PageDown · scroll a preview or help\nEsc · dismiss panel or clear filter\nq · leave Pika\n\nInside an agent: use the visible Pika return control.\nPrivate consultation: Enter sends, Ctrl+J adds a newline,\nCtrl+U clears the draft, Esc closes the private side.";
+    format!("{base}\nP · main Pika assistant (selected task is focus, never permission to read it)")
+}
+
+fn assistant_entry() -> (String, Color) {
     #[cfg(unix)]
     {
-        format!("{base}\nP · main Pika assistant (independent of the selected conversation)")
+        let cue = (|| -> Result<_> {
+            let selected = crate::assistant_startup::load(&crate::assistant_startup::path()?)?;
+            let (root, scope) = match selected {
+                Some(selected) => (selected.profile_root, selected.scope),
+                None => (
+                    crate::paths::Paths::discover()?.state_dir.join("assistant"),
+                    "personal".into(),
+                ),
+            };
+            crate::assistant_presentation::read_cue(
+                &root,
+                &crate::assistant::scope(&scope)?,
+                crate::assistant::timestamp(),
+            )
+        })();
+        if let Ok(Some(cue)) = cue {
+            return assistant_entry_state(&cue.state, &cue.unread_summary);
+        }
     }
-    #[cfg(not(unix))]
-    {
-        base.to_owned()
+    (
+        "P · your assistant · no current briefing".into(),
+        Color::DarkGrey,
+    )
+}
+
+fn refresh_assistant_cue(board: &mut Board, last: &mut Instant) -> bool {
+    if last.elapsed() < Duration::from_secs(1) {
+        return false;
     }
+    *last = Instant::now();
+    let cue = assistant_entry();
+    let changed = cue != board.assistant_entry;
+    board.assistant_entry = cue;
+    changed
+}
+
+fn assistant_entry_state(state: &str, summary: &str) -> (String, Color) {
+    let (label, color) = match state {
+        "investigating" => ("thinking", Color::Blue),
+        "awaiting_decision" => ("needs you", Color::Red),
+        "answer_available" => ("answer ready", Color::Green),
+        "updated" => ("new saved updates", Color::Cyan),
+        "paused" => ("paused", Color::Yellow),
+        "no_new_state" => ("caught up", Color::DarkGrey),
+        _ => ("unavailable · cached", Color::DarkGrey),
+    };
+    let summary = crate::fleet::sanitize_terminal_text(summary);
+    (
+        format!(
+            "P · your assistant · {label}{}",
+            if summary.is_empty() {
+                String::new()
+            } else {
+                format!(" · {summary}")
+            }
+        ),
+        color,
+    )
 }
 
 fn phase_color(phase: ChatPhase) -> Color {
@@ -3399,6 +3498,36 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn assistant_rail_preserves_shared_filter_and_live_status_without_provider_work() {
+        let source = crate::activity_feed::Source::default();
+        let mut visible = BoardItem::local(session(Status::Ready));
+        visible.session.name = Some("included-task".into());
+        let mut hidden = BoardItem::local(session(Status::Working));
+        hidden.session.name = Some("other-task".into());
+        source.filter("included");
+        source
+            .publisher()
+            .publish(vec![visible.clone(), hidden.clone()], vec![]);
+        let mut before = Vec::new();
+        assistant_backdrop(&mut before, source.snapshot().unwrap(), None, (140, 35)).unwrap();
+        let rows = crate::terminal_frame::rows(&before, (140, 35)).unwrap();
+        let rendered =
+            crate::fleet::sanitize_terminal_lines(&String::from_utf8(rows.concat()).unwrap());
+        assert!(rendered.contains("included-task"));
+        assert!(!rendered.contains("other-task"));
+        assert!(rendered.contains("1 ready"));
+        visible.session.status = Status::NeedsYou;
+        source.publisher().publish(vec![visible, hidden], vec![]);
+        let mut after = Vec::new();
+        assistant_backdrop(&mut after, source.snapshot().unwrap(), None, (140, 35)).unwrap();
+        assert_ne!(before, after);
+        let rendered = crate::fleet::sanitize_terminal_lines(&String::from_utf8(after).unwrap());
+        assert!(rendered.contains("1 need you"));
+        assert_eq!(source.snapshot().unwrap().revision, 3);
+    }
+
     fn board(status: Status) -> Board {
         Board::new(vec![BoardItem::local(session(status))])
     }
@@ -3517,14 +3646,15 @@ mod tests {
         let mut empty = Board::new(vec![]);
         assert_eq!(
             empty.key(key(KeyCode::Char('P')), None),
-            Some(BoardAction::Assistant)
+            Some(BoardAction::Assistant(None))
         );
         let mut board = board(Status::Ready);
         let before = board.summary();
         let selected = board.selected_key.clone();
+        let focus = board.selected().map(Box::new);
         assert_eq!(
             board.key(key(KeyCode::Char('P')), None),
-            Some(BoardAction::Assistant)
+            Some(BoardAction::Assistant(focus))
         );
         assert_eq!(board.summary(), before);
         assert_eq!(board.selected_key, selected);

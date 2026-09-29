@@ -89,6 +89,12 @@ pub struct Usage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerEvent {
+    ContextCompaction {
+        thread_id: Option<String>,
+        turn_id: String,
+        item_id: String,
+        completed: bool,
+    },
     AgentDelta {
         thread_id: Option<String>,
         turn_id: String,
@@ -138,6 +144,15 @@ impl ServerEvent {
             .and_then(Value::as_str)
             .map(str::to_owned);
         match method {
+            "item/started" | "item/completed"
+                if params
+                    .get("item")
+                    .and_then(|i| i.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("contextCompaction") =>
+            {
+                parse_compaction(params, thread_id, turn_id, method == "item/completed")
+            }
             "item/agentMessage/delta" => Ok(Self::AgentDelta {
                 thread_id,
                 turn_id: turn_id
@@ -174,6 +189,49 @@ impl ServerEvent {
             _ => Ok(Self::Other { thread_id, turn_id }),
         }
     }
+}
+
+fn parse_compaction(
+    params: &Value,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    completed: bool,
+) -> Result<ServerEvent, ProviderError> {
+    let item_id = params
+        .get("item")
+        .and_then(|i| i.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| valid_compaction_id(id))
+        .ok_or_else(|| ProviderError::Protocol("compaction missing valid item id".into()))?;
+    let turn_id = turn_id
+        .filter(|id| valid_compaction_id(id))
+        .ok_or_else(|| ProviderError::Protocol("compaction missing valid turn id".into()))?;
+    if thread_id
+        .as_deref()
+        .is_none_or(|id| !valid_compaction_id(id))
+    {
+        return Err(ProviderError::Protocol(
+            "compaction missing valid thread id".into(),
+        ));
+    }
+    Ok(ServerEvent::ContextCompaction {
+        thread_id,
+        turn_id,
+        item_id: item_id.into(),
+        completed,
+    })
+}
+
+fn valid_compaction_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+}
+
+/// Only exact completed item lifecycles become durable checkpoint signals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
 }
 
 fn parse_completed_event(
@@ -247,6 +305,8 @@ pub struct MainAssistant<T: RpcTransport> {
     config: ProviderConfig,
     state: AssistantState,
     response: String,
+    compaction_started: std::collections::BTreeSet<String>,
+    compaction_events: Vec<CompactionEvent>,
 }
 
 impl<T: RpcTransport> MainAssistant<T> {
@@ -257,6 +317,8 @@ impl<T: RpcTransport> MainAssistant<T> {
             config: ProviderConfig::default(),
             state: AssistantState::New,
             response: String::new(),
+            compaction_started: Default::default(),
+            compaction_events: Vec::new(),
         }
     }
     pub fn with_config(
@@ -283,6 +345,8 @@ impl<T: RpcTransport> MainAssistant<T> {
             config,
             state: AssistantState::New,
             response: String::new(),
+            compaction_started: Default::default(),
+            compaction_events: Vec::new(),
         })
     }
     pub fn state(&self) -> &AssistantState {
@@ -296,6 +360,10 @@ impl<T: RpcTransport> MainAssistant<T> {
     }
     pub fn transport(&self) -> &T {
         &self.transport
+    }
+
+    pub fn take_compaction_events(&mut self) -> Vec<CompactionEvent> {
+        std::mem::take(&mut self.compaction_events)
     }
 
     pub fn start_or_resume(&mut self) -> Result<(), ProviderError> {
@@ -375,6 +443,7 @@ impl<T: RpcTransport> MainAssistant<T> {
             turn_id: turn_id.clone(),
         };
         self.response.clear();
+        self.compaction_started.clear();
         Ok(turn_id)
     }
 
@@ -413,6 +482,9 @@ impl<T: RpcTransport> MainAssistant<T> {
                 | ServerEvent::ToolRequest { thread_id, turn_id } => {
                     (thread_id.as_deref(), turn_id.as_str())
                 }
+                ServerEvent::ContextCompaction {
+                    thread_id, turn_id, ..
+                } => (thread_id.as_deref(), turn_id.as_str()),
                 ServerEvent::Other { thread_id, turn_id } => {
                     (thread_id.as_deref(), turn_id.as_deref().unwrap_or(""))
                 }
@@ -421,6 +493,26 @@ impl<T: RpcTransport> MainAssistant<T> {
                 continue;
             }
             match event {
+                ServerEvent::ContextCompaction {
+                    item_id, completed, ..
+                } => {
+                    if !valid_compaction_id(&item_id) {
+                        continue;
+                    }
+                    if completed {
+                        if self.compaction_started.remove(&item_id)
+                            && self.compaction_events.len() < 64
+                        {
+                            self.compaction_events.push(CompactionEvent {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                item_id,
+                            });
+                        }
+                    } else if self.compaction_started.len() < 64 {
+                        self.compaction_started.insert(item_id);
+                    }
+                }
                 ServerEvent::AgentDelta { text: delta, .. } => {
                     if self.response.len().saturating_add(delta.len())
                         > self.config.max_response_bytes
@@ -556,6 +648,55 @@ fn verify_thread_settings(response: &Value, config: &ProviderConfig) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compaction_requires_exact_started_item_and_bounds_collection() {
+        let event = |method: &str, thread: &str, item: &str| {
+            ServerEvent::from_json(&json!({"method":method,"params": {
+                "threadId":thread,"turnId":"turn-1", "item":{"type":"contextCompaction","id":item}
+            }}))
+            .unwrap()
+        };
+        let mut events = vec![
+            event("item/completed", "thr-new", "unstarted"),
+            event("item/started", "wrong-thread", "wrong"),
+            event("item/completed", "thr-new", "wrong"),
+            event("item/started", "thr-new", "exact"),
+            event("item/completed", "thr-new", "different"),
+            event("item/completed", "thr-new", "exact"),
+            event("item/completed", "thr-new", "exact"),
+        ];
+        for i in 0..100 {
+            events.push(event("item/started", "thr-new", &format!("item-{i}")));
+            events.push(event("item/completed", "thr-new", &format!("item-{i}")));
+        }
+        let mut assistant = MainAssistant::new(
+            Fake {
+                events,
+                ..Default::default()
+            },
+            MainProfile {
+                profile_id: "fixture".into(),
+                thread_id: None,
+            },
+        );
+        assistant.start_or_resume().unwrap();
+        assistant.begin_turn("fixture").unwrap();
+        assert!(assistant.poll_turn().unwrap().is_none());
+        let checkpoints = assistant.take_compaction_events();
+        assert_eq!(checkpoints.len(), 64);
+        assert_eq!(checkpoints[0].item_id, "exact");
+        assert!(assistant.take_compaction_events().is_empty());
+        assert!(
+            ServerEvent::from_json(&json!({"method":"item/completed","params":{
+                "threadId":"thr-new", "turnId":"turn-1", "item":{"type":"contextCompaction","id":""}
+            }}))
+            .is_err()
+        );
+        assert!(matches!(
+            ServerEvent::from_json(&json!({"method":"thread/compacted"})).unwrap(),
+            ServerEvent::Other { .. }
+        ));
+    }
     #[derive(Default)]
     struct Fake {
         requests: Vec<(String, Value)>,

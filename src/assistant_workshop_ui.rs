@@ -74,6 +74,27 @@ pub struct WorkshopUi {
 }
 
 impl WorkshopUi {
+    pub fn catalog(
+        &self,
+        scope: &Scope,
+        hash: Option<&str>,
+    ) -> Result<serde_json::Value, WorkshopUiError> {
+        Ok(self.workshop.catalog(scope, hash)?)
+    }
+
+    pub fn assess(
+        &self,
+        scope: &Scope,
+        hash: &str,
+        outcome: &str,
+        evidence: &str,
+        rollback: Option<&str>,
+    ) -> Result<serde_json::Value, WorkshopUiError> {
+        Ok(self
+            .workshop
+            .assess(scope, hash, outcome, evidence, rollback)?)
+    }
+
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, WorkshopUiError> {
         let workshop = Arc::new(Workshop::open(path.as_ref())?);
         let (jobs, queue) = mpsc::sync_channel::<CandidateJob>(1);
@@ -299,13 +320,8 @@ impl WorkshopUi {
         Ok(())
     }
 
-    pub fn approve_exact(
-        &self,
-        hash: &str,
-        scope: Scope,
-        expiry: f64,
-    ) -> Result<String, WorkshopUiError> {
-        Ok(self.workshop.approve_exact(hash, scope, expiry)?)
+    pub fn approve_exact(&self, hash: &str, scope: Scope) -> Result<String, WorkshopUiError> {
+        Ok(self.workshop.approve_exact(hash, scope)?)
     }
     pub fn revoke(&self, grant_id: &str) -> Result<(), WorkshopUiError> {
         Ok(self.workshop.revoke(grant_id)?)
@@ -315,9 +331,8 @@ impl WorkshopUi {
         name: &str,
         hash: &str,
         scope: Scope,
-        expiry: f64,
     ) -> Result<String, WorkshopUiError> {
-        Ok(self.workshop.rollback_exact(name, hash, scope, expiry)?)
+        Ok(self.workshop.rollback_exact(name, hash, scope)?)
     }
     pub fn invoke(
         &self,
@@ -371,7 +386,7 @@ mod tests {
     use super::*;
     use crate::assistant_evolution::{Expr, ToolDefinition};
     use serde_json::json;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     #[test]
     fn candidate_needs_explicit_approval_and_scope_is_exact() {
@@ -426,13 +441,7 @@ mod tests {
             ui.invoke("titles", &inputs(json!({"title":"Fresh"})))
                 .is_err()
         );
-        let expiry = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64()
-            + 3600.0;
-        ui.approve_exact(&report.tool_hash, scope.clone(), expiry)
-            .unwrap();
+        ui.approve_exact(&report.tool_hash, scope.clone()).unwrap();
         assert_eq!(
             ui.invoke("titles", &inputs(json!({"title":"Fresh"})))
                 .unwrap()

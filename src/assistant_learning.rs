@@ -61,6 +61,30 @@ fn now() -> i64 {
         .min(i64::MAX as u64) as i64
 }
 
+/// Prepare a bounded hypothesis from the exact human correction. This is a
+/// deterministic proposal only: no provider call, protected-case authoring,
+/// activation, or inferred human acceptance. Repeated requests are idempotent.
+pub fn prepare_correction_proposal(
+    root: impl AsRef<Path>,
+    scope: &str,
+    correction_id: &str,
+) -> Result<Record, LearningError> {
+    let (memory_path, _) = paths(root.as_ref())?;
+    let memory = Store::open(memory_path)?;
+    let correction = validated_correction(&memory, correction_id, &scope_for(scope))?;
+    let excerpt: String = correction.body.chars().take(1024).collect();
+    let need = format!(
+        "Hypothesis: a scoped pure-data transformation or working-method revision may prevent recurrence of this correction (bounded excerpt): {excerpt}. First reproduce the failure and contrast it with an unaffected case. Benefit remains unassessed; existing access and spending limits remain unchanged."
+    );
+    register_hypothesis(
+        root,
+        scope,
+        &format!("correction-proposal-{correction_id}"),
+        correction_id,
+        &need,
+    )
+}
+
 /// Register a human correction as a worker proposal request, preserving the
 /// correction dependency and exact scope.  The proposal is not a decision.
 pub fn register_hypothesis(
@@ -249,6 +273,60 @@ fn bounded_summary(summary: &Value) -> Result<String, LearningError> {
 mod tests {
     use super::*;
     use crate::assistant_memory::NewRecord;
+
+    #[test]
+    fn correction_proposal_is_nonexecuting_scoped_idempotent_and_forgettable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("private");
+        let mut memory = Store::open(root.join("memory.sqlite")).unwrap();
+        let scope = scope_for("alpha");
+        let source = memory
+            .append(NewRecord {
+                kind: RecordKind::Finding,
+                origin: Origin::Worker,
+                scope: scope.clone(),
+                body: "old".into(),
+                provenance: "fixture".into(),
+                timestamp: 1,
+                supersedes: None,
+                dependencies: vec![],
+                decision_state: None,
+                protected_policy: false,
+            })
+            .unwrap();
+        let correction = memory
+            .append(NewRecord {
+                kind: RecordKind::Correction,
+                origin: Origin::Human,
+                scope: scope.clone(),
+                body: "Explain the changed assumptions".into(),
+                provenance: "explicit correction".into(),
+                timestamp: 2,
+                supersedes: Some(source.id.clone()),
+                dependencies: vec![source.id],
+                decision_state: None,
+                protected_policy: false,
+            })
+            .unwrap();
+        let proposal = prepare_correction_proposal(&root, "alpha", &correction.id).unwrap();
+        assert_eq!(proposal.kind, RecordKind::Proposal);
+        assert_eq!(proposal.origin, Origin::Worker);
+        assert_eq!(proposal.scope, scope);
+        assert_eq!(proposal.dependencies, vec![correction.id.clone()]);
+        assert_eq!(
+            prepare_correction_proposal(&root, "alpha", &correction.id)
+                .unwrap()
+                .id,
+            proposal.id
+        );
+        assert!(prepare_correction_proposal(&root, "beta", &correction.id).is_err());
+        assert!(!root.join("workshop.sqlite").exists());
+        assert!(!root.join("policy.sqlite").exists());
+        assert!(!root.join("author-runtime.sqlite").exists());
+        memory.forget(&correction.id).unwrap();
+        assert!(memory.get(&proposal.id).unwrap().is_none());
+        assert!(prepare_correction_proposal(&root, "alpha", &correction.id).is_err());
+    }
 
     #[test]
     fn correction_hypothesis_candidate_use_survives_restart_and_scope_is_exact() {

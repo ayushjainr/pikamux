@@ -7,6 +7,25 @@ pub(crate) fn database(path: &Path) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("Assistant database needs a private parent"))?;
     directory(parent)?;
     file(path)?;
+    check_sidecars(path)
+}
+
+/// Validate existing state without creating a directory, database, or sidecar.
+/// Readers must additionally open SQLite with READ_ONLY (never CREATE).
+pub(crate) fn existing_database(path: &Path) -> io::Result<()> {
+    existing_file(path)?;
+    check_sidecars(path)
+}
+
+pub(crate) fn existing_file(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("Assistant database needs a private parent"))?;
+    check_directory(parent)?;
+    check(path, false)
+}
+
+fn check_sidecars(path: &Path) -> io::Result<()> {
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sibling = path.as_os_str().to_owned();
         sibling.push(suffix);
@@ -29,6 +48,10 @@ pub(crate) fn directory(path: &Path) -> io::Result<()> {
         }
         builder.create(path)?;
     }
+    check_directory(path)
+}
+
+fn check_directory(path: &Path) -> io::Result<()> {
     check(path, true)?;
     #[cfg(unix)]
     {
@@ -98,6 +121,18 @@ fn check(path: &Path, directory: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn existing_database_validation_never_creates_missing_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("absent/state.sqlite");
+        assert!(existing_database(&path).is_err());
+        assert!(!path.parent().unwrap().exists());
+        database(&path).unwrap();
+        existing_database(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(existing_database(&path).is_err());
+        assert!(!path.exists());
+    }
     #[cfg(unix)]
     #[test]
     fn rejects_database_and_sidecar_links_without_modifying_targets() {

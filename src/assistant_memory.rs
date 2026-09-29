@@ -57,7 +57,7 @@ impl Scope {
         .iter()
         .all(|(source, target)| source.is_none() || source == target)
     }
-    fn validate(&self) -> Result<(), MemoryError> {
+    pub(crate) fn validate(&self) -> Result<(), MemoryError> {
         for value in [
             &self.node,
             &self.project,
@@ -137,14 +137,47 @@ pub struct Record {
     pub protected_policy: bool,
 }
 
+/// A bounded typed active page. `limited` means callers must not claim that
+/// an empty/short projection proves no other matching records exist.
+pub struct RecordPage {
+    pub records: Vec<Record>,
+    pub limited: bool,
+    pub byte_limited: bool,
+}
+
+/// Stable insertion/update ordering independent of user-supplied timestamps.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RevisionRecord {
+    pub revision: u64,
+    pub record: Record,
+}
+pub(crate) struct RevisionPage {
+    pub records: Vec<RevisionRecord>,
+    pub through: u64,
+    pub next: u64,
+    pub has_more: bool,
+}
+
+/// Minimal ancestry metadata: classification never needs historical bodies.
+#[derive(Clone)]
+pub struct RecordLineage {
+    pub id: String,
+    pub kind: RecordKind,
+    pub origin: Origin,
+    pub scope: Scope,
+    pub supersedes: Option<String>,
+    pub provenance: String,
+}
+
 pub struct Store {
     path: PathBuf,
-    connection: Connection,
-    profile_id: String,
+    pub(crate) connection: Connection,
+    pub(crate) profile_id: String,
 }
 
 fn create_memory_schema(connection: &Connection) -> Result<(), MemoryError> {
     connection.execute_batch("CREATE TABLE IF NOT EXISTS memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\nCREATE TABLE IF NOT EXISTS memory_records (id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, kind TEXT NOT NULL, origin TEXT NOT NULL, project TEXT, provider TEXT, conversation TEXT, body TEXT NOT NULL, provenance TEXT NOT NULL, timestamp INTEGER NOT NULL, supersedes TEXT, dependencies TEXT NOT NULL, decision_state TEXT, protected_policy INTEGER NOT NULL);\nCREATE TABLE IF NOT EXISTS memory_receipts (request_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, record_id TEXT, timestamp INTEGER NOT NULL);\nCREATE INDEX IF NOT EXISTS memory_records_time ON memory_records(timestamp DESC);\nCREATE INDEX IF NOT EXISTS memory_records_profile ON memory_records(profile_id);\nCREATE INDEX IF NOT EXISTS memory_records_supersedes ON memory_records(profile_id,supersedes);")?;
+    connection.execute_batch("CREATE INDEX IF NOT EXISTS memory_records_active_type ON memory_records(profile_id,kind,timestamp DESC,id DESC)")?;
     Ok(())
 }
 
@@ -232,7 +265,28 @@ fn ensure_memory_search_index(tx: &Transaction<'_>) -> Result<(), MemoryError> {
              INSERT INTO memory_fts(rowid, body) VALUES (new.rowid, new.body);
          END;",
     )?;
-    backfill_search_index_if_needed(tx)
+    backfill_search_index_if_needed(tx)?;
+    ensure_memory_revisions(tx)
+}
+
+fn ensure_memory_revisions(tx: &Transaction<'_>) -> Result<(), MemoryError> {
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS memory_revisions(revision INTEGER PRIMARY KEY AUTOINCREMENT,record_id TEXT NOT NULL UNIQUE);
+        CREATE TRIGGER IF NOT EXISTS memory_revisions_insert AFTER INSERT ON memory_records BEGIN
+            INSERT INTO memory_revisions(record_id) VALUES(new.id);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memory_revisions_update AFTER UPDATE ON memory_records BEGIN
+            DELETE FROM memory_revisions WHERE record_id=old.id;
+            INSERT INTO memory_revisions(record_id) VALUES(new.id);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memory_revisions_delete AFTER DELETE ON memory_records BEGIN
+            DELETE FROM memory_revisions WHERE record_id=old.id;
+        END;")?;
+    let initialized: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM memory_meta WHERE key='memory_revision_index_version' AND value='1')",[],|r|r.get(0))?;
+    if !initialized {
+        tx.execute("INSERT OR IGNORE INTO memory_revisions(record_id) SELECT id FROM memory_records ORDER BY rowid",[])?;
+        tx.execute("INSERT INTO memory_meta(key,value) VALUES('memory_revision_index_version','1') ON CONFLICT(key) DO UPDATE SET value=excluded.value",[])?;
+    }
+    Ok(())
 }
 
 fn backfill_search_index_if_needed(tx: &Transaction<'_>) -> Result<(), MemoryError> {
@@ -293,6 +347,99 @@ fn existing_idempotent_record(
 }
 
 impl Store {
+    /// Bound this connection's lock wait without changing worker connections.
+    pub(crate) fn set_busy_timeout(&mut self, millis: u64) -> Result<(), MemoryError> {
+        self.connection
+            .busy_timeout(std::time::Duration::from_millis(millis))?;
+        Ok(())
+    }
+
+    /// Cache refreshes are optional work: they must never queue behind a
+    /// foreground writer. Restore the normal timeout even when work fails.
+    fn without_lock_wait<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, MemoryError>,
+    ) -> Result<T, MemoryError> {
+        let previous: u64 = self
+            .connection
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+        self.connection.busy_timeout(std::time::Duration::ZERO)?;
+        let result = operation(self);
+        self.connection
+            .busy_timeout(std::time::Duration::from_millis(previous))?;
+        result
+    }
+
+    pub(crate) fn try_read_snapshot<T>(
+        &mut self,
+        read: impl FnOnce(&Self) -> Result<T, MemoryError>,
+    ) -> Result<T, MemoryError> {
+        self.without_lock_wait(|store| store.read_snapshot(read))
+    }
+
+    pub(crate) fn try_publish_at_epoch<T>(
+        &mut self,
+        expected_epoch: u64,
+        publish: impl FnOnce() -> Result<T, rusqlite::Error>,
+    ) -> Result<T, MemoryError> {
+        self.without_lock_wait(|store| store.publish_at_epoch(expected_epoch, publish))
+    }
+
+    /// Collect a bounded multi-query view without mixing record generations.
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        read: impl FnOnce(&Self) -> Result<T, MemoryError>,
+    ) -> Result<T, MemoryError> {
+        let tx = self.connection.unchecked_transaction()?;
+        let result = read(self)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn revision_page(
+        &self,
+        scope: &Scope,
+        after: u64,
+        through: Option<u64>,
+        limit: usize,
+        active_only: bool,
+    ) -> Result<RevisionPage, MemoryError> {
+        scope.validate()?;
+        let maximum: u64 = self.connection.query_row(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='memory_revisions'),0)",
+            [],
+            |r| r.get(0),
+        )?;
+        let through = through.unwrap_or(maximum);
+        if after > through || through > maximum || limit == 0 {
+            return Err(MemoryError::Invalid("invalid memory revision page".into()));
+        }
+        let cap = limit.min(64);
+        let mut query = self.connection.prepare("SELECT m.id,m.profile_id,m.kind,m.origin,m.project,m.provider,m.conversation,m.body,m.provenance,m.timestamp,m.supersedes,m.dependencies,m.decision_state,m.protected_policy,m.node,v.revision FROM memory_revisions v JOIN memory_records m ON m.id=v.record_id WHERE m.profile_id=? AND v.revision>? AND v.revision<=? AND (m.project IS NULL OR m.project=?) AND (m.provider IS NULL OR m.provider=?) AND (m.conversation IS NULL OR m.conversation=?) AND (m.node IS NULL OR m.node=?) AND (?=0 OR (m.kind!='\"Draft\"' AND (m.decision_state IS NULL OR m.decision_state!='\"Superseded\"') AND NOT EXISTS(SELECT 1 FROM memory_records n WHERE n.profile_id=m.profile_id AND n.supersedes=m.id))) ORDER BY v.revision ASC LIMIT ?")?;
+        let records = query
+            .query_map(
+                params![
+                    self.profile_id,
+                    after,
+                    through,
+                    scope.project,
+                    scope.provider,
+                    scope.conversation,
+                    scope.node,
+                    active_only,
+                    cap + 1
+                ],
+                |row| {
+                    Ok(RevisionRecord {
+                        revision: row.get(15)?,
+                        record: row_to_record(row)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(bound_revision_page(records, cap, through))
+    }
+
     /// Open (or create) a private assistant database at an explicit path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
         let path = path.as_ref().to_path_buf();
@@ -303,6 +450,41 @@ impl Store {
         create_memory_schema(&connection)?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let profile_id = migrate_memory_schema(&transaction)?;
+        ensure_memory_search_index(&transaction)?;
+        transaction.commit()?;
+        Ok(Self {
+            path,
+            connection,
+            profile_id,
+        })
+    }
+
+    /// Attach an existing authority without ever creating a replacement file.
+    /// Verify identity under the migration transaction before any schema write.
+    pub(crate) fn open_existing(
+        path: impl AsRef<Path>,
+        expected_profile: &str,
+    ) -> Result<Self, MemoryError> {
+        let path = path.as_ref().to_path_buf();
+        crate::assistant_storage::existing_database(&path)?;
+        let mut connection =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(std::time::Duration::from_millis(500))?;
+        connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let actual: String = transaction.query_row(
+            "SELECT value FROM memory_meta WHERE key='profile_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if actual != expected_profile {
+            return Err(MemoryError::Invalid(
+                "assistant profile changed; existing-authority attachment refused".into(),
+            ));
+        }
+        create_memory_schema(&transaction)?;
         let profile_id = migrate_memory_schema(&transaction)?;
         ensure_memory_search_index(&transaction)?;
         transaction.commit()?;
@@ -411,6 +593,14 @@ impl Store {
         expected_epoch: u64,
         dispatch: impl FnOnce() -> T,
     ) -> Result<T, MemoryError> {
+        self.dispatch_at_epoch_checked(expected_epoch, |_| dispatch())
+    }
+
+    pub(crate) fn dispatch_at_epoch_checked<T>(
+        &mut self,
+        expected_epoch: u64,
+        dispatch: impl FnOnce(&rusqlite::Transaction<'_>) -> T,
+    ) -> Result<T, MemoryError> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -434,7 +624,7 @@ impl Store {
                 "memory was forgotten before provider dispatch; context requires recovery".into(),
             ));
         }
-        let result = dispatch();
+        let result = dispatch(&tx);
         // No writes to commit after the external effect. Drop releases the
         // read-only writer reservation even on a callback error or unwind.
         drop(tx);
@@ -484,6 +674,76 @@ impl Store {
         request_id: &str,
         input: NewRecord,
     ) -> Result<Record, MemoryError> {
+        self.append_idempotent_checked(request_id, input, false)
+    }
+
+    /// Trusted conversation adapter: preserve raw human words and, for the
+    /// narrow recognized presentation grammar, atomically supersede the prior
+    /// preference in exactly this scope. No model text reaches this boundary.
+    pub(crate) fn append_conversation_input(
+        &mut self,
+        request_id: &str,
+        mut input: NewRecord,
+        preference: Option<crate::assistant_preferences::BriefingPreference>,
+        expected_epoch: u64,
+    ) -> Result<Record, MemoryError> {
+        validate_request_id(request_id)?;
+        validate_conversation_input(&input, preference)?;
+        // Keep the historical raw-input receipt hash: retrying an older input
+        // must return its existing classification, never reinterpret it.
+        let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&input)?));
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if read_forget_epoch(&tx)? != expected_epoch {
+            return Err(MemoryError::Invalid(
+                "memory changed through forgetting; input not saved".into(),
+            ));
+        }
+        if let Some(record) = existing_idempotent_record(&tx, request_id, &hash, &self.profile_id)?
+        {
+            tx.commit()?;
+            return Ok(record);
+        }
+        if let Some(preference) = preference {
+            apply_presentation_revision(&tx, &self.profile_id, &mut input, preference)?;
+        }
+        let record = append_in_tx(&tx, &self.profile_id, Uuid::new_v4().to_string(), input)?;
+        tx.execute("INSERT INTO memory_receipts(request_id,payload_hash,record_id,timestamp) VALUES(?,?,?,?)", params![request_id,hash,record.id,record.timestamp])?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// Append one immutable human revision only while its exact predecessor is
+    /// current. The check shares the write transaction with the append, so two
+    /// clients cannot fork the active decision. An identical retry still returns
+    /// its original receipt, even after a later revision.
+    pub fn append_revision_idempotent(
+        &mut self,
+        request_id: &str,
+        input: NewRecord,
+    ) -> Result<Record, MemoryError> {
+        if input.origin != Origin::Human {
+            return Err(MemoryError::WorkerCannotAssumeUserAuthority);
+        }
+        if !input
+            .supersedes
+            .as_ref()
+            .is_some_and(|id| input.dependencies.contains(id))
+        {
+            return Err(MemoryError::Invalid(
+                "revision must retain its exact predecessor as a dependency".into(),
+            ));
+        }
+        self.append_idempotent_checked(request_id, input, true)
+    }
+
+    fn append_idempotent_checked(
+        &mut self,
+        request_id: &str,
+        input: NewRecord,
+        require_active_predecessor: bool,
+    ) -> Result<Record, MemoryError> {
         validate_request_id(request_id)?;
         Self::validate_input(&input)?;
         let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&input)?));
@@ -495,6 +755,18 @@ impl Store {
             tx.commit()?;
             return Ok(record);
         }
+        if require_active_predecessor {
+            let superseded: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_records WHERE profile_id=? AND supersedes=?)",
+                params![self.profile_id, input.supersedes],
+                |row| row.get(0),
+            )?;
+            if superseded {
+                return Err(MemoryError::Invalid(
+                    "record has a newer revision; inspect and use its current record ID".into(),
+                ));
+            }
+        }
         let id = Uuid::new_v4().to_string();
         let record = append_in_tx(&tx, &self.profile_id, id, input)?;
         tx.execute("INSERT INTO memory_receipts(request_id,payload_hash,record_id,timestamp) VALUES(?,?,?,?)", params![request_id, hash, record.id, record.timestamp])?;
@@ -503,7 +775,58 @@ impl Store {
     }
 }
 
-fn append_in_tx(
+fn validate_conversation_input(
+    input: &NewRecord,
+    preference: Option<crate::assistant_preferences::BriefingPreference>,
+) -> Result<(), MemoryError> {
+    Store::validate_input(input)?;
+    if input.origin != Origin::Human
+        || input.kind != RecordKind::Finding
+        || input.protected_policy
+        || input.supersedes.is_some()
+        || !input.dependencies.is_empty()
+        || input.decision_state.is_some()
+    {
+        return Err(MemoryError::Invalid(
+            "expected raw human conversation input".into(),
+        ));
+    }
+    if preference != crate::assistant_preferences::recognize(&input.body) {
+        return Err(MemoryError::Invalid(
+            "presentation preference must match exact human words".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_presentation_revision(
+    tx: &Transaction<'_>,
+    profile_id: &str,
+    input: &mut NewRecord,
+    preference: crate::assistant_preferences::BriefingPreference,
+) -> Result<(), MemoryError> {
+    let previous = tx.query_row(
+        "SELECT id FROM memory_records m WHERE profile_id=? AND project IS ? AND provider IS ? AND conversation IS ? AND node IS ? AND kind='\"UserInstruction\"' AND origin='\"Human\"' AND protected_policy=0 AND CASE WHEN json_valid(provenance) THEN json_extract(provenance,'$.presentation_preference.key') END=? AND NOT EXISTS(SELECT 1 FROM memory_records n WHERE n.supersedes=m.id AND n.profile_id=m.profile_id) ORDER BY timestamp DESC,id DESC LIMIT 1",
+        params![profile_id,input.scope.project,input.scope.provider,input.scope.conversation,input.scope.node,crate::assistant_preferences::KEY],
+        |row| row.get::<_, String>(0),
+    ).optional()?;
+    input.kind = RecordKind::UserInstruction;
+    let mut provenance: serde_json::Value = serde_json::from_str(&input.provenance)?;
+    let fields = provenance
+        .as_object_mut()
+        .ok_or_else(|| MemoryError::Invalid("conversation provenance must be an object".into()))?;
+    fields.insert("authority".into(), "presentation_preference_only".into());
+    fields.insert(
+        "presentation_preference".into(),
+        serde_json::json!({"key":crate::assistant_preferences::KEY,"bullets":preference.bullets}),
+    );
+    input.provenance = provenance.to_string();
+    input.dependencies = previous.iter().cloned().collect();
+    input.supersedes = previous;
+    Ok(())
+}
+
+pub(crate) fn append_in_tx(
     tx: &Transaction<'_>,
     profile_id: &str,
     id: String,
@@ -608,6 +931,31 @@ impl Store {
         max_bytes: usize,
         excluded: &std::collections::HashSet<String>,
     ) -> Result<Vec<Record>, MemoryError> {
+        self.search_bm25_filtered(scope, query, limit, max_bytes, excluded, false)
+    }
+
+    /// Filter standing guidance in SQL before the candidate limit. Otherwise
+    /// hundreds of matching findings could hide an older applicable instruction.
+    pub(crate) fn search_standing_bm25_with_budget(
+        &self,
+        scope: &Scope,
+        query: &str,
+        limit: usize,
+        max_bytes: usize,
+        excluded: &std::collections::HashSet<String>,
+    ) -> Result<Vec<Record>, MemoryError> {
+        self.search_bm25_filtered(scope, query, limit, max_bytes, excluded, true)
+    }
+
+    fn search_bm25_filtered(
+        &self,
+        scope: &Scope,
+        query: &str,
+        limit: usize,
+        max_bytes: usize,
+        excluded: &std::collections::HashSet<String>,
+        standing_only: bool,
+    ) -> Result<Vec<Record>, MemoryError> {
         scope.validate()?;
         let cap = limit.min(MAX_RETRIEVAL);
         if cap == 0 || max_bytes == 0 {
@@ -627,6 +975,7 @@ impl Store {
                       AND (m.conversation IS NULL OR m.conversation=?)
                       AND (m.node IS NULL OR m.node=?)
                       AND m.kind != '"Draft"'
+                      AND (?=0 OR m.protected_policy=1 OR m.kind IN ('"UserInstruction"','"Correction"'))
                       AND (m.decision_state IS NULL OR m.decision_state != '"Superseded"')
                       AND NOT EXISTS(
                           SELECT 1 FROM memory_records n
@@ -643,6 +992,7 @@ impl Store {
                 scope.provider,
                 scope.conversation,
                 scope.node,
+                standing_only,
                 MAX_RETRIEVAL as i64,
             ],
             row_to_record,
@@ -676,7 +1026,7 @@ impl Store {
         scope.validate()?;
         let cap = limit.min(MAX_RETRIEVAL);
         let sql = if active {
-            r#"SELECT id,profile_id,kind,origin,project,provider,conversation,body,provenance,timestamp,supersedes,dependencies,decision_state,protected_policy,node FROM memory_records m WHERE profile_id=? AND (project IS NULL OR project=?) AND (provider IS NULL OR provider=?) AND (conversation IS NULL OR conversation=?) AND (node IS NULL OR node=?) AND kind != '"Draft"' AND (decision_state IS NULL OR decision_state != '"Superseded"') AND NOT EXISTS(SELECT 1 FROM memory_records n WHERE n.supersedes=m.id AND n.profile_id=m.profile_id) ORDER BY CASE WHEN kind IN ('"UserInstruction"','"Correction"') THEN 0 WHEN kind='"Decision"' THEN 1 ELSE 2 END,timestamp DESC,id DESC LIMIT ?"#
+            r#"SELECT id,profile_id,kind,origin,project,provider,conversation,body,provenance,timestamp,supersedes,dependencies,decision_state,protected_policy,node FROM memory_records m WHERE profile_id=? AND (project IS NULL OR project=?) AND (provider IS NULL OR provider=?) AND (conversation IS NULL OR conversation=?) AND (node IS NULL OR node=?) AND kind != '"Draft"' AND (decision_state IS NULL OR decision_state != '"Superseded"') AND NOT EXISTS(SELECT 1 FROM memory_records n WHERE n.supersedes=m.id AND n.profile_id=m.profile_id) ORDER BY protected_policy DESC,CASE WHEN kind IN ('"UserInstruction"','"Correction"') THEN 0 WHEN kind='"Decision"' THEN 1 ELSE 2 END,timestamp DESC,id DESC LIMIT ?"#
         } else {
             "SELECT id,profile_id,kind,origin,project,provider,conversation,body,provenance,timestamp,supersedes,dependencies,decision_state,protected_policy,node FROM memory_records WHERE profile_id=? AND (project IS NULL OR project=?) AND (provider IS NULL OR provider=?) AND (conversation IS NULL OR conversation=?) AND (node IS NULL OR node=?) ORDER BY timestamp DESC, id DESC LIMIT ?"
         };
@@ -709,6 +1059,78 @@ impl Store {
     /// Exact dependency lookup for trusted coordinators; never a model-owned query.
     pub fn get(&self, id: &str) -> Result<Option<Record>, MemoryError> {
         Ok(self.connection.query_row("SELECT id,profile_id,kind,origin,project,provider,conversation,body,provenance,timestamp,supersedes,dependencies,decision_state,protected_policy,node FROM memory_records WHERE profile_id=? AND id=?", params![self.profile_id,id], row_to_record).optional()?)
+    }
+
+    /// A revision is immutable evidence identity, not model-authored freshness.
+    pub(crate) fn source_version(&self, id: &str) -> Result<Option<u64>, MemoryError> {
+        Ok(self.connection.query_row(
+            "SELECT v.revision FROM memory_revisions v JOIN memory_records m ON m.id=v.record_id WHERE m.id=? AND m.profile_id=?",
+            params![id, self.profile_id], |row| row.get(0),
+        ).optional()?)
+    }
+
+    pub fn lineage(&self, id: &str) -> Result<Option<RecordLineage>, MemoryError> {
+        Ok(self.connection.query_row(
+            "SELECT id,kind,origin,node,project,provider,conversation,supersedes,substr(provenance,1,16384) FROM memory_records WHERE profile_id=? AND id=?",
+            params![self.profile_id,id], |row| Ok(RecordLineage {
+                id: row.get(0)?, kind: decode_json_column(row,1)?, origin: decode_json_column(row,2)?,
+                scope: Scope { node: row.get(3)?, project: row.get(4)?, provider: row.get(5)?, conversation: row.get(6)? },
+                supersedes: row.get(7)?, provenance: row.get(8)?,
+            })
+        ).optional()?)
+    }
+
+    /// Active typed records have their own quota independent of newer activity.
+    /// Fetch one extra row to disclose overflow without loading/counting the
+    /// whole archive. Scope filtering and supersession precede the bound.
+    pub fn active_by_kind(
+        &self,
+        scope: &Scope,
+        kind: RecordKind,
+        since: Option<i64>,
+        limit: usize,
+    ) -> Result<RecordPage, MemoryError> {
+        scope.validate()?;
+        let cap = limit.min(MAX_RETRIEVAL);
+        let mut stmt = self.connection.prepare(
+            "SELECT id,profile_id,kind,origin,project,provider,conversation,body,provenance,timestamp,supersedes,dependencies,decision_state,protected_policy,node FROM memory_records m WHERE profile_id=? AND kind=? AND (project IS NULL OR project=?) AND (provider IS NULL OR provider=?) AND (conversation IS NULL OR conversation=?) AND (node IS NULL OR node=?) AND (? IS NULL OR timestamp>=?) AND (decision_state IS NULL OR decision_state != '\"Superseded\"') AND NOT EXISTS(SELECT 1 FROM memory_records n WHERE n.supersedes=m.id AND n.profile_id=m.profile_id) ORDER BY timestamp DESC,id DESC LIMIT ?"
+        )?;
+        let rows = stmt.query_map(
+            params![
+                self.profile_id,
+                serde_json::to_string(&kind)?,
+                scope.project,
+                scope.provider,
+                scope.conversation,
+                scope.node,
+                since,
+                since,
+                cap + 1
+            ],
+            row_to_record,
+        )?;
+        let mut page = RecordPage {
+            records: vec![],
+            limited: false,
+            byte_limited: false,
+        };
+        let mut bytes = 0usize;
+        for row in rows {
+            let record = row?;
+            let cost = record.body.len().saturating_add(record.provenance.len());
+            if bytes.saturating_add(cost) > MAX_RECORD_BYTES {
+                page.byte_limited = true;
+                page.limited = true;
+                continue;
+            }
+            if page.records.len() == cap {
+                page.limited = true;
+                continue;
+            }
+            bytes += cost;
+            page.records.push(record);
+        }
+        Ok(page)
     }
 
     /// Exact active lookup; historical corrections remain retrievable with
@@ -746,23 +1168,13 @@ impl Store {
     }
 
     /// Delete a record and every record that depends on it, transitively.
+    /// Recognized presentation preferences include their same-key predecessor
+    /// chain, so forgetting a correction does not revive the obsolete setting.
     pub fn forget(&mut self, id: &str) -> Result<usize, MemoryError> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let old_epoch: Option<String> = tx
-            .query_row(
-                "SELECT value FROM memory_meta WHERE key='forget_epoch'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let epoch = old_epoch
-            .unwrap_or_else(|| "0".into())
-            .parse::<u64>()
-            .ok()
-            .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| MemoryError::Invalid("invalid or exhausted forget generation".into()))?;
+        let epoch = next_forget_epoch(&tx)?;
         if tx
             .query_row(
                 "SELECT 1 FROM memory_records WHERE id=? AND profile_id=?",
@@ -774,7 +1186,7 @@ impl Store {
         {
             return Err(MemoryError::NotFound(id.into()));
         }
-        let mut pending = vec![id.to_string()];
+        let mut pending = vec![presentation_preference_root(&tx, &self.profile_id, id)?];
         let mut removed = 0;
         while let Some(target) = pending.pop() {
             let mut stmt = tx.prepare("SELECT id FROM memory_records WHERE profile_id=? AND (supersedes=? OR dependencies LIKE '%' || ? || '%')")?;
@@ -791,6 +1203,126 @@ impl Store {
         tx.commit()?;
         Ok(removed)
     }
+
+    /// Revoke model-derived memory for an exact scope when an external input
+    /// grant is withdrawn. Older findings may not carry source-grant lineage,
+    /// so retain no worker assertion from that scope (or its descendants).
+    /// The same transaction advances the context fence even with zero matches:
+    /// an in-flight worker must not append a late finding after revocation.
+    pub(crate) fn forget_worker_scope(&mut self, scope: &Scope) -> Result<usize, MemoryError> {
+        if scope
+            .project
+            .as_ref()
+            .is_none_or(|name| name.trim().is_empty())
+        {
+            return Err(MemoryError::Invalid(
+                "exact project scope is required for derived-memory revocation".into(),
+            ));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let epoch = next_forget_epoch(&tx)?;
+        let mut pending = {
+            let mut query = tx.prepare("SELECT id FROM memory_records WHERE profile_id=? AND origin='\"Worker\"' AND project IS ? AND provider IS ? AND conversation IS ? AND node IS ?")?;
+            query
+                .query_map(
+                    params![
+                        self.profile_id,
+                        scope.project,
+                        scope.provider,
+                        scope.conversation,
+                        scope.node
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut removed = 0;
+        while let Some(id) = pending.pop() {
+            let mut query = tx.prepare("SELECT id FROM memory_records WHERE profile_id=? AND (supersedes=? OR EXISTS(SELECT 1 FROM json_each(memory_records.dependencies) WHERE value=?))")?;
+            let children = query
+                .query_map(params![self.profile_id, id, id], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            pending.extend(children);
+            removed += tx.execute(
+                "DELETE FROM memory_records WHERE profile_id=? AND id=?",
+                params![self.profile_id, id],
+            )?;
+        }
+        tx.execute("INSERT INTO memory_meta(key,value) VALUES('forget_epoch',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [epoch.to_string()])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+}
+
+fn bound_revision_page(records: Vec<RevisionRecord>, cap: usize, through: u64) -> RevisionPage {
+    let mut page = RevisionPage {
+        records: Vec::new(),
+        through,
+        next: through,
+        has_more: false,
+    };
+    let mut bytes = 0usize;
+    for entry in records {
+        let cost = entry
+            .record
+            .body
+            .len()
+            .saturating_add(entry.record.provenance.len());
+        if page.records.len() == cap || bytes.saturating_add(cost) > 2 * MAX_RECORD_BYTES {
+            page.has_more = true;
+            page.next = page.records.last().map_or(0, |r| r.revision);
+            break;
+        }
+        bytes += cost;
+        page.records.push(entry);
+    }
+    page
+}
+
+fn next_forget_epoch(connection: &Connection) -> Result<u64, MemoryError> {
+    read_forget_epoch(connection)?
+        .checked_add(1)
+        .ok_or_else(|| MemoryError::Invalid("exhausted forget generation".into()))
+}
+
+fn read_forget_epoch(connection: &Connection) -> Result<u64, MemoryError> {
+    let old: Option<String> = connection
+        .query_row(
+            "SELECT value FROM memory_meta WHERE key='forget_epoch'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    old.unwrap_or_else(|| "0".into())
+        .parse::<u64>()
+        .map_err(|_| MemoryError::Invalid("invalid forget generation".into()))
+}
+
+fn presentation_preference_root(
+    connection: &Connection,
+    profile_id: &str,
+    id: &str,
+) -> Result<String, MemoryError> {
+    // This exception is deliberately limited to our typed presentation key.
+    // Generic findings/decisions retain their existing forgetting behavior.
+    let mut current = id.to_owned();
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(current.clone()) {
+        let parent: Option<String> = connection.query_row(
+            "SELECT p.id FROM memory_records m JOIN memory_records p ON p.id=m.supersedes AND p.profile_id=m.profile_id AND p.project IS m.project AND p.provider IS m.provider AND p.conversation IS m.conversation AND p.node IS m.node WHERE m.id=? AND m.profile_id=? AND m.kind='\"UserInstruction\"' AND p.kind=m.kind AND m.origin='\"Human\"' AND p.origin=m.origin AND CASE WHEN json_valid(m.provenance) THEN json_extract(m.provenance,'$.presentation_preference.key') END=? AND CASE WHEN json_valid(p.provenance) THEN json_extract(p.provenance,'$.presentation_preference.key') END=?",
+            params![current,profile_id,crate::assistant_preferences::KEY,crate::assistant_preferences::KEY],
+            |row| row.get(0),
+        ).optional()?;
+        let Some(parent) = parent else {
+            return Ok(current);
+        };
+        current = parent;
+    }
+    Err(MemoryError::Invalid("cyclic preference lineage".into()))
 }
 
 fn load_scope(tx: &Transaction<'_>, id: &str) -> Result<Option<Scope>, MemoryError> {
@@ -908,6 +1440,10 @@ fn decode_optional_json_column<T: DeserializeOwned>(
         })
         .transpose()
 }
+
+#[cfg(test)]
+#[path = "assistant_preference_storage_tests.rs"]
+mod preference_storage_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1177,6 +1713,86 @@ mod tests {
             })
             .unwrap();
         other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn optional_publication_restores_owner_timeout_and_does_not_change_workers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private/m.sqlite");
+        let mut owner = Store::open(&path).unwrap();
+        let worker = Store::open(&path).unwrap();
+        owner.set_busy_timeout(25).unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut called = false;
+        assert!(
+            owner
+                .try_publish_at_epoch(0, || {
+                    called = true;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!called);
+        assert_eq!(
+            owner
+                .connection
+                .query_row::<u64, _, _>("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap(),
+            25
+        );
+        assert_eq!(
+            worker
+                .connection
+                .query_row::<u64, _, _>("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap(),
+            500
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        owner.try_publish_at_epoch(0, || Ok(())).unwrap();
+        assert_eq!(
+            owner
+                .connection
+                .query_row::<u64, _, _>("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap(),
+            25
+        );
+    }
+
+    #[test]
+    fn existing_authority_open_preserves_identity_and_never_creates_missing_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private/m.sqlite");
+        assert!(Store::open_existing(&path, "expected").is_err());
+        assert!(!path.parent().unwrap().exists());
+        let owner = Store::open(&path).unwrap();
+        let profile = owner.profile_id().to_owned();
+        drop(owner);
+        assert!(Store::open_existing(&path, "different").is_err());
+        let attached = Store::open_existing(&path, &profile).unwrap();
+        assert_eq!(attached.profile_id(), profile);
+        drop(attached);
+        std::fs::remove_file(&path).unwrap();
+        assert!(Store::open_existing(&path, &profile).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn existing_authority_mismatch_does_not_migrate_schema() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private/m.sqlite");
+        crate::assistant_storage::database(&path).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE memory_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO memory_meta VALUES('profile_id','different');").unwrap();
+        assert!(Store::open_existing(&path, "expected").is_err());
+        let count: u64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name!='memory_meta'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
     #[test]
     fn identical_conversation_on_other_node_cannot_read_memory() {

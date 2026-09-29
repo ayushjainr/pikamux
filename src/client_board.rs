@@ -377,6 +377,14 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
     drop(quota_worker);
     drop(summary_source);
     match result? {
+        BoardAction::Assistant(_) => {
+            let mut runtime = crate::client_cli::SystemClientRuntime::discover()?;
+            crate::assistant_client::run(
+                &mut runtime,
+                crate::assistant_client::Args::default(),
+                &mut std::io::stdout().lock(),
+            )
+        }
         BoardAction::Update(version) => crate::windows_update::install(version.as_deref(), true),
         _ => Ok(0),
     }

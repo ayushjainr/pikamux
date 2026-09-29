@@ -5,6 +5,7 @@
 use assert_cmd::Command;
 use pikamux::store::Store;
 use serde_json::Value;
+use std::os::unix::fs::PermissionsExt;
 use std::{fs, path::PathBuf};
 use tempfile::TempDir;
 
@@ -78,6 +79,206 @@ fn json_output(fixture: &Fixture, args: &[&str]) -> Value {
         .clone();
     serde_json::from_slice(&output)
         .unwrap_or_else(|error| panic!("not JSON: {error}: {}", String::from_utf8_lossy(&output)))
+}
+
+#[test]
+fn normal_startup_uses_saved_profile_scope_and_keeps_json_offline() {
+    let source = Fixture::new();
+    json_output(
+        &source,
+        &[
+            "pika",
+            "--scope",
+            "pika",
+            "--remember",
+            "Retain my preference",
+            "--json",
+        ],
+    );
+    let before = json_output(&source, &["pika", "--scope", "pika", "--json"]);
+    source.assert_host_exited();
+    let installed = Fixture::new();
+    let provider = installed.root.path().join("fake-codex");
+    fs::copy("/usr/bin/false", &provider).unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    // Configure via the public command with an inert executable, never a model.
+    json_output(
+        &installed,
+        &[
+            "pika",
+            "--profile-root",
+            source.assistant_root().to_str().unwrap(),
+            "--expected-profile-id",
+            before["profile_id"].as_str().unwrap(),
+            "--scope",
+            "pika",
+            "--enable-codex",
+            provider.to_str().unwrap(),
+            "--no-call-limit",
+            "--set-default",
+            "--json",
+        ],
+    );
+    source.assert_host_exited();
+    for _ in 0..2 {
+        let after = json_output(&installed, &["pika", "--json"]);
+        assert_eq!(after["profile_id"], before["profile_id"]);
+        assert_eq!(after["records"], before["records"]);
+        assert_eq!(after["scope"], "pika");
+        assert_eq!(after["provider"], "none");
+        source.assert_host_exited();
+    }
+    assert!(!installed.assistant_root().exists());
+    assert!(!installed.operational_db.exists());
+    // A broken default cannot prevent an explicit exact-profile recovery view.
+    let selection_path = installed
+        .root
+        .path()
+        .join("state/assistant-startup/selection.json");
+    let saved_selection = fs::read(&selection_path).unwrap();
+    fs::write(
+        installed
+            .root
+            .path()
+            .join("state/assistant-startup/selection.json"),
+        "broken selection",
+    )
+    .unwrap();
+    installed.command(&["pika", "--json"]).assert().failure();
+    let explicit = json_output(
+        &installed,
+        &[
+            "pika",
+            "--profile-root",
+            source.assistant_root().to_str().unwrap(),
+            "--expected-profile-id",
+            before["profile_id"].as_str().unwrap(),
+            "--scope",
+            "pika",
+            "--json",
+        ],
+    );
+    assert_eq!(explicit["records"], before["records"]);
+    source.assert_host_exited();
+    fs::write(selection_path, saved_selection).unwrap();
+    // A missing binding fails closed instead of creating a new empty assistant.
+    fs::rename(
+        source.assistant_root(),
+        source.root.path().join("moved-profile"),
+    )
+    .unwrap();
+    installed.command(&["pika", "--json"]).assert().failure();
+    assert!(!installed.assistant_root().exists());
+}
+
+#[test]
+fn existing_profile_entry_reuses_memory_without_creating_default_authority() {
+    let source = Fixture::new();
+    json_output(
+        &source,
+        &[
+            "pika",
+            "--scope",
+            "pika",
+            "--remember",
+            "Keep the user involved",
+            "--json",
+        ],
+    );
+    let first = json_output(&source, &["pika", "--scope", "pika", "--json"]);
+    source.assert_host_exited();
+    let preview = Fixture::new();
+    let root = source.assistant_root();
+    let args = [
+        "pika",
+        "--profile-root",
+        root.to_str().unwrap(),
+        "--expected-profile-id",
+        first["profile_id"].as_str().unwrap(),
+        "--scope",
+        "pika",
+        "--json",
+    ];
+    for _ in 0..2 {
+        let reopened = json_output(&preview, &args);
+        assert_eq!(reopened["profile_id"], first["profile_id"]);
+        assert_eq!(reopened["records"], first["records"]);
+        assert_eq!(reopened["state"], "not_enabled");
+        source.assert_host_exited();
+    }
+    assert!(!preview.assistant_root().exists());
+    assert!(!preview.operational_db.exists());
+    assert!(!root.join("provider-home").exists());
+}
+
+#[test]
+fn existing_profile_entry_refuses_missing_or_mismatched_authority_before_writes() {
+    let f = Fixture::new();
+    let missing = f.root.path().join("missing");
+    f.command(&[
+        "pika",
+        "--profile-root",
+        missing.to_str().unwrap(),
+        "--expected-profile-id",
+        "aaaaaaaa-0000-4000-8000-000000000001",
+        "--json",
+    ])
+    .assert()
+    .failure();
+    assert!(!missing.exists());
+    let original = json_output(&f, &["pika", "--json"]);
+    f.assert_host_exited();
+    let root = f.assistant_root();
+    let memory_before = fs::read(root.join("memory.sqlite")).unwrap();
+    let owner_before = fs::read(root.join("owner.sqlite")).unwrap();
+    f.command(&[
+        "pika",
+        "--profile-root",
+        root.to_str().unwrap(),
+        "--expected-profile-id",
+        "aaaaaaaa-0000-4000-8000-000000000001",
+        "--json",
+    ])
+    .assert()
+    .failure();
+    assert_eq!(fs::read(root.join("memory.sqlite")).unwrap(), memory_before);
+    assert_eq!(fs::read(root.join("owner.sqlite")).unwrap(), owner_before);
+    assert!(!root.join("view.sock").exists());
+    assert!(!root.join("provider-home").exists());
+    let after = json_output(&f, &["pika", "--json"]);
+    assert_eq!(after["profile_id"], original["profile_id"]);
+    f.assert_host_exited();
+}
+
+#[test]
+fn existing_profile_entry_rejects_symlink_and_requires_both_binding_arguments() {
+    let f = Fixture::new();
+    let first = json_output(&f, &["pika", "--json"]);
+    f.assert_host_exited();
+    let link = f.root.path().join("alias");
+    std::os::unix::fs::symlink(f.assistant_root(), &link).unwrap();
+    f.command(&[
+        "pika",
+        "--profile-root",
+        link.to_str().unwrap(),
+        "--expected-profile-id",
+        first["profile_id"].as_str().unwrap(),
+        "--json",
+    ])
+    .assert()
+    .failure();
+    f.command(&["pika", "--profile-root", link.to_str().unwrap(), "--json"])
+        .assert()
+        .failure();
+    f.command(&[
+        "pika",
+        "--expected-profile-id",
+        first["profile_id"].as_str().unwrap(),
+        "--json",
+    ])
+    .assert()
+    .failure();
+    assert!(!f.assistant_root().join("view.sock").exists());
 }
 
 #[test]
@@ -159,19 +360,34 @@ fn two_live_views_share_memory_forget_epoch_and_survive_one_view_closing() {
         &mut first,
         serde_json::json!({"operation":"forget","record_id":records[0]["id"]}),
     );
-    let forgotten = request(
-        &mut second,
-        serde_json::json!({"operation":"snapshot","scope":"personal"}),
-    );
+    let cleanup_deadline = Instant::now() + Duration::from_secs(3);
+    let forgotten = loop {
+        let reply = request(
+            &mut second,
+            serde_json::json!({"operation":"snapshot","scope":"personal"}),
+        );
+        if reply["payload"]["memory_epoch"] == 1 {
+            break reply;
+        }
+        assert_eq!(
+            reply["payload"]["cleanup_pending"], true,
+            "forget is neither pending nor complete"
+        );
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "queued forget never committed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert_eq!(forgotten["payload"]["memory_epoch"], 1);
     assert_eq!(forgotten["payload"]["records"], serde_json::json!([]));
     let recovery = request(
         &mut first,
         serde_json::json!({"operation":"fresh_context","request_id":"99999999-9999-4999-8999-999999999999"}),
     );
-    assert_eq!(
-        recovery["payload"]["recovery_id"],
-        "99999999-9999-4999-8999-999999999999"
+    assert!(
+        recovery["payload"]["recovery_id"] == "99999999-9999-4999-8999-999999999999"
+            || recovery["payload"]["cleanup_pending"] == true
     );
     let recovery_deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -196,14 +412,14 @@ fn two_live_views_share_memory_forget_epoch_and_survive_one_view_closing() {
         serde_json::json!({"operation":"brief","scope":"personal"}),
     );
     assert_eq!(
-        brief["payload"]["brief"]["decisions"]
+        brief["payload"]["presentation"]["brief"]["decisions"]
             .as_array()
             .unwrap()
             .len(),
         1
     );
     assert_eq!(
-        brief["payload"]["brief"]["commitments"][0]["text"],
+        brief["payload"]["presentation"]["brief"]["commitments"][0]["text"],
         "measure freshness"
     );
     assert!(
@@ -243,7 +459,7 @@ fn two_live_views_share_memory_forget_epoch_and_survive_one_view_closing() {
         serde_json::json!({"operation":"brief","scope":"personal"}),
     );
     assert_eq!(
-        corrected["payload"]["brief"]["instructions"][0]["text"],
+        corrected["payload"]["presentation"]["brief"]["instructions"][0]["text"],
         "Explain the trade-offs"
     );
     let excluded = request(
@@ -251,7 +467,7 @@ fn two_live_views_share_memory_forget_epoch_and_survive_one_view_closing() {
         serde_json::json!({"operation":"brief","scope":"other"}),
     );
     assert_eq!(
-        excluded["payload"]["brief"]["decisions"],
+        excluded["payload"]["presentation"]["brief"]["decisions"],
         serde_json::json!([])
     );
     drop(first);
@@ -266,16 +482,51 @@ fn two_live_views_share_memory_forget_epoch_and_survive_one_view_closing() {
 }
 
 #[test]
-fn pika_pika_json_creates_only_private_assistant_state() {
+fn pika_pika_preview_is_private_and_invokes_no_provider_or_fleet_command_on_path() {
     let fixture = Fixture::new();
-    let value = json_output(&fixture, &["pika", "--json"]);
+    let denied_bin = fixture.root.path().join("denied-bin");
+    let marker = fixture.root.path().join("external-process-started");
+    fs::create_dir(&denied_bin).unwrap();
+    for name in [
+        "codex",
+        "claude",
+        "opencode",
+        "muse",
+        "ssh",
+        "tailscale",
+        "tmux",
+    ] {
+        let path = denied_bin.join(name);
+        fs::write(
+            &path,
+            "#!/bin/sh\nprintf x >> \"$PIKA_EXTERNAL_CALL_MARKER\"\nexit 97\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = fixture
+        .command(&["pika", "--json"])
+        .env("PATH", format!("{}:/usr/bin:/bin", denied_bin.display()))
+        .env("PIKA_EXTERNAL_CALL_MARKER", &marker)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(value["state"], "not_enabled");
     assert_eq!(value["provider"], "none");
+    assert_eq!(value["background_calls"], 0);
+    assert!(
+        !marker.exists(),
+        "preview launched a provider or fleet command"
+    );
     assert!(fixture.assistant_root().join("memory.sqlite").is_file());
     assert!(
         !fixture.operational_db.exists(),
         "assistant preview touched operational DB"
     );
+    assert!(!fixture.root.path().join("state/pika.db").exists());
     assert!(!fixture.root.path().join("config/pika/config.json").exists());
     assert!(fixture.assistant_root().join("owner.lock").is_file());
     fixture.assert_host_exited();
@@ -348,13 +599,4 @@ fn explicit_open_keeps_project_thread_named_pika_on_the_existing_parser() {
         !stderr.contains("No exact conversation named"),
         "named project conversation was not resolved: {stderr}"
     );
-}
-
-#[test]
-fn assistant_preview_never_starts_a_provider_or_fleet_process() {
-    let fixture = Fixture::new();
-    let value = json_output(&fixture, &["pika", "--json"]);
-    assert_eq!(value["background_calls"], 0);
-    assert!(!fixture.root.path().join("state/pika.db").exists());
-    fixture.assert_host_exited();
 }

@@ -63,6 +63,7 @@ pub fn spawn(config: AuthorConfig) -> Result<AssistantService, String> {
         let journal = root.join("author-runtime.sqlite");
         let mut runtime = AssistantRuntime::open(provider, memory, policy, journal, scope)
             .map_err(|e| e.to_string())?;
+        runtime.set_assignment_mode();
         runtime
             .start_fresh_disposable(now())
             .map_err(|e| e.to_string())?;
@@ -77,12 +78,13 @@ fn validate_config(config: &AuthorConfig) -> Result<(), String> {
     if !config.executable.is_absolute() {
         return Err("provider executable must be absolute".into());
     }
-    if config.scope.project.as_deref() != Some("personal")
-        || config.scope.node.is_some()
+    if config.scope.project.as_deref().is_none_or(|project| {
+        project.is_empty() || project.len() > 256 || project.chars().any(char::is_control)
+    }) || config.scope.node.is_some()
         || config.scope.provider.is_some()
         || config.scope.conversation.is_some()
     {
-        return Err("author scope must be the personal scope".into());
+        return Err("author requires one exact, bounded project scope".into());
     }
     Ok(())
 }
@@ -100,7 +102,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_non_personal_or_non_absolute_author_config() {
+    fn accepts_exact_project_but_rejects_non_absolute_or_ambiguous_author_config() {
         let invalid_root = AuthorConfig {
             root: PathBuf::from("relative"),
             executable: PathBuf::from("/bin/true"),
@@ -111,7 +113,7 @@ mod tests {
         };
         assert!(validate_config(&invalid_root).is_err());
 
-        let invalid_scope = AuthorConfig {
+        let mut invalid_scope = AuthorConfig {
             root: PathBuf::from("/tmp/author"),
             executable: PathBuf::from("/bin/true"),
             scope: Scope {
@@ -119,6 +121,8 @@ mod tests {
                 ..Scope::default()
             },
         };
+        assert!(validate_config(&invalid_scope).is_ok());
+        invalid_scope.scope.node = Some("unapproved-node".into());
         assert!(validate_config(&invalid_scope).is_err());
     }
 }
