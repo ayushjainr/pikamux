@@ -20,9 +20,15 @@ pub mod assistant_decisions;
 pub mod assistant_evolution;
 #[cfg(unix)]
 mod assistant_feedback;
+// Shared assistant domain types remain portable, but their authority-side
+// operations are driven only by the Unix host. Windows is a remote client.
+// Keep dead-code enforcement on the hosting targets rather than exporting
+// internal mutation APIs merely to satisfy a client-only build.
+#[cfg_attr(windows, allow(dead_code))]
 mod assistant_guidance;
 #[cfg(unix)]
 mod assistant_host;
+#[cfg_attr(windows, allow(dead_code))]
 pub mod assistant_investigation;
 #[cfg(unix)]
 pub mod assistant_investigation_provider;
@@ -30,13 +36,17 @@ pub mod assistant_investigation_provider;
 pub mod assistant_investigation_service;
 #[cfg(unix)]
 pub mod assistant_learning;
+#[cfg_attr(windows, allow(dead_code))]
 pub mod assistant_lifecycle;
+#[cfg_attr(windows, allow(dead_code))]
 mod assistant_maintenance;
 #[cfg(unix)]
 mod assistant_maintenance_driver;
 #[cfg(unix)]
 mod assistant_maintenance_worker;
+#[cfg_attr(windows, allow(dead_code))]
 pub mod assistant_memory;
+#[cfg_attr(windows, allow(dead_code))]
 mod assistant_method;
 #[cfg(unix)]
 mod assistant_method_controls;
@@ -44,6 +54,7 @@ mod assistant_method_controls;
 mod assistant_method_service;
 #[cfg(unix)]
 mod assistant_observation;
+#[cfg_attr(windows, allow(dead_code))]
 pub mod assistant_policy;
 mod assistant_preferences;
 #[cfg(unix)]
@@ -55,7 +66,9 @@ pub mod assistant_recovery;
 pub mod assistant_recovery_service;
 #[cfg(unix)]
 mod assistant_remote;
+#[cfg_attr(windows, allow(dead_code))]
 pub mod assistant_retention;
+#[cfg_attr(windows, allow(dead_code))]
 pub mod assistant_runtime;
 #[cfg(unix)]
 mod assistant_self_awareness;
@@ -64,10 +77,13 @@ pub mod assistant_service;
 mod assistant_session;
 #[cfg(unix)]
 mod assistant_startup;
+#[cfg_attr(windows, allow(dead_code))]
 mod assistant_storage;
 #[cfg(unix)]
 pub mod assistant_transport;
+#[cfg_attr(windows, allow(dead_code))]
 pub mod assistant_workshop;
+#[cfg_attr(windows, allow(dead_code))]
 mod assistant_workshop_handoff;
 pub mod assistant_workshop_ui;
 #[cfg(not(windows))]
