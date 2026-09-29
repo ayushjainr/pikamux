@@ -1,4 +1,4 @@
-Pika 0.6.32 brings the persistent assistant onto the main board.
+Pika 0.6.33 brings the persistent assistant onto the main board.
 
 - Press **P** to talk to Pika. Wide terminals retain the live workstream rail;
   narrow terminals focus the conversation beneath the board header. Esc/F12

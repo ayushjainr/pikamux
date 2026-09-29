@@ -4803,8 +4803,11 @@ mod receiver_clock_tests {
         write_executable(
             &ssh,
             &format!(
-                "printf '%s\\n' {}\nPIKA_TEST_ESCAPED_PID={} PIKA_TEST_ESCAPED_RELEASE={} PIKA_TEST_ESCAPED_DONE={} exec {} --exact consult::tests::escaped_pipe_holder_fixture --ignored --nocapture",
+                "printf '%s\\n' {}\nLLVM_PROFILE_FILE={} PIKA_TEST_ESCAPED_PID={} PIKA_TEST_ESCAPED_RELEASE={} PIKA_TEST_ESCAPED_DONE={} exec {} --exact consult::tests::escaped_pipe_holder_fixture --ignored --nocapture",
                 shell_words::quote(&opened_fixture()),
+                // Cancellation can interrupt this fixture's profiler write.
+                // Product cleanup coverage stays in the parent test process.
+                shell_words::quote(&root.path().join("fixture-%p.profraw").to_string_lossy()),
                 shell_words::quote(&pid_path.to_string_lossy()),
                 shell_words::quote(&release_path.to_string_lossy()),
                 shell_words::quote(&done_path.to_string_lossy()),

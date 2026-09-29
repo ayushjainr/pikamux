@@ -2766,7 +2766,14 @@ mod tests {
                 ])
                 .env("PIKA_TEST_ESCAPED_PID", &self.pid_path)
                 .env("PIKA_TEST_ESCAPED_RELEASE", &self.release_path)
-                .env("PIKA_TEST_ESCAPED_DONE", &self.done_path);
+                .env("PIKA_TEST_ESCAPED_DONE", &self.done_path)
+                // This disposable helper may be killed during its exit. Keep
+                // its partial profiler dump out of the product coverage merge;
+                // the parent still measures every cleanup branch under test.
+                .env(
+                    "LLVM_PROFILE_FILE",
+                    self.done_path.with_extension("%p.profraw"),
+                );
             command
         }
 
