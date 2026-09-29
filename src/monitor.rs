@@ -1826,11 +1826,8 @@ impl Board {
     fn ensure_visible(&mut self, height: u16) {
         let visible = self.visible();
         let selected = self.selected_index(&visible);
-        #[cfg(unix)]
-        let list_overhead = 4;
-        #[cfg(not(unix))]
-        let list_overhead = 3;
-        let budget = usize::from(height.saturating_sub(list_overhead)).max(3);
+        // Both native and remote-client boards render the assistant entry row.
+        let budget = usize::from(height.saturating_sub(4)).max(3);
         let mut used = 0;
         let mut prior = "";
         let mut first = selected;
