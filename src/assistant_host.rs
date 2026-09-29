@@ -407,11 +407,9 @@ impl Client {
         let mut reply = Vec::new();
         // One outstanding request per connection; unsolicited/pipelined replies
         // are a protocol error, not a second action receipt.
-        let started = Instant::now();
+        // The socket's read timeout bounds each stalled read. A whole-reply
+        // deadline would reject a bounded reply that is still making progress.
         loop {
-            if started.elapsed() > Duration::from_secs(2) {
-                bail!("Assistant receipt unknown; no automatic retry");
-            }
             let mut chunk = [0; 8192];
             let count = self
                 .stream
@@ -486,6 +484,50 @@ impl Drop for Client {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn client_accepts_a_progressing_reply_beyond_two_seconds_without_replay() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server = thread::spawn(move || {
+            let mut input = std::io::BufReader::new(peer.try_clone().unwrap());
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut input, &mut line).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Request>(&line).unwrap().payload,
+                "once"
+            );
+            let mut bytes = serde_json::to_vec(&Reply {
+                protocol: PROTOCOL,
+                generation: "one".into(),
+                payload: Some(json!("complete")),
+                error: None,
+            })
+            .unwrap();
+            bytes.push(b'\n');
+            // Each read progresses before the socket idle deadline, but the
+            // complete reply crosses the old absolute two-second cutoff.
+            for piece in bytes.chunks(bytes.len().div_ceil(5)) {
+                thread::sleep(Duration::from_millis(550));
+                peer.write_all(piece).unwrap();
+            }
+            peer.set_nonblocking(true).unwrap();
+            let mut extra = [0];
+            assert_eq!(
+                peer.read(&mut extra).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        });
+        let mut client = Client {
+            stream,
+            generation: None,
+            child: None,
+        };
+        assert_eq!(client.request(json!("once")).unwrap(), "complete");
+        server.join().unwrap();
+    }
 
     #[test]
     fn partial_reply_progress_renews_idle_deadline_but_a_stalled_reader_expires() {
