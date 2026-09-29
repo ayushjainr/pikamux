@@ -2991,7 +2991,7 @@ fn refresh_assistant_cue(board: &mut Board, last: &mut Instant) -> bool {
     changed
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn assistant_entry_state(state: &str, summary: &str) -> (String, Color) {
     let (label, color) = match state {
         "investigating" => ("thinking", Color::Blue),
