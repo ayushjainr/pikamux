@@ -32,10 +32,10 @@ fn recorded_terminal(transcript: &std::path::Path, args: &[&str]) -> Command {
     let mut command = Command::new("script");
     #[cfg(target_os = "linux")]
     command
-        .args(["-q", "-e", "-c", &shell_words::join(args)])
+        .args(["-q", "-f", "-e", "-c", &shell_words::join(args)])
         .arg(transcript);
     #[cfg(not(target_os = "linux"))]
-    command.arg("-q").arg(transcript).args(args);
+    command.args(["-q", "-F"]).arg(transcript).args(args);
     command
 }
 
@@ -504,11 +504,14 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
     let socket = format!("pika-rust-receipt-{}", std::process::id());
     let _guard = IsolatedTmux(socket.clone());
     let committed = temp.path().join("committed");
-    // Keep the pane alive until the handoff is proven, with a finite watchdog.
-    // Runner speed must not determine whether the receipt can be observed.
+    let transcript = temp.path().join("receipt.out");
+    // A committed handoff precedes receipt rendering. Keep the fixture alive
+    // until the recording actually sees it, not for a guessed 300ms delay.
+    // The finite watchdog still makes a missing receipt fail the assertion.
     let pane_command = format!(
-        "n=0; while test ! -f {} && test $n -lt 300; do n=$((n + 1)); sleep 0.1; done; sleep 0.3",
-        shell_words::quote(committed.to_str().unwrap())
+        "n=0; while test $n -lt 300; do if test -f {} && grep -q 'CONTINUITY PROVEN - receipt_test - ATTACHED LIVE' {} 2>/dev/null; then break; fi; n=$((n + 1)); sleep 0.1; done",
+        shell_words::quote(committed.to_str().unwrap()),
+        shell_words::quote(transcript.to_str().unwrap())
     );
     assert!(
         Command::new("tmux")
@@ -536,7 +539,6 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
     )
     .unwrap();
     let pane = tmux.get_pane("pika-c-receipt").unwrap().unwrap();
-    let transcript = temp.path().join("receipt.out");
     let trace = temp.path().join("tmux.trace");
     let adapter = temp.path().join("tmux-receipt-adapter");
     fs::write(

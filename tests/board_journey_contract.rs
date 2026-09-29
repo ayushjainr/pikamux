@@ -1210,10 +1210,14 @@ fn help_and_usage_are_real_board_actions_with_a_return_path() {
 #[test]
 fn unwatch_can_be_cancelled_and_then_confirmed_without_leaving_the_board() {
     let mut board = BoardProcess::start();
+    board.await_text("x unwatch");
     board.send(b"x");
     board.await_text("Stop watching audit_saved");
+    board.await_text("Esc cancel");
     board.send(b"\x1b");
-    board.await_text("audit_saved");
+    // The name also exists in a still-buffered confirmation frame. Wait for
+    // the restored controls before sending x, or it can confirm the old dialog.
+    board.await_text("x unwatch");
     let store = Store::at(board.root.path().join("state/pika.db"));
     let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     assert!(
