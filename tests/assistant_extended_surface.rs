@@ -166,7 +166,7 @@ impl Host {
             "host exceeded the reply wire bound"
         );
         serde_json::from_str(&reply)
-            .unwrap_or_else(|error| panic!("invalid host reply: {error}: {reply}"))
+            .unwrap_or_else(|error| panic!("invalid host reply: {error} ({} bytes)", reply.len()))
     }
 
     fn request(&mut self, payload: Value) -> Value {

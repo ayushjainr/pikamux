@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.33 — Your persistent assistant, at home on the board
+## 0.6.34 — Your persistent assistant, at home on the board
 
 - Talk to Pika with `P` on the main board, alongside its live filtered workstream
   rail, or through `pika pika`. Both reuse the selected assistant profile,

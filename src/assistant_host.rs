@@ -285,7 +285,10 @@ impl View {
     fn write_output(&mut self) -> Result<()> {
         match self.stream.write(&self.output[self.written..]) {
             Ok(0) => bail!("View closed"),
-            Ok(count) => self.written += count,
+            Ok(count) => {
+                self.written += count;
+                self.touched = Instant::now();
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error.into()),
         }
@@ -483,6 +486,80 @@ impl Drop for Client {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn partial_reply_progress_renews_idle_deadline_but_a_stalled_reader_expires() {
+        use std::os::fd::AsRawFd;
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let size: libc::c_int = 4096;
+        // Only this disposable socket: force partial writes on every host.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    writer.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&size) as _,
+                )
+            },
+            0
+        );
+        let expected = vec![b'x'; MAX_REPLY];
+        let mut view = View {
+            stream: writer,
+            input: Vec::new(),
+            output: expected.clone(),
+            written: 0,
+            touched: Instant::now() - Duration::from_secs(3),
+        };
+        let mut received = Vec::new();
+        let mut pieces = 0;
+        while !view.output.is_empty() {
+            assert!(pieces < MAX_REPLY, "reply stopped making progress");
+            // Model a delayed scheduling interval, without a flaky wall-clock sleep.
+            view.touched = Instant::now() - Duration::from_secs(3);
+            let before = view.written;
+            view.tick("test", &mut |_| panic!("no request may be replayed"))
+                .unwrap();
+            assert!(view.written > before);
+            assert!(view.touched.elapsed() < Duration::from_secs(2));
+            let mut chunk = [0; 8192];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => panic!("reader closed before reply completed"),
+                    Ok(n) => received.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            pieces += 1;
+        }
+        assert!(pieces > 1, "fixture must exercise partial output");
+        assert_eq!(received, expected);
+
+        view.output = expected;
+        view.written = 0;
+        loop {
+            let before = view.written;
+            view.write_output().unwrap();
+            assert!(!view.output.is_empty(), "fixture must fill the socket");
+            if view.written == before {
+                break;
+            }
+        }
+        view.touched = Instant::now() - Duration::from_secs(3);
+        let error = view
+            .tick("test", &mut |_| panic!("no request expected"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Slow or incomplete assistant frame")
+        );
+    }
 
     #[test]
     fn attachment_hello_is_inert_and_pins_the_serving_generation() {
