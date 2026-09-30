@@ -556,6 +556,7 @@ pub(crate) fn run_activity_view(
 }
 
 /// The same exact rows and ordering, without previews or auxiliary board panels.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn run_thread_list(
     source: &crate::activity_feed::Source,
     current: &(Provider, String),
@@ -2152,6 +2153,7 @@ impl Board {
         Ok(())
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn focus_current_thread(&mut self, current: &(Provider, String)) {
         if let Some(item) = self.items.iter().find(|item| {
             item.node_id.is_none()
@@ -2162,6 +2164,7 @@ impl Board {
         }
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn thread_key(&mut self, key: KeyEvent) -> Option<BoardAction> {
         match key.code {
             KeyCode::Up
@@ -2175,6 +2178,7 @@ impl Board {
         }
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn draw_threads(&self, output: &mut impl Write, width: u16, height: u16) -> Result<()> {
         let mut frame = Vec::new();
         queue!(

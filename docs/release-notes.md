@@ -1,4 +1,4 @@
-Pika 0.6.35 improves native navigation, terminal colors and connection UX.
+Pika 0.6.36 improves native navigation, terminal colors and connection UX.
 
 - **F12 once** opens a compact thread list beside the agent. Arrows and Enter
   select an exact conversation; Escape closes the list. **F12 again** returns

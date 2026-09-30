@@ -38,6 +38,7 @@ impl Screen {
     }
 
     /// Reuse setup's choices inside an already-owned alternate screen.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn embedded() -> Self {
         Self {
             active: true,

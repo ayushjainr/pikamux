@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.6.35 — Native navigation and clearer connections
+## 0.6.36 — Native navigation and clearer connections
+
+Version 0.6.35 was not published: Windows-only unused native-host helpers failed
+the warnings-as-errors build. 0.6.36 retains strict checks on hosting platforms
+and narrowly marks those helpers unused on the Windows client.
 
 - Press F12 once for a compact thread list beside the native agent; press it
   again to return to the original board. Exact switching reuses the shared feed,

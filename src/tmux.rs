@@ -61,6 +61,7 @@ fn return_navigation_action(mouse: bool) -> String {
     ])
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn valid_return_origin(value: &str) -> bool {
     value == "detach"
         || value
@@ -102,6 +103,7 @@ pub struct Tmux {
     client_name: Option<String>,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) struct ThreadHandoff {
     client: String,
     pid: u32,
@@ -117,6 +119,7 @@ struct ThreadOrigin {
     target: String,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl ThreadOrigin {
     fn matches(&self, client: &str, created: u64) -> bool {
         self.client == client && self.created == created
@@ -837,6 +840,7 @@ impl Tmux {
     }
 
     /// Mask provider identity before the companion subscribes to observation.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn prepare_threads_view(&self, origin: &str) -> Result<Pane> {
         let (pane, grant) = self.companion_grant(origin, Companion::Threads)?;
         let viewer = std::env::var("TMUX_PANE").context("Threads requires a companion terminal")?;
@@ -864,6 +868,7 @@ impl Tmux {
         Ok((pane, grant))
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn set_threads_zoom(&self, zoom: bool) -> Result<()> {
         let viewer = std::env::var("TMUX_PANE")?;
         if !valid_pane_id(&viewer)
@@ -889,6 +894,7 @@ impl Tmux {
         Ok(())
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn with_remote_threads<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
         let viewer = std::env::var("TMUX_PANE")?;
         if !valid_pane_id(&viewer)
@@ -948,6 +954,7 @@ impl Tmux {
 
     /// Borrow the retained board's feed and original return route for this
     /// exact client. Neither belongs to the short-lived companion view.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn thread_handoff(&self, origin: &str) -> Result<ThreadHandoff> {
         let viewer = std::env::var("TMUX_PANE")?;
         let format = [
@@ -1001,6 +1008,7 @@ impl Tmux {
         })
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn for_thread_handoff(&self, handoff: &ThreadHandoff) -> Self {
         Self {
             client_name: Some(handoff.client.clone()),
@@ -1008,10 +1016,12 @@ impl Tmux {
         }
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn return_remote_handoff(&self, handoff: &ThreadHandoff) -> Result<()> {
         self.return_to_board(&std::env::var("TMUX_PANE")?, &handoff.client)
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn borrow_board_feed(&self, origin: &str, pid: u32) -> Result<Option<String>> {
         let cached = self.output(
             ["show-options", "-qv", "-t", origin, "@pika_board_clients"],
@@ -1028,6 +1038,7 @@ impl Tmux {
             .map(|(_, token)| token.clone()))
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn return_to_board(&self, target: &str, client: &str) -> Result<()> {
         if !valid_pane_id(target) {
             bail!("The opening terminal changed");
@@ -1064,6 +1075,7 @@ impl Tmux {
         Ok(())
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn switch_back_to_board(&self, client: &str, route: Option<&str>, last: &str) -> Result<()> {
         match route {
             Some("detach") => {
@@ -1082,6 +1094,7 @@ impl Tmux {
         Ok(())
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn thread_origins(&self, pane: &str) -> Result<BTreeMap<u32, ThreadOrigin>> {
         let out = self.output(
             ["show-options", "-qv", "-t", pane, "@pika_threads_origins"],
@@ -1096,6 +1109,7 @@ impl Tmux {
         Ok(routes)
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn finish_thread_handoff(&self, handoff: &ThreadHandoff) -> Result<()> {
         let format = [
             "#{client_name}",
