@@ -46,7 +46,7 @@
       28
     ],
     "src/cli.rs::setup_screen": [
-      136
+      109
     ],
     "src/cli.rs::wait": [
       16
@@ -61,7 +61,7 @@
       21
     ],
     "src/client_cli.rs::home": [
-      44
+      26
     ],
     "src/client_cli.rs::run_with": [
       26
@@ -143,13 +143,13 @@
       65
     ],
     "src/files_view.rs::handle_key": [
-      23
+      21
     ],
     "src/files_view.rs::handle_mouse": [
       29
     ],
     "src/files_view.rs::render": [
-      96
+      94
     ],
     "src/files_view.rs::run": [
       16
@@ -224,7 +224,7 @@
       46
     ],
     "src/monitor.rs::draw_frame": [
-      55
+      38
     ],
     "src/monitor.rs::draw_quota": [
       17
@@ -267,7 +267,7 @@
       21
     ],
     "src/providers.rs::claude_records": [
-      42
+      41
     ],
     "src/providers.rs::claude_transcript_paths": [
       16
@@ -355,12 +355,6 @@
     ],
     "src/tmux.rs::configure_return_navigation": [
       17
-    ],
-    "src/tmux.rs::open_files_companion": [
-      19
-    ],
-    "src/tmux.rs::open_files_locked": [
-      20
     ],
     "src/update.rs::discover_managed_install": [
       19

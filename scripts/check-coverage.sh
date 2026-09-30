@@ -18,9 +18,10 @@ mkdir -p "$report_dir"
 # cargo-llvm-cov's default clean_partial (deliberately no --no-clean).
 rm -f -- "$report_dir/summary.md" "$report_dir/coverage.json" "$report_dir/html/index.html"
 wrapper="$repo_dir/scripts/with-test-home.sh"
-"$wrapper" cargo "+$toolchain" llvm-cov --branch --locked --no-report \
+"$wrapper" env -u PIKA_DB_PATH -u PIKA_UPDATE_CHECK cargo "+$toolchain" llvm-cov --branch --locked --no-report \
   --lib --test hooks_contract --test store_contract --test board_journey_contract \
   --test real_tmux_contract --test identity_safety_contract --test terminal_signal_contract \
+  --test onboarding_journey_contract --test terminal_color_contract --test cli_smoke \
   -- --test-threads=1
 # Reuse the same run's profiles for both reports. Do not mask failed tests.
 "$wrapper" cargo "+$toolchain" llvm-cov report --json --output-path "$report_dir/coverage.json"

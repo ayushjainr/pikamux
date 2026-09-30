@@ -173,7 +173,9 @@ impl CodexTransport {
     /// Start only an explicitly isolated provider process. This does not
     /// provision a login; the operator must separately approve and populate
     /// the isolated Codex home before using a real provider account.
-    pub fn spawn(config: TransportConfig) -> Result<Self, TransportError> {
+    pub fn spawn(mut config: TransportConfig) -> Result<Self, TransportError> {
+        config.validate()?;
+        config.executable = native_executable(&config.executable)?;
         config.validate()?;
         let mut child = spawn_provider(&config)?;
         let stdin = child
@@ -235,8 +237,14 @@ impl CodexTransport {
             match self
                 .frames
                 .recv_timeout(remaining)
-                .map_err(|_| TransportError::Rpc("RPC response timeout".into()))??
-            {
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => {
+                        TransportError::Rpc("RPC response timeout".into())
+                    }
+                    mpsc::RecvTimeoutError::Disconnected => {
+                        TransportError::Rpc("Codex closed the connection before replying".into())
+                    }
+                })?? {
                 Frame {
                     id: Some(response_id),
                     result,
@@ -295,6 +303,51 @@ impl CodexTransport {
         }
         Ok(())
     }
+}
+
+/// Use the native payload from this exact npm package, not ambient system Node.
+fn native_executable(executable: &Path) -> Result<PathBuf, TransportError> {
+    let package = executable.parent().and_then(Path::parent);
+    if executable.file_name().is_none_or(|name| name != "codex.js")
+        || package.is_none_or(|path| !path.ends_with("@openai/codex"))
+    {
+        return Ok(executable.to_path_buf());
+    }
+    let (platform, target) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => ("codex-linux-x64", "x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
+        ("macos", "x86_64") => ("codex-darwin-x64", "x86_64-apple-darwin"),
+        ("macos", "aarch64") => ("codex-darwin-arm64", "aarch64-apple-darwin"),
+        _ => {
+            return Err(TransportError::Isolation(
+                "Unsupported Codex package platform".into(),
+            ));
+        }
+    };
+    let package = package.expect("package checked");
+    let relative = format!("vendor/{target}/bin/codex");
+    let candidates = [
+        package
+            .join("node_modules/@openai")
+            .join(platform)
+            .join(&relative),
+        package
+            .parent()
+            .expect("scoped package")
+            .join(platform)
+            .join(&relative),
+        package.join(&relative),
+    ];
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            TransportError::Isolation(
+                "Codex's native executable is missing. Reinstall Codex and reconnect Pika".into(),
+            )
+        })?
+        .canonicalize()
+        .map_err(Into::into)
 }
 
 fn spawn_provider(config: &TransportConfig) -> Result<Child, TransportError> {
@@ -746,6 +799,68 @@ mod tests {
             codex_home: home,
             scratch,
         }
+    }
+
+    #[test]
+    fn exited_provider_is_not_reported_as_a_timeout() {
+        use crate::assistant_provider::RpcTransport;
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("exits");
+        fs::write(&executable, "#!/bin/sh\nread line\nexit 42\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut transport = CodexTransport::spawn(config(root.path(), executable)).unwrap();
+        let start = Instant::now();
+        let error = transport
+            .request("initialize", json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("closed the connection"), "{error}");
+        assert!(!error.contains("timeout"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn npm_launcher_uses_its_bundled_native_payload_without_system_node() {
+        use crate::assistant_provider::RpcTransport;
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("node_modules/@openai/codex");
+        let launcher = package.join("bin/codex.js");
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        fs::write(&launcher, "#!/bin/sh\nexit 99\n").unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            native_executable(&launcher).is_err(),
+            "missing payload must not fall back to Node"
+        );
+        for target in [
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+        ] {
+            let native = package.join(format!("vendor/{target}/bin/codex"));
+            fs::create_dir_all(native.parent().unwrap()).unwrap();
+            fs::write(
+                &native,
+                "#!/bin/sh\nread line\nprintf '%s\\n' '{\"id\":1,\"result\":{\"native\":true}}'\n",
+            )
+            .unwrap();
+            fs::set_permissions(&native, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let selected = native_executable(&launcher).unwrap();
+        let mut transport = CodexTransport::spawn(config(root.path(), launcher)).unwrap();
+        assert_eq!(
+            transport.request("initialize", json!({})).unwrap()["native"],
+            true
+        );
+        // Resolving the wrapper cannot bypass the executable ownership/mode check.
+        fs::set_permissions(&selected, fs::Permissions::from_mode(0o777)).unwrap();
+        let invalid = TransportConfig {
+            executable: selected,
+            codex_home: root.path().join("codex-home"),
+            scratch: root.path().join("scratch"),
+        };
+        assert!(CodexTransport::spawn(invalid).is_err());
     }
 
     #[test]

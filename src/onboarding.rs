@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthChar;
 pub(crate) struct Screen {
     active: bool,
     color: bool,
+    owns_terminal: bool,
 }
 
 impl Screen {
@@ -21,6 +22,7 @@ impl Screen {
         let screen = Self {
             active,
             color: std::env::var_os("NO_COLOR").is_none(),
+            owns_terminal: active,
         };
         if active {
             terminal::enable_raw_mode()?;
@@ -33,6 +35,15 @@ impl Screen {
             )?;
         }
         Ok(screen)
+    }
+
+    /// Reuse setup's choices inside an already-owned alternate screen.
+    pub(crate) fn embedded() -> Self {
+        Self {
+            active: true,
+            color: std::env::var_os("NO_COLOR").is_none(),
+            owns_terminal: false,
+        }
     }
 
     pub(crate) fn active(&self) -> bool {
@@ -58,9 +69,9 @@ impl Screen {
         let mut selected = vec![false; choices.len()];
         loop {
             let footer: String = if multiple {
-                "Space select · Enter next · d details · Esc skip".into()
+                "Space select · Enter next · F1 help · Esc back".into()
             } else {
-                "↑↓ move · Enter choose · d details · Esc back".into()
+                "Enter choose · F1 help · d details · Esc back".into()
             };
             self.paint(title, body, choices, focused, &selected, multiple, &footer)?;
             match event::read()? {
@@ -75,13 +86,9 @@ impl Screen {
                         continue;
                     }
                     match key.code {
-                        KeyCode::Char('d') => self.details(
-                            title,
-                            &format!(
-                                "{body}\n\n{}",
-                                choices.get(focused).map(String::as_str).unwrap_or("")
-                            ),
-                        )?,
+                        KeyCode::F(1) | KeyCode::Char('d') => {
+                            self.selection_details(key.code, title, body, choices.get(focused))?
+                        }
                         KeyCode::Up | KeyCode::Char('k') => focused = focused.saturating_sub(1),
                         KeyCode::Down | KeyCode::Char('j') => {
                             focused = (focused + 1).min(choices.len().saturating_sub(1));
@@ -109,6 +116,23 @@ impl Screen {
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn selection_details(
+        &self,
+        key: KeyCode,
+        title: &str,
+        body: &str,
+        selected: Option<&String>,
+    ) -> Result<()> {
+        if key == KeyCode::F(1) {
+            self.details("Help", "Up/Down moves between choices.\nEnter chooses the highlighted action. Space selects machines when offered.\nd shows Details. Esc goes back without approving a change.")
+        } else {
+            self.details(
+                title,
+                &format!("{body}\n\n{}", selected.map(String::as_str).unwrap_or("")),
+            )
         }
     }
 
@@ -232,7 +256,7 @@ impl Screen {
 
 impl Drop for Screen {
     fn drop(&mut self) {
-        if self.active {
+        if self.owns_terminal {
             let _ = execute!(
                 io::stdout(),
                 ResetColor,

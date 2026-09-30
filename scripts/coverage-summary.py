@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 import sys
 
-FILES = ("core.rs", "store.rs", "hooks.rs", "process.rs", "tmux.rs", "cli.rs")
+FILES = ("core.rs", "store.rs", "hooks.rs", "process.rs", "tmux.rs", "cli.rs",
+         "terminal.rs", "onboarding.rs", "monitor.rs")
 
 
 def summarize(document):

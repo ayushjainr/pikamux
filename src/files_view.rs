@@ -88,6 +88,8 @@ struct State {
     dirty: bool,
     changed_only: bool,
     git_rx: Option<GitTask>,
+    help: bool,
+    help_scroll: usize,
 }
 
 struct GitTask {
@@ -124,6 +126,8 @@ impl State {
         let entries = files_data::list_dir(&project).context("list project directory")?;
         let (git_rx, snapshot) = start_git_snapshot(project.clone());
         Ok(Self {
+            help: false,
+            help_scroll: 0,
             project: project.clone(),
             current: project,
             entries,
@@ -495,9 +499,9 @@ pub fn run(project: PathBuf) -> Result<i32> {
                 state.dragging_divider = false;
                 state.dirty = true;
             }
-            Event::Mouse(mouse) => handle_mouse(&mut state, mouse),
+            Event::Mouse(mouse) => dispatch_mouse(&mut state, mouse),
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if handle_key(&mut state, key) {
+                if dispatch_key(&mut state, key) {
                     break Ok(0);
                 }
             }
@@ -525,12 +529,36 @@ fn start_git_snapshot(project: PathBuf) -> (GitTask, GitSnapshot) {
     (GitTask { rx, cancel, worker }, fallback)
 }
 
-fn handle_key(state: &mut State, key: KeyEvent) -> bool {
-    state.dragging_divider = false;
+fn dispatch_key(state: &mut State, key: KeyEvent) -> bool {
     if key.modifiers.contains(event::KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
     }
+    if state.help {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) | KeyCode::Char('?' | 'q') => {
+                state.help = false
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                state.help_scroll = (state.help_scroll + 1).min(12)
+            }
+            KeyCode::Up | KeyCode::PageUp => {
+                state.help_scroll = state.help_scroll.saturating_sub(1)
+            }
+            _ => {}
+        }
+        state.dirty = true;
+        return false;
+    }
+    handle_key(state, key)
+}
+
+fn handle_key(state: &mut State, key: KeyEvent) -> bool {
+    state.dragging_divider = false;
     match key.code {
+        KeyCode::F(1) | KeyCode::Char('?') => {
+            state.help = true;
+            state.help_scroll = 0;
+        }
         KeyCode::Esc | KeyCode::Char('q') => return true,
         KeyCode::Tab => {
             state.focus = if state.focus == Focus::Tree {
@@ -644,6 +672,12 @@ fn handle_key(state: &mut State, key: KeyEvent) -> bool {
         state.reveal_tree_selection();
     }
     false
+}
+
+fn dispatch_mouse(state: &mut State, mouse: MouseEvent) {
+    if !state.help {
+        handle_mouse(state, mouse);
+    }
 }
 
 fn handle_mouse(state: &mut State, mouse: MouseEvent) {
@@ -763,10 +797,7 @@ fn render(state: &mut State, (w, h): (u16, u16)) -> Result<Vec<u8>> {
     for y in 0..h {
         queue!(frame, MoveTo(0, y), Clear(ClearType::CurrentLine))?;
     }
-    if w < 30 || h < 8 {
-        if h > 0 {
-            cell(&mut frame, 0, 0, w, "q close · Files · enlarge pane")?;
-        }
+    if draw_files_overlay(&mut frame, state, w, h)? {
         queue!(frame, EndSynchronizedUpdate)?;
         return Ok(frame);
     }
@@ -996,10 +1027,56 @@ fn render(state: &mut State, (w, h): (u16, u16)) -> Result<Vec<u8>> {
         0,
         h - 1,
         w,
-        &format!("q close · {tree_key} · {keys}"),
+        &format!("Esc close · F1 help · {tree_key} · {keys}"),
     )?;
     queue!(frame, EndSynchronizedUpdate)?;
     Ok(frame)
+}
+
+fn draw_files_overlay(
+    frame: &mut impl Write,
+    state: &State,
+    width: u16,
+    height: u16,
+) -> Result<bool> {
+    if width < 30 || height < 8 {
+        if height > 0 {
+            cell(frame, 0, 0, width, "Esc close · Files · enlarge pane")?;
+        }
+        return Ok(true);
+    }
+    if state.help {
+        draw_files_help(frame, width, height, state.help_scroll)?;
+    }
+    Ok(state.help)
+}
+
+fn draw_files_help(frame: &mut impl Write, width: u16, height: u16, scroll: usize) -> Result<()> {
+    cell(frame, 0, 0, width, "Files · Help")?;
+    let lines = [
+        "Read-only. Closing Files keeps your agent running.",
+        "Enter · open selected file or directory",
+        "Tab · switch between tree and file",
+        "Up/Down · move or scroll; PageUp/PageDown · page",
+        "t · hide or show tree; drag its edge to resize",
+        "w · wrap lines or enable horizontal scrolling",
+        "Left/Right · pan unwrapped text",
+        "m · Markdown rendered/source",
+        "d · file diff; c · changed files",
+        "u / Backspace · parent directory",
+        "b · back to original project; r · refresh",
+        "Mouse wheel · scroll the hovered pane",
+        "Esc / q · close Files (outside Help)",
+    ];
+    for (index, line) in lines
+        .iter()
+        .skip(scroll)
+        .take(height.saturating_sub(3) as usize)
+        .enumerate()
+    {
+        cell(frame, 0, index as u16 + 1, width, line)?;
+    }
+    cell(frame, 0, height - 1, width, "Esc back · Up/Down scroll")
 }
 
 fn cell(out: &mut impl Write, x: u16, y: u16, width: u16, text: &str) -> Result<()> {
@@ -1060,6 +1137,42 @@ fn clip(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn help_is_a_reversible_layer_without_changing_the_open_file() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("code.rs"), "fn main() {}\n").unwrap();
+        let mut state = State::new(temp.path().to_path_buf()).unwrap();
+        state.open_selected();
+        let original = (state.current.clone(), state.text.clone(), state.selected);
+        let key = |code| KeyEvent::new(code, event::KeyModifiers::NONE);
+        assert!(!dispatch_key(&mut state, key(KeyCode::F(1))));
+        for width in [30, 60, 120] {
+            let frame = render(&mut state, (width, 24)).unwrap();
+            let text = String::from_utf8(frame).unwrap();
+            assert!(text.contains("Files"));
+            assert!(text.contains("Esc back"));
+        }
+        dispatch_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 3,
+                modifiers: event::KeyModifiers::NONE,
+            },
+        );
+        assert!(!dispatch_key(&mut state, key(KeyCode::PageDown)));
+        assert!(!dispatch_key(&mut state, key(KeyCode::Esc)));
+        assert!(!state.help);
+        assert_eq!(
+            (state.current.clone(), state.text.clone(), state.selected),
+            original
+        );
+        assert!(
+            dispatch_key(&mut state, key(KeyCode::Esc)),
+            "second Escape closes Files"
+        );
+    }
     #[test]
     fn controls_are_removed_from_names() {
         assert_eq!(clean("a\n\tb"), "a��b");
@@ -1135,7 +1248,7 @@ mod tests {
         for size in [(120, 32), (60, 20), (32, 8), (10, 2)] {
             let frame = String::from_utf8(render(&mut state, size).unwrap()).unwrap();
             assert!(!frame.contains("\x1b]52"));
-            assert!(frame.contains("q close"));
+            assert!(frame.contains("Esc close"));
             assert!(frame.ends_with("\x1b[?2026l"));
         }
     }
@@ -1150,19 +1263,19 @@ mod tests {
         let original = state.text.clone();
         render(&mut state, (40, 12)).unwrap();
         assert!(state.rows.len() > 20);
-        handle_key(&mut state, KeyCode::PageDown.into());
+        dispatch_key(&mut state, KeyCode::PageDown.into());
         assert_eq!(state.scroll, 6);
         render(&mut state, (40, 12)).unwrap();
         assert_eq!(
             state.scroll, 6,
             "ordinary render must not reset visual scroll"
         );
-        handle_key(&mut state, KeyCode::End.into());
+        dispatch_key(&mut state, KeyCode::End.into());
         assert_eq!(state.scroll, state.rows.len() - 6);
         let anchor = state.rows[state.scroll].source_line;
         render(&mut state, (60, 12)).unwrap();
         assert_eq!(state.rows[state.scroll].source_line, anchor);
-        handle_key(&mut state, KeyCode::Char('w').into());
+        dispatch_key(&mut state, KeyCode::Char('w').into());
         render(&mut state, (60, 12)).unwrap();
         assert!(!state.wrap);
         assert_eq!(state.rows.len(), 2);
@@ -1181,11 +1294,11 @@ mod tests {
         let rich = String::from_utf8(render(&mut state, (90, 20)).unwrap()).unwrap();
         assert!(rich.contains("Rendered"));
         assert!(!rich.contains("**bold**"));
-        handle_key(&mut state, KeyCode::Char('m').into());
+        dispatch_key(&mut state, KeyCode::Char('m').into());
         let raw = String::from_utf8(render(&mut state, (90, 20)).unwrap()).unwrap();
         assert!(raw.contains("Source"));
         assert!(raw.contains("**bold**"));
-        handle_key(&mut state, KeyCode::Char('m').into());
+        dispatch_key(&mut state, KeyCode::Char('m').into());
         assert!(state.rendered_markdown());
         state.mode = ViewMode::Diff;
         assert!(!state.rendered_markdown());
@@ -1206,7 +1319,7 @@ mod tests {
         state.scroll = 2;
         let selected = state.selected;
         let path = state.file_path.clone();
-        handle_key(&mut state, KeyCode::Char('t').into());
+        dispatch_key(&mut state, KeyCode::Char('t').into());
         let full = String::from_utf8(render(&mut state, (120, 24)).unwrap()).unwrap();
         assert!(state.tree_hidden);
         assert_eq!(state.focus, Focus::File);
@@ -1214,31 +1327,31 @@ mod tests {
         assert!(state.layout_width > split_width);
         assert_eq!(state.rows[state.scroll].source_line, 3);
         assert!(full.contains("t show tree"));
-        handle_key(&mut state, KeyCode::Char('t').into());
+        dispatch_key(&mut state, KeyCode::Char('t').into());
         render(&mut state, (120, 24)).unwrap();
         assert!(!state.tree_hidden);
         assert_eq!(state.focus, Focus::Tree);
         assert_eq!(state.selected, selected);
         assert_eq!(state.file_path, path);
         assert_eq!(state.rows[state.scroll].source_line, 3);
-        handle_key(&mut state, KeyCode::Char('t').into());
+        dispatch_key(&mut state, KeyCode::Char('t').into());
         render(&mut state, (60, 24)).unwrap();
-        handle_key(&mut state, KeyCode::Char('t').into());
+        dispatch_key(&mut state, KeyCode::Char('t').into());
         render(&mut state, (60, 24)).unwrap();
         assert_eq!(state.focus, Focus::Tree);
-        handle_key(&mut state, KeyCode::Tab.into());
+        dispatch_key(&mut state, KeyCode::Tab.into());
         render(&mut state, (60, 24)).unwrap();
-        handle_key(&mut state, KeyCode::Char('t').into());
+        dispatch_key(&mut state, KeyCode::Char('t').into());
         assert_eq!(
             state.focus,
             Focus::Tree,
             "t reveals the auto-hidden narrow tree"
         );
         render(&mut state, (120, 24)).unwrap();
-        handle_key(&mut state, KeyCode::Char('t').into());
-        handle_key(&mut state, KeyCode::Tab.into());
+        dispatch_key(&mut state, KeyCode::Char('t').into());
+        dispatch_key(&mut state, KeyCode::Tab.into());
         assert!(!state.tree_hidden, "Tab must never focus a hidden tree");
-        handle_key(&mut state, KeyCode::Char('t').into());
+        dispatch_key(&mut state, KeyCode::Char('t').into());
         state.up();
         assert!(!state.tree_hidden, "directory navigation reveals the tree");
     }
@@ -1262,27 +1375,27 @@ mod tests {
         state.git_rx = None;
         state.text = (0..100).map(|n| format!("line {n}\n")).collect();
         render(&mut state, (120, 24)).unwrap();
-        handle_mouse(&mut state, mouse(MouseEventKind::ScrollDown, 80, 8));
+        dispatch_mouse(&mut state, mouse(MouseEventKind::ScrollDown, 80, 8));
         assert_eq!(state.scroll, 3);
         assert_eq!(state.focus, Focus::Tree);
         assert_eq!(state.tree_scroll, 0);
-        handle_mouse(&mut state, mouse(MouseEventKind::ScrollDown, 8, 8));
+        dispatch_mouse(&mut state, mouse(MouseEventKind::ScrollDown, 8, 8));
         assert_eq!(state.tree_scroll, 3);
         assert_eq!(state.scroll, 3);
         assert_eq!(state.selected, 0);
         assert!(state.file_path.is_none());
         render(&mut state, (120, 24)).unwrap();
         assert_eq!(state.tree_scroll, 3, "render must not undo mouse scrolling");
-        handle_mouse(&mut state, mouse(MouseEventKind::ScrollUp, 8, 8));
+        dispatch_mouse(&mut state, mouse(MouseEventKind::ScrollUp, 8, 8));
         assert_eq!(state.tree_scroll, 0);
-        handle_mouse(&mut state, mouse(MouseEventKind::ScrollUp, 80, 8));
+        dispatch_mouse(&mut state, mouse(MouseEventKind::ScrollUp, 80, 8));
         assert_eq!(state.scroll, 0);
         state.dirty = false;
-        handle_mouse(&mut state, mouse(MouseEventKind::Moved, 20, 8));
-        handle_mouse(&mut state, mouse(MouseEventKind::ScrollDown, 80, 23));
+        dispatch_mouse(&mut state, mouse(MouseEventKind::Moved, 20, 8));
+        dispatch_mouse(&mut state, mouse(MouseEventKind::ScrollDown, 80, 23));
         assert!(!state.dirty, "hover and footer wheel must not repaint");
-        handle_mouse(&mut state, mouse(MouseEventKind::ScrollDown, 8, 8));
-        handle_mouse(
+        dispatch_mouse(&mut state, mouse(MouseEventKind::ScrollDown, 8, 8));
+        dispatch_mouse(
             &mut state,
             mouse(MouseEventKind::Down(MouseButton::Left), 8, 2),
         );
@@ -1298,11 +1411,11 @@ mod tests {
         state.text = "first\nsecond\nthird".into();
         render(&mut state, (120, 24)).unwrap();
         state.scroll = 1;
-        handle_mouse(
+        dispatch_mouse(
             &mut state,
             mouse(MouseEventKind::Down(MouseButton::Left), 40, 8),
         );
-        handle_mouse(
+        dispatch_mouse(
             &mut state,
             mouse(MouseEventKind::Drag(MouseButton::Left), 54, 8),
         );
@@ -1310,44 +1423,44 @@ mod tests {
         assert_eq!(state.geometry().divider, Some(54));
         assert_eq!(state.layout_width, 57);
         assert_eq!(state.rows[state.scroll].source_line, 2);
-        handle_mouse(
+        dispatch_mouse(
             &mut state,
             mouse(MouseEventKind::Drag(MouseButton::Left), u16::MAX, 8),
         );
         assert_eq!(state.preferred_tree_width, Some(86));
-        handle_mouse(
+        dispatch_mouse(
             &mut state,
             mouse(MouseEventKind::Drag(MouseButton::Left), 0, 8),
         );
         assert_eq!(state.preferred_tree_width, Some(18));
-        handle_mouse(
+        dispatch_mouse(
             &mut state,
             mouse(MouseEventKind::Up(MouseButton::Left), 0, u16::MAX),
         );
-        handle_mouse(
+        dispatch_mouse(
             &mut state,
             mouse(MouseEventKind::Drag(MouseButton::Left), 60, 8),
         );
         assert_eq!(state.preferred_tree_width, Some(18));
         render(&mut state, (120, 24)).unwrap();
-        handle_mouse(
+        dispatch_mouse(
             &mut state,
             mouse(MouseEventKind::Down(MouseButton::Left), 18, 8),
         );
-        handle_key(&mut state, KeyCode::Char('t').into());
-        handle_mouse(
+        dispatch_key(&mut state, KeyCode::Char('t').into());
+        dispatch_mouse(
             &mut state,
             mouse(MouseEventKind::Drag(MouseButton::Left), 60, 8),
         );
         assert_eq!(state.preferred_tree_width, Some(18));
         render(&mut state, (120, 24)).unwrap();
         assert_eq!(state.layout_width, 113);
-        handle_key(&mut state, KeyCode::Char('t').into());
+        dispatch_key(&mut state, KeyCode::Char('t').into());
         render(&mut state, (120, 24)).unwrap();
         assert_eq!(state.geometry().divider, Some(18));
         render(&mut state, (60, 24)).unwrap();
         assert_eq!(state.geometry().divider, None);
-        handle_mouse(
+        dispatch_mouse(
             &mut state,
             mouse(MouseEventKind::Down(MouseButton::Left), 18, 1),
         );
@@ -1388,7 +1501,7 @@ mod tests {
             string_rows.concat(),
             "\"a long string whose color must survive wrapping across rows\""
         );
-        handle_key(&mut state, KeyCode::Char('w').into());
+        dispatch_key(&mut state, KeyCode::Char('w').into());
         render(&mut state, (40, 16)).unwrap();
         assert_eq!(state.rows.len(), 2);
         state.mode = ViewMode::Diff;

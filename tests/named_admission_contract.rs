@@ -6,6 +6,8 @@ use pikamux::{
     store::{LiveOwner, Store},
     tmux::Tmux,
 };
+use rusqlite::{Connection, params};
+use std::io::Write;
 use std::{fs, path::Path};
 
 fn paths(root: &Path) -> Paths {
@@ -155,6 +157,90 @@ fn first_reconcile_auto_admits_only_provider_proven_claude_personal_names() {
     let after_unwatch = pika(paths, store.clone()).reconcile_local().unwrap();
     assert!(after_unwatch.sessions.is_empty());
     assert!(store.is_untracked(Provider::Claude, named).unwrap());
+}
+
+#[test]
+fn open_board_discovers_codex_rename_then_preserves_removal_across_refresh_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let store = Store::at(paths.database.clone());
+    let board = pika(paths.clone(), store.clone());
+    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let transcript = paths.codex_home.join("thread.jsonl");
+    json_line(
+        &transcript,
+        serde_json::json!({"type":"session_meta","payload":{
+            "id":id,"source":"cli","originator":"codex-tui","thread_source":"user"
+        }}),
+    );
+    let db = Connection::open(paths.codex_home.join("state_1.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,name TEXT,cwd TEXT,rollout_path TEXT,created_at INTEGER,updated_at INTEGER,archived INTEGER);").unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES(?1,'Generated title','/project',?2,1,2,0)",
+        params![id, transcript.to_string_lossy()],
+    )
+    .unwrap();
+    let index_path = paths.codex_home.join("session_index.jsonl");
+    json_line(
+        &index_path,
+        serde_json::json!({"id":id,"thread_name":"Generated title","updated_at":1}),
+    );
+    assert!(board.reconcile_local().unwrap().sessions.is_empty());
+
+    let mut index = fs::OpenOptions::new()
+        .append(true)
+        .open(&index_path)
+        .unwrap();
+    db.execute(
+        "UPDATE threads SET name='my_project',updated_at=3 WHERE id=?1",
+        [id],
+    )
+    .unwrap();
+    writeln!(
+        index,
+        "{}",
+        serde_json::json!({"id":id,"thread_name":"my_project","updated_at":3})
+    )
+    .unwrap();
+    // Keep the same Pika service alive: restarting used to hide cache bugs in
+    // tests. Only wait for the documented discovery interval, not a model.
+    std::thread::sleep(std::time::Duration::from_millis(5_050));
+    let rows = board.clone().reconcile_local().unwrap().sessions;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session_id, id);
+    assert_eq!(rows[0].name.as_deref(), Some("my_project"));
+
+    db.execute(
+        "UPDATE threads SET name='renamed_project',updated_at=4 WHERE id=?1",
+        [id],
+    )
+    .unwrap();
+    writeln!(
+        index,
+        "{}",
+        serde_json::json!({"id":id,"thread_name":"renamed_project","updated_at":4})
+    )
+    .unwrap();
+    let rows = board.reconcile_local().unwrap().sessions;
+    assert_eq!(rows.len(), 1, "rename must not create another row");
+    assert_eq!(rows[0].name.as_deref(), Some("renamed_project"));
+
+    store.untrack_session(Provider::Codex, id).unwrap();
+    assert!(board.reconcile_local().unwrap().sessions.is_empty());
+    std::thread::sleep(std::time::Duration::from_millis(5_050));
+    assert!(
+        board.reconcile_local().unwrap().sessions.is_empty(),
+        "refresh must respect removal"
+    );
+    assert!(
+        pika(paths, store.clone())
+            .reconcile_local()
+            .unwrap()
+            .sessions
+            .is_empty(),
+        "restart must respect removal"
+    );
+    assert!(store.is_untracked(Provider::Codex, id).unwrap());
 }
 
 #[test]

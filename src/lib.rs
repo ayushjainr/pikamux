@@ -116,6 +116,7 @@ mod files_syntax;
 mod files_view;
 pub mod fleet;
 pub mod hooks;
+mod machine_settings;
 pub mod model;
 pub mod monitor;
 mod muse;

@@ -15,7 +15,7 @@ use crossterm::{
     },
 };
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     io::{self, IsTerminal, Write},
     sync::{
         Arc, Mutex,
@@ -132,6 +132,7 @@ pub(crate) struct BoardMemory {
     offset: usize,
     update_version: Option<String>,
     pub(crate) notice: Option<String>,
+    seen: BTreeSet<BoardKey>,
 }
 
 /// A one-slot channel whose producer always replaces an unpublished value.
@@ -200,6 +201,7 @@ impl FleetHealthFeed {
 #[derive(Clone, Debug, PartialEq)]
 pub enum BoardAction {
     Assistant(Option<Box<BoardItem>>),
+    Settings,
     /// Explicit discovery; handled inside the board, never by setup.
     Add,
     Open(BoardItem),
@@ -278,7 +280,7 @@ impl ActionDriver {
                 item.session.session_id
             ),
             BoardAction::Untrack(item) => format!(
-                "Stopping observation · {} · {}",
+                "Removing from board · {} · {}",
                 item.session.display_name(),
                 item.session.session_id
             ),
@@ -551,6 +553,55 @@ pub(crate) fn run_activity_view(
         Some(source.delayed()),
         (Some(fleet_health), Some(actions), memory),
     )
+}
+
+/// The same exact rows and ordering, without previews or auxiliary board panels.
+pub(crate) fn run_thread_list(
+    source: &crate::activity_feed::Source,
+    current: &(Provider, String),
+    memory: &mut BoardMemory,
+) -> Result<BoardAction> {
+    let _terminal = TerminalGuard::enter()?;
+    let initial = source.snapshot().expect("activity producer is seeded");
+    let mut board = Board::new(initial.items);
+    if memory.initialized {
+        board.restore(memory);
+    } else {
+        board.focus_current_thread(current);
+        board.action_notice = memory.notice.take();
+    }
+    let mut updates = source.subscribe();
+    let mut output = io::stdout().lock();
+    let mut presenter = FramePresenter::default();
+    loop {
+        if let Some(frame) = updates.take() {
+            board.replace_items(frame.items);
+        }
+        let (width, height) = size().unwrap_or((38, 30));
+        board.ensure_visible(height);
+        presenter.present(&mut output, (width, height), |frame| {
+            board.draw_threads(frame, width, height)
+        })?;
+        if !event::poll(Duration::from_secs(1))? {
+            continue;
+        }
+        if let Event::Key(key) = event::read()?
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                || key == KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            {
+                return Ok(BoardAction::Quit);
+            }
+            if key.code == KeyCode::Char('r') {
+                let _ = source.refresh().try_send(());
+                board.action_notice = None;
+            } else if let Some(action) = board.thread_key(key) {
+                board.remember(memory);
+                return Ok(action);
+            }
+        }
+    }
 }
 
 fn run_loop(
@@ -1221,11 +1272,14 @@ struct Board {
     client_actions: bool,
     client_updates: bool,
     confirm_untrack: Option<BoardItem>,
+    seen: BTreeSet<BoardKey>,
+    added_notice: Option<(String, Instant)>,
 }
 
 impl Board {
     fn restore(&mut self, memory: &mut BoardMemory) {
         if memory.initialized {
+            self.seen.extend(memory.seen.iter().cloned());
             self.filter.clone_from(&memory.filter);
             self.selected_key.clone_from(&memory.selected_key);
             self.offset = memory.offset;
@@ -1246,6 +1300,7 @@ impl Board {
         memory.filter.clone_from(&self.filter);
         memory.offset = self.offset;
         memory.update_version.clone_from(&self.update_version);
+        memory.seen.clone_from(&self.seen);
     }
 
     fn summary(&self) -> crate::activity_feed::Summary {
@@ -1257,6 +1312,7 @@ impl Board {
     fn new(mut items: Vec<BoardItem>) -> Self {
         sort_items(&mut items);
         let selected_key = items.first().map(BoardItem::key);
+        let seen = items.iter().map(BoardItem::key).collect();
         Self {
             assistant_entry: ("P · your assistant".into(), Color::Magenta),
             feed_summary: None,
@@ -1281,6 +1337,8 @@ impl Board {
             client_updates: false,
             confirm_untrack: None,
             preview: None,
+            seen,
+            added_notice: None,
         }
     }
 
@@ -1363,6 +1421,7 @@ impl Board {
     }
 
     fn replace_items(&mut self, mut items: Vec<BoardItem>) {
+        self.note_added(&items);
         let previous = self.selected_key.clone();
         sort_items(&mut items);
         self.items = items;
@@ -1374,6 +1433,30 @@ impl Board {
         });
         if self.selected_key.is_none() {
             self.reselect_first();
+        }
+    }
+
+    fn note_added(&mut self, items: &[BoardItem]) {
+        let added = items
+            .iter()
+            .filter(|item| {
+                self.seen.insert(item.key())
+                    && !item.stale
+                    && item.pending_token.is_none()
+                    && item
+                        .session
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| !name.trim().is_empty())
+            })
+            .collect::<Vec<_>>();
+        if !added.is_empty() {
+            let text = if added.len() == 1 {
+                format!("Added to your board · {}", added[0].session.display_name())
+            } else {
+                format!("Added to your board · {} conversations", added.len())
+            };
+            self.added_notice = Some((text, Instant::now()));
         }
     }
 
@@ -1552,7 +1635,7 @@ impl Board {
             && key.kind == KeyEventKind::Repeat
             && matches!(
                 key.code,
-                KeyCode::Enter | KeyCode::Char('x' | 'n' | 'U' | '+')
+                KeyCode::Enter | KeyCode::F(2) | KeyCode::Char('x' | 'n' | 'U' | '+')
             )
         {
             return None;
@@ -1642,9 +1725,12 @@ impl Board {
                 self.selected_key = self.visible().last().map(|item| item.key());
             }
             KeyCode::Char('/') => self.filtering = true,
-            KeyCode::Char('?') => {
+            KeyCode::Char('?') | KeyCode::F(1) => {
                 self.action_scroll = 0;
                 self.action_notice = Some(board_keys_help());
+            }
+            KeyCode::F(2) => {
+                return Some(BoardAction::Settings);
             }
             KeyCode::Char('u') => self.toggle_usage_notice(),
             KeyCode::Char('d') => {
@@ -1705,7 +1791,7 @@ impl Board {
                             )
                         } else {
                             format!(
-                                "Stop watching {} @{}?\n{} · {}\nThe agent and its conversation stay intact.\nEnter / x confirm · Esc cancel",
+                                "Remove from board · {} @{}?\n{} · {}\nThe conversation stays saved; a running agent keeps running.\nYou can add it again later.\nEnter / x remove · Esc back",
                                 item.session.display_name(),
                                 item.node_label().unwrap_or("here"),
                                 item.session.provider,
@@ -1899,78 +1985,7 @@ impl Board {
             )?;
             queue!(output, Print("\r\n"))?;
         }
-        let selected_index = self.selected_index(&visible);
-        let mut line = 2_u16;
-        let mut prior_group = "";
-        for (index, item) in visible.iter().enumerate().skip(self.offset) {
-            let session = &item.session;
-            let current_group = item_group(item);
-            if current_group != prior_group && line < height.saturating_sub(2) {
-                styled(
-                    output,
-                    group_color(current_group),
-                    false,
-                    &format!("\r\n{current_group}"),
-                )?;
-                queue!(output, Print("\r\n"))?;
-                line += 2;
-                prior_group = current_group;
-            }
-            if line >= height.saturating_sub(2) {
-                break;
-            }
-            let marker = if index == selected_index { "›" } else { " " };
-            let provider = match session.provider {
-                Provider::Codex => "C",
-                Provider::Claude => "A",
-                Provider::Opencode => "O",
-                Provider::Muse => "M",
-            };
-            let age = human_age(session.last_event_at.max(session.last_activity_at));
-            let node = item
-                .node_label()
-                .map(|value| format!(" @{value}"))
-                .unwrap_or_default();
-            let stale = if item.stale { " ◌" } else { "" };
-            let pending = if item.pending_token.is_some() {
-                if session.home_state == "startup-exited" {
-                    " startup exited"
-                } else if session.status == Status::Starting {
-                    " starting"
-                } else {
-                    " unconfirmed"
-                }
-            } else {
-                ""
-            };
-            let usable = list_width.saturating_sub(12);
-            let label = format!(
-                "{}{}{}{}",
-                self.disambiguated_name(item),
-                node,
-                pending,
-                stale
-            );
-            let row = format!(
-                "{marker} {provider} {:<width$} {age:>5}",
-                truncate(&label, usable),
-                width = usable
-            );
-            if index == selected_index {
-                queue!(output, SetAttribute(Attribute::Reverse))?;
-            }
-            styled(
-                output,
-                status_color(session.status),
-                false,
-                &fit(&row, list_width),
-            )?;
-            if index == selected_index {
-                queue!(output, SetAttribute(Attribute::NoReverse))?;
-            }
-            queue!(output, Print("\r\n"))?;
-            line += 1;
-        }
+        self.draw_thread_rows(output, list_width, height, 2)?;
 
         self.draw_empty_state(output, width, height, visible.is_empty())?;
         let add_text = self.add.as_ref().map(|panel| {
@@ -2009,6 +2024,11 @@ impl Board {
                 ChatPhase::Failed | ChatPhase::Closed => "esc return to board",
             };
             queue!(output, Print(fit(help, width)))?;
+        } else if self.confirm_untrack.is_some() {
+            queue!(
+                output,
+                Print(fit("Enter confirm · Esc back · agent keeps running", width))
+            )?;
         } else if self.action_notice.is_some() {
             queue!(
                 output,
@@ -2031,19 +2051,213 @@ impl Board {
                 ))
             )?;
         } else {
-            queue!(output, Print(fit(board_idle_help(), width)))?;
+            queue!(output, Print(fit(board_idle_help(width), width)))?;
         }
-        if let Some(health) = self.health_line()
+        self.draw_health_or_admission(output, width, height)?;
+        queue!(output, ResetColor)?;
+        Ok(())
+    }
+
+    fn draw_thread_rows(
+        &self,
+        output: &mut impl Write,
+        list_width: usize,
+        height: u16,
+        start: u16,
+    ) -> Result<()> {
+        let visible = self.visible();
+        let selected_index = self.selected_index(&visible);
+        let mut line = start;
+        let mut prior_group = "";
+        for (index, item) in visible.iter().enumerate().skip(self.offset) {
+            let current_group = item_group(item);
+            if current_group != prior_group && line < height.saturating_sub(2) {
+                styled(
+                    output,
+                    group_color(current_group),
+                    false,
+                    &format!("\r\n{current_group}"),
+                )?;
+                queue!(output, Print("\r\n"))?;
+                line += 2;
+                prior_group = current_group;
+            }
+            if line >= height.saturating_sub(2) {
+                break;
+            }
+            self.draw_thread_row(output, item, index == selected_index, list_width)?;
+            line += 1;
+        }
+        Ok(())
+    }
+
+    fn draw_thread_row(
+        &self,
+        output: &mut impl Write,
+        item: &BoardItem,
+        selected: bool,
+        list_width: usize,
+    ) -> Result<()> {
+        let session = &item.session;
+        let marker = if selected { "›" } else { " " };
+        let provider = match session.provider {
+            Provider::Codex => "C",
+            Provider::Claude => "A",
+            Provider::Opencode => "O",
+            Provider::Muse => "M",
+        };
+        let age = human_age(session.last_event_at.max(session.last_activity_at));
+        let node = item
+            .node_label()
+            .map(|value| format!(" @{value}"))
+            .unwrap_or_default();
+        let stale = if item.stale { " ◌" } else { "" };
+        let pending = if item.pending_token.is_some() {
+            if session.home_state == "startup-exited" {
+                " startup exited"
+            } else if session.status == Status::Starting {
+                " starting"
+            } else {
+                " unconfirmed"
+            }
+        } else {
+            ""
+        };
+        let usable = list_width.saturating_sub(12);
+        let label = format!(
+            "{}{}{}{}",
+            self.disambiguated_name(item),
+            node,
+            pending,
+            stale
+        );
+        let row = format!(
+            "{marker} {provider} {:<width$} {age:>5}",
+            truncate(&label, usable),
+            width = usable
+        );
+        if selected {
+            queue!(output, SetAttribute(Attribute::Reverse))?;
+        }
+        styled(
+            output,
+            status_color(session.status),
+            false,
+            &fit(&row, list_width),
+        )?;
+        if selected {
+            queue!(output, SetAttribute(Attribute::NoReverse))?;
+        }
+        queue!(output, Print("\r\n"))?;
+        Ok(())
+    }
+
+    fn focus_current_thread(&mut self, current: &(Provider, String)) {
+        if let Some(item) = self.items.iter().find(|item| {
+            item.node_id.is_none()
+                && item.session.provider == current.0
+                && item.key().2 == current.1
+        }) {
+            self.selected_key = Some(item.key());
+        }
+    }
+
+    fn thread_key(&mut self, key: KeyEvent) -> Option<BoardAction> {
+        match key.code {
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::Enter => self.key(key, None),
+            _ => None,
+        }
+    }
+
+    fn draw_threads(&self, output: &mut impl Write, width: u16, height: u16) -> Result<()> {
+        let mut frame = Vec::new();
+        queue!(
+            frame,
+            SetAttribute(Attribute::Reset),
+            ResetColor,
+            MoveTo(0, 0),
+            Clear(ClearType::All)
+        )?;
+        styled(
+            &mut frame,
+            Color::Magenta,
+            true,
+            &fit("PIKA · Threads", usize::from(width)),
+        )?;
+        queue!(frame, Print("\r\n"))?;
+        self.draw_thread_rows(&mut frame, usize::from(width), height, 1)?;
+        if self.items.is_empty() && height > 5 {
+            queue!(
+                frame,
+                MoveTo(0, 3),
+                Print(fit("No threads on this board yet.", usize::from(width)))
+            )?;
+        }
+        if let Some(notice) = &self.action_notice {
+            queue!(
+                frame,
+                MoveTo(0, height.saturating_sub(3)),
+                SetForegroundColor(Color::Yellow),
+                Print(fit(
+                    &crate::fleet::sanitize_terminal_text(notice),
+                    usize::from(width)
+                ))
+            )?;
+        }
+        queue!(
+            frame,
+            MoveTo(0, height.saturating_sub(2)),
+            SetForegroundColor(Color::DarkGrey),
+            Print(fit(
+                "↑↓ select · Enter open · Esc close",
+                usize::from(width)
+            )),
+            MoveTo(0, height.saturating_sub(1)),
+            Print(fit("Press again: full board", usize::from(width))),
+            ResetColor
+        )?;
+        if std::env::var_os("NO_COLOR").is_some() {
+            output.write_all(&without_colors(&frame))?;
+        } else {
+            output.write_all(&frame)?;
+        }
+        Ok(())
+    }
+
+    fn draw_health_or_admission(
+        &self,
+        output: &mut impl Write,
+        width: usize,
+        height: u16,
+    ) -> Result<()> {
+        let health = self.health_line();
+        let color = if health.is_some() {
+            Color::DarkYellow
+        } else {
+            Color::DarkGrey
+        };
+        let bottom = health.or_else(|| {
+            self.added_notice
+                .as_ref()
+                .filter(|(_, at)| at.elapsed() < Duration::from_secs(6))
+                .map(|(text, _)| text.clone())
+        });
+        if let Some(health) = bottom
             && height > 1
         {
             queue!(
                 output,
                 MoveTo(0, height - 1),
-                SetForegroundColor(Color::DarkYellow),
+                SetForegroundColor(color),
                 Print(fit(&health, width))
             )?;
         }
-        queue!(output, ResetColor)?;
         Ok(())
     }
 
@@ -2057,19 +2271,7 @@ impl Board {
         if !empty || self.action_notice.is_some() || self.chat.is_some() || self.add.is_some() {
             return Ok(());
         }
-        let lines = if !self.filter.is_empty() {
-            [
-                "No conversations match this filter.",
-                "Press Esc to see all your work.",
-                "",
-            ]
-        } else {
-            [
-                "Your board is ready for your work.",
-                "Run pika NAME to find or start a conversation.",
-                "Press + to add an existing conversation. Setup connects machines.",
-            ]
-        };
+        let lines = self.empty_state_lines();
         for (index, text) in lines.iter().enumerate() {
             if 3 + index < height.saturating_sub(2) as usize {
                 queue!(output, MoveTo(0, 3 + index as u16))?;
@@ -2086,6 +2288,28 @@ impl Board {
             }
         }
         Ok(())
+    }
+
+    fn empty_state_lines(&self) -> [&str; 3] {
+        if !self.filter.is_empty() {
+            [
+                "No conversations match this filter.",
+                "Esc clears the filter and shows your board.",
+                "F1 help · F2 settings",
+            ]
+        } else if self.local_refresh_delayed || !self.fleet_health.is_empty() {
+            [
+                "Your conversations are unavailable right now.",
+                "r retry · F2 settings for your machines",
+                "This is not a complete inventory. Connection details are below.",
+            ]
+        } else {
+            [
+                "No conversations on this board yet.",
+                "+ find a conversation · F2 connect a machine",
+                "Named conversation missing? Use +, or pika NAME for an exact lookup.",
+            ]
+        }
     }
 
     fn quota_height(&self, width: u16, height: u16) -> u16 {
@@ -2940,13 +3164,23 @@ fn draw_status_summary(
     Ok(())
 }
 
-fn board_idle_help() -> &'static str {
-    "+ add · ↑↓ move · enter open · P Pika · p peek · a ask · x unwatch · / filter · ? keys · q leave"
+fn board_idle_help(width: usize) -> &'static str {
+    match width {
+        0..=49 => "Enter open · F1 help · q leave",
+        50..=79 => "Enter open · P Pika · F2 settings · F1 help · q leave",
+        _ => "Enter open · + find · P Pika · x remove · F1 help · F2 settings · q leave",
+    }
 }
 
 fn board_keys_help() -> String {
     let base = "PIKA KEYS\n\n+ · add an existing conversation; choose machine, search, confirm\n↑↓ / j k · select a conversation\nEnter · open the selected exact conversation\np · preview live Pika pane output; unread preserved\na · private expert consultation in this panel\nd · identity details and full expert card\nx · stop watching, after confirmation; agent stays intact\nn · open the oldest attention item\n/ · filter by name or machine\nr · refresh observations\nu · cumulative usage for the selected conversation\nU · review an available update\nPageUp / PageDown · scroll a preview or help\nEsc · dismiss panel or clear filter\nq · leave Pika\n\nInside an agent: use the visible Pika return control.\nPrivate consultation: Enter sends, Ctrl+J adds a newline,\nCtrl+U clears the draft, Esc closes the private side.";
-    format!("{base}\nP · main Pika assistant (selected task is focus, never permission to read it)")
+    format!(
+        "{}\nP · main Pika assistant\nF1 / ? · help\nF2 · settings and machine connections",
+        base.replace(
+            "x · stop watching, after confirmation; agent stays intact",
+            "x · remove from board, after confirmation; agent and history stay intact"
+        )
+    )
 }
 
 fn assistant_entry() -> (String, Color) {
@@ -3179,6 +3413,74 @@ fn playbook_tip() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_list_is_only_exact_board_rows_at_every_width() {
+        let mut first = BoardItem::local(session(Status::NeedsYou));
+        first.session.name = Some("needs_answer".into());
+        first.session.attention_reason = Some("private preview should not appear".into());
+        first.session.unread = true;
+        let mut second = first.clone();
+        second.session.session_id = "22222222-2222-4222-8222-222222222222".into();
+        second.session.name = Some("other_thread".into());
+        second.session.status = Status::Ready;
+        second.node_id = Some("node-two".into());
+        second.node_name = Some("rs2a".into());
+        let mut board = Board::new(vec![second.clone(), first.clone()]);
+        for width in [38, 80, 180] {
+            let mut rendered = Vec::new();
+            board.draw_threads(&mut rendered, width, 24).unwrap();
+            let text = String::from_utf8(rendered).unwrap();
+            assert!(text.contains("needs_answer"));
+            assert!(text.contains("other_thread @rs2a"));
+            assert!(text.find("needs_answer").unwrap() < text.find("other_thread").unwrap());
+            assert!(text.contains("Press again: full board"));
+            for forbidden in [
+                "private preview",
+                "Weekly",
+                "Useful for",
+                "Pika · chat",
+                "Enter open · p",
+            ] {
+                assert!(!text.contains(forbidden), "unexpected panel: {text:?}");
+            }
+        }
+        assert_eq!(board.thread_key(key(KeyCode::Char('p'))), None);
+        assert_eq!(board.thread_key(key(KeyCode::Char('/'))), None);
+        assert_eq!(board.thread_key(key(KeyCode::Down)), None);
+        assert_eq!(
+            board.thread_key(key(KeyCode::Enter)),
+            Some(BoardAction::Open(second))
+        );
+        assert!(board.items.iter().all(|item| item.session.unread));
+    }
+
+    #[test]
+    fn thread_list_refresh_preserves_exact_selection_and_rejects_stale_rows() {
+        let original = BoardItem::local(session(Status::Ready));
+        let mut other = original.clone();
+        other.node_id = Some("remote-node".into());
+        other.node_name = Some("rs8".into());
+        other.stale = true;
+        let mut board = Board::new(vec![original.clone(), other.clone()]);
+        board.thread_key(key(KeyCode::End));
+        assert_eq!(board.selected(), Some(other.clone()));
+        assert_eq!(board.thread_key(key(KeyCode::Enter)), None);
+        let mut renamed = original;
+        renamed.session.name = Some("renamed_local".into());
+        renamed.session.status = Status::NeedsYou;
+        board.replace_items(vec![other.clone(), renamed]);
+        assert_eq!(board.selected(), Some(other));
+        assert_eq!(board.thread_key(key(KeyCode::Enter)), None);
+        let mut repeat = key(KeyCode::Enter);
+        repeat.kind = KeyEventKind::Repeat;
+        board.thread_key(key(KeyCode::Home));
+        assert_eq!(
+            board.thread_key(repeat),
+            None,
+            "holding Enter must not open twice"
+        );
+    }
 
     #[derive(Default)]
     struct FrameOutput {
@@ -3425,6 +3727,104 @@ mod tests {
             board.key(key(KeyCode::Enter), None),
             Some(BoardAction::Untrack(exact))
         );
+    }
+
+    #[test]
+    fn admission_notice_is_once_per_identity_without_stealing_selection_or_unread() {
+        let original = BoardItem::local(session(Status::Ready));
+        let mut board = Board::new(vec![original.clone()]);
+        assert!(
+            board.added_notice.is_none(),
+            "initial inventory stays quiet"
+        );
+        let selected = board.selected_key.clone();
+        let mut added = original.clone();
+        added.session.session_id = "22222222-2222-4222-8222-222222222222".into();
+        added.session.name = Some("new named work".into());
+        added.session.unread = true;
+        added.session.status = Status::NeedsYou;
+        board.replace_items(vec![added.clone(), original.clone()]);
+        assert_eq!(board.selected_key, selected);
+        assert!(
+            board
+                .items
+                .iter()
+                .find(|row| row.key() == added.key())
+                .unwrap()
+                .session
+                .unread
+        );
+        assert!(
+            board
+                .added_notice
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("new named work")
+        );
+        board.added_notice = None;
+        added.session.name = Some("renamed work".into());
+        board.replace_items(vec![added.clone(), original.clone()]);
+        assert!(board.added_notice.is_none(), "rename is not admission");
+        board.replace_items(vec![original.clone()]);
+        let mut memory = BoardMemory::default();
+        board.remember(&mut memory);
+        let mut returned = Board::new(vec![original.clone()]);
+        returned.restore(&mut memory);
+        returned.replace_items(vec![original, added]);
+        assert!(
+            returned.added_notice.is_none(),
+            "reappearing after handoff is not admission"
+        );
+        assert_eq!(returned.selected_key, selected);
+    }
+
+    #[test]
+    fn empty_states_distinguish_filter_unavailable_and_unpopulated_board() {
+        let mut board = Board::new(Vec::new());
+        assert!(board.empty_state_lines()[0].contains("on this board yet"));
+        board.local_refresh_delayed = true;
+        assert!(board.empty_state_lines()[0].contains("unavailable"));
+        board.local_refresh_delayed = false;
+        board.replace_fleet_health(vec!["rs6 · connection failed".into()]);
+        assert!(board.empty_state_lines()[0].contains("unavailable"));
+        board.filter = "my work".into();
+        assert!(board.empty_state_lines()[0].contains("match this filter"));
+        assert!(board.health_line().unwrap().contains("rs6"));
+        for width in [60, 100, 160] {
+            let mut output = Vec::new();
+            board.draw(&mut output, width, 24).unwrap();
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.contains("No conversations match"));
+            assert!(text.contains("Esc clears"));
+            assert!(text.contains("F2 settings"));
+        }
+    }
+
+    #[test]
+    fn help_and_settings_preserve_selection_and_filter_and_do_not_steal_typing() {
+        let mut board = Board::new(vec![BoardItem::local(session(Status::Ready))]);
+        let selected = board.selected_key.clone();
+        assert_eq!(board.key(key(KeyCode::F(1)), None), None);
+        assert!(board.action_notice.as_ref().unwrap().contains("F2"));
+        board.key(key(KeyCode::Esc), None);
+        board.key(key(KeyCode::Char('/')), None);
+        board.key(key(KeyCode::Char('q')), None);
+        assert_eq!(board.filter, "q");
+        board.key(key(KeyCode::Esc), None);
+        board.key(key(KeyCode::Esc), None);
+        assert_eq!(
+            board.key(key(KeyCode::F(2)), None),
+            Some(BoardAction::Settings)
+        );
+        assert_eq!(board.selected_key, selected);
+        board.client_actions = true;
+        board.key(key(KeyCode::Char('x')), None);
+        let mut frame = Vec::new();
+        board.draw(&mut frame, 160, 24).unwrap();
+        let text = String::from_utf8(frame).unwrap();
+        assert!(text.contains("Remove from board"));
+        assert!(text.contains("Enter confirm · Esc back"));
     }
 
     fn session(status: Status) -> Session {
@@ -4539,7 +4939,7 @@ mod tests {
             let text = String::from_utf8(rendered).unwrap();
             assert!(text.contains("WEEKLY"));
             assert!(text.contains("63%"));
-            assert!(text.contains("enter open"));
+            assert!(text.contains("Enter open"));
             assert!(text.contains(&format!("\u{1b}[{};1H", height - 1)));
         }
         let mut remote = BoardItem::local(session(Status::Working));

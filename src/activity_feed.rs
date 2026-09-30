@@ -38,6 +38,23 @@ struct ReturnInterest {
     session_id: String,
 }
 
+// Local color is advisory lifecycle presentation, not proof of live ownership.
+// Store deliberately does not persist runtime flags. A bounded known home is
+// enough to publish a color; the renderer selects its actual pane/provider/UUID.
+fn known_local_home(item: &BoardItem) -> bool {
+    item.node_id.is_none()
+        && item.session.managed
+        && item
+            .session
+            .tmux_session
+            .as_deref()
+            .is_some_and(crate::tmux::is_pika_session)
+        && item.session.tmux_pane.as_deref().is_some_and(|pane| {
+            pane.strip_prefix('%')
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReturnStatus {
     pub provider: Provider,
@@ -409,8 +426,27 @@ impl Source {
     }
     fn return_statuses(state: &Arc<Mutex<State>>, node_id: Option<&str>) -> Vec<ReturnStatus> {
         let state = state.lock().unwrap();
-        state
-            .return_interests
+        let mut interests = state.return_interests.clone();
+        // A short-lived thread picker borrows the retained board's feed. The
+        // producer already sees its known home in the shared durable cache.
+        // Publish advisory lifecycle color without an IPC registration channel
+        // or another provider scan. Runtime/exactness proof belongs to opening.
+        for item in &state.items {
+            if interests.len() >= MAX_RETURN_INTERESTS {
+                break;
+            }
+            if known_local_home(item)
+                && item.pending_token.is_none()
+                && valid_return_session_id(&item.session.session_id)
+            {
+                interests.insert(ReturnInterest {
+                    node_id: None,
+                    provider: item.session.provider,
+                    session_id: item.session.session_id.clone(),
+                });
+            }
+        }
+        interests
             .iter()
             .filter(|interest| interest.node_id.as_deref() == node_id)
             .map(|interest| {
@@ -420,7 +456,7 @@ impl Source {
                         && item.session.session_id == interest.session_id
                         && !item.stale
                         && item.pending_token.is_none()
-                        && item.session.live
+                        && (item.session.live || known_local_home(item))
                 });
                 ReturnStatus {
                     provider: interest.provider,
@@ -1708,6 +1744,67 @@ mod tests {
             Source::return_statuses(&source.0.state, None)[0].status,
             None
         );
+    }
+
+    #[test]
+    fn known_home_switch_uses_durable_feed_without_new_registration() {
+        let source = Source::default();
+        let publisher = source.publisher();
+        let mut row = request("switched", 1.0);
+        row.session.tmux_session = Some("pika-c-switched".into());
+        row.session.tmux_pane = Some("%1".into());
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at(temp.path().join("pika.db"));
+        store.initialize().unwrap();
+        store.upsert_session(&row.session, false).unwrap();
+        row.session = store
+            .get_session(row.session.provider, &row.session.session_id)
+            .unwrap()
+            .unwrap();
+        assert!(!row.session.live);
+        assert!(!row.session.attached);
+        assert_eq!(row.session.home_state, "unknown");
+        publisher.publish(vec![row.clone()], vec![]);
+        let projected = Source::return_statuses(&source.0.state, None);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].session_id, row.session.session_id);
+        assert_eq!(projected[0].status, Some(Status::NeedsYou));
+        assert!(source.0.state.lock().unwrap().return_interests.is_empty());
+
+        row.session.status = Status::Ready;
+        store.upsert_session(&row.session, true).unwrap();
+        row.session = store
+            .get_session(row.session.provider, &row.session.session_id)
+            .unwrap()
+            .unwrap();
+        publisher.publish(vec![row.clone()], vec![]);
+        assert_eq!(
+            Source::return_statuses(&source.0.state, None)[0].status,
+            Some(Status::Ready)
+        );
+        row.stale = true;
+        publisher.publish(vec![row.clone()], vec![]);
+        assert_eq!(
+            Source::return_statuses(&source.0.state, None)[0].status,
+            None
+        );
+
+        // Cached remote rows, pending launches, missing or unmanaged homes
+        // cannot create implicit local interests.
+        row.stale = false;
+        row.node_id = Some("remote".into());
+        let mut pending = row.clone();
+        pending.node_id = None;
+        pending.pending_token = Some("launch".into());
+        let mut missing = row.clone();
+        missing.node_id = None;
+        missing.session.tmux_pane = None;
+        let mut unmanaged = row.clone();
+        unmanaged.node_id = None;
+        unmanaged.session.managed = false;
+        publisher.publish(vec![row, pending, missing, unmanaged], vec![]);
+        assert!(Source::return_statuses(&source.0.state, None).is_empty());
+        assert!(Source::return_statuses(&source.0.state, Some("remote")).is_empty());
     }
 
     #[test]

@@ -38,6 +38,13 @@ fn check_sidecars(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn directory(path: &Path) -> io::Result<()> {
+    private_directory(path)?;
+    check_directory(path)
+}
+
+/// A private coordination directory inside the existing board state boundary.
+/// This does not establish the ancestor trust required by assistant authority.
+pub(crate) fn private_directory(path: &Path) -> io::Result<()> {
     if fs::symlink_metadata(path).is_err() {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
@@ -48,7 +55,7 @@ pub(crate) fn directory(path: &Path) -> io::Result<()> {
         }
         builder.create(path)?;
     }
-    check_directory(path)
+    check(path, true)
 }
 
 fn check_directory(path: &Path) -> io::Result<()> {
@@ -66,9 +73,12 @@ fn check_directory(path: &Path) -> io::Result<()> {
                 || (metadata.uid() != 0 && metadata.uid() != unsafe { libc::geteuid() })
                 || (metadata.mode() & 0o022 != 0 && !root_sticky)
             {
-                return Err(io::Error::other(
-                    "Assistant state has an untrusted writable ancestor",
-                ));
+                return Err(io::Error::other(format!(
+                    "Assistant state ancestor {} is not trusted (owner UID {}, mode {:04o}); use a private profile under trusted ancestors",
+                    ancestor.display(),
+                    metadata.uid(),
+                    metadata.mode() & 0o7777
+                )));
             }
         }
     }

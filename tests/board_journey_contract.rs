@@ -51,11 +51,16 @@ impl Drop for BoardProcess {
 
 impl BoardProcess {
     fn start() -> Self {
+        Self::start_with_ancestor_mode(0o700)
+    }
+
+    fn start_with_ancestor_mode(mode: u32) -> Self {
         // Keep the Unix socket path below the platform's address-length limit.
         let root = tempfile::Builder::new()
             .prefix("pika-board-")
             .tempdir_in("/tmp")
             .unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(mode)).unwrap();
         for dir in [
             "bin", "home", "config", "state", "cache", "data", "codex", "claude", "oc", "tmp",
             "sockets",
@@ -221,8 +226,16 @@ impl BoardProcess {
     }
 
     fn tmux(&self, args: &[&str]) -> String {
+        // A fixture-created server must inherit the same disposable state as
+        // the board. Otherwise a companion starts against an unrelated DB.
+        let environment = self.endpoint(&[]);
         let output = Command::new(self.root.path().join("bin/tmux"))
             .env_clear()
+            .envs(
+                environment
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
+            )
             .env("HOME", self.root.path().join("home"))
             .env("TMUX_TMPDIR", self.root.path().join("sockets"))
             .env(
@@ -264,6 +277,42 @@ impl BoardProcess {
                 "board exited before {expected:?}: {}",
                 self.output
             );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn await_thread_list(&mut self, origin: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let panes = self.tmux(&[
+                "list-panes",
+                "-t",
+                origin,
+                "-F",
+                "#{pane_id} #{@pika_threads_source}",
+            ]);
+            let viewer = panes.lines().find_map(|line| {
+                line.split_once(' ')
+                    .filter(|(_, source)| *source == origin)
+                    .map(|(pane, _)| pane)
+            });
+            if let Some(viewer) = viewer
+                && self.tmux(&["list-clients", "-F", "#{pane_id}"]).trim() == viewer
+                && self
+                    .tmux(&["capture-pane", "-p", "-t", viewer])
+                    .contains("Threads")
+            {
+                return viewer.to_owned();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "thread list did not take focus: {panes}"
+            );
+            let mut bytes = [0; 32768];
+            if let Ok(count) = self.terminal.read(&mut bytes) {
+                self.output
+                    .push_str(&String::from_utf8_lossy(&bytes[..count]));
+            }
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -491,6 +540,459 @@ fn unverified_terminal_requires_choice_and_never_relaunches_or_acknowledges() {
     assert!(board.child.wait().unwrap().success());
 }
 
+fn remote_f12_fixture(fail: bool) -> (BoardProcess, String, String) {
+    use pikamux::fleet::{CAPABILITIES, PROTOCOL_NAME, PROTOCOL_VERSION, session_to_wire};
+    let mut board = BoardProcess::start();
+    fs::write(
+        board.root.path().join("bin/tmux"),
+        format!(
+            "#!/bin/sh\nexec {} -f /dev/null \"$@\"\n",
+            shell_words::quote(real_tmux_binary().to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    board.real_tmux = true;
+    fs::write(board.root.path().join("bin/codex"),
+        "#!/bin/sh\ntest \"$1\" = resume || exit 97\nprintf 'FAKE AGENT READY\\n'\nwhile :; do sleep 1; done\n").unwrap();
+    board.send(b"/audit\r");
+    board.await_text("FILTER audit");
+    board.send(b"\r");
+    board.await_text("CONTINUITY PROVEN");
+    let store = Store::at(board.root.path().join("state/pika.db"));
+    let origin = store
+        .get_session(
+            pikamux::model::Provider::Codex,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+        .unwrap()
+        .unwrap();
+    let pane = origin.tmux_pane.clone().unwrap();
+    let pid = board.tmux(&["display-message", "-p", "-t", &pane, "#{pane_pid}"]);
+    let node_id = uuid::Uuid::new_v4().to_string();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    store
+        .upsert_fleet_node(&pikamux::model::FleetNode {
+            node_id: node_id.clone(),
+            alias: "fixture-remote".into(),
+            ssh_target: "fixture-only".into(),
+            sources: vec!["explicit".into()],
+            status: "ready".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
+            package_version: Some("0.6.0".into()),
+            capabilities: CAPABILITIES.iter().map(|s| (*s).into()).collect(),
+            last_seen: now,
+            last_attempt_at: now,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+    let mut remote = origin;
+    remote.session_id = uuid::Uuid::new_v4().to_string();
+    remote.name = Some("zulu_remote".into());
+    remote.home_state = "exact".into();
+    remote.live = true;
+    let snapshot = serde_json::json!({"type":"snapshot", "protocol":PROTOCOL_NAME,
+        "version":PROTOCOL_VERSION, "node_id":node_id, "machine":"fixture-remote",
+        "captured_at":now, "sessions":[session_to_wire(&remote, false)], "profiles":[], "cards":[]});
+    store.put_remote_snapshot(&node_id, &snapshot, now).unwrap();
+    fs::write(board.root.path().join("bin/ssh"), format!(
+        "#!/bin/sh\ncase \"$*\" in\n*'_fleet-open'*)\nstty raw -echo\nprintf 'REMOTE AGENT READY\\r\\n'\n{}\n;;\n*) cat >/dev/null; printf '%s\\n' {} ;;\nesac\n",
+        if fail { "exit 23" } else { "dd bs=1 count=5 of=/dev/null 2>/dev/null\nprintf 'REMOTE THREADS\\r\\n'\ndd bs=1 count=5 of=/dev/null 2>/dev/null\nexit 0" },
+        shell_words::quote(&snapshot.to_string())
+    )).unwrap();
+    (board, pane, pid)
+}
+
+#[test]
+fn remote_f12_reaches_remote_then_returns_exact_original_board() {
+    let (mut board, origin, pid) = remote_f12_fixture(false);
+    board.send(b"\x1b[24~");
+    let viewer = board.await_thread_list(&origin);
+    board.await_text("zulu_remote");
+    board.send(b"\x1b[F\r");
+    board.await_text("REMOTE AGENT READY");
+    assert_eq!(
+        board
+            .tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &viewer,
+                "#{window_zoomed_flag}"
+            ])
+            .trim(),
+        "1"
+    );
+    assert_eq!(
+        board
+            .tmux(&[
+                "show-options",
+                "-pqv",
+                "-t",
+                &viewer,
+                "@pika_return_navigation"
+            ])
+            .trim(),
+        "0"
+    );
+    board.send(b"\x1b[24~");
+    board.await_text("REMOTE THREADS");
+    assert_eq!(
+        board.tmux(&["list-clients", "-F", "#{pane_id}"]).trim(),
+        viewer
+    );
+    board.send(b"\x1b[24~");
+    board.await_text("FILTER audit");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while board
+        .tmux(&["list-panes", "-t", &origin, "-F", "#{pane_id}"])
+        .trim()
+        != origin
+    {
+        assert!(
+            Instant::now() < deadline,
+            "remote companion was not reclaimed"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        board.tmux(&["display-message", "-p", "-t", &origin, "#{pane_pid}"]),
+        pid
+    );
+    assert_eq!(
+        board
+            .tmux(&["list-panes", "-t", &origin, "-F", "#{pane_id}"])
+            .trim(),
+        origin
+    );
+}
+
+#[test]
+fn remote_f12_failed_ssh_restores_retryable_threads_and_original_board() {
+    let (mut board, origin, pid) = remote_f12_fixture(true);
+    board.send(b"\x1b[24~");
+    let viewer = board.await_thread_list(&origin);
+    board.await_text("zulu_remote");
+    board.send(b"\x1b[F\r");
+    board.await_text("Threads");
+    board.await_text("23");
+    assert_eq!(
+        board
+            .tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &viewer,
+                "#{window_zoomed_flag}"
+            ])
+            .trim(),
+        "0"
+    );
+    assert_eq!(
+        board
+            .tmux(&[
+                "show-options",
+                "-pqv",
+                "-t",
+                &viewer,
+                "@pika_return_navigation"
+            ])
+            .trim(),
+        ""
+    );
+    // A failed interactive SSH open must not consume the selected row/action.
+    board.send(b"\r");
+    board.await_text("REMOTE AGENT READY");
+    board.output.clear();
+    board.await_text("Threads");
+    board.await_text("23");
+    assert_eq!(
+        board.tmux(&["list-clients", "-F", "#{pane_id}"]).trim(),
+        viewer
+    );
+    board.send(b"\x1b[24~");
+    board.await_text("FILTER audit");
+    assert_eq!(
+        board.tmux(&["display-message", "-p", "-t", &origin, "#{pane_pid}"]),
+        pid
+    );
+}
+
+#[test]
+fn side_list_cancels_and_switches_without_losing_the_board_or_live_feed() {
+    for from_tmux in [false, true] {
+        let real_tmux = real_tmux_binary();
+        let mut board = BoardProcess::start();
+        fs::write(
+            board.root.path().join("bin/tmux"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexec {} -f /dev/null \"$@\"\n",
+                shell_words::quote(board.root.path().join("tmux-trace").to_str().unwrap()),
+                shell_words::quote(real_tmux.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        board.real_tmux = true;
+        // Exercise tmux's actual serialization of the previous Pika binding,
+        // not a synthetic list-keys string. Existing installs retain F12.
+        board.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "legacy-binding-fixture",
+            "exec sleep 60",
+        ]);
+        board.tmux(&[
+            "bind-key",
+            "-T",
+            "root",
+            "F12",
+            "if-shell",
+            "-F",
+            "#{&&:#{@pika_return_navigation},#{m:pika-*,#{session_name}}}",
+            "if-shell -F '#{client_last_session}' 'switch-client -l' detach-client",
+            "send-keys F12",
+        ]);
+        let launches = board.root.path().join("launches");
+        fs::write(board.root.path().join("bin/codex"), format!(
+        "#!/bin/sh\ntest \"$1\" = resume || exit 97\nprintf '%s\\n' \"$2\" >> {}\nprintf 'FAKE AGENT READY\\n'\nwhile :; do sleep 1; done\n",
+        shell_words::quote(launches.to_str().unwrap())
+    )).unwrap();
+        let store = Store::at(board.root.path().join("state/pika.db"));
+        let mut seed = store
+            .get_session(
+                pikamux::model::Provider::Codex,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            )
+            .unwrap()
+            .unwrap();
+        seed.session_id = uuid::Uuid::new_v4().to_string();
+        seed.name = Some("switch_origin".into());
+        seed.last_activity_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        seed.last_event_at = seed.last_activity_at;
+        store.upsert_session(&seed, false).unwrap();
+        board.send(b"r");
+        board.await_text("switch_origin");
+        board.send(b"\x1b[H\r");
+        board.await_text("CONTINUITY PROVEN");
+        let upgraded_keys = board.tmux(&["list-keys", "-T", "root"]);
+        assert!(
+            upgraded_keys
+                .lines()
+                .any(|line| { line.contains(" F12 ") && line.contains("@pika_threads_callback") }),
+            "legacy F12 binding was not upgraded: {upgraded_keys}"
+        );
+        let original = store
+            .get_session(seed.provider, &seed.session_id)
+            .unwrap()
+            .unwrap()
+            .tmux_pane
+            .unwrap();
+        let original_pid = board.tmux(&["display-message", "-p", "-t", &original, "#{pane_pid}"]);
+        let mut second = store
+            .get_session(pikamux::model::Provider::Codex, &seed.session_id)
+            .unwrap()
+            .unwrap();
+        second.session_id = uuid::Uuid::new_v4().to_string();
+        second.name = Some("zulu_other".into());
+        second.tmux_session = None;
+        second.tmux_pane = None;
+        second.root_pid = None;
+        second.live = false;
+        second.attached = false;
+        second.status = Status::Parked;
+        second.unread = true;
+        second.home_state = "missing".into();
+        store.upsert_session(&second, false).unwrap();
+        if from_tmux {
+            board.tmux(&[
+                "new-session",
+                "-d",
+                "-s",
+                "home-board",
+                "printf 'ORIGINAL BOARD\\n'; exec sleep 30",
+            ]);
+            board.tmux(&["switch-client", "-t", "home-board"]);
+            board.tmux(&["switch-client", "-t", &original]);
+        }
+
+        board.send(b"\x1b[24~");
+        let viewer = board.await_thread_list(&original);
+        board.await_text("Threads");
+        board.await_text("zulu_other");
+        let capture = board.tmux(&["capture-pane", "-p", "-t", &viewer]);
+        assert!(!capture.contains("preview"));
+        assert!(!capture.contains("WEEKLY"));
+        assert!(!capture.contains("Useful for"));
+        assert_eq!(
+            board
+                .tmux(&["display-message", "-p", "-t", &viewer, "#{pane_width}"])
+                .trim(),
+            "38"
+        );
+        assert_eq!(
+            board
+                .tmux(&["show-options", "-pqv", "-t", &viewer, "@pika_provider"])
+                .trim(),
+            ""
+        );
+        assert!(
+            store
+                .get_session(second.provider, &second.session_id)
+                .unwrap()
+                .unwrap()
+                .unread
+        );
+        board.send(b"\x1b");
+        board.await_text("FAKE AGENT READY");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while board
+            .tmux(&["list-panes", "-t", &original, "-F", "#{pane_id}"])
+            .trim()
+            != original
+        {
+            assert!(
+                Instant::now() < deadline,
+                "Escape did not reclaim the companion pane"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            board
+                .tmux(&["list-panes", "-t", &original, "-F", "#{pane_id}"])
+                .trim(),
+            original
+        );
+        assert_eq!(
+            board.tmux(&["display-message", "-p", "-t", &original, "#{pane_pid}"]),
+            original_pid
+        );
+        assert!(
+            store
+                .get_session(second.provider, &second.session_id)
+                .unwrap()
+                .unwrap()
+                .unread
+        );
+
+        board.send(b"\x1b[24~");
+        board.await_thread_list(&original);
+        board.await_text("Threads");
+        board.await_text("zulu_other");
+        board.send(b"\x1b[F"); // End then Enter: no name typing.
+        board.await_text("zulu_other");
+        board.send(b"\r");
+        board.await_text(&format!("exact id {}", &second.session_id[..8]));
+        let opened = store
+            .get_session(second.provider, &second.session_id)
+            .unwrap()
+            .unwrap();
+        let destination = opened.tmux_pane.unwrap();
+        assert!(!opened.unread);
+        assert_eq!(
+            board.tmux(&["list-clients", "-F", "#{pane_id}"]).trim(),
+            destination
+        );
+        assert_eq!(
+            board.tmux(&["display-message", "-p", "-t", &original, "#{pane_pid}"]),
+            original_pid
+        );
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
+
+        // The old board producer remains connected after the side-view exits.
+        board.output.clear();
+        store
+            .record_status_observation(
+                second.provider,
+                &second.session_id,
+                &StatusObservation {
+                    kind: ObservationKind::Lifecycle,
+                    status: Status::NeedsYou,
+                    unread: false,
+                    attention_reason: Some("new question".into()),
+                    error: None,
+                    observed_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64(),
+                    source: "fixture:side-switch".into(),
+                },
+            )
+            .unwrap();
+        let mut projected = store
+            .get_session(second.provider, &second.session_id)
+            .unwrap()
+            .unwrap();
+        projected.status = Status::NeedsYou;
+        projected.unread = false;
+        store.upsert_session(&projected, true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let counts = board.tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &destination,
+                "#{E:@pika_board_summary}",
+            ]);
+            let color = board.tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &destination,
+                "#{T:@pika_return_style}",
+            ]);
+            if counts.contains("1 need you") && color.contains("fg=red") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "switched feed did not stay live: {counts:?}, {color:?}"
+            );
+            // A real client continuously drains the PTY while status changes.
+            let mut bytes = [0; 32768];
+            if let Ok(count) = board.terminal.read(&mut bytes) {
+                board
+                    .output
+                    .push_str(&String::from_utf8_lossy(&bytes[..count]));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!board.output.contains("Board disconnected"));
+        board.send(b"\x1b[24~");
+        board.await_thread_list(&destination);
+        board.await_text("Threads");
+        // Switch back to the already-running origin. The full-board route must
+        // survive more than one handoff, and this open must not launch a copy.
+        board.send(b"\x1b[H\x1b[B\r");
+        board.await_text(&format!("exact id {}", &seed.session_id[..8]));
+        assert_eq!(
+            board.tmux(&["list-clients", "-F", "#{pane_id}"]).trim(),
+            original
+        );
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
+        board.send(b"\x1b[24~");
+        board.await_thread_list(&original);
+        board.await_text("Threads");
+        board.send(b"\x1b[24~");
+        if from_tmux {
+            board.await_text("ORIGINAL BOARD");
+            board.tmux(&["detach-client"]);
+        }
+        board.await_text("WEEKLY"); // Original full board, not the previous agent.
+        assert!(board.tmux(&["list-clients"]).trim().is_empty());
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
+        board.finish();
+    }
+}
+
 #[test]
 fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
     let real_tmux = real_tmux_binary();
@@ -685,7 +1187,7 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
             }
             board.send(b"\x1b[<0;116;32M\x1b[<0;116;32m"); // Files click
         }
-        board.await_text("q close");
+        board.await_text("Esc close");
         let viewer = board
             .tmux(&["display-message", "-p", "#{pane_id}"])
             .trim()
@@ -825,6 +1327,10 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
             thread::sleep(Duration::from_millis(350));
         }
         board.send(return_keys);
+        if return_keys == b"\x1b[24~" {
+            board.await_text("Threads");
+            board.send(return_keys);
+        }
         board.await_text("FILTER audit");
         assert!(board.child.try_wait().unwrap().is_none());
         let store = Store::at(board.root.path().join("state/pika.db"));
@@ -923,6 +1429,8 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
     board.send(b"\r");
     board.await_text("F11");
     board.send(b"\x1b[23~");
+    board.await_text("Threads");
+    board.send(b"\x1b[23~");
     board.await_text("FILTER audit");
     assert!(
         board
@@ -944,6 +1452,8 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
     let target = original_pane.flatten().unwrap();
     board.tmux(&["switch-client", "-t", "origin"]);
     board.tmux(&["switch-client", "-t", &target]);
+    board.send(b"\x1b[23~");
+    board.await_text("Threads");
     board.send(b"\x1b[23~");
     board.await_text("ORIGINAL BOARD");
     // Only fixture teardown uses tmux's conventional detach; the user-facing
@@ -1125,7 +1635,7 @@ fn add_named_native_conversation_without_setup_preserves_unread_and_cancel() {
     assert!(!board.root.path().join("codex/hooks.json").exists());
     assert!(!board.root.path().join("claude/settings.json").exists());
     board.send(b"\x1b");
-    board.await_text("+ add");
+    board.await_text("+ find");
     board.finish();
 }
 
@@ -1210,14 +1720,14 @@ fn help_and_usage_are_real_board_actions_with_a_return_path() {
 #[test]
 fn unwatch_can_be_cancelled_and_then_confirmed_without_leaving_the_board() {
     let mut board = BoardProcess::start();
-    board.await_text("x unwatch");
+    board.await_text("x remove");
     board.send(b"x");
-    board.await_text("Stop watching audit_saved");
-    board.await_text("Esc cancel");
+    board.await_text("Remove from board · audit_saved");
+    board.await_text("Esc back");
     board.send(b"\x1b");
     // The name also exists in a still-buffered confirmation frame. Wait for
     // the restored controls before sending x, or it can confirm the old dialog.
-    board.await_text("x unwatch");
+    board.await_text("x remove");
     let store = Store::at(board.root.path().join("state/pika.db"));
     let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     assert!(
@@ -1226,15 +1736,89 @@ fn unwatch_can_be_cancelled_and_then_confirmed_without_leaving_the_board() {
             .unwrap()
     );
     board.send(b"x");
-    board.await_text("Stop watching audit_saved");
+    board.await_text("Remove from board · audit_saved");
     board.send(b"\r");
-    board.await_text("Stopped watching audit_saved");
+    board.await_text("Removed audit_saved from your board");
     assert!(
         store
             .is_untracked(pikamux::model::Provider::Codex, id)
             .unwrap()
     );
     assert!(board.child.try_wait().unwrap().is_none());
+    board.finish();
+}
+
+#[test]
+fn shared_mount_board_opens_even_when_assistant_authority_is_unavailable() {
+    let mut board = BoardProcess::start_with_ancestor_mode(0o775);
+    board.await_text("P Pika");
+    board.send(b"P");
+    board.await_text("Assistant state ancestor");
+    board.await_text("Your project agents were not changed");
+    assert!(
+        !board
+            .root
+            .path()
+            .join("state/assistant/memory.sqlite")
+            .exists()
+    );
+    assert_eq!(
+        fs::metadata(board.root.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o775
+    );
+    board.finish();
+}
+
+#[test]
+fn board_settings_and_assistant_return_keep_filter_draft_and_unread() {
+    let mut board = BoardProcess::start();
+    board.send(b"/audit\r");
+    board.await_text("FILTER audit");
+    board.send(b"\x1bOQ"); // F2
+    board.await_text("Board settings");
+    assert!(board.output.contains("Connect a machine"));
+    board.send(b"\x1b[B\x1b[B\r");
+    board.await_text("No other machines connected yet");
+    board.send(b"\x1b");
+    board.await_text("Board settings");
+    board.send(b"\x1b");
+    board.await_text("FILTER audit");
+    board.send(b"P");
+    board.await_text("Enter to connect Pika");
+    board.send(b"unsent continuity question");
+    board.await_text("unsent continuity question");
+    board.send(b"\x1b");
+    board.await_text("FILTER audit");
+    board.send(b"P");
+    board.await_text("unsent continuity question");
+    board.send(b"\x1b");
+    board.await_text("FILTER audit");
+    let store = Store::at(board.root.path().join("state/pika.db"));
+    assert!(
+        store
+            .get_session(
+                pikamux::model::Provider::Codex,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            )
+            .unwrap()
+            .unwrap()
+            .unread
+    );
+    let memory =
+        rusqlite::Connection::open(board.root.path().join("state/assistant/memory.sqlite"))
+            .unwrap();
+    let sent: i64 = memory
+        .query_row(
+            "SELECT count(*) FROM memory_records WHERE body LIKE '%unsent continuity question%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sent, 0);
     board.finish();
 }
 
@@ -1386,7 +1970,9 @@ fn client_update_exit_keeps_one_reopenable_startup_home_and_an_actionable_board_
         board.await_text(&format!("{provider} exited during startup"));
         board.send(b"\r");
         board.await_text("STARTUP EXITED");
-        board.send(b"\x1b[24~"); // F12 returns without killing the retained shell.
+        board.send(b"\x1b[24~");
+        board.await_text("Threads");
+        board.send(b"\x1b[24~"); // Second F12 returns without killing the retained shell.
         board.await_text(&format!("{provider} exited during startup"));
         assert_eq!(
             fs::read_to_string(&launches)

@@ -315,6 +315,7 @@ fn decode(bytes: &[u8], generation: &str) -> Result<Value> {
 }
 
 pub(crate) struct Client {
+    root: PathBuf,
     stream: UnixStream,
     generation: Option<String>,
     child: Option<Child>,
@@ -326,10 +327,15 @@ impl Client {
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         Ok(Self {
+            root: root.to_path_buf(),
             stream,
             generation: None,
             child: None,
         })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     pub(crate) fn attach(root: &Path) -> Result<Self> {
@@ -521,6 +527,7 @@ mod tests {
             );
         });
         let mut client = Client {
+            root: PathBuf::new(),
             stream,
             generation: None,
             child: None,

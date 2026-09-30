@@ -3,6 +3,50 @@ use predicates::prelude::*;
 
 #[cfg(unix)]
 #[test]
+fn machine_discovery_reads_ssh_config_and_includes_without_connecting() {
+    let (temp, mut command) = wait_command(false);
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(home.join(".ssh/conf.d")).unwrap();
+    std::fs::write(home.join("config"), "Host wrong-home-config\n").unwrap();
+    std::fs::write(
+        home.join(".ssh/config"),
+        "Host rs6\nInclude conf.d/*.conf\n",
+    )
+    .unwrap();
+    std::fs::write(home.join(".ssh/conf.d/servers.conf"), "Host rs2a\n").unwrap();
+    let connected = temp.path().join("connected");
+    write_test_executable(
+        &temp.path().join("bin/ssh"),
+        &format!(
+            "#!/bin/sh\ntouch {}\nexit 91\n",
+            shell_words::quote(connected.to_str().unwrap())
+        ),
+    );
+    write_test_executable(&temp.path().join("bin/tailscale"), "#!/bin/sh\nexit 1\n");
+    let output = command
+        .args(["machines", "discover", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&output).unwrap();
+    let targets: Vec<_> = rows
+        .iter()
+        .map(|row| row["ssh_target"].as_str().unwrap())
+        .collect();
+    assert_eq!(targets, ["rs2a", "rs6"]);
+    assert!(!connected.exists());
+    assert!(
+        Store::at(temp.path().join("state/pika.db"))
+            .list_nodes()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn client_board_rejects_changed_machine_before_opening_inventory() {
     let (_temp, mut command) = wait_command(false);
     command

@@ -39,9 +39,28 @@ refused before starting a host or enabling a provider; no replacement profile or
 credential copy is made. Operational observation still uses the configured Pika
 state/configuration paths, so preview launchers must isolate those separately.
 
-Without an enabled provider, ordinary text is saved as a draft, not sent.
-With a ready enabled provider, ordinary text submits a paid reasoning turn.
-`/help` lists the interactive commands.
+On first use, press Enter to connect Pika. The guided setup explains account
+usage, offers an isolated Codex sign-in if needed, and remembers this profile for
+future visits. It does not enable background work or project-conversation access.
+Until connected, ordinary text stays unsent in the composer; backing out of
+setup preserves it. With a ready connection, Enter submits a paid reasoning turn.
+F1 opens help, saved updates, and feedback. F2 opens connection settings. Technical
+details remain available through advanced commands and `/help`.
+
+If Codex cannot start, F2 offers **Reconnect** without sending the draft or
+requiring another sign-in when the saved profile is still valid. Your draft
+remains in the composer; send it yourself once connected. This recovery applies
+only before a message is accepted, not to replies whose delivery is uncertain.
+Connection errors are summarized in the conversation; **Technical details** in
+settings retains the diagnostic information. Chat roles and the composer use
+your terminal's colors; `NO_COLOR` keeps the same layout without colors.
+
+During a native board visit, leaving Pika with Esc/F12 and returning with P
+restores the unsent draft and reading position for the same profile and scope.
+This navigation state lives only in that board process; it is not another memory
+database, does not survive closing the board, and never sends on return. Cached
+displayed output is not restored across a completed forget operation. A remote
+assistant opened in a separate Windows terminal keeps its own view lifecycle.
 
 ### Feedback during daily use
 

@@ -21,6 +21,17 @@ struct Journey {
 
 impl Journey {
     fn start(args: &[&str], width: u16, height: u16) -> Self {
+        Self::start_with_io(args, width, height, true, true, Some("xterm-256color"))
+    }
+
+    fn start_with_io(
+        args: &[&str],
+        width: u16,
+        height: u16,
+        input_tty: bool,
+        output_tty: bool,
+        term: Option<&str>,
+    ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("pika-onboard-")
             .tempdir_in("/tmp")
@@ -130,13 +141,23 @@ impl Journey {
                 "PATH",
                 format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
             )
-            .env("TERM", "xterm-256color")
             .env("NO_COLOR", "1")
             .env("PIKA_UPDATE_CHECK", "0")
             .env("PIKA_TMUX_SOCKET", "onboarding-test")
-            .stdin(Stdio::from(child_terminal.try_clone().unwrap()))
-            .stdout(Stdio::from(child_terminal.try_clone().unwrap()))
+            .stdin(if input_tty {
+                Stdio::from(child_terminal.try_clone().unwrap())
+            } else {
+                Stdio::null()
+            })
+            .stdout(if output_tty {
+                Stdio::from(child_terminal.try_clone().unwrap())
+            } else {
+                Stdio::from(File::create(root.path().join("stdout.txt")).unwrap())
+            })
             .stderr(Stdio::from(child_terminal.try_clone().unwrap()));
+        if let Some(term) = term {
+            command.env("TERM", term);
+        }
         command.process_group(0);
         let child = command.spawn().unwrap();
         Self {
@@ -180,15 +201,35 @@ impl Journey {
     }
 
     fn finish(&mut self) {
+        self.finish_with_code(0, true);
+    }
+
+    fn finish_with_code(&mut self, expected_code: i32, alternate_screen: bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             self.drain();
             if let Some(status) = self.child.try_wait().unwrap() {
-                assert!(status.success(), "{}", self.output);
                 self.drain();
+                self.output.push_str(
+                    &fs::read_to_string(self.root.path().join("stdout.txt")).unwrap_or_default(),
+                );
+                assert_eq!(status.code(), Some(expected_code), "{}", self.output);
+                if alternate_screen {
+                    assert!(
+                        self.output.contains("\x1b[?1049l"),
+                        "alternate screen not restored: {}",
+                        self.output
+                    );
+                } else {
+                    assert!(
+                        !self.output.contains("\x1b[?1049h"),
+                        "noninteractive command entered full screen: {}",
+                        self.output
+                    );
+                }
                 assert!(
-                    self.output.contains("\x1b[?1049l"),
-                    "alternate screen not restored: {}",
+                    !self.output.contains("open terminal failed"),
+                    "{}",
                     self.output
                 );
                 let mut attrs = unsafe { std::mem::zeroed::<libc::termios>() };
@@ -243,6 +284,94 @@ fn first_pika_is_a_quiet_consent_screen_and_escape_preserves_settings() {
 }
 
 #[test]
+fn redirected_input_or_output_uses_finite_commands_without_taking_over_the_terminal() {
+    // Three independent noninteractive routes, not just both streams piped.
+    // Keep stderr on the PTY so a subprocess's raw terminal error is observed.
+    for (input_tty, output_tty) in [(false, true), (true, false), (false, false)] {
+        let mut board =
+            Journey::start_with_io(&[], 100, 32, input_tty, output_tty, Some("xterm-256color"));
+        board.finish_with_code(0, false);
+        assert!(
+            board.output.contains("No conversations are tracked yet"),
+            "{}",
+            board.output
+        );
+        assert!(!board.output.contains("Enable updates"), "{}", board.output);
+        board.assert_untouched();
+
+        let mut setup = Journey::start_with_io(
+            &["setup", "--dry-run", "--no-machines", "--no-import"],
+            100,
+            32,
+            input_tty,
+            output_tty,
+            Some("xterm-256color"),
+        );
+        setup.finish_with_code(0, false);
+        assert!(setup.output.contains("Dry run only"), "{}", setup.output);
+        setup.assert_untouched();
+    }
+}
+
+#[test]
+fn setup_without_terminal_input_requires_explicit_consent_and_preserves_settings() {
+    let mut setup = Journey::start_with_io(
+        &["setup", "--no-machines", "--no-import"],
+        100,
+        32,
+        false,
+        true,
+        Some("xterm-256color"),
+    );
+    setup.finish_with_code(2, false);
+    assert!(
+        setup.output.contains("pika setup --yes"),
+        "{}",
+        setup.output
+    );
+    setup.assert_untouched();
+}
+
+#[test]
+fn dumb_terminal_setup_uses_a_plain_prompt_and_can_be_declined() {
+    let mut setup = Journey::start_with_io(
+        &["setup", "--no-machines", "--no-import"],
+        100,
+        32,
+        true,
+        true,
+        Some("dumb"),
+    );
+    setup.await_text("Apply these changes?");
+    setup.send(b"n\n");
+    setup.finish_with_code(0, false);
+    assert!(
+        setup.output.contains("No changes applied"),
+        "{}",
+        setup.output
+    );
+    setup.assert_untouched();
+}
+
+#[test]
+fn missing_term_setup_works_on_a_pty_without_a_controlling_terminal() {
+    // openpty + process_group intentionally does not acquire a controlling
+    // terminal. An SSH-like PTY on stdin/stdout is sufficient for setup.
+    let mut setup = Journey::start_with_io(
+        &["setup", "--no-machines", "--no-import"],
+        100,
+        32,
+        true,
+        true,
+        None,
+    );
+    setup.await_text("Enable updates");
+    setup.send(b"\x1b");
+    setup.finish();
+    setup.assert_untouched();
+}
+
+#[test]
 fn detailed_diff_is_available_before_approval_and_cancel_writes_nothing() {
     let mut j = Journey::start(&["setup", "--no-machines", "--no-import"], 100, 32);
     j.await_text("Enable updates");
@@ -293,6 +422,268 @@ fn tiny_terminal_cannot_approve_an_invisible_choice() {
     j.send(b"\x1b");
     j.finish();
     j.assert_untouched();
+}
+
+#[test]
+fn setup_finish_connects_saved_machines_without_repeating_provider_setup() {
+    let mut j = Journey::start(&["setup", "--no-machines", "--no-import"], 100, 32);
+    j.await_text("Enable updates");
+    fs::create_dir_all(j.root.path().join("home/.ssh")).unwrap();
+    fs::write(
+        j.root.path().join("home/.ssh/config"),
+        "Host lab\n  HostName lab.invalid\n",
+    )
+    .unwrap();
+    executable(
+        &j.root.path().join("bin/ssh"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/ssh-calls\"\nexit 97\n",
+    );
+    j.send(b"\r");
+    j.await_text("Connect another machine");
+    let hooks_before = fs::read(j.root.path().join("claude/settings.json")).unwrap();
+    j.send(b"\x1b[B\r");
+    j.await_text("Connect your machines");
+    assert!(j.output.contains("lab"));
+    assert!(!j.root.path().join("home/ssh-calls").exists());
+    j.send(b" \r");
+    j.await_text("Connection unavailable");
+    assert!(j.output.contains("Retry connection"));
+    j.send(b"\r");
+    j.await_text("Open board");
+    assert!(
+        fs::read_to_string(j.root.path().join("home/ssh-calls"))
+            .unwrap()
+            .contains("lab")
+    );
+    assert!(!j.output.contains("Enable updates"));
+    assert_eq!(
+        fs::read(j.root.path().join("claude/settings.json")).unwrap(),
+        hooks_before
+    );
+    j.send(b"\x1b[B\x1b[B\r");
+    j.await_text("lab was not connected");
+    j.send(b"\x1b");
+    j.await_text("Open board");
+    j.send(b"\x1b");
+    j.finish();
+}
+
+#[test]
+fn machine_address_entry_can_be_cancelled_without_connecting() {
+    let mut j = Journey::start(&["setup", "--no-machines", "--no-import"], 100, 32);
+    j.await_text("Enable updates");
+    executable(
+        &j.root.path().join("bin/ssh"),
+        "#!/bin/sh\ntouch \"$HOME/ssh-calls\"\nexit 97\n",
+    );
+    j.send(b"\r");
+    j.await_text("Connect another machine");
+    j.send(b"\x1b[B\r");
+    j.await_text("Enter a machine address");
+    j.send(b" \r");
+    j.await_text("Machine address");
+    j.send(b"user@example.invalid\x1b");
+    j.await_text("Open board");
+    assert!(!j.root.path().join("home/ssh-calls").exists());
+    j.send(b"\x1b");
+    j.finish();
+}
+
+#[test]
+fn machine_connection_needs_verified_snapshot_and_explicit_retry() {
+    use serde_json::json;
+    let mut j = Journey::start(&["setup", "--no-machines", "--no-import"], 100, 32);
+    j.await_text("Enable updates");
+    fs::create_dir_all(j.root.path().join("home/.ssh")).unwrap();
+    fs::write(
+        j.root.path().join("home/.ssh/config"),
+        "Host lab\n  HostName lab.invalid\n",
+    )
+    .unwrap();
+    let node = "99999999-9999-4999-8999-999999999999";
+    let hello = json!({"type":"hello", "protocol":pikamux::fleet::PROTOCOL_NAME,"version":pikamux::fleet::PROTOCOL_VERSION,"node_id":node,"machine":"lab","package_version":pikamux::VERSION,"capabilities":pikamux::fleet::CAPABILITIES});
+    let snapshot = json!({"type":"snapshot","protocol":pikamux::fleet::PROTOCOL_NAME,"version":pikamux::fleet::PROTOCOL_VERSION,"node_id":node,"machine":"lab","captured_at":1,"sessions":[],"profiles":[],"cards":[]});
+    executable(
+        &j.root.path().join("bin/ssh"),
+        &format!(
+            r#"#!/bin/sh
+IFS= read -r request
+printf '%s\n' "$request" >> "$HOME/ssh-requests"
+case "$request" in
+  *hello*) printf '%s\n' '{hello}' ;;
+  *snapshot*)
+    if [ -f "$HOME/retry-ready" ]; then printf '%s\n' '{snapshot}'; else printf '%s\n' '{{"incomplete":true}}'; fi ;;
+  *) exit 97 ;;
+esac
+"#
+        ),
+    );
+    j.send(b"\r");
+    j.await_text("Connect another machine");
+    j.send(b"\x1b[B\r");
+    j.await_text("lab");
+    j.send(b" \r");
+    j.await_text("Connection unavailable");
+    let store = pikamux::store::Store::at(j.root.path().join("state/pika/pika.db"));
+    assert!(
+        store.list_nodes().unwrap().is_empty(),
+        "SSH hello alone is not a connected machine"
+    );
+    assert_eq!(
+        fs::read_to_string(j.root.path().join("home/ssh-requests"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    fs::write(j.root.path().join("home/retry-ready"), "ready").unwrap();
+    j.send(b"\x1b[B\r");
+    j.await_text("Machines connected");
+    assert!(j.output.contains("lab"));
+    assert_eq!(store.list_nodes().unwrap().len(), 1);
+    assert!(store.has_remote_snapshot(node).unwrap());
+    assert_eq!(
+        fs::read_to_string(j.root.path().join("home/ssh-requests"))
+            .unwrap()
+            .lines()
+            .count(),
+        4
+    );
+    j.send(b"\x1b");
+    j.await_text("Open board");
+    j.send(b"\x1b");
+    j.finish();
+    assert!(!j.root.path().join("home/provider-calls").exists());
+}
+
+#[test]
+fn assistant_first_use_is_quiet_and_connection_cancel_preserves_draft() {
+    let mut j = Journey::start(&["pika"], 100, 32);
+    j.await_text("Enter to connect Pika");
+    assert!(!j.output.contains("Saved, dated evidence"));
+    assert!(!j.output.contains("/brief-seen"));
+    assert!(!j.output.contains("provider off"));
+    j.send(b"Remember this draft\r");
+    j.await_text("Connect with Codex");
+    j.send(b"\x1b");
+    j.await_text("Remember this draft");
+    assert!(!j.root.path().join("home/provider-calls").exists());
+    assert!(
+        !j.root
+            .path()
+            .join("state/pika/assistant-startup/selection.json")
+            .exists()
+    );
+    j.send(b"\x1bOP"); // F1 opens help without sending the draft.
+    j.await_text("How can Pika help?");
+    j.send(b"\x1b");
+    j.await_text("Remember this draft");
+    j.send(b"\x1b");
+    j.finish();
+    let db = rusqlite::Connection::open(j.root.path().join("state/pika/assistant/memory.sqlite"))
+        .unwrap();
+    let saved: i64 = db
+        .query_row(
+            "SELECT count(*) FROM memory_records WHERE body LIKE '%Remember this draft%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(saved, 0, "an unsent draft must not become saved memory");
+}
+
+#[test]
+fn assistant_failed_sign_in_restores_the_composer_and_does_not_enable() {
+    let mut j = Journey::start(&["pika"], 100, 32);
+    j.await_text("Enter to connect Pika");
+    j.send(b"\r");
+    j.await_text("Connect with Codex");
+    j.send(b"\r");
+    j.await_text("Connect and remember");
+    j.send(b"\r");
+    j.await_text("Sign in to Codex");
+    j.send(b"\r");
+    j.await_text("Pika couldn't finish connecting");
+    assert!(
+        !j.root
+            .path()
+            .join("state/pika/assistant-startup/selection.json")
+            .exists()
+    );
+    j.send(b"\x1b");
+    j.await_text("Enter to connect Pika");
+    j.send(b"\x1b");
+    j.finish();
+}
+
+#[test]
+fn assistant_confirmed_connection_remembers_the_same_profile_without_sending_a_message() {
+    let mut j = Journey::start(&["pika"], 100, 32);
+    j.await_text("Enter to connect Pika");
+    executable(
+        &j.root.path().join("bin/codex"),
+        "#!/bin/sh\nif [ \"$1\" = login ]; then\n  umask 077\n  printf '{}' > \"$CODEX_HOME/auth.json\"\n  printf '%s\\n' \"$CODEX_HOME\" > \"$HOME/login-home\"\n  exit 0\nfi\nprintf x >> \"$CODEX_HOME/start-count\"\nexit 97\n",
+    );
+    j.send(b"A draft, not a request yet\r");
+    j.await_text("Connect with Codex");
+    j.send(b"\r");
+    j.await_text("Connect and remember");
+    let selection = j
+        .root
+        .path()
+        .join("state/pika/assistant-startup/selection.json");
+    assert!(!selection.exists());
+    j.send(b"\r");
+    j.await_text("Sign in to Codex");
+    j.send(b"\r");
+    j.await_text("F2 to reconnect");
+    assert!(j.output.contains("A draft, not a request yet"));
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(&selection).unwrap()).unwrap();
+    let profile_root = j.root.path().join("state/pika/assistant");
+    assert_eq!(saved["profile_root"], profile_root.to_str().unwrap());
+    assert_eq!(saved["max_calls"], i64::MAX as u64);
+    assert_eq!(
+        fs::read_to_string(j.root.path().join("home/login-home"))
+            .unwrap()
+            .trim(),
+        profile_root.join("provider-home").to_str().unwrap()
+    );
+    assert!(!j.root.path().join("codex/auth.json").exists());
+    // A saved exact provider may differ from the next PATH lookup. Reconnect
+    // must keep the selected provider, not silently switch to a new package.
+    let pinned = j.root.path().join("bin/pinned-codex");
+    fs::copy(j.root.path().join("bin/codex"), &pinned).unwrap();
+    saved["executable"] = serde_json::json!(pinned);
+    fs::write(&selection, serde_json::to_vec(&saved).unwrap()).unwrap();
+    executable(
+        &j.root.path().join("bin/codex"),
+        "#!/bin/sh\nprintf x > \"$CODEX_HOME/reconnect-decoy\"\nexit 97\n",
+    );
+    j.await_text("F2 to reconnect");
+    assert!(!j.output.contains("Transport("));
+    j.send(b"\x1bOQ"); // F2, explicit reconnect, never an automatic resend.
+    j.await_text("Reconnect Pika");
+    j.await_text("send a message.");
+    j.send(b"\r");
+    j.await_text("F2 to reconnect");
+    assert_eq!(
+        fs::read_to_string(profile_root.join("provider-home/start-count")).unwrap(),
+        "xx"
+    );
+    assert!(j.output.contains("A draft, not a request yet"));
+    assert!(!profile_root.join("provider-home/reconnect-decoy").exists());
+    j.send(b"\x1b");
+    j.finish();
+    let db = rusqlite::Connection::open(profile_root.join("memory.sqlite")).unwrap();
+    let messages: i64 = db
+        .query_row(
+            "SELECT count(*) FROM memory_records WHERE body LIKE '%A draft, not a request yet%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(messages, 0);
 }
 
 #[test]
@@ -431,8 +822,10 @@ fn windows_screen_pairs_only_selected_hosts_and_keeps_success_after_failure() {
     j.send(b"\r");
     j.await_text("Choose your machines");
     j.send(b" \x1b[B \r");
+    j.await_text("Connection unavailable");
+    j.send(b"\r");
     j.await_text("Some connections need attention");
-    assert!(j.output.contains("1 machine(s) connected"));
+    assert!(j.output.contains("1 saved connection(s)"));
     assert!(!j.output.contains("PAIRED"));
     j.send(b"\r");
     j.finish();

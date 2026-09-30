@@ -249,7 +249,7 @@ fn codex_later_name_change_appears_without_importing_generated_or_helper_titles(
         json_line(
             &transcript,
             serde_json::json!({"type":"session_meta","payload":{
-                "id":id,"source":source,"forked_from_id":parent
+                "id":id,"source":source,"forked_from_id":parent,"originator":"codex-tui"
             }}),
         );
         db.execute(
@@ -302,6 +302,196 @@ fn codex_later_name_change_appears_without_importing_generated_or_helper_titles(
     assert_eq!(rows[0].session_id, renamed);
     assert!(!store.is_watched(Provider::Codex, generated).unwrap());
     assert!(!store.is_watched(Provider::Codex, helper).unwrap());
+}
+
+#[test]
+fn codex_named_admission_distinguishes_interactive_originators_from_workers() {
+    let cases = [
+        (
+            "terminal",
+            serde_json::json!({"source":"cli","originator":"codex-tui","thread_source":"user"}),
+            true,
+        ),
+        (
+            "desktop",
+            serde_json::json!({"source":"vscode","originator":"Codex Desktop","thread_source":"user"}),
+            true,
+        ),
+        (
+            "terminal via vscode",
+            serde_json::json!({"source":"vscode","originator":"codex-tui"}),
+            true,
+        ),
+        (
+            "app server",
+            serde_json::json!({"source":"appServer","originator":"Codex Desktop"}),
+            true,
+        ),
+        (
+            "legacy app server",
+            serde_json::json!({"source":"app-server"}),
+            true,
+        ),
+        (
+            "null originator",
+            serde_json::json!({"source":"cli","originator":null}),
+            true,
+        ),
+        (
+            "unknown interactive client",
+            serde_json::json!({"source":"cli","originator":"another-interactive-client"}),
+            true,
+        ),
+        (
+            "exec originator",
+            serde_json::json!({"source":"cli","originator":"CODEX_EXEC"}),
+            false,
+        ),
+        (
+            "configured worker",
+            serde_json::json!({"source":"cli","originator":"Team-Worker"}),
+            false,
+        ),
+        (
+            "exec source",
+            serde_json::json!({"source":"exec","originator":"codex-tui"}),
+            false,
+        ),
+        (
+            "subagent",
+            serde_json::json!({"source":"cli","thread_source":"subagent"}),
+            false,
+        ),
+        (
+            "structured subagent",
+            serde_json::json!({"source":{"subagent":{"thread_spawn":{}}},"originator":"codex-tui"}),
+            false,
+        ),
+        (
+            "fork",
+            serde_json::json!({"source":"cli","forked_from_id":"22222222-2222-4222-8222-222222222222"}),
+            false,
+        ),
+        (
+            "unknown source",
+            serde_json::json!({"source":"unknown","originator":"codex-tui"}),
+            false,
+        ),
+        (
+            "wrong identity",
+            serde_json::json!({"source":"cli","id":"22222222-2222-4222-8222-222222222222"}),
+            false,
+        ),
+    ];
+    for (label, mut payload, admitted) in cases {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(root.path());
+        let id = "11111111-1111-4111-8111-111111111111";
+        payload
+            .as_object_mut()
+            .unwrap()
+            .entry("id")
+            .or_insert(serde_json::json!(id));
+        let transcript = paths.codex_home.join("thread.jsonl");
+        json_line(
+            &transcript,
+            serde_json::json!({"type":"session_meta","payload":payload}),
+        );
+        let db = Connection::open(paths.codex_home.join("state_1.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,name TEXT,cwd TEXT,rollout_path TEXT,created_at INTEGER,updated_at INTEGER,archived INTEGER);").unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES(?1,'my_named_project','/project',?2,1,2,0)",
+            params![id, transcript.to_string_lossy()],
+        )
+        .unwrap();
+        fs::write(
+            paths.codex_home.join("session_index.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"id":id,"thread_name":"Generated title","updated_at":1}),
+                serde_json::json!({"id":id,"thread_name":"my_named_project","updated_at":2}),
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            codex_worker_originators: vec!["team-worker".into()],
+            ..Config::default()
+        };
+        let candidates = Providers::new(&paths, &config).import_candidates(Provider::Codex);
+        assert_eq!(
+            candidates.len(),
+            usize::from(admitted),
+            "discovery: {label}"
+        );
+        let store = Store::from_paths(&paths);
+        let rows = Pika::with_components(
+            paths,
+            config,
+            store.clone(),
+            Tmux::with_executable("/usr/bin/false", Some("isolated".into())),
+        )
+        .reconcile_local()
+        .unwrap()
+        .sessions;
+        assert_eq!(
+            rows.len(),
+            usize::from(admitted),
+            "board inventory: {label}"
+        );
+        assert_eq!(
+            store.is_watched(Provider::Codex, id).unwrap(),
+            admitted,
+            "membership: {label}"
+        );
+        if admitted {
+            assert_eq!(rows[0].name.as_deref(), Some("my_named_project"), "{label}");
+        }
+    }
+}
+
+#[test]
+fn claude_named_discovery_eventually_reaches_older_large_histories() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(root.path());
+    let config = Config::default();
+    let providers = Providers::new(&paths, &config);
+    let mut expected = BTreeSet::new();
+    for index in 0..19 {
+        let id = format!("00000000-0000-4000-8000-{index:012}");
+        let path = paths.claude_home.join(format!("projects/p/{id}.jsonl"));
+        sparse_title_transcript(
+            &path,
+            &format!("project-{index}"),
+            3 * 1024 * 1024,
+            100 + index,
+        );
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writeln!(file, "{}", serde_json::json!({"sessionId":id,"isSidechain":false,"entrypoint":if index == 18 {"sdk-cli"} else {"cli"}})).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100 + index))
+            .unwrap();
+        if index % 2 == 0 {
+            json_line(
+                &paths.claude_home.join(format!("sessions/{id}.json")),
+                serde_json::json!({"kind":"interactive","sessionId":id,"name":format!("project-{index}"),"nameSource":"custom"}),
+            );
+        }
+        if index != 18 {
+            expected.insert(id);
+        }
+    }
+    let mut found = BTreeSet::new();
+    for _ in 0..19 {
+        // Repeated bounded discovery must make progress even when nothing is
+        // renamed or touched again. Both registry and history-only rows count.
+        for candidate in providers.import_candidates(Provider::Claude) {
+            assert!(expected.contains(&candidate.session_id), "worker admitted");
+            found.insert(candidate.session_id);
+        }
+        if found == expected {
+            break;
+        }
+    }
+    assert_eq!(found, expected, "older named conversations must not starve");
 }
 
 #[test]

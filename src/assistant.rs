@@ -11,7 +11,7 @@ use crossterm::{
         MouseEventKind,
     },
     execute, queue,
-    style::{Color, Print, ResetColor, SetForegroundColor},
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{
         self, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
     },
@@ -25,8 +25,13 @@ use std::{
 };
 use unicode_width::UnicodeWidthChar;
 
+#[path = "assistant_setup.rs"]
+mod setup;
+
 #[derive(clap::Args, Debug, Default)]
 pub(crate) struct Args {
+    #[arg(skip)]
+    pub view_memory: Option<std::sync::Arc<std::sync::Mutex<ViewMemory>>>,
     #[arg(skip)]
     pub startup_notice: Option<String>,
     #[arg(skip)]
@@ -673,6 +678,9 @@ fn open_host_memory(root: &Path, expected_profile: Option<&str>) -> Result<Store
         Some(profile) => Store::open_existing(root.join("memory.sqlite"), profile)?,
         None => Store::open(root.join("memory.sqlite"))?,
     };
+    // Prepare shared maintenance tables before background workers and the first
+    // foreground write can race to create them on separate connections.
+    crate::assistant_maintenance::initialize(&memory)?;
     memory.set_busy_timeout(25)?;
     crate::assistant_retention::cleanup(root, memory.forget_epoch()?)?;
     Ok(memory)
@@ -1930,6 +1938,7 @@ fn finish_entry(client: &mut Client, args: Args) -> Result<i32> {
         args.focus,
         args.board,
         args.startup_notice,
+        args.view_memory,
     )?;
     Ok(0)
 }
@@ -2033,7 +2042,7 @@ pub(crate) fn interactive_view(
     scope: &str,
     focus: Option<Focus>,
 ) -> Result<()> {
-    entry_view(client, scope, focus, false, None)
+    entry_view(client, scope, focus, false, None, None)
 }
 
 fn entry_view(
@@ -2042,6 +2051,7 @@ fn entry_view(
     focus: Option<Focus>,
     board: bool,
     notice: Option<String>,
+    memory: Option<std::sync::Arc<std::sync::Mutex<ViewMemory>>>,
 ) -> Result<()> {
     let feed = match crate::activity_feed::current() {
         Some(context) => context,
@@ -2049,7 +2059,9 @@ fn entry_view(
             &crate::core::Pika::discover()?,
         )?),
     };
-    crate::activity_feed::with(Some(feed), || run_view(client, scope, focus, board, notice))
+    crate::activity_feed::with(Some(feed), || {
+        run_view(client, scope, focus, board, notice, memory)
+    })
 }
 
 fn normalize_args(args: &mut Args) {
@@ -2164,15 +2176,22 @@ fn run_view(
     focus: Option<Focus>,
     board: bool,
     notice: Option<String>,
+    memory: Option<std::sync::Arc<std::sync::Mutex<ViewMemory>>>,
 ) -> Result<()> {
     let _screen = Screen::enter()?;
     let mut view = AssistantView::new(client, scope)?;
     view.focus = focus;
     view.board = board;
+    if let Some(memory) = &memory {
+        memory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .restore(&mut view);
+    }
     if let Some(notice) = notice {
         view.notice = notice;
     }
-    loop {
+    let outcome = (|| loop {
         view.paint_if_dirty()?;
         if !event::poll(Duration::from_millis(100))? {
             view.refresh_if_due()?;
@@ -2181,6 +2200,65 @@ fn run_view(
         if !view.handle_event(event::read()?)? {
             return Ok(());
         }
+    })();
+    if let Some(memory) = memory {
+        memory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .save(&view);
+    }
+    outcome
+}
+
+/// Ephemeral navigation state owned by the board, never a sent message or a
+/// second memory store. Profile/scope/forget generation fence restored output.
+#[derive(Debug, Default)]
+pub(crate) struct ViewMemory {
+    profile: String,
+    scope: String,
+    epoch: Option<u64>,
+    draft: String,
+    scroll: usize,
+    output: String,
+    brief: Option<crate::assistant_presentation::BriefCursor>,
+    memory_next: Option<crate::assistant_presentation::MemoryCursor>,
+    record_next: Option<crate::assistant_presentation::RecordChunkCursor>,
+}
+
+impl ViewMemory {
+    fn restore(&self, view: &mut AssistantView<'_>) {
+        if self.profile.is_empty()
+            || view.snapshot["profile_id"].as_str() != Some(self.profile.as_str())
+            || self.scope != view.scope
+        {
+            return;
+        }
+        view.draft.clone_from(&self.draft);
+        if self.epoch.is_some()
+            && self.epoch == view.snapshot["memory_epoch"].as_u64()
+            && self.epoch == view.last_brief.as_ref().map(|cursor| cursor.epoch)
+        {
+            view.scroll = self.scroll;
+            view.local_output.clone_from(&self.output);
+            view.last_brief.clone_from(&self.brief);
+            view.memory_next.clone_from(&self.memory_next);
+            view.record_next.clone_from(&self.record_next);
+        }
+    }
+
+    fn save(&mut self, view: &AssistantView<'_>) {
+        self.profile = view.snapshot["profile_id"]
+            .as_str()
+            .unwrap_or_default()
+            .into();
+        self.scope = view.scope.into();
+        self.epoch = view.last_memory_epoch;
+        self.draft.clone_from(&view.draft);
+        self.scroll = view.scroll;
+        self.output.clone_from(&view.local_output);
+        self.brief.clone_from(&view.last_brief);
+        self.memory_next.clone_from(&view.memory_next);
+        self.record_next.clone_from(&view.record_next);
     }
 }
 
@@ -2306,6 +2384,11 @@ impl<'a> AssistantView<'a> {
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Esc | KeyCode::F(12) => return Ok(false),
+            KeyCode::F(1) => self.open_help()?,
+            KeyCode::F(2) => self.open_settings()?,
+            KeyCode::Enter if self.draft.is_empty() && needs_connection(&self.snapshot) => {
+                self.open_settings()?;
+            }
             KeyCode::PageDown => {
                 self.scroll = self
                     .scroll
@@ -2337,6 +2420,13 @@ impl<'a> AssistantView<'a> {
     }
 
     fn submit(&mut self) -> Result<()> {
+        if !self.draft.starts_with('/')
+            && (self.snapshot["provider"] != "codex" || needs_connection(&self.snapshot))
+        {
+            self.notice = "Connect Pika to send this message. Your draft is still here.".into();
+            self.open_settings()?;
+            return Ok(());
+        }
         let mut request = if let Some(request) = self.context_command() {
             request
         } else if !self.draft.starts_with('/') && self.snapshot["provider"] == "codex" {
@@ -2432,7 +2522,11 @@ impl<'a> AssistantView<'a> {
         if let Some(chunk) = reply.get("memory_record") {
             self.record_next = serde_json::from_value(chunk["next"].clone()).ok().flatten();
         }
-        self.local_output = reply["local_output"].as_str().unwrap_or("").to_owned();
+        self.local_output = if reply.get("presentation").is_some() && self.draft != "/brief" {
+            setup::brief_text(&reply["presentation"]["brief"])
+        } else {
+            reply["local_output"].as_str().unwrap_or("").to_owned()
+        };
         if self.draft.starts_with("/forget ") {
             self.local_output.clear();
         }
@@ -2443,6 +2537,92 @@ impl<'a> AssistantView<'a> {
         self.draft.clear();
         self.scroll = 0;
     }
+
+    fn open_help(&mut self) -> Result<()> {
+        let draft = self.draft.clone();
+        let ui = crate::onboarding::Screen::embedded();
+        let choice = ui.choice(
+            "How can Pika help?",
+            "Ask about a decision, remember something important, or pick up where you left off.",
+            &[
+                "Back to conversation",
+                "See saved updates",
+                "Leave feedback",
+                "Advanced commands",
+            ],
+        )?;
+        match choice {
+            Some(1) => self.send_draft(Request::Brief {
+                scope: self.scope.into(),
+            }),
+            Some(2) => {
+                if let Some(note) =
+                    ui.input("Leave feedback", "What should we improve about Pika?")?
+                {
+                    self.send_draft(Request::Feedback {
+                        scope: self.scope.into(),
+                        note: Some(note),
+                    });
+                }
+            }
+            Some(3) => {
+                self.send_draft(Request::Help);
+            }
+            _ => {}
+        }
+        self.draft = draft;
+        self.presenter = crate::monitor::FramePresenter::default();
+        Ok(())
+    }
+
+    fn open_settings(&mut self) -> Result<()> {
+        let result = self.configure_connection();
+        self.presenter = crate::monitor::FramePresenter::default();
+        if let Err(error) = result {
+            self.notice = format!("Provider not started: {error}");
+            let ui = crate::onboarding::Screen::embedded();
+            if ui.choice(
+                "Pika couldn't finish connecting",
+                "Your draft and saved memories are still here. No message was sent.",
+                &["Back to conversation", "Technical details"],
+            )? == Some(1)
+            {
+                ui.details("Technical details", &self.notice)?;
+            }
+        }
+        self.snapshot = send(
+            self.client,
+            Request::Snapshot {
+                scope: self.scope.into(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn configure_connection(&mut self) -> Result<()> {
+        let mut settings = self.snapshot.clone();
+        settings["view_notice"] = json!(self.notice);
+        let Some(selection) = setup::choose(self.client.root(), &settings, self.scope)? else {
+            return Ok(());
+        };
+        send(
+            self.client,
+            Request::Enable {
+                scope: self.scope.into(),
+                executable: selection.executable.clone(),
+                max_calls: selection.max_calls,
+                restore: false,
+            },
+        )?;
+        crate::assistant_startup::save(&crate::assistant_startup::path()?, &selection)?;
+        self.notice =
+            "Connecting Pika… Your message will be sent only when you press Enter.".into();
+        Ok(())
+    }
+}
+
+fn needs_connection(snapshot: &Value) -> bool {
+    matches!(snapshot["state"].as_str(), Some("not_enabled")) || snapshot["can_reconnect"] == true
 }
 
 /// Bind the shortcut to the exact report the user saw, never to "latest" at the
@@ -3009,6 +3189,11 @@ fn compose(
     scroll: usize,
 ) -> Result<Vec<u8>> {
     let (columns, height) = dimensions;
+    let notice = if snapshot["state"] == "unavailable" && notice.starts_with("Connecting Pika") {
+        ""
+    } else {
+        notice
+    };
     if columns < 8 || height < 8 {
         return resize_frame(columns, height);
     }
@@ -3040,11 +3225,24 @@ fn compose(
             height.saturating_sub(origin.1),
         );
         buffer.extend(render_lines_at(
-            lines, draft, notice, panel, scroll, origin,
+            lines,
+            draft,
+            notice,
+            panel,
+            scroll,
+            origin,
+            needs_connection(snapshot),
         )?);
         return Ok(buffer);
     }
-    render_lines(lines, draft, notice, dimensions, scroll)
+    render_lines(
+        lines,
+        draft,
+        notice,
+        dimensions,
+        scroll,
+        needs_connection(snapshot),
+    )
 }
 
 fn resize_frame(columns: u16, height: u16) -> Result<Vec<u8>> {
@@ -3062,40 +3260,46 @@ fn resize_frame(columns: u16, height: u16) -> Result<Vec<u8>> {
 
 fn header_lines(snapshot: &Value) -> Vec<String> {
     let mut lines = vec![
-        "PIKA · your persistent assistant".to_owned(),
-        format!(
-            "{} · {} · {}",
-            match snapshot["state"].as_str() {
-                Some("ready") => "Ready",
-                Some("working") => "Thinking",
-                Some("starting") => "Connecting",
-                Some("recovering") => "Recovering",
-                Some("cancelling") => "Stopping this request",
-                Some("unavailable" | "stopped") => "Provider unavailable",
-                _ => "Local memory · provider off",
-            },
-            snapshot["scope"].as_str().unwrap_or("personal"),
-            background_label(&snapshot["control"])
-        ),
+        "✦ PIKA".to_owned(),
         if snapshot["control"]["context_blocked"] == true {
-            "Fresh context required before reasoning · /fresh-context".into()
+            "Pika needs to reconnect. Your memories are safe. F2 for details.".into()
         } else if snapshot["control"]["paused"] == true {
-            "Reasoning paused · /resume · project agents are untouched".into()
-        } else if snapshot["control"]["board_shared"] == true {
-            "Board metadata shared for approved identities only · /board-share off".into()
+            "Paused · /resume when you're ready".into()
         } else {
-            "Board sharing off · /board-share previews exactly what would be shared".into()
+            match snapshot["state"].as_str() {
+                Some("working") => "Thinking…",
+                Some("starting") => "Connecting…",
+                Some("recovering") => "Reconnecting…",
+                Some("cancelling") => "Stopping this reply…",
+                Some("unavailable" | "stopped") => {
+                    if snapshot["can_reconnect"] == true {
+                        "! Couldn't connect · F2 to reconnect · your draft is safe"
+                    } else {
+                        "! Reply interrupted · F2 details · no message resent"
+                    }
+                }
+                Some("ready") => "● Connected · Luna",
+                _ => "Your persistent assistant",
+            }
+            .into()
         },
-        String::new(),
     ];
     if let Some(label) = snapshot["focus_label"].as_str() {
-        lines.insert(
-            3,
-            format!(
-                "Focus · {} · a reference, not permission to read it",
-                crate::fleet::sanitize_terminal_text(label)
-            ),
-        );
+        lines.push(format!(
+            "About {}",
+            crate::fleet::sanitize_terminal_text(label)
+        ));
+    }
+    lines.push(String::new());
+    if snapshot["state"] == "not_enabled" {
+        lines.extend([
+            "Welcome to Pika".into(),
+            "Keep track of decisions, remember what matters, and pick up your work.".into(),
+            String::new(),
+            "Connect once to start talking.".into(),
+            "Enter  Connect Pika     F1  Look around".into(),
+            String::new(),
+        ]);
     }
     lines
 }
@@ -3130,7 +3334,6 @@ fn append_board(lines: &mut Vec<String>) {
         lines.push(format!(
             "Board · {needs} need you · {working} working · {ready} ready · {parked} parked"
         ));
-        lines.push("Shared board feed · no extra scan · source unread unchanged".into());
         for item in state
             .items
             .iter()
@@ -3175,9 +3378,6 @@ fn append_output(snapshot: &Value, lines: &mut Vec<String>) {
 
 fn append_provider_status(snapshot: &Value, lines: &mut Vec<String>) {
     append_native_method_status(snapshot, lines);
-    if let Some(error) = snapshot["error"].as_str() {
-        lines.push(format!("Provider unavailable · {error}"));
-    }
     if let Some(author) = snapshot["author"].as_object() {
         lines.push(format!(
             "Disposable tool author · {}",
@@ -3186,8 +3386,8 @@ fn append_provider_status(snapshot: &Value, lines: &mut Vec<String>) {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
         ));
-        if let Some(error) = author.get("error").and_then(Value::as_str) {
-            lines.push(format!("Author incomplete · {error}"));
+        if author.get("error").and_then(Value::as_str).is_some() {
+            lines.push("! Couldn't finish preparing the tool · F2 for details".into());
         }
     }
 }
@@ -3200,14 +3400,14 @@ fn append_native_method_status(snapshot: &Value, lines: &mut Vec<String>) {
     {
         lines.push(format!("Native workshop · {state}"));
         if !method["result"].is_null() {
-            lines.push(serde_json::to_string_pretty(&method["result"]).unwrap_or_default());
+            lines.push("Tool check results are available · F2 for details".into());
         }
-        if let Some(error) = method["error"].as_str() {
-            lines.push(format!("Workshop incomplete · {error}"));
+        if method["error"].as_str().is_some() {
+            lines.push("! Couldn't finish checking the tool · F2 for details".into());
         }
     }
-    if let Some(notice) = snapshot["cleanup_notice"].as_str() {
-        lines.push(notice.into());
+    if snapshot["cleanup_notice"].as_str().is_some() {
+        lines.push("Assistant recovery has an update · F2 for details".into());
     }
 }
 
@@ -3220,8 +3420,8 @@ fn append_recovery_status(snapshot: &Value, lines: &mut Vec<String>) {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
         ));
-        if let Some(error) = recovery.get("error").and_then(Value::as_str) {
-            lines.push(format!("Recovery incomplete · {error}"));
+        if recovery.get("error").and_then(Value::as_str).is_some() {
+            lines.push("! Recovery needs attention · F2 for details".into());
         }
         if recovery.get("state").and_then(Value::as_str) == Some("completed") {
             lines.push("Fresh context ready. Saved memory and call charges remain. Re-enable the provider explicitly; no request was replayed.".into());
@@ -3241,12 +3441,13 @@ fn append_investigation(snapshot: &Value, lines: &mut Vec<String>) {
         if let Some(text) = investigation.get("text").and_then(Value::as_str) {
             lines.push(text.into());
         }
-        if let Some(error) = investigation.get("error").and_then(Value::as_str) {
-            lines.push(format!("Incomplete · {error}"));
+        if investigation.get("error").and_then(Value::as_str).is_some() {
+            lines.push("! Couldn't finish the investigation · F2 for details".into());
         }
     }
     if let Some(partial) = snapshot["partial"].as_str().filter(|text| !text.is_empty()) {
-        lines.push(format!("Pika · {partial}"));
+        lines.push("✦ Pika".into());
+        lines.push(partial.into());
         lines.push(String::new());
     }
 }
@@ -3302,8 +3503,10 @@ fn append_records(snapshot: &Value, lines: &mut Vec<String>) {
         .as_array()
         .filter(|_| snapshot["local_output"].as_str().is_none_or(str::is_empty))
     {
-        if records.is_empty() {
-            lines.push("Start with what matters to you. /remember saves an instruction.".into());
+        if records.is_empty() && snapshot["state"] == "ready" {
+            lines.push("What would you like to work on?".into());
+            lines.push(String::new());
+            lines.push("Ask about a decision, share an idea, or tell me what to remember.".into());
         }
         for record in records.iter().rev() {
             let label = match (record["kind"].as_str(), record["origin"].as_str()) {
@@ -3313,10 +3516,13 @@ fn append_records(snapshot: &Value, lines: &mut Vec<String>) {
                 (Some(kind), _) => kind,
                 _ => "Memory",
             };
-            lines.push(format!(
-                "{} · {}",
-                label,
-                crate::assistant_briefing::readable_decision(record["body"].as_str().unwrap_or(""))
+            lines.push(match label {
+                "You" => "› You".into(),
+                "Pika" => "✦ Pika".into(),
+                _ => label.into(),
+            });
+            lines.push(crate::assistant_briefing::readable_decision(
+                record["body"].as_str().unwrap_or(""),
             ));
             lines.push(String::new());
         }
@@ -3329,6 +3535,7 @@ fn render_lines(
     notice: &str,
     dimensions: (u16, u16),
     scroll: usize,
+    connect: bool,
 ) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     queue!(buffer, MoveTo(0, 0), Clear(ClearType::All))?;
@@ -3339,6 +3546,7 @@ fn render_lines(
         dimensions,
         scroll,
         (0, 0),
+        connect,
     )?);
     Ok(buffer)
 }
@@ -3350,9 +3558,11 @@ fn render_lines_at(
     dimensions: (u16, u16),
     scroll: usize,
     origin: (u16, u16),
+    connect: bool,
 ) -> Result<Vec<u8>> {
     let (columns, height) = dimensions;
-    let width = usize::from(columns.saturating_sub(4));
+    let width = usize::from(columns.saturating_sub(4)).min(104);
+    let left = origin.0 + columns.saturating_sub(width as u16) / 2;
     let colors = std::env::var_os("NO_COLOR").is_none();
     let mut buffer = Vec::new();
     for row in 0..height {
@@ -3364,46 +3574,125 @@ fn render_lines_at(
     }
     let wrapped = lines
         .into_iter()
-        .flat_map(|line| wrap(&line, width))
+        .flat_map(|line| {
+            let style = conversation_style(&line);
+            wrap(&line, width).into_iter().map(move |row| (row, style))
+        })
         .collect::<Vec<_>>();
-    let visible = usize::from(height.saturating_sub(6));
+    let visible = usize::from(height.saturating_sub(8));
     let scroll = scroll.min(wrapped.len().saturating_sub(visible));
-    for (index, line) in wrapped
-        .into_iter()
-        .skip(scroll)
-        .take(usize::from(height.saturating_sub(6)))
-        .enumerate()
+    for (index, (line, (color, bold))) in wrapped.into_iter().skip(scroll).take(visible).enumerate()
     {
-        queue!(buffer, MoveTo(origin.0 + 2, origin.1 + index as u16))?;
-        if colors && index == 0 {
-            queue!(buffer, SetForegroundColor(Color::Cyan))?;
+        queue!(buffer, MoveTo(left, origin.1 + 1 + index as u16))?;
+        if colors {
+            queue!(buffer, SetForegroundColor(color))?;
+            if bold {
+                queue!(buffer, SetAttribute(Attribute::Bold))?;
+            }
         }
-        queue!(buffer, Print(line), ResetColor)?;
-    }
-    for (offset, text) in [
-        (5, notice.to_owned()),
-        (3, format!("› {draft}")),
-        (
-            1,
-            "Esc/F12 board · PgUp/PgDn scroll · /help · Ctrl+C clear draft".into(),
-        ),
-    ] {
-        let wrapped = wrap(&text, width);
         queue!(
             buffer,
-            MoveTo(origin.0 + 2, origin.1 + height.saturating_sub(offset)),
-            Print(
-                if offset == 3 {
-                    wrapped.last()
-                } else {
-                    wrapped.first()
-                }
-                .cloned()
-                .unwrap_or_default()
-            )
+            Print(line),
+            SetAttribute(Attribute::Reset),
+            ResetColor
+        )?;
+    }
+    for (offset, text) in composer_rows(width, draft, notice, connect) {
+        let wrapped = wrap(&text, width);
+        if colors {
+            queue!(buffer, SetForegroundColor(composer_color(offset, draft)))?;
+        }
+        let row = if offset == 3 {
+            wrapped.last()
+        } else {
+            wrapped.first()
+        };
+        queue!(
+            buffer,
+            MoveTo(left, origin.1 + height.saturating_sub(offset)),
+            Print(row.cloned().unwrap_or_default()),
+            ResetColor
         )?;
     }
     Ok(buffer)
+}
+
+fn composer_color(offset: u16, draft: &str) -> Color {
+    match offset {
+        6 => Color::Yellow,
+        3 if !draft.is_empty() => Color::Reset,
+        4 | 2 => Color::Cyan,
+        _ => Color::DarkGrey,
+    }
+}
+
+fn composer_rows(width: usize, draft: &str, notice: &str, connect: bool) -> [(u16, String); 5] {
+    [
+        (6, friendly_notice(notice)),
+        (4, format!("╭{}", "─".repeat(width.saturating_sub(1)))),
+        (
+            3,
+            if draft.is_empty() {
+                if connect {
+                    "│ › Enter to connect Pika".into()
+                } else {
+                    "│ › Message Pika…".into()
+                }
+            } else {
+                format!("│ › {draft}▏")
+            },
+        ),
+        (2, format!("╰{}", "─".repeat(width.saturating_sub(1)))),
+        (
+            1,
+            if connect {
+                "Enter connect · F1 help · F2 settings · Esc/F12 board".into()
+            } else {
+                "Enter send · F1 help · F2 settings · Esc/F12 board".into()
+            },
+        ),
+    ]
+}
+
+fn conversation_style(line: &str) -> (Color, bool) {
+    if line.starts_with('✦') {
+        (Color::Cyan, true)
+    } else if line.starts_with("› You") {
+        (Color::Blue, true)
+    } else if line.starts_with('!') || line.starts_with("Needs attention") {
+        (Color::Yellow, false)
+    } else if line.starts_with('●') {
+        (Color::Green, false)
+    } else if line.starts_with("Board ·") || line.starts_with("Your persistent") {
+        (Color::DarkGrey, false)
+    } else {
+        (Color::Reset, false)
+    }
+}
+
+fn friendly_notice(notice: &str) -> String {
+    if notice.starts_with("Provider not started:") {
+        return "Couldn't connect. Your saved memories are here. F2 for details.".into();
+    }
+    if notice.starts_with("Turn not accepted:") {
+        return "Couldn't send. Your draft is still here. F2 for details.".into();
+    }
+    match notice {
+        "Saved briefing opened. Nothing acknowledged; no model call."
+        | "Local memory ready. A provider and spending allowance have not been enabled. Drafts remain unsent." => {
+            String::new()
+        }
+        "Sent once. Waiting for Pika; no automatic retry."
+        | "Accepted once; do not resend if delivery becomes unknown." => "Message sent.".into(),
+        "Foreground provider ready. Requests use your explicit call allowance." => String::new(),
+        "Checking the isolated provider. No new request has been sent." => {
+            "Connecting Pika…".into()
+        }
+        "Request in progress within the approved allowance. No automatic retry." => {
+            "Thinking…".into()
+        }
+        _ => notice.into(),
+    }
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -3802,15 +4091,110 @@ mod tests {
     fn background_display_tracks_real_control_state_and_remaining_allowance() {
         for state in ["enabled", "paused", "expired", "exhausted"] {
             let snapshot = json!({"scope":"alpha","state":"ready","control":{"background":{"state":state,"remaining_calls":3,"config":{"expires_at":2000000000_i64}}}});
-            let header = header_lines(&snapshot).join("\n");
-            assert!(header.contains(&format!("background {state}")), "{header}");
-            assert!(header.contains("3 calls available"));
-            assert!(header.contains("local"));
-            assert!(!header.contains("background spending off"));
+            let details = setup::details(&snapshot);
+            assert!(
+                details.contains(&format!("background {state}")),
+                "{details}"
+            );
+            assert!(details.contains("3 calls available"));
+            assert!(details.contains("local"));
+            assert!(
+                !header_lines(&snapshot)
+                    .join("\n")
+                    .contains("calls available")
+            );
         }
         assert_eq!(background_label(&json!({})), "background off");
         let blocked = header_lines(&json!({"control":{"context_blocked":true}})).join("\n");
-        assert!(blocked.contains("Fresh context required"));
+        assert!(blocked.contains("needs to reconnect"));
+    }
+
+    #[test]
+    fn board_return_restores_unsent_draft_but_never_forgotten_or_other_scope_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("assistant");
+        let mut memory = Store::open(root.join("memory.sqlite")).unwrap();
+        let record = memory
+            .append(NewRecord {
+                kind: RecordKind::Finding,
+                origin: Origin::Human,
+                scope: scope("personal").unwrap(),
+                body: "forgettable marker".into(),
+                provenance: "synthetic fixture".into(),
+                timestamp: 1,
+                supersedes: None,
+                dependencies: vec![],
+                decision_state: None,
+                protected_policy: false,
+            })
+            .unwrap();
+        drop(memory);
+        let owned = root.clone();
+        let server = std::thread::spawn(move || serve(&owned, None).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !root.join("view.sock").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut client = Client::attach(&root).unwrap();
+        let mut navigation = ViewMemory::default();
+        let mut view = AssistantView::new(&mut client, "personal").unwrap();
+        view.draft = "unsent question".into();
+        view.scroll = 3;
+        assert!(view.local_output.contains("forgettable marker"));
+        navigation.save(&view);
+        drop(view);
+        let mut reopened = AssistantView::new(&mut client, "personal").unwrap();
+        navigation.restore(&mut reopened);
+        assert_eq!(reopened.draft, "unsent question");
+        assert_eq!(reopened.scroll, 3);
+        assert!(reopened.local_output.contains("forgettable marker"));
+        assert_eq!(
+            reopened.snapshot["records"].as_array().unwrap().len(),
+            1,
+            "return did not send"
+        );
+        drop(reopened);
+        let mut other = AssistantView::new(&mut client, "project:other").unwrap();
+        navigation.restore(&mut other);
+        assert!(other.draft.is_empty());
+        assert!(!other.local_output.contains("forgettable marker"));
+        drop(other);
+        let forgotten_reply = send(
+            &mut client,
+            Request::Forget {
+                record_id: record.id,
+            },
+        )
+        .unwrap();
+        assert_eq!(forgotten_reply["cleanup_pending"], true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let snapshot = send(
+                &mut client,
+                Request::Snapshot {
+                    scope: "personal".into(),
+                },
+            )
+            .unwrap();
+            if snapshot["memory_epoch"].as_u64() != navigation.epoch {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queued forgetting never completed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut forgotten = AssistantView::new(&mut client, "personal").unwrap();
+        navigation.restore(&mut forgotten);
+        assert_eq!(forgotten.draft, "unsent question");
+        assert!(!forgotten.local_output.contains("forgettable marker"));
+        assert_eq!(forgotten.scroll, 0);
+        drop(forgotten);
+        drop(client);
+        assert_eq!(server.join().unwrap(), 0);
+        assert!(!root.join("provider-home").exists());
     }
 
     #[test]
@@ -3938,6 +4322,160 @@ mod tests {
                 .unwrap()
         );
         assert!(output.is_empty());
+    }
+    #[test]
+    #[ignore = "manual visual fixture; synthetic data only"]
+    fn assistant_visual_fixture() {
+        let dir = tempfile::Builder::new()
+            .prefix("pika-chat-visual-")
+            .tempdir_in("/tmp")
+            .unwrap()
+            .keep();
+        for (name, dimensions, snapshot, draft) in [
+            (
+                "conversation",
+                (120, 28),
+                json!({"state":"ready","provider":"codex","records":[{"kind":"Finding","origin":"Worker","body":"I help you keep track of your work, remember decisions, and pick up where you left off.\n\nTell me what matters today, or ask me to recall a decision."},{"kind":"Finding","origin":"Human","body":"Tell me about yourself."}]}),
+                "What should we focus on today?",
+            ),
+            (
+                "reconnect",
+                (80, 24),
+                json!({"state":"unavailable","provider":"codex","can_reconnect":true,"records":[],"error":"Transport(internal)"}),
+                "Keep this draft",
+            ),
+            (
+                "first-use",
+                (60, 24),
+                json!({"state":"not_enabled","provider":"none","records":[]}),
+                "",
+            ),
+        ] {
+            let frame = compose(&snapshot, draft, "", dimensions, 0).unwrap();
+            let rows = crate::terminal_frame::rows(&frame, dimensions).unwrap();
+            let rows: Vec<_> = rows
+                .into_iter()
+                .map(|r| String::from_utf8(r).unwrap())
+                .collect();
+            std::fs::write(
+                dir.join(format!("{name}.json")),
+                serde_json::to_vec(&json!({"dimensions":dimensions,"rows":rows})).unwrap(),
+            )
+            .unwrap();
+        }
+        println!("VISUAL_FIXTURES={}", dir.display());
+    }
+
+    #[test]
+    fn restored_startup_error_is_readable_in_details_not_in_conversation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("assistant");
+        let owner = Owner::acquire(&root).unwrap();
+        let server = std::thread::spawn(move || {
+            owner.serve(|request| {
+                assert_eq!(request["operation"], "enable");
+                bail!("Transport(RESTORED_STARTUP_DIAGNOSTIC)")
+            })
+        });
+        let mut client = Client::attach(&root).unwrap();
+        let mut args = Args {
+            enable_codex: Some("/fake/pinned-codex".into()),
+            restore_startup: true,
+            no_call_limit: true,
+            ..Default::default()
+        };
+        assert!(prepare_enable(&mut client, &mut args).unwrap().is_none());
+        let notice = args.startup_notice.unwrap();
+        assert!(notice.contains("RESTORED_STARTUP_DIAGNOSTIC"));
+        let snapshot = json!({"state":"not_enabled","view_notice":notice});
+        let frame = compose(&snapshot, "unsent draft", &notice, (100, 28), 0).unwrap();
+        let text = String::from_utf8(frame).unwrap();
+        assert!(text.contains("Couldn't connect"));
+        assert!(text.contains("unsent draft"));
+        assert!(!text.contains("RESTORED_STARTUP_DIAGNOSTIC"));
+        assert!(setup::details(&snapshot).contains("RESTORED_STARTUP_DIAGNOSTIC"));
+        drop(client);
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn worker_diagnostics_and_results_are_available_in_details_without_filling_chat() {
+        let snapshot = json!({"state":"ready","records":[],
+            "author":{"state":"failed","error":"AUTHOR_DIAGNOSTIC"},
+            "method_control":{"state":"failed","error":"METHOD_DIAGNOSTIC","result":{"raw":"METHOD_RESULT"}},
+            "recovery":{"state":"failed","error":"RECOVERY_DIAGNOSTIC"},
+            "investigation":{"state":"failed","error":"INVESTIGATION_DIAGNOSTIC","text":"Useful partial answer"},
+            "cleanup_notice":"CLEANUP_DIAGNOSTIC"});
+        let frame = compose(&snapshot, "", "", (100, 60), 0).unwrap();
+        let chat = String::from_utf8(frame).unwrap();
+        let details = setup::details(&snapshot);
+        for marker in [
+            "AUTHOR_DIAGNOSTIC",
+            "METHOD_DIAGNOSTIC",
+            "METHOD_RESULT",
+            "RECOVERY_DIAGNOSTIC",
+            "INVESTIGATION_DIAGNOSTIC",
+            "CLEANUP_DIAGNOSTIC",
+        ] {
+            assert!(!chat.contains(marker), "{marker}");
+            assert!(details.contains(marker), "{marker}");
+        }
+        assert!(chat.contains("Useful partial answer"));
+        assert!(chat.contains("F2 for details"));
+    }
+
+    #[test]
+    fn disconnected_surface_hides_debug_errors_and_keeps_recovery_visible() {
+        let snapshot = json!({"state":"unavailable","provider":"codex","can_reconnect":true,"error":"Transport(SECRET_INTERNAL_ERROR)","records":[]});
+        let frame = compose(
+            &snapshot,
+            "keep my draft",
+            "Turn not accepted: Closed. Draft retained; no automatic retry.",
+            (80, 24),
+            0,
+        )
+        .unwrap();
+        let rows = crate::terminal_frame::rows(&frame, (80, 24)).unwrap();
+        let text =
+            crate::fleet::sanitize_terminal_lines(&String::from_utf8(rows.concat()).unwrap());
+        assert!(text.contains("F2 to reconnect"));
+        assert!(text.contains("keep my draft"));
+        assert!(text.contains("Couldn't send"));
+        assert!(!text.contains("Closed"));
+        assert!(!text.contains("SECRET_INTERNAL_ERROR"));
+        assert!(text.contains('╭') && text.contains('╰'));
+        assert!(needs_connection(&snapshot));
+        assert!(!needs_connection(
+            &json!({"state":"unavailable","request_id":"accepted-turn","can_reconnect":false})
+        ));
+    }
+
+    #[test]
+    fn first_use_layout_keeps_connection_and_composer_visible_without_diagnostics() {
+        let snapshot =
+            json!({"scope":"personal","state":"not_enabled","provider":"none","records":[]});
+        for width in [60, 100, 200] {
+            let frame = compose(
+                &snapshot,
+                "",
+                "Saved briefing opened. Nothing acknowledged; no model call.",
+                (width, 24),
+                0,
+            )
+            .unwrap();
+            let rows = crate::terminal_frame::rows(&frame, (width, 24)).unwrap();
+            let text =
+                crate::fleet::sanitize_terminal_lines(&String::from_utf8(rows.concat()).unwrap());
+            assert!(text.contains("Connect once to start talking"));
+            assert!(text.contains("Enter to connect Pika"));
+            assert!(text.contains("F2 settings"));
+            assert!(!text.contains("Nothing acknowledged"));
+            assert!(!text.contains("provider off"));
+            let footer = crate::fleet::sanitize_terminal_lines(
+                &String::from_utf8(rows[23].clone()).unwrap(),
+            );
+            assert!(footer.contains("Esc/F12 board"));
+        }
     }
     #[test]
     fn provider_snapshot_notice_does_not_claim_enabled_provider_is_off() {

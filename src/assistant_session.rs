@@ -171,6 +171,9 @@ impl Session {
         }
         let config = transport_config(root, &executable)?;
         let scope = project_scope(name);
+        // Validation permits replacement only after initialization failed before
+        // any request was accepted. Reap that owned worker; never replay a turn.
+        self.service.take();
         self.author_config = Some(crate::assistant_author::AuthorConfig {
             root: root.to_path_buf(),
             executable,
@@ -611,7 +614,7 @@ impl Session {
         let comparison = self.comparison_snapshot(scope, workshop_report.as_ref());
         json!({"state": match snapshot.state {
             ServiceState::Starting => "starting", ServiceState::Idle => "ready", ServiceState::Running => "working", ServiceState::Cancelling => "cancelling", ServiceState::Completed => "ready", ServiceState::Failed => "unavailable", ServiceState::Stopped => "stopped"
-        }, "provider":"codex", "background_calls":0, "author":author,"request_id":snapshot.request_id,"user_record_id":snapshot.user_record_id, "partial":text, "error":error, "cost":"unknown; count and deadline bounded", "workshop_state": workshop_state, "workshop_error": workshop_error, "workshop_report": workshop_report,"workshop_comparison":comparison, "needs_approval": needs_approval})
+        }, "provider":"codex", "can_reconnect": snapshot.state == ServiceState::Failed && snapshot.request_id.is_none() && !self.redacted && !self.busy(), "background_calls":0, "author":author,"request_id":snapshot.request_id,"user_record_id":snapshot.user_record_id, "partial":text, "error":error, "cost":"unknown; count and deadline bounded", "workshop_state": workshop_state, "workshop_error": workshop_error, "workshop_report": workshop_report,"workshop_comparison":comparison, "needs_approval": needs_approval})
     }
 
     fn pending_scope_matches(&self, scope: &str) -> bool {
@@ -899,7 +902,13 @@ fn evolution_prompt(scope: &str, need: &str) -> String {
 }
 
 fn validate_enable(session: &Session, root: &Path, calls: u64) -> Result<()> {
-    if session.service.is_some() {
+    if session.service.as_ref().is_some_and(|service| {
+        let state = service.snapshot();
+        state.state != ServiceState::Failed
+            || state.request_id.is_some()
+            || session.redacted
+            || session.busy()
+    }) {
         bail!(
             "Pika already has a foreground provider; close all assistant views before changing it"
         );
@@ -1170,6 +1179,26 @@ mod tests {
     };
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn failed_initialization_can_reconnect_but_forgotten_context_cannot() {
+        let root = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut session = Session::new();
+        session.service = Some(AssistantService::spawn(
+            || -> std::result::Result<FakeRuntime, String> { Err("startup failed".into()) },
+        ));
+        for _ in 0..100 {
+            if session.service.as_ref().unwrap().snapshot().state == ServiceState::Failed {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        validate_enable(&session, root.path(), 12).unwrap();
+        session.redacted = true;
+        assert!(validate_enable(&session, root.path(), 12).is_err());
+    }
 
     #[test]
     fn enable_accepts_uncapped_lifetime_only_as_an_explicit_allowance() {

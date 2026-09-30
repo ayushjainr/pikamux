@@ -29,6 +29,15 @@ A shared, bounded discovery cache checks supported providers every five seconds
 while local reconciliation is running, including when no conversations are yet
 watched. Admission preserves existing lifecycle, ownership and unread state;
 explicit unwatch tombstones always win. There is no model call or new daemon.
+Interactive Codex originator labels (including `codex-tui` and `Codex Desktop`)
+are not worker evidence; admission uses the shared worker classification along
+with exact root identity and rename evidence. Claude named discovery rotates
+priority across the bounded inventory, reserving worker checks and title reads
+for the same batch within the existing byte limits. This cursor is independent
+of watched-title reconciliation, so repeated refreshes make progress through
+older large histories rather than permanently starving them. Large inventories
+can take multiple refreshes; five seconds is the scan cadence, not a guarantee
+that every conversation is discovered in five seconds.
 An open, creation or adoption also keeps watching that exact provider identity;
 provider-generated names, hook events and inherited pane tags alone do not.
 Explicit selection and exact attachment receipts persist independently of later
@@ -197,6 +206,20 @@ file is not mistaken for first use. Dry runs, redirected output, --yes and
 --details retain the finite diagnostic interface. Escape never approves a
 settings write or selects machines; below 60 × 20, hidden choices cannot execute.
 
+F1 opens Help on the board, setup choices, assistant and Files. Existing aliases
+remain available; typing keys remain text inside composers and filters. Board F2
+opens Settings, with Connect a machine and Machine connections. The connection
+list is cache-only; Retry explicitly refreshes the selected immutable node.
+Failed onboarding offers an explicit retry and retains other successful
+connections. Native onboarding reports success only after a validated snapshot;
+Windows pairing is labelled a saved connection until board refresh verifies it.
+
+New named board members receive one quiet, coalesced notice during the current
+board visit. Initial inventory and renames are quiet; notifications do not move
+selection, open a conversation or acknowledge unread output. Empty states
+distinguish a filter with no matches, incomplete/unavailable inventory, and no
+board members, using the existing feed rather than another discovery scan.
+
 `pika` opens the live monitor only on an interactive terminal. `pika list` and
 redirected bare output remain finite and stable. Arrow keys or j/k move the
 selection; Enter opens the exact selected identity; `a` focuses the default
@@ -204,7 +227,8 @@ Luna-medium ephemeral multi-turn Codex side consultation inside the inspector;
 `pika ask --deep` selects Sol-medium explicitly; n opens the oldest attention item
 using the same ordering as `pika next`; p opens a sanitized pane peek; u
 toggles the usage view; r reconciles; ? explains controls; q or Esc recovers or
-exits. `x` asks to stop watching the selected UUID; x or Enter confirms and Esc
+exits. `x` asks to remove the selected UUID from the board, while keeping its
+agent and history intact; x or Enter confirms and Esc
 or q cancels. Inside the side panel, ordinary keys type, Enter sends, Ctrl+J
 inserts a newline, Ctrl+U clears the draft, arrows scroll conversation history,
 and Esc closes and discards the side before returning focus to operations.
@@ -214,9 +238,15 @@ Local selection persists by `(provider, UUID)`; federated selection persists by
 `thread@machine`, while every action is freshly routed by immutable identities.
 
 Pika-owned native-agent homes show a single bottom navigation row: `← Pika`
-and the available return key, normally F12. Clicking the label or pressing the
-displayed key detaches a fresh terminal attachment; an existing tmux client
-switches back to its previous session. Neither action sends an exit command to
+and the available return key, normally F12. One press opens a compact thread
+list beside the agent (below it in narrow terminals), without preview, quota,
+assistant or settings panels. It reuses the board's exact rows, ordering and
+activity service; the existing observation lease prevents duplicate scans.
+Arrow keys select; Enter uses the normal exact-identity open path; Escape closes
+only the companion. A second press returns to the full board and closes the list.
+Clicking the label goes directly to the full board. Full-board return detaches
+a fresh terminal attachment; an existing tmux client switches back to its
+original board session, including after switching between threads. None of these actions sends an exit command to
 the agent. The normal board loop retains selection, filter and viewport, while
 freshly checking identity on the next opening. Separate Windows agent windows
 close their attachment and leave the original board running; native window
@@ -293,6 +323,9 @@ If no eligible NEEDS YOU item exists, the newest READY item becomes the suffix,
 visually distinguished from an attention request. It uses the identical filter,
 event-time ordering and immutable-identity tie-breaker. Pending launches and
 stale rows cannot become either suffix.
+The local Pika label follows advisory lifecycle status for its known managed
+home. Durable cache rows do not claim live ownership; exact opening still
+requires fresh provider/process proof. Color updates reuse the shared feed.
 It remains until resolved or superseded; no animation or extra observation is
 needed. Narrow clients shorten the label, then omit it before navigation/counts.
 There is no second inventory on the destination. Across SSH, one service-owned
@@ -642,6 +675,34 @@ The same assistant composer, commands and host serve both entry points. Esc/F12
 returns to the retained board selection/filter. This adds no observer or model
 turn for rendering; provider suggestions are not source-task actions.
 
+Setup's completion screen always offers Connect another machine, including on
+repeat setup. It reuses the existing discovery and verified connection flow
+without reinstalling provider hooks. The picker accepts saved connections or
+an explicit machine address; cancellation contacts nothing not selected.
+
+The assistant's default screen is a conversation, not a diagnostic report.
+First use offers Connect Pika; connection, disclosure and sign-in choices reuse
+the ordinary setup screen. Explicit confirmation enables foreground Codex/Luna
+and remembers the existing profile for later visits without a message cap. A
+separate provider-home login is requested only when needed; credentials are
+never copied from coding sessions. This does not enable background work or
+project access. Before connection, typed messages stay in the composer rather
+than being silently saved as unsent memory. Help and settings preserve drafts.
+F1 offers saved updates, feedback and advanced commands; F2 shows connection
+settings. Routine storage, acknowledgement, IDs and transport details stay out
+of the conversation. Saved summaries remain labelled as saved notes, failures
+remain visible, and the complete diagnostic/JSON interfaces remain available.
+Conversation roles, connection state and the framed composer use terminal-theme
+colors (or plain text with NO_COLOR); errors do not replace the conversation
+with raw transport output. A failed provider startup offers an explicit F2
+reconnect that preserves the draft, profile and call allowance and sends no
+message. An accepted or uncertain turn is never eligible for this startup retry.
+For npm Codex installations, the transport resolves the native payload within
+the selected package and validates it before launch, rather than depending on
+system Node. An exited process is reported as closed, not as an RPC timeout.
+Shared maintenance tables are prepared before worker startup so their first
+creation cannot race the user's initial foreground memory write.
+
 On macOS/Linux, one OS-locked authority host serves bounded local IPC views.
 Its profile identity and scoped memory survive provider-session and host exit.
 Foreground ownership normally ends when its final view closes; separately
@@ -654,7 +715,14 @@ Closing or pausing the assistant never terminates project agents.
 The observation service remains independent. Compatible observers use a private
 per-profile lease for local reconciliation and fleet refresh; followers consume
 committed caches rather than starting another scanner per view. Assistant
-projection contains bounded exact-identity metadata, not transcripts, cards,
+authority and board coordination have different storage boundaries: the board
+uses its existing private state root and private lease directory/file, permitting
+shared or administrator-owned mount ancestors without chmod/chown. It assumes
+the same filesystem trust as its existing board database, not protection from
+the administrator controlling that database's ancestors. Assistant authority
+retains its stricter ancestor validation, with the offending path in the error;
+an unavailable assistant cannot prevent ordinary board observation or navigation.
+Assistant projection contains bounded exact-identity metadata, not transcripts, cards,
 paths, or credentials. Stale/partial coverage stays explicit. Legacy installed
 boards must not be assumed to participate in the lease protocol.
 

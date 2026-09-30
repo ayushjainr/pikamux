@@ -20,8 +20,12 @@ impl ObservationLease {
         if !state_dir.is_absolute() {
             return Err(io::Error::other("Observation state path must be absolute"));
         }
+        // Observation coordinates the existing board database, not assistant
+        // authority. Shared/admin-owned mount ancestors are valid board homes;
+        // the state root, lease directory and file themselves must be private.
+        crate::assistant_storage::private_directory(state_dir)?;
         let root = state_dir.join("activity-feed");
-        crate::assistant_storage::directory(&root)?;
+        crate::assistant_storage::private_directory(&root)?;
         let path = root.join("observer.lock");
         crate::assistant_storage::file(&path)?;
         Ok(Self {
@@ -123,6 +127,51 @@ mod tests {
         assert!(paused.acquire(true).unwrap().is_some());
         assert!(paused.acquire(false).unwrap().is_none());
         assert!(owner.acquire(true).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_mount_ancestors_preserve_private_lease_exclusion() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let shared = temporary.path().join("shared-state");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let state = shared.join("pika");
+        let first = ObservationLease::new(&state).unwrap();
+        let second = ObservationLease::new(&state).unwrap();
+        let held = first.acquire(true).unwrap().unwrap();
+        assert!(second.acquire(true).unwrap().is_none());
+        first.release();
+        assert!(second.acquire(true).unwrap().is_none());
+        drop(held);
+        assert!(second.acquire(true).unwrap().is_some());
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
+        // Coordination acceptance never relaxes assistant authority storage.
+        let error = crate::assistant_storage::directory(&state.join("assistant")).unwrap_err();
+        assert!(error.to_string().contains(shared.to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonprivate_or_linked_board_state_is_not_repaired_or_accepted() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(ObservationLease::new(&state).is_err());
+        assert!(!state.join("activity-feed").exists());
+        assert_eq!(
+            std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
+        let link = temporary.path().join("linked-state");
+        std::os::unix::fs::symlink(&state, &link).unwrap();
+        assert!(ObservationLease::new(&link).is_err());
     }
 
     #[cfg(unix)]

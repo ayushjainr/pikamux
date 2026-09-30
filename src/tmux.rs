@@ -38,15 +38,89 @@ const TERMINAL_REPLY_KEY_OPTION: &str = "@pika_terminal_reply_key";
 const RETURN_CONDITION: &str = "#{&&:#{@pika_return_navigation},#{m:pika-*,#{session_name}}}";
 // An existing tmux client returns to its previous session (where the board
 // remains running). A new terminal attachment detaches back to its caller.
-const RETURN_ACTION: &str = "if-shell -F '#{client_last_session}' 'switch-client -l' detach-client";
+const LEGACY_RETURN_ACTION: &str =
+    "if-shell -F '#{client_last_session}' 'switch-client -l' detach-client";
+const THREADS_VISIBLE: &str = "#{m:*1*,#{P:#{?@pika_threads_source,#{?pane_dead,0,1},0}}}";
+
+fn return_navigation_action(mouse: bool) -> String {
+    let full = "run-shell -b '#{@pika_threads_callback} --pane #{pane_id} --board --client #{q:client_name}'";
+    let callback = "run-shell -b '#{@pika_threads_callback} --pane #{pane_id}'";
+    let picker = if mouse {
+        full.into()
+    } else {
+        shell_words::join(["if-shell", "-F", THREADS_VISIBLE, full, callback])
+    };
+    // Older managed homes have no side-list callback. Their existing return
+    // route remains usable after another home updates the shared root key.
+    shell_words::join([
+        "if-shell",
+        "-F",
+        "#{@pika_threads_callback}",
+        &picker,
+        LEGACY_RETURN_ACTION,
+    ])
+}
+
+fn valid_return_origin(value: &str) -> bool {
+    value == "detach"
+        || value
+            .strip_prefix('$')
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn companion_identity(pane: &Pane, kind: Companion) -> bool {
+    is_pika_session(&pane.session_name)
+        && pane.pika_provider.is_some()
+        && !pane.dead
+        && (pane.pika_session_id.is_some()
+            || (kind == Companion::Threads && pane.pika_launch_token.is_some()))
+}
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const STDOUT_LIMIT: usize = 16 * 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Companion {
+    Files,
+    Threads,
+}
+
+impl Companion {
+    fn option(self, suffix: &str) -> String {
+        let kind = match self {
+            Self::Files => "files",
+            Self::Threads => "threads",
+        };
+        format!("@pika_{kind}_{suffix}")
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Tmux {
     executable: String,
     socket_name: Option<String>,
+    client_name: Option<String>,
+}
+
+pub(crate) struct ThreadHandoff {
+    client: String,
+    pid: u32,
+    created: u64,
+    pub(crate) feed: Option<String>,
+    origin: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ThreadOrigin {
+    client: String,
+    created: u64,
+    target: String,
+}
+
+impl ThreadOrigin {
+    fn matches(&self, client: &str, created: u64) -> bool {
+        self.client == client && self.created == created
+    }
 }
 
 impl Default for Tmux {
@@ -54,6 +128,7 @@ impl Default for Tmux {
         Self {
             executable: "tmux".into(),
             socket_name: std::env::var("PIKA_TMUX_SOCKET").ok(),
+            client_name: None,
         }
     }
 }
@@ -63,6 +138,7 @@ impl Tmux {
         Self {
             executable: executable.into(),
             socket_name,
+            client_name: None,
         }
     }
 
@@ -72,6 +148,18 @@ impl Tmux {
             command.args(["-L", socket]);
         }
         command
+    }
+
+    fn pane_attach_command(&self, pane: &str, inside_tmux: bool) -> String {
+        if !inside_tmux {
+            return format!("attach-session -t {}", shell_words::quote(pane));
+        }
+        let client = self
+            .client_name
+            .as_ref()
+            .map(|name| format!(" -c {}", shell_words::quote(name)))
+            .unwrap_or_default();
+        format!("switch-client{client} -t {}", shell_words::quote(pane))
     }
 
     fn output<I, S>(&self, args: I, check: bool) -> Result<std::process::Output>
@@ -382,7 +470,7 @@ impl Tmux {
             true,
         )?;
         let hint = match shortcut {
-            Some(key) => format!("{key} · agent keeps running"),
+            Some(key) => format!("{key} threads · twice board"),
             None if mouse.is_some() => "click to return · agent keeps running".into(),
             None => "custom key bindings · use your detach control".into(),
         };
@@ -410,7 +498,7 @@ impl Tmux {
             String::new()
         };
         let bar = format!(
-            "#[align=left,{range},{style}] ← Pika #[default,norange]  #{{?@pika_board_summary,{key} #{{E:@pika_board_summary}},{hint}}} {files}"
+            "#[align=left,{range},{style}] ← Pika #[default,norange]  #{{?@pika_board_summary,{key} threads · twice board #{{E:@pika_board_summary}},{hint}}} {files}"
         );
         let target = shell_words::quote(&pane.pane_id);
         let mut callback = vec!["env".to_owned()];
@@ -418,10 +506,17 @@ impl Tmux {
             callback.push(format!("PIKA_TMUX_SOCKET={socket}"));
         }
         callback.push(std::env::current_exe()?.to_string_lossy().into_owned());
+        let mut threads_callback = callback.clone();
+        threads_callback.push("_threads-open".to_owned());
         callback.push("_files-open".to_owned());
         let callback = shell_words::join(callback);
+        let threads_callback = shell_words::join(threads_callback);
         let mutation = [
             format!("set-option -t {target} @pika_return_navigation 1"),
+            format!(
+                "set-option -t {target} @pika_threads_callback {}",
+                shell_words::quote(&threads_callback)
+            ),
             format!(
                 "set-option -t {target} @pika_files_callback {}",
                 shell_words::quote(&callback)
@@ -465,6 +560,16 @@ impl Tmux {
         candidates: &[&'a str],
         mouse: bool,
     ) -> Result<Option<&'a str>> {
+        self.callback_binding(bindings, candidates, mouse, "@pika_files_callback")
+    }
+
+    fn callback_binding<'a>(
+        &self,
+        bindings: &str,
+        candidates: &[&'a str],
+        mouse: bool,
+        callback: &str,
+    ) -> Result<Option<&'a str>> {
         let parsed: Vec<_> = bindings
             .lines()
             .map(|line| {
@@ -484,9 +589,9 @@ impl Tmux {
             } else {
                 format!("send-keys {key}")
             };
-            let action = "run-shell -b '#{@pika_files_callback} --pane #{pane_id}'";
-            let condition = "#{&&:#{@pika_return_navigation},#{@pika_files_callback}}";
-            let command = ["if-shell", "-F", condition, action, &replay];
+            let action = format!("run-shell -b '#{{{callback}}} --pane #{{pane_id}}'");
+            let condition = format!("#{{&&:#{{@pika_return_navigation}},#{{{callback}}}}}");
+            let command = ["if-shell", "-F", &condition, &action, &replay];
             if let Some(existing) = parsed
                 .iter()
                 .find(|line| root_binding_key(line) == Some(*key))
@@ -501,7 +606,7 @@ impl Tmux {
             }
             self.output(
                 [
-                    "bind-key", "-T", "root", key, "if-shell", "-F", condition, action, &replay,
+                    "bind-key", "-T", "root", key, "if-shell", "-F", &condition, &action, &replay,
                 ],
                 true,
             )?;
@@ -525,32 +630,30 @@ impl Tmux {
     /// The short lease serializes simultaneous callbacks without a daemon or
     /// lock file. A crashed callback expires instead of leaving a stuck lock.
     pub fn open_files_companion(&self, target: &str) -> Result<()> {
+        self.open_companion(target, Companion::Files, false)
+    }
+
+    pub fn open_threads_companion(&self, target: &str, close: bool) -> Result<()> {
+        self.open_companion(target, Companion::Threads, close)
+    }
+
+    fn open_companion(&self, target: &str, kind: Companion, close: bool) -> Result<()> {
         if !valid_pane_id(target) {
-            bail!("invalid Files pane");
+            bail!("invalid companion pane");
         }
-        let source = self.files_pane_option(target, "@pika_files_source")?;
+        let mut source = self.files_pane_option(target, "@pika_threads_source")?;
+        if source.is_empty() {
+            source = self.files_pane_option(target, "@pika_files_source")?;
+        }
         let origin = if source.is_empty() {
             target
         } else {
             source.as_str()
         };
         if !valid_pane_id(origin) {
-            bail!("invalid Files origin");
+            bail!("invalid companion origin");
         }
-        let pane = self
-            .get_pane(origin)?
-            .context("The original agent pane is no longer available")?;
-        if !is_pika_session(&pane.session_name)
-            || pane.pika_provider.is_none()
-            || pane.pika_session_id.is_none()
-            || pane.dead
-        {
-            bail!("Files requires an open Pika conversation");
-        }
-        let grant = self.files_pane_option(origin, "@pika_files_generation")?;
-        if grant.is_empty() || grant != pane_generation_condition(&pane) {
-            bail!("The conversation changed; reopen it from Pika before browsing files");
-        }
+        let (pane, grant) = self.companion_grant(origin, kind)?;
         let project = self.files_pane_option(origin, "@pika_files_project")?;
         if !Path::new(&project).is_absolute() {
             bail!("No project directory is available");
@@ -558,11 +661,12 @@ impl Tmux {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        let expired = format!("#{{<=:#{{@pika_files_opening}},{now}}}");
-        let unlocked = format!("#{{||:#{{!:#{{@pika_files_opening}}}},{expired}}}");
+        let opening = kind.option("opening");
+        let expired = format!("#{{<=:#{{{opening}}},{now}}}");
+        let unlocked = format!("#{{||:#{{!:#{{{opening}}}}},{expired}}}");
         let condition = format!("#{{&&:{grant},{unlocked}}}");
         let acquire = format!(
-            "set-option -p -t {origin} @pika_files_opening {} ; display-message -p acquired",
+            "set-option -p -t {origin} {opening} {} ; display-message -p acquired",
             now + 15
         );
         let lock = self.output(
@@ -580,20 +684,36 @@ impl Tmux {
         if String::from_utf8_lossy(&lock.stdout).trim() != "acquired" {
             return Ok(());
         }
-        let result = self.open_files_locked(&pane, &grant, &project);
-        let _ = self.output(
-            ["set-option", "-pu", "-t", origin, "@pika_files_opening"],
-            false,
-        );
+        let result = self.open_companion_locked(&pane, &grant, &project, kind, close);
+        let _ = self.output(["set-option", "-pu", "-t", origin, &opening], false);
         result
     }
 
-    fn open_files_locked(&self, pane: &Pane, grant: &str, project: &str) -> Result<()> {
+    fn open_companion_locked(
+        &self,
+        pane: &Pane,
+        grant: &str,
+        project: &str,
+        kind: Companion,
+        close: bool,
+    ) -> Result<()> {
         let origin = &pane.pane_id;
+        if let Some(existing) = self.find_companion(origin, grant, kind)? {
+            let action = if close { "kill-pane" } else { "select-pane" };
+            self.output([action, "-t", &existing], true)?;
+            return Ok(());
+        }
+        if close {
+            return Ok(());
+        }
+        self.split_companion(pane, grant, project, kind)
+    }
+
+    fn find_companion(&self, origin: &str, grant: &str, kind: Companion) -> Result<Option<String>> {
         let format = [
             "#{pane_id}",
-            "#{@pika_files_source}",
-            "#{@pika_files_generation}",
+            &format!("#{{{}}}", kind.option("source")),
+            &format!("#{{{}}}", kind.option("generation")),
             "#{pane_dead}",
         ]
         .join(FORMAT_SEPARATOR);
@@ -606,10 +726,20 @@ impl Tmux {
                 && fields[3] == "0"
                 && valid_pane_id(fields[0])
             {
-                self.output(["select-pane", "-t", fields[0]], true)?;
-                return Ok(());
+                return Ok(Some(fields[0].into()));
             }
         }
+        Ok(None)
+    }
+
+    fn split_companion(
+        &self,
+        pane: &Pane,
+        grant: &str,
+        project: &str,
+        kind: Companion,
+    ) -> Result<()> {
+        let origin = &pane.pane_id;
         let dims = self.output(
             [
                 "display-message",
@@ -624,7 +754,11 @@ impl Tmux {
             .split_whitespace()
             .filter_map(|x| x.parse().ok())
             .collect();
-        let wide = dims.len() == 2 && dims[0] >= 140 && dims[0] >= dims[1].saturating_mul(3);
+        let wide = dims.len() == 2
+            && match kind {
+                Companion::Files => dims[0] >= 140 && dims[0] >= dims[1].saturating_mul(3),
+                Companion::Threads => dims[0] >= 90,
+            };
         let executable = std::env::current_exe()?.to_string_lossy().into_owned();
         // Multi-argument split-window execs this argv directly, avoiding shell
         // startup scripts and interpolation of filenames into shell commands.
@@ -639,14 +773,21 @@ impl Tmux {
             "-c",
             &cwd_format,
             "-l",
-            "45%",
+            if kind == Companion::Threads && wide {
+                "38"
+            } else {
+                "45%"
+            },
         ];
         if wide {
             split.extend(["-h", "-b"]);
         } else {
             split.push("-v");
         }
-        split.extend([&executable, "_files-view", "--project", project]);
+        match kind {
+            Companion::Files => split.extend([&executable, "_files-view", "--project", project]),
+            Companion::Threads => split.extend([&executable, "_threads-view", "--source", origin]),
+        }
         let split = shell_words::join(split);
         let out = self.output(
             [
@@ -662,23 +803,346 @@ impl Tmux {
         )?;
         let viewer = String::from_utf8(out.stdout)?.trim().to_owned();
         if !valid_pane_id(&viewer) {
-            bail!("Files opened but its pane could not be identified");
+            bail!("Companion opened but its pane could not be identified");
         }
+        self.tag_companion(&viewer, origin, grant, kind)?;
+        Ok(())
+    }
+
+    fn tag_companion(
+        &self,
+        viewer: &str,
+        origin: &str,
+        grant: &str,
+        kind: Companion,
+    ) -> Result<()> {
         for (option, value) in [
-            ("@pika_files_source", origin.as_str()),
-            ("@pika_files_generation", grant),
+            (kind.option("source"), origin),
+            (kind.option("generation"), grant),
             // Empty pane-local tags mask any inherited session-level tags.
-            ("@pika_provider", ""),
-            ("@pika_session_id", ""),
-            ("@pika_launch_token", ""),
-            ("@pika_name", ""),
+            ("@pika_provider".into(), ""),
+            ("@pika_session_id".into(), ""),
+            ("@pika_launch_token".into(), ""),
+            ("@pika_name".into(), ""),
         ] {
-            self.output(["set-option", "-p", "-t", &viewer, option, value], true)?;
+            self.output(["set-option", "-p", "-t", viewer, &option, value], true)?;
         }
         // An ordinary viewer exit must reclaim space, even if the user enables
         // remain-on-exit globally. This option is scoped to the new pane only.
         self.output(
-            ["set-option", "-p", "-t", &viewer, "remain-on-exit", "off"],
+            ["set-option", "-p", "-t", viewer, "remain-on-exit", "off"],
+            true,
+        )?;
+        Ok(())
+    }
+
+    /// Mask provider identity before the companion subscribes to observation.
+    pub(crate) fn prepare_threads_view(&self, origin: &str) -> Result<Pane> {
+        let (pane, grant) = self.companion_grant(origin, Companion::Threads)?;
+        let viewer = std::env::var("TMUX_PANE").context("Threads requires a companion terminal")?;
+        let current = self
+            .get_pane(&viewer)?
+            .context("The companion terminal is no longer open")?;
+        if !valid_pane_id(origin) || viewer == origin || current.session_name != pane.session_name {
+            bail!("The original thread changed; reopen it from the board");
+        }
+        self.tag_companion(&viewer, origin, &grant, Companion::Threads)?;
+        Ok(pane)
+    }
+
+    fn companion_grant(&self, origin: &str, kind: Companion) -> Result<(Pane, String)> {
+        let pane = self
+            .get_pane(origin)?
+            .context("The original thread is no longer open")?;
+        let grant = self.files_pane_option(origin, "@pika_files_generation")?;
+        if !companion_identity(&pane, kind)
+            || grant.is_empty()
+            || grant != pane_generation_condition(&pane)
+        {
+            bail!("The original thread changed; reopen it from the board");
+        }
+        Ok((pane, grant))
+    }
+
+    pub(crate) fn set_threads_zoom(&self, zoom: bool) -> Result<()> {
+        let viewer = std::env::var("TMUX_PANE")?;
+        if !valid_pane_id(&viewer)
+            || self
+                .files_pane_option(&viewer, "@pika_threads_source")?
+                .is_empty()
+        {
+            bail!("Threads requires its companion terminal");
+        }
+        let out = self.output(
+            [
+                "display-message",
+                "-p",
+                "-t",
+                &viewer,
+                "#{window_zoomed_flag}",
+            ],
+            true,
+        )?;
+        if (String::from_utf8_lossy(&out.stdout).trim() == "1") != zoom {
+            self.output(["resize-pane", "-Z", "-t", &viewer], true)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_remote_threads<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let viewer = std::env::var("TMUX_PANE")?;
+        if !valid_pane_id(&viewer)
+            || self
+                .files_pane_option(&viewer, "@pika_threads_source")?
+                .is_empty()
+        {
+            bail!("Threads requires its companion terminal");
+        }
+        let previous = self.files_pane_option(&viewer, "@pika_return_navigation")?;
+        // The remote tmux owns its native navigation. Replaying the outer
+        // key lets its first F12 open its list rather than close this one.
+        self.output(
+            [
+                "set-option",
+                "-p",
+                "-t",
+                &viewer,
+                "@pika_return_navigation",
+                "0",
+            ],
+            true,
+        )?;
+        let result = self.set_threads_zoom(true).and_then(|()| action());
+        let restore = if previous.is_empty() {
+            self.output(
+                [
+                    "set-option",
+                    "-pu",
+                    "-t",
+                    &viewer,
+                    "@pika_return_navigation",
+                ],
+                true,
+            )
+        } else {
+            self.output(
+                [
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &viewer,
+                    "@pika_return_navigation",
+                    &previous,
+                ],
+                true,
+            )
+        };
+        let unzoom = self.set_threads_zoom(false);
+        // Restore on errors too, while retaining the original opening failure.
+        result.and_then(|value| {
+            restore?;
+            unzoom?;
+            Ok(value)
+        })
+    }
+
+    /// Borrow the retained board's feed and original return route for this
+    /// exact client. Neither belongs to the short-lived companion view.
+    pub(crate) fn thread_handoff(&self, origin: &str) -> Result<ThreadHandoff> {
+        let viewer = std::env::var("TMUX_PANE")?;
+        let format = [
+            "#{client_name}",
+            "#{client_pid}",
+            "#{pane_id}",
+            "#{client_last_session}",
+            "#{client_created}",
+        ]
+        .join(FORMAT_SEPARATOR);
+        let out = self.output(["list-clients", "-F", &format], true)?;
+        let rows = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| tmux_fields(line).map(str::to_owned).collect::<Vec<_>>())
+            .filter(|row| row.len() == 5 && row[2] == viewer)
+            .collect::<Vec<_>>();
+        let [row] = rows.as_slice() else {
+            bail!("The thread list is no longer focused in one terminal");
+        };
+        let pid = row[1].parse::<u32>()?;
+        let created = row[4].parse::<u64>()?;
+        let feed = self.borrow_board_feed(origin, pid)?;
+        let routes = self.thread_origins(origin)?;
+        let route = if let Some(route) = routes
+            .get(&pid)
+            .filter(|route| route.matches(&row[0], created))
+        {
+            route.target.clone()
+        } else if row[3].is_empty() || is_pika_session(&row[3]) {
+            "detach".into()
+        } else {
+            // display-message takes a pane target; the trailing colon resolves
+            // the exact session's current pane instead of an empty format scope.
+            let target = format!("={}:", row[3]);
+            let out = self.output(
+                ["display-message", "-p", "-t", &target, "#{session_id}"],
+                true,
+            )?;
+            let value = String::from_utf8(out.stdout)?.trim().to_owned();
+            if !valid_return_origin(&value) {
+                bail!("The original board is no longer available");
+            }
+            value
+        };
+        Ok(ThreadHandoff {
+            client: row[0].clone(),
+            pid,
+            created,
+            feed,
+            origin: route,
+        })
+    }
+
+    pub(crate) fn for_thread_handoff(&self, handoff: &ThreadHandoff) -> Self {
+        Self {
+            client_name: Some(handoff.client.clone()),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn return_remote_handoff(&self, handoff: &ThreadHandoff) -> Result<()> {
+        self.return_to_board(&std::env::var("TMUX_PANE")?, &handoff.client)
+    }
+
+    fn borrow_board_feed(&self, origin: &str, pid: u32) -> Result<Option<String>> {
+        let cached = self.output(
+            ["show-options", "-qv", "-t", origin, "@pika_board_clients"],
+            false,
+        )?;
+        let clients: BTreeMap<u32, (String, String)> = if cached.stdout.len() <= 4096 {
+            serde_json::from_slice(&cached.stdout).unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        Ok(clients
+            .get(&pid)
+            .filter(|(pane, token)| pane == origin && crate::activity_feed::token(token).is_ok())
+            .map(|(_, token)| token.clone()))
+    }
+
+    pub(crate) fn return_to_board(&self, target: &str, client: &str) -> Result<()> {
+        if !valid_pane_id(target) {
+            bail!("The opening terminal changed");
+        }
+        let origin = self.files_pane_option(target, "@pika_threads_source")?;
+        let origin = if origin.is_empty() { target } else { &origin };
+        let format = [
+            "#{client_name}",
+            "#{client_pid}",
+            "#{pane_id}",
+            "#{client_last_session}",
+            "#{client_created}",
+        ]
+        .join(FORMAT_SEPARATOR);
+        let out = self.output(["list-clients", "-F", &format], true)?;
+        let rows = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| tmux_fields(line).map(str::to_owned).collect::<Vec<_>>())
+            .filter(|row| row.len() == 5 && row[0] == client && row[2] == target)
+            .collect::<Vec<_>>();
+        let [row] = rows.as_slice() else {
+            bail!("The opening terminal changed");
+        };
+        let routes = self.thread_origins(origin)?;
+        let created = row[4].parse::<u64>()?;
+        let route = routes
+            .get(&row[1].parse::<u32>()?)
+            .filter(|route| route.matches(client, created))
+            .map(|route| route.target.as_str());
+        self.switch_back_to_board(client, route, &row[3])?;
+        // Returning never needs provider identity. Pane cleanup does: if the
+        // origin changed meanwhile, leave that pane rather than kill it.
+        let _ = self.open_threads_companion(target, true);
+        Ok(())
+    }
+
+    fn switch_back_to_board(&self, client: &str, route: Option<&str>, last: &str) -> Result<()> {
+        match route {
+            Some("detach") => {
+                self.output(["detach-client", "-t", client], true)?;
+            }
+            Some(session) => {
+                self.output(["switch-client", "-c", client, "-t", session], true)?;
+            }
+            None if !last.is_empty() && !is_pika_session(last) => {
+                self.output(["switch-client", "-c", client, "-l"], true)?;
+            }
+            None => {
+                self.output(["detach-client", "-t", client], true)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn thread_origins(&self, pane: &str) -> Result<BTreeMap<u32, ThreadOrigin>> {
+        let out = self.output(
+            ["show-options", "-qv", "-t", pane, "@pika_threads_origins"],
+            false,
+        )?;
+        let mut routes: BTreeMap<u32, ThreadOrigin> = if out.stdout.len() <= 4096 {
+            serde_json::from_slice(&out.stdout).unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        routes.retain(|_, value| valid_return_origin(&value.target));
+        Ok(routes)
+    }
+
+    pub(crate) fn finish_thread_handoff(&self, handoff: &ThreadHandoff) -> Result<()> {
+        let format = [
+            "#{client_name}",
+            "#{client_pid}",
+            "#{pane_id}",
+            "#{client_created}",
+        ]
+        .join(FORMAT_SEPARATOR);
+        let out = self.output(["list-clients", "-F", &format], true)?;
+        let rows = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| tmux_fields(line).map(str::to_owned).collect::<Vec<_>>())
+            .filter(|row| {
+                row.len() == 4
+                    && row[0] == handoff.client
+                    && row[1] == handoff.pid.to_string()
+                    && row[3] == handoff.created.to_string()
+            })
+            .collect::<Vec<_>>();
+        let [row] = rows.as_slice() else {
+            bail!("The opening terminal changed");
+        };
+        let pane = &row[2];
+        if !valid_pane_id(pane) {
+            bail!("The opening terminal is no longer available");
+        }
+        let mut routes = self.thread_origins(pane)?;
+        routes.remove(&handoff.pid);
+        while routes.len() >= 8 {
+            routes.pop_first();
+        }
+        routes.insert(
+            handoff.pid,
+            ThreadOrigin {
+                client: handoff.client.clone(),
+                created: handoff.created,
+                target: handoff.origin.clone(),
+            },
+        );
+        self.output(
+            [
+                "set-option",
+                "-t",
+                pane,
+                "@pika_threads_origins",
+                &serde_json::to_string(&routes)?,
+            ],
             true,
         )?;
         Ok(())
@@ -724,7 +1188,8 @@ impl Tmux {
             } else {
                 format!("send-keys {key}")
             };
-            let command = ["if-shell", "-F", RETURN_CONDITION, RETURN_ACTION, &replay];
+            let action = return_navigation_action(mouse);
+            let command = ["if-shell", "-F", RETURN_CONDITION, &action, &replay];
             if let Some(existing) = parsed
                 .iter()
                 .find(|line| root_binding_key(line) == Some(*key))
@@ -735,7 +1200,20 @@ impl Tmux {
                 {
                     return Ok(Some(key));
                 }
-                continue;
+                // Update only the exact previous Pika-owned binding. Arbitrary
+                // user bindings, even on F12, retain their existing behavior.
+                let legacy = [
+                    "if-shell",
+                    "-F",
+                    RETURN_CONDITION,
+                    LEGACY_RETURN_ACTION,
+                    &replay,
+                ];
+                if return_command_words(existing[key_index + 1..].iter().map(String::as_str))
+                    != return_command_words(legacy.into_iter())
+                {
+                    continue;
+                }
             }
             self.output(
                 [
@@ -746,7 +1224,7 @@ impl Tmux {
                     "if-shell",
                     "-F",
                     RETURN_CONDITION,
-                    RETURN_ACTION,
+                    &action,
                     &replay,
                 ],
                 true,
@@ -969,11 +1447,7 @@ impl Tmux {
         self.configure_exact_home(pane)?;
         self.configure_return_navigation(pane)?;
         let condition = pane_generation_condition(pane);
-        let attach = if inside_tmux {
-            format!("switch-client -t {}", shell_words::quote(&pane.pane_id))
-        } else {
-            format!("attach-session -t {}", shell_words::quote(&pane.pane_id))
-        };
+        let attach = self.pane_attach_command(&pane.pane_id, inside_tmux);
         let mut argv = vec![self.executable.clone()];
         if let Some(socket) = &self.socket_name {
             argv.extend(["-L".into(), socket.clone()]);
@@ -988,12 +1462,13 @@ impl Tmux {
             "run-shell 'exit 75'".into(),
         ]);
         if inside_tmux {
-            let client = self
-                .output(["display-message", "-p", "#{client_name}"], false)
-                .ok()
-                .filter(|output| output.status.success())
-                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-                .filter(|value| !value.is_empty());
+            let client = self.client_name.clone().or_else(|| {
+                self.output(["display-message", "-p", "#{client_name}"], false)
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                    .filter(|value| !value.is_empty())
+            });
             let status =
                 bounded_output(Command::new(&argv[0]).args(&argv[1..]), COMMAND_TIMEOUT)?.status;
             if !status.success() {
@@ -1180,7 +1655,7 @@ impl Tmux {
                 };
                 let pane_number = client_pane.strip_prefix('%').unwrap_or_default();
                 let condition = format!(
-                    "#{{&&:#{{==:#{{client_pid}},{client_pid}}},#{{==:#{{?@pika_files_source,#{{@pika_files_source}},#{{pane_id}}}},#{{a:37}}{pane_number}}}}}"
+                    "#{{&&:#{{==:#{{client_pid}},{client_pid}}},#{{==:#{{?@pika_threads_source,#{{@pika_threads_source}},#{{?@pika_files_source,#{{@pika_files_source}},#{{pane_id}}}}}},#{{a:37}}{pane_number}}}}}"
                 );
                 let value = if plain.get(client_pid).copied().unwrap_or(false) {
                     "default".to_owned()
@@ -1196,7 +1671,7 @@ impl Tmux {
             // the percent during format expansion instead (after strftime).
             let pane_number = &pane[1..];
             text.push_str(&format!(
-                "#{{?#{{&&:#{{==:#{{client_pid}},{pid}}},#{{==:#{{?@pika_files_source,#{{@pika_files_source}},#{{pane_id}}}},#{{a:37}}{pane_number}}}}}, │ #{{?#{{@pika_feed_{token}}},#{{T:@pika_feed_{token}}},Board disconnected}},}}"
+                "#{{?#{{&&:#{{==:#{{client_pid}},{pid}}},#{{==:#{{?@pika_threads_source,#{{@pika_threads_source}},#{{?@pika_files_source,#{{@pika_files_source}},#{{pane_id}}}}}},#{{a:37}}{pane_number}}}}}, │ #{{?#{{@pika_feed_{token}}},#{{T:@pika_feed_{token}}},Board disconnected}},}}"
             ));
         }
         self.output(
@@ -1424,11 +1899,7 @@ impl Tmux {
             self.configure_return_navigation(pane)?;
         }
         let condition = pane_generation_condition(pane);
-        let attach = if inside_tmux {
-            format!("switch-client -t {}", shell_words::quote(&pane.pane_id))
-        } else {
-            format!("attach-session -t {}", shell_words::quote(&pane.pane_id))
-        };
+        let attach = self.pane_attach_command(&pane.pane_id, inside_tmux);
         let mut argv = vec![self.executable.clone()];
         if let Some(socket) = &self.socket_name {
             argv.extend(["-L".into(), socket.clone()]);
@@ -1445,15 +1916,17 @@ impl Tmux {
         if inside_tmux {
             // Capture the invoking client before switch-client changes its
             // selected pane. A receipt must never leak to every tmux client.
-            let client_name = wants_receipt
-                .then(|| {
-                    self.output(["display-message", "-p", "#{client_name}"], false)
-                        .ok()
-                        .filter(|output| output.status.success())
-                        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-                        .filter(|value| !value.is_empty())
-                })
-                .flatten();
+            let client_name = self.client_name.clone().or_else(|| {
+                wants_receipt
+                    .then(|| {
+                        self.output(["display-message", "-p", "#{client_name}"], false)
+                            .ok()
+                            .filter(|output| output.status.success())
+                            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                            .filter(|value| !value.is_empty())
+                    })
+                    .flatten()
+            });
             let status =
                 bounded_output(Command::new(&argv[0]).args(&argv[1..]), COMMAND_TIMEOUT)?.status;
             if status.success() {
@@ -2066,9 +2539,12 @@ fn agent_wrapper(
         std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into())
     ));
     launch.push("TERM=tmux-direct".into());
-    if let Ok(value) = std::env::var("COLORTERM") {
-        launch.push(format!("COLORTERM={value}"));
-    }
+    // tmux-direct describes our RGB virtual terminal, but heuristic detectors
+    // (including Claude's supports-color) do not recognize that TERM alone.
+    // SSH need not forward COLORTERM, and a retained server may have a stale
+    // value. Advertise the same capability to both kinds of detector. tmux
+    // remains responsible for adapting output to its attached physical client.
+    launch.push("COLORTERM=truecolor".into());
     let palette = environment
         .get(FOREGROUND_ENV)
         .and_then(|foreground| terminal::decode_color(foreground))
@@ -2126,6 +2602,40 @@ mod tests {
 
     #[cfg(unix)]
     use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_launch_advertises_rgb_without_caller_color_hints() {
+        let wrapper = agent_wrapper(
+            Provider::Claude,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '%s/%s' \"$TERM\" \"$COLORTERM\"".into(),
+            ],
+            &BTreeMap::new(),
+            None,
+            Some("color-fixture"),
+        )
+        .unwrap();
+        // Execute just the real provider launch, never the exit hook or login
+        // shell. Vary the inherited server environment without process-global
+        // env mutations, which would race other tests.
+        let launch = wrapper.split("; pika_rc=$?;").next().unwrap();
+        for inherited in [None, Some(""), Some("24bit"), Some("stale")] {
+            let mut command = Command::new("/bin/sh");
+            command.env_clear().args(["-c", launch]);
+            if let Some(value) = inherited {
+                command.env("COLORTERM", value);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                "tmux-direct/truecolor"
+            );
+        }
+    }
 
     #[test]
     fn inventory_parser_keeps_raw_names() {
@@ -2285,7 +2795,7 @@ mod tests {
         let own = format!(
             "bind-key -T root F12 if-shell -F {} {} 'send-keys F12'",
             shell_words::quote(RETURN_CONDITION),
-            shell_words::quote(RETURN_ACTION)
+            shell_words::quote(&return_navigation_action(false))
         );
         assert_eq!(
             tmux.return_binding(&own, &["F12"], false).unwrap(),
@@ -2306,6 +2816,46 @@ mod tests {
             calls,
             "catch-all binding belongs to the user"
         );
+        let legacy = format!(
+            "bind-key -T root F12 if-shell -F {} {} 'send-keys F12'",
+            shell_words::quote(RETURN_CONDITION),
+            shell_words::quote(LEGACY_RETURN_ACTION)
+        );
+        assert_eq!(
+            tmux.return_binding(&legacy, &["F12"], false).unwrap(),
+            Some("F12")
+        );
+        let upgraded = fs::read_to_string(&trace).unwrap();
+        assert!(upgraded[calls.len()..].contains("@pika_threads_callback"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_board_return_survives_origin_change_and_rejects_reused_clients() {
+        for (saved_client, saved_created, expected) in [
+            ("/dev/fixture", 100, "switch-client -c /dev/fixture -t $7"),
+            ("/dev/previous", 100, "detach-client -t /dev/fixture"),
+            ("/dev/fixture", 99, "detach-client -t /dev/fixture"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let trace = temp.path().join("calls");
+            let routes = serde_json::json!({"12345": {"client":saved_client, "created":saved_created, "target":"$7"}}).to_string();
+            let tmux = tmux_fixture(
+                &temp,
+                &format!(
+                    "printf '%s\\n' \"$*\" >> {}\ncase \"$*\" in\n'list-clients -F '*) printf '/dev/fixture\\03712345\\037%%2\\037pika-c-previous\\037100\\n';;\n*'@pika_threads_source') printf '%%1';;\n*'@pika_threads_origins') printf '%s' {};;\nesac\n",
+                    shell_words::quote(trace.to_str().unwrap()),
+                    shell_words::quote(&routes)
+                ),
+            );
+            // Cleanup cannot prove the missing origin's generation. Returning
+            // uses the independently known route and never kills that pane.
+            tmux.return_to_board("%2", "/dev/fixture").unwrap();
+            let calls = fs::read_to_string(trace).unwrap();
+            assert!(calls.contains(expected), "{calls}");
+            assert!(!calls.contains("kill-pane"));
+            assert!(!calls.contains("switch-client -c /dev/fixture -l"));
+        }
     }
 
     #[cfg(unix)]
@@ -2330,7 +2880,7 @@ mod tests {
         assert!(calls.contains("Files F9"));
         assert!(calls.contains("MouseDown1StatusRight"));
         assert!(calls.contains("@pika_files_generation"));
-        assert!(calls.contains("F12 · agent keeps running"));
+        assert!(calls.contains("F12 threads · twice board"));
         assert!(calls.contains("fg=default,bg=default"));
         assert!(!calls.contains("window-style"));
         assert!(!calls.contains("pane-border-style"));
@@ -2478,7 +3028,7 @@ mod tests {
         assert!(calls.contains(&second_key));
         assert!(calls.contains("@pika_return_style"));
         assert!(
-            calls.contains("#{?#{&&:#{==:#{client_pid},54321},#{==:#{?@pika_files_source,#{@pika_files_source},#{pane_id}},#{a:37}1}},default,")
+            calls.contains("#{?#{&&:#{==:#{client_pid},54321},#{==:#{?@pika_threads_source,#{@pika_threads_source},#{?@pika_files_source,#{@pika_files_source},#{pane_id}}},#{a:37}1}},default,")
         );
         assert!(calls.contains("client_pid},12345"));
         assert!(calls.contains("client_pid},54321"));
@@ -2768,7 +3318,7 @@ mod tests {
         assert!(calls.contains("#{==:#{client_pid},12345}"));
         assert!(
             calls
-                .contains("#{==:#{?@pika_files_source,#{@pika_files_source},#{pane_id}},#{a:37}1}")
+                .contains("#{==:#{?@pika_threads_source,#{@pika_threads_source},#{?@pika_files_source,#{@pika_files_source},#{pane_id}}},#{a:37}1}")
         );
         assert!(calls.contains("@pika_feed_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         assert!(calls.contains("Board disconnected"));

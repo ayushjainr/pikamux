@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.35 — Native navigation and clearer connections
+
+- Press F12 once for a compact thread list beside the native agent; press it
+  again to return to the original board. Exact switching reuses the shared feed,
+  preserves the board selection and never launches a duplicate provider.
+- Preserve native harness RGB colors even when SSH omits the color hint.
+  Existing provider processes keep their original environment.
+- Make assistant connection, help and settings conversational, preserving drafts
+  and the existing profile. Resolve installed Codex native payloads directly and
+  report startup exits without replaying accepted or uncertain requests.
+- Share machine settings and improve Files reading, named-conversation discovery,
+  and startup/terminal regression coverage without changing exact-identity rules.
+- Keep installation and fleet migration separate. In particular, tmux clients
+  must match their live server; a binary update does not migrate running sessions.
+
 ## 0.6.34 — Your persistent assistant, at home on the board
 
 - Talk to Pika with `P` on the main board, alongside its live filtered workstream

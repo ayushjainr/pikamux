@@ -47,6 +47,7 @@ const PROVIDER_SQLITE_DEADLINE: Duration = Duration::from_millis(400);
 const PROVIDER_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 
 static CLAUDE_TITLE_CURSORS: OnceLock<Mutex<VecDeque<(PathBuf, usize)>>> = OnceLock::new();
+static CLAUDE_ADMISSION_CURSORS: OnceLock<Mutex<VecDeque<(PathBuf, usize)>>> = OnceLock::new();
 
 pub struct Providers<'a> {
     paths: &'a Paths,
@@ -884,7 +885,9 @@ fn codex_named_import_candidates(home: &Path, config: &Config) -> Vec<Candidate>
                 && candidate.transcript_path.as_deref().is_some_and(|path| {
                     read_first_json_budgeted(path, &mut metadata_budget)
                         .as_ref()
-                        .is_some_and(|meta| codex_interactive_root(meta, &candidate.session_id))
+                        .is_some_and(|meta| {
+                            codex_interactive_root(meta, &candidate.session_id, config)
+                        })
                 })
         })
         .map(|mut candidate| {
@@ -896,7 +899,7 @@ fn codex_named_import_candidates(home: &Path, config: &Config) -> Vec<Candidate>
         .collect()
 }
 
-fn codex_interactive_root(metadata: &Value, id: &str) -> bool {
+fn codex_interactive_root(metadata: &Value, id: &str, config: &Config) -> bool {
     if metadata.get("type").and_then(Value::as_str) != Some("session_meta") {
         return false;
     }
@@ -910,8 +913,9 @@ fn codex_interactive_root(metadata: &Value, id: &str) -> bool {
             .get("forked_from_id")
             .and_then(Value::as_str)
             .is_none()
-        && payload.get("thread_source").and_then(Value::as_str) != Some("subagent")
-        && payload.get("originator").is_none()
+        // Interactive clients also set originator (e.g. codex-tui and Codex
+        // Desktop). Reuse the worker classifier, not mere field presence.
+        && !codex_worker_metadata(metadata, config)
 }
 
 fn codex_archived_index_ids(
@@ -1105,10 +1109,18 @@ fn next_claude_title_batch(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    next_claude_scan_batch(home, &ordered, &CLAUDE_TITLE_CURSORS)
+}
+
+fn next_claude_scan_batch(
+    home: &Path,
+    ordered: &[String],
+    cursor_store: &OnceLock<Mutex<VecDeque<(PathBuf, usize)>>>,
+) -> BTreeSet<String> {
     if ordered.is_empty() {
         return BTreeSet::new();
     }
-    let cursors = CLAUDE_TITLE_CURSORS.get_or_init(|| Mutex::new(VecDeque::new()));
+    let cursors = cursor_store.get_or_init(|| Mutex::new(VecDeque::new()));
     let mut cursors = cursors
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1129,6 +1141,44 @@ fn next_claude_title_batch(
     }
     cursors.push_back((home.to_path_buf(), next));
     selected
+}
+
+/// Give a different bounded batch first access to the existing byte budgets.
+/// Small inventories still scan in one pass; older large histories eventually
+/// get a turn instead of losing every cycle to the same recent transcripts.
+fn claude_admission_batch(
+    home: &Path,
+    paths: &[PathBuf],
+    sessions: &[PathBuf],
+) -> BTreeSet<String> {
+    let ordered = paths
+        .iter()
+        .chain(sessions)
+        .filter_map(|path| path.file_stem()?.to_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    next_claude_scan_batch(home, &ordered, &CLAUDE_ADMISSION_CURSORS)
+}
+
+fn claude_priority_path(path: &Path, priority: &BTreeSet<String>) -> bool {
+    path.file_stem()
+        .and_then(OsStr::to_str)
+        .is_some_and(|id| priority.contains(id))
+}
+
+fn claude_priority_workers(
+    transcripts: &BTreeMap<String, PathBuf>,
+    priority: &BTreeSet<String>,
+    budget: &mut u64,
+) -> BTreeMap<String, Option<bool>> {
+    priority
+        .iter()
+        .filter_map(|id| {
+            let path = transcripts.get(id)?;
+            Some((id.clone(), claude_worker_bounded(path, id, budget)))
+        })
+        .collect()
 }
 
 fn coprime_scan_step(batch: usize, population: usize) -> usize {
@@ -1161,6 +1211,34 @@ fn should_scan_claude_title(
         }
 }
 
+fn order_claude_registry_paths(
+    paths: &mut Vec<PathBuf>,
+    identities: Option<&BTreeSet<String>>,
+    query: Option<&str>,
+    priority: &BTreeSet<String>,
+) {
+    paths.sort_by_key(|path| {
+        let identity = path.file_stem().and_then(OsStr::to_str).unwrap_or("");
+        (
+            !claude_priority_path(path, priority),
+            std::cmp::Reverse(
+                identities.is_some_and(|wanted| wanted.contains(identity))
+                    || query.is_some_and(|needle| needle == identity),
+            ),
+            std::cmp::Reverse(modified(path).to_bits()),
+        )
+    });
+    if let Some(wanted) = identities {
+        paths.retain(|path| {
+            path.file_stem()
+                .and_then(OsStr::to_str)
+                .is_some_and(|identity| wanted.contains(identity))
+        });
+    } else {
+        paths.truncate(MAX_CLAUDE_DISCOVERY_FILES);
+    }
+}
+
 fn claude_records(
     home: &Path,
     query: Option<&str>,
@@ -1180,28 +1258,18 @@ fn claude_records(
         .collect::<BTreeMap<_, _>>();
     let mut records: BTreeMap<String, Candidate> = BTreeMap::new();
     let mut session_paths = claude_session_paths(home, &exact_identities, identities.is_some());
-    session_paths.sort_by_key(|path| {
-        let identity = path.file_stem().and_then(OsStr::to_str).unwrap_or("");
-        (
-            std::cmp::Reverse(
-                identities.is_some_and(|wanted| wanted.contains(identity))
-                    || query.is_some_and(|needle| needle == identity),
-            ),
-            std::cmp::Reverse(modified(path).to_bits()),
-        )
-    });
-    if identities.is_none() {
-        session_paths.truncate(MAX_CLAUDE_DISCOVERY_FILES);
+    let admission_batch = if explicit_only && query.is_none() && identities.is_none() {
+        claude_admission_batch(home, &transcripts, &session_paths)
     } else {
-        session_paths.retain(|path| {
-            path.file_stem()
-                .and_then(OsStr::to_str)
-                .is_some_and(|identity| identities.is_some_and(|wanted| wanted.contains(identity)))
-        });
-    }
+        BTreeSet::new()
+    };
+    order_claude_registry_paths(&mut session_paths, identities, query, &admission_batch);
     let mut metadata_budget = MAX_CLAUDE_METADATA_TOTAL_BYTES;
     let mut worker_budget = MAX_CLAUDE_METADATA_TOTAL_BYTES;
-    let mut worker_states = BTreeMap::<String, Option<bool>>::new();
+    // Reserve worker checks for the same batch as title reads. Otherwise the
+    // live registry can exhaust the budget before history-only rows are seen.
+    let mut worker_states =
+        claude_priority_workers(&transcript_paths, &admission_batch, &mut worker_budget);
     for path in session_paths {
         let Some(value) = read_bounded_json_budgeted(&path, &mut metadata_budget) else {
             continue;
@@ -1219,51 +1287,29 @@ fn claude_records(
         if identities.is_some_and(|wanted| !wanted.contains(identity)) {
             continue;
         }
-        let visible_name = value.get("name").and_then(Value::as_str);
         let transcript = transcript_paths.get(identity).cloned();
         let exact_identity =
             query == Some(identity) || identities.is_some_and(|wanted| wanted.contains(identity));
-        let worker = transcript.as_ref().map_or(Some(false), |path| {
-            claude_worker_bounded(path, identity, &mut worker_budget)
+        let worker = *worker_states.entry(identity.to_owned()).or_insert_with(|| {
+            transcript.as_ref().map_or(Some(false), |path| {
+                claude_worker_bounded(path, identity, &mut worker_budget)
+            })
         });
-        worker_states.insert(identity.to_owned(), worker);
         if worker == Some(true) || (worker.is_none() && !exact_identity) {
             continue;
         }
-        let name = if value.get("nameSource").and_then(Value::as_str) == Some("derived") {
-            None
-        } else {
-            visible_name.map(str::to_owned)
-        };
         records.insert(
             identity.into(),
-            Candidate {
-                provider: Provider::Claude,
-                session_id: identity.into(),
-                name,
-                cwd: value.get("cwd").and_then(Value::as_str).map(str::to_owned),
-                branch: None,
-                transcript_path: transcript.map(|path| path.to_string_lossy().into_owned()),
-                model: value
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                updated_at: timestamp(value.get("updatedAt").or_else(|| value.get("startedAt"))),
-                created_at: timestamp(value.get("startedAt")),
-                live: false,
-                pid: None,
-                source: if value.get("nameSource").and_then(Value::as_str) == Some("custom") {
-                    "claude-live-custom".into()
-                } else {
-                    "claude-live".into()
-                },
-                parent_session_id: None,
-                lifecycle_status: None,
-            },
+            claude_live_candidate(&value, identity, transcript),
         );
     }
 
-    transcripts.sort_by_key(|path| std::cmp::Reverse(modified(path).to_bits()));
+    transcripts.sort_by_key(|path| {
+        (
+            !claude_priority_path(path, &admission_batch),
+            std::cmp::Reverse(modified(path).to_bits()),
+        )
+    });
     let title_scan_ids = identities.map_or_else(BTreeSet::new, |wanted| {
         next_claude_title_batch(home, &transcripts, wanted)
     });
@@ -1598,6 +1644,38 @@ fn transcript_title(path: &Path, explicit_only: bool, byte_budget: &mut u64) -> 
         }
     }
     explicit.or(generated)
+}
+
+fn claude_live_candidate(value: &Value, identity: &str, transcript: Option<PathBuf>) -> Candidate {
+    let name_source = value.get("nameSource").and_then(Value::as_str);
+    let name = if name_source == Some("derived") {
+        None
+    } else {
+        value.get("name").and_then(Value::as_str).map(str::to_owned)
+    };
+    Candidate {
+        provider: Provider::Claude,
+        session_id: identity.into(),
+        name,
+        cwd: value.get("cwd").and_then(Value::as_str).map(str::to_owned),
+        branch: None,
+        transcript_path: transcript.map(|path| path.to_string_lossy().into_owned()),
+        model: value
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        updated_at: timestamp(value.get("updatedAt").or_else(|| value.get("startedAt"))),
+        created_at: timestamp(value.get("startedAt")),
+        live: false,
+        pid: None,
+        source: if name_source == Some("custom") {
+            "claude-live-custom".into()
+        } else {
+            "claude-live".into()
+        },
+        parent_session_id: None,
+        lifecycle_status: None,
+    }
 }
 
 fn claude_worker_bounded(path: &Path, identity: &str, byte_budget: &mut u64) -> Option<bool> {

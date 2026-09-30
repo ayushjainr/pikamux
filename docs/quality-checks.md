@@ -74,8 +74,9 @@ scripts/check-coverage.sh
 The pinned coverage-only nightly enables real branch instrumentation through
 [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov/tree/v0.6.18).
 Release builds and normal checks stay on Rust 1.88. The instrumented run covers
-library tests plus the recovery contract targets. One run produces JSON, an
-HTML report and a focused summary for core, store, hooks, process, tmux and CLI
+library tests plus the recovery, startup/onboarding, CLI and terminal-color
+contract targets. One run produces JSON, an HTML report and a focused summary
+for core, store, hooks, process, tmux, CLI, terminal bridge, onboarding and monitor
 under `target/recovery-coverage/`. CI publishes them as an artifact and job summary.
 Open `target/recovery-coverage/html/index.html` to inspect uncovered decisions.
 
@@ -90,3 +91,30 @@ Compiler branches do not enumerate every ordering of asynchronous events.
 Coverage is currently collected on Linux CI. It does not prove Windows or macOS
 behavior, every provider version, or real fleet reliability; platform contracts
 and explicit live validation remain separate.
+
+### Terminal startup paths
+
+`onboarding_journey_contract` drives the native command on disposable PTYs.
+Startup tests separately exercise redirected input, redirected output, both
+redirected, missing TERM, TERM=dumb, input EOF without consent, and cancellation.
+They check observable output, exit status, unchanged settings and terminal
+restoration. `board_journey_contract` covers opening/switching and returning
+inside and outside a private tmux server, with provider launches counted to
+detect duplicate agents. Passing counts or CCN alone do not establish this
+coverage. An environment failure still needs a faithful reproduction; a passing
+nearby scenario is counterevidence, not a fix.
+
+### Dependency upgrades with a live tmux server
+
+Board startup and noninteractive tmux queries are not attachment checks. A new
+PATH client can query an older running server successfully while interactive
+attachment fails. Before cutting over a tmux client, test attachment and detach
+against both a matching disposable server and the retained server version, using
+private sockets and inert fixture processes. Do not restart live user sessions
+as part of the test or assume replacing the executable upgrades their server.
+
+The rs8 investigation reproduced `open terminal failed: not a terminal` with a
+3.7c client and a disposable 3.2a server (exit 1). Matched 3.2a/3.2a and
+3.7c/3.7c fixtures attached and detached successfully (exit 0). Earlier mixed
+startup-only checks passed and missed this boundary. These are recorded manual
+compatibility measurements, not an automated cross-version CI coverage claim.

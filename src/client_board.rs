@@ -282,9 +282,80 @@ pub(crate) fn start_activity_feed(store: &Store) -> Result<crate::activity_feed:
     Ok(summary_source)
 }
 
-pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
+pub fn run(mut config: ClientConfig, cache_path: &Path) -> Result<i32> {
+    use crate::client_cli::ClientCliRuntime;
+    let mut memory = monitor::BoardMemory::default();
+    loop {
+        match run_once(&config, cache_path, &mut memory)? {
+            BoardAction::Assistant(_) => {
+                let mut runtime = crate::client_cli::SystemClientRuntime::discover()?;
+                if let Err(error) = crate::assistant_client::run(
+                    &mut runtime,
+                    crate::assistant_client::Args::default(),
+                    &mut std::io::stdout().lock(),
+                ) {
+                    memory.notice = Some(format!(
+                        "Pika could not open.\n{error}\nYour board is still available."
+                    ));
+                }
+            }
+            BoardAction::Settings => {
+                let mut runtime = crate::client_cli::SystemClientRuntime::discover()?;
+                if let Err(error) = client_settings(&mut runtime, cache_path) {
+                    memory.notice = Some(format!(
+                        "Settings could not complete.\n{error}\nSaved connections were kept."
+                    ));
+                }
+                match runtime.load_config() {
+                    Ok(saved) => config = saved,
+                    Err(error) => {
+                        memory.notice = Some(format!(
+                            "Could not reload connections.\n{error}\nYour current board was kept."
+                        ))
+                    }
+                }
+            }
+            BoardAction::Update(version) => {
+                return crate::windows_update::install(version.as_deref(), true);
+            }
+            _ => return Ok(0),
+        }
+    }
+}
+
+fn client_settings(
+    runtime: &mut crate::client_cli::SystemClientRuntime,
+    cache_path: &Path,
+) -> Result<()> {
+    use crate::client_cli::ClientCliRuntime;
+    loop {
+        let ui = crate::onboarding::Screen::new(true)?;
+        match ui.choice(
+            "Board settings",
+            "Connect your machines here. Your agents keep running.",
+            &["Back to board", "Connect a machine", "Machine connections"],
+        )? {
+            Some(1) => {
+                drop(ui);
+                crate::client_cli::connect_machines(runtime, &mut std::io::stdout().lock())?;
+            }
+            Some(2) => {
+                let store = Store::at(cache_path);
+                sync_pairings(&store, &runtime.load_config()?)?;
+                crate::machine_settings::connections(&store, &ui)?;
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn run_once(
+    config: &ClientConfig,
+    cache_path: &Path,
+    memory: &mut monitor::BoardMemory,
+) -> Result<BoardAction> {
     let store = Store::at(cache_path);
-    sync_pairings(&store, &config)?;
+    sync_pairings(&store, config)?;
     let summary_source = start_activity_feed(&store)?;
     let cancellation = CancellationToken::default();
     let action_path = cache_path.to_owned();
@@ -327,7 +398,7 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
                 let remote = exact_remote(&store, &item)?;
                 manager.untrack(&remote, None)?;
                 Ok(format!(
-                    "Stopped watching {}. The agent and conversation were left intact.",
+                    "Removed {} from your board. The agent and conversation were left intact.",
                     remote.qualified_name()
                 ))
             }
@@ -368,7 +439,7 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
                 update_receiver,
                 monitor::FleetHealthFeed::new(Vec::new(), health_receive).with_quota(quota_feed),
                 actions,
-                None,
+                Some(memory),
             )
         },
     );
@@ -376,18 +447,7 @@ pub fn run(config: ClientConfig, cache_path: &Path) -> Result<i32> {
     drop(update_checker);
     drop(quota_worker);
     drop(summary_source);
-    match result? {
-        BoardAction::Assistant(_) => {
-            let mut runtime = crate::client_cli::SystemClientRuntime::discover()?;
-            crate::assistant_client::run(
-                &mut runtime,
-                crate::assistant_client::Args::default(),
-                &mut std::io::stdout().lock(),
-            )
-        }
-        BoardAction::Update(version) => crate::windows_update::install(version.as_deref(), true),
-        _ => Ok(0),
-    }
+    result
 }
 
 /// Shared with the host board: one ephemeral remote side for all follow-ups.

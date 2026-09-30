@@ -1,4 +1,22 @@
-Pika 0.6.34 brings the persistent assistant onto the main board.
+Pika 0.6.35 improves native navigation, terminal colors and connection UX.
+
+- **F12 once** opens a compact thread list beside the agent. Arrows and Enter
+  select an exact conversation; Escape closes the list. **F12 again** returns
+  to the original full board with its selection and filter preserved.
+- Native launches advertise tmux RGB capability even when SSH drops the color
+  hint. Existing provider processes retain their original environment.
+- Assistant connection, help and settings preserve drafts and profile identity.
+  Startup reconnect is explicit; accepted or uncertain turns are never replayed.
+  Installed npm Codex uses its validated native payload.
+- Machine settings, Files reading and named discovery gain clearer behavior,
+  backed by expanded isolated terminal and onboarding checks.
+
+This ships the current assistant implementation, not a new provider-thread design.
+Updates do not migrate fleet machines or live tmux sessions. Keep the tmux client
+compatible with its running server: a 3.7c client with a 3.2a server can fail
+attachment with a misleading “not a terminal” message. Plan migration separately.
+
+The existing assistant capabilities and boundaries remain:
 
 - Press **P** to talk to Pika. Wide terminals retain the live workstream rail;
   narrow terminals focus the conversation beneath the board header. Esc/F12

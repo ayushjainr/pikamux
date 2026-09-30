@@ -130,6 +130,22 @@ enum Command {
         #[arg(long)]
         project: PathBuf,
     },
+    #[command(name = "_threads-open", hide = true)]
+    ThreadsOpen {
+        #[arg(long)]
+        pane: String,
+        #[arg(long)]
+        close: bool,
+        #[arg(long, requires = "client")]
+        board: bool,
+        #[arg(long, requires = "board")]
+        client: Option<String>,
+    },
+    #[command(name = "_threads-view", hide = true)]
+    ThreadsView {
+        #[arg(long)]
+        source: String,
+    },
     #[command(name = "_install-native", hide = true)]
     InstallNative(InstallNativeArgs),
     #[command(name = "_fleet", hide = true)]
@@ -640,6 +656,23 @@ where
             Ok(0)
         }
         Some(Command::FilesView { project }) => crate::files_view::run(project),
+        Some(Command::ThreadsOpen {
+            pane,
+            close,
+            board,
+            client,
+        }) => {
+            let tmux = crate::tmux::Tmux::default();
+            if board {
+                tmux.return_to_board(
+                    &pane,
+                    client.as_deref().context("Missing opening terminal")?,
+                )?;
+            } else {
+                tmux.open_threads_companion(&pane, close)?;
+            }
+            Ok(0)
+        }
         Some(Command::Hook(args)) => hook(args),
         Some(Command::ProcessExit(args)) => process_exit(args),
         command => dispatch(&Pika::discover()?, command),
@@ -657,6 +690,7 @@ fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
             run_board(pika)
         }
         Some(Command::ClientFleetOpen(a)) => client_fleet_open(pika, a),
+        Some(Command::ThreadsView { source }) => run_threads(pika, &source),
         Some(Command::List(a)) => list(pika, a),
         Some(Command::Next) => next(pika),
         Some(Command::Peek(a)) => peek(pika, a),
@@ -706,6 +740,7 @@ fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
             | Command::ClaudeStatusline { .. }
             | Command::TerminalBridge(_)
             | Command::FilesOpen { .. }
+            | Command::ThreadsOpen { .. }
             | Command::FilesView { .. }
             | Command::Hook(_)
             | Command::ProcessExit(_),
@@ -775,7 +810,7 @@ fn drive_board(
     let mut memory = monitor::BoardMemory::default();
     loop {
         let action = observe(&mut memory)?;
-        if matches!(action, BoardAction::Assistant(_)) {
+        if matches!(action, BoardAction::Assistant(_) | BoardAction::Settings) {
             memory.notice = apply(action)
                 .err()
                 .map(|error| format!("PIKA · {error}\nYour project agents were not changed."));
@@ -866,12 +901,17 @@ fn run_board(pika: &Pika) -> Result<i32> {
     }
     let source = crate::activity_observer::start(pika)?;
     let mut update = None;
+    let assistant_memory = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::assistant::ViewMemory::default(),
+    ));
     let outcome =
         crate::activity_feed::with(Some(crate::activity_feed::Context::Source(source)), || {
             drive_board(
                 |memory| observe_board(pika, memory),
                 |action| {
-                    if matches!(action, BoardAction::Update(_)) {
+                    if let BoardAction::Assistant(item) = action {
+                        open_assistant_with_memory(pika, item, Some(assistant_memory.clone()))
+                    } else if matches!(action, BoardAction::Update(_)) {
                         update = Some(action);
                         Ok(0)
                     } else {
@@ -887,9 +927,79 @@ fn run_board(pika: &Pika) -> Result<i32> {
     }
 }
 
+fn run_threads(pika: &Pika, origin: &str) -> Result<i32> {
+    let pane = pika.tmux.prepare_threads_view(origin)?;
+    let identity = pane
+        .pika_session_id
+        .unwrap_or_else(|| format!("pending:{}", pane.pika_launch_token.unwrap()));
+    let current = (pane.pika_provider.unwrap(), identity);
+    // The observation lease makes this a cache follower when the board's
+    // producer is running; otherwise the same service takes over. No quota,
+    // preview, consultation or update worker belongs to this view.
+    let source = crate::activity_observer::start(pika)?;
+    let mut memory = monitor::BoardMemory::default();
+    crate::activity_feed::with(
+        Some(crate::activity_feed::Context::Source(source.clone())),
+        || {
+            loop {
+                match monitor::run_thread_list(&source, &current, &mut memory)? {
+                    BoardAction::Open(item) => match switch_thread(pika, &source, origin, item) {
+                        Ok(0) => return Ok(0),
+                        outcome => {
+                            memory.notice = Some(match outcome {
+                                Err(error) => format!("Could not open: {error}"),
+                                Ok(code) => {
+                                    format!("Opening ended ({code}). Try again or press Esc.")
+                                }
+                            });
+                        }
+                    },
+                    _ => return Ok(0),
+                }
+            }
+        },
+    )
+}
+
+fn switch_thread(
+    pika: &Pika,
+    source: &crate::activity_feed::Source,
+    origin: &str,
+    item: BoardItem,
+) -> Result<i32> {
+    let remote = item.node_id.is_some();
+    let handoff = pika.tmux.thread_handoff(origin)?;
+    let mut routed = pika.clone();
+    routed.tmux = pika.tmux.for_thread_handoff(&handoff);
+    let context = if remote {
+        Some(crate::activity_feed::Context::Source(source.clone()))
+    } else {
+        handoff
+            .feed
+            .clone()
+            .map(crate::activity_feed::Context::Remote)
+    };
+    let open = || crate::activity_feed::with(context, || open_board_item(&routed, item));
+    // A fleet SSH handoff fills the terminal and gives navigation keys to the
+    // remote harness; failures restore this list so the user can retry.
+    let result = if remote {
+        pika.tmux.with_remote_threads(open)
+    } else {
+        open()
+    };
+    if matches!(result, Ok(0)) {
+        pika.tmux.finish_thread_handoff(&handoff)?;
+        if remote {
+            pika.tmux.return_remote_handoff(&handoff)?;
+        }
+    }
+    result
+}
+
 fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
     match action {
         BoardAction::Assistant(item) => open_assistant(pika, item),
+        BoardAction::Settings => board_settings(pika),
         BoardAction::Add => unreachable!("adding conversations is handled inside the board"),
         BoardAction::Open(item) => open_board_item(pika, item),
         BoardAction::Peek(item) => peek_board_item(pika, item),
@@ -940,7 +1050,48 @@ fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
     }
 }
 
+fn board_settings(pika: &Pika) -> Result<i32> {
+    let ui = crate::onboarding::Screen::new(true)?;
+    loop {
+        match ui.choice(
+            "Board settings",
+            "Connect your machines here. Your agents keep running.",
+            &["Back to board", "Connect a machine", "Machine connections"],
+        )? {
+            Some(1) => {
+                let mut notices = Vec::new();
+                let journal = std::cell::RefCell::new(Vec::new());
+                connect_setup_machines(
+                    pika,
+                    &ui,
+                    SetupMachineOptions {
+                        explicit_machines: &[],
+                        install_bundle: None,
+                        remote_import_all: false,
+                        yes: false,
+                    },
+                    &mut notices,
+                    &journal,
+                )?;
+                if !notices.is_empty() {
+                    ui.details("Connection details", &notices.join("\n\n"))?;
+                }
+            }
+            Some(2) => crate::machine_settings::connections(&pika.store, &ui)?,
+            _ => return Ok(0),
+        }
+    }
+}
+
 fn open_assistant(pika: &Pika, item: Option<Box<BoardItem>>) -> Result<i32> {
+    open_assistant_with_memory(pika, item, None)
+}
+
+fn open_assistant_with_memory(
+    pika: &Pika,
+    item: Option<Box<BoardItem>>,
+    memory: Option<std::sync::Arc<std::sync::Mutex<crate::assistant::ViewMemory>>>,
+) -> Result<i32> {
     let focus = item
         .filter(|item| item.pending_token.is_none())
         .map(|item| {
@@ -958,6 +1109,7 @@ fn open_assistant(pika: &Pika, item: Option<Box<BoardItem>>) -> Result<i32> {
         })
         .transpose()?;
     crate::assistant::run(crate::assistant::Args {
+        view_memory: memory,
         board: true,
         focus,
         ..Default::default()
@@ -1177,7 +1329,7 @@ fn board_action_driver(pika: Pika) -> monitor::ActionDriver {
                     .untrack(&remote, None)
                     .map_err(anyhow::Error::from)?;
                 return Ok(format!(
-                    "Stopped watching {}. The agent and its history are unchanged.",
+                    "Removed {} from your board. The agent and its history are unchanged.",
                     remote.qualified_name()
                 ));
             }
@@ -1282,7 +1434,7 @@ fn untrack_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
             .untrack(&remote, None)
             .map_err(anyhow::Error::from)?;
         println!(
-            "Stopped watching {}. The remote agent and its history were not stopped or archived.",
+            "Removed {} from your board. The remote agent and its history are unchanged.",
             remote.qualified_name()
         );
         return Ok(0);
@@ -2242,7 +2394,7 @@ fn untrack(pika: &Pika, name: &str) -> Result<i32> {
                 .untrack(&remote, None)
                 .map_err(anyhow::Error::from)?;
             println!(
-                "Stopped watching {}. The remote agent and its history were not stopped or archived.",
+                "Removed {} from your board. The remote agent and its history are unchanged.",
                 remote.qualified_name()
             );
             Ok(0)
@@ -2264,7 +2416,7 @@ fn untrack_report(pika: &Pika, s: &Session) -> Result<(i32, String)> {
         .as_deref()
         .and_then(|_| pika.clear_exact_tags(s).err());
     let mut report = format!(
-        "Stopped watching {}. The agent and its history were not stopped or archived.",
+        "Removed {} from your board. The agent and its history are unchanged.",
         s.display_name()
     );
     if let Some(error) = clear_error {
@@ -3157,157 +3309,18 @@ fn setup_screen(pika: &Pika, a: SetupArgs, ui: &crate::onboarding::Screen) -> Re
         &["Just this machine for now", "Connect another machine"],
     )? == Some(1));
     if add_machines {
-        ui.progress(
-            "Find your machines",
-            "Reading saved connections. No candidate has been contacted.",
+        connect_setup_machines(
+            pika,
+            ui,
+            SetupMachineOptions {
+                explicit_machines: &explicit_machines,
+                install_bundle: install_bundle.as_deref(),
+                remote_import_all,
+                yes: a.yes,
+            },
+            &mut notices,
+            &journal,
         )?;
-        let home = directories::BaseDirs::new()
-            .context("cannot determine home directory for machine discovery")?;
-        let report = fleet::discover_node_candidates(
-            &pika.store,
-            home.home_dir(),
-            std::path::Path::new("tailscale"),
-            Duration::from_secs(3),
-        )
-        .map_err(anyhow::Error::from)?;
-        let selected = if explicit_machines.is_empty() {
-            if ui.active() {
-                let labels = report
-                    .candidates
-                    .iter()
-                    .map(|c| format!("{} · {}", c.alias, c.ssh_target))
-                    .collect::<Vec<_>>();
-                ui.select(
-                    "Connect your machines",
-                    "Only the machines you select will be contacted.",
-                    &labels,
-                    true,
-                )?
-                .unwrap_or_default()
-                .into_iter()
-                .map(|i| report.candidates[i].clone())
-                .collect()
-            } else {
-                choose_machine_candidates(report.candidates)?
-            }
-        } else {
-            let discovered = report
-                .candidates
-                .into_iter()
-                .map(|candidate| (candidate.key(), candidate))
-                .collect::<std::collections::HashMap<_, _>>();
-            explicit_machines
-                .into_iter()
-                .map(|target| {
-                    discovered.get(&target.to_lowercase()).cloned().map_or_else(
-                        || {
-                            Ok(NodeCandidate {
-                                alias: fleet::suggest_alias(&target)
-                                    .map_err(anyhow::Error::from)?,
-                                ssh_target: target,
-                                sources: vec!["explicit".to_owned()],
-                                hostname: None,
-                                online: None,
-                                os_name: None,
-                            })
-                        },
-                        Ok,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
-        let manager = FleetManager::new(&pika.store, SshTransport::default());
-        let mut added = Vec::new();
-        for candidate in selected {
-            ui.progress(
-                "Connect your machines",
-                &format!("Connecting to {}…", candidate.alias),
-            )?;
-            match manager.add(&candidate, Some(&candidate.alias)) {
-                Ok(node) => {
-                    println!(
-                        "Trusted Pika machine {} · {}",
-                        node.alias,
-                        &node.node_id[..8]
-                    );
-                    added.push(node);
-                }
-                Err(error) if error.kind == FleetErrorKind::Missing => {
-                    if let Some(bundle_path) = install_bundle.as_deref() {
-                        let transport = SshTransport::default();
-                        let target = transport
-                            .native_target(&candidate.ssh_target)
-                            .map_err(anyhow::Error::from)?;
-                        let prepared = update::prepare_remote_install_bundle(
-                            bundle_path,
-                            &target,
-                            Some(VERSION),
-                        )?;
-                        let prompt = format!(
-                            "Install Pika {} on {} ({})? [y/N] ",
-                            prepared.version(),
-                            candidate.ssh_target,
-                            target
-                        );
-                        if a.yes
-                            || if ui.active() {
-                                ui.choice(
-                                    "Install on this machine?",
-                                    &prompt,
-                                    &["Not now", "Install Pika"],
-                                )? == Some(1)
-                            } else {
-                                confirm(&prompt)?
-                            }
-                        {
-                            transport
-                                .install_bundle(&candidate.ssh_target, &prepared, None)
-                                .map_err(anyhow::Error::from)?;
-                            let node = manager
-                                .add(&candidate, Some(&candidate.alias))
-                                .map_err(anyhow::Error::from)?;
-                            println!(
-                                "Installed and trusted {} · node {} verified",
-                                node.alias,
-                                &node.node_id[..8]
-                            );
-                            added.push(node);
-                        } else {
-                            println!("Nothing installed on {}.", candidate.ssh_target);
-                        }
-                    } else {
-                        notices.push(format!("{} was not connected: Pika is not installed there. See setup details for the command.", candidate.alias));
-                        eprintln!(
-                            "pika: Pika is missing on {}. Nothing was installed. Install Pika there, then rerun exactly: `pika setup --machine {}`; or provide a reviewed native bundle with `--install-bundle PATH`.",
-                            candidate.ssh_target,
-                            shell_words::quote(&candidate.ssh_target)
-                        );
-                    }
-                }
-                Err(error) => {
-                    notices.push(format!("{} was not connected: {error}", candidate.alias));
-                    eprintln!(
-                        "pika: {} was not added: {}. Other selected machines are handled separately.",
-                        candidate.alias, error
-                    );
-                }
-            }
-        }
-        if remote_import_all {
-            for node in added {
-                let candidates = manager
-                    .remote_candidates(&node, false)
-                    .map_err(anyhow::Error::from)?;
-                let mut count = 0;
-                for candidate in candidates {
-                    manager
-                        .adopt(&node, &candidate, None)
-                        .map_err(anyhow::Error::from)?;
-                    count += 1;
-                }
-                println!("Watching {count} conversation(s) on {}.", node.alias);
-            }
-        }
     }
     if ui.active() {
         let count = pika.store.list_sessions()?.len();
@@ -3318,22 +3331,40 @@ fn setup_screen(pika: &Pika, a: SetupArgs, ui: &crate::onboarding::Screen) -> Re
                 "{count} conversation(s) on your board.\nEnter opens a conversation. Use its visible ← Pika control to return."
             )
         };
-        let body = format!(
-            "{intro}\n\nAgents can discover and consult project experts through the installed skill.\n{}",
-            if notices.is_empty() {
-                "No interviews were run during setup.".into()
-            } else {
-                format!("{} connection notice(s) to review below.", notices.len())
-            }
-        );
         loop {
+            let body = format!(
+                "{intro}\n\nAgents can discover and consult project experts through the installed skill.\n{}",
+                if notices.is_empty() {
+                    "No interviews were run during setup.".into()
+                } else {
+                    format!("{} connection notice(s) to review below.", notices.len())
+                }
+            );
             match ui.choice(
                 "Your board",
                 &body,
-                &["Open board", "Connection notices", "Setup details", "Done"],
+                &[
+                    "Open board",
+                    "Connect another machine",
+                    "Connection notices",
+                    "Setup details",
+                    "Done",
+                ],
             )? {
                 Some(0) => return Ok(10),
-                Some(1) => ui.details(
+                Some(1) => connect_setup_machines(
+                    pika,
+                    ui,
+                    SetupMachineOptions {
+                        explicit_machines: &[],
+                        install_bundle: install_bundle.as_deref(),
+                        remote_import_all: false,
+                        yes: false,
+                    },
+                    &mut notices,
+                    &journal,
+                )?,
+                Some(2) => ui.details(
                     "Connection notices",
                     &if notices.is_empty() {
                         "No connection notices.".into()
@@ -3341,7 +3372,7 @@ fn setup_screen(pika: &Pika, a: SetupArgs, ui: &crate::onboarding::Screen) -> Re
                         notices.join("\n\n")
                     },
                 )?,
-                Some(2) => ui.details("Setup details", &journal.borrow().join("\n\n"))?,
+                Some(3) => ui.details("Setup details", &journal.borrow().join("\n\n"))?,
                 _ => return Ok(0),
             }
         }
@@ -3352,6 +3383,278 @@ fn setup_screen(pika: &Pika, a: SetupArgs, ui: &crate::onboarding::Screen) -> Re
         );
     }
     Ok(0)
+}
+fn connect_setup_machines(
+    pika: &Pika,
+    ui: &crate::onboarding::Screen,
+    options: SetupMachineOptions<'_>,
+    notices: &mut Vec<String>,
+    journal: &std::cell::RefCell<Vec<String>>,
+) -> Result<()> {
+    let SetupMachineOptions {
+        explicit_machines,
+        install_bundle,
+        remote_import_all,
+        yes,
+    } = options;
+    macro_rules! println {
+        ($($arg:tt)*) => {{
+            if ui.active() { journal.borrow_mut().push(format!($($arg)*)); }
+            else { std::println!($($arg)*); }
+        }};
+    }
+    macro_rules! eprintln {
+        ($($arg:tt)*) => {{
+            if ui.active() { journal.borrow_mut().push(format!($($arg)*)); }
+            else { std::eprintln!($($arg)*); }
+        }};
+    }
+    let selected = find_setup_machines(pika, ui, explicit_machines)?;
+    let manager = FleetManager::new(&pika.store, SshTransport::default());
+    let mut added = Vec::new();
+    for candidate in selected {
+        match connect_setup_candidate(&manager, ui, &candidate)? {
+            Ok(node) => {
+                println!(
+                    "Trusted Pika machine {} · {}",
+                    node.alias,
+                    &node.node_id[..8]
+                );
+                added.push(node);
+            }
+            Err(error) if error.kind == FleetErrorKind::Missing => {
+                if let Some(bundle_path) = install_bundle {
+                    if install_setup_machine(ui, &candidate, bundle_path, yes)? {
+                        let node = manager
+                            .add(&candidate, Some(&candidate.alias))
+                            .map_err(anyhow::Error::from)?;
+                        println!(
+                            "Installed and trusted {} · node {} verified",
+                            node.alias,
+                            &node.node_id[..8]
+                        );
+                        added.push(node);
+                    } else {
+                        println!("Nothing installed on {}.", candidate.ssh_target);
+                    }
+                } else {
+                    notices.push(format!("{} was not connected: Pika is not installed there. See setup details for the command.", candidate.alias));
+                    eprintln!(
+                        "pika: Pika is missing on {}. Nothing was installed. Install Pika there, then rerun exactly: `pika setup --machine {}`; or provide a reviewed native bundle with `--install-bundle PATH`.",
+                        candidate.ssh_target,
+                        shell_words::quote(&candidate.ssh_target)
+                    );
+                }
+            }
+            Err(error) => {
+                notices.push(format!("{} was not connected: {error}", candidate.alias));
+                eprintln!(
+                    "pika: {} was not added: {}. Other selected machines are handled separately.",
+                    candidate.alias, error
+                );
+            }
+        }
+    }
+    if remote_import_all {
+        import_setup_machine_conversations(&manager, &added, ui, journal)?;
+    }
+    show_connected_machines(ui, &added)?;
+    Ok(())
+}
+
+fn connect_setup_candidate(
+    manager: &FleetManager<'_, SshTransport>,
+    ui: &crate::onboarding::Screen,
+    candidate: &NodeCandidate,
+) -> Result<std::result::Result<crate::model::FleetNode, crate::fleet::FleetError>> {
+    loop {
+        ui.progress(
+            "Connect your machines",
+            &format!("Connecting to {}…", candidate.alias),
+        )?;
+        let result = manager.add(candidate, Some(&candidate.alias));
+        let Err(error) = &result else {
+            return Ok(result);
+        };
+        if !ui.active() || error.kind == FleetErrorKind::Missing {
+            return Ok(result);
+        }
+        if ui.choice(
+            "Connection unavailable",
+            &format!(
+                "{} was not connected.\n{error}\n\nOther connections are kept.",
+                candidate.alias
+            ),
+            &["Continue", "Retry connection"],
+        )? != Some(1)
+        {
+            return Ok(result);
+        }
+    }
+}
+
+fn import_setup_machine_conversations(
+    manager: &FleetManager<'_, SshTransport>,
+    nodes: &[crate::model::FleetNode],
+    ui: &crate::onboarding::Screen,
+    journal: &std::cell::RefCell<Vec<String>>,
+) -> Result<()> {
+    for node in nodes {
+        let candidates = manager
+            .remote_candidates(node, false)
+            .map_err(anyhow::Error::from)?;
+        let count = candidates.len();
+        for candidate in candidates {
+            manager
+                .adopt(node, &candidate, None)
+                .map_err(anyhow::Error::from)?;
+        }
+        let text = format!("Watching {count} conversation(s) on {}.", node.alias);
+        if ui.active() {
+            journal.borrow_mut().push(text);
+        } else {
+            println!("{text}");
+        }
+    }
+    Ok(())
+}
+
+fn show_connected_machines(
+    ui: &crate::onboarding::Screen,
+    nodes: &[crate::model::FleetNode],
+) -> Result<()> {
+    if ui.active() && !nodes.is_empty() {
+        let names = nodes
+            .iter()
+            .map(|node| node.alias.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui.details(
+            "Machines connected",
+            &format!("{names}\n\nTheir tracked conversations are now available on your board."),
+        )?;
+    }
+    Ok(())
+}
+fn install_setup_machine(
+    ui: &crate::onboarding::Screen,
+    candidate: &NodeCandidate,
+    bundle: &std::path::Path,
+    yes: bool,
+) -> Result<bool> {
+    let transport = SshTransport::default();
+    let target = transport
+        .native_target(&candidate.ssh_target)
+        .map_err(anyhow::Error::from)?;
+    let prepared = update::prepare_remote_install_bundle(bundle, &target, Some(VERSION))?;
+    let prompt = format!(
+        "Install Pika {} on {} ({})?",
+        prepared.version(),
+        candidate.ssh_target,
+        target
+    );
+    let approved = yes
+        || if ui.active() {
+            ui.choice(
+                "Install on this machine?",
+                &prompt,
+                &["Not now", "Install Pika"],
+            )? == Some(1)
+        } else {
+            confirm(&format!("{prompt} [y/N] "))?
+        };
+    if approved {
+        transport
+            .install_bundle(&candidate.ssh_target, &prepared, None)
+            .map_err(anyhow::Error::from)?;
+    }
+    Ok(approved)
+}
+fn find_setup_machines(
+    pika: &Pika,
+    ui: &crate::onboarding::Screen,
+    explicit_machines: &[String],
+) -> Result<Vec<NodeCandidate>> {
+    ui.progress(
+        "Find your machines",
+        "Reading saved connections. No candidate has been contacted.",
+    )?;
+    let home = directories::BaseDirs::new()
+        .context("cannot determine home directory for machine discovery")?;
+    let report = fleet::discover_node_candidates(
+        &pika.store,
+        &home.home_dir().join(".ssh"),
+        std::path::Path::new("tailscale"),
+        Duration::from_secs(3),
+    )
+    .map_err(anyhow::Error::from)?;
+    if explicit_machines.is_empty() {
+        if ui.active() {
+            choose_setup_machines(ui, &report.candidates)
+        } else {
+            choose_machine_candidates(report.candidates)
+        }
+    } else {
+        let discovered = report
+            .candidates
+            .into_iter()
+            .map(|candidate| (candidate.key(), candidate))
+            .collect::<std::collections::HashMap<_, _>>();
+        explicit_machines
+            .iter()
+            .cloned()
+            .map(|target| {
+                discovered.get(&target.to_lowercase()).cloned().map_or_else(
+                    || {
+                        Ok(NodeCandidate {
+                            alias: fleet::suggest_alias(&target).map_err(anyhow::Error::from)?,
+                            ssh_target: target,
+                            sources: vec!["explicit".to_owned()],
+                            hostname: None,
+                            online: None,
+                            os_name: None,
+                        })
+                    },
+                    Ok,
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+}
+fn choose_setup_machines(
+    ui: &crate::onboarding::Screen,
+    candidates: &[NodeCandidate],
+) -> Result<Vec<NodeCandidate>> {
+    let mut labels = candidates
+        .iter()
+        .map(|c| format!("{} · {}", c.alias, c.ssh_target))
+        .collect::<Vec<_>>();
+    labels.push("Enter a machine address…".into());
+    let selected = ui.select("Connect your machines",
+        "Choose saved connections, or enter an address.\nSpace selects; Enter continues. Only selected machines are contacted.",
+        &labels, true)?.unwrap_or_default();
+    let mut result = Vec::new();
+    for index in selected {
+        if let Some(candidate) = candidates.get(index) {
+            result.push(candidate.clone());
+        } else if let Some(target) = ui.input("Machine address", "Enter the name you use to connect, such as rs6 or ayush@my-server.\nPika must already be installed there.")? {
+            match fleet::suggest_alias(&target) {
+                Ok(alias) => result.push(NodeCandidate {
+                    alias, ssh_target: target, sources: vec!["explicit".into()],
+                    hostname: None, online: None, os_name: None,
+                }),
+                Err(error) => ui.details("Check the machine address", &error.to_string())?,
+            }
+        }
+    }
+    Ok(result)
+}
+
+struct SetupMachineOptions<'a> {
+    explicit_machines: &'a [String],
+    install_bundle: Option<&'a std::path::Path>,
+    remote_import_all: bool,
+    yes: bool,
 }
 fn choose_setup_conversations(
     ui: &crate::onboarding::Screen,
@@ -5367,7 +5670,7 @@ fn machines(pika: &Pika, a: MachinesArgs) -> Result<i32> {
                 .context("cannot determine home directory for SSH discovery")?;
             let report = fleet::discover_node_candidates(
                 &pika.store,
-                home.home_dir(),
+                &home.home_dir().join(".ssh"),
                 std::path::Path::new("tailscale"),
                 Duration::from_secs(3),
             )

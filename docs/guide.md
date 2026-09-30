@@ -58,9 +58,11 @@ Recent conversations and other machines are optional. **Open board** takes you
 directly to your work. Connection notices explain any remaining integration
 steps; detailed hook and backup receipts remain under **Setup details**.
 
-Select a conversation and press Enter to open it. Click `← Pika` or press the
-return key shown beside it (normally F12) to return to the board; the agent
-stays running. The return bar carries the board's live counts and names the latest
+Select a conversation and press Enter to open it. Press the key beside `← Pika`
+(normally F12) once for a side list of threads, with no preview. Use ↑↓ and Enter
+to switch; Escape closes the list. Press the key again for the full board, or
+click `← Pika` to go there directly. Your agents stay running. The return bar
+carries the board's live counts and names the latest
 conversation waiting for your input, including its machine when remote. It follows
 your board filter; completed results and stale remote rows do not become that
 name. Narrow terminals shorten or hide it to keep navigation visible.
@@ -297,12 +299,16 @@ open a Pika server network port. A hidden versioned JSONL protocol runs over an
 ordinary non-interactive SSH process; human attaches use an SSH PTY. Network
 visibility is not treated as authorization.
 
-Interactive `pika setup` has a two-stage federation step:
+In `pika setup`, choose **Connect another machine** on the final screen. This
+remains available when you run setup again, not just on first installation:
 
 1. It passively reads concrete aliases from `~/.ssh/config` and peers already
    visible in `tailscale status --json`, then asks which machines to contact.
+   Use Space to select and Enter to continue, or select **Enter a machine
+   address** for a machine that isn't listed.
 2. After a selected machine proves its immutable Pika node UUID and protocol,
-   Pika asks which eligible conversations to add there.
+   its tracked conversations become available on this board. Adding a machine
+   from the final screen does not repeat provider setup or import every thread.
 
 Unselected candidates receive no network traffic. Selecting a remote
 conversation updates Pika only on that remote machine; it does not start, move,
@@ -387,6 +393,12 @@ pika experts QUERY      find exact conversation threads by work context
 ```
 
 The complete command reference follows.
+
+On the board, **F2 Settings → Connect a machine** adds another machine without
+repeating provider setup. **Machine connections** shows saved connection details
+and offers an explicit retry. **F1 Help** explains controls; `?` still works.
+`x` removes a conversation from the board, not its saved history or running agent.
+Settings and assistant visits preserve the board's selection and filter.
 
 ```text
 pika                       open the live operations monitor
@@ -654,7 +666,8 @@ every five minutes without spending provider quota. The selected-pane tail is
 read-only, transcript-free, and never acknowledges unread work. Selection
 remains stable by provider identity even when a status change reorders rows.
 Use `/` to filter. Selection, filter and viewport are preserved while opening a
-native agent and returning with `← Pika` or its displayed key (normally F12).
+native agent and returning with `← Pika` or two presses of its displayed key
+(normally F12). One press opens the compact thread list; Escape closes it.
 Pika preserves existing tmux bindings and selects F11/F10 if F12 is occupied;
 your terminal may require its Fn key to send a function key. Clicking is an
 alternative. The navigation strip leaves the agent's native interface and
@@ -798,8 +811,12 @@ and explicitly adopted sessions untouched. It also launches the agent with the
 caller's `PATH`, a 24-bit RGB tmux terminal contract, and without stale
 automation-only `NO_COLOR` state inherited from an older tmux server. Explicit
 interactive `NO_COLOR` preferences remain respected. Pika declares RGB support
-to tmux and uses the `tmux-direct` terminfo contract so every provider retains
-its 24-bit color palette. Codex additionally derives its adaptive user-message and
+to tmux and uses `TERM=tmux-direct` with `COLORTERM=truecolor` so providers using
+either terminfo or heuristic color detection retain their RGB palette, even
+when SSH does not forward color hints. This applies when starting a provider;
+reattaching cannot change an already-running provider's environment or cached
+color choice. Pika never restarts an agent to refresh colors.
+Codex additionally derives its adaptive user-message and
 composer fills from OSC 10/11 terminal queries, which tmux consumes without
 answering. Before starting Codex, Pika queries the directly attached terminal
 once and passes the result to a transparent private-PTY bridge. The bridge
