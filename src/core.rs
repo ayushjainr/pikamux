@@ -1558,15 +1558,24 @@ impl Pika {
         let panes = self.tmux.list_panes().context(
             "Pika refused to inspect the existing terminal because tmux could not be observed",
         )?;
-        let tagged = panes
-            .iter()
-            .filter(|pane| {
-                crate::tmux::is_pika_session(&pane.session_name)
-                    && !pane.dead
-                    && pane.pika_provider == Some(session.provider)
-                    && pane.pika_session_id.as_deref() == Some(&session.session_id)
-            })
-            .collect::<Vec<_>>();
+        let mut tagged = Vec::new();
+        for pane in panes.iter().filter(|pane| {
+            crate::tmux::is_pika_session(&pane.session_name)
+                && !pane.dead
+                && pane.pika_provider == Some(session.provider)
+                && pane.pika_session_id.as_deref() == Some(&session.session_id)
+        }) {
+            let root = processes
+                .get(&pane.pane_pid)
+                .context("a tagged terminal root could not be observed")?;
+            // Untracking leaves terminals alive. A previous, now idle shell
+            // must not hide the unique live client when the row is added back.
+            // Ignore only a known shell with no descendants in a complete
+            // observation; unknown roots, helpers and busy panes remain rivals.
+            if !process::observed_idle_shell(root, processes) {
+                tagged.push(pane);
+            }
+        }
         if tagged.len() != 1 {
             bail!(
                 "Pika found {} tagged terminals for this conversation; it will not offer an unverified handoff",
@@ -3091,6 +3100,128 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unverified_binding_boomerang_ignores_only_an_observed_idle_shell() {
+        let (root, mut pika, session) = unverified_fixture("abababab-abab-4bab-8bab-abababababab");
+        let pid = i64::from(std::process::id());
+        let start = process::process_start_time(pid).unwrap();
+        let mut live = tagged_pane(&session.session_id);
+        live.pane_pid = pid;
+        let mut idle = live.clone();
+        idle.pane_id = "%2".into();
+        idle.pane_pid = 999_998;
+        pika.tmux = fixture_tmux(root.path(), &[idle, live]);
+        pika.process_observer = Arc::new(move || {
+            ProcessObservation::complete(BTreeMap::from([
+                (pid, record(pid, None, start, &["codex"])),
+                (999_998, record(999_998, None, 10, &["/bin/bash", "-l"])),
+            ]))
+        });
+        pika.store
+            .untrack_session(session.provider, &session.session_id)
+            .unwrap();
+        assert!(
+            pika.store
+                .is_untracked(session.provider, &session.session_id)
+                .unwrap()
+        );
+        pika.store.adopt_session(&session).unwrap();
+        assert!(
+            !pika
+                .store
+                .is_untracked(session.provider, &session.session_id)
+                .unwrap()
+        );
+        let before = pika
+            .store
+            .get_session(session.provider, &session.session_id)
+            .unwrap()
+            .unwrap();
+        let binding = pika.unverified_pane_binding(&before).unwrap();
+        assert_eq!(binding.pane.pane_id, "%1");
+        assert_eq!(binding.provider_pid, pid);
+        pika.revalidate_unverified_pane(&before, &binding).unwrap();
+        assert_eq!(
+            pika.store
+                .get_session(session.provider, &session.session_id)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert!(
+            pika.store
+                .get_recovery_owner(session.provider, &session.session_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(pika.store.list_pending().unwrap().is_empty());
+        assert!(pika.store.get_meta("last_attached").unwrap().is_none());
+        // An ignored idle terminal becoming a client invalidates the offered
+        // handoff too; the candidate filter must be rerun, not cached.
+        pika.process_observer = Arc::new(move || {
+            ProcessObservation::complete(BTreeMap::from([
+                (pid, record(pid, None, start, &["codex"])),
+                (999_998, record(999_998, None, 10, &["codex"])),
+            ]))
+        });
+        assert!(pika.revalidate_unverified_pane(&before, &binding).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverified_binding_never_discards_unknown_or_busy_duplicate_panes() {
+        for case in [
+            "missing-root",
+            "unknown-root",
+            "busy-shell",
+            "shell-command",
+            "provider-wrapper",
+            "other-provider",
+            "shared-helper",
+            "second-client",
+            "partial",
+        ] {
+            let (root, mut pika, session) =
+                unverified_fixture("acacacac-acac-4cac-8cac-acacacacacac");
+            let pid = i64::from(std::process::id());
+            let start = process::process_start_time(pid).unwrap();
+            let mut live = tagged_pane(&session.session_id);
+            live.pane_pid = pid;
+            let mut extra = live.clone();
+            extra.pane_id = "%2".into();
+            extra.pane_pid = 999_998;
+            pika.tmux = fixture_tmux(root.path(), &[live, extra]);
+            pika.process_observer = Arc::new(move || {
+                let mut records = BTreeMap::from([(pid, record(pid, None, start, &["codex"]))]);
+                let argv: &[&str] = match case {
+                    "unknown-root" => &["mystery"],
+                    "shell-command" => &["bash", "-c", "while :; do :; done"],
+                    "provider-wrapper" => &["bash", "/path/codex"],
+                    "other-provider" => &["claude"],
+                    "shared-helper" => &["codex", "app-server"],
+                    "second-client" => &["codex"],
+                    _ => &["bash"],
+                };
+                if case != "missing-root" {
+                    records.insert(999_998, record(999_998, None, 10, argv));
+                }
+                if case == "busy-shell" {
+                    records.insert(
+                        999_997,
+                        record(999_997, Some(999_998), 11, &["sleep", "100"]),
+                    );
+                }
+                if case == "partial" {
+                    ProcessObservation::partial(records, vec!["unreadable child".into()])
+                } else {
+                    ProcessObservation::complete(records)
+                }
+            });
+            assert!(pika.unverified_pane_binding(&session).is_err(), "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn reconciliation_completes_only_an_independently_proven_pending_launch() {
         for case in [
             "exact",
@@ -3221,7 +3352,7 @@ mod tests {
         first.pane_pid = 10;
         pika.tmux = fixture_tmux(root.path(), &[first, duplicate]);
         let error = pika.unverified_pane_binding(&session).unwrap_err();
-        assert!(error.to_string().contains("2 tagged terminals"));
+        assert!(error.to_string().contains("root could not be observed"));
     }
 
     #[cfg(unix)]

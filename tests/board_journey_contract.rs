@@ -441,6 +441,15 @@ fn remote_board_feed_verifies_node_bounds_frames_and_clears_on_disconnect() {
 
 #[test]
 fn unverified_terminal_requires_choice_and_never_relaunches_or_acknowledges() {
+    unverified_terminal_journey(false);
+}
+
+#[test]
+fn boomerang_with_idle_duplicate_opens_only_existing_terminal_by_explicit_choice() {
+    unverified_terminal_journey(true);
+}
+
+fn unverified_terminal_journey(boomerang: bool) {
     let real_tmux = real_tmux_binary();
     let mut board = BoardProcess::start();
     fs::write(
@@ -486,6 +495,48 @@ fn unverified_terminal_requires_choice_and_never_relaunches_or_acknowledges() {
         board.tmux(&["set-option", "-p", "-t", "pika-c-unverified", key, value]);
     }
     board.tmux(&["bind-key", "-T", "root", "F12", "detach-client"]);
+    if boomerang {
+        board.tmux(&["new-session", "-d", "-s", "pika-c-idle", "exec /bin/sh"]);
+        for (key, value) in [
+            ("@pika_provider", "codex"),
+            ("@pika_session_id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            ("@pika_name", "audit_saved"),
+        ] {
+            board.tmux(&["set-option", "-p", "-t", "pika-c-idle", key, value]);
+        }
+        let store = Store::at(board.root.path().join("state/pika.db"));
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut session = store
+            .get_session(pikamux::model::Provider::Codex, id)
+            .unwrap()
+            .unwrap();
+        store.untrack_session(session.provider, id).unwrap();
+        assert!(store.is_untracked(session.provider, id).unwrap());
+        store.adopt_session(&session).unwrap();
+        // A new completion after readoption must not be collected by fallback.
+        session.unread = true;
+        store.upsert_session(&session, true).unwrap();
+        store
+            .record_status_observation(
+                session.provider,
+                id,
+                &StatusObservation {
+                    kind: ObservationKind::Lifecycle,
+                    status: Status::Ready,
+                    unread: true,
+                    attention_reason: Some("completed".into()),
+                    error: None,
+                    observed_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64(),
+                    source: "fixture-boomerang-completion".into(),
+                },
+            )
+            .unwrap();
+        board.send(b"r");
+        board.await_text("audit_saved");
+    }
     let before = board.tmux(&[
         "display-message",
         "-p",

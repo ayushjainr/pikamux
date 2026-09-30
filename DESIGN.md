@@ -377,6 +377,10 @@ conversation continuity: Pika freezes and rechecks the unique owned pane and its
 process generation, labels the attachment unverified, preserves unread state,
 and creates no agent or recovery certificate. Missing, changed, or ambiguous
 panes stay blocked. Cancellation and noninteractive callers never opt in.
+An old tagged terminal consisting only of an observed plain or login shell
+with no descendants does not compete with the unique live terminal for this
+fallback. This requires complete process observation and is rechecked at
+handoff; unknown, busy, helper-only and additional client terminals stay blocked.
 
 Public state is a projection, not a stored assertion. Pika persists provider
 lifecycle, identity-safety, and runtime observations as separate latest facts.

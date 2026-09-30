@@ -664,6 +664,29 @@ pub fn find_session_processes(
     canonical_identity_pids(&matches, processes)
 }
 
+/// Only a recognized shell without observed descendants can be discarded as
+/// an inert tagged terminal. Callers must require a complete observation first.
+pub(crate) fn observed_idle_shell(
+    root: &ProcessRecord,
+    processes: &BTreeMap<i64, ProcessRecord>,
+) -> bool {
+    let executable = root
+        .argv
+        .first()
+        .and_then(|value| Path::new(value).file_name())
+        .and_then(OsStr::to_str);
+    let plain_invocation = root.argv.len() == 1
+        || (root.argv.len() == 2 && matches!(root.argv[1].as_str(), "-l" | "--login"));
+    plain_invocation
+        && executable.is_some_and(|name| {
+            matches!(
+                name.trim_start_matches('-'),
+                "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish"
+            )
+        })
+        && process_tree(root.pid, processes).len() == 1
+}
+
 pub(crate) fn canonical_identity_pids(
     matches: &BTreeSet<i64>,
     processes: &BTreeMap<i64, ProcessRecord>,
@@ -1313,6 +1336,22 @@ mod tests {
         );
         assert_eq!(selection.candidates.len(), 1);
         assert!(selection.ambiguous_provider);
+    }
+
+    #[test]
+    fn observed_idle_shell_accepts_only_plain_or_login_shells_without_children() {
+        for argv in [
+            vec!["/bin/bash"],
+            vec!["/bin/bash", "-l"],
+            vec!["zsh", "--login"],
+            vec!["-bash"],
+        ] {
+            let root = record(1, None, &argv);
+            let mut records = BTreeMap::from([(1, root.clone())]);
+            assert!(observed_idle_shell(&root, &records), "{argv:?}");
+            records.insert(2, record(2, Some(1), &["sleep", "100"]));
+            assert!(!observed_idle_shell(&root, &records), "{argv:?}");
+        }
     }
 
     #[test]
