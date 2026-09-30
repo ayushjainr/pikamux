@@ -146,6 +146,16 @@ pub struct Pika {
     process_observer: Arc<dyn Fn() -> ProcessObservation + Send + Sync>,
     local_reconcile_fence: Arc<LocalReconcileFence>,
     named_discovery: Arc<NamedDiscovery>,
+    launch_context: Option<LaunchContext>,
+}
+
+/// Explicit launch-local provider configuration. Ordinary conversations never
+/// inherit the persistent assistant's private provider home or skills.
+#[derive(Clone)]
+pub(crate) struct LaunchContext {
+    pub cwd: std::path::PathBuf,
+    pub environment: BTreeMap<String, String>,
+    pub arguments: Vec<String>,
 }
 
 #[derive(Default)]
@@ -195,6 +205,7 @@ impl Pika {
             process_observer: Arc::new(process::observe),
             local_reconcile_fence: Arc::default(),
             named_discovery: Arc::default(),
+            launch_context: None,
         })
     }
 
@@ -207,7 +218,26 @@ impl Pika {
             process_observer: Arc::new(process::observe),
             local_reconcile_fence: Arc::default(),
             named_discovery: Arc::default(),
+            launch_context: None,
         }
+    }
+
+    pub(crate) fn with_launch_context(mut self, context: LaunchContext) -> Self {
+        self.launch_context = Some(context);
+        self
+    }
+
+    fn launch_argv(&self, mut argv: Vec<String>) -> Vec<String> {
+        if let Some(context) = &self.launch_context {
+            argv.extend(context.arguments.iter().cloned());
+        }
+        argv
+    }
+
+    pub(crate) fn launch_working_directory(&self) -> Option<&Path> {
+        self.launch_context
+            .as_ref()
+            .map(|context| context.cwd.as_path())
     }
 
     fn observe_processes(&self) -> ProcessObservation {
@@ -1847,7 +1877,7 @@ impl Pika {
                 );
             }
             let providers = Providers::new(&self.paths, &self.config);
-            let argv = providers.resume_argv(session.provider, &identity);
+            let argv = self.launch_argv(providers.resume_argv(session.provider, &identity));
             let environment = self.register_launch_wrapper(
                 session.provider,
                 Some(&session.session_id),
@@ -1975,7 +2005,19 @@ impl Pika {
     }
 
     pub fn new_session(&self, name: &str, provider: Provider, attach: bool) -> Result<OpenReceipt> {
-        validate_daily_name(name)?;
+        self.new_session_with_token(name, provider, attach, &Uuid::new_v4().to_string())
+    }
+
+    /// Pin a profile's first launch intent before entering the existing exact
+    /// launch machinery; this does not implement another launcher.
+    pub(crate) fn new_session_with_token(
+        &self,
+        name: &str,
+        provider: Provider,
+        attach: bool,
+        launch_token: &str,
+    ) -> Result<OpenReceipt> {
+        let token = validated_launch_token(name, launch_token)?;
         let observation = self.observe_processes();
         require_complete_processes(&observation, "start a new conversation")?;
         let existing_panes = self
@@ -1988,11 +2030,17 @@ impl Pika {
                 shell_words::quote(name)
             );
         }
-        let token = Uuid::new_v4().to_string();
         let reserved = (provider == Provider::Claude).then(|| Uuid::new_v4().to_string());
         let providers = Providers::new(&self.paths, &self.config);
-        let argv = providers.new_argv(provider, name, reserved.as_deref());
-        let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+        let argv = self.launch_argv(providers.new_argv(provider, name, reserved.as_deref()));
+        let cwd = self
+            .launch_context
+            .as_ref()
+            .map(|context| context.cwd.clone())
+            .map(Ok)
+            .unwrap_or_else(std::env::current_dir)?
+            .to_string_lossy()
+            .into_owned();
         let internal = free_tmux_name(
             &Tmux::internal_name(provider, reserved.as_deref().unwrap_or(&token)),
             &existing_panes,
@@ -2074,15 +2122,13 @@ impl Pika {
                         binding.provider_pid,
                         start_time,
                     )?;
-                    self.store.upsert_session(&provisional, true)?;
-                    let _ = self.store.certify_launch(
-                        &token,
-                        provider,
-                        session_id,
-                        binding.provider_pid,
-                        start_time,
-                    )?;
-                    exact_new_home = Some((provisional, binding));
+                    // Reserved argv proves this process owns the launch, not
+                    // that the provider created the conversation. Only an
+                    // independently persisted provider lifecycle/discovery
+                    // record may replace the startup recovery handle.
+                    if let Some(confirmed) = self.store.get_session(provider, session_id)? {
+                        exact_new_home = Some((confirmed, binding));
+                    }
                 }
             }
             let current = self
@@ -2133,7 +2179,14 @@ impl Pika {
         token: &str,
         name: &str,
     ) -> Result<BTreeMap<String, String>> {
-        let environment = launch_environment(provider, session_id, token, name);
+        let mut environment = self
+            .launch_context
+            .as_ref()
+            .map(|context| context.environment.clone())
+            .unwrap_or_default();
+        // Exact wrapper identity is owned by the launch reservation, not by
+        // launch-local settings supplied by a presentation consumer.
+        environment.extend(launch_environment(provider, session_id, token, name));
         if !self
             .store
             .register_pending_wrapper_owner(token, &environment["PIKA_OWNER_TOKEN"])?
@@ -2743,6 +2796,12 @@ fn ambiguity_message(query: &str, sessions: &[Session]) -> String {
     message
 }
 
+fn validated_launch_token(name: &str, launch_token: &str) -> Result<String> {
+    let token = Uuid::parse_str(launch_token)?.to_string();
+    validate_daily_name(name)?;
+    Ok(token)
+}
+
 fn validate_daily_name(name: &str) -> Result<()> {
     let trimmed = name.trim();
     if trimmed.is_empty() || trimmed.len() > 120 || trimmed.chars().any(char::is_control) {
@@ -2828,6 +2887,57 @@ mod tests {
             Tmux::with_executable("/usr/bin/true", Some("never-used".into())),
         );
         (root, pika)
+    }
+
+    #[test]
+    fn native_launch_context_preserves_exact_owner_and_does_not_change_ordinary_launches() {
+        let (root, ordinary) = test_pika();
+        let argv = vec!["codex".into(), "resume".into(), "exact-uuid".into()];
+        assert_eq!(ordinary.launch_argv(argv.clone()), argv);
+        assert!(ordinary.launch_working_directory().is_none());
+        let private = root.path().join("private-workspace");
+        let native = ordinary.clone().with_launch_context(LaunchContext {
+            cwd: private.clone(),
+            environment: BTreeMap::from([
+                ("CODEX_HOME".into(), "private-provider-home".into()),
+                ("PIKA_PROVIDER".into(), "claude".into()),
+                ("PIKA_LAUNCH_TOKEN".into(), "wrong-launch".into()),
+                ("PIKA_OWNER_TOKEN".into(), "wrong-owner".into()),
+            ]),
+            arguments: vec!["--profile".into(), "pika-assistant".into()],
+        });
+        assert_eq!(native.launch_working_directory(), Some(private.as_path()));
+        let launched = native.launch_argv(argv.clone());
+        assert_eq!(&launched[..3], argv.as_slice());
+        assert_eq!(&launched[3..], &["--profile", "pika-assistant"]);
+        let token = Uuid::new_v4().to_string();
+        native
+            .store
+            .add_pending(&PendingLaunch {
+                launch_token: token.clone(),
+                name: "Pika".into(),
+                provider: Provider::Codex,
+                cwd: private.display().to_string(),
+                tmux_session: None,
+                tmux_pane: None,
+                root_pid: None,
+                root_pid_start: None,
+                expected_session_id: None,
+                preexisting_session_ids: Some(vec![]),
+                candidate_session_id: None,
+                candidate_observed_at: None,
+                created_at: 1.0,
+            })
+            .unwrap();
+        let environment = native
+            .register_launch_wrapper(Provider::Codex, None, &token, "Pika")
+            .unwrap();
+        assert_eq!(environment["CODEX_HOME"], "private-provider-home");
+        assert_eq!(environment["PIKA_PROVIDER"], "codex");
+        assert_eq!(environment["PIKA_LAUNCH_TOKEN"], token);
+        assert_ne!(environment["PIKA_OWNER_TOKEN"], "wrong-owner");
+        assert_eq!(ordinary.launch_argv(argv.clone()), argv);
+        assert!(ordinary.launch_working_directory().is_none());
     }
 
     fn test_session(identity: &str) -> Session {

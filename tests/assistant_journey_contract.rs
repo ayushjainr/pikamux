@@ -101,10 +101,9 @@ fn normal_startup_uses_saved_profile_scope_and_keeps_json_offline() {
     let provider = installed.root.path().join("fake-codex");
     fs::copy("/usr/bin/false", &provider).unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
-    // Configure via the public command with an inert executable, never a model.
-    json_output(
-        &installed,
-        &[
+    // JSON administration cannot start the former bespoke foreground session.
+    installed
+        .command(&[
             "pika",
             "--profile-root",
             source.assistant_root().to_str().unwrap(),
@@ -117,8 +116,36 @@ fn normal_startup_uses_saved_profile_scope_and_keeps_json_offline() {
             "--no-call-limit",
             "--set-default",
             "--json",
-        ],
-    );
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "No alternate assistant session was started",
+        ));
+    let selection_path = installed
+        .root
+        .path()
+        .join("state/assistant-startup/selection.json");
+    assert!(!selection_path.exists());
+    assert!(!source.assistant_root().join("native-binding.json").exists());
+    // A saved selection produced by native interactive entry is an exact local
+    // reference. Loading it for export must not execute even this inert provider.
+    fs::create_dir_all(selection_path.parent().unwrap()).unwrap();
+    fs::set_permissions(
+        selection_path.parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::write(
+        &selection_path,
+        serde_json::to_vec(&serde_json::json!({
+            "profile_root":source.assistant_root(), "profile_id":before["profile_id"],
+            "scope":"pika", "executable":provider, "max_calls":i64::MAX as u64
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&selection_path, fs::Permissions::from_mode(0o600)).unwrap();
     source.assert_host_exited();
     for _ in 0..2 {
         let after = json_output(&installed, &["pika", "--json"]);

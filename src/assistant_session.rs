@@ -67,6 +67,22 @@ impl Session {
         )?)
     }
 
+    pub(crate) fn observe_evolution(
+        &mut self,
+        scope: &str,
+        hash: &str,
+        outcome: &str,
+        evidence: &str,
+    ) -> Result<Value> {
+        self.require_scope(scope)?;
+        Ok(self.ensure_workshop_stored()?.observe(
+            &ToolScope::new([scope]),
+            hash,
+            outcome,
+            evidence,
+        )?)
+    }
+
     pub(crate) fn prepare_improvement(
         &self,
         root: &Path,
@@ -197,6 +213,41 @@ impl Session {
         self.author_config
             .as_ref()
             .map(|config| (config.scope.clone(), config.executable.clone()))
+    }
+
+    /// Bind only disposable workers to the already-certified native main.
+    /// This grants no allowance, starts no main service and changes no control.
+    pub(crate) fn bind_native_worker_context(
+        &mut self,
+        root: &Path,
+        scope: &str,
+        executable: &Path,
+    ) -> Result<()> {
+        if self.redacted || self.busy() || self.service.is_some() {
+            bail!("Native worker context cannot replace active or forgotten work");
+        }
+        if self
+            .scope
+            .as_deref()
+            .is_some_and(|current| current != scope)
+            || self
+                .workshop_root
+                .as_deref()
+                .is_some_and(|current| current != root)
+        {
+            bail!("Native worker context cannot change the exact profile or scope");
+        }
+        validate_native_worker_context(root, scope)?;
+        // Validate the private transport paths without starting a provider.
+        transport_config(root, executable)?;
+        self.set_workshop_root(root)?;
+        self.author_config = Some(crate::assistant_author::AuthorConfig {
+            root: root.to_owned(),
+            executable: executable.to_owned(),
+            scope: project_scope(scope),
+        });
+        self.scope = Some(scope.to_owned());
+        Ok(())
     }
 
     pub(crate) fn begin_background(&self, name: &str, id: &str, prompt: &str) -> Result<()> {
@@ -338,24 +389,15 @@ impl Session {
         if self.redacted {
             bail!("Memory was forgotten; evolution is blocked")
         }
+        if self.service.is_none() && self.author_config.is_some() {
+            validate_native_worker_context(root, scope)?;
+            crate::assistant_control::Controller::attach(root)?.require_foreground(scope)?;
+        }
         // A completed evaluator turn may have become visible between host
         // calls.  Settle that receipt before admitting a new request so the
         // previous request cannot strand the session in `pending`.
         self.tick()?;
-        if self.busy() {
-            bail!("Wait for or cancel the current assistant work");
-        }
-        if self.service.as_ref().is_some_and(|service| {
-            !matches!(
-                service.snapshot().state,
-                ServiceState::Idle | ServiceState::Completed
-            )
-        }) {
-            bail!("The main provider must be ready before starting an author");
-        }
-        if self.scope.as_deref() != Some(scope) {
-            bail!("This scope has no enabled provider")
-        }
+        self.require_evolution_ready(scope)?;
         if request_id.is_empty() || request_id.len() > 256 {
             bail!("bounded evolution request id required")
         }
@@ -376,6 +418,24 @@ impl Session {
         self.workshop_root = Some(root.to_path_buf());
         if spec_json.len() > 16 * 1024 {
             bail!("evolution specification exceeds 16 KiB")
+        }
+        Ok(())
+    }
+
+    fn require_evolution_ready(&self, scope: &str) -> Result<()> {
+        if self.busy() {
+            bail!("Wait for or cancel the current assistant work");
+        }
+        if self.service.as_ref().is_some_and(|service| {
+            !matches!(
+                service.snapshot().state,
+                ServiceState::Idle | ServiceState::Completed
+            )
+        }) {
+            bail!("The main provider must be ready before starting an author");
+        }
+        if self.scope.as_deref() != Some(scope) {
+            bail!("This scope has no enabled provider")
         }
         Ok(())
     }
@@ -820,7 +880,7 @@ fn empty_provider_workshop_state(
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EvolutionSpec {
+pub(crate) struct EvolutionSpec {
     need: String,
     cases: Vec<crate::assistant_evolution::EvaluationCase>,
     #[serde(default)]
@@ -920,6 +980,38 @@ fn validate_enable(session: &Session, root: &Path, calls: u64) -> Result<()> {
     }
     if !(1..=100).contains(&calls) && calls != crate::assistant_policy::NO_CALL_LIMIT {
         bail!("Choose --max-calls 1–100 or --no-call-limit; neither sets a monetary ceiling");
+    }
+    Ok(())
+}
+
+fn validate_native_worker_context(root: &Path, scope: &str) -> Result<()> {
+    require_native_worker_scope(root, scope)?;
+    crate::assistant_storage::existing_database(&root.join("memory.sqlite"))?;
+    let profile = Store::open(root.join("memory.sqlite"))?
+        .profile_id()
+        .to_owned();
+    let path = root.join("native-binding.json");
+    crate::assistant_storage::existing_file(&path)?;
+    let binding: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let session = binding["thread_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Native main identity has not been certified"))?;
+    crate::assistant_native::require_thread(root, &profile, scope, session)?;
+    crate::assistant_native::require_current_context(root, &profile, scope)?;
+    crate::assistant_control::Controller::attach(root)?.require_context(scope)?;
+    if crate::assistant_recovery_service::has_unfinished(root)? {
+        bail!("Resolve the existing recovery before starting a disposable worker");
+    }
+    Ok(())
+}
+
+fn require_native_worker_scope(root: &Path, scope: &str) -> Result<()> {
+    if !root.is_absolute()
+        || scope.is_empty()
+        || scope.len() > 256
+        || scope.chars().any(char::is_control)
+    {
+        bail!("Native worker requires an absolute private root and exact bounded scope");
     }
     Ok(())
 }
@@ -1177,6 +1269,79 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn native_worker_binding_starts_no_main_and_preserves_policy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("private");
+        crate::assistant_storage::directory(&root).unwrap();
+        let profile = Store::open(root.join("memory.sqlite"))
+            .unwrap()
+            .profile_id()
+            .to_owned();
+        crate::assistant_control::Controller::open(&root).unwrap();
+        crate::assistant_storage::directory(&root.join("native-registry")).unwrap();
+        let registry = crate::store::Store::at(root.join("native-registry/pika.db"));
+        registry.initialize().unwrap();
+        let thread = uuid::Uuid::new_v4().to_string();
+        let token = uuid::Uuid::new_v4().to_string();
+        registry
+            .bind_launch(&token, crate::model::Provider::Codex, &thread)
+            .unwrap();
+        crate::assistant_storage::file(&root.join("native-binding.json")).unwrap();
+        std::fs::write(root.join("native-binding.json"), serde_json::to_vec(&json!({
+                "profile_id":profile,"scope":"alpha","thread_id":thread,"launch_token":token,"memory_epoch":0
+        })).unwrap()).unwrap();
+        let before = AssistantPolicy::open(root.join("policy.sqlite"))
+            .unwrap()
+            .config()
+            .unwrap();
+        let executable = temporary.path().join("fake-codex");
+        std::fs::write(&executable, "#!/bin/sh\nexit 91\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut session = Session::new();
+        session
+            .bind_native_worker_context(&root, "alpha", &executable)
+            .unwrap();
+        assert!(session.service.is_none());
+        assert!(session.author.is_none());
+        assert!(!session.busy());
+        assert_eq!(session.permission().unwrap().0, project_scope("alpha"));
+        assert_eq!(
+            before,
+            AssistantPolicy::open(root.join("policy.sqlite"))
+                .unwrap()
+                .config()
+                .unwrap()
+        );
+        assert!(
+            session
+                .bind_native_worker_context(&root, "beta", &executable)
+                .is_err()
+        );
+        rusqlite::Connection::open(root.join("owner.sqlite"))
+            .unwrap()
+            .execute("UPDATE assistant_control SET paused=1 WHERE id=1", [])
+            .unwrap();
+        // Restarted read-only inspection remains available while reasoning is paused.
+        let mut session = Session::new();
+        session
+            .bind_native_worker_context(&root, "alpha", &executable)
+            .unwrap();
+        assert!(session.tool_catalog("alpha", None).is_ok());
+        let spec = json!({"need":"Select attention titles", "cases":[{"inputs":[{"value":{"status":"needs_you","title":"Yes"},"scope":ToolScope::new(["alpha"])}],"expected":["Yes"]},{"inputs":[],"expected":[]}]});
+        assert!(
+            session
+                .evolve_spec(&root, "alpha", "paused-author", &spec.to_string())
+                .is_err()
+        );
+        assert!(session.service.is_none());
+        assert!(session.author.is_none());
+    }
     use std::thread;
     use std::time::Duration;
 
@@ -1291,6 +1456,10 @@ mod tests {
             }
         });
         let mut session = Session::with_service_for_test(service, "alpha");
+        assert!(
+            session.service.is_none(),
+            "the disposable author must not start a main provider"
+        );
         let spec = json!({"need":"Select attention titles", "cases":[{"inputs":[{"value":{"status":"needs_you","title":"Yes"},"scope":ToolScope::new(["alpha"])}],"expected":["Yes"]},{"inputs":[],"expected":[]}]});
         assert!(
             session
@@ -1308,12 +1477,44 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         let snapshot = session.snapshot("alpha");
+        assert!(session.service.is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the approved disposable author ran"
+        );
         assert_eq!(snapshot["workshop_report"]["passed"], true);
         let hash = snapshot["workshop_report"]["tool_hash"]
             .as_str()
             .unwrap()
             .to_owned();
+        let observation = session
+            .observe_evolution(
+                "alpha",
+                &hash,
+                "regression",
+                "Worker evidence, not human authority",
+            )
+            .unwrap();
+        assert_eq!(observation["origin"], "worker");
+        assert_eq!(observation["human_assessment"], false);
+        assert_eq!(observation["retired"], false);
+        assert_eq!(
+            session.tool_catalog("alpha", Some(&hash)).unwrap()["tools"][0]["active"],
+            false
+        );
         session.approve_evolution("alpha", &hash).unwrap();
+        session
+            .observe_evolution(
+                "alpha",
+                &hash,
+                "retire",
+                "Worker cannot retire an approved tool",
+            )
+            .unwrap();
+        let detail = session.tool_catalog("alpha", Some(&hash)).unwrap();
+        assert_eq!(detail["tools"][0]["active"], true);
+        assert_eq!(detail["tools"][0]["observations"][0]["origin"], "worker");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         drop(session);
         let mut session = Session::with_workshop_for_test("alpha", &root);

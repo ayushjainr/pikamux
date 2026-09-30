@@ -95,6 +95,16 @@ impl WorkshopUi {
             .assess(scope, hash, outcome, evidence, rollback)?)
     }
 
+    pub fn observe(
+        &self,
+        scope: &Scope,
+        hash: &str,
+        outcome: &str,
+        evidence: &str,
+    ) -> Result<serde_json::Value, WorkshopUiError> {
+        Ok(self.workshop.observe(scope, hash, outcome, evidence)?)
+    }
+
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, WorkshopUiError> {
         let workshop = Arc::new(Workshop::open(path.as_ref())?);
         let (jobs, queue) = mpsc::sync_channel::<CandidateJob>(1);

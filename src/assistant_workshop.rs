@@ -91,6 +91,19 @@ impl Workshop {
         Ok(receipt)
     }
 
+    pub fn observe(
+        &self,
+        scope: &Scope,
+        hash: &str,
+        outcome: &str,
+        evidence: &str,
+    ) -> Result<serde_json::Value, EvolutionError> {
+        self.registry.observe(hash, scope, outcome, evidence)?;
+        Ok(
+            serde_json::json!({"hash":hash,"outcome":outcome,"origin":"worker","human_assessment":false,"retired":false,"activation_authority":false}),
+        )
+    }
+
     fn validate_assessment_rollback(
         &self,
         name: &str,

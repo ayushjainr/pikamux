@@ -354,6 +354,11 @@ impl Client {
 
     fn start_owner(root: &Path, profile: Option<&str>) -> Result<Child> {
         let mut command = Command::new(std::env::current_exe()?);
+        // Provider identity hooks use the private registry; board observation
+        // continues to use the ordinary shared producer, even on cold startup.
+        if let Some(database) = std::env::var_os("PIKA_ASSISTANT_BOARD_DB_PATH") {
+            command.env("PIKA_DB_PATH", database);
+        }
         command.arg("_assistant-host").arg("--root").arg(root);
         if let Some(profile) = profile {
             command.arg("--expected-profile-id").arg(profile);

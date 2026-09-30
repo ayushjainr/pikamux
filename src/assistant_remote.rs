@@ -95,8 +95,12 @@ pub(crate) fn run(args: Args) -> Result<i32> {
         .filter(|id| *id == args.expected_profile_id)
         .context("Assistant profile changed during attachment; no action was submitted")?;
     verify(&paths, &args)?;
-    crate::assistant::interactive_view(&mut client, &args.scope, None)?;
-    Ok(0)
+    crate::cli::assistant_entry(crate::assistant::Args {
+        profile_root: Some(root),
+        expected_profile_id: Some(args.expected_profile_id),
+        scope: args.scope,
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]

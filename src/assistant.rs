@@ -87,6 +87,45 @@ pub(crate) struct Focus {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    NativeState {
+        scope: String,
+    },
+    NativeLearning {
+        scope: String,
+        request_id: String,
+        body: String,
+        candidates: Vec<crate::assistant_continuity::LearningCandidate>,
+    },
+    NativePrompt {
+        scope: String,
+        request_id: String,
+        body: String,
+        session_id: String,
+        timestamp: i64,
+        turn_id: String,
+    },
+    NativeFeedback {
+        scope: String,
+        source_id: String,
+    },
+    NativeReflection {
+        scope: String,
+    },
+    NativeFreshContext {
+        scope: String,
+        request_id: String,
+    },
+    NativeSignal {
+        scope: String,
+        event: String,
+        session_id: String,
+        turn_id: String,
+    },
+    NativeEof {
+        scope: String,
+        session_id: String,
+        turn_id: String,
+    },
     Snapshot {
         scope: String,
     },
@@ -201,6 +240,34 @@ enum Request {
         scope: String,
         request_id: String,
         spec: String,
+    },
+    NativeEvolveSpec {
+        scope: String,
+        source_id: String,
+        source_revision: u64,
+        request_id: String,
+        spec: String,
+    },
+    NativeAssessTool {
+        scope: String,
+        hash: String,
+        outcome: String,
+        evidence: String,
+    },
+    NativeHelper {
+        scope: String,
+        request_id: String,
+        question: String,
+        dependencies: Vec<crate::assistant_context::SourceVersion>,
+        consultation_id: Option<String>,
+    },
+    NativeHelperStatus {
+        scope: String,
+        request_id: String,
+    },
+    NativeHelperCancel {
+        scope: String,
+        request_id: String,
     },
     ToolCatalog {
         scope: String,
@@ -589,6 +656,23 @@ fn needs_foreground_priority(request: &Request) -> bool {
     )
 }
 
+fn bind_native_workers(
+    root: &Path,
+    memory: &Store,
+    session: &mut crate::assistant_session::Session,
+    name: &str,
+) -> Result<()> {
+    if !root.join("native-binding.json").try_exists()? {
+        return Ok(());
+    }
+    crate::assistant_native::require_current_context(root, memory.profile_id(), name)?;
+    let executable = crate::assistant_native::provider_executable(root, memory.profile_id(), name)?;
+    if session.permission().is_none() {
+        session.bind_native_worker_context(root, name, &executable)?;
+    }
+    Ok(())
+}
+
 fn handle_host_request(
     root: &Path,
     memory: &mut Store,
@@ -598,21 +682,41 @@ fn handle_host_request(
     auxiliary: &mut AuxiliaryWorkers,
     request: Request,
 ) -> Result<Value> {
-    if let Request::Feedback { scope: name, note } = &request {
-        scope(name)?;
-        return crate::assistant_feedback::submit(root, name, note.as_deref(), timestamp());
-    }
-    if let Some(reply) = existing_recovery_reply(root, &request)? {
+    if let Some(reply) = native_feedback_command(root, &request)? {
         return Ok(reply);
     }
-    if recovery.as_ref().is_some_and(|r| r.busy())
-        && !matches!(
-            request,
-            Request::Snapshot { .. } | Request::Help | Request::MaintenanceStatus { .. }
-        )
-    {
-        bail!("Pika is finishing owned-job recovery; changes wait until it completes.");
+    let request = native_evolution_request(memory, request)?;
+    if let Some(reply) = native_helper_request(root, memory, control, &request)? {
+        return Ok(reply);
     }
+    bind_request_workers(root, memory, session, &request)?;
+    if let Some(reply) = native_early_request(root, memory, &request)? {
+        return Ok(reply);
+    }
+    require_recovery_admission(recovery, &request)?;
+    if let Some(mut reply) = handle_native_request(memory, control, &request)? {
+        if let Some(control_reply) =
+            handle_native_prompt_control(root, memory, control, session, &request)?
+        {
+            reply["intercepted_control"] = json!(true);
+            reply["notice"] = control_reply;
+            return Ok(reply);
+        }
+        update_native_receipt(root, session, &request, &mut reply)?;
+        return Ok(reply);
+    }
+    dispatch_auxiliary_request(root, memory, session, recovery, control, auxiliary, request)
+}
+
+fn dispatch_auxiliary_request(
+    root: &Path,
+    memory: &mut Store,
+    session: &mut crate::assistant_session::Session,
+    recovery: &mut Option<crate::assistant_recovery_service::RecoveryService>,
+    control: &mut crate::assistant_control::Controller,
+    auxiliary: &mut AuxiliaryWorkers,
+    request: Request,
+) -> Result<Value> {
     let request = match auxiliary.fence_request(request) {
         Ok(request) => request,
         Err(reply) => return Ok(reply),
@@ -627,6 +731,666 @@ fn handle_host_request(
         return Ok(reply);
     }
     dispatch_session_request(root, memory, session, recovery, control, auxiliary, request)
+}
+
+fn native_feedback_command(root: &Path, request: &Request) -> Result<Option<Value>> {
+    if let Request::NativePrompt {
+        scope: name, body, ..
+    } = &request
+    {
+        if body == "$pika-user-feedback" || body.starts_with("$pika-user-feedback ") {
+            scope(name)?;
+            let note = body.strip_prefix("$pika-user-feedback ").unwrap_or("");
+            let mut result = crate::assistant_feedback::submit(
+                root,
+                name,
+                (!note.trim().is_empty()).then_some(note),
+                timestamp(),
+            )?;
+            result["intercepted_control"] = json!(true);
+            if note.trim().is_empty() {
+                result["notice"] = json!(format!(
+                    "Feedback file: {}. Add a note with $pika-user-feedback NOTE. No model turn started.",
+                    root.join("user_feedback.md").display()
+                ));
+            }
+            return Ok(Some(result));
+        }
+    }
+    Ok(None)
+}
+
+fn native_evolution_request(memory: &Store, request: Request) -> Result<Request> {
+    Ok(match request {
+        Request::NativeEvolveSpec {
+            scope: name,
+            source_id,
+            source_revision,
+            request_id,
+            spec,
+        } => {
+            let source = memory
+                .get_active(&source_id)?
+                .context("Tool proposal source is missing")?;
+            if memory.source_version(&source_id)? != Some(source_revision)
+                || !(source.origin == Origin::Human
+                    || (source.origin == Origin::Worker
+                        && source.provenance == "validated_workshop_proposal_v1"))
+                || !source.scope.permits(&scope(&name)?)
+            {
+                bail!(
+                    "Tool proposal requires an eligible scoped input or validated workshop source; it grants no activation authority"
+                );
+            }
+            Request::EvolveSpec {
+                scope: name,
+                request_id,
+                spec,
+            }
+        }
+        other => other,
+    })
+}
+
+fn native_helper_request(
+    root: &Path,
+    memory: &Store,
+    control: &crate::assistant_control::Controller,
+    request: &Request,
+) -> Result<Option<Value>> {
+    match request {
+        Request::NativeEof {
+            scope,
+            session_id,
+            turn_id,
+        } => {
+            crate::assistant_native::require_thread(root, memory.profile_id(), scope, session_id)?;
+            return crate::assistant_native_turns::close_adapter(root, scope, session_id, turn_id)
+                .map(Some);
+        }
+        Request::NativeHelper {
+            scope,
+            request_id,
+            question,
+            dependencies,
+            consultation_id,
+        } => {
+            return crate::assistant_native_helpers::start(
+                root,
+                memory.profile_id(),
+                scope,
+                request_id,
+                question,
+                dependencies,
+                consultation_id.as_deref(),
+                &control.gate(),
+            )
+            .map(Some);
+        }
+        Request::NativeHelperStatus { scope, request_id } => {
+            return crate::assistant_native_helpers::status(
+                root,
+                memory.profile_id(),
+                scope,
+                request_id,
+            )
+            .map(Some);
+        }
+        Request::NativeHelperCancel { scope, request_id } => {
+            return crate::assistant_native_helpers::cancel(
+                root,
+                memory.profile_id(),
+                scope,
+                request_id,
+            )
+            .map(Some);
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
+fn bind_request_workers(
+    root: &Path,
+    memory: &Store,
+    session: &mut crate::assistant_session::Session,
+    request: &Request,
+) -> Result<()> {
+    if let Some(name) = match &request {
+        Request::ToolCatalog { scope, .. }
+        | Request::AssessTool { scope, .. }
+        | Request::NativeAssessTool { scope, .. }
+        | Request::EvolveSpec { scope, .. }
+        | Request::ApproveTool { scope, .. }
+        | Request::RevokeTool { scope, .. }
+        | Request::RollbackTool { scope, .. }
+        | Request::InvokeTool { scope, .. } => Some(scope),
+        _ => None,
+    } {
+        bind_native_workers(root, memory, session, name)?;
+    }
+    Ok(())
+}
+
+fn native_early_request(root: &Path, memory: &Store, request: &Request) -> Result<Option<Value>> {
+    if let Request::NativeFreshContext { scope, request_id } = &request {
+        return crate::assistant_native::fresh_context(
+            root,
+            memory.profile_id(),
+            scope,
+            request_id,
+        )
+        .map(Some);
+    }
+    if let Some(reply) = handle_native_feedback(root, memory, request)? {
+        return Ok(Some(reply));
+    }
+    if let Request::Feedback { scope: name, note } = &request {
+        scope(name)?;
+        return crate::assistant_feedback::submit(root, name, note.as_deref(), timestamp())
+            .map(Some);
+    }
+    if let Some(reply) = existing_recovery_reply(root, request)? {
+        return Ok(Some(reply));
+    }
+    Ok(None)
+}
+
+fn require_recovery_admission(
+    recovery: &Option<crate::assistant_recovery_service::RecoveryService>,
+    request: &Request,
+) -> Result<()> {
+    if recovery.as_ref().is_some_and(|r| r.busy())
+        && !matches!(
+            request,
+            Request::Snapshot { .. }
+                | Request::NativeState { .. }
+                | Request::Help
+                | Request::MaintenanceStatus { .. }
+        )
+    {
+        bail!("Pika is finishing owned-job recovery; changes wait until it completes.");
+    }
+    Ok(())
+}
+
+fn update_native_receipt(
+    root: &Path,
+    session: &mut crate::assistant_session::Session,
+    request: &Request,
+    reply: &mut Value,
+) -> Result<()> {
+    if let Request::NativeState { scope } = &request {
+        reply["native_dispatch"] = crate::assistant_native_turns::snapshot(root, scope)?;
+        reply["workshop"] = session.snapshot(scope)["evolution"].clone();
+    }
+    if let Request::NativePrompt {
+        scope,
+        session_id,
+        turn_id,
+        ..
+    } = &request
+    {
+        reply["native_turn"] = serde_json::to_value(crate::assistant_native_turns::before_submit(
+            root, scope, turn_id, session_id,
+        )?)?;
+    }
+    if let Request::NativeSignal {
+        scope,
+        event,
+        session_id,
+        turn_id,
+    } = &request
+        && matches!(event.as_str(), "Stop" | "Interrupt")
+    {
+        reply["native_turn"] = serde_json::to_value(crate::assistant_native_turns::finish(
+            root,
+            scope,
+            turn_id,
+            session_id,
+            event == "Interrupt",
+        )?)?;
+    }
+    Ok(())
+}
+
+/// Exact commands in genuine hook words execute before foreground admission;
+/// this is not available as a model MCP request or a grant passthrough.
+fn handle_native_prompt_control(
+    root: &Path,
+    memory: &mut Store,
+    control: &mut crate::assistant_control::Controller,
+    session: &mut crate::assistant_session::Session,
+    request: &Request,
+) -> Result<Option<Value>> {
+    let Request::NativePrompt {
+        scope: name, body, ..
+    } = request
+    else {
+        return Ok(None);
+    };
+    let Some(action) = body.strip_prefix("$pika-control ") else {
+        return Ok(None);
+    };
+    let words = action.split_whitespace().collect::<Vec<_>>();
+    if matches!(
+        words.first().copied(),
+        Some("tools" | "activate" | "revoke")
+    ) {
+        bind_native_workers(root, memory, session, name)?;
+    }
+    if let Some(reply) = [
+        native_board_guidance_control(memory, control, name, &words)?,
+        native_consult_control(root, name, &words)?,
+        native_tool_control(session, name, &words)?,
+        native_memory_control(root, memory, control, name, &words)?,
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    {
+        return Ok(Some(json!(serde_json::to_string(&reply)?)));
+    }
+    native_simple_control(root, memory, control, name, action).map(|notice| Some(json!(notice)))
+}
+
+fn native_board_guidance_control(
+    memory: &mut Store,
+    control: &mut crate::assistant_control::Controller,
+    name: &str,
+    words: &[&str],
+) -> Result<Option<Value>> {
+    Ok(match words {
+        ["board-share"] => Some(control.share_board(name, None)?),
+        ["board-share", "off"] => {
+            control.revoke_board(name)?;
+            Some(
+                json!({"notice":"Board sharing revoked. Fresh context is required before further native reasoning."}),
+            )
+        }
+        ["board-share", confirmation] => Some(control.share_board(name, Some(confirmation))?),
+        ["guidance"] => Some(
+            json!({"guidance":crate::assistant_guidance::applicable_guidance(memory, &scope(name)?, 16)?}),
+        ),
+        ["guidance-off", id] => Some(json!({"notice":set_guidance(memory, name, id, false)?})),
+        ["guidance-on", id] => Some(json!({"notice":set_guidance(memory, name, id, true)?})),
+        _ => None,
+    })
+}
+
+fn native_consult_control(root: &Path, name: &str, words: &[&str]) -> Result<Option<Value>> {
+    Ok(match words {
+        ["consults"] => Some(crate::assistant_consultation_permissions::list(root, name)?),
+        ["allow-consult", provider, conversation] => {
+            Some(crate::assistant_consultation_permissions::approve(
+                root,
+                &crate::core::Pika::discover()?,
+                name,
+                provider.parse().map_err(anyhow::Error::msg)?,
+                conversation,
+                crate::assistant_policy::UNTIL_REVOKED,
+            )?)
+        }
+        [action @ ("revoke-consult" | "forget-consult"), id] => {
+            let result = handle_consultation_permissions(
+                root,
+                &Request::RevokeConsult {
+                    scope: name.into(),
+                    id: (*id).into(),
+                    forget: *action == "forget-consult",
+                },
+            )?
+            .context("Exact consultation control is unavailable")?;
+            Some(result)
+        }
+        _ => None,
+    })
+}
+
+fn native_tool_control(
+    session: &mut crate::assistant_session::Session,
+    name: &str,
+    words: &[&str],
+) -> Result<Option<Value>> {
+    Ok(match words {
+        ["tools"] => Some(session.tool_catalog(name, None)?),
+        ["tools", hash] => Some(session.tool_catalog(name, Some(hash))?),
+        ["activate", hash] => Some(
+            json!({"grant_id":session.approve_evolution(name, hash)?,"notice":"Exact evaluated tool version approved until revoked."}),
+        ),
+        ["revoke", grant] => {
+            session.revoke_evolution(name, grant)?;
+            Some(json!({"notice":"Exact tool grant revoked."}))
+        }
+        _ => None,
+    })
+}
+
+fn native_memory_control(
+    root: &Path,
+    memory: &mut Store,
+    control: &mut crate::assistant_control::Controller,
+    name: &str,
+    words: &[&str],
+) -> Result<Option<Value>> {
+    Ok(match words {
+        ["forget", id] => {
+            let record = memory.get(id)?.context("Memory source does not exist")?;
+            if !record.scope.permits(&scope(name)?) {
+                bail!("Memory source is outside this scope");
+            }
+            let removed = memory.forget(id)?;
+            crate::assistant_retention::cleanup(root, memory.forget_epoch()?)?;
+            Some(
+                json!({"forgotten":removed,"notice":"Source and dependent native memory removed. Its old provider context is now invalid; use fresh-context before further reasoning."}),
+            )
+        }
+        ["maintenance-enable", calls] | ["maintenance-enable", calls, _] => Some(
+            native_enable_maintenance(root, memory, control, name, words, calls)?,
+        ),
+        ["fresh-context"] => Some(crate::assistant_native::fresh_context(
+            root,
+            memory.profile_id(),
+            name,
+            &uuid::Uuid::new_v4().to_string(),
+        )?),
+        _ => None,
+    })
+}
+
+fn native_enable_maintenance(
+    root: &Path,
+    memory: &mut Store,
+    control: &mut crate::assistant_control::Controller,
+    name: &str,
+    words: &[&str],
+    calls: &str,
+) -> Result<Value> {
+    let calls: u64 = calls
+        .parse()
+        .context("Maintenance requires an explicit call budget")?;
+    let interval_hours: u64 = words
+        .get(2)
+        .map_or(Ok(24), |value| value.parse())
+        .context("Cadence must be 1–168 hours")?;
+    if !(1..=168).contains(&interval_hours) {
+        bail!("Cadence must be 1–168 hours");
+    }
+    let executable = crate::assistant_native::provider_executable(root, memory.profile_id(), name)?;
+    let allowance = crate::assistant_policy::AssistantPolicy::open(root.join("policy.sqlite"))?
+        .config()?
+        .max_total_calls;
+    control.approve_maintenance(name, &executable, allowance, calls, 0)?;
+    crate::assistant_maintenance::configure(
+        memory,
+        &scope(name)?,
+        interval_hours * 3600,
+        true,
+        timestamp(),
+    )?;
+    Ok(
+        json!({"notice":"Scoped maintenance enabled until revoked, within the existing explicit budget. This grants no board or transcript access."}),
+    )
+}
+
+fn native_simple_control(
+    root: &Path,
+    memory: &mut Store,
+    control: &mut crate::assistant_control::Controller,
+    name: &str,
+    action: &str,
+) -> Result<String> {
+    let notice = match action.trim() {
+        "status" => native_status_notice(root, control, name)?,
+        "pause" => {
+            control.pause()?;
+            "Pika paused. Project agents were not stopped.".into()
+        }
+        "resume" => {
+            control.resume()?;
+            "Pika resumed within its existing permissions. Send your next question normally.".into()
+        }
+        "reflect" => {
+            if crate::assistant_maintenance::status(memory, &scope(name)?)?["enabled"] != true {
+                bail!("Reflection was not queued: maintenance is disabled for this scope");
+            }
+            crate::assistant_maintenance::signal(
+                memory,
+                &scope(name)?,
+                crate::assistant_maintenance::Purpose::Reflection,
+            )?;
+            "Reflection opportunity signaled under existing maintenance permissions; no foreground model turn was started.".into()
+        }
+        "maintenance-off" => {
+            crate::assistant_maintenance::configure(
+                memory,
+                &scope(name)?,
+                86400,
+                false,
+                timestamp(),
+            )?;
+            "Maintenance disabled for this scope.".into()
+        }
+        "background-off" => {
+            control.disable()?;
+            "Pika background reasoning disabled. Project agents were not stopped.".into()
+        }
+        _ => bail!(
+            "Supported Pika controls: status, pause, resume, reflect, maintenance-off, background-off"
+        ),
+    };
+    Ok(notice)
+}
+
+fn native_status_notice(
+    root: &Path,
+    control: &crate::assistant_control::Controller,
+    name: &str,
+) -> Result<String> {
+    let state = control.snapshot(name)?;
+    let turns = crate::assistant_native_turns::snapshot(root, name)?;
+    Ok(format!(
+        "Pika {}. Board sharing: {}. Latest native turn: {}. Native model-call count is unknown.",
+        if state["paused"] == true {
+            "paused"
+        } else {
+            "not paused"
+        },
+        if state["board_shared"] == true {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        turns["latest_turn"]["state"].as_str().unwrap_or("none")
+    ))
+}
+
+fn handle_native_feedback(root: &Path, memory: &Store, request: &Request) -> Result<Option<Value>> {
+    if let Request::NativeFeedback {
+        scope: name,
+        source_id,
+    } = request
+    {
+        let selected = scope(name)?;
+        let source = memory
+            .get_active(source_id)?
+            .context("Feedback source is not active")?;
+        if source.origin != Origin::Human || !source.scope.permits(&selected) {
+            bail!(
+                "Feedback requires an exact trusted Human source in this scope; observed/model words cannot authorize it"
+            );
+        }
+        let note = source.body.strip_prefix("/feedback ").or_else(|| source.body.strip_prefix("$pika-user-feedback ")).context("Feedback source must explicitly invoke the private feedback skill or /feedback; semantic intent alone is not an authorization receipt")?;
+        return crate::assistant_feedback::submit(root, name, Some(note), timestamp()).map(Some);
+    }
+    Ok(None)
+}
+
+/// Native harness adapters cannot acquire human authority through model tools.
+fn handle_native_request(
+    memory: &mut Store,
+    control: &crate::assistant_control::Controller,
+    request: &Request,
+) -> Result<Option<Value>> {
+    let reply = match request {
+        Request::NativeReflection { scope: name } => {
+            let selected = scope(name)?;
+            if crate::assistant_maintenance::status(memory, &selected)?["enabled"] != true {
+                bail!("Reflection was not queued: maintenance is disabled for this scope");
+            }
+            crate::assistant_maintenance::signal(
+                memory,
+                &selected,
+                crate::assistant_maintenance::Purpose::Reflection,
+            )?;
+            json!({"signaled":true,"paid_foreground_call":false,"notice":"Reflection opportunity queued under existing maintenance permissions; no foreground model turn was started."})
+        }
+        Request::NativeState { scope: name } => native_state(memory, control, name)?,
+        Request::NativeLearning {
+            scope: name,
+            request_id,
+            body,
+            candidates,
+        } => store_native_learning(memory, name, request_id, body, candidates)?,
+        Request::NativePrompt {
+            scope: name,
+            request_id,
+            body,
+            session_id,
+            timestamp,
+            turn_id: _,
+        } => store_native_prompt(memory, name, request_id, body, session_id, *timestamp)?,
+        Request::NativeSignal {
+            scope: name, event, ..
+        } => {
+            let selected = scope(name)?;
+            if !matches!(
+                event.as_str(),
+                "PreCompact" | "PostCompact" | "Stop" | "Interrupt"
+            ) {
+                bail!("Unsupported native maintenance signal");
+            }
+            if event != "Interrupt" {
+                crate::assistant_maintenance::signal(
+                    memory,
+                    &selected,
+                    crate::assistant_maintenance::Purpose::Consolidation,
+                )?;
+            }
+            json!({"signaled":true,"event":event,"paid_call":false,
+                "notice":"Coalesced maintenance opportunity only; not proof that compaction completed."})
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(reply))
+}
+
+fn store_native_learning(
+    memory: &mut Store,
+    name: &str,
+    request_id: &str,
+    body: &str,
+    candidates: &[crate::assistant_continuity::LearningCandidate],
+) -> Result<Value> {
+    let selected = scope(name)?;
+    if body.trim().is_empty() || body.len() > 16 * 1024 {
+        bail!("Learning requires bounded nonempty words");
+    }
+    let sources = native_learning_sources(candidates);
+    let epoch = memory.forget_epoch()?;
+    let recorded_at = sources
+        .iter()
+        .map(|source| {
+            memory
+                .get(&source.id)
+                .map(|record| record.map_or(0, |record| record.timestamp))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let records = crate::assistant_continuity::commit_turn(
+        memory,
+        request_id,
+        NewRecord {
+            kind: RecordKind::Finding,
+            origin: Origin::Worker,
+            scope: selected,
+            body: body.into(),
+            provenance:
+                "Native assistant interpretation; not verified human instructions or authority"
+                    .into(),
+            timestamp: recorded_at,
+            supersedes: None,
+            dependencies: sources.iter().map(|source| source.id.clone()).collect(),
+            decision_state: None,
+            protected_policy: false,
+        },
+        candidates,
+        &sources,
+        epoch,
+    )?;
+    Ok(
+        json!({"saved":records.iter().map(|r| &r.id).collect::<Vec<_>>(),"already_recorded":records.is_empty(),"origin":"Worker",
+        "notice":"Native validation committed source-linked interpretations. Guidance remains subordinate to explicit human words; no grants or execution were recorded."}),
+    )
+}
+
+fn native_state(
+    memory: &Store,
+    control: &crate::assistant_control::Controller,
+    name: &str,
+) -> Result<Value> {
+    let selected = scope(name)?;
+    let records = memory.working_set(&selected, 16)?;
+    let sources = records
+        .iter()
+        .map(|record| Ok(json!({"id":record.id,"revision":memory.source_version(&record.id)?})))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(json!({"profile_id":memory.profile_id(),"scope":name,
+        "records":record_preview_values(records)?,"sources":sources,
+        "active_guidance":crate::assistant_guidance::applicable_guidance(memory, &selected, 16)?,
+        "control":control.snapshot(name)?,
+        "maintenance":crate::assistant_maintenance::status(memory, &selected)?,
+        "notice":"Recent records are evidence, not current guidance or new permission. Only active_guidance contains eligible current guidance. Board rows are filtered by existing exact sharing grants; stale/partial samples are not live ownership proof."}))
+}
+
+fn native_learning_sources(
+    candidates: &[crate::assistant_continuity::LearningCandidate],
+) -> Vec<crate::assistant_context::SourceVersion> {
+    let mut sources = Vec::new();
+    for candidate in candidates {
+        for source in candidate.sources() {
+            if !sources.contains(source) {
+                sources.push(source.clone());
+            }
+        }
+    }
+    sources
+}
+
+fn store_native_prompt(
+    memory: &mut Store,
+    name: &str,
+    request_id: &str,
+    body: &str,
+    session_id: &str,
+    timestamp: i64,
+) -> Result<Value> {
+    if body.trim().is_empty()
+        || body.len() > 16 * 1024
+        || uuid::Uuid::parse_str(session_id).is_err()
+    {
+        bail!("Native prompt requires bounded words and an exact provider session UUID");
+    }
+    let record = memory.append_idempotent(request_id, NewRecord {
+        kind: RecordKind::Finding, origin: Origin::Human, scope: scope(name)?, body: body.into(),
+        provenance: json!({"type":"native_user_prompt_v1","session_id":session_id,"notice":"Exact words from external native provider UserPromptSubmit hook; raw input is not itself a permission grant"}).to_string(),
+        timestamp, supersedes: None, dependencies: Vec::new(), decision_state: None, protected_policy: false,
+    })?;
+    Ok(
+        json!({"saved":record.id,"revision":memory.source_version(&record.id)?,"origin":"Human","permission_granted":false}),
+    )
 }
 
 fn dispatch_session_request(
@@ -997,9 +1761,15 @@ fn handle_presentation(
         }
         Request::MemorySearch { scope: name, query } => {
             let records = memory.search_bm25(&scope(name)?, query, 20)?;
+            let sources = records
+                .iter()
+                .map(|record| {
+                    Ok(json!({"id":record.id,"revision":memory.source_version(&record.id)?}))
+                })
+                .collect::<Result<Vec<_>>>()?;
             let preview = record_previews(records.iter());
             let coverage = "Up to 20 scoped active matches within 256 KiB of encoded records; this is a bounded lexical search, not a complete archive. /memory exports the archive in pages.";
-            json!({"records":records,"coverage":coverage,"local_output":format!("{coverage}\n{preview}")})
+            json!({"records":records,"sources":sources,"coverage":coverage,"local_output":format!("{coverage}\n{preview}")})
         }
         _ => return Ok(None),
     };
@@ -1096,7 +1866,7 @@ fn handle_prepared_session(
     request: Request,
     raw_body: Option<String>,
 ) -> Result<Value> {
-    if let Some(result) = handle_session_tools(root, session, &request)? {
+    if let Some(result) = handle_session_tools(root, memory, session, &request)? {
         return Ok(result);
     }
     if let Some(result) = handle_session_provider(root, session, &request, raw_body.as_deref())? {
@@ -1263,10 +2033,11 @@ fn board_share_text(result: &Value) -> String {
 
 fn handle_session_tools(
     root: &Path,
+    memory: &mut Store,
     session: &mut crate::assistant_session::Session,
     request: &Request,
 ) -> Result<Option<Value>> {
-    if let Some(value) = handle_tool_management(root, session, request)? {
+    if let Some(value) = handle_tool_management(root, memory, session, request)? {
         return Ok(Some(value));
     }
     match request {
@@ -1318,6 +2089,7 @@ fn handle_session_tools(
 
 fn handle_tool_management(
     root: &Path,
+    memory: &mut Store,
     session: &mut crate::assistant_session::Session,
     request: &Request,
 ) -> Result<Option<Value>> {
@@ -1330,6 +2102,12 @@ fn handle_tool_management(
             evidence,
             rollback,
         } => session.assess_evolution(scope, hash, outcome, evidence, rollback.as_deref())?,
+        Request::NativeAssessTool {
+            scope,
+            hash,
+            outcome,
+            evidence,
+        } => observe_native_tool(root, memory, session, scope, hash, outcome, evidence)?,
         Request::Improvement {
             scope,
             correction_id,
@@ -1339,6 +2117,24 @@ fn handle_tool_management(
     Ok(Some(
         json!({"local_output":serde_json::to_string_pretty(&result)?,"details":result}),
     ))
+}
+
+fn observe_native_tool(
+    root: &Path,
+    memory: &mut Store,
+    session: &mut crate::assistant_session::Session,
+    scope: &str,
+    hash: &str,
+    outcome: &str,
+    evidence: &str,
+) -> Result<Value> {
+    let epoch = memory.forget_epoch()?;
+    crate::assistant_native::require_current_context(root, memory.profile_id(), scope)?;
+    Ok(memory.publish_at_epoch(epoch, || {
+        session
+            .observe_evolution(scope, hash, outcome, evidence)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))
+    })?)
 }
 
 fn handle_session_provider(
@@ -1909,16 +2705,17 @@ fn handle_forget(memory: &mut Store, record_id: &str) -> Result<Value> {
 }
 
 pub(crate) fn run(mut args: Args) -> Result<i32> {
+    if args.enable_codex.is_some() {
+        bail!(
+            "Open Pika in an interactive terminal to connect its native Codex conversation. No alternate assistant session was started."
+        );
+    }
     apply_startup(&mut args)?;
     normalize_args(&mut args);
     scope(&args.scope)?;
     let mut client = attach_view(&args)?;
-    let enabled = prepare_enable(&mut client, &mut args)?;
     if args.set_default {
         save_startup(&args)?;
-    }
-    if let Some(result) = enabled {
-        return Ok(result);
     }
     let command = save_command(&args);
     if let Some((kind, body)) = command {
@@ -1928,7 +2725,7 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
 }
 
 fn finish_entry(client: &mut Client, args: Args) -> Result<i32> {
-    if args.json || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+    if args.offline || args.json || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         println!("{}", send(client, Request::Snapshot { scope: args.scope })?);
         return Ok(0);
     }
@@ -1943,6 +2740,7 @@ fn finish_entry(client: &mut Client, args: Args) -> Result<i32> {
     Ok(0)
 }
 
+#[cfg(test)]
 fn prepare_enable(client: &mut Client, args: &mut Args) -> Result<Option<i32>> {
     match enable_from_args(client, args) {
         Err(error) if args.restore_startup => {
@@ -2037,14 +2835,6 @@ fn attach_view(args: &Args) -> Result<Client> {
     Client::attach(&root)
 }
 
-pub(crate) fn interactive_view(
-    client: &mut Client,
-    scope: &str,
-    focus: Option<Focus>,
-) -> Result<()> {
-    entry_view(client, scope, focus, false, None, None)
-}
-
 fn entry_view(
     client: &mut Client,
     scope: &str,
@@ -2081,6 +2871,7 @@ fn save_command(args: &Args) -> Option<(SaveKind, &str)> {
         })
 }
 
+#[cfg(test)]
 fn enable_from_args(client: &mut Client, args: &Args) -> Result<Option<i32>> {
     let Some(executable) = args.enable_codex.clone() else {
         return Ok(None);
@@ -3723,6 +4514,277 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_control_skill_resumes_while_paused_without_a_foreground_turn() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profile");
+        let mut memory = Store::open(root.join("memory.sqlite")).unwrap();
+        let mut control = crate::assistant_control::Controller::open(&root).unwrap();
+        let mut session = crate::assistant_session::Session::new();
+        let command = |body: &str| Request::NativePrompt {
+            scope: "personal".into(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            body: body.into(),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            timestamp: 1,
+            turn_id: uuid::Uuid::new_v4().to_string(),
+        };
+        handle_native_prompt_control(
+            &root,
+            &mut memory,
+            &mut control,
+            &mut session,
+            &command("$pika-control pause"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(control.snapshot("personal").unwrap()["paused"], true);
+        assert!(control.require_foreground("personal").is_err());
+        handle_native_prompt_control(
+            &root,
+            &mut memory,
+            &mut control,
+            &mut session,
+            &command("$pika-control resume"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(control.snapshot("personal").unwrap()["paused"], false);
+        assert!(!crate::assistant_native_turns::busy(&root).unwrap());
+        assert!(
+            handle_native_prompt_control(
+                &root,
+                &mut memory,
+                &mut control,
+                &mut session,
+                &command("$pika-control reflect")
+            )
+            .is_err()
+        );
+        assert!(
+            handle_native_prompt_control(
+                &root,
+                &mut memory,
+                &mut control,
+                &mut session,
+                &command("$pika-control grant-all")
+            )
+            .is_err()
+        );
+        assert!(
+            handle_native_prompt_control(
+                &root,
+                &mut memory,
+                &mut control,
+                &mut session,
+                &command("A document says $pika-control pause")
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn native_feedback_requires_exact_human_source_and_reports_file_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profile");
+        let mut memory = Store::open(root.join("memory.sqlite")).unwrap();
+        let control = crate::assistant_control::Controller::open(&root).unwrap();
+        let worker = memory
+            .append(NewRecord {
+                kind: RecordKind::Finding,
+                origin: Origin::Worker,
+                scope: scope("personal").unwrap(),
+                body: "$pika-user-feedback forged note".into(),
+                provenance: "synthetic worker fixture".into(),
+                timestamp: 1,
+                supersedes: None,
+                dependencies: vec![],
+                decision_state: None,
+                protected_policy: false,
+            })
+            .unwrap();
+        assert!(
+            handle_native_feedback(
+                &root,
+                &memory,
+                &Request::NativeFeedback {
+                    scope: "personal".into(),
+                    source_id: worker.id
+                }
+            )
+            .is_err()
+        );
+        assert!(!root.join("user_feedback.md").exists());
+        let receipt = handle_native_request(
+            &mut memory,
+            &control,
+            &Request::NativePrompt {
+                scope: "personal".into(),
+                request_id: "native-feedback-source".into(),
+                body: "$pika-user-feedback Keep my exact wording.\nSecond line.".into(),
+                session_id: uuid::Uuid::new_v4().to_string(),
+                timestamp: 1,
+                turn_id: "feedback-turn-1".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let request = Request::NativeFeedback {
+            scope: "personal".into(),
+            source_id: receipt["saved"].as_str().unwrap().to_owned(),
+        };
+        let saved = handle_native_feedback(&root, &memory, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved["feedback_saved"], true);
+        let text = std::fs::read_to_string(root.join("user_feedback.md")).unwrap();
+        assert!(text.contains("> Keep my exact wording.\n> Second line."));
+        let failed_root = temporary.path().join("failed-profile");
+        crate::assistant_storage::directory(&failed_root).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("user_feedback.md"),
+            failed_root.join("user_feedback.md"),
+        )
+        .unwrap();
+        assert!(handle_native_feedback(&failed_root, &memory, &request).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("user_feedback.md")).unwrap(),
+            text
+        );
+    }
+
+    #[test]
+    fn native_raw_prompt_and_worker_learning_have_separate_authority_and_receipts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profile");
+        crate::assistant_storage::directory(&root).unwrap();
+        let mut memory = Store::open(root.join("memory.sqlite")).unwrap();
+        let control = crate::assistant_control::Controller::open(&root).unwrap();
+        let prompt = Request::NativePrompt {
+            scope: "personal".into(),
+            request_id: "native-source-1".into(),
+            body: "Explain the reasoning more directly".into(),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            timestamp: 1,
+            turn_id: "native-turn-1".into(),
+        };
+        let receipt = handle_native_request(&mut memory, &control, &prompt)
+            .unwrap()
+            .unwrap();
+        let id = receipt["saved"].as_str().unwrap().to_owned();
+        assert_eq!(memory.get(&id).unwrap().unwrap().origin, Origin::Human);
+        assert_eq!(memory.get(&id).unwrap().unwrap().kind, RecordKind::Finding);
+        let candidate = crate::assistant_continuity::LearningCandidate::Fact {
+            body: "Interpretation of the raw user words".into(),
+            sources: vec![crate::assistant_context::SourceVersion {
+                id: id.clone(),
+                revision: receipt["revision"].as_u64().unwrap(),
+            }],
+        };
+        let request = Request::NativeLearning {
+            scope: "personal".into(),
+            request_id: "native-learning-1".into(),
+            body: "Interpretation".into(),
+            candidates: vec![candidate.clone()],
+        };
+        let saved = handle_native_request(&mut memory, &control, &request)
+            .unwrap()
+            .unwrap();
+        for id in saved["saved"].as_array().unwrap() {
+            assert_eq!(
+                memory.get(id.as_str().unwrap()).unwrap().unwrap().origin,
+                Origin::Worker
+            );
+        }
+        let retry = handle_native_request(&mut memory, &control, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry["already_recorded"], true);
+        assert!(retry["saved"].as_array().unwrap().is_empty());
+        let wrong_scope = Request::NativeLearning {
+            scope: "other".into(),
+            request_id: "native-learning-2".into(),
+            body: "Wrong scope".into(),
+            candidates: vec![candidate],
+        };
+        assert!(handle_native_request(&mut memory, &control, &wrong_scope).is_err());
+        let state = handle_native_request(
+            &mut memory,
+            &control,
+            &Request::NativeState {
+                scope: "personal".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(state["control"]["board_shared"], false);
+        assert!(state["control"]["board"].is_null());
+        let guidance: crate::assistant_continuity::LearningCandidate = serde_json::from_value(json!({
+            "kind":"guidance","spec":{"adaptation":{"kind":"guidance","topic":"reasoning","instruction":"Explain the reasoning directly and tie the conclusion to evidence.","lasting":true,"when":null},"sources":[{"id":id,"revision":receipt["revision"]}],"applicability":"scope_wide","reason":"The actual user asked for a more direct reasoning style."}
+        })).unwrap();
+        let request = Request::NativeLearning {
+            scope: "personal".into(),
+            request_id: "native-guidance-1".into(),
+            body: "Understood; guidance recorded after native validation.".into(),
+            candidates: vec![guidance],
+        };
+        let receipt = handle_native_request(&mut memory, &control, &request)
+            .unwrap()
+            .unwrap();
+        let guidance_id = receipt["saved"][1].as_str().unwrap();
+        let saved = memory.get(guidance_id).unwrap().unwrap();
+        assert_eq!(saved.origin, Origin::Worker);
+        assert_eq!(saved.kind, RecordKind::InferredPreference);
+        assert!(!saved.protected_policy);
+        assert!(
+            !crate::assistant_guidance::applicable_guidance(
+                &memory,
+                &scope("personal").unwrap(),
+                16
+            )
+            .unwrap()
+            .is_empty()
+        );
+        for index in 0..24 {
+            memory
+                .append(NewRecord {
+                    kind: RecordKind::Finding,
+                    origin: Origin::Human,
+                    scope: scope("personal").unwrap(),
+                    body: format!("More recent unrelated evidence {index}"),
+                    provenance: "test-human".into(),
+                    timestamp: 100 + index,
+                    supersedes: None,
+                    dependencies: vec![],
+                    decision_state: None,
+                    protected_policy: false,
+                })
+                .unwrap();
+        }
+        let active = handle_native_request(
+            &mut memory,
+            &control,
+            &Request::NativeState {
+                scope: "personal".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!active["active_guidance"].as_array().unwrap().is_empty());
+        set_guidance(&mut memory, "personal", guidance_id, false).unwrap();
+        let disabled = handle_native_request(
+            &mut memory,
+            &control,
+            &Request::NativeState {
+                scope: "personal".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(disabled["active_guidance"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
     fn saved_startup_enables_only_interactive_matching_scope_and_preserves_reads() {
         fn selected() -> crate::assistant_startup::Selection {
             crate::assistant_startup::Selection {
@@ -3946,6 +5008,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(feedback["feedback_saved"], true);
+        control.pause().unwrap();
+        let native_feedback = handle_host_request(
+            &root,
+            &mut memory,
+            &mut session,
+            &mut recovery,
+            &mut control,
+            &mut auxiliary,
+            Request::NativePrompt {
+                scope: "personal".into(),
+                request_id: "native-feedback-no-turn".into(),
+                body: "$pika-user-feedback  exact native words  \nnext line ".into(),
+                session_id: uuid::Uuid::new_v4().to_string(),
+                timestamp: 1,
+                turn_id: "never-dispatched".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(native_feedback["feedback_saved"], true);
+        assert_eq!(native_feedback["intercepted_control"], true);
+        assert!(
+            std::fs::read_to_string(root.join("user_feedback.md"))
+                .unwrap()
+                .contains(">  exact native words  \n> next line \n")
+        );
+        assert!(
+            crate::assistant_native_turns::snapshot(&root, "personal").unwrap()["latest_turn"]
+                .is_null()
+        );
         assert!(
             std::fs::read_to_string(root.join("user_feedback.md"))
                 .unwrap()

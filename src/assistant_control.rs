@@ -120,15 +120,25 @@ impl Controller {
         )?)
     }
 
-    pub(crate) fn require_foreground(&self, name: &str) -> Result<()> {
+    pub(crate) fn require_context(&self, name: &str) -> Result<()> {
         scope(name)?;
-        let (paused, blocked) = self.flags()?;
+        if self.root.join("native-binding.json").exists() {
+            crate::assistant_native_helpers::invalidate_unavailable_consultations(
+                &self.root, name,
+            )?;
+        }
+        let (_, blocked) = self.flags()?;
         if blocked {
             bail!(
                 "Provider context is blocked after revocation or uncertain work; complete fresh-context recovery before using it again"
             );
         }
-        if paused {
+        Ok(())
+    }
+
+    pub(crate) fn require_foreground(&self, name: &str) -> Result<()> {
+        self.require_context(name)?;
+        if self.flags()?.0 {
             bail!("Assistant reasoning is paused; resume it explicitly before sending");
         }
         Ok(())
@@ -267,6 +277,7 @@ impl Controller {
     pub(crate) fn recovered(&mut self) -> Result<()> {
         // Failed/crashed revocation cleanup must finish before any unblock.
         self.finish_revocations()?;
+        crate::assistant_native_turns::recovered(&self.root)?;
         // Explicit recovery acknowledges uncertainty, never refunds it and
         // never permits the same deterministic request to be replayed.
         let connection = Connection::open_with_flags(
@@ -478,7 +489,7 @@ impl Controller {
         active: bool,
     ) -> Result<Option<BackgroundConfig>> {
         let (paused, blocked) = self.flags()?;
-        if paused || blocked {
+        if paused || blocked || crate::assistant_native_turns::busy(&self.root)? {
             return Ok(None);
         }
         if !active && self.unresolved()? {
@@ -785,6 +796,9 @@ impl Controller {
     }
 
     fn eligible_background(&mut self, timestamp: i64) -> Result<Option<(BackgroundConfig, u64)>> {
+        if crate::assistant_native_turns::busy(&self.root)? {
+            return Ok(None);
+        }
         // Explicit memory maintenance is a separate consumer of the shared
         // allowance, not permission for the legacy board investigation path.
         if self.maintenance_permission(timestamp, true)?.is_some() {
@@ -794,10 +808,7 @@ impl Controller {
         let (paused, blocked) = self.flags()?;
         // A job has already reserved its maximum. Exhaustion must prevent the
         // next job, not revoke the still-running job's approved worker calls.
-        let eligible = (status.state == "enabled"
-            || (status.state == "exhausted" && self.active.is_some()))
-            && !paused
-            && !blocked;
+        let eligible = background_is_eligible(status.state, self.active.is_some(), paused, blocked);
         let Some(config) = status.config.filter(|_| eligible) else {
             self.observer = None;
             self.pending = None;
@@ -860,6 +871,13 @@ impl Controller {
         session: &mut impl ControlSession,
         config: &BackgroundConfig,
     ) -> Result<()> {
+        if self.root.join("native-binding.json").try_exists()? {
+            // Native foreground is never restored through the former chat
+            // service. Consolidation/Reflection use their independent existing
+            // maintenance worker; this legacy main-session path cannot own it.
+            self.notice = Some("The native conversation owns foreground reasoning. Background maintenance uses its separately enabled worker.".into());
+            return Ok(());
+        }
         if self.restore_attempted {
             return Ok(());
         }
@@ -984,6 +1002,10 @@ impl Controller {
         )?;
         self.set_policy_background(0)
     }
+}
+
+fn background_is_eligible(state: &str, active: bool, paused: bool, blocked: bool) -> bool {
+    (state == "enabled" || (state == "exhausted" && active)) && !paused && !blocked
 }
 
 fn retryable_database_busy(error: &anyhow::Error) -> bool {

@@ -106,14 +106,7 @@ fn cleanup_inner(
     let mut databases = Vec::new();
     let mut changed = 0;
     for path in known {
-        if !scrub_permissions && path == root.join("owner.sqlite") {
-            if let Some(count) = scrub_presentation_only(&path)? {
-                changed += count;
-                databases.push(path);
-            }
-            continue;
-        }
-        if let Some(count) = scrub_database(&path, epoch)? {
+        if let Some(count) = scrub_known(root, &path, epoch, scrub_permissions)? {
             changed += count;
             databases.push(path);
         }
@@ -126,6 +119,21 @@ fn cleanup_inner(
         databases,
         changed,
     })
+}
+
+fn scrub_known(
+    root: &Path,
+    path: &Path,
+    epoch: u64,
+    scrub_permissions: bool,
+) -> Result<Option<usize>, RetentionError> {
+    if !scrub_permissions && path == root.join("owner.sqlite") {
+        return scrub_presentation_only(path);
+    }
+    if !scrub_permissions && path == root.join("workshop.sqlite") {
+        return scrub_observations(path);
+    }
+    scrub_database(path, epoch, scrub_permissions)
 }
 
 fn previous_epoch(marker: &Path) -> Result<Option<u64>, RetentionError> {
@@ -158,20 +166,25 @@ fn previous_epoch(marker: &Path) -> Result<Option<u64>, RetentionError> {
     Ok(Some(value as u64))
 }
 
-fn scrub_database(path: &Path, epoch: u64) -> Result<Option<usize>, RetentionError> {
+fn scrub_database(
+    path: &Path,
+    epoch: u64,
+    scrub_permissions: bool,
+) -> Result<Option<usize>, RetentionError> {
     let Some(conn) = open_known(path)? else {
         return Ok(None);
     };
     conn.busy_timeout(std::time::Duration::from_millis(500))?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     let tx = conn.unchecked_transaction()?;
-    let mut changed = scrub_derived_tables(&tx, epoch)?;
+    let mut changed = scrub_derived_tables(&tx, epoch, scrub_permissions)?;
     for table in [
         "assistant_evolution_pending",
         "consultation_permissions",
         "assistant_board_shares",
         "assistant_lifetime",
         "tool_assessments",
+        "tool_observations",
         "tool_retirements",
         "learning_uses",
         "learning_candidates",
@@ -184,18 +197,25 @@ fn scrub_database(path: &Path, epoch: u64) -> Result<Option<usize>, RetentionErr
         "tool_candidates",
         "protected_suites",
     ] {
+        if !scrub_permissions && table != "assistant_evolution_pending" {
+            continue;
+        }
         changed += execute_if_present(&tx, table, &format!("DELETE FROM {table}"))?;
     }
     tx.commit()?;
     Ok(Some(changed))
 }
 
-fn scrub_derived_tables(tx: &Connection, epoch: u64) -> Result<usize, RetentionError> {
+fn scrub_derived_tables(
+    tx: &Connection,
+    epoch: u64,
+    scrub_permissions: bool,
+) -> Result<usize, RetentionError> {
     let mut changed = scrub_presentation_tables(tx)?;
     // Full forget also revokes saved board grants. Their derived memory must
     // be invalidated before fresh-context recovery can authorize another send.
     // Persist the intent first; Controller retries it before recovery begins.
-    if table_exists(tx, "assistant_board_shares")? {
+    if scrub_permissions && table_exists(tx, "assistant_board_shares")? {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS assistant_board_revocations(scope TEXT PRIMARY KEY,epoch INTEGER)")?;
         changed += tx.execute("INSERT OR IGNORE INTO assistant_board_revocations(scope,epoch) SELECT scope,NULL FROM assistant_board_shares",[])?;
     }
@@ -263,6 +283,17 @@ fn scrub_presentation_only(path: &Path) -> Result<Option<usize>, RetentionError>
     Ok(Some(changed))
 }
 
+fn scrub_observations(path: &Path) -> Result<Option<usize>, RetentionError> {
+    let Some(connection) = open_known(path)? else {
+        return Ok(None);
+    };
+    Ok(Some(execute_if_present(
+        &connection,
+        "tool_observations",
+        "DELETE FROM tool_observations",
+    )?))
+}
+
 fn write_epoch(marker: &Path, epoch: u64) -> Result<(), RetentionError> {
     let marker_conn = crate::assistant_storage::database(marker)
         .map_err(RetentionError::Filesystem)
@@ -279,6 +310,62 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    #[test]
+    fn scoped_revocation_preserves_unrelated_standing_permissions_and_tools() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("private");
+        let grants = root.join("consultation-permissions.sqlite");
+        crate::assistant_storage::database(&grants).unwrap();
+        let conn = Connection::open(&grants).unwrap();
+        conn.execute_batch("CREATE TABLE consultation_permissions(id TEXT); INSERT INTO consultation_permissions VALUES('unrelated');").unwrap();
+        let workshop = root.join("workshop.sqlite");
+        crate::assistant_storage::database(&workshop).unwrap();
+        let tools = Connection::open(&workshop).unwrap();
+        tools.execute_batch("CREATE TABLE tool_grants(id TEXT); INSERT INTO tool_grants VALUES('standing'); CREATE TABLE tool_candidates(id TEXT); INSERT INTO tool_candidates VALUES('unrelated-tool');").unwrap();
+        let runtime = root.join("runtime.sqlite");
+        crate::assistant_storage::database(&runtime).unwrap();
+        let cache = Connection::open(&runtime).unwrap();
+        cache.execute_batch("CREATE TABLE assistant_runtime_turns(prompt TEXT,reply TEXT,dependencies TEXT,state TEXT); INSERT INTO assistant_runtime_turns VALUES('old context','old result','[]','completed');").unwrap();
+        cleanup_revoked_context(&root, 1).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT id FROM consultation_permissions", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "unrelated"
+        );
+        assert_eq!(
+            tools
+                .query_row("SELECT id FROM tool_grants", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "standing"
+        );
+        assert_eq!(
+            tools
+                .query_row("SELECT id FROM tool_candidates", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "unrelated-tool"
+        );
+        assert_eq!(
+            cache
+                .query_row("SELECT prompt FROM assistant_runtime_turns", [], |r| r
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            ""
+        );
+        cleanup(&root, 2).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM consultation_permissions", [], |r| r
+                .get::<_, u64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn forget_scrubs_owner_permissions_but_preserves_charges_and_pending_cleanup() {

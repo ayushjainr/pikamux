@@ -38,6 +38,16 @@ pub enum WorkerPoll {
 /// A fresh disposable provider adapter. Implementations must not reuse a
 /// project-agent thread or infer permissions from worker text.
 pub trait DisposableWorker: Send {
+    /// Native helper adapters must fence the exact admitted native parent at
+    /// their actual provider send, including deferred consultation sends.
+    fn bind_native_parent(
+        &mut self,
+        _runtime: &Path,
+        _turn: &str,
+        _session: &str,
+    ) -> Result<(), String> {
+        Err("This worker cannot fence an exact native parent turn".into())
+    }
     /// Deferred native adapters must acquire their own memory/policy fence at
     /// the eventual send, using bind_dispatch_epoch; scheduling is not delivery.
     fn dispatches_later(&self) -> bool {

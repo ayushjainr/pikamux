@@ -351,7 +351,7 @@ impl AssistantPolicy {
         reject_duplicate_reservation(&tx, id)?;
         validate_child_budget(&tx, parent_id, root_id, calls, now, deadline)?;
         validate_root_budgets(&tx, &cfg, parent_id, background, calls)?;
-        validate_concurrency(&tx, parent_id, cfg.max_concurrent)?;
+        validate_concurrency(&tx, parent_id, cfg.max_concurrent, &self.path)?;
         tx.execute("INSERT INTO assistant_reservations(id,root_id,parent_id,calls,deadline_at,background,state,created_at) VALUES (?,?,?,?,?,?,?,?)", params![id, root_id, parent_id, calls as i64, deadline, background as i64, ReservationState::Reserved.as_str(), now])?;
         tx.commit()?;
         Ok(Reservation {
@@ -686,18 +686,45 @@ fn validate_concurrency(
     tx: &rusqlite::Transaction<'_>,
     parent_id: Option<&str>,
     maximum: u64,
+    policy_path: &Path,
 ) -> Result<(), PolicyError> {
     let active: i64 = tx.query_row(
         "SELECT COUNT(*) FROM assistant_reservations r WHERE state IN ('reserved','dispatched') AND (? IS NULL OR r.id <> ?) AND NOT EXISTS (SELECT 1 FROM assistant_reservations child WHERE child.parent_id=r.id)",
         params![parent_id, parent_id],
         |row| row.get(0),
     )?;
-    if active >= maximum as i64 {
+    // All admissions serialize on this policy writer lock. Native CLI turn
+    // intent is recorded under the same lock, so bounded workers count their
+    // active native parent without inventing a model-call reservation.
+    let native = native_occupancy(policy_path)?;
+    if active.saturating_add(native) >= maximum as i64 {
         return Err(PolicyError::Denied(
             "concurrent reservation limit reached".into(),
         ));
     }
     Ok(())
+}
+
+fn native_occupancy(policy_path: &Path) -> Result<i64, PolicyError> {
+    let runtime = policy_path.with_file_name("runtime.sqlite");
+    if !runtime.try_exists()? {
+        return Ok(0);
+    }
+    crate::assistant_storage::existing_database(&runtime)?;
+    let db = Connection::open_with_flags(runtime, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let native: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='assistant_native_turns')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !native {
+        return Ok(0);
+    }
+    Ok(db.query_row(
+        "SELECT COUNT(*) FROM assistant_native_turns WHERE state IN ('intent','dispatched')",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 fn validate_transition_state(
@@ -918,6 +945,47 @@ mod tests {
             path: PathBuf::from("in-memory-fixture"),
             conn,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_parent_and_bounded_worker_share_the_concurrency_limit() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("profile");
+        let _control = crate::assistant_control::Controller::open(&root).unwrap();
+        let mut policy = AssistantPolicy::open(root.join("policy.sqlite")).unwrap();
+        policy
+            .configure(&PolicyConfig {
+                max_total_calls: NO_CALL_LIMIT,
+                max_concurrent: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        crate::assistant_native_turns::before_submit(&root, "personal", "native-turn", &session)
+            .unwrap();
+        policy.reserve_root("helper", 1, false, 1, None).unwrap();
+        assert!(
+            policy
+                .reserve_root("another-helper", 1, false, 1, None)
+                .is_err()
+        );
+        policy
+            .record_outcome("helper", DeliveryOutcome::Completed, 2)
+            .unwrap();
+        policy
+            .reserve_root("replacement-helper", 1, false, 2, None)
+            .unwrap();
+        assert!(
+            policy
+                .reserve_root("still-full", 1, false, 2, None)
+                .is_err()
+        );
+        crate::assistant_native_turns::finish(&root, "personal", "native-turn", &session, false)
+            .unwrap();
+        policy
+            .reserve_root("after-native-completion", 1, false, 3, None)
+            .unwrap();
     }
     #[test]
     fn removing_trial_cap_preserves_history_across_restart_and_allows_further_calls() {

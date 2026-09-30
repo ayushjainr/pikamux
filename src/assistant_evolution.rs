@@ -820,7 +820,7 @@ impl Registry {
             EvolutionError::InvalidDefinition(format!("private assistant database: {error}"))
         })?;
         let connection = Connection::open(path)?;
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS tool_assessments (assessment_id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT NOT NULL, outcome TEXT NOT NULL, evidence TEXT NOT NULL, created_at REAL NOT NULL); CREATE TABLE IF NOT EXISTS tool_retirements (hash TEXT PRIMARY KEY, created_at REAL NOT NULL);")?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS tool_assessments (assessment_id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT NOT NULL, outcome TEXT NOT NULL, evidence TEXT NOT NULL, created_at REAL NOT NULL); CREATE TABLE IF NOT EXISTS tool_retirements (hash TEXT PRIMARY KEY, created_at REAL NOT NULL); CREATE TABLE IF NOT EXISTS tool_observations (observation_id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT NOT NULL, outcome TEXT NOT NULL, evidence TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin='worker'), created_at REAL NOT NULL);")?;
         connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS tool_candidates (hash TEXT PRIMARY KEY, name TEXT NOT NULL, definition_json BLOB NOT NULL, authoring_evidence TEXT NOT NULL, created_at REAL NOT NULL); CREATE TABLE IF NOT EXISTS protected_suites (suite_id TEXT PRIMARY KEY, cases_json BLOB NOT NULL, suite_hash TEXT NOT NULL UNIQUE); CREATE TABLE IF NOT EXISTS candidate_required_suites (hash TEXT NOT NULL REFERENCES tool_candidates(hash), suite_id TEXT NOT NULL REFERENCES protected_suites(suite_id), PRIMARY KEY(hash,suite_id)); CREATE TABLE IF NOT EXISTS tool_evaluations (evaluation_id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT NOT NULL REFERENCES tool_candidates(hash), suite_id TEXT NOT NULL REFERENCES protected_suites(suite_id), report_json BLOB NOT NULL, passed INTEGER NOT NULL, created_at REAL NOT NULL); CREATE TABLE IF NOT EXISTS tool_grants (grant_id TEXT PRIMARY KEY, hash TEXT NOT NULL REFERENCES tool_candidates(hash), scope_json BLOB NOT NULL, expires_at REAL, revoked INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL); CREATE TABLE IF NOT EXISTS tool_activations (name TEXT PRIMARY KEY, hash TEXT NOT NULL REFERENCES tool_candidates(hash), grant_id TEXT NOT NULL REFERENCES tool_grants(grant_id), active INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS tool_comparisons (comparison_id INTEGER PRIMARY KEY AUTOINCREMENT, candidate_hash TEXT NOT NULL REFERENCES tool_candidates(hash), baseline_hash TEXT, suite_id TEXT NOT NULL REFERENCES protected_suites(suite_id), scope_json BLOB NOT NULL, candidate_passed INTEGER NOT NULL, baseline_passed INTEGER, candidate_fuel INTEGER NOT NULL, baseline_fuel INTEGER, candidate_operations INTEGER NOT NULL, baseline_operations INTEGER, verdict TEXT NOT NULL, receipt_json BLOB NOT NULL, created_at REAL NOT NULL);")?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -1456,6 +1456,7 @@ impl Registry {
         entry["grants"] = catalog_grants(&db, hash)?;
         if detail {
             entry["assessments"] = catalog_assessments(&db, hash)?;
+            entry["observations"] = catalog_observations(&db, hash)?;
         }
         entry["retired"] = Value::Bool(db.query_row(
             "SELECT EXISTS(SELECT 1 FROM tool_retirements WHERE hash=?)",
@@ -1517,6 +1518,35 @@ impl Registry {
         tx.commit()?;
         Ok(())
     }
+
+    /// Worker evidence never retires tools, revokes grants or activates a version.
+    pub(crate) fn observe(
+        &self,
+        hash: &str,
+        scope: &Scope,
+        outcome: &str,
+        evidence: &str,
+    ) -> Result<(), EvolutionError> {
+        if !matches!(outcome, "helped" | "neutral" | "regression" | "retire")
+            || evidence.trim().is_empty()
+            || evidence.len() > 4096
+        {
+            return Err(EvolutionError::InvalidDefinition("observation needs helped/neutral/regression/retire and 1–4096 bytes of worker evidence".into()));
+        }
+        let candidate = self
+            .candidate(hash)?
+            .ok_or_else(|| EvolutionError::NotFound(hash.into()))?;
+        if &candidate.definition.input_scope != scope {
+            return Err(EvolutionError::ApprovalMismatch);
+        }
+        self.connection.lock().unwrap().execute("INSERT INTO tool_observations(hash,outcome,evidence,origin,created_at) VALUES(?,?,?,'worker',?)", params![hash,outcome,evidence,now()])?;
+        Ok(())
+    }
+}
+
+fn catalog_observations(db: &Connection, hash: &str) -> Result<Value, EvolutionError> {
+    let mut query = db.prepare("SELECT outcome,evidence,origin,created_at FROM tool_observations WHERE hash=? ORDER BY observation_id DESC LIMIT 16")?;
+    Ok(Value::Array(query.query_map([hash], |r| Ok(serde_json::json!({"outcome":r.get::<_,String>(0)?,"evidence":r.get::<_,String>(1)?,"origin":r.get::<_,String>(2)?,"created_at":r.get::<_,f64>(3)?})))?.collect::<Result<Vec<_>,_>>()?))
 }
 
 fn catalog_grants(db: &Connection, hash: &str) -> Result<Value, EvolutionError> {

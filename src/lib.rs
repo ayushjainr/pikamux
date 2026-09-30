@@ -20,6 +20,18 @@ pub mod assistant_decisions;
 pub mod assistant_evolution;
 #[cfg(unix)]
 mod assistant_feedback;
+#[cfg(unix)]
+mod assistant_native;
+#[cfg(unix)]
+mod assistant_native_helpers;
+#[cfg(unix)]
+mod assistant_native_profile;
+#[cfg(unix)]
+mod assistant_native_recovery;
+#[cfg(unix)]
+mod assistant_native_tools;
+#[cfg(unix)]
+mod assistant_native_turns;
 // Shared assistant domain types remain portable, but their authority-side
 // operations are driven only by the Unix host. Windows is a remote client.
 // Keep dead-code enforcement on the hosting targets rather than exporting

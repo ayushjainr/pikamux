@@ -262,6 +262,7 @@ pub(crate) fn revoke(root: &Path, id: &str) -> Result<Value> {
         Ok(()) | Err(crate::assistant_policy::PolicyError::UnknownGrant(_)) => {}
         Err(error) => return Err(error.into()),
     }
+    crate::assistant_native_helpers::invalidate_consultation(root, &saved.project, id)?;
     Ok(
         json!({"id":id,"revoked":true,"notice":"Queued consultation use is blocked. Existing provider copies are not deleted."}),
     )
@@ -420,6 +421,78 @@ mod tests {
         pika.store.untrack_session(Provider::Codex, &id).unwrap();
         assert!(load(&root, &scope, now()).unwrap().is_empty());
         revoke(&root, approval["id"].as_str().unwrap()).unwrap();
+    }
+    #[test]
+    fn registry_unwatch_cascades_native_consultation_evidence_before_recall() {
+        let (dir, pika, id) = fixture();
+        let root = dir.path().join("assistant");
+        approve(
+            &root,
+            &pika,
+            "project-a",
+            Provider::Codex,
+            &id,
+            now() + 3600,
+        )
+        .unwrap();
+        let scope = crate::assistant::scope("project-a").unwrap();
+        let approved = load(&root, &scope, now()).unwrap().remove(0);
+        let binding =
+            json!({"id":approved.id,"grant_id":approved.grant_id,"binding":approved.grant_scope()})
+                .to_string();
+        let mut memory = crate::assistant_memory::Store::open(root.join("memory.sqlite")).unwrap();
+        let marker = memory
+            .append(crate::assistant_memory::NewRecord {
+                kind: crate::assistant_memory::RecordKind::Finding,
+                origin: crate::assistant_memory::Origin::System,
+                scope: scope.clone(),
+                body: "Synthetic exact registry source reference".into(),
+                provenance: "test".into(),
+                timestamp: 1,
+                supersedes: None,
+                dependencies: vec![],
+                decision_state: None,
+                protected_policy: false,
+            })
+            .unwrap();
+        let result = memory
+            .append(crate::assistant_memory::NewRecord {
+                kind: crate::assistant_memory::RecordKind::Finding,
+                origin: crate::assistant_memory::Origin::Worker,
+                scope,
+                body: "Synthetic descendant, no transcript".into(),
+                provenance: "test".into(),
+                timestamp: 2,
+                supersedes: None,
+                dependencies: vec![marker.id.clone()],
+                decision_state: None,
+                protected_policy: false,
+            })
+            .unwrap();
+        let dbpath = root.join("investigation.sqlite");
+        crate::assistant_storage::database(&dbpath).unwrap();
+        let db = Connection::open(dbpath).unwrap();
+        db.execute_batch("CREATE TABLE native_helper_requests(root_id TEXT PRIMARY KEY,profile TEXT NOT NULL,scope TEXT NOT NULL,request_hash TEXT NOT NULL,epoch INTEGER NOT NULL,sources TEXT NOT NULL,result_sources TEXT,turn_id TEXT NOT NULL,session_id TEXT NOT NULL,consultation TEXT,consultation_source TEXT);").unwrap();
+        db.execute("INSERT INTO native_helper_requests(root_id,profile,scope,request_hash,epoch,sources,turn_id,session_id,consultation,consultation_source) VALUES('test',?,'project-a','hash',0,'[]','turn','session',?,?)",params![memory.profile_id(),binding,marker.id]).unwrap();
+        assert_eq!(
+            crate::assistant_native_helpers::invalidate_unavailable_consultations(
+                &root,
+                "project-a"
+            )
+            .unwrap(),
+            0
+        );
+        pika.store.untrack_session(Provider::Codex, &id).unwrap();
+        assert!(
+            crate::assistant_native_helpers::invalidate_unavailable_consultations(
+                &root,
+                "project-a"
+            )
+            .unwrap()
+                >= 2
+        );
+        assert!(memory.get_active(&marker.id).unwrap().is_none());
+        assert!(memory.get_active(&result.id).unwrap().is_none());
     }
     #[test]
     fn actual_dispatch_source_fence_serializes_unwatch_and_rejects_stale_binding() {

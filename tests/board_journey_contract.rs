@@ -2322,7 +2322,7 @@ fn shared_mount_board_opens_even_when_assistant_authority_is_unavailable() {
 }
 
 #[test]
-fn board_settings_and_assistant_return_keep_filter_draft_and_unread() {
+fn board_settings_and_unsupported_native_entry_preserve_filter_and_unread() {
     let mut board = BoardProcess::start();
     board.send(b"/audit\r");
     board.await_text("FILTER audit");
@@ -2336,13 +2336,12 @@ fn board_settings_and_assistant_return_keep_filter_draft_and_unread() {
     board.send(b"\x1b");
     board.await_text("FILTER audit");
     board.send(b"P");
-    board.await_text("Enter to connect Pika");
-    board.send(b"unsent continuity question");
-    board.await_text("unsent continuity question");
+    board.await_text("Native provider does not support the scoped capability check");
+    assert!(!board.output.contains("Enter to connect Pika"));
     board.send(b"\x1b");
     board.await_text("FILTER audit");
     board.send(b"P");
-    board.await_text("unsent continuity question");
+    board.await_text("Native provider does not support the scoped capability check");
     board.send(b"\x1b");
     board.await_text("FILTER audit");
     let store = Store::at(board.root.path().join("state/pika.db"));
@@ -2360,13 +2359,16 @@ fn board_settings_and_assistant_return_keep_filter_draft_and_unread() {
         rusqlite::Connection::open(board.root.path().join("state/assistant/memory.sqlite"))
             .unwrap();
     let sent: i64 = memory
-        .query_row(
-            "SELECT count(*) FROM memory_records WHERE body LIKE '%unsent continuity question%'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT count(*) FROM memory_records", [], |row| row.get(0))
         .unwrap();
     assert_eq!(sent, 0);
+    assert!(
+        !board
+            .root
+            .path()
+            .join("state/assistant/native-registry/pika.db")
+            .exists()
+    );
     board.finish();
 }
 
@@ -2445,8 +2447,17 @@ fn client_update_exit_keeps_one_reopenable_startup_home_and_an_actionable_board_
     let store = Store::at(board.root.path().join("state/pika.db"));
     for (provider, code) in [(Provider::Codex, 0), (Provider::Claude, 1)] {
         let launches = board.root.path().join(format!("{provider}-launches"));
+        let release = board.root.path().join(format!("{provider}-exit-release"));
+        let wait_for_caller = if provider == Provider::Claude {
+            format!(
+                "while [ ! -f {} ]; do sleep 0.01; done\n",
+                shell_words::quote(release.to_str().unwrap())
+            )
+        } else {
+            String::new()
+        };
         fs::write(board.root.path().join("bin").join(provider.as_str()), format!(
-            "#!/bin/sh\n[ \"$*\" = 'app-server --stdio' ] && exit 97\nprintf launched\\n >> {}\nprintf 'Updater finished; restart the client.\\n'\nexit {code}\n",
+            "#!/bin/sh\n[ \"$*\" = 'app-server --stdio' ] && exit 97\nprintf launched\\n >> {}\n{wait_for_caller}printf 'Updater finished; restart the client.\\n'\nexit {code}\n",
             shell_words::quote(launches.to_str().unwrap())
         )).unwrap();
         let name = format!("updating_{provider}");
@@ -2477,6 +2488,9 @@ fn client_update_exit_keeps_one_reopenable_startup_home_and_an_actionable_board_
             thread::sleep(Duration::from_millis(20));
         }
         let launch_output = launch.wait_with_output().unwrap();
+        // Force the reserved Claude UUID-bearing process to be observable
+        // before it exits. Mere argv ownership must not certify a conversation.
+        fs::write(&release, b"caller finished").unwrap();
         let pending = store
             .list_pending()
             .unwrap()

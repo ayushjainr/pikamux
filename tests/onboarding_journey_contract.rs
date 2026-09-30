@@ -32,6 +32,18 @@ impl Journey {
         output_tty: bool,
         term: Option<&str>,
     ) -> Self {
+        Self::start_prepared(args, width, height, input_tty, output_tty, term, |_| {})
+    }
+
+    fn start_prepared(
+        args: &[&str],
+        width: u16,
+        height: u16,
+        input_tty: bool,
+        output_tty: bool,
+        term: Option<&str>,
+        prepare: impl FnOnce(&std::path::Path),
+    ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("pika-onboard-")
             .tempdir_in("/tmp")
@@ -75,6 +87,7 @@ impl Journey {
             "{\"theme\":\"existing-theme\"}\n",
         )
         .unwrap();
+        prepare(root.path());
         let (mut master, mut slave) = (-1, -1);
         let mut size = libc::winsize {
             ws_col: width,
@@ -557,133 +570,204 @@ esac
 }
 
 #[test]
-fn assistant_first_use_is_quiet_and_connection_cancel_preserves_draft() {
-    let mut j = Journey::start(&["pika"], 100, 32);
-    j.await_text("Enter to connect Pika");
-    assert!(!j.output.contains("Saved, dated evidence"));
-    assert!(!j.output.contains("/brief-seen"));
-    assert!(!j.output.contains("provider off"));
-    j.send(b"Remember this draft\r");
-    j.await_text("Connect with Codex");
-    j.send(b"\x1b");
-    j.await_text("Remember this draft");
+fn assistant_first_use_is_native_and_unsupported_provider_launches_nothing() {
+    let mut j = Journey::start_prepared(
+        &["pika"],
+        100,
+        32,
+        true,
+        true,
+        Some("xterm-256color"),
+        |root| {
+            native_probe_fixture(&root.join("bin/codex"));
+        },
+    );
+    j.finish_with_code(1, false);
+    assert!(j.output.contains("capability"), "{}", j.output);
+    assert!(!j.output.contains("Enter to connect Pika"));
+    assert!(!j.output.contains("Connect with Codex"));
+    assert!(!j.output.contains("Sign in to Codex"));
+    let profile = j.root.path().join("state/pika/assistant");
+    let probe = fs::read_to_string(profile.join("provider-home/probe-context")).unwrap();
+    assert!(probe.contains("debug prompt-input"));
+    assert!(probe.contains("--model gpt-6-luna"));
+    assert!(probe.contains("--profile pika-assistant"));
+    assert!(!profile.join("provider-home/paid-turn").exists());
+    assert!(!profile.join("native-registry/pika.db").exists());
+    assert!(
+        !j.root
+            .path()
+            .join("state/pika/assistant-startup/selection.json")
+            .exists()
+    );
+    assert!(!j.root.path().join("codex/auth.json").exists());
+    let db = rusqlite::Connection::open(profile.join("memory.sqlite")).unwrap();
+    let messages: i64 = db
+        .query_row("SELECT count(*) FROM memory_records", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        messages, 0,
+        "provider capability inspection is not a human message"
+    );
+}
+
+#[test]
+fn assistant_finite_saved_allowance_is_preserved_without_login_or_launch() {
+    let mut j = Journey::start_prepared(
+        &["pika"],
+        100,
+        32,
+        true,
+        true,
+        Some("xterm-256color"),
+        |root| {
+            save_native_selection(root, &root.join("bin/codex"), 7);
+        },
+    );
+    j.finish_with_code(1, false);
+    assert!(j.output.contains("per-model-call ceiling"), "{}", j.output);
+    let selection: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            j.root
+                .path()
+                .join("state/pika/assistant-startup/selection.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(selection["max_calls"], 7);
     assert!(!j.root.path().join("home/provider-calls").exists());
     assert!(
         !j.root
             .path()
-            .join("state/pika/assistant-startup/selection.json")
+            .join("state/pika/assistant/native-binding.json")
             .exists()
     );
-    j.send(b"\x1bOP"); // F1 opens help without sending the draft.
-    j.await_text("How can Pika help?");
-    j.send(b"\x1b");
-    j.await_text("Remember this draft");
-    j.send(b"\x1b");
-    j.finish();
-    let db = rusqlite::Connection::open(j.root.path().join("state/pika/assistant/memory.sqlite"))
-        .unwrap();
-    let saved: i64 = db
-        .query_row(
-            "SELECT count(*) FROM memory_records WHERE body LIKE '%Remember this draft%'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(saved, 0, "an unsent draft must not become saved memory");
-}
-
-#[test]
-fn assistant_failed_sign_in_restores_the_composer_and_does_not_enable() {
-    let mut j = Journey::start(&["pika"], 100, 32);
-    j.await_text("Enter to connect Pika");
-    j.send(b"\r");
-    j.await_text("Connect with Codex");
-    j.send(b"\r");
-    j.await_text("Connect and remember");
-    j.send(b"\r");
-    j.await_text("Sign in to Codex");
-    j.send(b"\r");
-    j.await_text("Pika couldn't finish connecting");
     assert!(
         !j.root
             .path()
-            .join("state/pika/assistant-startup/selection.json")
+            .join("state/pika/assistant/provider-home/auth.json")
             .exists()
     );
-    j.send(b"\x1b");
-    j.await_text("Enter to connect Pika");
-    j.send(b"\x1b");
-    j.finish();
+    assert!(!j.output.contains("Sign in to Codex"));
 }
 
 #[test]
-fn assistant_confirmed_connection_remembers_the_same_profile_without_sending_a_message() {
-    let mut j = Journey::start(&["pika"], 100, 32);
-    j.await_text("Enter to connect Pika");
-    executable(
-        &j.root.path().join("bin/codex"),
-        "#!/bin/sh\nif [ \"$1\" = login ]; then\n  umask 077\n  printf '{}' > \"$CODEX_HOME/auth.json\"\n  printf '%s\\n' \"$CODEX_HOME\" > \"$HOME/login-home\"\n  exit 0\nfi\nprintf x >> \"$CODEX_HOME/start-count\"\nexit 97\n",
+fn assistant_native_entry_keeps_exact_saved_provider_profile_and_authentication() {
+    let mut j = Journey::start_prepared(
+        &["pika"],
+        100,
+        32,
+        true,
+        true,
+        Some("xterm-256color"),
+        |root| {
+            let pinned = root.join("bin/pinned-codex");
+            native_probe_fixture(&pinned);
+            save_native_selection(root, &pinned, i64::MAX as u64);
+            let home = root.join("state/pika/assistant/provider-home");
+            fs::create_dir_all(&home).unwrap();
+            fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(
+                home.join("auth.json"),
+                r#"{"OPENAI_API_KEY":"synthetic-private-auth"}"#,
+            )
+            .unwrap();
+            fs::write(
+                home.join("config.toml"),
+                "theme = 'existing-private-theme'\nsandbox_mode = 'danger-full-access'\n",
+            )
+            .unwrap();
+            for name in ["auth.json", "config.toml"] {
+                fs::set_permissions(home.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            executable(
+                &root.join("bin/codex"),
+                "#!/bin/sh\nprintf decoy > \"$HOME/provider-decoy\"\nexit 97\n",
+            );
+        },
     );
-    j.send(b"A draft, not a request yet\r");
-    j.await_text("Connect with Codex");
-    j.send(b"\r");
-    j.await_text("Connect and remember");
-    let selection = j
-        .root
-        .path()
-        .join("state/pika/assistant-startup/selection.json");
-    assert!(!selection.exists());
-    j.send(b"\r");
-    j.await_text("Sign in to Codex");
-    j.send(b"\r");
-    j.await_text("F2 to reconnect");
-    assert!(j.output.contains("A draft, not a request yet"));
-    let mut saved: serde_json::Value =
-        serde_json::from_slice(&fs::read(&selection).unwrap()).unwrap();
-    let profile_root = j.root.path().join("state/pika/assistant");
-    assert_eq!(saved["profile_root"], profile_root.to_str().unwrap());
-    assert_eq!(saved["max_calls"], i64::MAX as u64);
+    j.finish_with_code(1, false);
+    let root = j.root.path().join("state/pika/assistant");
+    let selection: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            j.root
+                .path()
+                .join("state/pika/assistant-startup/selection.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(selection["profile_root"], root.to_str().unwrap());
     assert_eq!(
-        fs::read_to_string(j.root.path().join("home/login-home"))
-            .unwrap()
-            .trim(),
-        profile_root.join("provider-home").to_str().unwrap()
+        selection["executable"],
+        j.root.path().join("bin/pinned-codex").to_str().unwrap()
+    );
+    let context = fs::read_to_string(root.join("provider-home/probe-context")).unwrap();
+    assert!(context.contains(root.join("provider-home").to_str().unwrap()));
+    assert!(context.contains(root.join("native-assistant").to_str().unwrap()));
+    assert!(context.contains("--ask-for-approval never"));
+    assert!(!j.root.path().join("home/provider-decoy").exists());
+    assert!(!j.root.path().join("home/provider-calls").exists());
+    assert!(!root.join("provider-home/paid-turn").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("provider-home/auth.json")).unwrap(),
+        r#"{"OPENAI_API_KEY":"synthetic-private-auth"}"#
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("provider-home/config.toml")).unwrap(),
+        "theme = 'existing-private-theme'\nsandbox_mode = 'danger-full-access'\n"
     );
     assert!(!j.root.path().join("codex/auth.json").exists());
-    // A saved exact provider may differ from the next PATH lookup. Reconnect
-    // must keep the selected provider, not silently switch to a new package.
-    let pinned = j.root.path().join("bin/pinned-codex");
-    fs::copy(j.root.path().join("bin/codex"), &pinned).unwrap();
-    saved["executable"] = serde_json::json!(pinned);
-    fs::write(&selection, serde_json::to_vec(&saved).unwrap()).unwrap();
-    executable(
-        &j.root.path().join("bin/codex"),
-        "#!/bin/sh\nprintf x > \"$CODEX_HOME/reconnect-decoy\"\nexit 97\n",
-    );
-    j.await_text("F2 to reconnect");
-    assert!(!j.output.contains("Transport("));
-    j.send(b"\x1bOQ"); // F2, explicit reconnect, never an automatic resend.
-    j.await_text("Reconnect Pika");
-    j.await_text("send a message.");
-    j.send(b"\r");
-    j.await_text("F2 to reconnect");
-    assert_eq!(
-        fs::read_to_string(profile_root.join("provider-home/start-count")).unwrap(),
-        "xx"
-    );
-    assert!(j.output.contains("A draft, not a request yet"));
-    assert!(!profile_root.join("provider-home/reconnect-decoy").exists());
-    j.send(b"\x1b");
-    j.finish();
-    let db = rusqlite::Connection::open(profile_root.join("memory.sqlite")).unwrap();
+    assert!(!root.join("native-registry/pika.db").exists());
+    let binding: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("native-binding.json")).unwrap()).unwrap();
+    assert_eq!(binding["profile_id"], selection["profile_id"]);
+    assert_eq!(binding["scope"], selection["scope"]);
+    assert_eq!(binding["provider_executable"], selection["executable"]);
+    let db = rusqlite::Connection::open(root.join("memory.sqlite")).unwrap();
     let messages: i64 = db
-        .query_row(
-            "SELECT count(*) FROM memory_records WHERE body LIKE '%A draft, not a request yet%'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT count(*) FROM memory_records", [], |row| row.get(0))
         .unwrap();
     assert_eq!(messages, 0);
+}
+
+fn save_native_selection(root: &std::path::Path, executable: &std::path::Path, max_calls: u64) {
+    let profile = root.join("state/pika/assistant");
+    let memory = pikamux::assistant_memory::Store::open(profile.join("memory.sqlite")).unwrap();
+    let selection = root.join("state/pika/assistant-startup/selection.json");
+    fs::create_dir_all(selection.parent().unwrap()).unwrap();
+    fs::set_permissions(
+        selection.parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::write(
+        &selection,
+        serde_json::to_vec(&serde_json::json!({
+            "profile_root":profile, "profile_id":memory.profile_id(),
+            "scope":"personal", "executable":executable, "max_calls":max_calls
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(selection, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn native_probe_fixture(path: &std::path::Path) {
+    executable(
+        path,
+        r#"#!/bin/sh
+case " $* " in
+  *" debug prompt-input "*)
+    printf '%s\n%s\n%s\n' "$CODEX_HOME" "$PWD" "$*" > "$CODEX_HOME/probe-context"
+    printf '[]\n'
+    exit 0 ;;
+esac
+printf unexpected > "$CODEX_HOME/paid-turn"
+exit 97
+"#,
+    );
 }
 
 #[test]

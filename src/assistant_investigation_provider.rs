@@ -65,6 +65,7 @@ impl WorkerFactory for CodexWorkerFactory {
         Ok(Box::new(CodexWorker {
             provider,
             receipt: WorkerReceipt::default(),
+            native_parent: None,
         }))
     }
 }
@@ -84,8 +85,18 @@ fn sanitize(value: &str) -> String {
 pub struct CodexWorker<T: RpcTransport = CodexTransport> {
     provider: MainAssistant<T>,
     receipt: WorkerReceipt,
+    native_parent: Option<(PathBuf, String, String)>,
 }
 impl<T: RpcTransport + Send> DisposableWorker for CodexWorker<T> {
+    fn bind_native_parent(
+        &mut self,
+        runtime: &std::path::Path,
+        turn: &str,
+        session: &str,
+    ) -> Result<(), String> {
+        self.native_parent = Some((runtime.to_owned(), turn.into(), session.into()));
+        Ok(())
+    }
     fn start(&mut self, assignment: &str, scope: &Scope) -> Result<(), String> {
         validate_project_scope(scope).map_err(|e| e.to_string())?;
         self.provider.start_or_resume().map_err(display)?;
@@ -93,6 +104,14 @@ impl<T: RpcTransport + Send> DisposableWorker for CodexWorker<T> {
         self.receipt.thread_id = self.provider.profile().thread_id.clone();
         self.receipt.delivery = Some("unknown".into());
         self.receipt.cleanup = Some("provider_retention_unknown".into());
+        let _parent = self
+            .native_parent
+            .as_ref()
+            .map(|(path, turn, session)| {
+                crate::assistant_native_helpers::parent_lease(path, turn, session)
+            })
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let turn_id = self.provider.begin_turn(assignment).map_err(display)?;
         self.receipt.turn_id = Some(turn_id);
         Ok(())
@@ -110,6 +129,14 @@ impl<T: RpcTransport + Send> DisposableWorker for CodexWorker<T> {
         self.receipt.delivery = Some("unknown".into());
         self.receipt.cleanup = Some("provider_retention_unknown".into());
         let _admission = cancellation.enter()?;
+        let _parent = self
+            .native_parent
+            .as_ref()
+            .map(|(path, turn, session)| {
+                crate::assistant_native_helpers::parent_lease(path, turn, session)
+            })
+            .transpose()
+            .map_err(|e| e.to_string())?;
         self.receipt.turn_id = Some(self.provider.begin_turn(assignment).map_err(display)?);
         Ok(())
     }
@@ -207,6 +234,7 @@ mod cancellation_tests {
         let mut worker = CodexWorker {
             provider,
             receipt: Default::default(),
+            native_parent: None,
         };
         let cancellation = crate::assistant_service::DispatchCancellation::default();
         let worker_gate = cancellation.clone();

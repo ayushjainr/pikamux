@@ -251,6 +251,7 @@ impl WorkerFactory for ScopedWorkerFactory {
                 permission_root: self.permission_root.clone(),
                 memory_epoch: None,
                 dispatch_cancellation: Default::default(),
+                native_parent: None,
             })),
         }
     }
@@ -268,14 +269,18 @@ struct ConsultationWorker {
     permission_root: Option<PathBuf>,
     memory_epoch: Option<(PathBuf, u64)>,
     dispatch_cancellation: crate::assistant_service::DispatchCancellation,
+    native_parent: Option<(PathBuf, String, String)>,
 }
 struct DispatchLease {
+    _native_parent: Option<rusqlite::Connection>,
     _memory: rusqlite::Connection,
     _policy: AssistantPolicy,
     _registry: Option<rusqlite::Connection>,
     _admission: crate::assistant_service::DispatchAdmission,
 }
+#[allow(clippy::too_many_arguments)]
 fn dispatch_fence(
+    native_parent: Option<(PathBuf, String, String)>,
     memory_epoch: (PathBuf, u64),
     policy_path: PathBuf,
     permission_root: Option<PathBuf>,
@@ -309,7 +314,14 @@ fn dispatch_fence(
             anyhow::bail!("Consultation cancelled before dispatch");
         }
         let admission = dispatch_cancellation.enter().map_err(anyhow::Error::msg)?;
+        let parent = native_parent
+            .as_ref()
+            .map(|(path, turn, session)| {
+                crate::assistant_native_helpers::parent_lease(path, turn, session)
+            })
+            .transpose()?;
         Ok(Box::new(DispatchLease {
+            _native_parent: parent,
             _memory: memory,
             _policy: policy,
             _registry: registry,
@@ -356,6 +368,15 @@ fn exact_dispatched_child(
     Ok(child)
 }
 impl DisposableWorker for ConsultationWorker {
+    fn bind_native_parent(
+        &mut self,
+        runtime: &std::path::Path,
+        turn: &str,
+        session: &str,
+    ) -> Result<(), String> {
+        self.native_parent = Some((runtime.to_owned(), turn.into(), session.into()));
+        Ok(())
+    }
     fn dispatches_later(&self) -> bool {
         true
     }
@@ -386,6 +407,7 @@ impl DisposableWorker for ConsultationWorker {
         let cancel = self.cancel.clone();
         let deadline = child.deadline_at;
         let fence = dispatch_fence(
+            self.native_parent.clone(),
             self.memory_epoch
                 .clone()
                 .ok_or("Missing exact dispatch epoch")?,
@@ -594,6 +616,7 @@ mod tests {
                 permission_root: None,
                 memory_epoch: Some((path, 0)),
                 dispatch_cancellation: Default::default(),
+                native_parent: None,
             };
             let dispatch_cancellation = crate::assistant_service::DispatchCancellation::default();
             worker
@@ -630,6 +653,7 @@ mod tests {
             .unwrap();
         policy.mark_dispatched("root:expert", now()).unwrap();
         let fence = dispatch_fence(
+            None,
             (policy.path().with_file_name("memory.sqlite"), 0),
             policy.path().into(),
             None,
@@ -706,6 +730,7 @@ mod tests {
             permission_root: None,
             memory_epoch: Some((policy.path().with_file_name("memory.sqlite"), 0)),
             dispatch_cancellation: Default::default(),
+            native_parent: None,
         };
         worker.start("bounded question", &a.scope).unwrap();
         let started = std::time::Instant::now();
@@ -758,6 +783,7 @@ mod tests {
             permission_root: None,
             memory_epoch: Some((policy.path().with_file_name("memory.sqlite"), 0)),
             dispatch_cancellation: Default::default(),
+            native_parent: None,
         };
         assert!(worker.start("bounded question", &a.scope).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);

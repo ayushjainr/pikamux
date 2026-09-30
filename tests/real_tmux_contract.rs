@@ -873,34 +873,38 @@ fn real_isolated_tmux_resumes_all_providers_and_reuses_each_exact_home() {
             .iter()
             .filter(|item| item.name == "fresh_claude")
             .count(),
-        0,
-        "an immediately observable UUID-bearing provider is certified instead of left pending"
+        1,
+        "reserved UUID argv alone cannot confirm provider conversation creation"
     );
     let expected = pending.expected_session_id.as_deref().unwrap();
-    let tracked = pika
-        .store
-        .get_session(Provider::Claude, expected)
-        .unwrap()
-        .expect("the exact new Claude identity should be tracked immediately");
-    assert_eq!(tracked.name.as_deref(), Some("fresh_claude"));
-    assert_eq!(tracked.tmux_pane, pending.tmux_pane);
+    assert!(
+        pika.store
+            .get_session(Provider::Claude, expected)
+            .unwrap()
+            .is_none()
+    );
 
-    // Exercise the actual new-process argv for every provider. Codex/OpenCode
-    // issue their UUID only after startup, so simulate their lifecycle hook's
-    // independently observed PID generation and exact pane certification.
+    // Exercise actual new-process argv for every provider, followed by genuine
+    // lifecycle evidence with independently observed PID generation and exact
+    // pane certification. Reserved Claude argv is not lifecycle confirmation.
     pika.config.write(&pika.paths).unwrap();
     for provider in Provider::ALL {
-        let current = if provider == Provider::Claude {
-            tracked.clone()
-        } else {
+        let current = {
             let name = format!("fresh_{provider}");
-            let receipt = pika
-                .new_session(&name, provider, false)
-                .unwrap_or_else(|error| panic!("new {provider} failed: {error:#}"));
-            let OpenTarget::Pending(pending) = receipt.target else {
-                panic!("new provider did not retain its launch identity")
+            let pending = if provider == Provider::Claude {
+                pending.clone()
+            } else {
+                let receipt = pika
+                    .new_session(&name, provider, false)
+                    .unwrap_or_else(|error| panic!("new {provider} failed: {error:#}"));
+                let OpenTarget::Pending(pending) = receipt.target else {
+                    panic!("new provider did not retain its launch identity")
+                };
+                pending
             };
-            let identity = if matches!(provider, Provider::Codex | Provider::Muse) {
+            let identity = if provider == Provider::Claude {
+                pending.expected_session_id.as_deref().unwrap()
+            } else if matches!(provider, Provider::Codex | Provider::Muse) {
                 "66666666-6666-4666-8666-666666666666"
             } else {
                 "ses_freshfixture"
@@ -967,15 +971,29 @@ fn real_isolated_tmux_resumes_all_providers_and_reuses_each_exact_home() {
                 )
                 .unwrap();
             assert!(
-                pikamux::hooks::certify_hook_home(
-                    &pika.store,
-                    &pending.launch_token,
-                    &tag,
-                    pid,
-                    generation
-                )
-                .unwrap()
+                hook.launch_certified
+                    || pikamux::hooks::certify_hook_home(
+                        &pika.store,
+                        &pending.launch_token,
+                        &tag,
+                        pid,
+                        generation
+                    )
+                    .unwrap()
             );
+            assert!(
+                pika.store
+                    .get_pending(&pending.launch_token)
+                    .unwrap()
+                    .is_none()
+            );
+            let owner = pika
+                .store
+                .get_recovery_owner(provider, identity)
+                .unwrap()
+                .unwrap();
+            assert_eq!(owner.pid, pid);
+            assert_eq!(owner.start_time, generation);
             pika.store.get_session(provider, identity).unwrap().unwrap()
         };
         assert_eq!(

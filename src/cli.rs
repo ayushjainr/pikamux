@@ -59,6 +59,12 @@ struct Cli {
 enum Command {
     /// Talk to your persistent Pika assistant.
     Pika(crate::assistant::Args),
+    #[command(name = "_assistant-native-tools", hide = true)]
+    AssistantNativeTools(crate::assistant_native_tools::ToolsArgs),
+    #[command(name = "_assistant-native-hook", hide = true)]
+    AssistantNativeHook(crate::assistant_native_tools::HookArgs),
+    /// Manage Pika's assistant without sending a model request.
+    AssistantControl(crate::assistant_native_tools::ControlArgs),
     #[command(name = "_assistant-client", hide = true)]
     AssistantClient(crate::assistant_remote::Args),
     #[command(name = "_assistant-host", hide = true)]
@@ -644,7 +650,10 @@ where
 {
     let cli = Cli::try_parse_from(args)?;
     match cli.command {
-        Some(Command::Pika(args)) => crate::assistant::run(args),
+        Some(Command::Pika(args)) => assistant_entry(args),
+        Some(Command::AssistantNativeTools(args)) => crate::assistant_native_tools::run_tools(args),
+        Some(Command::AssistantNativeHook(args)) => crate::assistant_native_tools::run_hook(args),
+        Some(Command::AssistantControl(args)) => crate::assistant_native_tools::run_control(args),
         Some(Command::AssistantClient(args)) => crate::assistant_remote::run(args),
         Some(Command::AssistantHost {
             root,
@@ -740,6 +749,9 @@ fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
         Some(
             Command::InstallNative(_)
             | Command::Pika(_)
+            | Command::AssistantNativeTools(_)
+            | Command::AssistantNativeHook(_)
+            | Command::AssistantControl(_)
             | Command::AssistantClient(_)
             | Command::AssistantHost { .. }
             | Command::ClaudeStatusline { .. }
@@ -1154,12 +1166,23 @@ fn open_assistant_with_memory(
             })
         })
         .transpose()?;
-    crate::assistant::run(crate::assistant::Args {
+    assistant_entry(crate::assistant::Args {
         view_memory: memory,
         board: true,
         focus,
         ..Default::default()
     })
+}
+
+pub(crate) fn assistant_entry(args: crate::assistant::Args) -> Result<i32> {
+    if crate::assistant_native::wants_native(&args) {
+        let ordinary = Pika::discover()?;
+        with_open_activity(&ordinary, || crate::assistant_native::run(args))
+    } else {
+        // Explicit offline/export/administration commands retain the existing
+        // native owners; they never become an alternate foreground harness.
+        crate::assistant::run(args)
+    }
 }
 
 fn exact_remote(pika: &Pika, item: &BoardItem) -> Result<fleet::FleetSession> {
