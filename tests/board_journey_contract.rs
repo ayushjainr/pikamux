@@ -1567,7 +1567,9 @@ fn add_named_native_conversation_without_setup_preserves_unread_and_cancel() {
     let store = Store::at(board.root.path().join("state/pika.db"));
     let db = rusqlite::Connection::open(store.path()).unwrap();
     db.execute(
-        "INSERT INTO sessions(provider,session_id,name,status,unread,managed,source,created_at,updated_at,last_event_at,last_activity_at) VALUES ('claude',?1,'native_renamed','READY',1,0,'external',1,1,1,1)",
+        // Named discovery may already have admitted this exact fixture while
+        // its provider files were being written. Preserve that existing row.
+        "INSERT OR IGNORE INTO sessions(provider,session_id,name,status,unread,managed,source,created_at,updated_at,last_event_at,last_activity_at) VALUES ('claude',?1,'native_renamed','READY',1,0,'external',1,1,1,1)",
         [identity],
     )
     .unwrap();
@@ -1857,7 +1859,9 @@ fn overdue_launch_can_be_hidden_without_deleting_recovery_or_untracking_a_conver
     board.send(b"x");
     board.await_text("Hide launch entry for stuck_launch");
     board.send(b"\x1b");
-    board.await_text("stuck_launch");
+    // The row name is unchanged during confirmation; only restored normal
+    // controls prove cancellation completed before the next action.
+    board.await_text("FILTER stuck · / edit · esc clear");
     assert_eq!(store.list_visible_pending().unwrap().len(), 1);
     board.send(b"x");
     board.await_text("Hide launch entry for stuck_launch");
