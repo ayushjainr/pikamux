@@ -559,12 +559,15 @@ pub(crate) fn run_activity_view(
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn run_thread_list(
     source: &crate::activity_feed::Source,
+    store: &crate::store::Store,
     current: &(Provider, String),
     memory: &mut BoardMemory,
 ) -> Result<BoardAction> {
     let _terminal = TerminalGuard::enter()?;
     let initial = source.snapshot().expect("activity producer is seeded");
     let mut board = Board::new(initial.items);
+    board.quota = crate::quota::cached_local(store);
+    let mut quota_read = Instant::now();
     if memory.initialized {
         board.restore(memory);
     } else {
@@ -578,8 +581,12 @@ pub(crate) fn run_thread_list(
         if let Some(frame) = updates.take() {
             board.replace_items(frame.items);
         }
+        if quota_read.elapsed() >= Duration::from_secs(1) {
+            board.quota = crate::quota::cached_local(store);
+            quota_read = Instant::now();
+        }
         let (width, height) = size().unwrap_or((38, 30));
-        board.ensure_visible(height);
+        board.ensure_visible(height.saturating_sub(thread_quota_height(width, height)));
         presenter.present(&mut output, (width, height), |frame| {
             board.draw_threads(frame, width, height)
         })?;
@@ -2180,6 +2187,8 @@ impl Board {
 
     #[cfg_attr(windows, allow(dead_code))]
     fn draw_threads(&self, output: &mut impl Write, width: u16, height: u16) -> Result<()> {
+        let quota_height = thread_quota_height(width, height);
+        let list_height = height.saturating_sub(quota_height);
         let mut frame = Vec::new();
         queue!(
             frame,
@@ -2195,7 +2204,7 @@ impl Board {
             &fit("PIKA · Threads", usize::from(width)),
         )?;
         queue!(frame, Print("\r\n"))?;
-        self.draw_thread_rows(&mut frame, usize::from(width), height, 1)?;
+        self.draw_thread_rows(&mut frame, usize::from(width), list_height, 1)?;
         if self.items.is_empty() && height > 5 {
             queue!(
                 frame,
@@ -2206,7 +2215,7 @@ impl Board {
         if let Some(notice) = &self.action_notice {
             queue!(
                 frame,
-                MoveTo(0, height.saturating_sub(3)),
+                MoveTo(0, list_height.saturating_sub(3)),
                 SetForegroundColor(Color::Yellow),
                 Print(fit(
                     &crate::fleet::sanitize_terminal_text(notice),
@@ -2214,6 +2223,7 @@ impl Board {
                 ))
             )?;
         }
+        self.draw_thread_quota(&mut frame, width, height, quota_height)?;
         queue!(
             frame,
             MoveTo(0, height.saturating_sub(2)),
@@ -2230,6 +2240,44 @@ impl Board {
             output.write_all(&without_colors(&frame))?;
         } else {
             output.write_all(&frame)?;
+        }
+        Ok(())
+    }
+
+    fn draw_thread_quota(
+        &self,
+        output: &mut impl Write,
+        width: u16,
+        height: u16,
+        rows: u16,
+    ) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let empty = crate::quota::View::default();
+        let view = if self.quota.node_id.is_none() {
+            &self.quota
+        } else {
+            &empty
+        };
+        let readings = crate::quota::PROVIDERS
+            .map(|provider| crate::quota::compact_row(provider, view, crate::quota::now()));
+        let lines = [
+            "WEEKLY LEFT · this machine".to_owned(),
+            format!("{} | {}", readings[0], readings[1]),
+        ];
+        for (index, line) in lines.iter().enumerate() {
+            queue!(output, MoveTo(0, height - 4 + index as u16))?;
+            styled(
+                output,
+                if index == 0 {
+                    Color::DarkGrey
+                } else {
+                    Color::Yellow
+                },
+                false,
+                &fit(line, usize::from(width)),
+            )?;
         }
         Ok(())
     }
@@ -3075,6 +3123,10 @@ fn group(session: &Session) -> &'static str {
     crate::activity_feed::group(session.status, false)
 }
 
+fn thread_quota_height(width: u16, height: u16) -> u16 {
+    if width >= 26 && height >= 10 { 2 } else { 0 }
+}
+
 fn item_group(item: &BoardItem) -> &'static str {
     crate::activity_feed::group(item.session.status, item.stale)
 }
@@ -3484,6 +3536,86 @@ mod tests {
             None,
             "holding Enter must not open twice"
         );
+    }
+
+    #[test]
+    fn thread_footer_keeps_base_usage_and_controls_visible_at_supported_sizes() {
+        let at = crate::quota::now();
+        let mut board = board(Status::Ready);
+        board.quota.readings = [Provider::Codex, Provider::Claude]
+            .map(|provider| crate::expert_refresh::QuotaSnapshot {
+                provider,
+                used_percent: if provider == Provider::Codex {
+                    99.9
+                } else {
+                    100.0
+                },
+                reset_at: at as i64 + 3600,
+                observed_at: at - 600.0,
+                source: "fixture".into(),
+            })
+            .to_vec();
+        board.items[0].node_id = Some("remote-node".into());
+        board.items[0].node_name = Some("rs6".into());
+        board.action_notice = Some("Cannot open: existing terminal changed".into());
+        for (width, height) in [(38, 10), (38, 24), (80, 12), (180, 30)] {
+            let mut bytes = Vec::new();
+            board.draw_threads(&mut bytes, width, height).unwrap();
+            let rows = crate::terminal_frame::rows(&bytes, (width, height)).unwrap();
+            let text = |index: usize| String::from_utf8(without_colors(&rows[index])).unwrap();
+            assert!(text(usize::from(height - 4)).contains("WEEKLY LEFT · this machine"));
+            assert!(text(usize::from(height - 3)).contains("<1% stale | Claude 0% stale"));
+            assert!(text(usize::from(height - 5)).contains("Cannot open"));
+            assert!(text(usize::from(height - 2)).contains("Enter open · Esc close"));
+            assert!(text(usize::from(height - 1)).contains("full board"));
+        }
+        for (width, height) in [(38, 9), (25, 24)] {
+            let mut bytes = Vec::new();
+            board.draw_threads(&mut bytes, width, height).unwrap();
+            assert!(!String::from_utf8(bytes).unwrap().contains("WEEKLY"));
+        }
+        board.quota.node_id = Some("remote-node".into());
+        let mut bytes = Vec::new();
+        board.draw_threads(&mut bytes, 38, 24).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("Codex — | Claude —"));
+        assert!(!text.contains("0%") && !text.contains("stale"));
+    }
+
+    #[test]
+    fn thread_footer_never_covers_the_selected_row_after_scrolling_or_resize() {
+        let mut items = Vec::new();
+        for index in 0..40 {
+            let mut item = session(if index % 2 == 0 {
+                Status::Working
+            } else {
+                Status::Ready
+            });
+            item.session_id = format!("thread-{index}");
+            item.name = Some(format!("thread-{index}"));
+            items.push(BoardItem::local(item));
+        }
+        let mut board = Board::new(items);
+        for (width, height) in [(38, 24), (38, 10), (80, 12), (38, 9)] {
+            let visible: Vec<_> = board.visible().into_iter().cloned().collect();
+            for item in visible {
+                board.selected_key = Some(item.key());
+                board.ensure_visible(height - thread_quota_height(width, height));
+                let mut bytes = Vec::new();
+                board.draw_threads(&mut bytes, width, height).unwrap();
+                let rows = crate::terminal_frame::rows(&bytes, (width, height)).unwrap();
+                let end = usize::from(height - 2 - thread_quota_height(width, height));
+                let text = rows[..end]
+                    .iter()
+                    .flat_map(|row| without_colors(row))
+                    .collect::<Vec<_>>();
+                assert!(
+                    String::from_utf8(text)
+                        .unwrap()
+                        .contains(&item.session.display_name())
+                );
+            }
+        }
     }
 
     #[derive(Default)]

@@ -937,15 +937,16 @@ fn run_threads(pika: &Pika, origin: &str) -> Result<i32> {
         .unwrap_or_else(|| format!("pending:{}", pane.pika_launch_token.unwrap()));
     let current = (pane.pika_provider.unwrap(), identity);
     // The observation lease makes this a cache follower when the board's
-    // producer is running; otherwise the same service takes over. No quota,
-    // preview, consultation or update worker belongs to this view.
+    // producer is running; otherwise the same service takes over. Quota is a
+    // cache-only consumer; no quota, preview, consultation or update worker
+    // belongs to this view.
     let source = crate::activity_observer::start(pika)?;
     let mut memory = monitor::BoardMemory::default();
     crate::activity_feed::with(
         Some(crate::activity_feed::Context::Source(source.clone())),
         || {
             loop {
-                match monitor::run_thread_list(&source, &current, &mut memory)? {
+                match monitor::run_thread_list(&source, &pika.store, &current, &mut memory)? {
                     BoardAction::Open(item) => match switch_thread(pika, &source, origin, item) {
                         Ok(0) => return Ok(0),
                         outcome => {

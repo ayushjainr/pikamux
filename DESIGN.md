@@ -157,6 +157,15 @@ read-only endpoint remains available to protocol clients, but the board does not
 use remote quota. Older fleet hosts therefore need no upgrade for the base-machine
 strip. Quota never writes to conversation state or blocks rendering/input.
 
+The compact thread companion shows the same weekly remaining percentages in a
+two-line footer, without a full quota panel. It reads only the quota worker's
+last published local view from the existing board store; opening, selecting or
+refreshing the companion never starts a quota RPC or SSH request. Cached ages
+and reset validity retain the normal quota rules; an unavailable reading is an
+em dash, not zero. The footer says `this machine`, including when selecting a
+remote row. Very short panes omit it to preserve navigation. There is no new
+database, observer, daemon or allowance aggregation.
+
 Stopping observation is distinct from detaching a tmux client. `x` opens a
 UUID-bound confirmation in the inspector: Pika removes the workstream from Live
 Operations while leaving the agent process, provider conversation, and expert
@@ -239,9 +248,10 @@ Local selection persists by `(provider, UUID)`; federated selection persists by
 
 Pika-owned native-agent homes show a single bottom navigation row: `← Pika`
 and the available return key, normally F12. One press opens a compact thread
-list beside the agent (below it in narrow terminals), without preview, quota,
-assistant or settings panels. It reuses the board's exact rows, ordering and
-activity service; the existing observation lease prevents duplicate scans.
+list beside the agent (below it in narrow terminals), with a compact cached
+weekly-usage footer but no preview, assistant or settings panels. It reuses the
+board's exact rows, ordering and activity service; the existing observation
+lease prevents duplicate scans.
 Arrow keys select; Enter uses the normal exact-identity open path; Escape closes
 only the companion. A second press returns to the full board and closes the list.
 The compact list captures the invoking terminal's tmux client name, PID and

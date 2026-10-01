@@ -853,6 +853,29 @@ fn claude_side_list_switches_only_the_opener_when_two_terminals_share_a_window()
     side_list_journey(pikamux::model::Provider::Claude, true);
 }
 
+fn seed_thread_quota(store: &Store, codex_used: f64) {
+    let at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let reading = |provider, used| {
+        serde_json::json!({
+            "provider":provider, "used_percent":used, "observed_at":at,
+            "reset_at":at as i64 + 3600, "source":"disposable quota fixture",
+        })
+    };
+    store
+        .set_meta(
+            "quota:local-view-v1",
+            &serde_json::json!({
+                "node_id":null, "readings":[reading("codex", codex_used), reading("claude", 100.0)],
+                "delayed":false, "unavailable":null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+}
+
 fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) {
     for from_tmux in [false, true] {
         let real_tmux = real_tmux_binary();
@@ -888,13 +911,23 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             "send-keys F12",
         ]);
         let launches = board.root.path().join("launches");
+        let quota_calls = board.root.path().join("quota-calls");
+        let quota_probe = format!(
+            "if [ \"$*\" = 'app-server --stdio' ]; then printf 'quota\\n' >> {}; exit 97; fi\n",
+            shell_words::quote(quota_calls.to_str().unwrap())
+        );
+        fs::write(
+            board.root.path().join("bin/codex"),
+            format!("#!/bin/sh\n{quota_probe}exit 97\n"),
+        )
+        .unwrap();
         let (executable, resume) = if provider == pikamux::model::Provider::Claude {
             ("claude", "--resume")
         } else {
             ("codex", "resume")
         };
         fs::write(board.root.path().join("bin").join(executable), format!(
-        "#!/bin/sh\ntest \"$1\" = {resume} || exit 97\nprintf '%s\\n' \"$2\" >> {}\nprintf 'FAKE AGENT READY\\n'\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\n{quota_probe}test \"$1\" = {resume} || exit 97\nprintf '%s\\n' \"$2\" >> {}\nprintf 'FAKE AGENT READY\\n'\nwhile :; do sleep 1; done\n",
         shell_words::quote(launches.to_str().unwrap())
     )).unwrap();
         let store = Store::at(board.root.path().join("state/pika.db"));
@@ -975,13 +1008,27 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             }
         }
 
+        seed_thread_quota(&store, 37.0);
+        let probes_before = fs::read_to_string(&quota_calls).unwrap_or_default();
         board.send(b"\x1b[24~");
         let viewer = board.await_thread_list(&original);
         board.await_text("Threads");
         board.await_text("zulu_other");
         let capture = board.tmux(&["capture-pane", "-p", "-t", &viewer]);
         assert!(!capture.contains("preview"));
-        assert!(!capture.contains("WEEKLY"));
+        assert!(capture.contains("WEEKLY LEFT · this machine"));
+        assert!(capture.contains("Codex  63% | Claude 0%"), "{capture}");
+        seed_thread_quota(&store, 76.0);
+        board.await_text("24%");
+        let capture = board.tmux(&["capture-pane", "-p", "-t", &viewer]);
+        assert!(capture.contains("Codex  24% | Claude 0%"), "{capture}");
+        board.send(b"r");
+        thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            fs::read_to_string(&quota_calls).unwrap_or_default(),
+            probes_before,
+            "opening and refreshing the companion must not request quota"
+        );
         assert!(!capture.contains("Useful for"));
         assert_eq!(
             board
@@ -1148,9 +1195,18 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             board.await_text("ORIGINAL BOARD");
             board.tmux(&["detach-client", "-t", &opening_client]);
         }
-        board.await_text("WEEKLY"); // Original full board, not the previous agent.
+        // WEEKLY now also exists in the compact pane. Require full-board
+        // chrome so a queued companion frame cannot masquerade as return.
+        board.await_text("resets in local time");
         drop(other);
-        assert!(board.tmux(&["list-clients"]).trim().is_empty());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !board.tmux(&["list-clients"]).trim().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "fixture terminals did not detach"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
         board.finish();
     }

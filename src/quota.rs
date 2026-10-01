@@ -18,6 +18,8 @@ use std::{
 
 pub(crate) const PROVIDERS: [Provider; 2] = [Provider::Codex, Provider::Claude];
 const REFRESH: Duration = Duration::from_secs(120);
+const LOCAL_CACHE_KEY: &str = "quota:local-view-v1";
+const MAX_CACHE_BYTES: usize = 4096;
 
 pub(crate) fn now() -> f64 {
     SystemTime::now()
@@ -26,12 +28,48 @@ pub(crate) fn now() -> f64 {
         .as_secs_f64()
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct View {
     pub node_id: Option<String>,
     pub readings: Vec<QuotaSnapshot>,
     pub delayed: bool,
     pub unavailable: Option<String>,
+}
+
+// Cross-process presentation cache in the existing board store. Only the
+// quota producer writes it; companions never start another provider lookup.
+fn cache_local(store: &Store, view: &View) -> Result<()> {
+    if view.node_id.is_some() {
+        bail!("Remote quota cannot replace this machine's reading");
+    }
+    let encoded = serde_json::to_string(view)?;
+    if encoded.len() > MAX_CACHE_BYTES {
+        bail!("Quota cache exceeds its display budget");
+    }
+    store.set_meta(LOCAL_CACHE_KEY, &encoded)
+}
+
+pub(crate) fn cached_local(store: &Store) -> View {
+    let read = || -> Option<View> {
+        let encoded = store.get_meta(LOCAL_CACHE_KEY).ok()??;
+        if encoded.len() > MAX_CACHE_BYTES {
+            return None;
+        }
+        let view: View = serde_json::from_str(&encoded).ok()?;
+        if view.node_id.is_some() || view.readings.len() > PROVIDERS.len() {
+            return None;
+        }
+        let at = now();
+        let mut providers = std::collections::BTreeSet::new();
+        for reading in &view.readings {
+            if !valid(reading, at) || !providers.insert(reading.provider) {
+                return None;
+            }
+        }
+        Some(view)
+    };
+    read().unwrap_or_default()
 }
 
 pub(crate) struct Feed {
@@ -140,6 +178,11 @@ fn observe(
             }
             if cancel.is_cancelled() {
                 break;
+            }
+            if selected.is_none() {
+                // Optional telemetry persistence cannot block normal navigation
+                // on an unavailable store or become conversation state.
+                let _ = cache_local(&store, &view);
             }
             // A lookup finishing after the user moves never labels another host's quota.
             send.publish(view.clone());
@@ -368,6 +411,77 @@ mod tests {
     }
 
     #[test]
+    fn companions_reuse_local_readings_without_mutating_the_store() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::at(root.path().join("pika.db"));
+        assert!(cached_local(&store).readings.is_empty());
+        assert!(!store.exists(), "cache inspection cannot create a database");
+        let at = now();
+        let mut sample = reading(37.0);
+        sample.observed_at = at - 600.0;
+        sample.reset_at = at as i64 + 3600;
+        let view = View {
+            readings: vec![sample],
+            delayed: true,
+            ..View::default()
+        };
+        cache_local(&store, &view).unwrap();
+        let encoded = store.get_meta(LOCAL_CACHE_KEY).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                compact_row(Provider::Codex, &cached_local(&store), at),
+                "Codex  63% stale"
+            );
+        }
+        assert_eq!(store.get_meta(LOCAL_CACHE_KEY).unwrap(), encoded);
+        let remote = View {
+            node_id: Some("other-machine".into()),
+            ..view
+        };
+        assert!(cache_local(&store, &remote).is_err());
+        assert_eq!(store.get_meta(LOCAL_CACHE_KEY).unwrap(), encoded);
+    }
+
+    #[test]
+    fn cached_quota_rejects_malformed_foreign_and_invalid_readings() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::at(root.path().join("pika.db"));
+        let at = now();
+        let mut sample = reading(0.0);
+        sample.observed_at = at;
+        sample.reset_at = at as i64 + 3600;
+        let base = json!(View {
+            readings: vec![sample],
+            ..View::default()
+        });
+        let mut invalid = Vec::new();
+        for (field, value) in [
+            ("used_percent", json!(101)),
+            ("observed_at", json!(at + 120.0)),
+            ("source", json!("\u{1b}[31m")),
+            ("provider", json!("muse")),
+        ] {
+            let mut row = base.clone();
+            row["readings"][0][field] = value;
+            invalid.push(row.to_string());
+        }
+        let mut foreign = base.clone();
+        foreign["node_id"] = json!("other-machine");
+        invalid.push(foreign.to_string());
+        let mut duplicate = base.clone();
+        duplicate["readings"]
+            .as_array_mut()
+            .unwrap()
+            .push(base["readings"][0].clone());
+        invalid.push(duplicate.to_string());
+        invalid.extend(["not JSON".into(), "x".repeat(MAX_CACHE_BYTES + 1)]);
+        for encoded in invalid {
+            store.set_meta(LOCAL_CACHE_KEY, &encoded).unwrap();
+            assert!(cached_local(&store).readings.is_empty());
+        }
+    }
+
+    #[test]
     fn quota_bar_represents_remaining_not_used_and_distinguishes_unknown_zero_and_tiny() {
         let mut view = View {
             readings: vec![reading(37.0)],
@@ -465,6 +579,10 @@ mod tests {
         let at = Instant::now();
         drop(worker);
         assert!(at.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            cached_local(&store).unavailable.as_deref(),
+            Some("not available on this device")
+        );
         assert!(store.list_sessions().unwrap().is_empty());
     }
 
