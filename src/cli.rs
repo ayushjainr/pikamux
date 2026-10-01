@@ -669,6 +669,9 @@ where
                     client.as_deref().context("Missing opening terminal")?,
                 )?;
             } else {
+                let tmux = std::env::var("PIKA_THREADS_OPENING_CLIENT")
+                    .map(|client| tmux.for_client(&client))
+                    .unwrap_or(tmux);
                 tmux.open_threads_companion(&pane, close)?;
             }
             Ok(0)

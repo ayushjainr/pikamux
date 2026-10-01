@@ -43,8 +43,16 @@ const LEGACY_RETURN_ACTION: &str =
 const THREADS_VISIBLE: &str = "#{m:*1*,#{P:#{?@pika_threads_source,#{?pane_dead,0,1},0}}}";
 
 fn return_navigation_action(mouse: bool) -> String {
+    return_navigation_action_version(mouse, true)
+}
+
+fn return_navigation_action_version(mouse: bool, capture_client: bool) -> String {
     let full = "run-shell -b '#{@pika_threads_callback} --pane #{pane_id} --board --client #{q:client_name}'";
-    let callback = "run-shell -b '#{@pika_threads_callback} --pane #{pane_id}'";
+    let callback = if capture_client {
+        "run-shell -b 'PIKA_THREADS_OPENING_CLIENT=#{q:client_name} #{@pika_threads_callback} --pane #{pane_id}'"
+    } else {
+        "run-shell -b '#{@pika_threads_callback} --pane #{pane_id}'"
+    };
     let picker = if mouse {
         full.into()
     } else {
@@ -113,6 +121,23 @@ pub(crate) struct ThreadHandoff {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadClient {
+    client: String,
+    pid: u32,
+    created: u64,
+}
+
+impl ThreadClient {
+    fn matches(&self, row: &[String]) -> bool {
+        row.len() == 5
+            && row[0] == self.client
+            && row[1] == self.pid.to_string()
+            && row[4] == self.created.to_string()
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ThreadOrigin {
     client: String,
     created: u64,
@@ -137,6 +162,12 @@ impl Default for Tmux {
 }
 
 impl Tmux {
+    pub(crate) fn for_client(&self, client: &str) -> Self {
+        Self {
+            client_name: Some(client.into()),
+            ..self.clone()
+        }
+    }
     pub fn with_executable(executable: impl Into<String>, socket_name: Option<String>) -> Self {
         Self {
             executable: executable.into(),
@@ -657,6 +688,7 @@ impl Tmux {
             bail!("invalid companion origin");
         }
         let (pane, grant) = self.companion_grant(origin, kind)?;
+        let opening_client = self.companion_client(target, kind, close)?;
         let project = self.files_pane_option(origin, "@pika_files_project")?;
         if !Path::new(&project).is_absolute() {
             bail!("No project directory is available");
@@ -687,7 +719,14 @@ impl Tmux {
         if String::from_utf8_lossy(&lock.stdout).trim() != "acquired" {
             return Ok(());
         }
-        let result = self.open_companion_locked(&pane, &grant, &project, kind, close);
+        let result = self.open_companion_locked(
+            &pane,
+            &grant,
+            &project,
+            kind,
+            close,
+            opening_client.as_ref(),
+        );
         let _ = self.output(["set-option", "-pu", "-t", origin, &opening], false);
         result
     }
@@ -699,9 +738,13 @@ impl Tmux {
         project: &str,
         kind: Companion,
         close: bool,
+        opening_client: Option<&ThreadClient>,
     ) -> Result<()> {
         let origin = &pane.pane_id;
         if let Some(existing) = self.find_companion(origin, grant, kind)? {
+            if !close {
+                self.pin_thread_client(&existing, opening_client)?;
+            }
             let action = if close { "kill-pane" } else { "select-pane" };
             self.output([action, "-t", &existing], true)?;
             return Ok(());
@@ -709,7 +752,7 @@ impl Tmux {
         if close {
             return Ok(());
         }
-        self.split_companion(pane, grant, project, kind)
+        self.split_companion(pane, grant, project, kind, opening_client)
     }
 
     fn find_companion(&self, origin: &str, grant: &str, kind: Companion) -> Result<Option<String>> {
@@ -741,6 +784,7 @@ impl Tmux {
         grant: &str,
         project: &str,
         kind: Companion,
+        opening_client: Option<&ThreadClient>,
     ) -> Result<()> {
         let origin = &pane.pane_id;
         let dims = self.output(
@@ -809,6 +853,71 @@ impl Tmux {
             bail!("Companion opened but its pane could not be identified");
         }
         self.tag_companion(&viewer, origin, grant, kind)?;
+        self.pin_thread_client(&viewer, opening_client)?;
+        Ok(())
+    }
+
+    fn thread_clients(&self) -> Result<Vec<Vec<String>>> {
+        let format = [
+            "#{client_name}",
+            "#{client_pid}",
+            "#{pane_id}",
+            "#{client_last_session}",
+            "#{client_created}",
+        ]
+        .join(FORMAT_SEPARATOR);
+        let out = self.output(["list-clients", "-F", &format], true)?;
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| tmux_fields(line).map(str::to_owned).collect())
+            .collect())
+    }
+
+    fn capture_thread_client(&self, target: &str) -> Result<Option<ThreadClient>> {
+        let Some(client) = self.client_name.as_deref() else {
+            return Ok(None);
+        };
+        let rows = self
+            .thread_clients()?
+            .into_iter()
+            .filter(|row| row.len() == 5 && row[0] == client && row[2] == target)
+            .collect::<Vec<_>>();
+        let [row] = rows.as_slice() else {
+            bail!("Your terminal changed; press F12 to reopen the thread list");
+        };
+        Ok(Some(ThreadClient {
+            client: row[0].clone(),
+            pid: row[1].parse()?,
+            created: row[4].parse()?,
+        }))
+    }
+
+    fn companion_client(
+        &self,
+        target: &str,
+        kind: Companion,
+        close: bool,
+    ) -> Result<Option<ThreadClient>> {
+        match (kind, close) {
+            (Companion::Threads, false) => self.capture_thread_client(target),
+            _ => Ok(None),
+        }
+    }
+
+    fn pin_thread_client(&self, viewer: &str, client: Option<&ThreadClient>) -> Result<()> {
+        if let Some(client) = client {
+            self.output(
+                [
+                    "set-option",
+                    "-p",
+                    "-t",
+                    viewer,
+                    "@pika_threads_client",
+                    &serde_json::to_string(client)?,
+                ],
+                true,
+            )?;
+        }
         Ok(())
     }
 
@@ -957,19 +1066,19 @@ impl Tmux {
     #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn thread_handoff(&self, origin: &str) -> Result<ThreadHandoff> {
         let viewer = std::env::var("TMUX_PANE")?;
-        let format = [
-            "#{client_name}",
-            "#{client_pid}",
-            "#{pane_id}",
-            "#{client_last_session}",
-            "#{client_created}",
-        ]
-        .join(FORMAT_SEPARATOR);
-        let out = self.output(["list-clients", "-F", &format], true)?;
-        let rows = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|line| tmux_fields(line).map(str::to_owned).collect::<Vec<_>>())
-            .filter(|row| row.len() == 5 && row[2] == viewer)
+        self.thread_handoff_in_pane(origin, &viewer)
+    }
+
+    fn thread_handoff_in_pane(&self, origin: &str, viewer: &str) -> Result<ThreadHandoff> {
+        let client = self.thread_view_client(viewer)?;
+        let rows = self
+            .thread_clients()?
+            .into_iter()
+            .filter(|row| {
+                row.len() == 5
+                    && row[2] == viewer
+                    && client.as_ref().is_none_or(|client| client.matches(row))
+            })
             .collect::<Vec<_>>();
         let [row] = rows.as_slice() else {
             bail!("The thread list is no longer focused in one terminal");
@@ -1006,6 +1115,21 @@ impl Tmux {
             feed,
             origin: route,
         })
+    }
+
+    fn thread_view_client(&self, viewer: &str) -> Result<Option<ThreadClient>> {
+        let saved = self.files_pane_option(viewer, "@pika_threads_client")?;
+        if saved.len() > 1024 {
+            bail!("The thread list's opening terminal changed");
+        }
+        if saved.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(
+                serde_json::from_str::<ThreadClient>(&saved)
+                    .context("The thread list's opening terminal changed")?,
+            ))
+        }
     }
 
     #[cfg_attr(windows, allow(dead_code))]
@@ -1216,16 +1340,14 @@ impl Tmux {
                 }
                 // Update only the exact previous Pika-owned binding. Arbitrary
                 // user bindings, even on F12, retain their existing behavior.
-                let legacy = [
-                    "if-shell",
-                    "-F",
-                    RETURN_CONDITION,
-                    LEGACY_RETURN_ACTION,
-                    &replay,
-                ];
-                if return_command_words(existing[key_index + 1..].iter().map(String::as_str))
-                    != return_command_words(legacy.into_iter())
-                {
+                let previous = return_navigation_action_version(mouse, false);
+                let known = [LEGACY_RETURN_ACTION, &previous].into_iter().any(|action| {
+                    return_command_words(existing[key_index + 1..].iter().map(String::as_str))
+                        == return_command_words(
+                            ["if-shell", "-F", RETURN_CONDITION, action, &replay].into_iter(),
+                        )
+                });
+                if !known {
                     continue;
                 }
             }
@@ -2841,6 +2963,134 @@ mod tests {
         );
         let upgraded = fs::read_to_string(&trace).unwrap();
         assert!(upgraded[calls.len()..].contains("@pika_threads_callback"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn thread_handoff_selects_its_opening_client_when_two_terminals_share_the_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let tmux = tmux_fixture(
+            &temp,
+            "case \"$*\" in\n'list-clients -F '*) printf '/dev/other\\03723456\\037%%2\\037\\037200\\n/dev/opener\\03712345\\037%%2\\037\\037100\\n';;\n*'@pika_threads_client') printf '%s' '{\"client\":\"/dev/opener\",\"pid\":12345,\"created\":100}';;\nesac",
+        );
+        let handoff = tmux.thread_handoff_in_pane("%1", "%2").unwrap();
+        assert_eq!(handoff.client, "/dev/opener");
+        assert_eq!(handoff.pid, 12345);
+        assert_eq!(handoff.created, 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn thread_handoff_never_borrows_another_or_reused_terminal() {
+        let owner = r#"{"client":"/dev/opener","pid":12345,"created":100}"#;
+        let opener = "/dev/opener\\03712345\\037%%2\\037\\037100\\n";
+        let other = "/dev/other\\03723456\\037%%2\\037\\037200\\n";
+        for (saved, rows, allowed) in [
+            ("", opener.to_owned(), true),
+            ("", format!("{opener}{other}"), false),
+            (owner, other.to_owned(), false),
+            (owner, opener.replace("12345", "54321"), false),
+            (owner, opener.replace("100", "101"), false),
+            (owner, opener.replace("%%2", "%%3"), false),
+            (owner, format!("{opener}{opener}"), false),
+            ("not-json", opener.to_owned(), false),
+            (
+                r#"{"client":"/dev/opener","pid":12345}"#,
+                opener.to_owned(),
+                false,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let trace = temp.path().join("calls");
+            let tmux = tmux_fixture(
+                &temp,
+                &format!(
+                    "printf '%s\\n' \"$*\" >> {}\ncase \"$*\" in\n'list-clients -F '*) printf '{}';;\n*'@pika_threads_client') printf '%s' {};;\nesac",
+                    shell_words::quote(trace.to_str().unwrap()),
+                    rows,
+                    shell_words::quote(saved),
+                ),
+            );
+            let result = tmux.thread_handoff_in_pane("%1", "%2");
+            assert_eq!(result.is_ok(), allowed, "saved={saved:?}, rows={rows:?}");
+            let calls = fs::read_to_string(trace).unwrap();
+            assert!(!calls.contains("switch-client"));
+            assert!(!calls.contains("kill-pane"));
+            assert!(!calls.contains("send-keys"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn thread_list_captures_only_the_invoking_terminal_at_the_requested_pane() {
+        for (rows, allowed) in [
+            ("/dev/opener\\03712345\\037%%1\\037\\037100\\n", true),
+            ("/dev/opener\\03712345\\037%%2\\037\\037100\\n", false),
+            ("/dev/other\\03712345\\037%%1\\037\\037100\\n", false),
+            ("/dev/opener\\037bad-pid\\037%%1\\037\\037100\\n", false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let tmux = tmux_fixture(
+                &temp,
+                &format!("case \"$*\" in 'list-clients -F '*) printf '{rows}';; esac"),
+            );
+            assert!(tmux.capture_thread_client("%1").unwrap().is_none());
+            let routed = tmux.for_client("/dev/opener");
+            assert_eq!(routed.capture_thread_client("%1").is_ok(), allowed);
+            assert!(
+                routed
+                    .companion_client("%1", Companion::Files, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                routed
+                    .companion_client("%1", Companion::Threads, true)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compact_list_binding_upgrades_only_the_exact_previous_pika_action() {
+        for mouse in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let trace = temp.path().join("calls");
+            let tmux = tmux_fixture(
+                &temp,
+                &format!(
+                    "printf '%s\\n' \"$*\" >> {}",
+                    shell_words::quote(trace.to_str().unwrap())
+                ),
+            );
+            let previous = return_navigation_action_version(mouse, false);
+            let key = if mouse { "MouseDown1StatusLeft" } else { "F12" };
+            let replay = if mouse {
+                "send-keys -M"
+            } else {
+                "send-keys F12"
+            };
+            let binding = format!(
+                "bind-key -T root {key} if-shell -F {} {} {}",
+                shell_words::quote(RETURN_CONDITION),
+                shell_words::quote(&previous),
+                shell_words::quote(replay),
+            );
+            assert_eq!(
+                tmux.return_binding(&binding, &[key], mouse).unwrap(),
+                Some(key)
+            );
+            let calls = fs::read_to_string(&trace).unwrap_or_default();
+            assert_eq!(calls.lines().count(), usize::from(!mouse));
+            if !mouse {
+                assert!(calls.contains("PIKA_THREADS_OPENING_CLIENT="));
+            }
+            let changed = binding.replace("@pika_threads_callback", "@user_callback");
+            assert_eq!(tmux.return_binding(&changed, &[key], mouse).unwrap(), None);
+            assert_eq!(fs::read_to_string(trace).unwrap_or_default(), calls);
+        }
     }
 
     #[cfg(unix)]

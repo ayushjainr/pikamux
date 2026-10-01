@@ -244,6 +244,10 @@ assistant or settings panels. It reuses the board's exact rows, ordering and
 activity service; the existing observation lease prevents duplicate scans.
 Arrow keys select; Enter uses the normal exact-identity open path; Escape closes
 only the companion. A second press returns to the full board and closes the list.
+The compact list captures the invoking terminal's tmux client name, PID and
+creation generation. Enter rechecks that exact client and its focus before
+routing the opening; another client sharing the same window is not a blocker
+or a substitute. Older lists without that record require one unambiguous client.
 Clicking the label goes directly to the full board. Full-board return detaches
 a fresh terminal attachment; an existing tmux client switches back to its
 original board session, including after switching between threads. None of these actions sends an exit command to

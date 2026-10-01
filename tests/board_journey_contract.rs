@@ -26,6 +26,18 @@ struct BoardProcess {
     real_tmux: bool,
 }
 
+struct OtherTerminal {
+    child: Child,
+    _terminal: File,
+}
+
+impl Drop for OtherTerminal {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn real_tmux_binary() -> std::path::PathBuf {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|path| path.join("tmux"))
@@ -50,6 +62,61 @@ impl Drop for BoardProcess {
 }
 
 impl BoardProcess {
+    fn other_terminal(&self, pane: &str) -> OtherTerminal {
+        let (mut master, mut slave) = (-1, -1);
+        let mut size = libc::winsize {
+            ws_row: 32,
+            ws_col: 140,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &raw mut size,
+                )
+            },
+            0
+        );
+        let terminal = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let environment = self.endpoint(&[]);
+        let child = Command::new(self.root.path().join("bin/tmux"))
+            .env_clear()
+            .envs(
+                environment
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
+            )
+            .env("TERM", "xterm-256color")
+            .current_dir(self.root.path().join("home"))
+            .args(["-L", "board-journey", "attach-session", "-t", pane])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap();
+        OtherTerminal {
+            child,
+            _terminal: terminal,
+        }
+    }
+
+    fn client_pane(&self, client: &str) -> String {
+        self.tmux(&["list-clients", "-F", "#{client_name}|#{pane_id}"])
+            .lines()
+            .find_map(|line| {
+                line.split_once('|')
+                    .filter(|(name, _)| *name == client)
+                    .map(|(_, pane)| pane.into())
+            })
+            .expect("the opening terminal must remain attached")
+    }
+
     fn start() -> Self {
         Self::start_with_ancestor_mode(0o700)
     }
@@ -297,7 +364,10 @@ impl BoardProcess {
                     .map(|(pane, _)| pane)
             });
             if let Some(viewer) = viewer
-                && self.tmux(&["list-clients", "-F", "#{pane_id}"]).trim() == viewer
+                && self
+                    .tmux(&["list-clients", "-F", "#{pane_id}"])
+                    .lines()
+                    .any(|pane| pane == viewer)
                 && self
                     .tmux(&["capture-pane", "-p", "-t", viewer])
                     .contains("Threads")
@@ -775,6 +845,15 @@ fn remote_f12_failed_ssh_restores_retryable_threads_and_original_board() {
 
 #[test]
 fn side_list_cancels_and_switches_without_losing_the_board_or_live_feed() {
+    side_list_journey(pikamux::model::Provider::Codex, false);
+}
+
+#[test]
+fn claude_side_list_switches_only_the_opener_when_two_terminals_share_a_window() {
+    side_list_journey(pikamux::model::Provider::Claude, true);
+}
+
+fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) {
     for from_tmux in [false, true] {
         let real_tmux = real_tmux_binary();
         let mut board = BoardProcess::start();
@@ -809,8 +888,13 @@ fn side_list_cancels_and_switches_without_losing_the_board_or_live_feed() {
             "send-keys F12",
         ]);
         let launches = board.root.path().join("launches");
-        fs::write(board.root.path().join("bin/codex"), format!(
-        "#!/bin/sh\ntest \"$1\" = resume || exit 97\nprintf '%s\\n' \"$2\" >> {}\nprintf 'FAKE AGENT READY\\n'\nwhile :; do sleep 1; done\n",
+        let (executable, resume) = if provider == pikamux::model::Provider::Claude {
+            ("claude", "--resume")
+        } else {
+            ("codex", "resume")
+        };
+        fs::write(board.root.path().join("bin").join(executable), format!(
+        "#!/bin/sh\ntest \"$1\" = {resume} || exit 97\nprintf '%s\\n' \"$2\" >> {}\nprintf 'FAKE AGENT READY\\n'\nwhile :; do sleep 1; done\n",
         shell_words::quote(launches.to_str().unwrap())
     )).unwrap();
         let store = Store::at(board.root.path().join("state/pika.db"));
@@ -822,6 +906,7 @@ fn side_list_cancels_and_switches_without_losing_the_board_or_live_feed() {
             .unwrap()
             .unwrap();
         seed.session_id = uuid::Uuid::new_v4().to_string();
+        seed.provider = provider;
         seed.name = Some("switch_origin".into());
         seed.last_activity_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -848,7 +933,7 @@ fn side_list_cancels_and_switches_without_losing_the_board_or_live_feed() {
             .unwrap();
         let original_pid = board.tmux(&["display-message", "-p", "-t", &original, "#{pane_pid}"]);
         let mut second = store
-            .get_session(pikamux::model::Provider::Codex, &seed.session_id)
+            .get_session(provider, &seed.session_id)
             .unwrap()
             .unwrap();
         second.session_id = uuid::Uuid::new_v4().to_string();
@@ -872,6 +957,22 @@ fn side_list_cancels_and_switches_without_losing_the_board_or_live_feed() {
             ]);
             board.tmux(&["switch-client", "-t", "home-board"]);
             board.tmux(&["switch-client", "-t", &original]);
+        }
+
+        let opening_client = board
+            .tmux(&["list-clients", "-F", "#{client_name}"])
+            .trim()
+            .to_owned();
+        let other = shared_terminal.then(|| board.other_terminal(&original));
+        if other.is_some() {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while board.tmux(&["list-clients"]).lines().count() != 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the second terminal did not attach"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
         }
 
         board.send(b"\x1b[24~");
@@ -947,10 +1048,23 @@ fn side_list_cancels_and_switches_without_losing_the_board_or_live_feed() {
             .unwrap();
         let destination = opened.tmux_pane.unwrap();
         assert!(!opened.unread);
-        assert_eq!(
-            board.tmux(&["list-clients", "-F", "#{pane_id}"]).trim(),
-            destination
-        );
+        assert_eq!(board.client_pane(&opening_client), destination);
+        if other.is_some() {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while board
+                .tmux(&["list-clients", "-F", "#{pane_id}"])
+                .lines()
+                .filter(|pane| *pane == original)
+                .count()
+                != 1
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the other terminal must stay with the original agent"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
         assert_eq!(
             board.tmux(&["display-message", "-p", "-t", &original, "#{pane_pid}"]),
             original_pid
@@ -1024,10 +1138,7 @@ fn side_list_cancels_and_switches_without_losing_the_board_or_live_feed() {
         // survive more than one handoff, and this open must not launch a copy.
         board.send(b"\x1b[H\x1b[B\r");
         board.await_text(&format!("exact id {}", &seed.session_id[..8]));
-        assert_eq!(
-            board.tmux(&["list-clients", "-F", "#{pane_id}"]).trim(),
-            original
-        );
+        assert_eq!(board.client_pane(&opening_client), original);
         assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
         board.send(b"\x1b[24~");
         board.await_thread_list(&original);
@@ -1035,9 +1146,10 @@ fn side_list_cancels_and_switches_without_losing_the_board_or_live_feed() {
         board.send(b"\x1b[24~");
         if from_tmux {
             board.await_text("ORIGINAL BOARD");
-            board.tmux(&["detach-client"]);
+            board.tmux(&["detach-client", "-t", &opening_client]);
         }
         board.await_text("WEEKLY"); // Original full board, not the previous agent.
+        drop(other);
         assert!(board.tmux(&["list-clients"]).trim().is_empty());
         assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
         board.finish();
