@@ -43,6 +43,162 @@ pub const MAX_SNAPSHOT_NOTICES: usize = 16;
 pub const MAX_CACHED_FLEET_ROWS: usize = 8_000;
 pub const MAX_CACHED_FLEET_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CACHED_FLEET_NODES: usize = 64;
+pub(crate) const ATTACH_OUTCOME_CAPABILITY: &str = "attach-outcome-v1";
+// Opt-in endpoint status: ordinary zero remains cancellation/unverified/unknown.
+pub(crate) const EXACT_HANDOFF_STATUS: i32 = 254;
+
+pub(crate) fn encode_attach_outcome(code: i32, exact: bool) -> i32 {
+    if code == 0 && exact {
+        EXACT_HANDOFF_STATUS
+    } else if code == EXACT_HANDOFF_STATUS {
+        1
+    } else {
+        code
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct AttachOutcome {
+    pub(crate) exit_code: i32,
+    pub(crate) exact: bool,
+}
+
+fn decode_attach_outcome(code: i32, reported: bool) -> AttachOutcome {
+    let exact = reported && code == EXACT_HANDOFF_STATUS;
+    AttachOutcome {
+        exit_code: if exact { 0 } else { code },
+        exact,
+    }
+}
+
+#[cfg(test)]
+mod attach_outcome_tests {
+    use super::*;
+
+    struct AttachTransport {
+        code: i32,
+        calls: Mutex<Vec<(String, Vec<String>, bool)>>,
+    }
+
+    impl FleetTransport for &AttachTransport {
+        fn request(&self, _: &str, _: &Value, _: bool) -> Result<Value, FleetError> {
+            panic!("an attach receipt must not add an RPC");
+        }
+
+        fn run_exact(
+            &self,
+            node: &FleetNode,
+            args: &[String],
+            tty: bool,
+        ) -> Result<i32, FleetError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((node.node_id.clone(), args.to_vec(), tty));
+            Ok(self.code)
+        }
+    }
+
+    #[test]
+    fn attach_negotiates_receipts_without_changing_exact_route_or_legacy_behavior() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::at(root.path().join("state.db"));
+        let mut node: FleetNode = serde_json::from_value(json!({
+            "node_id":"11111111-1111-4111-8111-111111111111", "alias":"display-only",
+            "ssh_target":"fake", "sources":[], "status":"ready", "capabilities":[],
+            "last_seen":0.0, "last_attempt_at":0.0, "created_at":0.0, "updated_at":0.0
+        }))
+        .unwrap();
+        let session: Session = serde_json::from_value(json!({
+            "provider":"codex", "session_id":"22222222-2222-4222-8222-222222222222",
+            "name":"display-only", "status":"WORKING", "unread":true, "source":"fixture",
+            "managed":true, "created_at":0.0, "updated_at":0.0,
+            "last_event_at":0.0, "last_activity_at":0.0, "live":true, "attached":false,
+            "home_state":"exact"
+        }))
+        .unwrap();
+        let current = FleetSession {
+            node_id: node.node_id.clone(),
+            node_name: node.alias.clone(),
+            session,
+            stale: false,
+            remote_error: None,
+            seen_at: 0.0,
+            card_status: None,
+            card_detail: None,
+            expert_scope: None,
+            expert_current_work: None,
+            expert_topics: vec![],
+            watched: true,
+            availability: None,
+            scope_updated_at: None,
+            current_state_updated_at: None,
+            current_state_status: None,
+        };
+        for capable in [false, true] {
+            node.capabilities = if capable {
+                vec![ATTACH_OUTCOME_CAPABILITY.into()]
+            } else {
+                vec![]
+            };
+            for report in [false, true] {
+                for code in [0, 1, EXACT_HANDOFF_STATUS] {
+                    let transport = AttachTransport {
+                        code,
+                        calls: Mutex::new(vec![]),
+                    };
+                    let manager = FleetManager::new(&store, &transport);
+                    let outcome = manager.run_attach_outcome(&node, &current, report).unwrap();
+                    let reported = capable && report;
+                    assert_eq!(outcome.exact, reported && code == EXACT_HANDOFF_STATUS);
+                    assert_eq!(outcome.exit_code, if outcome.exact { 0 } else { code });
+                    let calls = transport.calls.lock().unwrap();
+                    let mut expected = vec![
+                        "_fleet-open".to_owned(),
+                        "--expected-node-id".into(),
+                        node.node_id.clone(),
+                        "--provider".into(),
+                        "codex".into(),
+                        "--session-id".into(),
+                        current.session.session_id.clone(),
+                    ];
+                    if reported {
+                        expected.push("--report-handoff".into());
+                    }
+                    assert_eq!(*calls, vec![(node.node_id.clone(), expected, true)]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_negotiated_exact_success_can_populate_recent_visits() {
+        for code in 0..=255 {
+            for exact in [false, true] {
+                let reported = decode_attach_outcome(encode_attach_outcome(code, exact), true);
+                assert_eq!(reported.exact, code == 0 && exact);
+                assert_eq!(reported.exit_code == 0, code == 0);
+                if code != EXACT_HANDOFF_STATUS && !(code == 0 && exact) {
+                    assert_eq!(reported.exit_code, code);
+                }
+                let legacy = decode_attach_outcome(code, false);
+                assert!(
+                    !legacy.exact,
+                    "legacy zero or reserved status is not exact proof"
+                );
+                assert_eq!(legacy.exit_code, code);
+            }
+        }
+        assert_eq!(
+            decode_attach_outcome(0, true),
+            AttachOutcome {
+                exit_code: 0,
+                exact: false
+            }
+        );
+    }
+}
+
 pub const CAPABILITIES: &[&str] = &[
     crate::assistant_client::CAPABILITY,
     "consultation-output-v1",
@@ -50,6 +206,7 @@ pub const CAPABILITIES: &[&str] = &[
     "candidates",
     "adopt",
     "attach",
+    ATTACH_OUTCOME_CAPABILITY,
     "peek",
     "acknowledge",
     "ack-event-bound-v1",
@@ -2762,6 +2919,22 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
     }
 
     pub fn attach(&self, session: &FleetSession) -> Result<i32, FleetError> {
+        self.attach_outcome(session, false)
+            .map(|outcome| outcome.exit_code)
+    }
+
+    pub(crate) fn attach_with_outcome(
+        &self,
+        session: &FleetSession,
+    ) -> Result<AttachOutcome, FleetError> {
+        self.attach_outcome(session, true)
+    }
+
+    fn attach_outcome(
+        &self,
+        session: &FleetSession,
+        report: bool,
+    ) -> Result<AttachOutcome, FleetError> {
         // The alias is display-only and can be renamed or reassigned after a
         // board row was selected. Refresh and resolve exclusively through the
         // immutable node/provider/conversation tuple carried by that row.
@@ -2815,19 +2988,35 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
             }
         };
         validate_exact_route(&stable_node, current)?;
-        self.transport.run_exact(
-            &stable_node,
-            &[
-                "_fleet-open".to_owned(),
-                "--expected-node-id".to_owned(),
-                stable_node.node_id.clone(),
-                "--provider".to_owned(),
-                current.session.provider.as_str().to_owned(),
-                "--session-id".to_owned(),
-                current.session.session_id.clone(),
-            ],
-            true,
-        )
+        self.run_attach_outcome(&stable_node, current, report)
+    }
+
+    fn run_attach_outcome(
+        &self,
+        node: &FleetNode,
+        current: &FleetSession,
+        report: bool,
+    ) -> Result<AttachOutcome, FleetError> {
+        let reported = report
+            && node
+                .capabilities
+                .iter()
+                .any(|capability| capability == ATTACH_OUTCOME_CAPABILITY);
+        let mut arguments = vec![
+            "_fleet-open".to_owned(),
+            "--expected-node-id".to_owned(),
+            node.node_id.clone(),
+            "--provider".to_owned(),
+            current.session.provider.as_str().to_owned(),
+            "--session-id".to_owned(),
+            current.session.session_id.clone(),
+        ];
+        if reported {
+            arguments.push("--report-handoff".into());
+        }
+        self.transport
+            .run_exact(node, &arguments, true)
+            .map(|code| decode_attach_outcome(code, reported))
     }
 
     pub fn capture(&self, session: &FleetSession, lines: usize) -> Result<String, FleetError> {

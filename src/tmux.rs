@@ -120,12 +120,64 @@ pub(crate) struct ThreadHandoff {
     origin: String,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ThreadClient {
     client: String,
     pid: u32,
     created: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecentThread {
+    pub(crate) node_id: Option<String>,
+    pub(crate) provider: Provider,
+    pub(crate) session_id: String,
+}
+
+impl RecentThread {
+    fn valid(&self) -> bool {
+        crate::providers::Providers::valid_id(self.provider, &self.session_id)
+            && self.node_id.as_ref().is_none_or(|node| {
+                !node.is_empty() && node.len() <= 128 && !node.chars().any(char::is_control)
+            })
+    }
+}
+
+const RECENT_THREADS_OPTION: &str = "@pika_recent_threads";
+const RECENT_THREADS_LOCK: &str = "@pika_recent_threads_lock";
+const RECENT_THREADS_EXPIRY: &str = "@pika_recent_threads_lock_expiry";
+type RecentThreads = BTreeMap<String, Vec<RecentThread>>;
+
+fn recent_client_key(client: &ThreadClient) -> String {
+    serde_json::to_string(&(client.client.as_str(), client.pid, client.created))
+        .expect("client identity serialization")
+}
+
+fn bounded_recent_threads(bytes: &[u8], active: &[Vec<String>]) -> RecentThreads {
+    let mut histories: RecentThreads = if bytes.len() <= 128 * 1024 {
+        serde_json::from_slice(bytes).unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    histories.retain(|key, history| {
+        let Ok((client, pid, created)) = serde_json::from_str::<(String, u32, u64)>(key) else {
+            return false;
+        };
+        let identity = ThreadClient {
+            client,
+            pid,
+            created,
+        };
+        history.retain(RecentThread::valid);
+        history.truncate(10);
+        active.iter().any(|row| identity.matches(row))
+    });
+    while histories.len() > 32 {
+        histories.pop_first();
+    }
+    histories
 }
 
 impl ThreadClient {
@@ -873,6 +925,218 @@ impl Tmux {
             .collect())
     }
 
+    /// Preference metadata only: every destination still requires normal exact opening.
+    pub(crate) fn recent_threads(&self, handoff: &ThreadHandoff) -> Result<Vec<RecentThread>> {
+        let client = ThreadClient {
+            client: handoff.client.clone(),
+            pid: handoff.pid,
+            created: handoff.created,
+        };
+        let active = self.thread_clients()?;
+        if !active.iter().any(|row| client.matches(row)) {
+            bail!("The thread list's opening terminal changed");
+        }
+        let out = self.output(["show-options", "-sqv", RECENT_THREADS_OPTION], false)?;
+        Ok(bounded_recent_threads(&out.stdout, &active)
+            .remove(&recent_client_key(&client))
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn record_recent_thread(
+        &self,
+        handoff: &ThreadHandoff,
+        thread: RecentThread,
+    ) -> Result<()> {
+        self.record_client_recent_thread(
+            &ThreadClient {
+                client: handoff.client.clone(),
+                pid: handoff.pid,
+                created: handoff.created,
+            },
+            thread,
+        )
+    }
+
+    fn record_client_recent_thread(
+        &self,
+        client: &ThreadClient,
+        thread: RecentThread,
+    ) -> Result<()> {
+        if !thread.valid() {
+            bail!("Invalid recent thread identity");
+        }
+        let (token, expires) = self.acquire_recent_threads()?;
+        let acquired = Instant::now();
+        let result = (|| {
+            let active = self.thread_clients()?;
+            if !active.iter().any(|row| client.matches(row)) {
+                bail!("The opening terminal changed");
+            }
+            let out = self.output(["show-options", "-sqv", RECENT_THREADS_OPTION], false)?;
+            let mut histories = bounded_recent_threads(&out.stdout, &active);
+            let key = recent_client_key(client);
+            if !histories.contains_key(&key) && histories.len() >= 32 {
+                histories.pop_first();
+            }
+            let history = histories.entry(key).or_default();
+            history.retain(|previous| previous != &thread);
+            history.insert(0, thread);
+            history.truncate(10);
+            let current = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            if acquired.elapsed() >= Duration::from_secs(30) || current >= expires {
+                bail!("Recent thread history lease expired");
+            }
+            self.commit_recent_threads(&token, &histories)?;
+            Ok(())
+        })();
+        // Both mutation and release are fenced in the server command queue.
+        // A suspended writer cannot overwrite or unlock a successor's lease.
+        let unlock = self.release_recent_threads(&token);
+        result.and_then(|()| unlock.map(|_| ()))
+    }
+
+    fn acquire_recent_threads(&self) -> Result<(String, u64)> {
+        // A server-queue lease serializes the bounded map update without a
+        // permanent wait-for lock if a callback is interrupted. Busy history
+        // writes are cosmetic failures, never failures of a successful open.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let expires = now + 30;
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let available = format!(
+            "#{{||:#{{==:#{{{RECENT_THREADS_LOCK}}},}},#{{<=:#{{{RECENT_THREADS_EXPIRY}}},{now}}}}}"
+        );
+        let acquire = format!(
+            "set-option -s {RECENT_THREADS_LOCK} {token} ; set-option -s {RECENT_THREADS_EXPIRY} {expires} ; display-message -p acquired"
+        );
+        let deadline = Instant::now() + COMMAND_TIMEOUT;
+        loop {
+            let lock = self.output(
+                [
+                    "if-shell",
+                    "-F",
+                    &available,
+                    &acquire,
+                    "display-message -p busy",
+                ],
+                true,
+            )?;
+            if String::from_utf8_lossy(&lock.stdout).trim() == "acquired" {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("Recent thread history is busy");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok((token, expires))
+    }
+
+    fn commit_recent_threads(&self, token: &str, histories: &RecentThreads) -> Result<()> {
+        let owned = format!("#{{==:#{{{RECENT_THREADS_LOCK}}},{token}}}");
+        let commit = shell_words::join([
+            "set-option",
+            "-s",
+            RECENT_THREADS_OPTION,
+            &serde_json::to_string(histories)?,
+        ]) + " ; display-message -p committed";
+        let output = self.output(
+            [
+                "if-shell",
+                "-F",
+                &owned,
+                &commit,
+                "display-message -p stale",
+            ],
+            true,
+        )?;
+        if String::from_utf8_lossy(&output.stdout).trim() != "committed" {
+            bail!("Recent thread history lease changed");
+        }
+        Ok(())
+    }
+
+    fn release_recent_threads(&self, token: &str) -> Result<()> {
+        let owned = format!("#{{==:#{{{RECENT_THREADS_LOCK}}},{token}}}");
+        let release = format!(
+            "set-option -su {RECENT_THREADS_LOCK} ; set-option -su {RECENT_THREADS_EXPIRY}"
+        );
+        self.output(["if-shell", "-F", &owned, &release, ""], true)?;
+        Ok(())
+    }
+
+    fn record_exact_recent_thread(&self, client_name: Option<&str>, pane: &Pane) {
+        let (Some(client_name), Some(provider), Some(session_id)) = (
+            client_name,
+            pane.pika_provider,
+            pane.pika_session_id.as_ref(),
+        ) else {
+            return;
+        };
+        // Require the successful handoff's exact current client and pane; stale
+        // pane tags or a recycled client name cannot populate another terminal.
+        let Ok(Some(client)) = self
+            .for_client(client_name)
+            .capture_thread_client(&pane.pane_id)
+        else {
+            return;
+        };
+        let _ = self.record_client_recent_thread(
+            &client,
+            RecentThread {
+                node_id: None,
+                provider,
+                session_id: session_id.clone(),
+            },
+        );
+    }
+
+    fn history_client(&self, name: Option<&str>) -> Option<ThreadClient> {
+        let name = name?;
+        let rows = self.thread_clients().ok()?;
+        let mut matching = rows.iter().filter(|row| row.len() == 5 && row[0] == name);
+        let row = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        Some(ThreadClient {
+            client: row[0].clone(),
+            pid: row[1].parse().ok()?,
+            created: row[4].parse().ok()?,
+        })
+    }
+
+    fn record_captured_recent_thread(&self, client: Option<&ThreadClient>, pane: &Pane) {
+        let Some(client) = client else {
+            return;
+        };
+        let Ok(Some(current)) = self
+            .for_client(&client.client)
+            .capture_thread_client(&pane.pane_id)
+        else {
+            return;
+        };
+        if current.pid != client.pid || current.created != client.created {
+            return;
+        }
+        let (Some(provider), Some(session_id)) =
+            (pane.pika_provider, pane.pika_session_id.as_ref())
+        else {
+            return;
+        };
+        let _ = self.record_client_recent_thread(
+            client,
+            RecentThread {
+                node_id: None,
+                provider,
+                session_id: session_id.clone(),
+            },
+        );
+    }
+
     fn capture_thread_client(&self, target: &str) -> Result<Option<ThreadClient>> {
         let Some(client) = self.client_name.as_deref() else {
             return Ok(None);
@@ -1605,6 +1869,7 @@ impl Tmux {
                     .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
                     .filter(|value| !value.is_empty())
             });
+            let history_client = self.history_client(client.as_deref());
             let status =
                 bounded_output(Command::new(&argv[0]).args(&argv[1..]), COMMAND_TIMEOUT)?.status;
             if !status.success() {
@@ -1614,6 +1879,7 @@ impl Tmux {
                 });
             }
             on_started()?;
+            self.record_captured_recent_thread(history_client.as_ref(), pane);
             let delivery = self.deliver_receipt(client.as_deref(), receipt);
             return Ok(ReceiptHandoff {
                 exit_code: 0,
@@ -1644,6 +1910,7 @@ impl Tmux {
                     .expect("tmux receipt target poisoned")
                     .clone();
                 on_started()?;
+                self.record_exact_recent_thread(client.as_deref(), pane);
                 let delivery = self.deliver_receipt(client.as_deref(), receipt);
                 *delivered_callback
                     .lock()
@@ -2052,28 +2319,18 @@ impl Tmux {
         if inside_tmux {
             // Capture the invoking client before switch-client changes its
             // selected pane. A receipt must never leak to every tmux client.
-            let client_name = self.client_name.clone().or_else(|| {
-                wants_receipt
-                    .then(|| {
-                        self.output(["display-message", "-p", "#{client_name}"], false)
-                            .ok()
-                            .filter(|output| output.status.success())
-                            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-                            .filter(|value| !value.is_empty())
-                    })
-                    .flatten()
-            });
+            let client_name = self.invoking_client_name(wants_receipt || configure_navigation);
+            let history_client = configure_navigation
+                .then(|| self.history_client(client_name.as_deref()))
+                .flatten();
             let status =
                 bounded_output(Command::new(&argv[0]).args(&argv[1..]), COMMAND_TIMEOUT)?.status;
             if status.success() {
-                if let Some(receipt) = on_started()? {
-                    let mut args = vec!["display-message"];
-                    if let Some(client) = client_name.as_deref() {
-                        args.extend(["-c", client]);
-                    }
-                    args.extend(["-d", "3000", "-l", &receipt]);
-                    let _ = self.output(args, false);
+                let receipt = on_started()?;
+                if configure_navigation {
+                    self.record_captured_recent_thread(history_client.as_ref(), pane);
                 }
+                self.show_optional_receipt(client_name.as_deref(), receipt.as_deref());
             }
             Ok(status.code().unwrap_or(1))
         } else {
@@ -2104,7 +2361,12 @@ impl Tmux {
                     }
                 },
                 || {
-                    if let Some(receipt) = on_started()? {
+                    let receipt = on_started()?;
+                    if configure_navigation {
+                        let client = receipt_client.lock().expect("tmux receipt target poisoned");
+                        self.record_exact_recent_thread(client.as_deref(), pane);
+                    }
+                    if let Some(receipt) = receipt {
                         if let Some(client) = receipt_client
                             .lock()
                             .expect("tmux receipt target poisoned")
@@ -2128,6 +2390,32 @@ impl Tmux {
                 },
             )
         }
+    }
+
+    fn invoking_client_name(&self, needed: bool) -> Option<String> {
+        self.client_name.clone().or_else(|| {
+            needed
+                .then(|| {
+                    self.output(["display-message", "-p", "#{client_name}"], false)
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                        .filter(|value| !value.is_empty())
+                })
+                .flatten()
+        })
+    }
+
+    fn show_optional_receipt(&self, client: Option<&str>, receipt: Option<&str>) {
+        let Some(receipt) = receipt else {
+            return;
+        };
+        let mut args = vec!["display-message"];
+        if let Some(client) = client {
+            args.extend(["-c", client]);
+        }
+        args.extend(["-d", "3000", "-l", receipt]);
+        let _ = self.output(args, false);
     }
 
     fn attach_with_started_mode<F>(
@@ -2736,6 +3024,90 @@ fn agent_wrapper(
 mod tests {
     use super::*;
 
+    #[test]
+    fn recent_history_is_exact_terminal_scoped_and_bounded() {
+        let client = ThreadClient {
+            client: "/dev/test".into(),
+            pid: 7,
+            created: 10,
+        };
+        let thread = RecentThread {
+            node_id: Some("node-exact".into()),
+            provider: Provider::Codex,
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+        };
+        let key = recent_client_key(&client);
+        let encoded =
+            serde_json::to_vec(&BTreeMap::from([(key.clone(), vec![thread.clone(); 20])])).unwrap();
+        let row = vec![
+            client.client.clone(),
+            "7".into(),
+            "%1".into(),
+            "".into(),
+            "10".into(),
+        ];
+        let histories = bounded_recent_threads(&encoded, std::slice::from_ref(&row));
+        assert_eq!(histories[&key].len(), 10);
+        assert_eq!(histories[&key][0], thread);
+        for field in [0, 1, 4] {
+            let mut reused = row.clone();
+            reused[field].push('1');
+            assert!(bounded_recent_threads(&encoded, &[reused]).is_empty());
+        }
+        assert!(bounded_recent_threads(&encoded, &[]).is_empty());
+        assert!(bounded_recent_threads(&vec![b' '; 128 * 1024 + 1], &[row]).is_empty());
+    }
+
+    #[test]
+    fn recent_history_rejects_unbounded_or_nonexact_destinations() {
+        let mut thread = RecentThread {
+            node_id: None,
+            provider: Provider::Claude,
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+        };
+        assert!(thread.valid());
+        thread.session_id = "provider-generated-title".into();
+        assert!(!thread.valid());
+        thread.session_id = "11111111-1111-4111-8111-111111111111".into();
+        thread.node_id = Some("a\nnode".into());
+        assert!(!thread.valid());
+        thread.node_id = None;
+        thread.provider = Provider::Opencode;
+        thread.session_id = "ses_exact1234".into();
+        assert!(thread.valid());
+        thread.session_id = "ses_bad\nidentity".into();
+        assert!(!thread.valid());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_exact_attach_records_only_the_successfully_opened_terminal() {
+        for fail in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let trace = temp.path().join("history-trace");
+            let tmux = tmux_fixture(&temp, &format!(
+                "printf '%s\\n' \"$*\" >> {}\ncase \"$*\" in\n*'@pika_recent_threads_lock'*'acquired'*) printf acquired;;\n*'@pika_recent_threads_lock'*'committed'*) printf committed;;\n'list-clients -F '*) printf '/dev/fixture\\03712345\\037%%1\\037\\037100\\n';;\n*'if-shell -F -t %1'*'switch-client'*) exit {};;\nesac",
+                shell_words::quote(trace.to_str().unwrap()),
+                if fail { 75 } else { 0 },
+            )).for_client("/dev/fixture");
+            let result = tmux
+                .attach_exact_with_observed_receipt_mode(
+                    &exact_test_pane(),
+                    "receipt",
+                    true,
+                    || Ok(()),
+                )
+                .unwrap();
+            assert_eq!(result.exit_code, if fail { 75 } else { 0 });
+            let calls = fs::read_to_string(&trace).unwrap();
+            assert_eq!(calls.contains("set-option -s @pika_recent_threads "), !fail);
+            if !fail {
+                assert!(calls.contains("11111111-1111-4111-8111-111111111111"));
+                assert!(calls.contains("12345,100"));
+            }
+        }
+    }
+
     #[cfg(unix)]
     use std::{fs, os::unix::fs::PermissionsExt};
 
@@ -3326,6 +3698,105 @@ mod tests {
     impl Drop for IsolatedTmux {
         fn drop(&mut self) {
             let _ = self.0.output(["kill-server"], false);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_recent_history_fences_expired_writers_and_concurrent_clients() {
+        let server = IsolatedTmux::new().unwrap();
+        let tmux = &server.0;
+        let mut clients = (0..2)
+            .map(|_| {
+                tmux.command()
+                    .args(["-C", "attach-session", "-t", "pika-c-return-test"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let rows = loop {
+            let rows = tmux.thread_clients().unwrap();
+            if rows.len() == 2 {
+                break rows;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "isolated clients failed to attach"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let identities = rows
+            .iter()
+            .map(|row| ThreadClient {
+                client: row[0].clone(),
+                pid: row[1].parse().unwrap(),
+                created: row[4].parse().unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let destination = |provider| RecentThread {
+            node_id: None,
+            provider,
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+        };
+        tmux.output(
+            ["set-option", "-s", RECENT_THREADS_LOCK, "stale-owner"],
+            true,
+        )
+        .unwrap();
+        tmux.output(["set-option", "-s", RECENT_THREADS_EXPIRY, "1"], true)
+            .unwrap();
+        let stale = BTreeMap::from([(
+            recent_client_key(&identities[0]),
+            vec![destination(Provider::Muse)],
+        )]);
+        tmux.record_client_recent_thread(&identities[0], destination(Provider::Codex))
+            .unwrap();
+        // A new lease is already owned by someone else. The suspended old
+        // writer can neither replace the map nor clear that successor's lock.
+        tmux.output(["set-option", "-s", RECENT_THREADS_LOCK, "successor"], true)
+            .unwrap();
+        tmux.output(
+            ["set-option", "-s", RECENT_THREADS_EXPIRY, "9999999999"],
+            true,
+        )
+        .unwrap();
+        assert!(tmux.commit_recent_threads("stale-owner", &stale).is_err());
+        tmux.release_recent_threads("stale-owner").unwrap();
+        assert_eq!(
+            tmux.output(["show-options", "-sqv", RECENT_THREADS_LOCK], true)
+                .unwrap()
+                .stdout,
+            b"successor\n"
+        );
+        tmux.release_recent_threads("successor").unwrap();
+        thread::scope(|scope| {
+            for (identity, provider) in identities.iter().zip([Provider::Codex, Provider::Claude]) {
+                scope.spawn(move || {
+                    tmux.record_client_recent_thread(identity, destination(provider))
+                        .unwrap()
+                });
+            }
+        });
+        let out = tmux
+            .output(["show-options", "-sqv", RECENT_THREADS_OPTION], true)
+            .unwrap();
+        let histories = bounded_recent_threads(&out.stdout, &rows);
+        assert_eq!(histories.len(), 2);
+        assert_eq!(
+            histories[&recent_client_key(&identities[0])],
+            vec![destination(Provider::Codex)]
+        );
+        assert_eq!(
+            histories[&recent_client_key(&identities[1])],
+            vec![destination(Provider::Claude)]
+        );
+        for client in &mut clients {
+            let _ = client.kill();
+            let _ = client.wait();
         }
     }
 

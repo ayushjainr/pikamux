@@ -250,8 +250,23 @@ Pika-owned native-agent homes show a single bottom navigation row: `← Pika`
 and the available return key, normally F12. One press opens a compact thread
 list beside the agent (below it in narrow terminals), with a compact cached
 weekly-usage footer but no preview, assistant or settings panels. It reuses the
-board's exact rows, ordering and activity service; the existing observation
-lease prevents duplicate scans.
+board's exact rows and activity service; the existing observation lease prevents
+duplicate scans. The full board retains attention ordering. The compact list
+leads with the invoking terminal's recent working set: `1` is Back to the
+previous thread and `2`–`9` open other recent visits. Current-thread orientation
+is separate, not a redundant choice. Other board members remain below recents,
+with arrow/Enter navigation. Numbered destinations and row order stay fixed for
+one open picker, including failed-open redisplay; names and status may refresh.
+Missing destinations stay unavailable, never reassigned to another thread.
+History is bounded exact node/provider/UUID preference metadata in the existing
+tmux server, keyed by client name, PID and creation generation. It records
+successful verified Pika handoffs, or seeds the exact currently observed origin
+when a launch acquired its identity after attachment; it never invents a previous
+visit. Failed, cancelled and unverified opens do not add visits. Remote
+`attach-outcome-v1` peers return an opt-in exact native receipt
+outcome over the existing attachment process; older peers remain openable but
+cannot supply verified recent visits to the coordinator. This adds no RPC,
+observer, database, daemon, model call or Ctrl/Alt/Command-number binding.
 Arrow keys select; Enter uses the normal exact-identity open path; Escape closes
 only the companion. A second press returns to the full board and closes the list.
 The compact list captures the invoking terminal's tmux client name, PID and

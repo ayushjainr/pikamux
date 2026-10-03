@@ -591,6 +591,8 @@ struct FleetOpenArgs {
     session_id: String,
     #[arg(long, value_parser = crate::activity_feed::token)]
     board_feed: Option<String>,
+    #[arg(long)]
+    report_handoff: bool,
 }
 #[derive(Args, Debug)]
 struct BoardFeedArgs {
@@ -936,6 +938,7 @@ fn run_threads(pika: &Pika, origin: &str) -> Result<i32> {
         .pika_session_id
         .unwrap_or_else(|| format!("pending:{}", pane.pika_launch_token.unwrap()));
     let current = (pane.pika_provider.unwrap(), identity);
+    let recent = current_thread_visits(pika, origin, &current).unwrap_or_default();
     // The observation lease makes this a cache follower when the board's
     // producer is running; otherwise the same service takes over. Quota is a
     // cache-only consumer; no quota, preview, consultation or update worker
@@ -946,7 +949,13 @@ fn run_threads(pika: &Pika, origin: &str) -> Result<i32> {
         Some(crate::activity_feed::Context::Source(source.clone())),
         || {
             loop {
-                match monitor::run_thread_list(&source, &pika.store, &current, &mut memory)? {
+                match monitor::run_thread_list(
+                    &source,
+                    &pika.store,
+                    &current,
+                    &recent,
+                    &mut memory,
+                )? {
                     BoardAction::Open(item) => match switch_thread(pika, &source, origin, item) {
                         Ok(0) => return Ok(0),
                         outcome => {
@@ -965,6 +974,30 @@ fn run_threads(pika: &Pika, origin: &str) -> Result<i32> {
     )
 }
 
+fn current_thread_visits(
+    pika: &Pika,
+    origin: &str,
+    current: &(Provider, String),
+) -> Result<Vec<crate::tmux::RecentThread>> {
+    let handoff = pika.tmux.thread_handoff(origin)?;
+    let mut recent = pika.tmux.recent_threads(&handoff)?;
+    let visit = crate::tmux::RecentThread {
+        node_id: None,
+        provider: current.0,
+        session_id: current.1.clone(),
+    };
+    // New launches may acquire their exact identity after the initial attach.
+    // Seed only this observed visit, never a guessed predecessor.
+    if !recent.contains(&visit)
+        && let Some(session) = pika.store.get_session(current.0, &current.1).ok().flatten()
+        && pika.exact_pane_binding(&session, Some(origin)).is_ok()
+        && pika.tmux.record_recent_thread(&handoff, visit).is_ok()
+    {
+        recent = pika.tmux.recent_threads(&handoff).unwrap_or(recent);
+    }
+    Ok(recent)
+}
+
 fn switch_thread(
     pika: &Pika,
     source: &crate::activity_feed::Source,
@@ -972,6 +1005,11 @@ fn switch_thread(
     item: BoardItem,
 ) -> Result<i32> {
     let remote = item.node_id.is_some();
+    let recent = crate::tmux::RecentThread {
+        node_id: item.node_id.clone(),
+        provider: item.session.provider,
+        session_id: item.session.session_id.clone(),
+    };
     let handoff = pika.tmux.thread_handoff(origin)?;
     let mut routed = pika.clone();
     routed.tmux = pika.tmux.for_thread_handoff(&handoff);
@@ -983,7 +1021,8 @@ fn switch_thread(
             .clone()
             .map(crate::activity_feed::Context::Remote)
     };
-    let open = || crate::activity_feed::with(context, || open_board_item(&routed, item));
+    let open =
+        || crate::activity_feed::with(context, || open_board_item_outcome(&routed, item, remote));
     // A fleet SSH handoff fills the terminal and gives navigation keys to the
     // remote harness; failures restore this list so the user can retry.
     let result = if remote {
@@ -991,13 +1030,16 @@ fn switch_thread(
     } else {
         open()
     };
-    if matches!(result, Ok(0)) {
+    if matches!(result, Ok((0, _))) {
+        if matches!(result, Ok((0, true))) {
+            let _ = pika.tmux.record_recent_thread(&handoff, recent);
+        }
         pika.tmux.finish_thread_handoff(&handoff)?;
         if remote {
             pika.tmux.return_remote_handoff(&handoff)?;
         }
     }
-    result
+    result.map(|(code, _)| code)
 }
 
 fn finish_board_action(pika: &Pika, action: BoardAction) -> Result<i32> {
@@ -1137,9 +1179,13 @@ fn exact_remote(pika: &Pika, item: &BoardItem) -> Result<fleet::FleetSession> {
 }
 
 fn open_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
+    open_board_item_outcome(pika, item, false).map(|(code, _)| code)
+}
+
+fn open_board_item_outcome(pika: &Pika, item: BoardItem, report: bool) -> Result<(i32, bool)> {
     if let Some(token) = item.pending_token.as_deref() {
         let receipt = pika.open_pending(token, true)?;
-        return finish_local_open(pika, &receipt);
+        return finish_local_open(pika, &receipt).map(|code| (code, false));
     }
     if item.node_id.is_some() {
         let remote = exact_remote(pika, &item)?;
@@ -1149,11 +1195,17 @@ fn open_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
             remote.session.provider,
             &remote.session.session_id,
         )? {
-            return Ok(code);
+            return Ok((code, false));
         }
-        return FleetManager::new(&pika.store, SshTransport::default())
-            .attach(&remote)
-            .map_err(anyhow::Error::from);
+        let manager = FleetManager::new(&pika.store, SshTransport::default());
+        return if report {
+            manager
+                .attach_with_outcome(&remote)
+                .map(|outcome| (outcome.exit_code, outcome.exact))
+        } else {
+            manager.attach(&remote).map(|code| (code, false))
+        }
+        .map_err(anyhow::Error::from);
     }
     let local_node_id = pika.store.ensure_local_node_id()?;
     if let Some(code) = maybe_open_client_window(
@@ -1162,9 +1214,9 @@ fn open_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
         item.session.provider,
         &item.session.session_id,
     )? {
-        return Ok(code);
+        return Ok((code, false));
     }
-    open_local_session(pika, item.session)
+    open_local_session(pika, item.session).map(|code| (code, false))
 }
 
 fn open_local_session(pika: &Pika, session: Session) -> Result<i32> {
@@ -1172,8 +1224,20 @@ fn open_local_session(pika: &Pika, session: Session) -> Result<i32> {
 }
 
 fn open_local_session_inner(pika: &Pika, session: Session) -> Result<i32> {
+    open_local_session_recorded(pika, session, &mut |_| {})
+}
+
+fn open_local_session_recorded(
+    pika: &Pika,
+    session: Session,
+    on_receipt: &mut impl FnMut(&crate::core::OpenReceipt),
+) -> Result<i32> {
+    let mut finish = |receipt: crate::core::OpenReceipt| {
+        on_receipt(&receipt);
+        finish_local_open(pika, &receipt)
+    };
     match pika.open_session(session.clone(), true) {
-        Ok(receipt) => finish_local_open(pika, &receipt),
+        Ok(receipt) => finish(receipt),
         Err(error)
             if matches!(
                 error.downcast_ref::<OpenError>(),
@@ -1210,7 +1274,7 @@ fn open_local_session_inner(pika: &Pika, session: Session) -> Result<i32> {
                         session.provider
                     );
                     let receipt = pika.clean_and_attach(session, (pid, generation), true)?;
-                    finish_local_open(pika, &receipt)
+                    finish(receipt)
                 }
                 "3" | "q" | "cancel" => {
                     eprintln!("pika: Cancelled. No state changed.");
@@ -1231,7 +1295,7 @@ fn open_local_session_inner(pika: &Pika, session: Session) -> Result<i32> {
             // race. It never retries provider execution; only proven exact
             // handoffs can acknowledge the selected event.
             match pika.recover_existing_session(session.clone(), true) {
-                Ok(receipt) => finish_local_open(pika, &receipt),
+                Ok(receipt) => finish(receipt),
                 Err(retry) if identity_unproven_error(&retry) => {
                     open_unverified_existing_terminal(pika, session, retry)
                 }
@@ -5857,13 +5921,33 @@ fn fleet_stdio(pika: &Pika, a: FleetInternalArgs) -> Result<i32> {
 fn fleet_open(pika: &Pika, a: FleetOpenArgs) -> Result<i32> {
     verify_local_node(pika, &a.expected_node_id)?;
     let session = exact_local_session(pika, a.provider, &a.session_id, true)?;
-    crate::activity_feed::with(
+    let mut exact = false;
+    let code = crate::activity_feed::with(
         a.board_feed
             .map(crate::activity_feed::Context::Remote)
             .or_else(crate::activity_feed::current),
-        || with_open_activity(pika, || open_local_session_inner(pika, session)),
-    )
+        || {
+            with_open_activity(pika, || {
+                open_local_session_recorded(pika, session, &mut |receipt| {
+                    exact = exact_attach_receipt(receipt);
+                })
+            })
+        },
+    )?;
+    Ok(if a.report_handoff {
+        fleet::encode_attach_outcome(code, exact)
+    } else {
+        code
+    })
 }
+
+fn exact_attach_receipt(receipt: &crate::core::OpenReceipt) -> bool {
+    receipt.kind != "UNVERIFIED TERMINAL"
+        && matches!(receipt.target, crate::core::OpenTarget::Session(_))
+        && receipt.receipt_delivery.is_some()
+        && receipt.exit_code == 0
+}
+
 fn client_fleet_open(pika: &Pika, a: ClientFleetOpenArgs) -> Result<i32> {
     verify_local_node(pika, &a.expected_node_id)?;
     if a.target_node_id == a.expected_node_id {
@@ -5874,6 +5958,7 @@ fn client_fleet_open(pika: &Pika, a: ClientFleetOpenArgs) -> Result<i32> {
                 provider: a.provider,
                 session_id: a.session_id,
                 board_feed: None,
+                report_handoff: false,
             },
         );
     }
@@ -6210,6 +6295,46 @@ mod fleet_consultation_tests {
     use crate::model::Status;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn recent_remote_visits_require_exact_interactive_receipts() {
+        let root = tempfile::tempdir().unwrap();
+        for kind in ["OPENED", "RESUMED", "UNVERIFIED TERMINAL"] {
+            for delivery in [
+                None,
+                Some(crate::tmux::ReceiptDelivery::TmuxClient),
+                Some(crate::tmux::ReceiptDelivery::InvokingTerminal),
+                Some(crate::tmux::ReceiptDelivery::Failed),
+            ] {
+                for code in [0, 1, 124, 254] {
+                    let mut receipt = crate::core::OpenReceipt {
+                        target: crate::core::OpenTarget::Session(Box::new(fixture_session(
+                            root.path(),
+                        ))),
+                        kind,
+                        exit_code: code,
+                        receipt_delivery: delivery,
+                    };
+                    assert_eq!(
+                        exact_attach_receipt(&receipt),
+                        kind != "UNVERIFIED TERMINAL" && delivery.is_some() && code == 0,
+                        "{kind}, {delivery:?}, {code}"
+                    );
+                    let pending = pending_from_board_item(&pending_untrack_item(
+                        root.path(),
+                        "pending-fixture",
+                        1.0,
+                        None,
+                    ));
+                    receipt.target = crate::core::OpenTarget::Pending(Box::new(pending));
+                    assert!(
+                        !exact_attach_receipt(&receipt),
+                        "pending is never exact history"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn board_remains_connected_after_multiple_opens_and_exits_on_quit() {

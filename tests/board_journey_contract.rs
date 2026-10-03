@@ -24,11 +24,84 @@ struct BoardProcess {
     output: String,
     root: tempfile::TempDir,
     real_tmux: bool,
+    recording: Option<Recording>,
+}
+
+struct Recording {
+    file: File,
+    directory: std::path::PathBuf,
+    started: Instant,
+    checkpoints: Vec<serde_json::Value>,
+}
+
+impl Recording {
+    fn start() -> Option<Self> {
+        let directory = std::path::PathBuf::from(std::env::var_os("PIKA_E2E_RECORD_DIR")?);
+        assert!(directory.is_absolute() && directory.is_dir());
+        let mut file = File::create(directory.join("side-list.cast")).unwrap();
+        writeln!(file, "{}", serde_json::json!({"version":2,"width":140,"height":32,"title":"Pika real PTY recent-thread journey","env":{"TERM":"xterm-256color"}})).unwrap();
+        Some(Self {
+            file,
+            directory,
+            started: Instant::now(),
+            checkpoints: Vec::new(),
+        })
+    }
+
+    fn event(&mut self, kind: &str, value: &str) {
+        writeln!(
+            self.file,
+            "{}",
+            serde_json::json!([self.started.elapsed().as_secs_f64(), kind, value])
+        )
+        .unwrap();
+        self.file.flush().unwrap();
+    }
 }
 
 struct OtherTerminal {
     child: Child,
     _terminal: File,
+}
+
+#[test]
+fn pika_exit_receipt_is_not_a_second_provider_identity_owner() {
+    let identity = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let record = |pid, argv: &[&str]| pikamux::process::ProcessRecord {
+        pid,
+        parent_pid: None,
+        start_time: 1,
+        argv: argv.iter().map(|value| (*value).to_owned()).collect(),
+    };
+    let records = std::collections::BTreeMap::from([
+        (1, record(1, &["codex", "resume", identity])),
+        (
+            2,
+            record(
+                2,
+                &[
+                    env!("CARGO_BIN_EXE_pika"),
+                    "_process-exit",
+                    "--provider",
+                    "codex",
+                    "--session-id",
+                    identity,
+                    "--code",
+                    "0",
+                ],
+            ),
+        ),
+    ]);
+    assert_eq!(
+        pikamux::process::find_session_processes(
+            identity,
+            pikamux::model::Provider::Codex,
+            &records,
+        ),
+        vec![1],
+        "Pika's receipt arguments are not evidence of another provider client"
+    );
+    assert_eq!(records[&2].provider(), None);
 }
 
 impl Drop for OtherTerminal {
@@ -62,7 +135,7 @@ impl Drop for BoardProcess {
 }
 
 impl BoardProcess {
-    fn other_terminal(&self, pane: &str) -> OtherTerminal {
+    fn other_terminal(&self, target: &str, exact_open: bool) -> OtherTerminal {
         let (mut master, mut slave) = (-1, -1);
         let mut size = libc::winsize {
             ws_row: 32,
@@ -83,18 +156,31 @@ impl BoardProcess {
             0
         );
         let terminal = unsafe { File::from_raw_fd(master) };
+        let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
         let slave = unsafe { File::from_raw_fd(slave) };
-        let environment = self.endpoint(&[]);
-        let child = Command::new(self.root.path().join("bin/tmux"))
-            .env_clear()
-            .envs(
-                environment
-                    .get_envs()
-                    .filter_map(|(key, value)| value.map(|value| (key, value))),
-            )
+        let mut command = if exact_open {
+            self.endpoint(&["open", target])
+        } else {
+            let environment = self.endpoint(&[]);
+            let mut command = Command::new(self.root.path().join("bin/tmux"));
+            command
+                .env_clear()
+                .envs(
+                    environment
+                        .get_envs()
+                        .filter_map(|(key, value)| value.map(|value| (key, value))),
+                )
+                .args(["-L", "board-journey", "attach-session", "-t", target]);
+            command
+        };
+        let child = command
             .env("TERM", "xterm-256color")
+            .env("SHELL", "/bin/sh")
             .current_dir(self.root.path().join("home"))
-            .args(["-L", "board-journey", "attach-session", "-t", pane])
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave))
@@ -252,14 +338,77 @@ impl BoardProcess {
             output: String::new(),
             root,
             real_tmux: false,
+            recording: Recording::start(),
         };
         board.await_text("audit_saved");
         board
     }
 
     fn send(&mut self, keys: &[u8]) {
+        if let Some(recording) = &mut self.recording {
+            recording.event("i", &String::from_utf8_lossy(keys));
+            let label = match keys {
+                b"\x1b[24~" => "F12",
+                b"\x1b" => "Esc",
+                b"1" => "1 · previous thread",
+                b"2" => "2 · other recent thread",
+                b"\x1b[F\r" => "End, Enter · open unvisited thread",
+                _ => "keyboard input",
+            };
+            recording.event("m", label);
+        }
         self.output.clear();
         self.terminal.write_all(keys).unwrap();
+    }
+
+    fn receive(&mut self, bytes: &[u8]) {
+        let output = String::from_utf8_lossy(bytes);
+        if let Some(recording) = &mut self.recording {
+            recording.event("o", &output);
+        }
+        self.output.push_str(&output);
+    }
+
+    fn checkpoint(&mut self, label: &str, store: &Store) {
+        if self.recording.is_none() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(1100);
+        while Instant::now() < deadline {
+            let mut bytes = [0; 32768];
+            if let Ok(count) = self.terminal.read(&mut bytes) {
+                self.receive(&bytes[..count]);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let panes = self.tmux(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}|#{pane_pid}|#{@pika_provider}|#{@pika_session_id}|#{@pika_threads_source}",
+        ]);
+        let clients = self.tmux(&[
+            "list-clients",
+            "-F",
+            "#{client_name}|#{client_pid}|#{pane_id}|#{client_created}",
+        ]);
+        let screens: Vec<_> = panes.lines().filter_map(|line| {
+            let pane = line.split('|').next()?;
+            Some(serde_json::json!({"pane":pane,"raw_screen":self.tmux(&["capture-pane", "-p", "-t", pane])}))
+        }).collect();
+        let launches = fs::read_to_string(self.root.path().join("launches")).unwrap_or_default();
+        let sessions = store.list_sessions().unwrap();
+        let processes: Vec<_> = pikamux::process::snapshot().values()
+            .filter(|record| record.argv.iter().any(|argument| argument.contains(self.root.path().to_str().unwrap()) || sessions.iter().any(|session| argument == &session.session_id)))
+            .map(|record| serde_json::json!({"pid":record.pid,"parent_pid":record.parent_pid,"start_time":record.start_time,"argv":record.argv,"provider":record.provider()})).collect();
+        let recording = self.recording.as_mut().unwrap();
+        recording.event("m", label);
+        recording.checkpoints.push(serde_json::json!({"label":label,"at":recording.started.elapsed().as_secs_f64(),"panes":panes,"clients":clients,"screens":screens,"launches":launches,"sessions":sessions,"processes":processes}));
+        fs::write(
+            recording.directory.join("checkpoints.json"),
+            serde_json::to_vec_pretty(&recording.checkpoints).unwrap(),
+        )
+        .unwrap();
     }
 
     fn endpoint(&self, args: &[&str]) -> Command {
@@ -326,7 +475,7 @@ impl BoardProcess {
         loop {
             let mut bytes = [0; 32768];
             match self.terminal.read(&mut bytes) {
-                Ok(n) => self.output.push_str(&String::from_utf8_lossy(&bytes[..n])),
+                Ok(n) => self.receive(&bytes[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => panic!("terminal read: {e}; output: {}", self.output),
             }
@@ -348,6 +497,7 @@ impl BoardProcess {
         }
     }
 
+    #[track_caller]
     fn await_thread_list(&mut self, origin: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -380,8 +530,7 @@ impl BoardProcess {
             );
             let mut bytes = [0; 32768];
             if let Ok(count) = self.terminal.read(&mut bytes) {
-                self.output
-                    .push_str(&String::from_utf8_lossy(&bytes[..count]));
+                self.receive(&bytes[..count]);
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -395,8 +544,7 @@ impl BoardProcess {
             // output continuously, and a full PTY must not manufacture a hang.
             let mut bytes = [0; 32768];
             if let Ok(count) = self.terminal.read(&mut bytes) {
-                self.output
-                    .push_str(&String::from_utf8_lossy(&bytes[..count]));
+                self.receive(&bytes[..count]);
             }
             if let Some(status) = self.child.try_wait().unwrap() {
                 assert!(status.success());
@@ -405,8 +553,7 @@ impl BoardProcess {
                     if count == 0 {
                         break;
                     }
-                    self.output
-                        .push_str(&String::from_utf8_lossy(&bytes[..count]));
+                    self.receive(&bytes[..count]);
                 }
                 break;
             }
@@ -877,7 +1024,12 @@ fn seed_thread_quota(store: &Store, codex_used: f64) {
 }
 
 fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) {
+    let recording = std::env::var_os("PIKA_E2E_RECORD_DIR").is_some();
+    let shared_terminal = shared_terminal || recording;
     for from_tmux in [false, true] {
+        if recording && from_tmux {
+            break;
+        }
         let real_tmux = real_tmux_binary();
         let mut board = BoardProcess::start();
         fs::write(
@@ -965,6 +1117,7 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             .tmux_pane
             .unwrap();
         let original_pid = board.tmux(&["display-message", "-p", "-t", &original, "#{pane_pid}"]);
+        board.checkpoint("A · exact original opened", &store);
         let mut second = store
             .get_session(provider, &seed.session_id)
             .unwrap()
@@ -996,7 +1149,7 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             .tmux(&["list-clients", "-F", "#{client_name}"])
             .trim()
             .to_owned();
-        let other = shared_terminal.then(|| board.other_terminal(&original));
+        let mut other = shared_terminal.then(|| board.other_terminal(&original, false));
         if other.is_some() {
             let deadline = Instant::now() + Duration::from_secs(3);
             while board.tmux(&["list-clients"]).lines().count() != 2 {
@@ -1010,10 +1163,17 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
 
         seed_thread_quota(&store, 37.0);
         let probes_before = fs::read_to_string(&quota_calls).unwrap_or_default();
+        let recovered_history = provider == pikamux::model::Provider::Codex && !from_tmux;
+        if recovered_history {
+            // A pending launch can be certified after its initial attachment.
+            // The first F12 must recover the currently proven exact visit.
+            board.tmux(&["set-option", "-s", "@pika_recent_threads", "{}"]);
+        }
         board.send(b"\x1b[24~");
         let viewer = board.await_thread_list(&original);
         board.await_text("Threads");
         board.await_text("zulu_other");
+        board.checkpoint("F12 · compact picker beside A", &store);
         let capture = board.tmux(&["capture-pane", "-p", "-t", &viewer]);
         assert!(!capture.contains("preview"));
         assert!(capture.contains("WEEKLY LEFT · this machine"));
@@ -1051,6 +1211,7 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
         );
         board.send(b"\x1b");
         board.await_text("FAKE AGENT READY");
+        board.checkpoint("Esc · picker closed, A still running", &store);
         let deadline = Instant::now() + Duration::from_secs(3);
         while board
             .tmux(&["list-panes", "-t", &original, "-F", "#{pane_id}"])
@@ -1117,6 +1278,30 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             original_pid
         );
         assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
+        board.checkpoint(
+            "B · unvisited thread opened through arrows and Enter",
+            &store,
+        );
+        if recovered_history {
+            board.send(b"\x1b[24~");
+            board.await_thread_list(&destination);
+            board.await_text("Threads");
+            board.send(b"1");
+            board.await_text(&format!("exact id {}", &seed.session_id[..8]));
+            assert_eq!(board.client_pane(&opening_client), original);
+            board.checkpoint(
+                "1 · returned to A after recovering missing visit history",
+                &store,
+            );
+            board.send(b"\x1b[24~");
+            board.await_thread_list(&original);
+            board.await_text("Threads");
+            board.send(b"1");
+            board.await_text(&format!("exact id {}", &second.session_id[..8]));
+            assert_eq!(board.client_pane(&opening_client), destination);
+            board.checkpoint("1 · returned to B, same live process", &store);
+            assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
+        }
 
         // The old board producer remains connected after the side-view exits.
         board.output.clear();
@@ -1171,22 +1356,153 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             // A real client continuously drains the PTY while status changes.
             let mut bytes = [0; 32768];
             if let Ok(count) = board.terminal.read(&mut bytes) {
-                board
-                    .output
-                    .push_str(&String::from_utf8_lossy(&bytes[..count]));
+                board.receive(&bytes[..count]);
             }
             thread::sleep(Duration::from_millis(20));
         }
         assert!(!board.output.contains("Board disconnected"));
+        // A third verified visit makes number 2 distinguishable from the
+        // previous-thread shortcut. An unvisited row remains arrow/Enter-only.
+        let mut third = second.clone();
+        third.session_id = uuid::Uuid::new_v4().to_string();
+        third.name = Some("zz_third_visit".into());
+        third.tmux_session = None;
+        third.tmux_pane = None;
+        third.root_pid = None;
+        third.status = Status::Parked;
+        store.upsert_session(&third, false).unwrap();
         board.send(b"\x1b[24~");
         board.await_thread_list(&destination);
         board.await_text("Threads");
-        // Switch back to the already-running origin. The full-board route must
-        // survive more than one handoff, and this open must not launch a copy.
-        board.send(b"\x1b[H\x1b[B\r");
+        board.await_text("zz_third_visit");
+        board.send(b"\x1b[F\r");
+        board.await_text(&format!("exact id {}", &third.session_id[..8]));
+        let third_pane = store
+            .get_session(third.provider, &third.session_id)
+            .unwrap()
+            .unwrap()
+            .tmux_pane
+            .unwrap();
+        assert_eq!(board.client_pane(&opening_client), third_pane);
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 3);
+        board.checkpoint("C · third exact visit opened", &store);
+        board.send(b"\x1b[24~");
+        let recent_viewer = board.await_thread_list(&third_pane);
+        board.await_text("Threads");
+        board.checkpoint("F12 · C picker has numbered B and A recents", &store);
+        // Reordering status while the list is open must not change the frozen
+        // numbered identities. Number 2 is still the original thread.
+        store
+            .record_status_observation(
+                seed.provider,
+                &seed.session_id,
+                &StatusObservation {
+                    kind: ObservationKind::Lifecycle,
+                    status: Status::NeedsYou,
+                    unread: false,
+                    attention_reason: Some("recent ordering fixture".into()),
+                    error: None,
+                    observed_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64(),
+                    source: "fixture:recent-refresh".into(),
+                },
+            )
+            .unwrap();
+        board.send(b"r");
+        thread::sleep(Duration::from_millis(2200));
+        let recent_capture = board.tmux(&["capture-pane", "-p", "-t", &recent_viewer]);
+        assert!(recent_capture.contains("switch_origin"), "{recent_capture}");
+        board.checkpoint(
+            "Background status changed · numbered targets remain frozen",
+            &store,
+        );
+        board.send(b"2");
         board.await_text(&format!("exact id {}", &seed.session_id[..8]));
         assert_eq!(board.client_pane(&opening_client), original);
-        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
+        board.checkpoint("2 · frozen second recent opens exact A", &store);
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 3);
+        assert_eq!(
+            fs::read_to_string(&quota_calls).unwrap_or_default(),
+            probes_before,
+            "recent-thread navigation must not request provider quota"
+        );
+        board.send(b"\x1b[24~");
+        board.await_thread_list(&original);
+        board.await_text("Threads");
+        board.send(b"1");
+        board.await_text(&format!("exact id {}", &third.session_id[..8]));
+        assert_eq!(board.client_pane(&opening_client), third_pane);
+        board.checkpoint("1 · previous thread returns to exact C", &store);
+        // The second terminal opened only this exact origin through Pika;
+        // number 1 must not borrow the opening terminal's previous visit.
+        if shared_terminal {
+            drop(other.take());
+            other = Some(board.other_terminal(&seed.session_id, true));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while board.tmux(&["list-clients"]).lines().count() != 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "second Pika terminal did not attach"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            let other = other.as_mut().unwrap();
+            let other_client = board
+                .tmux(&["list-clients", "-F", "#{client_name}"])
+                .lines()
+                .find(|client| *client != opening_client)
+                .unwrap()
+                .to_owned();
+            let mut bytes = [0; 32768];
+            while let Ok(count) = other._terminal.read(&mut bytes) {
+                if count == 0 {
+                    break;
+                }
+            }
+            other._terminal.write_all(b"\x1b[24~").unwrap();
+            let other_viewer = board.await_thread_list(&original);
+            other._terminal.write_all(b"1").unwrap();
+            thread::sleep(Duration::from_millis(300));
+            assert_eq!(board.client_pane(&other_client), other_viewer);
+            board.checkpoint(
+                "Second Pika terminal · 1 cannot borrow first terminal history",
+                &store,
+            );
+            other._terminal.write_all(b"\x1b").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while board
+                .tmux(&["list-panes", "-t", &original, "-F", "#{pane_id}"])
+                .trim()
+                != original
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "second terminal's Esc did not reclaim its viewer"
+                );
+                while let Ok(count) = other._terminal.read(&mut bytes) {
+                    if count == 0 {
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(board.client_pane(&other_client), original);
+            board.checkpoint(
+                "Second terminal Esc · same exact A provider survives",
+                &store,
+            );
+        }
+        board.send(b"\x1b[24~");
+        board.await_thread_list(&third_pane);
+        board.await_text("Threads");
+        // Switch back to the already-running origin. The full-board route must
+        // survive more than one handoff, and this open must not launch a copy.
+        board.send(b"1");
+        board.await_text(&format!("exact id {}", &seed.session_id[..8]));
+        assert_eq!(board.client_pane(&opening_client), original);
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 3);
         board.send(b"\x1b[24~");
         board.await_thread_list(&original);
         board.await_text("Threads");
@@ -1198,6 +1514,10 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
         // WEEKLY now also exists in the compact pane. Require full-board
         // chrome so a queued companion frame cannot masquerade as return.
         board.await_text("resets in local time");
+        board.checkpoint(
+            "Second F12 · full board returned, all agents retained",
+            &store,
+        );
         drop(other);
         let deadline = Instant::now() + Duration::from_secs(3);
         while !board.tmux(&["list-clients"]).trim().is_empty() {
@@ -1207,7 +1527,14 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             );
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 3);
+        assert!(
+            !fs::read_to_string(board.root.path().join("tmux-trace"))
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with("-L board-journey send-keys ")),
+            "navigation must never send keys to an agent"
+        );
         board.finish();
     }
 }

@@ -125,6 +125,18 @@ impl ProcessRecord {
 }
 
 pub fn process_kind(argv: &[String]) -> Option<Provider> {
+    // Pika receipts carry --provider and the exact UUID as data. They are not
+    // provider executables and must never become a second identity owner.
+    if argv.first().is_some_and(|executable| {
+        Path::new(executable)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("pika") || name.eq_ignore_ascii_case("pika.exe")
+            })
+    }) {
+        return None;
+    }
     if muse_executable_index(argv).is_some() {
         return Some(Provider::Muse);
     }

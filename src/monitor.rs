@@ -123,6 +123,14 @@ impl BoardItem {
 
 type BoardKey = (Option<String>, Provider, String);
 
+/// Frozen destinations belong to one open companion, not the attention board.
+#[derive(Clone)]
+struct ThreadNavigation {
+    current: BoardKey,
+    recent: Vec<BoardItem>,
+    order: Vec<BoardKey>,
+}
+
 /// Only UI state survives handoff. Activity observation belongs to the feed.
 #[derive(Default)]
 pub(crate) struct BoardMemory {
@@ -133,6 +141,7 @@ pub(crate) struct BoardMemory {
     update_version: Option<String>,
     pub(crate) notice: Option<String>,
     seen: BTreeSet<BoardKey>,
+    threads: Option<ThreadNavigation>,
 }
 
 /// A one-slot channel whose producer always replaces an unpublished value.
@@ -561,17 +570,18 @@ pub(crate) fn run_thread_list(
     source: &crate::activity_feed::Source,
     store: &crate::store::Store,
     current: &(Provider, String),
+    recent: &[crate::tmux::RecentThread],
     memory: &mut BoardMemory,
 ) -> Result<BoardAction> {
     let _terminal = TerminalGuard::enter()?;
     let initial = source.snapshot().expect("activity producer is seeded");
     let mut board = Board::new(initial.items);
+    board.prepare_thread_navigation(current, recent);
     board.quota = crate::quota::cached_local(store);
     let mut quota_read = Instant::now();
     if memory.initialized {
         board.restore(memory);
     } else {
-        board.focus_current_thread(current);
         board.action_notice = memory.notice.take();
     }
     let mut updates = source.subscribe();
@@ -1263,6 +1273,7 @@ struct Board {
     quota_enabled: bool,
     quota: crate::quota::View,
     items: Vec<BoardItem>,
+    threads: Option<ThreadNavigation>,
     selected_key: Option<BoardKey>,
     filter: String,
     filtering: bool,
@@ -1287,13 +1298,14 @@ struct Board {
 impl Board {
     fn restore(&mut self, memory: &mut BoardMemory) {
         if memory.initialized {
+            self.threads.clone_from(&memory.threads);
             self.seen.extend(memory.seen.iter().cloned());
             self.filter.clone_from(&memory.filter);
             self.selected_key.clone_from(&memory.selected_key);
             self.offset = memory.offset;
             self.update_version.clone_from(&memory.update_version);
             let needle = self.filter.to_lowercase();
-            if !self.items.iter().any(|item| {
+            if !self.visible().iter().any(|item| {
                 Some(item.key()) == self.selected_key && Self::matches_filter(item, &needle)
             }) {
                 self.reselect_first();
@@ -1309,6 +1321,7 @@ impl Board {
         memory.offset = self.offset;
         memory.update_version.clone_from(&self.update_version);
         memory.seen.clone_from(&self.seen);
+        memory.threads.clone_from(&self.threads);
     }
 
     fn summary(&self) -> crate::activity_feed::Summary {
@@ -1327,6 +1340,7 @@ impl Board {
             quota_enabled: false,
             quota: crate::quota::View::default(),
             items,
+            threads: None,
             selected_key,
             filter: String::new(),
             filtering: false,
@@ -1417,6 +1431,18 @@ impl Board {
     }
 
     fn visible(&self) -> Vec<&BoardItem> {
+        if let Some(threads) = &self.threads {
+            return threads
+                .order
+                .iter()
+                .filter_map(|key| {
+                    self.items
+                        .iter()
+                        .find(|item| item.key() == *key)
+                        .or_else(|| threads.recent.iter().find(|item| item.key() == *key))
+                })
+                .collect();
+        }
         let needle = self.filter.to_lowercase();
         self.items
             .iter()
@@ -1432,11 +1458,19 @@ impl Board {
         self.note_added(&items);
         let previous = self.selected_key.clone();
         sort_items(&mut items);
+        if let Some(threads) = &mut self.threads {
+            for item in &items {
+                let key = item.key();
+                if key != threads.current && !threads.order.contains(&key) {
+                    threads.order.push(key);
+                }
+            }
+        }
         self.items = items;
         let needle = self.filter.to_lowercase();
         self.selected_key = previous.filter(|key| {
-            self.items
-                .iter()
+            self.visible()
+                .into_iter()
                 .any(|item| item.key() == *key && Self::matches_filter(item, &needle))
         });
         if self.selected_key.is_none() {
@@ -1921,7 +1955,8 @@ impl Board {
         let visible = self.visible();
         let selected = self.selected_index(&visible);
         // Both native and remote-client boards render the assistant entry row.
-        let budget = usize::from(height.saturating_sub(4)).max(3);
+        let reserved = if self.threads.is_some() { 5 } else { 4 };
+        let budget = usize::from(height.saturating_sub(reserved)).max(3);
         let mut used = 0;
         let mut prior = "";
         let mut first = selected;
@@ -1929,7 +1964,7 @@ impl Board {
             let Some(item) = visible.get(index) else {
                 break;
             };
-            let group = item_group(item);
+            let group = self.thread_group(item);
             let cost = 1 + if group == prior { 0 } else { 2 };
             if used + cost > budget {
                 break;
@@ -2078,7 +2113,7 @@ impl Board {
         let mut line = start;
         let mut prior_group = "";
         for (index, item) in visible.iter().enumerate().skip(self.offset) {
-            let current_group = item_group(item);
+            let current_group = self.thread_group(item);
             if current_group != prior_group && line < height.saturating_sub(2) {
                 styled(
                     output,
@@ -2108,6 +2143,7 @@ impl Board {
     ) -> Result<()> {
         let session = &item.session;
         let marker = if selected { "›" } else { " " };
+        let number = self.recent_number(item);
         let provider = match session.provider {
             Provider::Codex => "C",
             Provider::Claude => "A",
@@ -2115,6 +2151,36 @@ impl Board {
             Provider::Muse => "M",
         };
         let age = human_age(session.last_event_at.max(session.last_activity_at));
+        let (label, missing) = self.thread_row_label(item, number);
+        let usable = list_width.saturating_sub(if number.is_some() { 14 } else { 12 });
+        let prefix = number.map(|value| format!("{value} ")).unwrap_or_default();
+        let row = format!(
+            "{marker} {prefix}{provider} {:<width$} {age:>5}",
+            truncate(&label, usable),
+            width = usable
+        );
+        if selected {
+            queue!(output, SetAttribute(Attribute::Reverse))?;
+        }
+        styled(
+            output,
+            if missing {
+                Color::DarkGrey
+            } else {
+                status_color(session.status)
+            },
+            false,
+            &fit(&row, list_width),
+        )?;
+        if selected {
+            queue!(output, SetAttribute(Attribute::NoReverse))?;
+        }
+        queue!(output, Print("\r\n"))?;
+        Ok(())
+    }
+
+    fn thread_row_label(&self, item: &BoardItem, number: Option<usize>) -> (String, bool) {
+        let session = &item.session;
         let node = item
             .node_label()
             .map(|value| format!(" @{value}"))
@@ -2131,48 +2197,103 @@ impl Board {
         } else {
             ""
         };
-        let usable = list_width.saturating_sub(12);
+        let back = if number == Some(1) { "Back to " } else { "" };
         let label = format!(
-            "{}{}{}{}",
+            "{back}{}{}{}{}",
             self.disambiguated_name(item),
             node,
             pending,
             stale
         );
-        let row = format!(
-            "{marker} {provider} {:<width$} {age:>5}",
-            truncate(&label, usable),
-            width = usable
-        );
-        if selected {
-            queue!(output, SetAttribute(Attribute::Reverse))?;
-        }
-        styled(
-            output,
-            status_color(session.status),
-            false,
-            &fit(&row, list_width),
-        )?;
-        if selected {
-            queue!(output, SetAttribute(Attribute::NoReverse))?;
-        }
-        queue!(output, Print("\r\n"))?;
-        Ok(())
+        let missing = number.is_some() && !self.items.iter().any(|live| live.key() == item.key());
+        let label = if missing {
+            format!("{label} · unavailable")
+        } else {
+            label
+        };
+        (label, missing)
     }
 
     #[cfg_attr(windows, allow(dead_code))]
-    fn focus_current_thread(&mut self, current: &(Provider, String)) {
-        if let Some(item) = self.items.iter().find(|item| {
-            item.node_id.is_none()
-                && item.session.provider == current.0
-                && item.key().2 == current.1
-        }) {
-            self.selected_key = Some(item.key());
+    fn prepare_thread_navigation(
+        &mut self,
+        current: &(Provider, String),
+        recent: &[crate::tmux::RecentThread],
+    ) {
+        let current = (None, current.0, current.1.clone());
+        let mut slots = Vec::<BoardItem>::new();
+        for target in recent {
+            let key = (
+                target.node_id.clone(),
+                target.provider,
+                target.session_id.clone(),
+            );
+            if key != current
+                && !slots.iter().any(|item| item.key() == key)
+                && let Some(item) = self.items.iter().find(|item| item.key() == key)
+            {
+                slots.push(item.clone());
+                if slots.len() == 9 {
+                    break;
+                }
+            }
+        }
+        let mut order = slots.iter().map(BoardItem::key).collect::<Vec<_>>();
+        for item in &self.items {
+            let key = item.key();
+            if key != current && !order.contains(&key) {
+                order.push(key);
+            }
+        }
+        self.selected_key = order.first().cloned();
+        self.threads = Some(ThreadNavigation {
+            current,
+            recent: slots,
+            order,
+        });
+    }
+
+    fn recent_number(&self, item: &BoardItem) -> Option<usize> {
+        self.threads
+            .as_ref()?
+            .recent
+            .iter()
+            .position(|slot| slot.key() == item.key())
+            .map(|index| index + 1)
+    }
+
+    fn thread_group(&self, item: &BoardItem) -> &'static str {
+        if self.threads.is_none() {
+            item_group(item)
+        } else if self.recent_number(item).is_some() {
+            "RECENT"
+        } else {
+            "ALL THREADS"
         }
     }
 
     #[cfg_attr(windows, allow(dead_code))]
     fn thread_key(&mut self, key: KeyEvent) -> Option<BoardAction> {
+        if let KeyCode::Char(digit @ '1'..='9') = key.code {
+            if key.kind != KeyEventKind::Press || !key.modifiers.is_empty() {
+                return None;
+            }
+            let target = self
+                .threads
+                .as_ref()?
+                .recent
+                .get((digit as u8 - b'1') as usize)?
+                .key();
+            self.selected_key = Some(target.clone());
+            return self.open_recent_thread(&target);
+        }
+        if key.code == KeyCode::Enter
+            && key.kind == KeyEventKind::Press
+            && self.threads.is_some()
+            && let Some(target) = self.selected_key.clone()
+        {
+            return self.open_recent_thread(&target);
+        }
         match key.code {
             KeyCode::Up
             | KeyCode::Down
@@ -2183,6 +2304,21 @@ impl Board {
             | KeyCode::Enter => self.key(key, None),
             _ => None,
         }
+    }
+
+    fn open_recent_thread(&mut self, target: &BoardKey) -> Option<BoardAction> {
+        let Some(item) = self.items.iter().find(|item| item.key() == *target) else {
+            self.action_notice =
+                Some("That thread is no longer on the board. Reopen the list to refresh.".into());
+            return None;
+        };
+        if !item.actionable() {
+            self.action_notice =
+                Some("That machine's thread list is out of date. Press r to refresh.".into());
+            return None;
+        }
+        self.action_notice = None;
+        Some(BoardAction::Open(item.clone()))
     }
 
     #[cfg_attr(windows, allow(dead_code))]
@@ -2204,34 +2340,15 @@ impl Board {
             &fit("PIKA · Threads", usize::from(width)),
         )?;
         queue!(frame, Print("\r\n"))?;
-        self.draw_thread_rows(&mut frame, usize::from(width), list_height, 1)?;
-        if self.items.is_empty() && height > 5 {
-            queue!(
-                frame,
-                MoveTo(0, 3),
-                Print(fit("No threads on this board yet.", usize::from(width)))
-            )?;
-        }
-        if let Some(notice) = &self.action_notice {
-            queue!(
-                frame,
-                MoveTo(0, list_height.saturating_sub(3)),
-                SetForegroundColor(Color::Yellow),
-                Print(fit(
-                    &crate::fleet::sanitize_terminal_text(notice),
-                    usize::from(width)
-                ))
-            )?;
-        }
+        let start = self.draw_current_thread(&mut frame, width)?;
+        self.draw_thread_rows(&mut frame, usize::from(width), list_height, start)?;
+        self.draw_thread_notices(&mut frame, width, height, list_height)?;
         self.draw_thread_quota(&mut frame, width, height, quota_height)?;
         queue!(
             frame,
             MoveTo(0, height.saturating_sub(2)),
             SetForegroundColor(Color::DarkGrey),
-            Print(fit(
-                "↑↓ select · Enter open · Esc close",
-                usize::from(width)
-            )),
+            Print(fit("1–9 · ↑↓ · Enter open · Esc close", usize::from(width))),
             MoveTo(0, height.saturating_sub(1)),
             Print(fit("Press again: full board", usize::from(width))),
             ResetColor
@@ -2242,6 +2359,57 @@ impl Board {
             output.write_all(&frame)?;
         }
         Ok(())
+    }
+
+    fn draw_thread_notices(
+        &self,
+        output: &mut impl Write,
+        width: u16,
+        height: u16,
+        list_height: u16,
+    ) -> Result<()> {
+        if self.visible().is_empty() && height > 5 {
+            queue!(
+                output,
+                MoveTo(0, 3),
+                Print(fit(
+                    "No other threads on this board yet.",
+                    usize::from(width)
+                ))
+            )?;
+        }
+        if let Some(notice) = &self.action_notice {
+            queue!(
+                output,
+                MoveTo(0, list_height.saturating_sub(3)),
+                SetForegroundColor(Color::Yellow),
+                Print(fit(
+                    &crate::fleet::sanitize_terminal_text(notice),
+                    usize::from(width)
+                ))
+            )?;
+        }
+        Ok(())
+    }
+
+    fn draw_current_thread(&self, output: &mut impl Write, width: u16) -> Result<u16> {
+        let Some(threads) = &self.threads else {
+            return Ok(1);
+        };
+        let label = self
+            .items
+            .iter()
+            .find(|item| item.key() == threads.current)
+            .map(|item| format!("Now · {}", self.disambiguated_name(item)))
+            .unwrap_or_else(|| "Current thread".into());
+        styled(
+            output,
+            Color::DarkGrey,
+            false,
+            &fit(&label, usize::from(width)),
+        )?;
+        queue!(output, Print("\r\n"))?;
+        Ok(2)
     }
 
     fn draw_thread_quota(
@@ -3469,6 +3637,196 @@ fn playbook_tip() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn numbered_item(index: u32, status: Status) -> BoardItem {
+        let mut item = BoardItem::local(session(status));
+        item.session.session_id = format!("{index:08x}-1111-4111-8111-111111111111");
+        item.session.name = Some(format!("thread_{index}"));
+        item
+    }
+
+    fn visited(item: &BoardItem) -> crate::tmux::RecentThread {
+        crate::tmux::RecentThread {
+            node_id: item.node_id.clone(),
+            provider: item.session.provider,
+            session_id: item.session.session_id.clone(),
+        }
+    }
+
+    #[test]
+    fn thread_recents_are_exact_unique_capped_and_previous_is_default() {
+        let current = numbered_item(0, Status::Working);
+        let items = (1..=12)
+            .map(|n| numbered_item(n, Status::Ready))
+            .collect::<Vec<_>>();
+        let mut recent = vec![visited(&current), visited(&items[1]), visited(&items[1])];
+        recent.extend(items.iter().map(visited));
+        let mut board = Board::new([vec![current.clone()], items.clone()].concat());
+        board.prepare_thread_navigation(
+            &(Provider::Codex, current.session.session_id.clone()),
+            &recent,
+        );
+        assert_eq!(board.selected(), Some(items[1].clone()));
+        assert_eq!(board.visible().len(), 12);
+        assert!(
+            !board
+                .visible()
+                .iter()
+                .any(|item| item.key() == current.key())
+        );
+        assert_eq!(board.threads.as_ref().unwrap().recent.len(), 9);
+        assert_eq!(
+            board.thread_key(key(KeyCode::Char('1'))),
+            Some(BoardAction::Open(items[1].clone()))
+        );
+        assert_eq!(
+            board.thread_key(key(KeyCode::Char('9'))),
+            Some(BoardAction::Open(items[8].clone()))
+        );
+        let mut repeated = key(KeyCode::Char('1'));
+        repeated.kind = KeyEventKind::Repeat;
+        assert_eq!(board.thread_key(repeated), None);
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            assert_eq!(
+                board.thread_key(KeyEvent::new(KeyCode::Char('1'), modifiers)),
+                None
+            );
+        }
+        assert_eq!(board.thread_key(key(KeyCode::Char('0'))), None);
+        assert!(
+            board
+                .items
+                .iter()
+                .all(|item| item.session.unread == current.session.unread)
+        );
+    }
+
+    #[test]
+    fn thread_numbers_freeze_across_status_rename_removal_and_failed_open_redisplay() {
+        let current = numbered_item(0, Status::Working);
+        let first = numbered_item(1, Status::Parked);
+        let second = numbered_item(2, Status::Ready);
+        let mut board = Board::new(vec![current.clone(), first.clone(), second.clone()]);
+        let current_id = (Provider::Codex, current.session.session_id.clone());
+        board.prepare_thread_navigation(&current_id, &[visited(&first), visited(&second)]);
+        let mut changed = second.clone();
+        changed.session.name = Some("same_name_as_removed".into());
+        changed.session.status = Status::NeedsYou;
+        let newcomer = numbered_item(3, Status::NeedsYou);
+        board.replace_items(vec![changed.clone(), current.clone(), newcomer.clone()]);
+        assert_eq!(
+            board
+                .visible()
+                .iter()
+                .map(|item| item.key())
+                .collect::<Vec<_>>(),
+            vec![first.key(), second.key(), newcomer.key()]
+        );
+        assert_eq!(board.thread_key(key(KeyCode::Char('1'))), None);
+        assert!(board.action_notice.as_ref().unwrap().contains("no longer"));
+        assert_eq!(board.thread_key(key(KeyCode::Enter)), None);
+        assert_eq!(
+            board.thread_key(key(KeyCode::Char('2'))),
+            Some(BoardAction::Open(changed.clone()))
+        );
+        let mut memory = BoardMemory::default();
+        board.remember(&mut memory);
+        memory.notice = Some("Could not open: changed owner".into());
+        let mut redisplay = Board::new(vec![current, changed.clone(), newcomer]);
+        redisplay.prepare_thread_navigation(&current_id, &[visited(&changed)]);
+        redisplay.restore(&mut memory);
+        assert_eq!(redisplay.thread_key(key(KeyCode::Char('1'))), None);
+        assert_eq!(
+            redisplay.thread_key(key(KeyCode::Char('2'))),
+            Some(BoardAction::Open(changed.clone()))
+        );
+        changed.stale = true;
+        redisplay.replace_items(vec![changed]);
+        assert_eq!(redisplay.thread_key(key(KeyCode::Char('2'))), None);
+        assert!(
+            redisplay
+                .action_notice
+                .as_ref()
+                .unwrap()
+                .contains("out of date")
+        );
+    }
+
+    #[test]
+    fn thread_numbers_distinguish_machine_provider_and_uuid() {
+        let current = numbered_item(0, Status::Working);
+        let local = numbered_item(1, Status::Ready);
+        let mut remote = local.clone();
+        remote.node_id = Some("exact-node".into());
+        remote.node_name = Some("remote".into());
+        let mut claude = local.clone();
+        claude.session.provider = Provider::Claude;
+        let mut board = Board::new(vec![
+            current.clone(),
+            local.clone(),
+            remote.clone(),
+            claude.clone(),
+        ]);
+        board.prepare_thread_navigation(
+            &(Provider::Codex, current.session.session_id),
+            &[visited(&remote), visited(&claude), visited(&local)],
+        );
+        for (digit, item) in [('1', remote), ('2', claude), ('3', local)] {
+            assert_eq!(
+                board.thread_key(key(KeyCode::Char(digit))),
+                Some(BoardAction::Open(item))
+            );
+        }
+        assert_eq!(board.thread_key(key(KeyCode::Char('4'))), None);
+    }
+
+    #[test]
+    fn thread_recents_keep_selection_numbers_and_quota_visible_on_resize() {
+        let current = numbered_item(0, Status::Working);
+        let items = (1..=30)
+            .map(|n| numbered_item(n, Status::Ready))
+            .collect::<Vec<_>>();
+        let mut board = Board::new([vec![current.clone()], items.clone()].concat());
+        board.prepare_thread_navigation(
+            &(Provider::Codex, current.session.session_id),
+            &items.iter().map(visited).collect::<Vec<_>>(),
+        );
+        for (width, height) in [(38, 24), (38, 10), (80, 12), (38, 9), (25, 24)] {
+            for item in &items {
+                board.selected_key = Some(item.key());
+                board.ensure_visible(height - thread_quota_height(width, height));
+                let mut bytes = Vec::new();
+                board.draw_threads(&mut bytes, width, height).unwrap();
+                let rows = crate::terminal_frame::rows(&bytes, (width, height)).unwrap();
+                let end = usize::from(height - 2 - thread_quota_height(width, height));
+                let text = String::from_utf8(
+                    rows[..end]
+                        .iter()
+                        .flat_map(|row| without_colors(row))
+                        .collect(),
+                )
+                .unwrap();
+                assert!(
+                    text.contains(&item.session.display_name()),
+                    "selected thread obscured at {width}x{height}: {text}"
+                );
+                assert!(text.contains("Now · thread_0"));
+            }
+        }
+        board.selected_key = Some(items[0].key());
+        board.ensure_visible(24 - thread_quota_height(38, 24));
+        let mut bytes = Vec::new();
+        board.draw_threads(&mut bytes, 38, 24).unwrap();
+        let text = String::from_utf8(without_colors(&bytes)).unwrap();
+        assert!(text.contains("1 C Back to thread_1"));
+        assert!(text.contains("2 C thread_2"));
+        assert!(text.contains("RECENT"));
+        assert!(text.contains("WEEKLY LEFT · this machine"));
+    }
 
     #[test]
     fn thread_list_is_only_exact_board_rows_at_every_width() {
