@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.37 — Recent threads and your native Pika assistant
+
+- Show cached weekly provider usage in the F12 companion without extra polling.
+- Jump to recent threads with numbered choices in the companion. Destinations
+  stay fixed while the list is open; shared terminals retain exact client focus.
+- Recover an existing live terminal when an earlier removed/re-added thread has
+  an idle old home, without launching another agent or claiming unverified identity.
+- Open the persistent assistant as a native Codex/Luna conversation with its own
+  instructions, skills and required Pika tools. Keep scoped memory and the exact
+  conversation binding separate from project agents and personal provider settings.
+- Hide internal assistant workspace paths from its native footer and title.
+- Retry transient local preview database contention at the normal local cadence;
+  retain the longer backoff for other failures and all exact-identity checks.
+
 ## 0.6.36 — Native navigation and clearer connections
 
 Version 0.6.35 was not published: Windows-only unused native-host helpers failed

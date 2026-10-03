@@ -15,6 +15,18 @@ const ERROR_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BYTES: usize = 16 * 1024;
 const MAX_LINES: usize = 120;
 
+fn refresh_interval(error: bool, retryable: bool, remote: bool) -> Duration {
+    if retryable {
+        LOCAL_INTERVAL
+    } else if error {
+        ERROR_INTERVAL
+    } else if remote {
+        REMOTE_INTERVAL
+    } else {
+        LOCAL_INTERVAL
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct View {
     pub text: String,
@@ -52,10 +64,38 @@ impl From<&BoardItem> for Identity {
 
 type Fetch = dyn Fn(BoardItem, CancellationToken) -> Result<String> + Send + Sync;
 
+struct FetchError {
+    text: String,
+    retryable: bool,
+}
+
+impl FetchError {
+    fn from_error(error: anyhow::Error, local: bool) -> Self {
+        // Classify before losing the typed cause at the worker boundary. A
+        // busy writer is temporary; identity failures still fail closed.
+        let retryable = local
+            && error.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::SqliteFailure(detail, _))
+                        if matches!(
+                            detail.code,
+                            rusqlite::ErrorCode::DatabaseBusy
+                                | rusqlite::ErrorCode::DatabaseLocked
+                        )
+                )
+            });
+        Self {
+            text: bounded_text(&error.to_string()),
+            retryable,
+        }
+    }
+}
+
 struct Request {
     generation: u64,
     cancel: CancellationToken,
-    result: mpsc::Receiver<Result<String, String>>,
+    result: mpsc::Receiver<Result<String, FetchError>>,
 }
 
 pub(crate) struct Driver {
@@ -116,14 +156,15 @@ impl Driver {
             .and_then(|request| match request.result.try_recv() {
                 Ok(result) => Some(result),
                 Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    Some(Err("Pane preview worker stopped.".into()))
-                }
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(FetchError {
+                    text: "Pane preview worker stopped.".into(),
+                    retryable: false,
+                })),
             });
         if let Some(reply) = reply {
             let request = self.request.take().expect("reply has a request");
             if request.generation == self.generation && !request.cancel.is_cancelled() {
-                let (text, error) = match reply {
+                let (text, error, retryable) = match reply {
                     Ok(text) => {
                         let text = bounded_text(&text);
                         (
@@ -133,11 +174,13 @@ impl Driver {
                                 text
                             },
                             false,
+                            false,
                         )
                     }
                     Err(error) => (
-                        bounded_text(&format!("Preview unavailable · {error}")),
+                        bounded_text(&format!("Preview unavailable · {}", error.text)),
                         true,
+                        error.retryable,
                     ),
                 };
                 self.view = Some(View {
@@ -147,13 +190,11 @@ impl Driver {
                     error,
                 });
                 self.due = now
-                    + if error {
-                        ERROR_INTERVAL
-                    } else if self.selected.as_ref().is_some_and(|id| id.node.is_some()) {
-                        REMOTE_INTERVAL
-                    } else {
-                        LOCAL_INTERVAL
-                    };
+                    + refresh_interval(
+                        error,
+                        retryable,
+                        self.selected.as_ref().is_some_and(|id| id.node.is_some()),
+                    );
                 changed = true;
             }
         }
@@ -173,11 +214,11 @@ impl Driver {
                 .name("pika-pane-preview".into())
                 .spawn(move || {
                     let provider = item.session.provider;
-                    let reply = fetch(item, child_cancel).map_err(|error| error.to_string());
+                    let local = item.node_id.is_none();
+                    let reply = fetch(item, child_cancel)
+                        .map_err(|error| FetchError::from_error(error, local));
                     // Bounds apply before the reply enters the channel, too.
-                    let reply = reply
-                        .map(|text| board_output(provider, &bounded_text(&text)))
-                        .map_err(|text| bounded_text(&text));
+                    let reply = reply.map(|text| board_output(provider, &bounded_text(&text)));
                     let _ = sender.send(reply);
                 }) {
                 Ok(_) => {
@@ -873,6 +914,74 @@ mod tests {
         driver.tick_at(Some(remote), false, next + ERROR_INTERVAL, 0.0);
         started.recv_timeout(Duration::from_secs(2)).unwrap();
         reply.send(Ok("restored".into())).unwrap();
+    }
+
+    // Focused service behavior with a real SQLite writer, not terminal proof.
+    #[test]
+    fn sqlite_writer_contention_recovers_at_local_cadence_without_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("preview.sqlite");
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        holder
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE preview_probe (value TEXT NOT NULL);
+                 INSERT INTO preview_probe VALUES ('exact pane output');
+                 BEGIN IMMEDIATE;",
+            )
+            .unwrap();
+        let (started_tx, started) = mpsc::channel();
+        let mut driver = Driver::new(move |_, _| {
+            use anyhow::Context;
+            let mut db = rusqlite::Connection::open(&path)?;
+            db.busy_timeout(Duration::ZERO)?;
+            started_tx.send(()).unwrap();
+            let tx = db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .context("exact ownership validation")?;
+            let output = tx.query_row("SELECT value FROM preview_probe", [], |row| row.get(0))?;
+            tx.commit()?;
+            Ok(output)
+        });
+        let now = Instant::now();
+        driver.tick_at(Some(item("a")), true, now, 0.0);
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        poll_done(&mut driver, Some(item("a")), now);
+        let view = driver.view().unwrap();
+        assert!(view.error && view.observed_at.is_none());
+        assert!(view.text.contains("exact ownership validation"));
+        assert_eq!(driver.due, now + LOCAL_INTERVAL);
+
+        holder.execute_batch("ROLLBACK").unwrap();
+        driver.tick_at(Some(item("a")), false, now + LOCAL_INTERVAL / 2, 0.0);
+        assert!(started.try_recv().is_err());
+        let next = now + LOCAL_INTERVAL;
+        driver.tick_at(Some(item("a")), false, next, 0.0);
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        poll_done(&mut driver, Some(item("a")), next);
+        let view = driver.view().unwrap();
+        assert_eq!(view.text, "exact pane output");
+        assert!(!view.error);
+        assert_eq!(view.observed_at, Some(123.0));
+    }
+
+    #[test]
+    fn untyped_lock_text_and_identity_failure_keep_permanent_error_backoff() {
+        for message in ["database is locked", "exact pane ownership changed"] {
+            let (mut driver, started, reply) = controlled();
+            let now = Instant::now();
+            driver.tick_at(Some(item("a")), true, now, 0.0);
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            reply.send(Err(anyhow::anyhow!(message))).unwrap();
+            poll_done(&mut driver, Some(item("a")), now);
+            assert_eq!(driver.due, now + ERROR_INTERVAL);
+            driver.tick_at(Some(item("a")), false, now + LOCAL_INTERVAL, 0.0);
+            assert!(started.try_recv().is_err());
+            driver.tick_at(Some(item("a")), false, now + ERROR_INTERVAL, 0.0);
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            reply.send(Ok("restored".into())).unwrap();
+            poll_done(&mut driver, Some(item("a")), now + ERROR_INTERVAL);
+        }
     }
 
     #[test]

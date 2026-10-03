@@ -1917,7 +1917,16 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
             session.unread = true;
             session.last_event_at = completed_at;
             store.upsert_session(&session, true).unwrap();
+            // A temporary writer must not strand the automatic pane preview.
+            // Observe the failure in the real terminal, then release the writer
+            // and require recovery without a second key press.
+            let writer = rusqlite::Connection::open(store.path()).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
             board.send(b"r");
+            board.await_text("Preview unavailable");
+            board.await_text("database is locked");
+            writer.execute_batch("ROLLBACK").unwrap();
+            board.output.clear();
             board.await_text("Pane output");
             board.await_text("FAKE AGENT READY");
             assert!(board.output.contains("Queued follow-up inputs"));

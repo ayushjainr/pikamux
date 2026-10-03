@@ -702,39 +702,39 @@ Missing or changed selected profiles fail visibly without creating a substitute.
 The selected authority reads this installation's existing board projection.
 Selection does not expand metadata sharing, transcript access or background spend.
 
-Board `P` keeps the operational rail and shared counts beside the conversation
-on wide terminals; narrow terminals retain the header and focus the chat panel.
-The same assistant composer, commands and host serve both entry points. Esc/F12
-returns to the retained board selection/filter. This adds no observer or model
-turn for rendering; provider suggestions are not source-task actions.
+Connected interactive entry through board `P` or `pika pika` opens the same
+native Codex/Luna conversation in a reserved Pika terminal home. The provider
+owns rendering, typing and conversation history; Pika does not wrap replies in
+its former JSON chat protocol. F12 uses the ordinary companion/board return
+navigation. Offline and machine-readable entry retain their explicit local
+interfaces. Rendering adds no observer or model turn, and provider suggestions
+are not source-task actions.
+
+The native assistant has its own workspace `AGENTS.md`, private skills and
+provider profile. It does not install assistant instructions in project or
+personal coding-provider homes. Its required MCP adapter exposes the existing
+scoped memory, board projection and control services. Native launch generation
+is forwarded explicitly to that adapter; missing or mismatched admission fails
+closed. The provider footer and terminal title omit internal workspace paths.
 
 Setup's completion screen always offers Connect another machine, including on
 repeat setup. It reuses the existing discovery and verified connection flow
 without reinstalling provider hooks. The picker accepts saved connections or
 an explicit machine address; cancellation contacts nothing not selected.
 
-The assistant's default screen is a conversation, not a diagnostic report.
-First use offers Connect Pika; connection, disclosure and sign-in choices reuse
-the ordinary setup screen. Explicit confirmation enables foreground Codex/Luna
-and remembers the existing profile for later visits without a message cap. A
-separate provider-home login is requested only when needed; credentials are
-never copied from coding sessions. This does not enable background work or
-project access. Before connection, typed messages stay in the composer rather
-than being silently saved as unsent memory. Help and settings preserve drafts.
-F1 offers saved updates, feedback and advanced commands; F2 shows connection
-settings. Routine storage, acknowledgement, IDs and transport details stay out
-of the conversation. Saved summaries remain labelled as saved notes, failures
-remain visible, and the complete diagnostic/JSON interfaces remain available.
-Conversation roles, connection state and the framed composer use terminal-theme
-colors (or plain text with NO_COLOR); errors do not replace the conversation
-with raw transport output. A failed provider startup offers an explicit F2
-reconnect that preserves the draft, profile and call allowance and sends no
-message. An accepted or uncertain turn is never eligible for this startup retry.
-For npm Codex installations, the transport resolves the native payload within
-the selected package and validates it before launch, rather than depending on
-system Node. An exited process is reported as closed, not as an RPC timeout.
-Shared maintenance tables are prepared before worker startup so their first
-creation cannot race the user's initial foreground memory write.
+The assistant's default screen is the provider's native conversation, not a
+diagnostic report. The selected private provider home may require its own login;
+credentials are never copied from coding sessions. Opening does not enable
+background work or project access. The native provider owns draft, help and
+settings interaction. Routine storage IDs, internal prompts and JSON envelopes
+belong in tools and requested diagnostics, not ordinary replies. The local
+offline/diagnostic interface remains separately available.
+
+Before native launch, Pika checks the provider's effective scoped capabilities
+and requires its backend connection. A missing or unsupported provider fails
+visibly without silently weakening the profile. Accepted or uncertain turns
+are not automatically replayed. Shared maintenance tables are prepared before
+worker startup so first creation cannot race foreground memory writes.
 
 On macOS/Linux, one OS-locked authority host serves bounded local IPC views.
 Its profile identity and scoped memory survive provider-session and host exit.
