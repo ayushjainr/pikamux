@@ -1,4 +1,4 @@
-Pika 0.6.37 brings recent-thread navigation and the native persistent assistant.
+Pika 0.6.38 brings recent-thread navigation and the native persistent assistant.
 
 - **F12 once** opens the compact thread list; **F12 again** returns to the full
   board. Numbered recent choices make switching faster without new global key

@@ -926,6 +926,7 @@ impl Tmux {
     }
 
     /// Preference metadata only: every destination still requires normal exact opening.
+    #[cfg_attr(windows, allow(dead_code))] // The client does not host tmux companions.
     pub(crate) fn recent_threads(&self, handoff: &ThreadHandoff) -> Result<Vec<RecentThread>> {
         let client = ThreadClient {
             client: handoff.client.clone(),
@@ -942,6 +943,7 @@ impl Tmux {
             .unwrap_or_default())
     }
 
+    #[cfg_attr(windows, allow(dead_code))] // The client does not host tmux companions.
     pub(crate) fn record_recent_thread(
         &self,
         handoff: &ThreadHandoff,

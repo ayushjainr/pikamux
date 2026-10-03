@@ -222,6 +222,7 @@ impl Pika {
         }
     }
 
+    #[cfg_attr(windows, allow(dead_code))] // Native assistant hosting is Unix-only.
     pub(crate) fn with_launch_context(mut self, context: LaunchContext) -> Self {
         self.launch_context = Some(context);
         self
@@ -234,6 +235,7 @@ impl Pika {
         argv
     }
 
+    #[cfg_attr(windows, allow(dead_code))] // Native assistant hosting is Unix-only.
     pub(crate) fn launch_working_directory(&self) -> Option<&Path> {
         self.launch_context
             .as_ref()

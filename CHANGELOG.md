@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.6.37 — Recent threads and your native Pika assistant
+## 0.6.38 — Recent threads and your native Pika assistant
+
+Version 0.6.37 was not published: Windows warnings-as-errors caught unused
+Unix-host helpers. 0.6.38 narrowly marks these helpers unused on the Windows
+client, retaining strict checks on hosting platforms.
 
 - Show cached weekly provider usage in the F12 companion without extra polling.
 - Jump to recent threads with numbered choices in the companion. Destinations

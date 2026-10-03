@@ -47,6 +47,7 @@ pub(crate) const ATTACH_OUTCOME_CAPABILITY: &str = "attach-outcome-v1";
 // Opt-in endpoint status: ordinary zero remains cancellation/unverified/unknown.
 pub(crate) const EXACT_HANDOFF_STATUS: i32 = 254;
 
+#[cfg_attr(windows, allow(dead_code))] // Encoded by the Unix hosting endpoint.
 pub(crate) fn encode_attach_outcome(code: i32, exact: bool) -> i32 {
     if code == 0 && exact {
         EXACT_HANDOFF_STATUS
@@ -2923,6 +2924,7 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
             .map(|outcome| outcome.exit_code)
     }
 
+    #[cfg_attr(windows, allow(dead_code))] // Used by the Unix tmux companion.
     pub(crate) fn attach_with_outcome(
         &self,
         session: &FleetSession,
