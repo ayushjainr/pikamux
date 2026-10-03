@@ -507,6 +507,14 @@ fn native_registry(
         "PIKA_ASSISTANT_BOARD_DB_PATH".into(),
         ordinary.paths.database.to_string_lossy().into_owned(),
     );
+    profile.environment.insert(
+        "PIKA_STATE_HOME".into(),
+        ordinary.paths.state_dir.to_string_lossy().into_owned(),
+    );
+    profile.environment.insert(
+        "PIKA_CONFIG_HOME".into(),
+        ordinary.paths.config_dir.to_string_lossy().into_owned(),
+    );
     let mut config = ordinary.config.clone();
     config
         .provider_executables
@@ -657,6 +665,10 @@ pub(crate) fn require_thread(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "assistant_native_mcp_tests.rs"]
+mod mcp_tests;
 
 #[cfg(test)]
 mod tests {

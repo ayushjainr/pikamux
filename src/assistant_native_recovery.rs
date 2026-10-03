@@ -283,7 +283,7 @@ fn require_provider_absent(
         .is_empty();
     if live_pane || live_process {
         bail!(
-            "Native Pika is still running or ownership is ambiguous. Exit that native conversation with /quit, then run pika assistant-control ... fresh-context. Detaching is not exit; no provider was killed."
+            "Pika is still open, or its earlier conversation cannot yet be verified as closed. Exit that assistant with /quit before continuing. Your saved memory is unchanged; no conversation was stopped."
         );
     }
     Ok(())

@@ -276,6 +276,14 @@ fn handle_hook_input(input: &[u8], payload: &Value, profile: &ToolsArgs) -> Resu
 /// external-only source route is deliberately absent from the MCP catalog.
 fn validate_hook_binding(payload: &Value, args: &ToolsArgs) -> Result<()> {
     validate_hook_environment(args)?;
+    let generation = std::env::var("PIKA_ASSISTANT_NATIVE_LAUNCH_TOKEN")
+        .context("Native hook missing its immutable launch generation")?;
+    crate::assistant_native::require_generation(
+        &args.profile_root,
+        &args.expected_profile_id,
+        &args.scope,
+        &generation,
+    )?;
     let paths = private_hook_registry(args)?;
     validate_registered_hook(payload, args, &paths)
 }

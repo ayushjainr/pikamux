@@ -423,6 +423,12 @@ pub(crate) fn prepare(
             "default_permissions=\"pika-source-scoped\"".into(),
             "--config".into(),
             format!("permissions.pika-source-scoped={permissions}"),
+            // Native presentation only: never expose the internal profile
+            // directory in the assistant footer or terminal window title.
+            "--config".into(),
+            "tui.status_line=[\"model-with-reasoning\",\"context-remaining\"]".into(),
+            "--config".into(),
+            "tui.terminal_title=[\"app-name\"]".into(),
             "--model".into(),
             "gpt-6-luna".into(),
             "--cd".into(),
@@ -519,6 +525,25 @@ fn configure(
     }
     server["args"] = value(args);
     server["enabled"] = value(true);
+    server["required"] = value(true);
+    // The private Pika adapter enforces scope, sources and explicit authority
+    // itself. A second provider approval gate would reject even ordinary recall
+    // under our noninteractive policy. This applies to Pika, not other servers.
+    server["default_tools_approval_mode"] = value("approve");
+    // Codex filters inherited environment for stdio MCP children. Forward
+    // only the exact native admission generation and board/registry paths;
+    // otherwise the adapter exits before advertising its tools.
+    let mut environment = toml_edit::Array::new();
+    for name in [
+        "PIKA_ASSISTANT_NATIVE_LAUNCH_TOKEN",
+        "PIKA_ASSISTANT_BOARD_DB_PATH",
+        "PIKA_DB_PATH",
+        "PIKA_STATE_HOME",
+        "PIKA_CONFIG_HOME",
+    ] {
+        environment.push(name);
+    }
+    server["env_vars"] = value(environment);
     config["mcp_servers"]["pika"] = Item::Table(server);
     config.remove("sandbox_mode");
     config["approval_policy"] = value("never");
@@ -699,6 +724,105 @@ mod tests {
         );
         assert!(!root.join("provider-home/skills").exists());
         assert!(!temp.path().join(".agents").exists());
+        let config: DocumentMut =
+            fs::read_to_string(root.join("provider-home/pika-assistant.config.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+        let server = &config["mcp_servers"]["pika"];
+        assert_eq!(server["required"].as_bool(), Some(true));
+        assert_eq!(
+            server["default_tools_approval_mode"].as_str(),
+            Some("approve")
+        );
+        assert_eq!(
+            server["env_vars"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "PIKA_ASSISTANT_NATIVE_LAUNCH_TOKEN",
+                "PIKA_ASSISTANT_BOARD_DB_PATH",
+                "PIKA_DB_PATH",
+                "PIKA_STATE_HOME",
+                "PIKA_CONFIG_HOME"
+            ]
+        );
+    }
+    #[test]
+    fn native_footer_overrides_exclude_paths_without_changing_private_settings() {
+        let (_temp, root, id) = fixture();
+        let base = "[tui]\ntheme='existing-custom-theme'\nstatus_line=['current-dir','project-root']\nterminal_title=['project','thread']\n";
+        let private = "[tui]\ntheme='private-custom-theme'\nstatus_line=['current-dir']\nterminal_title=['project']\n";
+        install(&root.join("provider-home/config.toml"), base).unwrap();
+        install(
+            &root.join("provider-home/pika-assistant.config.toml"),
+            private,
+        )
+        .unwrap();
+        install(
+            &root.join("provider-home/auth.json"),
+            "synthetic-auth-bytes",
+        )
+        .unwrap();
+        let launch = prepare(
+            &root,
+            &id,
+            "personal",
+            Path::new("/usr/bin/false"),
+            Path::new("/usr/bin/false"),
+        )
+        .unwrap();
+        let mut overrides = DocumentMut::new();
+        for pair in launch.argv.windows(2).filter(|pair| pair[0] == "--config") {
+            let document: DocumentMut = pair[1].parse().unwrap();
+            if let Some(tui) = document.get("tui") {
+                for (key, value) in tui.as_table().unwrap().iter() {
+                    overrides["tui"][key] = value.clone();
+                }
+            }
+        }
+        assert_eq!(
+            overrides["tui"]["status_line"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["model-with-reasoning", "context-remaining"]
+        );
+        assert_eq!(
+            overrides["tui"]["terminal_title"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["app-name"]
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("provider-home/config.toml")).unwrap(),
+            base
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("provider-home/auth.json")).unwrap(),
+            "synthetic-auth-bytes"
+        );
+        let preserved: DocumentMut =
+            fs::read_to_string(root.join("provider-home/pika-assistant.config.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+        assert_eq!(
+            preserved["tui"]["theme"].as_str(),
+            Some("private-custom-theme")
+        );
+        assert_eq!(
+            preserved["tui"]["status_line"][0].as_str(),
+            Some("current-dir")
+        );
     }
     #[test]
     fn mismatched_identity_creates_nothing() {
@@ -802,14 +926,19 @@ mod tests {
             .unwrap();
         let root = temp.path().join("private");
         let memory = crate::assistant_memory::Store::open(root.join("memory.sqlite")).unwrap();
-        let mut launch = prepare(
-            &root,
-            memory.profile_id(),
-            "personal",
-            Path::new("/usr/bin/false"),
-            &codex,
+        let pika = PathBuf::from(
+            std::env::var_os("PIKA_NATIVE_PIKA")
+                .unwrap_or_else(|| assert_cmd::cargo::cargo_bin("pika").into_os_string()),
         )
+        .canonicalize()
         .unwrap();
+        let mut launch = prepare(&root, memory.profile_id(), "personal", &pika, &codex).unwrap();
+        // Required-server startup must use the real adapter. Catalog loading
+        // needs its launch token but performs no authority/tool request.
+        launch.environment.insert(
+            "PIKA_ASSISTANT_NATIVE_LAUNCH_TOKEN".into(),
+            uuid::Uuid::new_v4().to_string(),
+        );
         install(
             &root.join("provider-home/config.toml"),
             "sandbox_mode = 'danger-full-access'\napproval_policy = 'on-request'\n[sandbox_workspace_write]\nwritable_roots = ['/tmp']\nnetwork_access = true\n",

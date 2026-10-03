@@ -24,6 +24,8 @@ mod assistant_feedback;
 mod assistant_native;
 #[cfg(unix)]
 mod assistant_native_helpers;
+#[cfg(all(test, unix))]
+mod assistant_native_hook_acceptance_tests;
 #[cfg(unix)]
 mod assistant_native_profile;
 #[cfg(unix)]
