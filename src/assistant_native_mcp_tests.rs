@@ -288,7 +288,7 @@ fn native_codex_connects_pika_and_reads_only_shared_board_rows() {
     let mut reopened = initialized_rpc(&mut command);
     // Codex does not retain a rollout before its first model turn. This
     // protocol-only fixture must not invent a replacement when resume fails.
-    // Actual same-UUID TUI reopen is separately measured in the alpha smoke.
+    // This alone does not prove same-UUID native TUI reopening.
     let resumed = reopened.request_frame("thread/resume", json!({"threadId":id,"model":"gpt-6-luna","modelProvider":"pika-no-inference","cwd":launch.cwd}));
     assert!(
         resumed["error"]["message"]
@@ -296,6 +296,41 @@ fn native_codex_connects_pika_and_reads_only_shared_board_rows() {
             .is_some_and(|message| message.contains("no rollout found")),
         "{resumed}"
     );
+    drop(reopened);
+    // Synthetic initial history only: this proves real native decoding and
+    // same-UUID reopening without submitting a model turn. It does not prove
+    // persistence of a real provider-generated answer or a TUI handoff.
+    let sessions = root.join("provider-home/sessions/2026/10/02");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let marker = "SYNTHETIC INITIAL HISTORY: native resume acceptance, no model turn";
+    let timestamp = "2026-10-02T00:00:00.000Z";
+    let records = [
+        json!({"timestamp":timestamp,"type":"session_meta","payload":{
+            "id":id,"timestamp":timestamp,"cwd":launch.cwd,
+            "originator":"synthetic-pika-native-acceptance","cli_version":"acceptance-fixture",
+            "source":"cli","model_provider":"pika-no-inference"
+        }}),
+        json!({"timestamp":timestamp,"type":"response_item","payload":{
+            "type":"message","role":"user","content":[{"type":"input_text","text":marker}]
+        }}),
+        json!({"timestamp":timestamp,"type":"event_msg","payload":{
+            "type":"user_message","message":marker,"images":[],"local_images":[]
+        }}),
+    ];
+    std::fs::write(
+        sessions.join(format!("rollout-2026-10-02T00-00-00-{id}.jsonl")),
+        records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let mut resumed_native = initialized_rpc(&mut command);
+        let restored = resumed_native.request("thread/resume", json!({"threadId":id,"model":"gpt-6-luna","modelProvider":"pika-no-inference","cwd":launch.cwd}));
+        assert_eq!(restored["thread"]["id"], id, "{restored}");
+        assert!(restored.to_string().contains(marker), "{restored}");
+    }
     assert_eq!(
         bind_scope(&root, &profile, "personal")
             .unwrap()
