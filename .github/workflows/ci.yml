@@ -115,6 +115,22 @@ jobs:
         run: |
           cargo build --release --locked
           PIKA_BENCH_SAMPLES=30 scripts/benchmark-native.sh target/release/pika | tee native-benchmark.txt
+      - name: Pair and authenticate beneath a foreign-owned mount
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          pairing_mount=$(mktemp -d /tmp/pika-pairing-mount.XXXXXX)
+          pairing_user="pika-pair-$$"
+          mkdir "$pairing_mount/accounts"
+          chmod 755 "$pairing_mount"
+          sudo chown nobody "$pairing_mount"
+          sudo useradd --no-create-home --home-dir "$pairing_mount/accounts" --shell /bin/sh "$pairing_user"
+          trap 'sudo userdel "$pairing_user"; sudo rm -f "$pairing_mount/accounts/pika" "$pairing_mount/accounts/journey.py"; sudo rmdir "$pairing_mount/accounts" "$pairing_mount"' EXIT
+          printf '%s:%s\n' "$pairing_user" "$(openssl rand -hex 32)" | sudo chpasswd
+          sudo chown "$pairing_user" "$pairing_mount/accounts"
+          sudo install -o "$pairing_user" -m 700 target/release/pika "$pairing_mount/accounts/pika"
+          sudo install -o "$pairing_user" -m 600 scripts/check-pairing-account-home.py "$pairing_mount/accounts/journey.py"
+          sudo -u "$pairing_user" python3 "$pairing_mount/accounts/journey.py" --binary "$pairing_mount/accounts/pika" --home-parent "$pairing_mount/accounts"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-benchmark-${{ matrix.os }}

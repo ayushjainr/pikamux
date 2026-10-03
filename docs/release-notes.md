@@ -1,4 +1,14 @@
-Pika 0.6.39 adds the server support for Pika's native iPhone alpha.
+Pika 0.6.40 fixes phone pairing for existing SSH accounts whose home is under
+an administrator-owned mount, such as `/mnt/ebs1/USER`.
+
+Run `pika update`, then `pika pair`. Pika stays under the invoking account and
+does not change mount ownership, relocate keys or restart conversations. The
+account's home and SSH files retain their ownership, permissions, ACL and link
+checks. Mount administrators are trusted to preserve the account's home path,
+as they already control that path; Pika does not protect against their tampering.
+SSH host-key validation and custom key paths outside home remain unchanged.
+
+Retained iPhone server support from 0.6.39:
 
 - Run **pika pair**, or choose **Connect phone** in board settings, then scan
   from Pika on the phone. A short-lived QR pins enrollment; the phone creates
