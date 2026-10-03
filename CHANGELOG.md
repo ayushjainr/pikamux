@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.39 — Connect your phone to existing Pika conversations
+
+- Add `pika pair` and **Connect phone**: a compact, short-lived QR enrolls
+  the phone's dedicated SSH key over a pinned private-network connection.
+- Serve the iPhone board, exact conversation history, replies, provider requests
+  and explicit thread creation through the native SSH endpoint. Uncertain
+  mutations retain original receipts rather than launching replacements.
+- Make the next normal native Pika assistant launch privately shareable with
+  the phone, preserving its scoped tools and memory; leave running assistants alone.
+- Include the native iOS alpha source and its journey evidence. The installable
+  release assets remain server/desktop binaries, not an App Store distribution.
+
+Mobile conversation control is currently verified for compatible Codex shared
+sessions, not every provider shown on the desktop board. Private network access
+and a working SSH service are still required. Updating one host does not update
+other machines or restart existing provider sessions.
+
 ## 0.6.38 — Recent threads and your native Pika assistant
 
 Version 0.6.37 was not published: Windows warnings-as-errors caught unused

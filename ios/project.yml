@@ -1,0 +1,67 @@
+name: Pika
+options:
+  deploymentTarget:
+    iOS: '17.0'
+packages:
+  MarkdownUI:
+    url: https://github.com/gonzalezreal/swift-markdown-ui.git
+    exactVersion: 2.4.1
+  Citadel:
+    url: https://github.com/orlandos-nl/Citadel.git
+    exactVersion: 0.12.1
+settings:
+  base:
+    SWIFT_VERSION: '6.0'
+    SWIFT_STRICT_CONCURRENCY: complete
+    PRODUCT_BUNDLE_IDENTIFIER: dev.pika.mobile.alpha
+    DEVELOPMENT_TEAM: ''
+    CODE_SIGN_STYLE: Automatic
+    PIKA_SSH_TEST_CONFIG: ''
+    TARGETED_DEVICE_FAMILY: '1'
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+targets:
+  Pika:
+    type: application
+    platform: iOS
+    sources:
+      - Pika
+      - path: THIRD_PARTY.md
+        buildPhase: resources
+    dependencies:
+      - package: MarkdownUI
+      - package: Citadel
+    info:
+      path: Pika/Info.plist
+      properties:
+        CFBundleDisplayName: Pika
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        NSLocalNetworkUsageDescription: Connect to your chosen Pika machine over your private network.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSExceptionDomains:
+            '100.64.0.0/10': {NSExceptionAllowsInsecureHTTPLoads: true}
+            '10.0.0.0/8': {NSExceptionAllowsInsecureHTTPLoads: true}
+            '172.16.0.0/12': {NSExceptionAllowsInsecureHTTPLoads: true}
+            '192.168.0.0/16': {NSExceptionAllowsInsecureHTTPLoads: true}
+            'fc00::/7': {NSExceptionAllowsInsecureHTTPLoads: true}
+        NSCameraUsageDescription: Scan the pairing code shown by your Pika machine.
+  PikaUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+    sources: [PikaUITests]
+    dependencies:
+      - target: Pika
+schemes:
+  Pika:
+    build:
+      targets:
+        Pika: all
+    test:
+      targets: [PikaUITests]
+      environmentVariables:
+        PIKA_SSH_TEST_CONFIG: $(PIKA_SSH_TEST_CONFIG)
+        PIKA_PAIR_TEST_CONFIG: $(PIKA_PAIR_TEST_CONFIG)

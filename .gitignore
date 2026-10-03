@@ -9,6 +9,8 @@
 /dist/
 /.venv/
 .DS_Store
+xcuserdata/
+*.xcuserstate
 __pycache__/
 .pytest_cache/
 .env

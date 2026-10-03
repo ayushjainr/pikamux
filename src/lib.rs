@@ -34,6 +34,24 @@ mod assistant_native_recovery;
 mod assistant_native_tools;
 #[cfg(unix)]
 mod assistant_native_turns;
+#[cfg(unix)]
+mod mobile;
+#[cfg(unix)]
+mod mobile_codex;
+#[cfg(unix)]
+mod mobile_delivery;
+#[cfg(unix)]
+mod mobile_pairing;
+#[cfg(unix)]
+mod mobile_pairing_acl;
+#[cfg(unix)]
+mod mobile_pairing_io;
+#[cfg(unix)]
+mod mobile_pairing_keys;
+#[cfg(unix)]
+mod mobile_pairing_ui;
+#[cfg(unix)]
+mod mobile_remote;
 // Shared assistant domain types remain portable, but their authority-side
 // operations are driven only by the Unix host. Windows is a remote client.
 // Keep dead-code enforcement on the hosting targets rather than exporting

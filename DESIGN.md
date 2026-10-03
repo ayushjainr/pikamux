@@ -5,6 +5,68 @@ shows where attention is needed and opens the exact selected conversation;
 expert cards let agents discover and consult relevant project experience.
 Provider harnesses remain responsible for their conversations and history.
 
+## iPhone pairing boundary
+
+The iPhone board is labelled Dex, with a red miniature Pokédex tab mark.
+Its red shell and cream inset are presentation only; the blue lens opens the
+existing machine-connections sheet. Red/amber/green lights project reported
+Needs you/Working/Ready rows from the shared board, matching the card badges.
+Disconnected and explicitly stale rows never light them; no new observer,
+elapsed-work inference, inline approval or transcript stream is introduced.
+Pika keeps its
+yellow tail, including a brief selection flick respecting Reduce Motion.
+Provider marks remain neutral. Cards preserve exact identities, state labels,
+freshness and unread evidence; no synthetic summaries or duplicate featured row.
+Opened conversations omit the large shell header, add button and tab bar.
+One compact red header identifies the thread and machine, with red/amber/green
+signal dots for that exact thread (all dim when disconnected, stale or cached).
+The red bottom accent is 8pt, flush with the physical bottom of Dex and threads,
+with no cream band beneath it. It overlays rather than consumes layout space
+and respects the keyboard. One continuous shape joins the right corner to that
+strip on both screens. The main header controls share one centerline; thread
+header content is 50pt with the same curved red-to-cream shoulder,
+with signals on the left, identity in the middle and provider mark on the right.
+Threads have no visible Back button; a rightward swipe from the left edge returns to
+the previous screen, with an accessibility escape action as an alternative.
+The native
+composer is docked to the bottom safe area above the keyboard, independently of
+transcript length. Native selection, multiline entry, draft isolation, receipt
+handling and provider connections are unchanged by this visual treatment.
+The send control uses the Pika tail while retaining its 44pt target and explicit
+Send accessibility label. Disabled sending dims the tail.
+Sending a valid message returns the conversation to its latest output and resumes
+following replies as their layout grows, including above the keyboard. Scrolling
+up pauses following; reading older history alone never resumes it.
+
+The iPhone renders provider replies as native GitHub-flavored Markdown, preserving
+the original transcript text. User messages remain literal. Presentation uses
+Pika's fixed light cream Pokédex theme regardless of system appearance, neutral provider marks, scrollable tables and code
+blocks with explicit Copy. Copy contains the rendered code body without fence
+markers or the fence-separating final newline. Markdown does not execute HTML,
+fetch images automatically, or open custom URL schemes. Only a user-tapped web
+or mail link can open externally. This view owns no connection or message state.
+
+The iPhone remains a client of the selected machine's shared board and existing
+conversations. Its normal transport is the narrow `_mobile` command over SSH;
+the phone does not own another assistant, fleet scanner or conversation store.
+
+The approved **Connect phone → Scan QR** journey adds a temporary foreground
+pairing endpoint, not a permanent listener. A compact QR carries its endpoint,
+an ephemeral TLS certificate pin and a short-lived one-use authorization. The
+phone obtains exact SSH and Pika identity over that pinned connection before
+enrollment. The QR never carries an existing private key. The phone generates
+and retains its own key; the host installs only its public key, restricted to
+the mobile command without forwarding or a terminal. Existing SSH entries and
+server policy are preserved. Manual authentication remains available.
+
+Pairing and connection are distinct: the phone records a completed connection
+only after pinned SSH authentication, matching Pika identity and a valid board.
+After an interrupted enrollment it retains the same provisional key and checks
+that connection, rather than generating another key or replaying a grant.
+Cancellation before dispatch installs nothing; cancellation after dispatch does
+not imply server-side revocation. The pairing token expires, but a successfully
+installed phone key remains authorized until revoked through SSH access control.
+
 Native Muse uses bounded root-session metadata discovery, exact UUID resume,
 and user-settings lifecycle hooks. Nested subagent logs and headless hook owners
 are excluded. Muse-generated titles are not evidence of a personal rename;

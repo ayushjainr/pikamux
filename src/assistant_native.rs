@@ -35,10 +35,11 @@ pub(crate) fn run(args: Args) -> Result<i32> {
         max_calls,
     } = entry;
     let native_executable = executable.canonicalize()?;
-    let (lock, binding, profile) =
+    let (lock, mut binding, mut profile) =
         prepare_home(&root, &profile_id, &scope, &executable, &native_executable)?;
-    let native = native_registry(&ordinary, &root, &native_executable, profile)?;
-    let receipt = open_exact(&native, &binding)?;
+    let native = native_registry(&ordinary, &root, &native_executable, &mut profile)?;
+    require_finished_shared_setup(&binding)?;
+    let receipt = launch_bound_home(&native, &root, &native_executable, &profile, &mut binding)?;
     confirm_first_launch(&native, &root, &binding)?;
     let selection = crate::assistant_startup::Selection {
         profile_root: root,
@@ -51,6 +52,10 @@ pub(crate) fn run(args: Args) -> Result<i32> {
         crate::assistant_startup::save(&crate::assistant_startup::path()?, &selection)?;
     }
     drop(lock);
+    attach_native_receipt(&native, receipt)
+}
+
+fn attach_native_receipt(native: &Pika, receipt: OpenReceipt) -> Result<i32> {
     let receipt = match receipt.target {
         crate::core::OpenTarget::Session(session) => native.open_session(*session, true)?,
         crate::core::OpenTarget::Pending(pending) => {
@@ -58,6 +63,66 @@ pub(crate) fn run(args: Args) -> Result<i32> {
         }
     };
     Ok(receipt.exit_code)
+}
+
+fn require_finished_shared_setup(binding: &Binding) -> Result<()> {
+    if binding.shared_creation && binding.thread_id.is_some() && !binding.shared_ready {
+        bail!(
+            "The assistant's exact UUID was created but its initial provider setup is unfinished. Recover that same identity before reopening; no replacement was created."
+        );
+    }
+    Ok(())
+}
+
+fn launch_bound_home(
+    native: &Pika,
+    root: &Path,
+    native_executable: &Path,
+    profile: &crate::assistant_native_profile::LaunchProfile,
+    binding: &mut Binding,
+) -> Result<OpenReceipt> {
+    let stored_session = binding
+        .thread_id
+        .as_deref()
+        .map(|thread| native.store.get_session(Provider::Codex, thread))
+        .transpose()?
+        .flatten();
+    Ok(
+        if binding.thread_id.is_none() && native.store.get_pending(&binding.launch_token)?.is_none()
+        {
+            reserve_shared_thread(native, root, native_executable, profile, binding)?;
+            native.new_shared_codex_home(
+                "Pika",
+                &binding.launch_token,
+                binding.thread_id.as_deref().expect("reserved identity"),
+            )?
+        } else if binding.shared_creation
+            && native.store.get_pending(&binding.launch_token)?.is_none()
+            && binding.thread_id.is_some()
+            && stored_session.is_none()
+        {
+            recover_reserved_home(native, profile, binding)?
+        } else {
+            open_exact(native, binding)?
+        },
+    )
+}
+
+fn recover_reserved_home(
+    native: &Pika,
+    profile: &crate::assistant_native_profile::LaunchProfile,
+    binding: &Binding,
+) -> Result<OpenReceipt> {
+    let mut provider = crate::assistant_native_profile::connect_shared_provider(profile)?;
+    let thread = binding.thread_id.as_deref().expect("saved shared identity");
+    let loaded = provider.rpc(
+        "thread/read",
+        serde_json::json!({"threadId":thread,"includeTurns":true}),
+    )?;
+    if loaded["thread"]["id"] != thread {
+        bail!("The private provider did not confirm the reserved assistant identity");
+    }
+    native.new_shared_codex_home("Pika", &binding.launch_token, thread)
 }
 
 fn prepare_home(
@@ -94,6 +159,14 @@ fn prepare_home(
         binding.launch_token.clone(),
     );
     crate::assistant_native_profile::validate_provider(native_executable, &profile)?;
+    if binding.thread_id.is_some()
+        || crate::store::Store::at(root.join("native-registry/pika.db"))
+            .get_pending(&binding.launch_token)?
+            .is_none()
+    {
+        crate::assistant_native_profile::stage_shared_resume(root, &mut profile)?;
+        crate::assistant_native_profile::validate_provider(native_executable, &profile)?;
+    }
     Ok((lock, binding, profile))
 }
 
@@ -256,6 +329,10 @@ struct Binding {
     memory_epoch: u64,
     #[serde(default)]
     provider_executable: Option<PathBuf>,
+    #[serde(default)]
+    shared_creation: bool,
+    #[serde(default)]
+    shared_ready: bool,
 }
 
 fn bind_scope(root: &Path, profile_id: &str, scope: &str) -> Result<Binding> {
@@ -282,6 +359,8 @@ fn bind_scope(root: &Path, profile_id: &str, scope: &str) -> Result<Binding> {
         memory_epoch: crate::assistant_memory::Store::open(root.join("memory.sqlite"))?
             .forget_epoch()?,
         provider_executable: None,
+        shared_creation: false,
+        shared_ready: false,
     };
     save_binding(root, &binding)?;
     Ok(binding)
@@ -440,17 +519,21 @@ pub(crate) fn fresh_context(
     request: &str,
 ) -> Result<serde_json::Value> {
     let _lock = launch_lock(root)?;
+    let binding = bind_scope(root, profile_id, scope)?;
+    if binding.shared_creation && binding.thread_id.is_none() {
+        bail!(
+            "Native assistant creation is unresolved. Recover its exact provider identity before requesting fresh context; no replacement was created."
+        );
+    }
     if let Some(receipt) =
         crate::assistant_native_recovery::completed_receipt(root, profile_id, scope, request)?
     {
-        let binding = bind_scope(root, profile_id, scope)?;
         let registry = crate::store::Store::at(root.join("native-registry/pika.db"));
         if recorded_thread(&registry, &binding)?.as_deref() == receipt["retired_thread"].as_str() {
             finish_retirement(root, &registry, &binding)?;
         }
         return Ok(receipt);
     }
-    let binding = bind_scope(root, profile_id, scope)?;
     let registry = crate::store::Store::at(root.join("native-registry/pika.db"));
     let thread = recorded_thread(&registry, &binding)?;
     let result = crate::assistant_native_recovery::fresh_context(
@@ -478,6 +561,8 @@ fn finish_retirement(root: &Path, registry: &crate::store::Store, binding: &Bind
         memory_epoch: crate::assistant_memory::Store::open(root.join("memory.sqlite"))?
             .forget_epoch()?,
         provider_executable: binding.provider_executable.clone(),
+        shared_creation: false,
+        shared_ready: false,
     };
     if let Some(thread) = recorded_thread(registry, binding)? {
         registry.untrack_session(Provider::Codex, &thread)?;
@@ -491,7 +576,7 @@ fn native_registry(
     ordinary: &Pika,
     root: &Path,
     executable: &Path,
-    mut profile: crate::assistant_native_profile::LaunchProfile,
+    profile: &mut crate::assistant_native_profile::LaunchProfile,
 ) -> Result<Pika> {
     let registry = root.join("native-registry");
     crate::assistant_storage::directory(&registry)?;
@@ -524,15 +609,100 @@ fn native_registry(
     Ok(
         Pika::with_components(paths, config, store, ordinary.tmux.clone()).with_launch_context(
             LaunchContext {
-                cwd: profile.cwd,
-                environment: profile.environment,
-                arguments: profile.argv,
+                cwd: profile.cwd.clone(),
+                environment: profile.environment.clone(),
+                arguments: profile.argv.clone(),
             },
         ),
     )
 }
 
+fn reserve_shared_thread(
+    native: &Pika,
+    root: &Path,
+    executable: &Path,
+    profile: &crate::assistant_native_profile::LaunchProfile,
+    binding: &mut Binding,
+) -> Result<()> {
+    if binding.shared_creation {
+        bail!(
+            "Assistant creation has an unknown outcome. No second conversation was created; retain this profile for exact recovery."
+        );
+    }
+    if !native.store.list_sessions()?.is_empty() || !native.store.list_pending()?.is_empty() {
+        bail!("The native assistant registry already has an identity; no replacement was created");
+    }
+    crate::assistant_native_profile::start_shared_provider(executable, profile)?;
+    let mut provider = crate::assistant_native_profile::connect_shared_provider(profile)?;
+    // Durable intent precedes dispatch. Any failure without an exact UUID stays
+    // unknown and never retries thread/start automatically.
+    binding.shared_creation = true;
+    save_binding(root, binding)?;
+    let result = provider.rpc(
+        "thread/start",
+        serde_json::json!({
+            "cwd":profile.cwd,"model":"gpt-6-luna","approvalPolicy":"never",
+            "ephemeral":false,"persistExtendedHistory":true,
+        }),
+    )?;
+    let thread = result["thread"]["id"]
+        .as_str()
+        .context("Private provider omitted the new assistant identity; creation is unknown")?;
+    binding.thread_id = Some(uuid::Uuid::parse_str(thread)?.to_string());
+    save_binding(root, binding)?;
+    materialize_reserved_thread(&mut provider, thread)?;
+    finish_shared_reservation(native, root, binding, thread)
+}
+
+fn materialize_reserved_thread(
+    provider: &mut crate::mobile_codex::Client,
+    thread: &str,
+) -> Result<()> {
+    // Codex does not materialize a fresh persistent thread until its first
+    // turn. Its archive API explicitly persists it without inference; restore
+    // only this just-created UUID before any terminal or user turn is admitted.
+    provider.rpc("thread/archive", serde_json::json!({"threadId":thread}))?;
+    let restored = provider.rpc("thread/unarchive", serde_json::json!({"threadId":thread}))?;
+    if restored["thread"]["id"] != thread {
+        bail!("Private provider did not restore the newly reserved identity");
+    }
+    let resumed = provider.rpc(
+        "thread/resume",
+        serde_json::json!({"threadId":thread,"excludeTurns":true}),
+    )?;
+    if resumed["thread"]["id"] != thread {
+        bail!("Private provider did not rejoin the newly reserved identity");
+    }
+    Ok(())
+}
+
+fn finish_shared_reservation(
+    native: &Pika,
+    root: &Path,
+    binding: &mut Binding,
+    thread: &str,
+) -> Result<()> {
+    if !native
+        .store
+        .bind_launch(&binding.launch_token, Provider::Codex, thread)?
+    {
+        bail!("Private assistant creation collided with another exact launch binding");
+    }
+    crate::assistant_native_recovery::record_context(
+        root,
+        &binding.profile_id,
+        &binding.scope,
+        thread,
+    )?;
+    binding.shared_ready = true;
+    save_binding(root, binding)?;
+    Ok(())
+}
+
 fn open_exact(native: &Pika, binding: &Binding) -> Result<OpenReceipt> {
+    if native.store.get_pending(&binding.launch_token)?.is_some() {
+        return native.open_pending(&binding.launch_token, false);
+    }
     if let Some(thread) = recorded_thread(&native.store, binding)? {
         if let Some(session) = native.store.get_session(Provider::Codex, &thread)? {
             return native.open_session(session, false);
@@ -611,6 +781,9 @@ pub(crate) fn require_current_context(root: &Path, profile_id: &str, scope: &str
 pub(crate) fn provider_executable(root: &Path, profile_id: &str, scope: &str) -> Result<PathBuf> {
     crate::assistant_host::verify_existing_profile(root, profile_id)?;
     let binding = bind_scope(root, profile_id, scope)?;
+    if binding.shared_creation && !binding.shared_ready {
+        bail!("The assistant's provider setup is unfinished; no helper was admitted");
+    }
     let executable = binding.provider_executable.context("This native profile has no recorded provider executable; open its exact conversation to connect it.")?;
     if !executable.is_absolute() || !executable.is_file() {
         bail!("This native profile's selected Codex executable is unavailable");
@@ -626,6 +799,69 @@ pub(crate) fn bound_thread(root: &Path, profile_id: &str, scope: &str) -> Result
         &binding,
     )?
     .context("Native conversation has no exact recorded provider UUID")
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct SharedBinding {
+    pub socket_path: PathBuf,
+    pub thread_id: String,
+    pub profile_id: String,
+    pub scope: String,
+    pub memory_epoch: u64,
+    pub launch_token: String,
+}
+
+/// Resolve only the existing private provider endpoint. This never starts a
+/// daemon, creates a conversation, or changes a running terminal's route.
+pub(crate) fn shared_binding(root: &Path, profile_id: &str, scope: &str) -> Result<SharedBinding> {
+    crate::assistant_host::verify_existing_profile(root, profile_id)?;
+    require_current_context(root, profile_id, scope)?;
+    let binding = bind_scope(root, profile_id, scope)?;
+    if binding.shared_creation && !binding.shared_ready {
+        bail!("The assistant's provider setup is unfinished; no mobile action was admitted");
+    }
+    let thread_id = bound_thread(root, profile_id, scope)?;
+    let socket_path = crate::assistant_native_profile::shared_socket(root).canonicalize()
+        .context("The assistant is not on its private shared connection yet. Exit its terminal normally, then reopen Pika; the running assistant was left untouched.")?;
+    require_private_socket(&socket_path)?;
+    std::os::unix::net::UnixStream::connect(&socket_path)
+        .context("The private assistant provider is unavailable; no replacement was started")?;
+    Ok(SharedBinding {
+        socket_path,
+        thread_id,
+        profile_id: profile_id.into(),
+        scope: scope.into(),
+        memory_epoch: binding.memory_epoch,
+        launch_token: binding.launch_token,
+    })
+}
+
+fn require_private_socket(socket_path: &Path) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = std::fs::symlink_metadata(socket_path)?;
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_socket() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        bail!("The assistant's private provider socket is not owner-only");
+    }
+    for ancestor in socket_path.ancestors().skip(1) {
+        let metadata = std::fs::symlink_metadata(ancestor)?;
+        let sticky_root = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
+        if !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+            || (metadata.mode() & 0o022 != 0 && !sticky_root)
+        {
+            bail!("The assistant provider socket has an untrusted parent");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn require_shared_binding(root: &Path, expected: &SharedBinding) -> Result<()> {
+    let current = shared_binding(root, &expected.profile_id, &expected.scope)?;
+    if current != *expected {
+        bail!("The assistant's exact context generation or private endpoint changed");
+    }
+    Ok(())
 }
 
 pub(crate) fn require_generation(
@@ -739,6 +975,65 @@ mod tests {
             .bind_launch(&binding.launch_token, Provider::Claude, &thread)
             .unwrap();
         assert!(recorded_thread(&store, &binding).is_err());
+    }
+
+    #[test]
+    fn unknown_shared_creation_never_replays_or_replaces_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("private");
+        crate::assistant_storage::directory(&root).unwrap();
+        let profile = crate::assistant_memory::Store::open(root.join("memory.sqlite"))
+            .unwrap()
+            .profile_id()
+            .to_owned();
+        let mut binding = bind_scope(&root, &profile, "personal").unwrap();
+        binding.shared_creation = true;
+        save_binding(&root, &binding).unwrap();
+        let before = std::fs::read(root.join("native-binding.json")).unwrap();
+        let native = Pika::with_components(
+            crate::paths::Paths::discover().unwrap(),
+            crate::config::Config::default(),
+            registry_fixture(&root),
+            crate::tmux::Tmux::with_executable("/usr/bin/false", Some("never-used".into())),
+        );
+        let launch = crate::assistant_native_profile::LaunchProfile {
+            cwd: root.clone(),
+            environment: Default::default(),
+            argv: Vec::new(),
+        };
+        let error = reserve_shared_thread(
+            &native,
+            &root,
+            Path::new("/usr/bin/false"),
+            &launch,
+            &mut binding,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown outcome"));
+        assert!(
+            shared_binding(&root, &profile, "personal")
+                .unwrap_err()
+                .to_string()
+                .contains("unfinished")
+        );
+        assert!(
+            fresh_context(
+                &root,
+                &profile,
+                "personal",
+                &uuid::Uuid::new_v4().to_string()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unresolved")
+        );
+        assert_eq!(
+            std::fs::read(root.join("native-binding.json")).unwrap(),
+            before
+        );
+        assert!(native.store.list_pending().unwrap().is_empty());
+        assert!(native.store.list_sessions().unwrap().is_empty());
+        assert!(!root.join("provider-home").exists());
     }
 
     #[test]

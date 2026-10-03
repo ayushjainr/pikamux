@@ -210,6 +210,7 @@ struct State {
     summary: Option<Summary>,
     health: Vec<String>,
     revision: u64,
+    observed_at: Option<f64>,
     return_interests: BTreeSet<ReturnInterest>,
     #[cfg(unix)]
     assistant_projection: Option<(std::path::PathBuf, String, Option<std::path::PathBuf>)>,
@@ -222,6 +223,7 @@ pub(crate) struct Snapshot {
     pub summary: Summary,
     pub health: Vec<String>,
     pub revision: u64,
+    pub observed_at: Option<f64>,
 }
 
 // The producer owns only data and cancellation, never a consumer lease. This
@@ -258,6 +260,14 @@ impl Publisher {
         }
         let mut state = self.state.lock().unwrap();
         state.summary = Some(summarize(&items, &state.filter));
+        if fresh {
+            state.observed_at = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64(),
+            );
+        }
         #[cfg(unix)]
         let projection = if fresh {
             state
@@ -317,6 +327,7 @@ fn snapshot(state: &State) -> Option<Snapshot> {
         summary: state.summary.clone()?,
         health: state.health.clone(),
         revision: state.revision,
+        observed_at: state.observed_at,
     })
 }
 struct Owner {

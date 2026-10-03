@@ -10,10 +10,107 @@ use std::{
 };
 use toml_edit::{DocumentMut, Item, Table, value};
 
+#[derive(Clone)]
 pub(crate) struct LaunchProfile {
     pub cwd: PathBuf,
     pub environment: BTreeMap<String, String>,
     pub argv: Vec<String>,
+}
+
+pub(crate) fn shared_socket(root: &Path) -> PathBuf {
+    root.join("provider-home/app-server-control/app-server-control.sock")
+}
+
+/// Provider-owned daemon management, confined to the existing private home.
+/// This is never called merely to open the phone or reopen a live terminal.
+pub(crate) fn start_shared_provider(provider: &Path, profile: &LaunchProfile) -> Result<()> {
+    let mut command = Command::new(provider);
+    command
+        .args(["app-server", "daemon", "start"])
+        .current_dir(&profile.cwd)
+        .envs(&profile.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .context("Private assistant provider could not start")?;
+    let output = capture_stream(child.stdout.take().unwrap(), 65536);
+    let diagnostics = capture_stream(child.stderr.take().unwrap(), 65536);
+    let start = Instant::now();
+    let timeout = Duration::from_secs(15);
+    let status = wait_capability_probe(&mut child, start, timeout)?;
+    wait_captures(&child, &output, &diagnostics, start, timeout)?;
+    let output = output
+        .join()
+        .map_err(|_| anyhow::anyhow!("Private provider output failed"))??;
+    let diagnostics = diagnostics
+        .join()
+        .map_err(|_| anyhow::anyhow!("Private provider diagnostics failed"))??;
+    if !status.success() || output.len() > 65536 || diagnostics.len() > 65536 {
+        bail!("Private assistant provider failed to start; no conversation was created");
+    }
+    Ok(())
+}
+
+pub(crate) fn connect_shared_provider(
+    profile: &LaunchProfile,
+) -> Result<crate::mobile_codex::Client> {
+    let home = profile
+        .environment
+        .get("CODEX_HOME")
+        .context("Missing private provider home")?;
+    crate::mobile_codex::Client::connect_server(
+        &Path::new(home).join("app-server-control/app-server-control.sock"),
+    )
+}
+
+/// Stage the private profile as daemon defaults. First creation reserves its
+/// exact provider UUID separately; shared hooks never establish terminal
+/// ownership. No provider process is started or stopped here.
+pub(crate) fn stage_shared_resume(root: &Path, profile: &mut LaunchProfile) -> Result<()> {
+    let home = root.join("provider-home");
+    let path = home.join("config.toml");
+    let mut config = load_native_config(&path)?;
+    let scoped = load_native_config(&home.join("pika-assistant.config.toml"))?;
+    for (key, item) in scoped.iter() {
+        merge_profile_item(config.as_table_mut().entry(key).or_insert(Item::None), item);
+    }
+    config.remove("sandbox_mode");
+    config["model"] = value("gpt-6-luna");
+    config["features"]["daemon_auto_start"] = value(true);
+    config["tui"]["status_line"] = value(toml_edit::Array::from_iter([
+        "model-with-reasoning",
+        "context-remaining",
+    ]));
+    config["tui"]["terminal_title"] = value(toml_edit::Array::from_iter(["app-name"]));
+    install(&path, &config.to_string())?;
+    // Codex deliberately selects embedded mode for --profile and arbitrary -c
+    // overrides. All those exact values are now supplied by the private base.
+    let mut args = Vec::new();
+    let mut index = 0;
+    while index < profile.argv.len() {
+        if matches!(profile.argv[index].as_str(), "--profile" | "--config") {
+            index += 2;
+        } else {
+            args.push(profile.argv[index].clone());
+            index += 1;
+        }
+    }
+    profile.argv = args;
+    Ok(())
+}
+
+fn merge_profile_item(destination: &mut Item, layer: &Item) {
+    if let (Some(destination), Some(layer)) = (destination.as_table_mut(), layer.as_table()) {
+        for (key, item) in layer.iter() {
+            merge_profile_item(destination.entry(key).or_insert(Item::None), item);
+        }
+    } else {
+        *destination = layer.clone();
+    }
 }
 
 /// Prove the selected native runtime honors the final scoped configuration.
@@ -666,6 +763,71 @@ mod tests {
             assert!(!root.join("native-registry").exists());
         }
     }
+    #[test]
+    fn shared_resume_preserves_private_identity_and_stages_exact_policy() {
+        let (_temp, root, id) = fixture();
+        install(
+            &root.join("provider-home/config.toml"),
+            "model = 'old'\nmodel_provider = 'synthetic'\n",
+        )
+        .unwrap();
+        install(
+            &root.join("provider-home/auth.json"),
+            "synthetic-not-a-credential",
+        )
+        .unwrap();
+        let mut launch = prepare(
+            &root,
+            &id,
+            "personal",
+            Path::new("/tmp/pika binary"),
+            Path::new("/usr/bin/false"),
+        )
+        .unwrap();
+        let original_environment = launch.environment.clone();
+        let original_cwd = launch.cwd.clone();
+        stage_shared_resume(&root, &mut launch).unwrap();
+        assert_eq!(launch.environment, original_environment);
+        assert_eq!(launch.cwd, original_cwd);
+        assert!(
+            !launch
+                .argv
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--profile" | "--config" | "--no-daemon"))
+        );
+        assert!(
+            launch
+                .argv
+                .windows(2)
+                .any(|args| args == ["--ask-for-approval", "never"])
+        );
+        let config = load_native_config(&root.join("provider-home/config.toml")).unwrap();
+        assert_eq!(config["model_provider"].as_str(), Some("synthetic"));
+        assert_eq!(config["approval_policy"].as_str(), Some("never"));
+        assert_eq!(
+            config["default_permissions"].as_str(),
+            Some("pika-source-scoped")
+        );
+        assert_eq!(
+            config["features"]["daemon_auto_start"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            config["mcp_servers"]["pika"]["command"].as_str(),
+            Some("/tmp/pika binary")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("provider-home/auth.json")).unwrap(),
+            "synthetic-not-a-credential"
+        );
+        let before = fs::read(root.join("provider-home/config.toml")).unwrap();
+        stage_shared_resume(&root, &mut launch).unwrap();
+        assert_eq!(
+            fs::read(root.join("provider-home/config.toml")).unwrap(),
+            before
+        );
+    }
+
     #[test]
     fn profile_is_isolated_and_preserves_provider_config_and_credentials() {
         let (temp, root, id) = fixture();

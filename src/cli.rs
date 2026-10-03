@@ -57,6 +57,12 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    #[cfg(unix)]
+    #[command(name = "_mobile", hide = true)]
+    Mobile,
+    #[cfg(unix)]
+    /// Connect a phone using a short-lived, private-network QR.
+    Pair(crate::mobile_pairing::Args),
     /// Talk to your persistent Pika assistant.
     Pika(crate::assistant::Args),
     #[command(name = "_assistant-native-tools", hide = true)]
@@ -695,6 +701,10 @@ where
 
 fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
     match command {
+        #[cfg(unix)]
+        Some(Command::Mobile) => crate::mobile::serve(pika),
+        #[cfg(unix)]
+        Some(Command::Pair(args)) => crate::mobile_pairing::run(pika, args),
         None => bare(pika),
         Some(Command::ClientBoard(a)) => {
             verify_local_node(pika, &a.expected_node_id)?;
@@ -1113,8 +1123,13 @@ fn board_settings(pika: &Pika) -> Result<i32> {
     loop {
         match ui.choice(
             "Board settings",
-            "Connect your machines here. Your agents keep running.",
-            &["Back to board", "Connect a machine", "Machine connections"],
+            "Connect a phone or another machine. Your agents keep running.",
+            &[
+                "Back to board",
+                "Connect a machine",
+                "Machine connections",
+                "Connect phone",
+            ],
         )? {
             Some(1) => {
                 let mut notices = Vec::new();
@@ -1136,8 +1151,16 @@ fn board_settings(pika: &Pika) -> Result<i32> {
                 }
             }
             Some(2) => crate::machine_settings::connections(&pika.store, &ui)?,
+            Some(3) => connect_phone(pika, &ui)?,
             _ => return Ok(0),
         }
+    }
+}
+
+fn connect_phone(pika: &Pika, ui: &crate::onboarding::Screen) -> Result<()> {
+    match crate::mobile_pairing::run_on_screen(pika, crate::mobile_pairing::Args::default(), ui) {
+        Ok(_) => Ok(()),
+        Err(error) => ui.details("Phone connection unavailable", &format!("{error:#}")),
     }
 }
 
@@ -3414,59 +3437,7 @@ fn setup_screen(pika: &Pika, a: SetupArgs, ui: &crate::onboarding::Screen) -> Re
         )?;
     }
     if ui.active() {
-        let count = pika.store.list_sessions()?.len();
-        let intro = if count == 0 {
-            "No conversations selected yet.\nYou can start or find one with pika NAME.".to_owned()
-        } else {
-            format!(
-                "{count} conversation(s) on your board.\nEnter opens a conversation. Use its visible ← Pika control to return."
-            )
-        };
-        loop {
-            let body = format!(
-                "{intro}\n\nAgents can discover and consult project experts through the installed skill.\n{}",
-                if notices.is_empty() {
-                    "No interviews were run during setup.".into()
-                } else {
-                    format!("{} connection notice(s) to review below.", notices.len())
-                }
-            );
-            match ui.choice(
-                "Your board",
-                &body,
-                &[
-                    "Open board",
-                    "Connect another machine",
-                    "Connection notices",
-                    "Setup details",
-                    "Done",
-                ],
-            )? {
-                Some(0) => return Ok(10),
-                Some(1) => connect_setup_machines(
-                    pika,
-                    ui,
-                    SetupMachineOptions {
-                        explicit_machines: &[],
-                        install_bundle: install_bundle.as_deref(),
-                        remote_import_all: false,
-                        yes: false,
-                    },
-                    &mut notices,
-                    &journal,
-                )?,
-                Some(2) => ui.details(
-                    "Connection notices",
-                    &if notices.is_empty() {
-                        "No connection notices.".into()
-                    } else {
-                        notices.join("\n\n")
-                    },
-                )?,
-                Some(3) => ui.details("Setup details", &journal.borrow().join("\n\n"))?,
-                _ => return Ok(0),
-            }
-        }
+        return setup_completion(pika, ui, install_bundle.as_deref(), &mut notices, &journal);
     }
     if !a.skip_walkthrough && io::stdin().is_terminal() {
         println!(
@@ -3474,6 +3445,70 @@ fn setup_screen(pika: &Pika, a: SetupArgs, ui: &crate::onboarding::Screen) -> Re
         );
     }
     Ok(0)
+}
+
+fn setup_completion(
+    pika: &Pika,
+    ui: &crate::onboarding::Screen,
+    install_bundle: Option<&std::path::Path>,
+    notices: &mut Vec<String>,
+    journal: &std::cell::RefCell<Vec<String>>,
+) -> Result<i32> {
+    let count = pika.store.list_sessions()?.len();
+    let intro = if count == 0 {
+        "No conversations selected yet.\nYou can start or find one with pika NAME.".to_owned()
+    } else {
+        format!(
+            "{count} conversation(s) on your board.\nEnter opens a conversation. Use its visible ← Pika control to return."
+        )
+    };
+    loop {
+        let body = format!(
+            "{intro}\n\nAgents can discover and consult project experts through the installed skill.\n{}",
+            if notices.is_empty() {
+                "No interviews were run during setup.".into()
+            } else {
+                format!("{} connection notice(s) to review below.", notices.len())
+            }
+        );
+        match ui.choice(
+            "Your board",
+            &body,
+            &[
+                "Open board",
+                "Connect another machine",
+                "Connection notices",
+                "Setup details",
+                "Connect phone",
+                "Done",
+            ],
+        )? {
+            Some(0) => return Ok(10),
+            Some(1) => connect_setup_machines(
+                pika,
+                ui,
+                SetupMachineOptions {
+                    explicit_machines: &[],
+                    install_bundle,
+                    remote_import_all: false,
+                    yes: false,
+                },
+                notices,
+                journal,
+            )?,
+            Some(2) => ui.details(
+                "Connection notices",
+                &if notices.is_empty() {
+                    "No connection notices.".into()
+                } else {
+                    notices.join("\n\n")
+                },
+            )?,
+            Some(3) => ui.details("Setup details", &journal.borrow().join("\n\n"))?,
+            Some(4) => connect_phone(pika, ui)?,
+            _ => return Ok(0),
+        }
+    }
 }
 fn connect_setup_machines(
     pika: &Pika,
