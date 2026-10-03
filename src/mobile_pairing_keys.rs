@@ -130,6 +130,9 @@ impl Grant {
         if !path.is_absolute() {
             bail!("SSH authorization path must be absolute");
         }
+        if has_traversal(&path) {
+            bail!("SSH authorization path must not contain traversal components");
+        }
         let parent = path
             .parent()
             .context("SSH authorization path has no parent")?;
@@ -303,20 +306,51 @@ fn ssh_directory(path: &Path) -> Result<()> {
     {
         bail!("SSH directory must be owned and not writable by others");
     }
-    trusted_ancestors(path)?;
+    let home = directories::BaseDirs::new().context("Cannot determine SSH home")?;
+    grant_ancestors(path, home.home_dir())?;
     Ok(())
 }
 
 fn trusted_ancestors(path: &Path) -> Result<()> {
+    validate_ancestors(path, None)
+}
+
+fn grant_ancestors(path: &Path, home: &Path) -> Result<()> {
+    // Lexical traversal must not escape the account-home boundary. Custom
+    // targets outside HOME retain the stronger host-anchor ancestor policy.
+    if has_traversal(path) {
+        bail!("SSH authorization path must not contain traversal components");
+    }
+    let boundary =
+        (home.is_absolute() && !has_traversal(home) && path.starts_with(home)).then_some(home);
+    validate_ancestors(path, boundary)
+}
+
+fn has_traversal(path: &Path) -> bool {
+    path.components().any(|part| {
+        matches!(
+            part,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    })
+}
+
+fn ancestor_owner_trusted(owner: u32, current: u32, above_home: bool) -> bool {
+    above_home || owner == 0 || owner == current
+}
+
+fn validate_ancestors(path: &Path, home: Option<&Path>) -> Result<()> {
     for ancestor in path.ancestors() {
         crate::mobile_pairing_acl::validate(ancestor)
             .with_context(|| format!("Cannot validate SSH ancestor ACL {}", ancestor.display()))?;
         let metadata = fs::symlink_metadata(ancestor)?;
         let owner = metadata.uid();
+        let above_home = home.is_some_and(|home| ancestor != home && home.starts_with(ancestor));
         // A sticky, root-owned temporary parent cannot replace an owned child.
         let sticky_root = owner == 0 && metadata.mode() & 0o1000 != 0;
         if !metadata.is_dir()
-            || owner != 0 && owner != unsafe { libc::geteuid() }
+            || !ancestor_owner_trusted(owner, unsafe { libc::geteuid() }, above_home)
+            || home == Some(ancestor) && owner != unsafe { libc::geteuid() }
             || metadata.mode() & 0o022 != 0 && !sticky_root
         {
             bail!("SSH path has an untrusted or writable ancestor");
@@ -346,6 +380,34 @@ mod tests {
         ] {
             assert!(public_key(&bad).is_err());
         }
+    }
+    #[test]
+    fn foreign_owner_exception_is_only_above_account_home() {
+        assert!(ancestor_owner_trusted(1234, 5678, true));
+        assert!(!ancestor_owner_trusted(1234, 5678, false));
+        assert!(ancestor_owner_trusted(0, 5678, false));
+        assert!(ancestor_owner_trusted(5678, 5678, false));
+    }
+    #[test]
+    fn home_boundary_keeps_path_and_write_safety() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let ssh = home.join(".ssh");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&ssh).unwrap();
+        assert!(grant_ancestors(&ssh, &home).is_ok());
+        assert!(grant_ancestors(&ssh.join("../.ssh"), &home).is_err());
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(grant_ancestors(&ssh, &home).is_err());
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(grant_ancestors(&ssh, &home).is_err());
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        assert!(grant_ancestors(&alias.join(".ssh"), &alias).is_err());
+        assert!(grant_ancestors(&ssh, &base.join("elsewhere")).is_ok());
     }
     #[test]
     fn preserves_public_ssh_modes_and_unrelated_bytes() {

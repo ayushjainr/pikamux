@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.40 — Pair from your existing SSH account
+
+- Allow phone enrollment beneath a safe administrator-owned mount above the
+  invoking user's home, without changing accounts, paths or disk ownership.
+- Retain account-home and SSH-file ownership, permission, ACL, link and
+  append-only grant checks. Host-key trust and custom paths outside home retain
+  their stricter ancestor checks.
+- Exercise disposable QR-protocol enrollment and SSH key authentication beneath
+  a foreign-owned mount in Linux CI.
+
 ## 0.6.39 — Connect your phone to existing Pika conversations
 
 - Add `pika pair` and **Connect phone**: a compact, short-lived QR enrolls

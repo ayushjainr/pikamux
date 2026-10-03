@@ -59,6 +59,17 @@ and retains its own key; the host installs only its public key, restricted to
 the mobile command without forwarding or a terminal. Existing SSH entries and
 server policy are preserved. Manual authentication remains available.
 
+Phone-key enrollment trusts the running account's configured home boundary:
+the home, SSH directory and authorization file must be owned by that account
+and protected against others' writes. Ancestors above home may have another
+owner (for example a mounted volume owned by an administrator), but must remain
+real directories without unsafe write permissions or ACLs. This assumes those
+ancestor owners are already trusted to preserve the account's home pathname;
+Pika does not establish trust in the mount administrator. Custom authorization
+paths outside home retain the root/current-user ancestor ownership requirement.
+SSH host-key anchors retain their separate, stricter ancestor trust policy.
+Enrollment never changes directory ownership, permissions or the target account.
+
 Pairing and connection are distinct: the phone records a completed connection
 only after pinned SSH authentication, matching Pika identity and a valid board.
 After an interrupted enrollment it retains the same provisional key and checks
