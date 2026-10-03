@@ -223,6 +223,8 @@ pub(crate) struct Snapshot {
     pub summary: Summary,
     pub health: Vec<String>,
     pub revision: u64,
+    // Used by the Unix phone endpoint; Windows only consumes the board rows.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub observed_at: Option<f64>,
 }
 

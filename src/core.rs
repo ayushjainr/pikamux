@@ -2025,6 +2025,7 @@ impl Pika {
     /// The caller has already obtained this UUID from its private shared Codex
     /// provider. This reserves a terminal for that loaded thread, not a second
     /// provider conversation, and still requires normal UUID-to-process proof.
+    #[cfg(unix)]
     pub(crate) fn new_shared_codex_home(
         &self,
         name: &str,

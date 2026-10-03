@@ -250,7 +250,10 @@ final class PikaUITests: XCTestCase {
         let second = app.buttons["Second page project"]
         XCTAssertTrue(second.waitForExistence(timeout: 5)); second.tap()
         let start = app.buttons["startThread"]
-        XCTAssertTrue(start.isEnabled); start.tap()
+        XCTAssertTrue(start.isEnabled)
+        let creation = XCTAttachment(screenshot: app.screenshot())
+        creation.name = "Start thread machine project and name"; creation.lifetime = .keepAlways; add(creation)
+        start.tap()
         XCTAssertTrue(app.staticTexts["Creation not confirmed. It will not be repeated automatically."].waitForExistence(timeout: 5))
         XCTAssertFalse(start.isEnabled)
         app.buttons["Check original creation receipts"].tap()
@@ -260,9 +263,14 @@ final class PikaUITests: XCTestCase {
     @MainActor func testAssistantLateApprovalHistoryAndReturnToExactProject() {
         launchFixture()
         app.terminate(); app.launchArguments = ["--ui-fixture", "--fixture-approval"]; app.launch()
-        app.buttons["pikaTab"].tap(); app.buttons["Open Pika"].tap()
+        app.buttons["pikaTab"].tap()
+        let landing = XCTAttachment(screenshot: app.screenshot())
+        landing.name = "Pika entry"; landing.lifetime = .keepAlways; add(landing)
+        app.buttons["Open Pika"].tap()
         XCTAssertTrue(app.staticTexts["/fixture/notes.txt"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["acceptProviderRequest"].isEnabled)
+        let assistant = XCTAttachment(screenshot: app.screenshot())
+        assistant.name = "Pika existing assistant with original request"; assistant.lifetime = .keepAlways; add(assistant)
         app.buttons["Load older context"].tap()
         XCTAssertTrue(app.staticTexts["Older exact fixture history"].waitForExistence(timeout: 5))
         swipeBack()
