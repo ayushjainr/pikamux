@@ -503,6 +503,26 @@ fn machine_address_entry_can_be_cancelled_without_connecting() {
 }
 
 #[test]
+fn setup_phone_pairing_unavailable_returns_to_board_without_changing_ssh_access() {
+    let mut j = Journey::start(&["setup", "--no-machines", "--no-import"], 100, 32);
+    j.await_text("Enable updates");
+    j.send(b"\r");
+    j.await_text("Connect phone");
+    let hooks_before = fs::read(j.root.path().join("claude/settings.json")).unwrap();
+    j.send(b"\x1b[B\x1b[B\x1b[B\x1b[B\r");
+    j.await_text("Phone connection unavailable");
+    assert!(!j.root.path().join("home/.ssh/authorized_keys").exists());
+    j.send(b"\x1b");
+    j.await_text("Open board");
+    assert_eq!(
+        fs::read(j.root.path().join("claude/settings.json")).unwrap(),
+        hooks_before
+    );
+    j.send(b"\x1b");
+    j.finish();
+}
+
+#[test]
 fn machine_connection_needs_verified_snapshot_and_explicit_retry() {
     use serde_json::json;
     let mut j = Journey::start(&["setup", "--no-machines", "--no-import"], 100, 32);

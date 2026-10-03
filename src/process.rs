@@ -324,6 +324,12 @@ pub fn process_generation(pid: i64) -> Option<ProcessGeneration> {
     platform::read(pid).map(|record| record.generation())
 }
 
+/// Exact-PID evidence for a kernel-authenticated connection peer. This does
+/// not prove the absence of other owners; launch paths still require observe.
+pub fn process_record(pid: i64) -> Option<ProcessRecord> {
+    platform::read(pid)
+}
+
 pub fn process_alive(pid: i64, generation: Option<u64>) -> bool {
     platform::read(pid)
         .is_some_and(|record| generation.is_none_or(|expected| record.start_time == expected))
@@ -881,7 +887,10 @@ mod platform {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::{ProcessObservation, ProcessRecord};
-    use libproc::libproc::{bsd_info::BSDInfo, proc_pid::pidinfo};
+    use libproc::libproc::{
+        bsd_info::BSDInfo,
+        proc_pid::{pidinfo, pidpath},
+    };
     use libproc::processes::{ProcFilter, pids_by_type};
 
     pub fn snapshot() -> ProcessObservation {
@@ -965,7 +974,7 @@ mod platform {
                     return Ok(None);
                 }
                 Ok(_) if attempt < 2 => std::thread::sleep(std::time::Duration::from_millis(2)),
-                Ok(_) => return Err("cannot read process command line after bounded retry".into()),
+                Ok(_) => return unreadable_process_result(pid32, &info),
             }
         }
         let argv = argv.ok_or_else(|| "cannot read process command line".to_owned())?;
@@ -996,6 +1005,119 @@ mod platform {
         // SAFETY: signal zero performs an existence/permission check only.
         let result = unsafe { libc::kill(pid, 0) };
         result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    // Public Darwin filesec APIs provide positive ACL-absence evidence.
+    // arm64 uses inode64 layouts without the historical symbol suffix.
+    unsafe extern "C" {
+        fn filesec_init() -> *mut libc::c_void;
+        fn filesec_free(security: *mut libc::c_void);
+        fn filesec_query_property(
+            security: *mut libc::c_void,
+            property: libc::c_int,
+            present: *mut libc::c_int,
+        ) -> libc::c_int;
+        #[cfg_attr(target_arch = "x86_64", link_name = "lstatx_np$INODE64")]
+        fn lstatx_np(
+            path: *const libc::c_char,
+            metadata: *mut libc::stat,
+            security: *mut libc::c_void,
+        ) -> libc::c_int;
+    }
+
+    fn trusted_os_component(path: &std::path::Path, image: bool) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path_name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: filesec_init creates an opaque allocation consumed only by
+        // documented filesec APIs and freed exactly once below.
+        let security = unsafe { filesec_init() };
+        if security.is_null() {
+            return false;
+        }
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let mut present = -1;
+        // SAFETY: valid NUL-terminated path, writable stat/output pointers,
+        // and live filesec allocation. FILESEC_ACL is public property 5.
+        let observed = unsafe {
+            lstatx_np(path_name.as_ptr(), metadata.as_mut_ptr(), security) == 0
+                && filesec_query_property(security, 5, &mut present) == 0
+        };
+        unsafe {
+            filesec_free(security);
+        }
+        if !observed || present != 0 {
+            return false;
+        }
+        // SAFETY: successful lstatx_np initialized the complete native stat.
+        let metadata = unsafe { metadata.assume_init() };
+        let expected = if image { libc::S_IFREG } else { libc::S_IFDIR };
+        metadata.st_uid == 0
+            && metadata.st_mode & libc::S_IFMT == expected
+            && metadata.st_mode & 0o022 == 0
+            && (path == std::path::Path::new("/") || metadata.st_flags & 0x0008_0000 != 0)
+    }
+
+    fn trusted_ssh_image(path: &str) -> bool {
+        if !matches!(path, "/usr/sbin/sshd" | "/usr/libexec/sshd-session") {
+            return false;
+        }
+        let path = std::path::Path::new(path);
+        trusted_os_component(path, true)
+            && path
+                .ancestors()
+                .skip(1)
+                .all(|parent| trusted_os_component(parent, false))
+    }
+
+    fn same_kernel_identity(first: &BSDInfo, second: &BSDInfo) -> bool {
+        first.pbi_pid == second.pbi_pid
+            && first.pbi_ruid == second.pbi_ruid
+            && first.pbi_uid == second.pbi_uid
+            && first.pbi_start_tvsec == second.pbi_start_tvsec
+            && first.pbi_start_tvusec == second.pbi_start_tvusec
+    }
+
+    fn trusted_ssh_supervisor(pid: i32, initial: &BSDInfo) -> bool {
+        // Root execution cannot rely on root-owned, non-writable files as an
+        // independent trust boundary; preserve the original partial result.
+        if initial.pbi_ruid == 0
+            || initial.pbi_uid == 0
+            || unsafe { libc::getuid() == 0 || libc::geteuid() == 0 }
+        {
+            return false;
+        }
+        let Ok(before) = pidinfo::<BSDInfo>(pid, 0) else {
+            return false;
+        };
+        if !same_kernel_identity(initial, &before) {
+            return false;
+        }
+        let Ok(path) = pidpath(pid) else {
+            return false;
+        };
+        if !trusted_ssh_image(&path) {
+            return false;
+        }
+        let Ok(rechecked_path) = pidpath(pid) else {
+            return false;
+        };
+        let Ok(after) = pidinfo::<BSDInfo>(pid, 0) else {
+            return false;
+        };
+        path == rechecked_path && same_kernel_identity(&before, &after)
+    }
+
+    fn unreadable_process_result(
+        pid: i32,
+        initial: &BSDInfo,
+    ) -> Result<Option<ProcessRecord>, String> {
+        if trusted_ssh_supervisor(pid, initial) {
+            Ok(None)
+        } else {
+            Err("cannot read process command line after bounded retry".into())
+        }
     }
 
     fn process_info_error_is_missing(error: &str) -> bool {
@@ -1047,6 +1169,56 @@ mod platform {
             }
         }
         (output.len() == count as usize).then_some(output)
+    }
+
+    #[cfg(test)]
+    mod trust_tests {
+        #[test]
+        #[ignore = "requires installed protected OS SSH image metadata"]
+        fn exact_protected_system_ssh_images_have_positive_metadata_and_acl_proof() {
+            assert!(super::trusted_ssh_image("/usr/sbin/sshd"));
+            if std::path::Path::new("/usr/libexec/sshd-session").exists() {
+                assert!(super::trusted_ssh_image("/usr/libexec/sshd-session"));
+            }
+        }
+
+        #[test]
+        fn names_prefixes_wrappers_and_arbitrary_paths_never_receive_trust() {
+            for path in [
+                "sshd",
+                "/tmp/sshd",
+                "/usr/sbin/sshd-fake",
+                "/bin/sh",
+                "/usr/libexec/sshd-keygen-wrapper",
+            ] {
+                assert!(!super::trusted_ssh_image(path), "{path}");
+            }
+            let owned = tempfile::tempdir().unwrap();
+            assert!(!super::trusted_os_component(owned.path(), false));
+        }
+
+        #[test]
+        fn root_and_changed_kernel_identity_never_receive_supervisor_trust() {
+            // BSDInfo is a C structure containing integer and byte fields.
+            let mut identity: super::BSDInfo = unsafe { std::mem::zeroed() };
+            assert!(!super::trusted_ssh_supervisor(
+                std::process::id() as i32,
+                &identity
+            ));
+            identity.pbi_pid = 42;
+            identity.pbi_ruid = 501;
+            identity.pbi_uid = 501;
+            identity.pbi_start_tvsec = 1;
+            let mut changed: super::BSDInfo = unsafe { std::mem::zeroed() };
+            assert!(!super::same_kernel_identity(&identity, &changed));
+            changed.pbi_pid = identity.pbi_pid;
+            changed.pbi_ruid = identity.pbi_ruid;
+            changed.pbi_uid = identity.pbi_uid;
+            changed.pbi_start_tvsec = identity.pbi_start_tvsec;
+            assert!(super::same_kernel_identity(&identity, &changed));
+            changed.pbi_uid = 0;
+            assert!(!super::same_kernel_identity(&identity, &changed));
+        }
     }
 }
 

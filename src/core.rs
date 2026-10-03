@@ -2019,9 +2019,43 @@ impl Pika {
         attach: bool,
         launch_token: &str,
     ) -> Result<OpenReceipt> {
+        self.new_session_with_reserved_thread(name, provider, attach, launch_token, None)
+    }
+
+    /// The caller has already obtained this UUID from its private shared Codex
+    /// provider. This reserves a terminal for that loaded thread, not a second
+    /// provider conversation, and still requires normal UUID-to-process proof.
+    #[cfg(unix)]
+    pub(crate) fn new_shared_codex_home(
+        &self,
+        name: &str,
+        launch_token: &str,
+        thread_id: &str,
+    ) -> Result<OpenReceipt> {
+        uuid::Uuid::parse_str(thread_id)?;
+        self.new_session_with_reserved_thread(
+            name,
+            Provider::Codex,
+            false,
+            launch_token,
+            Some(thread_id),
+        )
+    }
+
+    fn new_session_with_reserved_thread(
+        &self,
+        name: &str,
+        provider: Provider,
+        attach: bool,
+        launch_token: &str,
+        shared_thread: Option<&str>,
+    ) -> Result<OpenReceipt> {
         let token = validated_launch_token(name, launch_token)?;
         let observation = self.observe_processes();
-        require_complete_processes(&observation, "start a new conversation")?;
+        let processes = require_complete_processes(&observation, "start a new conversation")?;
+        if let Some(thread) = shared_thread {
+            ensure_new_identity_unowned(Some(thread), provider, processes)?;
+        }
         let existing_panes = self
             .tmux
             .list_panes()
@@ -2032,17 +2066,18 @@ impl Pika {
                 shell_words::quote(name)
             );
         }
-        let reserved = (provider == Provider::Claude).then(|| Uuid::new_v4().to_string());
+        let reserved = shared_thread
+            .map(str::to_owned)
+            .or_else(|| (provider == Provider::Claude).then(|| Uuid::new_v4().to_string()));
         let providers = Providers::new(&self.paths, &self.config);
-        let argv = self.launch_argv(providers.new_argv(provider, name, reserved.as_deref()));
-        let cwd = self
-            .launch_context
-            .as_ref()
-            .map(|context| context.cwd.clone())
-            .map(Ok)
-            .unwrap_or_else(std::env::current_dir)?
-            .to_string_lossy()
-            .into_owned();
+        let argv = self.reserved_launch_argv(
+            &providers,
+            provider,
+            name,
+            reserved.as_deref(),
+            shared_thread,
+        );
+        let cwd = self.new_launch_cwd()?;
         let internal = free_tmux_name(
             &Tmux::internal_name(provider, reserved.as_deref().unwrap_or(&token)),
             &existing_panes,
@@ -2074,104 +2109,181 @@ impl Pika {
                 shell_words::quote(name)
             );
         }
+        self.bind_shared_launch(&token, provider, shared_thread)?;
         // Failures deliberately retain the phase-stamped pending record. It is
         // the recovery handle if tmux accepted provider execution before a
         // later readback/store operation failed.
-        (|| {
-            let pane = self.start_new_provider(&pending, &internal, &argv)?;
-            let mut exact_new_home = None;
-            if let Some(session_id) = reserved.as_deref() {
-                let mut provisional = Session {
-                    provider,
-                    session_id: session_id.to_owned(),
-                    name: Some(name.to_owned()),
-                    cwd: Some(cwd.clone()),
-                    branch: None,
-                    transcript_path: None,
-                    tmux_session: Some(pane.session_name.clone()),
-                    tmux_pane: Some(pane.pane_id.clone()),
-                    root_pid: None,
-                    status: Status::Starting,
-                    unread: false,
-                    model: None,
-                    source: "pending-launch".into(),
-                    managed: true,
-                    error: None,
-                    attention_reason: None,
-                    created_at: pending.created_at,
-                    updated_at: pending.created_at,
-                    last_event_at: pending.created_at,
-                    last_activity_at: pending.created_at,
-                    live: true,
-                    attached: false,
-                    home_state: "starting".into(),
-                    cpu_percent: None,
-                    rss_kb: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                    cached_input_tokens: None,
-                    cache_write_tokens: None,
-                    total_tokens: None,
-                    estimated_cost_usd: None,
-                    active_thread_id: None,
-                };
-                if let Ok(binding) = wait_for_exact_binding(self, &provisional, &pane.pane_id) {
-                    let start_time = i64::try_from(binding.provider_start_time)
-                        .context("provider generation does not fit the state store")?;
-                    provisional.root_pid = Some(binding.provider_pid);
-                    self.store.observe_launched_generation(
-                        &token,
+        self.finish_reserved_launch(&pending, &internal, &argv, shared_thread.is_some(), attach)
+    }
+
+    fn reserved_launch_argv(
+        &self,
+        providers: &Providers<'_>,
+        provider: Provider,
+        name: &str,
+        reserved: Option<&str>,
+        shared_thread: Option<&str>,
+    ) -> Vec<String> {
+        self.launch_argv(if let Some(thread) = shared_thread {
+            providers.resume_argv(provider, thread)
+        } else {
+            providers.new_argv(provider, name, reserved)
+        })
+    }
+
+    fn bind_shared_launch(
+        &self,
+        token: &str,
+        provider: Provider,
+        shared_thread: Option<&str>,
+    ) -> Result<()> {
+        if let Some(thread) = shared_thread
+            && !self.store.bind_launch(token, provider, thread)?
+        {
+            bail!("The private shared thread reservation changed; no terminal was launched");
+        }
+        Ok(())
+    }
+
+    fn finish_reserved_launch(
+        &self,
+        pending: &PendingLaunch,
+        internal: &str,
+        argv: &[String],
+        shared: bool,
+        attach: bool,
+    ) -> Result<OpenReceipt> {
+        let token = pending.launch_token.as_str();
+        let provider = pending.provider;
+        let name = pending.name.as_str();
+        let cwd = pending.cwd.clone();
+        let reserved = pending.expected_session_id.as_deref();
+        let pane = self.start_new_provider(pending, internal, argv)?;
+        let mut exact_new_home = None;
+        if let Some(session_id) = reserved {
+            let mut provisional = Session {
+                provider,
+                session_id: session_id.to_owned(),
+                name: Some(name.to_owned()),
+                cwd: Some(cwd.clone()),
+                branch: None,
+                transcript_path: None,
+                tmux_session: Some(pane.session_name.clone()),
+                tmux_pane: Some(pane.pane_id.clone()),
+                root_pid: None,
+                status: Status::Starting,
+                unread: false,
+                model: None,
+                source: "pending-launch".into(),
+                managed: true,
+                error: None,
+                attention_reason: None,
+                created_at: pending.created_at,
+                updated_at: pending.created_at,
+                last_event_at: pending.created_at,
+                last_activity_at: pending.created_at,
+                live: true,
+                attached: false,
+                home_state: "starting".into(),
+                cpu_percent: None,
+                rss_kb: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                cache_write_tokens: None,
+                total_tokens: None,
+                estimated_cost_usd: None,
+                active_thread_id: None,
+            };
+            if let Ok(binding) = wait_for_exact_binding(self, &provisional, &pane.pane_id) {
+                let start_time = i64::try_from(binding.provider_start_time)
+                    .context("provider generation does not fit the state store")?;
+                provisional.root_pid = Some(binding.provider_pid);
+                self.store
+                    .observe_launched_generation(token, binding.provider_pid, start_time)?;
+                if shared {
+                    // The private provider's thread/start response established
+                    // creation; this independent exact TUI generation proves
+                    // the terminal is attached to that same loaded UUID.
+                    provisional.source = "private-shared-provider".into();
+                    self.store.upsert_session(&provisional, true)?;
+                    self.store.certify_launch(
+                        token,
+                        provider,
+                        session_id,
                         binding.provider_pid,
                         start_time,
                     )?;
-                    // Reserved argv proves this process owns the launch, not
-                    // that the provider created the conversation. Only an
-                    // independently persisted provider lifecycle/discovery
-                    // record may replace the startup recovery handle.
-                    if let Some(confirmed) = self.store.get_session(provider, session_id)? {
-                        exact_new_home = Some((confirmed, binding));
-                    }
+                }
+                // Reserved argv proves this process owns the launch, not
+                // that the provider created the conversation. Only an
+                // independently persisted provider lifecycle/discovery
+                // record may replace the startup recovery handle.
+                if let Some(confirmed) = self.store.get_session(provider, session_id)? {
+                    exact_new_home = Some((confirmed, binding));
                 }
             }
-            let current = self
-                .store
-                .get_pending(&token)?
-                .unwrap_or_else(|| PendingLaunch {
-                    tmux_session: Some(pane.session_name.clone()),
-                    tmux_pane: Some(pane.pane_id.clone()),
-                    root_pid: Some(pane.pane_pid),
-                    root_pid_start: process::process_start_time(pane.pane_pid)
-                        .and_then(|value| i64::try_from(value).ok()),
-                    ..pending.clone()
-                });
-            let (code, receipt_delivery) = if attach {
-                if let Some((session, binding)) = exact_new_home.as_ref() {
-                    let receipt = continuity_receipt(session, "NEW HOME");
-                    let handoff = self.tmux.attach_exact_with_observed_receipt(
-                        &binding.pane,
-                        &receipt,
-                        || self.record_exact_handoff(session, binding, session.last_event_at),
-                    )?;
-                    (handoff.exit_code, handoff.delivery)
-                } else {
-                    let receipt = pending_receipt(&current, "NEW HOME");
-                    let handoff =
-                        self.tmux
-                            .attach_exact_with_observed_receipt(&pane, &receipt, || {
-                                open_history::record_pending(&self.store, &current)
-                            })?;
-                    (handoff.exit_code, handoff.delivery)
-                }
+        }
+        self.deliver_new_launch(pending, &pane, exact_new_home.as_ref(), attach)
+    }
+
+    fn new_launch_cwd(&self) -> Result<String> {
+        Ok(self
+            .launch_context
+            .as_ref()
+            .map(|context| context.cwd.clone())
+            .map(Ok)
+            .unwrap_or_else(std::env::current_dir)?
+            .to_string_lossy()
+            .into_owned())
+    }
+
+    fn deliver_new_launch(
+        &self,
+        pending: &PendingLaunch,
+        pane: &Pane,
+        exact_new_home: Option<&(Session, ExactPaneBinding)>,
+        attach: bool,
+    ) -> Result<OpenReceipt> {
+        let token = pending.launch_token.as_str();
+        let current = self
+            .store
+            .get_pending(token)?
+            .unwrap_or_else(|| PendingLaunch {
+                tmux_session: Some(pane.session_name.clone()),
+                tmux_pane: Some(pane.pane_id.clone()),
+                root_pid: Some(pane.pane_pid),
+                root_pid_start: process::process_start_time(pane.pane_pid)
+                    .and_then(|value| i64::try_from(value).ok()),
+                ..pending.clone()
+            });
+        let (code, receipt_delivery) = if attach {
+            if let Some((session, binding)) = exact_new_home {
+                let receipt = continuity_receipt(session, "NEW HOME");
+                let handoff = self.tmux.attach_exact_with_observed_receipt(
+                    &binding.pane,
+                    &receipt,
+                    || self.record_exact_handoff(session, binding, session.last_event_at),
+                )?;
+                (handoff.exit_code, handoff.delivery)
             } else {
-                (0, None)
-            };
-            Ok(OpenReceipt {
-                target: OpenTarget::Pending(Box::new(current)),
-                kind: "NEW HOME",
-                exit_code: code,
-                receipt_delivery,
-            })
-        })()
+                let receipt = pending_receipt(&current, "NEW HOME");
+                let handoff =
+                    self.tmux
+                        .attach_exact_with_observed_receipt(pane, &receipt, || {
+                            open_history::record_pending(&self.store, &current)
+                        })?;
+                (handoff.exit_code, handoff.delivery)
+            }
+        } else {
+            (0, None)
+        };
+        Ok(OpenReceipt {
+            target: OpenTarget::Pending(Box::new(current)),
+            kind: "NEW HOME",
+            exit_code: code,
+            receipt_delivery,
+        })
     }
 
     fn register_launch_wrapper(

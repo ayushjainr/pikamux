@@ -1,4 +1,19 @@
-Pika 0.6.38 brings recent-thread navigation and the native persistent assistant.
+Pika 0.6.39 adds the server support for Pika's native iPhone alpha.
+
+- Run **pika pair**, or choose **Connect phone** in board settings, then scan
+  from Pika on the phone. A short-lived QR pins enrollment; the phone creates
+  its own restricted SSH key. Tailscale/private routing and SSH must work first.
+- Read the machine's board and connect to exact existing compatible Codex
+  conversations. Start a thread explicitly, reply, and respond to supported
+  original provider requests without creating a separate mobile conversation.
+- The next normal Pika assistant launch supports private shared attachment.
+  Existing running assistants are not restarted by an update.
+
+The iPhone app is an alpha, not distributed through these binary release assets.
+Other provider icons do not imply mobile control support. No other machines,
+live provider sessions, or existing pairings are automatically migrated.
+
+Retained desktop features from 0.6.38:
 
 - **F12 once** opens the compact thread list; **F12 again** returns to the full
   board. Numbered recent choices make switching faster without new global key

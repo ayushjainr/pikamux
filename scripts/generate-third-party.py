@@ -17,6 +17,8 @@ from pathlib import Path
 ALLOWED_LICENSES = {
     "MIT",
     "Apache-2.0",
+    "Apache-2.0 AND ISC",
+    "Apache-2.0 OR ISC OR MIT",
     "Apache-2.0 OR MIT",
     "MIT OR Apache-2.0",
     "Apache-2.0/MIT",
@@ -226,6 +228,13 @@ def main() -> None:
                 and member.isfile()
                 and relative.lower().startswith(NOTICE_PREFIXES)
             }
+            # ring's top-level LICENSE explicitly incorporates these vendored
+            # once_cell notices in addition to LICENSE-BoringSSL/other-bits.
+            if name == "ring":
+                candidates.update({
+                    "src/polyfill/once_cell/LICENSE-APACHE",
+                    "src/polyfill/once_cell/LICENSE-MIT",
+                })
             license_file = package.get("license_file")
             if isinstance(license_file, str):
                 if license_file.startswith("/") or ".." in Path(license_file).parts:

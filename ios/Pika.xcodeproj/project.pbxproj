@@ -1,0 +1,564 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+        AABB00112233445566778801 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = AABB00112233445566778802 /* MarkdownUI */; };
+		A55555555555555555555555 /* PikaQRIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A66666666666666666666666 /* PikaQRIntegrationTests.swift */; };
+		A11111111111111111111111 /* Pairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = A22222222222222222222222 /* Pairing.swift */; };
+		A33333333333333333333333 /* PairingScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A44444444444444444444444 /* PairingScanner.swift */; };
+		05BCF22D7509CC6F503FE97A /* JSONValue.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99EFD8731FCE1A63F5783759 /* JSONValue.swift */; };
+		1695A2BA5C6A8B467D50AF77 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5DC78F8ACA8BC57480D86E9 /* AppModel.swift */; };
+		177F019D7751D6BF5EE2CC64 /* NativeComposer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D22F3BD84185D2546EC7ED2 /* NativeComposer.swift */; };
+		1F6DE0AA2625D020433945E8 /* LocalStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79805DF42A91AE8CEA2B0655 /* LocalStore.swift */; };
+		348BF81C79FA594F6AE57449 /* ConnectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4804ECFBFD8333DB2B1AD77A /* ConnectionView.swift */; };
+		34CC1258C58D475A618B8C88 /* PikaSSHIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4CA0F777D3BD2938299FD84 /* PikaSSHIntegrationTests.swift */; };
+		3FF9178E174EBC1CEDF912AF /* AddThreadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A99004C96D9964BE04B597 /* AddThreadView.swift */; };
+		4486E2DC2719F40214340777 /* Citadel in Frameworks */ = {isa = PBXBuildFile; productRef = FE626D144038F3D770FB5378 /* Citadel */; };
+		4C2EB492614B7FD8F9A8F6FD /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F374D05BA8B37E4FC9D07A38 /* RootView.swift */; };
+		4D194950276A23A9AFA8EC79 /* THIRD_PARTY.md in Resources */ = {isa = PBXBuildFile; fileRef = 29A1F26CAD50AE06C3DE86FD /* THIRD_PARTY.md */; };
+		5A44A7C525121B529BF7E61E /* ThreadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99BBDA01FFD2EBE5B8E77995 /* ThreadView.swift */; };
+		79C9092EB9FC08DFF51EE296 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = BEC142A307A2C6237FAEC497 /* Theme.swift */; };
+		903D0FFC966C9670E998252A /* BoardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A832F9DCAFF050055ADB5D2 /* BoardView.swift */; };
+		93E177ABED1546F29A8F652B /* PikaUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 368DF1B933FFC3037E50EDF0 /* PikaUITests.swift */; };
+		96DC268D60C0881944A223BE /* ApprovalCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 648AD6BECCA05D168041D027 /* ApprovalCard.swift */; };
+		9B1DC89D6AD5CDC044E382E3 /* SSHWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87A61DF228663BFC0330D79A /* SSHWire.swift */; };
+		B620972C6A8FA1EA35C74820 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 5EF537F40A459242B22BCAEF /* Assets.xcassets */; };
+		BDED2920C026467DCC57FA1F /* PikaApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CB13A87DBAD3BE16606F80B /* PikaApp.swift */; };
+		F81761E87F8123EC6991254B /* FixtureWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70E2ECA62574C8F977FF09E3 /* FixtureWire.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A9FEB1E744F3D43539C6D78D /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B1881FA49A49A0E38D54E33D /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 2D0071299F035AA1EAC2CE97;
+			remoteInfo = Pika;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A66666666666666666666666 /* PikaQRIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PikaQRIntegrationTests.swift; sourceTree = "<group>"; };
+		A22222222222222222222222 /* Pairing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pairing.swift; sourceTree = "<group>"; };
+		A44444444444444444444444 /* PairingScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingScanner.swift; sourceTree = "<group>"; };
+		29A1F26CAD50AE06C3DE86FD /* THIRD_PARTY.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = THIRD_PARTY.md; sourceTree = "<group>"; };
+		368DF1B933FFC3037E50EDF0 /* PikaUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PikaUITests.swift; sourceTree = "<group>"; };
+		3D22F3BD84185D2546EC7ED2 /* NativeComposer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeComposer.swift; sourceTree = "<group>"; };
+		4804ECFBFD8333DB2B1AD77A /* ConnectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionView.swift; sourceTree = "<group>"; };
+		4F340333EBF85C4097106B1C /* PikaUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = PikaUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		5EF537F40A459242B22BCAEF /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		648AD6BECCA05D168041D027 /* ApprovalCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApprovalCard.swift; sourceTree = "<group>"; };
+		70E2ECA62574C8F977FF09E3 /* FixtureWire.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FixtureWire.swift; sourceTree = "<group>"; };
+		796AF560EF0DFCF0344F41B8 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		79805DF42A91AE8CEA2B0655 /* LocalStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalStore.swift; sourceTree = "<group>"; };
+		87A61DF228663BFC0330D79A /* SSHWire.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSHWire.swift; sourceTree = "<group>"; };
+		8CB13A87DBAD3BE16606F80B /* PikaApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PikaApp.swift; sourceTree = "<group>"; };
+		99BBDA01FFD2EBE5B8E77995 /* ThreadView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadView.swift; sourceTree = "<group>"; };
+		99EFD8731FCE1A63F5783759 /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
+		9A832F9DCAFF050055ADB5D2 /* BoardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoardView.swift; sourceTree = "<group>"; };
+		BEC142A307A2C6237FAEC497 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		E1A99004C96D9964BE04B597 /* AddThreadView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddThreadView.swift; sourceTree = "<group>"; };
+		E4CA0F777D3BD2938299FD84 /* PikaSSHIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PikaSSHIntegrationTests.swift; sourceTree = "<group>"; };
+		F374D05BA8B37E4FC9D07A38 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		F5DC78F8ACA8BC57480D86E9 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		F8FB9846E26624B7638DDA90 /* Pika.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Pika.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		ABCAE3B07EAD8BE4E7DBE6C1 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4486E2DC2719F40214340777 /* Citadel in Frameworks */,
+                AABB00112233445566778801 /* MarkdownUI in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0B010238D0B33730DC85B519 /* Core */ = {
+			isa = PBXGroup;
+			children = (
+				F5DC78F8ACA8BC57480D86E9 /* AppModel.swift */,
+				99EFD8731FCE1A63F5783759 /* JSONValue.swift */,
+				79805DF42A91AE8CEA2B0655 /* LocalStore.swift */,
+			);
+			path = Core;
+			sourceTree = "<group>";
+		};
+		15FBA42EAE7F72462927B6FC /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F8FB9846E26624B7638DDA90 /* Pika.app */,
+				4F340333EBF85C4097106B1C /* PikaUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		175604582A74C8E49F122E53 /* Presentation */ = {
+			isa = PBXGroup;
+			children = (
+				E1A99004C96D9964BE04B597 /* AddThreadView.swift */,
+				648AD6BECCA05D168041D027 /* ApprovalCard.swift */,
+				9A832F9DCAFF050055ADB5D2 /* BoardView.swift */,
+				4804ECFBFD8333DB2B1AD77A /* ConnectionView.swift */,
+				A44444444444444444444444 /* PairingScanner.swift */,
+				3D22F3BD84185D2546EC7ED2 /* NativeComposer.swift */,
+				F374D05BA8B37E4FC9D07A38 /* RootView.swift */,
+				BEC142A307A2C6237FAEC497 /* Theme.swift */,
+				99BBDA01FFD2EBE5B8E77995 /* ThreadView.swift */,
+			);
+			path = Presentation;
+			sourceTree = "<group>";
+		};
+		4BBB9BACF657E4516B7350AD = {
+			isa = PBXGroup;
+			children = (
+				29A1F26CAD50AE06C3DE86FD /* THIRD_PARTY.md */,
+				72C7A665D8AE88300F59D529 /* Pika */,
+				9DBEC7317C02E17B2A8D1593 /* PikaUITests */,
+				15FBA42EAE7F72462927B6FC /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		72C7A665D8AE88300F59D529 /* Pika */ = {
+			isa = PBXGroup;
+			children = (
+				5EF537F40A459242B22BCAEF /* Assets.xcassets */,
+				796AF560EF0DFCF0344F41B8 /* Info.plist */,
+				8CB13A87DBAD3BE16606F80B /* PikaApp.swift */,
+				AF93F67EA594A712C21A3C7C /* Connection */,
+				0B010238D0B33730DC85B519 /* Core */,
+				175604582A74C8E49F122E53 /* Presentation */,
+			);
+			path = Pika;
+			sourceTree = "<group>";
+		};
+		9DBEC7317C02E17B2A8D1593 /* PikaUITests */ = {
+			isa = PBXGroup;
+			children = (
+				E4CA0F777D3BD2938299FD84 /* PikaSSHIntegrationTests.swift */,
+				A66666666666666666666666 /* PikaQRIntegrationTests.swift */,
+				368DF1B933FFC3037E50EDF0 /* PikaUITests.swift */,
+			);
+			path = PikaUITests;
+			sourceTree = "<group>";
+		};
+		AF93F67EA594A712C21A3C7C /* Connection */ = {
+			isa = PBXGroup;
+			children = (
+				70E2ECA62574C8F977FF09E3 /* FixtureWire.swift */,
+				87A61DF228663BFC0330D79A /* SSHWire.swift */,
+				A22222222222222222222222 /* Pairing.swift */,
+			);
+			path = Connection;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		2D0071299F035AA1EAC2CE97 /* Pika */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1141B84504AC4499E3BFA395 /* Build configuration list for PBXNativeTarget "Pika" */;
+			buildPhases = (
+				8BB42A814838B8F723B2587E /* Sources */,
+				08830AC788BC88675F82D097 /* Resources */,
+				ABCAE3B07EAD8BE4E7DBE6C1 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Pika;
+			packageProductDependencies = (
+				FE626D144038F3D770FB5378 /* Citadel */,
+                AABB00112233445566778802 /* MarkdownUI */,
+			);
+			productName = Pika;
+			productReference = F8FB9846E26624B7638DDA90 /* Pika.app */;
+			productType = "com.apple.product-type.application";
+		};
+		AEA02C6ADF42DA084E4281FA /* PikaUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F275E37E9AD9A7F80F625D43 /* Build configuration list for PBXNativeTarget "PikaUITests" */;
+			buildPhases = (
+				6023270A4E630FC9CA92A75C /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				2D7897E510D89D22A02C8676 /* PBXTargetDependency */,
+			);
+			name = PikaUITests;
+			packageProductDependencies = (
+			);
+			productName = PikaUITests;
+			productReference = 4F340333EBF85C4097106B1C /* PikaUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		B1881FA49A49A0E38D54E33D /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					2D0071299F035AA1EAC2CE97 = {
+						ProvisioningStyle = Automatic;
+					};
+					AEA02C6ADF42DA084E4281FA = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+						TestTargetID = 2D0071299F035AA1EAC2CE97;
+					};
+				};
+			};
+			buildConfigurationList = EA4A2EAD13AEC1D3E51E7BCC /* Build configuration list for PBXProject "Pika" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 4BBB9BACF657E4516B7350AD;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+                AABB00112233445566778803 /* MarkdownUI */,
+				45E7BCAF75374A191214E241 /* XCRemoteSwiftPackageReference "Citadel" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 15FBA42EAE7F72462927B6FC /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				2D0071299F035AA1EAC2CE97 /* Pika */,
+				AEA02C6ADF42DA084E4281FA /* PikaUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		08830AC788BC88675F82D097 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B620972C6A8FA1EA35C74820 /* Assets.xcassets in Resources */,
+				4D194950276A23A9AFA8EC79 /* THIRD_PARTY.md in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		6023270A4E630FC9CA92A75C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				34CC1258C58D475A618B8C88 /* PikaSSHIntegrationTests.swift in Sources */,
+				A55555555555555555555555 /* PikaQRIntegrationTests.swift in Sources */,
+				93E177ABED1546F29A8F652B /* PikaUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		8BB42A814838B8F723B2587E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3FF9178E174EBC1CEDF912AF /* AddThreadView.swift in Sources */,
+				1695A2BA5C6A8B467D50AF77 /* AppModel.swift in Sources */,
+				96DC268D60C0881944A223BE /* ApprovalCard.swift in Sources */,
+				903D0FFC966C9670E998252A /* BoardView.swift in Sources */,
+				348BF81C79FA594F6AE57449 /* ConnectionView.swift in Sources */,
+				A11111111111111111111111 /* Pairing.swift in Sources */,
+				A33333333333333333333333 /* PairingScanner.swift in Sources */,
+				F81761E87F8123EC6991254B /* FixtureWire.swift in Sources */,
+				05BCF22D7509CC6F503FE97A /* JSONValue.swift in Sources */,
+				1F6DE0AA2625D020433945E8 /* LocalStore.swift in Sources */,
+				177F019D7751D6BF5EE2CC64 /* NativeComposer.swift in Sources */,
+				BDED2920C026467DCC57FA1F /* PikaApp.swift in Sources */,
+				4C2EB492614B7FD8F9A8F6FD /* RootView.swift in Sources */,
+				9B1DC89D6AD5CDC044E382E3 /* SSHWire.swift in Sources */,
+				79C9092EB9FC08DFF51EE296 /* Theme.swift in Sources */,
+				5A44A7C525121B529BF7E61E /* ThreadView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		2D7897E510D89D22A02C8676 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 2D0071299F035AA1EAC2CE97 /* Pika */;
+			targetProxy = A9FEB1E744F3D43539C6D78D /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		27C4480534ED35A5AC0E9819 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PIKA_SSH_TEST_CONFIG = "";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.pika.mobile.alpha;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		30829372611B0B0AC9B9996E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Pika;
+			};
+			name = Debug;
+		};
+		4A74CAEB00421F778BF1C026 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = 9N2YHJBG86;
+				INFOPLIST_FILE = Pika/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		75EA72DF19BD41FA82284ADC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Pika;
+			};
+			name = Release;
+		};
+		BF2578637802091049530134 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PIKA_SSH_TEST_CONFIG = "";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.pika.mobile.alpha;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		C89710F1EAB626E3BF0F8BF5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = 9N2YHJBG86;
+				INFOPLIST_FILE = Pika/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		1141B84504AC4499E3BFA395 /* Build configuration list for PBXNativeTarget "Pika" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C89710F1EAB626E3BF0F8BF5 /* Debug */,
+				4A74CAEB00421F778BF1C026 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		EA4A2EAD13AEC1D3E51E7BCC /* Build configuration list for PBXProject "Pika" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				27C4480534ED35A5AC0E9819 /* Debug */,
+				BF2578637802091049530134 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		F275E37E9AD9A7F80F625D43 /* Build configuration list for PBXNativeTarget "PikaUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				30829372611B0B0AC9B9996E /* Debug */,
+				75EA72DF19BD41FA82284ADC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+        AABB00112233445566778803 /* MarkdownUI */ = {
+            isa = XCRemoteSwiftPackageReference;
+            repositoryURL = "https://github.com/gonzalezreal/swift-markdown-ui.git";
+            requirement = {kind = exactVersion; version = 2.4.1; };
+        };
+		45E7BCAF75374A191214E241 /* XCRemoteSwiftPackageReference "Citadel" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/orlandos-nl/Citadel.git";
+			requirement = {
+				kind = exactVersion;
+				version = 0.12.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+        AABB00112233445566778802 /* MarkdownUI */ = {
+            isa = XCSwiftPackageProductDependency;
+            package = AABB00112233445566778803 /* MarkdownUI */;
+            productName = MarkdownUI;
+        };
+		FE626D144038F3D770FB5378 /* Citadel */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 45E7BCAF75374A191214E241 /* XCRemoteSwiftPackageReference "Citadel" */;
+			productName = Citadel;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = B1881FA49A49A0E38D54E33D /* Project object */;
+}

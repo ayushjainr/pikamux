@@ -46,7 +46,7 @@
       28
     ],
     "src/cli.rs::setup_screen": [
-      109
+      100
     ],
     "src/cli.rs::wait": [
       16
@@ -93,9 +93,6 @@
     ],
     "src/core.rs::identity_owners": [
       21
-    ],
-    "src/core.rs::new_session_with_token": [
-      26
     ],
     "src/core.rs::open_session": [
       26
