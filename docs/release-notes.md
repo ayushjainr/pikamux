@@ -1,4 +1,15 @@
-Pika 0.6.40 fixes phone pairing for existing SSH accounts whose home is under
+Pika 0.6.41 keeps multiple paired machines together on the iPhone board and adds
+exact-thread provider controls. Saved machines retain independent subscriptions,
+including cached offline rows. Optional nicknames change presentation only;
+conversation actions remain bound to the verified owning machine.
+
+Compatible Codex threads expose live model and skill catalogs. Model changes
+require provider confirmation without sending a chat turn; skill references are
+validated before dispatch. Unsupported or uncertain outcomes remain visible.
+The private assistant also supports safe account homes beneath administrator-owned
+mounts without moving credentials or changing directory permissions.
+
+Retained pairing support from 0.6.40 covers existing SSH accounts whose home is under
 an administrator-owned mount, such as `/mnt/ebs1/USER`.
 
 Run `pika update`, then `pika pair`. Pika stays under the invoking account and

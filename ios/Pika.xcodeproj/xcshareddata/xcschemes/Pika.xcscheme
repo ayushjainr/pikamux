@@ -54,6 +54,8 @@
       <CommandLineArguments>
       </CommandLineArguments>
       <EnvironmentVariables>
+         <EnvironmentVariable key = "PIKA_MULTI_SSH_TEST_CONFIG" value = "$(PIKA_MULTI_SSH_TEST_CONFIG)" isEnabled = "YES">
+         </EnvironmentVariable>
          <EnvironmentVariable key = "PIKA_PAIR_TEST_CONFIG" value = "$(PIKA_PAIR_TEST_CONFIG)" isEnabled = "YES">
          </EnvironmentVariable>
          <EnvironmentVariable

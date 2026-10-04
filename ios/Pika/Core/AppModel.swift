@@ -67,9 +67,13 @@ final class AppModel: ObservableObject {
     @Published var hostChallenge: HostChallenge?
     @Published var pendingPairingAvailable = false
     @Published var drafts: [String: String] = [:]
+    private var draftSkills: [String: [String]] = [:]
     @Published var pendingActions: [String: PendingAction] = [:]
     @Published var machines: [SavedMachine] = []
     @Published var activeNodeId: String?
+    @Published var machineFilter: String?
+    @Published private(set) var onlineNodes: Set<String> = []
+    @Published private(set) var connectionCompletion = 0
     @Published var isFixture = false
     @Published var choices: [String: String] = [:]
     @Published var creations: [String: CreationRecord] = [:]
@@ -80,6 +84,66 @@ final class AppModel: ObservableObject {
     @Published var coverageNote: String?
     private let store = LocalStore()
     private var wire: (any MobileWire)?
+    private var wires: [String: any MobileWire] = [:]
+    private var listeners: [String: Task<Void, Never>] = [:]
+    private var wireEpochs: [String: UUID] = [:]
+    private struct RouteEpoch: Equatable { let source: String; let epoch: UUID }
+    private func routeEpoch(for node: String) -> RouteEpoch? {
+        if isFixture { return connected ? RouteEpoch(source: "fixture", epoch: generation) : nil }
+        guard let source = route(for: node), let epoch = wireEpochs[source] else { return nil }
+        return RouteEpoch(source: source, epoch: epoch)
+    }
+    private var nodeCapabilities: [String: JSONValue] = [:]
+    private var sourceBoards: [String: [BoardItem]] = [:]
+    private var sourceNodes: [String: [MobileNode]] = [:]
+    private var resumeQueue: [SavedMachine] = []
+    private var blockedReconnectNodes: Set<String> = []
+    private var receivingNode: String?
+    private var pendingBoardNode: String?
+    private var previousPendingBoard: [BoardItem]?
+    private var stagingByNode: [String: [BoardItem]] = [:]
+    private var revisionByNode: [String: JSONValue] = [:]
+    private var pageByNode: [String: Int] = [:]
+    func isConnected(node: String) -> Bool { isFixture ? connected : route(for: node) != nil }
+    func capabilities(for node: String?) -> JSONValue {
+        guard let node else { return capabilities }
+        if isFixture { return capabilities }
+        return route(for: node).flatMap { nodeCapabilities[$0] } ?? .null
+    }
+    var filteredBoard: [BoardItem] { board.filter { machineFilter == nil || $0.identity.nodeId == machineFilter } }
+    func selectMachine(node: String) {
+        activeNodeId = node; wire = transport(for: node); capabilities = capabilities(for: node)
+    }
+    private func route(for node: String) -> String? {
+        if machines.contains(where: { $0.id == node }) { return onlineNodes.contains(node) ? node : nil }
+        let sources = onlineNodes.filter { sourceBoards[$0]?.contains(where: { $0.identity.nodeId == node }) == true || sourceNodes[$0]?.contains(where: { $0.id == node }) == true }
+        return sources.count == 1 ? sources.first : nil
+    }
+    private func transport(for node: String) -> (any MobileWire)? { isFixture ? (connected ? wire : nil) : route(for: node).flatMap { wires[$0] } }
+    func machineName(for node: String, fallback: String) -> String { machines.first(where: { $0.id == node })?.displayName ?? fallback }
+    func renameMachine(_ node: String, nickname: String) {
+        guard let index = machines.firstIndex(where: { $0.id == node }) else { return }
+        var updated = machines
+        let cleaned = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard cleaned.count <= 100 else { notice = "Use a machine nickname of 100 characters or fewer."; return }
+        updated[index].nickname = cleaned.isEmpty ? nil : cleaned
+        do { if !isFixture { try store.write(updated, name: "machines.json") }; machines = updated; rebuildBoard() }
+        catch { notice = "Machine nickname could not be saved. Its connection identity is unchanged." }
+    }
+    private func rebuildBoard() {
+        var rows: [ThreadIdentity: BoardItem] = [:]
+        // Directly paired authoritative nodes win over coordinator copies.
+        for source in sourceBoards.keys.sorted() {
+            for row in sourceBoards[source] ?? [] where rows[row.identity] == nil || source == row.identity.nodeId {
+                let direct = machines.first { $0.id == row.identity.nodeId }
+                rows[row.identity] = BoardItem(identity: row.identity, name: row.name,
+                    machine: direct?.displayName ?? row.machine, state: row.state, detail: row.detail,
+                    observedAt: row.observedAt, cachedAt: row.cachedAt,
+                    stale: row.stale == true || (!isFixture && !onlineNodes.contains(source)), unread: row.unread)
+            }
+        }
+        board = rows.values.sorted { $0.identity.draftKey < $1.identity.draftKey }
+    }
     private var connectingWire: SSHWire?
     private var connectionAttempt: ConnectionAttempt?
     private var eventsTask: Task<Void, Never>?
@@ -126,8 +190,16 @@ final class AppModel: ObservableObject {
         machines = store.read("machines.json", as: [SavedMachine].self) ?? []
         pendingPairingAvailable = (try? StagedPairing.pending()) != nil
         board = store.read("board.json", as: [BoardItem].self) ?? []
+        sourceBoards = store.read("machine-boards.json", as: [String: [BoardItem]].self) ?? [:]
+        if sourceBoards.isEmpty { for row in board { sourceBoards[row.identity.nodeId, default: []].append(row) } }
+        rebuildBoard()
         observedAt = store.read("observed.json", as: Date.self)
         drafts = store.read("drafts.json", as: [String: String].self) ?? [:]
+        draftSkills = store.read("draft-skills.json", as: [String: [String]].self) ?? [:]
+        for key in Array(draftSkills.keys) {
+            let words = Set((drafts[key] ?? "").split(whereSeparator: { $0.isWhitespace }).map(String.init))
+            draftSkills[key] = draftSkills[key]?.filter { words.contains("$" + $0) }
+        }
         pendingActions = store.read("pending.json", as: [String: PendingAction].self) ?? [:]
         choices = store.read("choices.json", as: [String: String].self) ?? [:]
         creations = store.read("creations.json", as: [String: CreationRecord].self) ?? [:]
@@ -142,9 +214,28 @@ final class AppModel: ObservableObject {
     }
     func setDraft(_ text: String, identity: ThreadIdentity) {
         drafts[identity.draftKey] = text
-        if !isFixture { do { try store.write(drafts, name: "drafts.json") } catch { notice = "Draft could not be saved. Keep this app open until storage is available." } }
+        let tokens = Set(text.split(whereSeparator: { $0.isWhitespace }).map(String.init))
+        let retained = (draftSkills[identity.draftKey] ?? []).filter { tokens.contains("$" + $0) }
+        if retained.isEmpty { draftSkills.removeValue(forKey: identity.draftKey) }
+        else { draftSkills[identity.draftKey] = retained }
+        if !isFixture {
+            do { try store.write(drafts, name: "drafts.json"); try store.write(draftSkills, name: "draft-skills.json") }
+            catch { notice = "Draft or selected skills could not be saved. Keep this app open until storage is available." }
+        }
     }
     func draft(_ identity: ThreadIdentity) -> String { drafts[identity.draftKey] ?? "" }
+    func referenceSkill(_ name: String, identity: ThreadIdentity) {
+        let clean = name.hasPrefix("$") ? String(name.dropFirst()) : name
+        guard !clean.isEmpty, clean.count <= 200, !clean.contains(where: { $0.isWhitespace }) else { return }
+        var references = draftSkills[identity.draftKey] ?? []
+        if !references.contains(clean) { references.append(clean) }
+        guard references.count <= 32 else { notice = "Use at most 32 selected skills in one reply."; return }
+        do {
+            var updated = draftSkills; updated[identity.draftKey] = references
+            if !isFixture { try store.write(updated, name: "draft-skills.json") }
+            draftSkills = updated
+        } catch { notice = "The skill selection could not be saved. Select it again before sending." }
+    }
     func beginPairing(_ code: String) {
         beginPairingTask(code)
     }
@@ -159,9 +250,6 @@ final class AppModel: ObservableObject {
     }
     private func beginPairingTask(_ code: String?) {
         cancelConnection()
-        eventsTask?.cancel(); connected = false; conversationCapabilities = .null
-        if let previous = wire { Task { await previous.close() } }
-        wire = nil
         let token = UUID(); generation = token; connecting = true; notice = "Pairing this phone…"
         connectionTask = Task {
             do {
@@ -208,10 +296,6 @@ final class AppModel: ObservableObject {
                          expectedHost: String? = nil, expectedNode: String? = nil, pairingStageId: String? = nil) {
         cancelConnection()
         if saved == nil { reconnectAttempts = 0 }
-        eventsTask?.cancel(); connected = false; conversationCapabilities = .null
-        observedRequests = [:]
-        if let previous = wire { Task { await previous.close() } }
-        wire = nil
         let token = UUID(); generation = token; connecting = true; notice = nil
         let attempt = ConnectionAttempt(); connectionAttempt = attempt
         connectionTask = Task {
@@ -227,16 +311,31 @@ final class AppModel: ObservableObject {
                 guard saved == nil || saved?.id == node else { await transport.close(); throw ConnectionError.changedNode }
                 guard expectedNode == nil || expectedNode == node else { await transport.close(); throw ConnectionError.changedNode }
                 guard generation == token, !Task.isCancelled else { await transport.close(); return }
+                // Replacement is an explicit offline boundary. Never leave an
+                // old online wire without its subscription or leak its socket.
+                if let previous = wires.removeValue(forKey: node) {
+                    listeners[node]?.cancel(); listeners.removeValue(forKey: node)
+                    onlineNodes.remove(node); connected = !onlineNodes.isEmpty
+                    if activeNodeId == node { wire = nil; conversationCapabilities = .null; conversationCached = !messages.isEmpty }
+                    rebuildBoard()
+                    await previous.close()
+                    guard generation == token, !Task.isCancelled else { await transport.close(); return }
+                }
                 firstBoardReceived = false
-                listen(transport)
+                pendingBoardNode = node
+                previousPendingBoard = sourceBoards[node]
+                listen(transport, node: node)
                 _ = try await transport.request("board/subscribe", params: .object([:]))
                 try await waitForFirstBoard(token: token)
                 guard generation == token, !Task.isCancelled else { await transport.close(); return }
+                guard firstBoardReceived else { await transport.close(); throw ConnectionError.disconnected }
                 let credentialId = saved?.credentialId ?? UUID().uuidString
                 let payload = try JSONEncoder().encode(CredentialPayload(secret: secret, passphrase: passphrase))
                 try KeychainStore.save(payload, id: credentialId)
                 let machine = SavedMachine(id: node, address: address, port: port, username: username,
-                    hostKey: transport.verifiedHostKey, credentialId: credentialId, keyAuthentication: key)
+                    hostKey: transport.verifiedHostKey, credentialId: credentialId, keyAuthentication: key,
+                    name: hello["name"].string ?? hello["hostname"].string ?? saved?.name,
+                    nickname: machines.first(where: { $0.id == node })?.nickname)
                 var updated = machines.filter { $0.id != node }; updated.append(machine)
                 try store.write(updated, name: "machines.json")
                 if let pairingStageId {
@@ -244,26 +343,48 @@ final class AppModel: ObservableObject {
                     pendingPairingAvailable = (try? StagedPairing.pending()) != nil
                 }
                 machines = updated
+                let restoresSelection = selected.map { !isConnected(node: $0.identity.nodeId) } ?? false
+                wires[node] = transport; onlineNodes.insert(node); nodeCapabilities[node] = hello["capabilities"]
+                blockedReconnectNodes.remove(node)
                 wire = transport; connected = true; connecting = false; activeNodeId = node
+                rebuildBoard()
+                connectionCompletion += 1
                 reconnectAttempts = 0
                 connectingWire = nil
+                pendingBoardNode = nil
+                previousPendingBoard = nil
+                try? store.write(sourceBoards, name: "machine-boards.json")
                 connectionAttempt = nil
                 capabilities = hello["capabilities"]
                 if let selected {
-                    if selected.state == "ASSISTANT" { _ = await openAssistant() }
-                    else { await open(selected) }
+                    selectMachine(node: selected.identity.nodeId)
+                    if restoresSelection, isConnected(node: selected.identity.nodeId) {
+                        if selected.state == "ASSISTANT" { _ = await openAssistant() }
+                        else { await open(selected) }
+                    }
                 }
+                guard generation == token else { return }
+                resumeNextMachine()
             } catch {
                 guard generation == token else { return }
-                connecting = false; connected = false; reportError(error, action: "Could not connect to this machine. Check the address and login, then try again.")
-                if let unfinished = connectingWire { await unfinished.close(); connectingWire = nil }
+                connecting = false; connected = !onlineNodes.isEmpty; reportError(error, action: "Could not connect to this machine. Check the address and login, then try again.")
+                let unfinished = connectingWire; connectingWire = nil
+                if let pending = pendingBoardNode {
+                    listeners[pending]?.cancel(); listeners.removeValue(forKey: pending)
+                    sourceBoards[pending] = previousPendingBoard; rebuildBoard()
+                }
+                pendingBoardNode = nil
+                previousPendingBoard = nil
+                if let unfinished { await unfinished.close() }
+                guard generation == token else { return }
                 if saved != nil {
                     switch error {
                     case ConnectionError.changedHost, ConnectionError.changedNode, ConnectionError.credentials,
-                        ConnectionError.secureStorage, ConnectionError.malformed: break
+                        ConnectionError.secureStorage, ConnectionError.malformed: if let saved { blockedReconnectNodes.insert(saved.id) }
                     default: scheduleReconnect(token: token)
                     }
                 }
+                resumeNextMachine()
             }
         }
     }
@@ -301,19 +422,33 @@ final class AppModel: ObservableObject {
         generation = UUID(); connectionTask?.cancel(); connectionTask = nil
         connecting = false; verifyHost(false)
         if let unfinished = connectingWire { Task { await unfinished.close() }; connectingWire = nil }
+        if let pending = pendingBoardNode {
+            listeners[pending]?.cancel(); listeners.removeValue(forKey: pending)
+            sourceBoards[pending] = previousPendingBoard; rebuildBoard()
+        }; pendingBoardNode = nil; previousPendingBoard = nil
         if let attempt = connectionAttempt { Task { await attempt.cancel() }; connectionAttempt = nil }
     }
     func resume() {
         if !foreground { reconnectAttempts = 0 }
         foreground = true
-        guard !isFixture, !connected, !connecting, let saved = machines.last else { return }
+        guard !isFixture, !connecting else { return }
+        resumeQueue = machines.filter { !onlineNodes.contains($0.id) && !blockedReconnectNodes.contains($0.id) }
+        resumeNextMachine()
+    }
+    private func resumeNextMachine() {
+        guard foreground, !connecting else { return }
+        guard !resumeQueue.isEmpty else {
+            if machines.contains(where: { !onlineNodes.contains($0.id) && !blockedReconnectNodes.contains($0.id) }) { scheduleReconnect(token: generation) }
+            return
+        }
+        let saved = resumeQueue.removeFirst()
         do {
             let credential = try JSONDecoder().decode(CredentialPayload.self, from: KeychainStore.load(id: saved.credentialId))
             beginConnection(address: saved.address, port: saved.port, username: saved.username,
                 secret: credential.secret, key: saved.keyAuthentication, passphrase: credential.passphrase, saved: saved)
-        } catch { notice = "Saved login unavailable. Add this machine again to authenticate." }
+        } catch { blockedReconnectNodes.insert(saved.id); notice = "Saved login unavailable for \(saved.displayName). Add this machine again to authenticate."; resumeNextMachine() }
     }
-    func retryConnection() { reconnectAttempts = 0; resume() }
+    func retryConnection() { reconnectAttempts = 0; blockedReconnectNodes = []; resume() }
     private func scheduleReconnect(token: UUID) {
         guard foreground, !isFixture, reconnectTask == nil, !machines.isEmpty else { return }
         reconnectAttempts = min(6, reconnectAttempts + 1)
@@ -321,29 +456,49 @@ final class AppModel: ObservableObject {
         reconnectTask = Task {
             defer { if generation == token { reconnectTask = nil } }
             try? await Task.sleep(for: .seconds(delay))
-            guard !Task.isCancelled, generation == token, foreground, !connected, !connecting else { return }
+            guard !Task.isCancelled, foreground, !connecting else { return }
             reconnectTask = nil; resume()
         }
     }
     func suspend() {
         foreground = false
         cancelConnection(); connected = false; eventsTask?.cancel()
+        resumeQueue = []
+        for task in listeners.values { task.cancel() }; listeners = [:]
+        for transport in wires.values { Task { await transport.close() } }; wires = [:]; onlineNodes = []
+        rebuildBoard()
         conversationCapabilities = .null; conversationCached = !messages.isEmpty
         boardStaging = []; boardPage = 0; boardRevision = .null
         if let wire { Task { await wire.close() } }
         wire = nil
     }
-    private func listen(_ transport: any MobileWire) {
-        eventsTask?.cancel()
+    private func listen(_ transport: any MobileWire, node: String? = nil) {
+        let source = node ?? "fixture-node"
+        listeners[source]?.cancel()
+        let epoch = UUID(); wireEpochs[source] = epoch; sourceNodes[source] = nil
         let token = generation
-        eventsTask = Task {
+        listeners[source] = Task {
             for await frame in transport.events {
-                guard !Task.isCancelled, generation == token else { return }
+                guard !Task.isCancelled, wireEpochs[source] == epoch else { return }
+                // A paired transport may project fleet rows, but cannot impersonate
+                // another directly paired node's conversation stream.
+                if frame["event"].string?.hasPrefix("conversation/") == true,
+                    let owner = frame["params"]["identity"]["nodeId"].string,
+                    owner != source, route(for: owner) != source { continue }
+                receivingNode = source
+                boardStaging = stagingByNode[source] ?? []; boardRevision = revisionByNode[source] ?? .null; boardPage = pageByNode[source] ?? 0
                 handleEvent(frame)
+                stagingByNode[source] = boardStaging; revisionByNode[source] = boardRevision; pageByNode[source] = boardPage
+                receivingNode = nil
             }
-            guard !Task.isCancelled, generation == token else { return }
-            boardReady?.resume(throwing: ConnectionError.disconnected); boardReady = nil
-            connected = false; conversationCapabilities = .null
+            guard !Task.isCancelled, wireEpochs[source] == epoch else { return }
+            if pendingBoardNode == source {
+                firstBoardReceived = false
+                boardReady?.resume(throwing: ConnectionError.disconnected); boardReady = nil
+            }
+            wires.removeValue(forKey: source); onlineNodes.remove(source); connected = !onlineNodes.isEmpty
+            if activeNodeId == source { wire = nil; conversationCapabilities = .null; conversationCached = !messages.isEmpty }
+            rebuildBoard()
             notice = "Connection lost. Last-known content and drafts are still here. Uncertain actions are not repeated."
             boardStaging = []; boardPage = 0; boardRevision = .null
             scheduleReconnect(token: token)
@@ -370,7 +525,9 @@ final class AppModel: ObservableObject {
             return
         }
         if frame["event"].string == "connection/error" {
-            if params["nodeId"] == .null || params["nodeId"].string == selected?.identity.nodeId {
+            if let selected,
+                (isFixture || receivingNode == route(for: selected.identity.nodeId)),
+                (params["nodeId"] == .null || params["nodeId"].string == selected.identity.nodeId) {
                 conversationCapabilities = .null; conversationCached = !messages.isEmpty
             }
             notice = "A machine connection failed. Last-known content is preserved."
@@ -403,7 +560,9 @@ final class AppModel: ObservableObject {
                     cachedAt: row["cachedAt"].number, stale: row["stale"].bool, unread: row["unread"].bool)
             }
             guard items.count == params["items"].array.count, params["items"].hasArrayShape else {
-                boardReady?.resume(throwing: ConnectionError.malformed); boardReady = nil
+                if receivingNode == pendingBoardNode {
+                    boardReady?.resume(throwing: ConnectionError.malformed); boardReady = nil
+                }
                 notice = "Invalid board snapshot. Previous board preserved."; return
             }
             // The verified selected node exposes its explicitly permitted fleet;
@@ -419,10 +578,17 @@ final class AppModel: ObservableObject {
                 guard Set(boardStaging.map(\.identity)).count == boardStaging.count else { boardStaging = []; notice = "Duplicate identity in board update. Previous board preserved."; return }
                 board = boardStaging; boardStaging = []
             } else { board = items }
-            firstBoardReceived = true; boardReady?.resume(); boardReady = nil
+            if let source = receivingNode {
+                sourceBoards[source] = board
+                rebuildBoard()
+                if !isFixture, source != pendingBoardNode { try? store.write(sourceBoards, name: "machine-boards.json") }
+            }
+            if connectingWire != nil, receivingNode == pendingBoardNode {
+                firstBoardReceived = true; boardReady?.resume(); boardReady = nil
+            } else if isFixture { firstBoardReceived = true }
             observedAt = params["observedAt"].number.map { Date(timeIntervalSince1970: $0) }
             coverageNote = params["coverage"]["partial"].bool ? "Partial board · some work is not included in this snapshot" : nil
-            if !isFixture { try? store.write(board, name: "board.json"); try? store.write(observedAt, name: "observed.json") }
+            if !isFixture, receivingNode != pendingBoardNode { try? store.write(board, name: "board.json"); try? store.write(observedAt, name: "observed.json") }
             if !params["health"].array.isEmpty { notice = "Some machine information is unavailable. Last-known content is preserved."; noticeDetails = params["health"].array.compactMap(\.string).joined(separator: "; ") }
         } else if frame["event"].string == "conversation/event", awaitingAssistant, assistantOpenToken == selectionGeneration {
             if stagedAssistantEvents.count < 128 { stagedAssistantEvents.append(frame) }
@@ -477,17 +643,18 @@ final class AppModel: ObservableObject {
         }
     }
     func open(_ item: BoardItem) async {
+        if !isFixture { selectMachine(node: item.identity.nodeId) }
         if selected?.identity != item.identity, noticeRequestAction != nil { notice = nil }
         if let previous = selected { lastKnownMessages[previous.identity] = Array(messages.suffix(500)) }
-        selected = item; messages = lastKnownMessages[item.identity] ?? []; question = nil; approval = nil; providerItems = [:]; conversationCapabilities = .null
+        selected = item; messages = lastKnownMessages[item.identity] ?? []; question = nil; approval = nil; providerItems = [:]; conversationCapabilities = .null; historyLoading = false
         conversationCached = !messages.isEmpty
         if lastKnownMessages.count > 20, let eviction = lastKnownMessages.keys.first(where: { $0 != item.identity }) { lastKnownMessages.removeValue(forKey: eviction) }
         let token = UUID(); selectionGeneration = token
-        let connectionToken = generation
-        guard connected, let wire else { notice = "Reconnect to read this exact conversation. Your draft is saved."; return }
+        let connectionToken = routeEpoch(for: item.identity.nodeId)
+        guard let wire = transport(for: item.identity.nodeId) else { notice = "Reconnect to read this exact conversation. Your draft is saved."; return }
         do {
             let result = try await wire.request("conversation/open", params: .object(["identity": item.identity.json]))
-            guard generation == connectionToken, selectionGeneration == token, selected?.identity == item.identity else { return }
+            guard routeEpoch(for: item.identity.nodeId) == connectionToken, selectionGeneration == token, selected?.identity == item.identity else { return }
             guard identity(result["identity"]) == item.identity else { throw ConnectionError.changedNode }
             conversationCapabilities = result["capabilities"]
             activeTurns[item.identity] = result["activeTurnId"].string
@@ -505,17 +672,17 @@ final class AppModel: ObservableObject {
             } }
             lastKnownMessages[item.identity] = Array(messages.suffix(500))
             conversationCached = false
-        } catch { if generation == connectionToken, selectionGeneration == token { reportError(error, action: "Could not read this conversation. Reconnect to check its original state.") } }
+        } catch { if routeEpoch(for: item.identity.nodeId) == connectionToken, selectionGeneration == token { reportError(error, action: "Could not read this conversation. Reconnect to check its original state.") } }
     }
     func loadOlder(_ item: BoardItem) async {
-        guard connected, selected?.identity == item.identity, historyCursor != .null, !historyLoading, let wire else { return }
+        guard selected?.identity == item.identity, historyCursor != .null, !historyLoading, let wire = transport(for: item.identity.nodeId) else { return }
         let token = selectionGeneration, cursor = historyCursor
-        let connectionToken = generation
+        let connectionToken = routeEpoch(for: item.identity.nodeId)
         historyLoading = true
-        defer { historyLoading = false }
+        defer { if selectionGeneration == token, routeEpoch(for: item.identity.nodeId) == connectionToken { historyLoading = false } }
         do {
             let result = try await wire.request("conversation/history", params: .object(["identity": item.identity.json, "cursor": cursor]))
-            guard generation == connectionToken, selectionGeneration == token, selected?.identity == item.identity else { return }
+            guard routeEpoch(for: item.identity.nodeId) == connectionToken, selectionGeneration == token, selected?.identity == item.identity else { return }
             guard identity(result["identity"]) == item.identity else { throw ConnectionError.changedNode }
             let previous = result["turns"]["data"].array.flatMap { $0["items"].array.compactMap { entry -> ChatMessage? in
                 guard let id = entry["id"].string, let type = entry["type"].string, ["userMessage", "agentMessage"].contains(type) else { return nil }
@@ -525,24 +692,27 @@ final class AppModel: ObservableObject {
             let ids = Set(messages.map(\.id))
             messages = previous.filter { !ids.contains($0.id) } + messages
             historyCursor = result["turns"]["nextCursor"]
-        } catch { if generation == connectionToken, selectionGeneration == token { reportError(error, action: "Older context is unavailable. Try again after reconnecting.") } }
+        } catch { if routeEpoch(for: item.identity.nodeId) == connectionToken, selectionGeneration == token { reportError(error, action: "Older context is unavailable. Try again after reconnecting.") } }
     }
     func canSend(_ item: BoardItem, composing: Bool) -> Bool {
-        connected && selected?.identity == item.identity && conversationCapabilities["send"].bool && !composing && !draft(item.identity).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+        isConnected(node: item.identity.nodeId) && selected?.identity == item.identity && conversationCapabilities["send"].bool && !composing && !draft(item.identity).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
             !pendingActions.values.contains { $0.identity == item.identity && !$0.id.hasPrefix("answer:") && !$0.id.hasPrefix("approval:") && ($0.state == "pending" || $0.state == "unknown") }
     }
     func send(_ item: BoardItem, composing: Bool) async {
-        guard canSend(item, composing: composing), let wire else { return }
+        guard canSend(item, composing: composing), let wire = transport(for: item.identity.nodeId) else { return }
         let text = draft(item.identity), id = UUID().uuidString
         pendingActions[id] = PendingAction(id: id, identity: item.identity, text: text, state: "pending")
         if !isFixture {
             do { try store.write(pendingActions, name: "pending.json") }
             catch { pendingActions.removeValue(forKey: id); notice = "Not sent. Your outgoing text could not be saved safely."; return }
         }
-        let token = generation
+        let token = routeEpoch(for: item.identity.nodeId)
         do {
             var params: [String: JSONValue] = ["identity": item.identity.json,
                 "clientMessageId": .string(id), "text": .string(text)]
+            let words = Set(text.split(whereSeparator: { $0.isWhitespace }).map(String.init))
+            let skills = (draftSkills[item.identity.draftKey] ?? []).filter { words.contains("$" + $0) }
+            if !skills.isEmpty { params["skills"] = .array(skills.map(JSONValue.string)) }
             if let turn = activeTurns[item.identity] { params["expectedTurnId"] = .string(turn) }
             let result = try await wire.request("conversation/send", params: .object(params))
             guard identity(result["identity"]) == item.identity, result["clientMessageId"].string == id else { throw ConnectionError.malformed }
@@ -550,16 +720,16 @@ final class AppModel: ObservableObject {
             let state = ["accepted", "delivered"].contains(receipt) ? "accepted" : (receipt == "rejected" ? "rejected" : "unknown")
             pendingActions[id]?.state = state
             if state == "accepted", draft(item.identity) == text { setDraft("", identity: item.identity) }
-            if generation == token, selected?.identity == item.identity {
-                notice = state == "accepted" ? (isFixture ? "Accepted by the UI fixture only." : "Accepted by the existing provider conversation.") :
+            if routeEpoch(for: item.identity.nodeId) == token, selected?.identity == item.identity {
+                notice = state == "accepted" ? (isFixture ? "Accepted by the UI fixture only." : ProcessInfo.processInfo.arguments.contains("--multi-machine-integration-test") ? "Accepted by the disposable SSH protocol fixture only." : "Accepted by the existing provider conversation.") :
                     (state == "rejected" ? "The provider rejected this message. Your draft is preserved." : "Outcome unknown. This message will not be repeated automatically.")
             }
         } catch ConnectionError.rejected(let message) {
             pendingActions[id]?.state = "rejected"
-            if generation == token, selected?.identity == item.identity { notice = "The machine rejected this message. Your draft is preserved."; noticeDetails = message }
+            if routeEpoch(for: item.identity.nodeId) == token, selected?.identity == item.identity { notice = "The machine rejected this message. Your draft is preserved."; noticeDetails = message }
         } catch {
             pendingActions[id]?.state = "unknown"
-            if generation == token, selected?.identity == item.identity { notice = "Outcome unknown. Your text is saved; it was not repeated." }
+            if routeEpoch(for: item.identity.nodeId) == token, selected?.identity == item.identity { notice = "Outcome unknown. Your text is saved; it was not repeated." }
         }
         if !isFixture {
             do { try store.write(pendingActions, name: "pending.json") }
@@ -567,7 +737,7 @@ final class AppModel: ObservableObject {
         }
     }
     func reconcile(_ item: BoardItem) async {
-        guard connected, let wire else { return }
+        guard let wire = transport(for: item.identity.nodeId) else { return }
         let unknown = pendingActions.values.filter { $0.identity == item.identity && $0.state == "unknown" && !$0.id.hasPrefix("answer:") && !$0.id.hasPrefix("approval:") }
         for action in unknown {
             do {
@@ -592,9 +762,9 @@ final class AppModel: ObservableObject {
     }
     func answer(_ question: ProviderQuestion, identity: ThreadIdentity, answers: [String: [String]]) async {
         guard connected, selected?.identity == identity, self.question?.id == question.id,
-            self.question?.requestId == question.requestId, conversationCapabilities["answer"].bool, let item = selected, let wire else { return }
+            self.question?.requestId == question.requestId, conversationCapabilities["answer"].bool, let item = selected, let wire = transport(for: identity.nodeId) else { return }
         let actionId = "answer:" + item.identity.draftKey + ":" + question.id
-        let token = generation
+        let token = routeEpoch(for: identity.nodeId)
         guard pendingActions[actionId] == nil else { notice = "This answer is already pending or uncertain. It will not be repeated."; return }
         pendingActions[actionId] = PendingAction(id: actionId, identity: item.identity, text: "Structured answer", state: "pending",
             requestId: question.requestId, turnId: question.turnId, itemId: question.itemId)
@@ -608,23 +778,23 @@ final class AppModel: ObservableObject {
             let result = try await wire.request("conversation/answer", params: .object(["identity": item.identity.json,
                 "requestId": question.requestId, "turnId": .string(question.turnId), "itemId": .string(question.itemId), "answers": .object(mapped)]))
             if result["state"].string != "submitted", pendingActions[actionId]?.state != "resolved" { pendingActions[actionId]?.state = result["state"].string == "rejected" ? "rejected" : "unknown" }
-            if generation == token, selected?.identity == identity, noticeRequestAction == actionId {
+            if routeEpoch(for: identity.nodeId) == token, selected?.identity == identity, noticeRequestAction == actionId {
                 requestNotice(pendingActions[actionId]?.state == "resolved" ? requestClosedNotice : result["state"].string == "submitted" ? "Answer submitted. Waiting for the original request to resolve." : result["state"].string == "rejected" ? "The machine rejected this answer. It was not repeated." : "Answer outcome unknown. It was not repeated.", action: actionId)
             }
         } catch ConnectionError.rejected(let details) {
             if pendingActions[actionId]?.state != "resolved" { pendingActions[actionId]?.state = "rejected" }
-            if generation == token, selected?.identity == identity, noticeRequestAction == actionId { requestNotice(pendingActions[actionId]?.state == "resolved" ? requestClosedNotice : "The machine rejected this answer before dispatch. Nothing was submitted.", action: actionId); noticeDetails = details }
+            if routeEpoch(for: identity.nodeId) == token, selected?.identity == identity, noticeRequestAction == actionId { requestNotice(pendingActions[actionId]?.state == "resolved" ? requestClosedNotice : "The machine rejected this answer before dispatch. Nothing was submitted.", action: actionId); noticeDetails = details }
         } catch {
             if pendingActions[actionId]?.state != "resolved" { pendingActions[actionId]?.state = "unknown" }
-            if generation == token, selected?.identity == identity, noticeRequestAction == actionId { requestNotice(pendingActions[actionId]?.state == "resolved" ? requestClosedNotice : "Answer outcome unknown. It was not repeated.", action: actionId) }
+            if routeEpoch(for: identity.nodeId) == token, selected?.identity == identity, noticeRequestAction == actionId { requestNotice(pendingActions[actionId]?.state == "resolved" ? requestClosedNotice : "Answer outcome unknown. It was not repeated.", action: actionId) }
         }
         if !isFixture { try? store.write(pendingActions, name: "pending.json") }
     }
     func approve(_ request: ProviderApproval, decision: String) async {
         guard connected, selected?.identity == request.identity, approval?.id == request.id,
-            approval?.requestId == request.requestId, ["accept", "decline"].contains(decision), let wire else { return }
+            approval?.requestId == request.requestId, ["accept", "decline"].contains(decision), let wire = transport(for: request.identity.nodeId) else { return }
         let id = "approval:" + request.identity.draftKey + ":" + request.id
-        let token = generation
+        let token = routeEpoch(for: request.identity.nodeId)
         guard pendingActions[id] == nil else { return }
         pendingActions[id] = PendingAction(id: id, identity: request.identity, text: "One-time provider decision", state: "pending",
             requestId: request.requestId, turnId: request.params["turnId"].string, itemId: request.params["itemId"].string)
@@ -636,26 +806,26 @@ final class AppModel: ObservableObject {
             let result = try await wire.request("conversation/approve", params: .object(["identity": request.identity.json,
                 "requestId": request.requestId, "turnId": request.params["turnId"], "itemId": request.params["itemId"], "decision": .string(decision)]))
             if pendingActions[id]?.state != "resolved" { pendingActions[id]?.state = result["state"].string == "submitted" ? "pending" : result["state"].string == "rejected" ? "rejected" : "unknown" }
-            if generation == token, selected?.identity == request.identity, noticeRequestAction == id {
+            if routeEpoch(for: request.identity.nodeId) == token, selected?.identity == request.identity, noticeRequestAction == id {
                 requestNotice(pendingActions[id]?.state == "resolved" ? requestClosedNotice : result["state"].string == "submitted" ? "Decision submitted. Waiting for the original request to close." : result["state"].string == "rejected" ? "The machine rejected this decision. It was not repeated." : "Decision outcome unknown. It was not repeated.", action: id)
             }
         } catch ConnectionError.rejected(let details) {
             if pendingActions[id]?.state != "resolved" { pendingActions[id]?.state = "rejected" }
-            if generation == token, selected?.identity == request.identity, noticeRequestAction == id { requestNotice(pendingActions[id]?.state == "resolved" ? requestClosedNotice : "The machine rejected this decision before dispatch. Nothing was submitted.", action: id); noticeDetails = details }
+            if routeEpoch(for: request.identity.nodeId) == token, selected?.identity == request.identity, noticeRequestAction == id { requestNotice(pendingActions[id]?.state == "resolved" ? requestClosedNotice : "The machine rejected this decision before dispatch. Nothing was submitted.", action: id); noticeDetails = details }
         } catch {
             if pendingActions[id]?.state != "resolved" { pendingActions[id]?.state = "unknown" }
-            if generation == token, selected?.identity == request.identity, noticeRequestAction == id { requestNotice(pendingActions[id]?.state == "resolved" ? requestClosedNotice : "Decision outcome unknown. It was not repeated.", action: id); noticeDetails = error.localizedDescription }
+            if routeEpoch(for: request.identity.nodeId) == token, selected?.identity == request.identity, noticeRequestAction == id { requestNotice(pendingActions[id]?.state == "resolved" ? requestClosedNotice : "Decision outcome unknown. It was not repeated.", action: id); noticeDetails = error.localizedDescription }
         }
         if !isFixture { try? store.write(pendingActions, name: "pending.json") }
     }
     func reconcileRequests(_ item: BoardItem) async {
-        guard connected, selected?.identity == item.identity, let wire else { return }
-        let token = generation
+        guard selected?.identity == item.identity, let wire = transport(for: item.identity.nodeId) else { return }
+        let token = routeEpoch(for: item.identity.nodeId)
         let actions = pendingActions.values.filter { $0.identity == item.identity && $0.requestId != nil && ["pending", "unknown"].contains($0.state) }
         var ownsNotice = true
         for action in actions {
             guard let request = action.requestId, let turn = action.turnId, let entry = action.itemId else { continue }
-            if ownsNotice, generation == token, selected?.identity == item.identity { requestNotice("Checking the original request…", action: action.id) }
+            if ownsNotice, routeEpoch(for: item.identity.nodeId) == token, selected?.identity == item.identity { requestNotice("Checking the original request…", action: action.id) }
             do {
                 let result = try await wire.request("conversation/requestStatus", params: .object([
                     "identity": item.identity.json, "requestId": request, "turnId": .string(turn), "itemId": .string(entry)]))
@@ -663,18 +833,18 @@ final class AppModel: ObservableObject {
                     result["turnId"].string == turn, result["itemId"].string == entry else { throw ConnectionError.malformed }
                 if result["state"].string == "resolved" {
                     pendingActions[action.id]?.state = "resolved"
-                    if generation == token, selected?.identity == item.identity {
+                    if routeEpoch(for: item.identity.nodeId) == token, selected?.identity == item.identity {
                         if question?.requestId == request, question?.turnId == turn, question?.itemId == entry { question = nil }
                         if approval?.identity == item.identity, approval?.requestId == request,
                             approval?.params["turnId"].string == turn, approval?.params["itemId"].string == entry { approval = nil }
                     }
                 }
-                if ownsNotice, generation == token, selected?.identity == item.identity, noticeRequestAction == action.id {
+                if ownsNotice, routeEpoch(for: item.identity.nodeId) == token, selected?.identity == item.identity, noticeRequestAction == action.id {
                     requestNotice(pendingActions[action.id]?.state == "resolved" ? requestClosedNotice :
                         "The decision remains pending or uncertain. It will not be repeated and does not block unrelated replies.", action: action.id)
                 } else { ownsNotice = false }
             } catch {
-                if ownsNotice, generation == token, selected?.identity == item.identity, noticeRequestAction == action.id {
+                if ownsNotice, routeEpoch(for: item.identity.nodeId) == token, selected?.identity == item.identity, noticeRequestAction == action.id {
                     requestNotice(pendingActions[action.id]?.state == "resolved" ? requestClosedNotice : "The original request status is unknown. Nothing was repeated.", action: action.id)
                 } else { ownsNotice = false }
             }
@@ -682,20 +852,20 @@ final class AppModel: ObservableObject {
         if !isFixture { try? store.write(pendingActions, name: "pending.json") }
     }
     func openAssistant() async -> BoardItem? {
-        guard let wire, connected else { notice = "Reconnect to the machine that owns your Pika assistant."; return nil }
+        guard let requestedNode = activeNodeId, let wire = transport(for: requestedNode) else { notice = "Reconnect to the machine that owns your Pika assistant."; return nil }
         let selectionToken = UUID(); selectionGeneration = selectionToken; assistantOpenToken = selectionToken
         awaitingAssistant = true; stagedAssistantEvents = []
         defer {
             if assistantOpenToken == selectionToken { awaitingAssistant = false; stagedAssistantEvents = []; assistantOpenToken = nil }
         }
-        let token = generation
+        let token = routeEpoch(for: requestedNode)
         do {
             let result = try await wire.request("assistant/open", params: .object([:]))
-            guard generation == token, selectionGeneration == selectionToken else { return nil }
-            guard let identity = identity(result["identity"]), identity.nodeId == activeNodeId,
+            guard routeEpoch(for: requestedNode) == token, selectionGeneration == selectionToken else { return nil }
+            guard let identity = identity(result["identity"]), identity.nodeId == requestedNode,
                 result["assistant"]["profileId"].string?.isEmpty == false else { throw ConnectionError.changedNode }
             if selected?.identity != identity, noticeRequestAction != nil { notice = nil }
-            let item = BoardItem(identity: identity, name: "Pika", machine: machines.first(where: { $0.id == identity.nodeId })?.address ?? "Machine", state: "ASSISTANT", detail: "")
+            let item = BoardItem(identity: identity, name: "Pika", machine: machines.first(where: { $0.id == identity.nodeId })?.displayName ?? "Machine", state: "ASSISTANT", detail: "")
             selected = item; question = nil; approval = nil; providerItems = [:]; conversationCapabilities = result["capabilities"]
             conversationCached = false; historyLoading = false
             historyCursor = result["turns"]["nextCursor"]
@@ -714,10 +884,60 @@ final class AppModel: ObservableObject {
             if isFixture { fixtureAssistantOpenCount += 1 }
             notice = nil
             return item
-        } catch { if generation == token, selectionGeneration == selectionToken { reportError(error, action: "The existing Pika assistant is unavailable. Reconnect to its machine and try again.") }; return nil }
+        } catch { if routeEpoch(for: requestedNode) == token, selectionGeneration == selectionToken { reportError(error, action: "The existing Pika assistant is unavailable. Reconnect to its machine and try again.") }; return nil }
+    }
+    func controls(_ item: BoardItem) async throws -> JSONValue {
+        guard selected?.identity == item.identity, let wire = transport(for: item.identity.nodeId) else { throw ConnectionError.disconnected }
+        let token = selectionGeneration
+        let connectionToken = routeEpoch(for: item.identity.nodeId)
+        let result = try await wire.request("conversation/controls", params: .object(["identity": item.identity.json]))
+        guard token == selectionGeneration, routeEpoch(for: item.identity.nodeId) == connectionToken, selected?.identity == item.identity,
+            identity(result["identity"]) == item.identity else { throw ConnectionError.changedNode }
+        return result
+    }
+    func selectModel(_ id: String, item: BoardItem) async -> Bool {
+        guard selected?.identity == item.identity, let wire = transport(for: item.identity.nodeId) else { return false }
+        let token = selectionGeneration
+        let connectionToken = routeEpoch(for: item.identity.nodeId)
+        do {
+            let result = try await wire.request("conversation/model", params: .object(["identity": item.identity.json, "model": .string(id)]))
+            guard token == selectionGeneration, routeEpoch(for: item.identity.nodeId) == connectionToken, selected?.identity == item.identity,
+                identity(result["identity"]) == item.identity else { throw ConnectionError.changedNode }
+            guard result["state"].string == "accepted" else {
+                notice = result["state"].string == "rejected" ? "The model change was rejected." : "Model change outcome unknown. Reopen controls to read its current setting; it will not be repeated."
+                return false
+            }
+            return true
+        } catch {
+            if token == selectionGeneration, routeEpoch(for: item.identity.nodeId) == connectionToken, selected?.identity == item.identity {
+                reportError(error, action: "Model change outcome unknown. Reopen controls to check its current setting; it will not be repeated.")
+            }
+            return false
+        }
     }
     func explainUnavailable(_ action: String) { notice = "\(action) is not yet supported by this machine's mobile connection. No conversation was created or changed." }
     func nodes() async throws -> [MobileNode] {
+        if !isFixture {
+            var merged = Dictionary(uniqueKeysWithValues: machines.map { ($0.id, MobileNode(id: $0.id, name: $0.displayName)) })
+            for source in onlineNodes.sorted() {
+                guard let transport = wires[source] else { continue }
+                let epoch = wireEpochs[source]
+                do {
+                    let result = try await transport.request("nodes/list", params: .object([:]))
+                    guard onlineNodes.contains(source), wireEpochs[source] == epoch, result["items"].hasArrayShape,
+                        result["items"].array.count <= 10_000 else { continue }
+                    let claims = result["items"].array.compactMap { row -> MobileNode? in
+                        guard let id = row["nodeId"].string, !id.isEmpty,
+                            let name = row["name"].string, !name.isEmpty else { return nil }
+                        return MobileNode(id: id, name: name)
+                    }
+                    guard claims.count == result["items"].array.count, Set(claims.map(\.id)).count == claims.count else { continue }
+                    sourceNodes[source] = claims
+                    for claim in claims where merged[claim.id] == nil { merged[claim.id] = claim }
+                } catch { /* Saved/offline machines remain selectable; no invented route. */ }
+            }
+            return merged.values.sorted { $0.name < $1.name }
+        }
         guard connected, let wire else { throw ConnectionError.disconnected }
         let result = try await wire.request("nodes/list", params: .object([:]))
         return result["items"].array.compactMap { row in
@@ -726,7 +946,7 @@ final class AppModel: ObservableObject {
         }
     }
     private func selector(_ method: String, node: String?) async throws -> [JSONValue] {
-        guard connected, let wire else { throw ConnectionError.disconnected }
+        guard let target = node ?? activeNodeId, let wire = transport(for: target) else { throw ConnectionError.disconnected }
         var rows: [JSONValue] = [], cursor: String?, seen = Set<String>()
         repeat {
             var params: [String: JSONValue] = ["limit": .number(256)]
@@ -753,11 +973,18 @@ final class AppModel: ObservableObject {
         }
     }
     func remember(project: String, provider: String) {
-        choices = ["project": project, "provider": provider]
+        choices["project"] = project; choices["provider"] = provider
         if !isFixture { try? store.write(choices, name: "choices.json") }
     }
+    var savedAssistantMachine: String? { choices["assistantMachine"].flatMap { node in machines.contains(where: { $0.id == node }) ? node : nil } }
+    func rememberAssistantMachine(_ node: String?) {
+        var updated = choices
+        updated["assistantMachine"] = node
+        do { if !isFixture { try store.write(updated, name: "choices.json") }; choices = updated }
+        catch { notice = "The assistant machine choice could not be saved." }
+    }
     func create(name: String, project: MobileProject, provider: String) async -> BoardItem? {
-        guard !mutationBusy, connected, capabilities["create"].bool, let wire,
+        guard !mutationBusy, capabilities(for: project.nodeId)["create"].bool, let wire = transport(for: project.nodeId),
             !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
             !creations.values.contains(where: { $0.state == "unknown" || $0.state == "pending" }) else {
             notice = "Creation is unavailable or an earlier creation needs its original receipt checked first."; return nil
@@ -784,7 +1011,7 @@ final class AppModel: ObservableObject {
             creations[id]?.state = "created"; creations[id]?.identity = identity
             if !isFixture { try store.write(creations, name: "creations.json") }
             remember(project: project.id, provider: provider)
-            return BoardItem(identity: identity, name: name, machine: machines.first(where: { $0.id == identity.nodeId })?.address ?? "Machine", state: "STARTING", detail: "")
+            return BoardItem(identity: identity, name: name, machine: machines.first(where: { $0.id == identity.nodeId })?.displayName ?? "Machine", state: "STARTING", detail: "")
         } catch ConnectionError.rejected(let message) {
             creations[id]?.state = "rejected"; notice = "The machine rejected creation. No conversation was created."; noticeDetails = message
         } catch { creations[id]?.state = "unknown"; notice = "Creation outcome unknown. No replacement was launched." }
@@ -792,8 +1019,9 @@ final class AppModel: ObservableObject {
         return nil
     }
     func reconcileCreations() async {
-        guard connected, let wire else { return }
+        guard connected else { return }
         for record in creations.values.filter({ $0.state == "unknown" }) {
+            guard let node = record.params["nodeId"].string, let wire = transport(for: node) else { continue }
             do {
                 let result = try await wire.request("conversation/receipt", params: .object([
                     "nodeId": record.params["nodeId"], "clientOperationId": .string(record.id)]))
@@ -808,12 +1036,12 @@ final class AppModel: ObservableObject {
         if !isFixture { try? store.write(creations, name: "creations.json") }
     }
     func adopt(_ candidate: ExistingCandidate) async -> BoardItem? {
-        guard !mutationBusy, connected, capabilities["adopt"].bool, let wire else { return nil }
+        guard !mutationBusy, capabilities(for: candidate.identity.nodeId)["adopt"].bool, let wire = transport(for: candidate.identity.nodeId) else { return nil }
         mutationBusy = true; defer { mutationBusy = false }
         do {
             let result = try await wire.request("conversation/adopt", params: .object(["identity": candidate.identity.json]))
             guard result["state"].string == "added", identity(result["identity"]) == candidate.identity else { throw ConnectionError.malformed }
-            return BoardItem(identity: candidate.identity, name: candidate.name, machine: machines.first(where: { $0.id == candidate.identity.nodeId })?.address ?? "Machine", state: "UNKNOWN", detail: "")
+            return BoardItem(identity: candidate.identity, name: candidate.name, machine: machines.first(where: { $0.id == candidate.identity.nodeId })?.displayName ?? "Machine", state: "UNKNOWN", detail: "")
         } catch { notice = "Addition could not be confirmed. No replacement agent was requested; an uncertain addition is not repeated automatically."; return nil }
     }
 }

@@ -117,14 +117,18 @@ private func authenticatedChannel(address: String, port: Int,
     verifier: any NIOSSHClientServerAuthenticationDelegate, attempt: ConnectionAttempt) async throws -> Channel {
     let loop = MultiThreadedEventLoopGroup.singleton.next()
     let completion = loop.makePromise(of: Void.self)
-    let channel = try await ClientBootstrap(group: loop).connectTimeout(.seconds(10)).channelInitializer { channel in
+    let bootstrap = ClientBootstrap(group: loop).connectTimeout(.seconds(10)).channelInitializer { channel in
         do {
             try channel.pipeline.syncOperations.addHandlers(NIOSSHHandler(role: .client(.init(userAuthDelegate: authentication(), serverAuthDelegate: verifier)),
                 allocator: channel.allocator, inboundChildChannelInitializer: nil), AuthenticationCompletion(completion))
             return channel.eventLoop.makeSucceededVoidFuture()
-        } catch { return channel.eventLoop.makeFailedFuture(error) }
-    }.connect(host: address, port: port).get()
-    try await attempt.attach(channel)
+        } catch { completion.fail(error); return channel.eventLoop.makeFailedFuture(error) }
+    }
+    let channel: Channel
+    do { channel = try await bootstrap.connect(host: address, port: port).get() }
+    catch { completion.fail(error); throw error }
+    do { try await attempt.attach(channel) }
+    catch { completion.fail(error); try? await channel.close(); throw error }
     let timeout = loop.scheduleTask(in: .seconds(10)) { completion.fail(ConnectionError.timeout); channel.close(promise: nil) }
     defer { timeout.cancel() }
     do { try await completion.futureResult.get(); return channel }

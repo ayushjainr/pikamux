@@ -72,4 +72,7 @@ struct SavedMachine: Codable, Identifiable, Sendable {
     let hostKey: String
     let credentialId: String
     let keyAuthentication: Bool
+    var name: String? = nil
+    var nickname: String? = nil
+    var displayName: String { nickname?.isEmpty == false ? nickname! : (name?.isEmpty == false ? name! : address) }
 }

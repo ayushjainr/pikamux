@@ -17,6 +17,7 @@ settings:
     DEVELOPMENT_TEAM: ''
     CODE_SIGN_STYLE: Automatic
     PIKA_SSH_TEST_CONFIG: ''
+    PIKA_MULTI_SSH_TEST_CONFIG: ''
     TARGETED_DEVICE_FAMILY: '1'
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
 targets:
@@ -64,4 +65,5 @@ schemes:
       targets: [PikaUITests]
       environmentVariables:
         PIKA_SSH_TEST_CONFIG: $(PIKA_SSH_TEST_CONFIG)
+        PIKA_MULTI_SSH_TEST_CONFIG: $(PIKA_MULTI_SSH_TEST_CONFIG)
         PIKA_PAIR_TEST_CONFIG: $(PIKA_PAIR_TEST_CONFIG)

@@ -18,16 +18,25 @@ struct BoardView: View {
                     Spacer(minLength: 8)
                 }
                 NoticeCard()
+                if !model.machines.isEmpty {
+                    Picker("Machine", selection: $model.machineFilter) {
+                        Text("All machines").tag(String?.none)
+                        ForEach(model.machines) { machine in
+                            Text(machine.displayName + (model.isConnected(node: machine.id) ? "" : " · Offline")).tag(Optional(machine.id))
+                        }
+                    }.pickerStyle(.menu).accessibilityIdentifier("machineFilter")
+                }
                 if let coverage = model.coverageNote { Text(coverage).font(.caption).foregroundStyle(.secondary) }
                 if !model.board.isEmpty {
                     LazyVStack(spacing: 10) {
-                        ForEach(["Needs you", "Working", "Ready", "Parked", "Cached", "Other"], id: \.self) { state in
-                            ForEach(rows(for: state)) { row in
-                                Button { destination = row } label: { DexThreadCard(row: row) }
-                                    .buttonStyle(.plain)
-                                    .accessibilityIdentifier("thread-" + row.identity.threadId)
-                                    .accessibilityLabel("Open \(row.name) on \(row.machine), \(row.identity.provider)")
-                            }
+                        // One identity scope follows rows across freshness/state
+                        // groups. Lazy child scopes must not retain old snapshots
+                        // when a cached row becomes live again.
+                        ForEach(orderedRows) { row in
+                            Button { destination = row } label: { DexThreadCard(row: row) }
+                                .buttonStyle(.plain)
+                                .accessibilityIdentifier("thread-" + (ProcessInfo.processInfo.arguments.contains("--multi-machine-integration-test") ? row.identity.draftKey : row.identity.threadId))
+                                .accessibilityLabel("Open \(row.name) on \(row.machine), \(row.identity.provider)")
                         }
                     }
                 }
@@ -57,7 +66,13 @@ struct BoardView: View {
     }
     private func rows(for state: String) -> [BoardItem] {
         let known = ["Needs you", "Working", "Ready", "Parked", "Cached"]
-        return model.board.filter { state == "Other" ? !known.contains(PikaTheme.state($0.state)) : PikaTheme.state($0.state) == state }
+        return model.filteredBoard.filter {
+            let category = $0.stale == true ? "Cached" : PikaTheme.state($0.state)
+            return state == "Other" ? !known.contains(category) : category == state
+        }
+    }
+    private var orderedRows: [BoardItem] {
+        ["Needs you", "Working", "Ready", "Parked", "Cached", "Other"].flatMap { rows(for: $0) }
     }
 }
 
@@ -73,6 +88,7 @@ private struct DexThreadCard: View {
                 }
                 Text("\(row.machine) · \(row.identity.provider.capitalized)").font(.subheadline).foregroundStyle(.secondary)
                 Text(row.observationSummary).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("boardFreshness-" + row.identity.draftKey)
                 if row.unread == true { Text("Unread").font(.caption2.weight(.semibold)).foregroundStyle(PikaTheme.accent) }
             }
             Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary).frame(maxHeight: .infinity)
@@ -82,10 +98,11 @@ private struct DexThreadCard: View {
     }
     private var name: some View { Text(row.name).font(.headline).foregroundStyle(.primary).lineLimit(2) }
     private var badge: some View {
-        HStack(spacing: 5) {
-            Circle().fill(PikaTheme.color(row.state)).frame(width: 7, height: 7)
-            Text(PikaTheme.state(row.state)).font(.caption.weight(.semibold))
-        }.foregroundStyle(PikaTheme.color(row.state)).padding(.horizontal, 9).padding(.vertical, 6)
-            .background(PikaTheme.color(row.state).opacity(0.08), in: Capsule()).fixedSize()
+        let color = PikaTheme.color(row.stale == true ? "CACHED" : row.state)
+        return HStack(spacing: 5) {
+            Circle().fill(color).frame(width: 7, height: 7)
+            Text((row.stale == true ? "Cached · " : "") + PikaTheme.state(row.state)).font(.caption.weight(.semibold))
+        }.foregroundStyle(color).padding(.horizontal, 9).padding(.vertical, 6)
+            .background(color.opacity(0.08), in: Capsule()).fixedSize()
     }
 }

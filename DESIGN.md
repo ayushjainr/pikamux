@@ -50,6 +50,24 @@ The iPhone remains a client of the selected machine's shared board and existing
 conversations. Its normal transport is the narrow `_mobile` command over SSH;
 the phone does not own another assistant, fleet scanner or conversation store.
 
+Saved phone connections contribute independent board subscriptions to one Dex.
+Adding a connection must not replace earlier machines. Cached rows remain visible
+when their machine is offline, and the machine filter includes saved empty or
+offline machines. Optional user nicknames are presentation metadata only: SSH
+trust, credentials, drafts and actions remain bound to immutable node identities.
+Directly paired owners take precedence over coordinator copies; an offline direct
+owner does not silently fail over through another machine. Coordinator-only
+identities require one unambiguous, verified route. Pika's assistant entry names
+the selected owning machine instead of implicitly choosing the last connection.
+
+Mobile composer controls consume the exact selected provider's live catalogs.
+Model changes affect only that thread, require provider confirmation and do not
+send a chat turn. Skill selection inserts a reference which is validated against
+that thread's provider-reported skills before dispatch. Unsupported controls and
+uncertain outcomes remain explicit; the phone never fabricates a provider menu
+or retries an uncertain change automatically. Thread creation visibly identifies
+the required name rather than leaving an unexplained disabled action.
+
 The approved **Connect phone → Scan QR** journey adds a temporary foreground
 pairing endpoint, not a permanent listener. A compact QR carries its endpoint,
 an ephemeral TLS certificate pin and a short-lived one-use authorization. The
@@ -826,7 +844,12 @@ uses its existing private state root and private lease directory/file, permittin
 shared or administrator-owned mount ancestors without chmod/chown. It assumes
 the same filesystem trust as its existing board database, not protection from
 the administrator controlling that database's ancestors. Assistant authority
-retains its stricter ancestor validation, with the offending path in the error;
+validates private account-owned files and nonwritable ancestors, with the offending
+path in the error. Only ancestors strictly above the effective account's native
+home may have a trusted administrator owner; provider-specific HOME overrides
+cannot move this boundary. Home and descendants retain ownership, mode and ACL
+safety, and external profiles retain the root/current-user ancestor policy.
+Validation never changes ownership, permissions, identity or history;
 an unavailable assistant cannot prevent ordinary board observation or navigation.
 Assistant projection contains bounded exact-identity metadata, not transcripts, cards,
 paths, or credentials. Stale/partial coverage stays explicit. Legacy installed

@@ -18,6 +18,9 @@ struct ConnectionView: View {
     @State private var scannedCode: String?
     @State private var manual = false
     @State private var discardPairing = false
+    @State private var renameNode: String?
+    @State private var nickname = ""
+    @State private var showRename = false
     @Environment(\.scenePhase) private var scenePhase
     var body: some View {
         NavigationStack {
@@ -88,8 +91,11 @@ struct ConnectionView: View {
                     Section("Saved machines") {
                         ForEach(model.machines) { machine in
                             VStack(alignment: .leading) {
-                                Text(machine.address)
-                                Text(machine.username).font(.caption).foregroundStyle(.secondary)
+                                Text(machine.displayName)
+                                Button("Edit nickname") { renameNode = machine.id; nickname = machine.nickname ?? ""; showRename = true }
+                                    .accessibilityIdentifier("renameMachine-" + machine.id)
+                                Text("\(machine.address) · \(model.isConnected(node: machine.id) ? "Connected" : "Offline · saved")").font(.caption).foregroundStyle(.secondary)
+                                    .accessibilityIdentifier("machineStatus-" + machine.id)
                                 DisclosureGroup("Details") { Text("Verified Pika identity: \(machine.id)").font(.caption.monospaced()).textSelection(.enabled) }.font(.caption)
                             }
                         }
@@ -135,8 +141,13 @@ struct ConnectionView: View {
                     }.padding(28).presentationDetents([.medium, .large]).interactiveDismissDisabled()
                 }
                 .scrollContentBackground(.hidden)
+                .alert("Machine nickname", isPresented: $showRename) {
+                    TextField("Nickname (optional)", text: $nickname).accessibilityIdentifier("machineNickname")
+                    Button("Save") { if let node = renameNode { model.renameMachine(node, nickname: nickname) } }
+                    Button("Cancel", role: .cancel) {}
+                } message: { Text("Only its display name changes. Address, login and verified identity stay unchanged.") }
                 .background(PikaTheme.background)
-                .onChange(of: model.connected) { _, connected in if connected { password = ""; passphrase = ""; keyBytes = nil; dismiss() } }
+                .onChange(of: model.connectionCompletion) { _, _ in password = ""; passphrase = ""; keyBytes = nil; dismiss() }
                 .onChange(of: scenePhase) { _, phase in if phase == .background { scannedCode = nil; scan = false; if model.connecting { model.cancelConnection() } } }
         }
     }

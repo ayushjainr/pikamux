@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.41 — One phone board, exact machine controls
+
+- Keep independently paired machines together on the iPhone board, including
+  cached offline rows, with optional display nicknames and explicit owner routing.
+- Add exact-thread provider model and skill controls from live provider catalogs;
+  uncertain changes remain explicit and are never retried automatically.
+- Keep the private assistant under the invoking account's safe configured home,
+  including administrator-owned mounts, without relocating provider credentials.
+- Extend native iPhone journey evidence and Linux account-home regression checks.
+
+The iPhone remains an alpha source deliverable; release assets are host/client
+binaries. Updates do not restart assistants, change pairings or update other hosts.
+
 ## 0.6.40 — Pair from your existing SSH account
 
 - Allow phone enrollment beneath a safe administrator-owned mount above the
