@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.44 — Attach your assistant's certified home
+
+- Continue a first-launch receipt through its durable exact conversation binding
+  after certification removes the temporary pending row. Launch-token recovery
+  only attaches an existing proven home; it never restores an unwatch or resumes
+  a duplicate provider. Explicit daily selection retains its existing behavior.
+- Find Codex's bundled runtime shell in the standard npm native-package layout,
+  preserving capability checks and isolated assistant credentials and state.
+- Exercise certification, repeated actual terminal attachment, exact PID/pane
+  continuity, unwatch refusal and unproven-startup refusal with fake providers.
+
+The phone source and build identity are unchanged. No account permissions,
+credentials, live provider sessions or conversation identities are reset.
+
 ## 0.6.43 — One phone board, exact machine controls
 
 Version 0.6.41 was not published: macOS CI exposed a terminal recorder injecting

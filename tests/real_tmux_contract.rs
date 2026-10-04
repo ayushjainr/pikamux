@@ -52,6 +52,17 @@ struct AttachedClient {
     socket: String,
 }
 
+struct RecordedAttach {
+    child: Child,
+}
+
+impl Drop for RecordedAttach {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Drop for AttachedClient {
     fn drop(&mut self) {
         let _ = Command::new("tmux")
@@ -140,7 +151,11 @@ fn fake_provider_pika(
     socket: &str,
     executable: &std::path::Path,
 ) -> Pika {
-    let paths = paths(temp.path());
+    fake_provider_at(temp.path(), socket, executable)
+}
+
+fn fake_provider_at(root: &std::path::Path, socket: &str, executable: &std::path::Path) -> Pika {
+    let paths = paths(root);
     let store = Store::from_paths(&paths);
     store.initialize().unwrap();
     let mut config = Config {
@@ -157,6 +172,212 @@ fn fake_provider_pika(
         store,
         Tmux::with_executable("tmux", Some(socket.to_owned())),
     )
+}
+
+#[test]
+fn real_isolated_first_launch_certification_attaches_and_reopens_same_home() {
+    require_tmux();
+    let temp = tempfile::tempdir().unwrap();
+    let socket = format!("pika-certified-first-launch-{}", std::process::id());
+    let _guard = IsolatedTmux(socket.clone());
+    let provider = temp.path().join("claude");
+    let launches = temp.path().join("launches");
+    fs::write(&provider, format!(
+        "#!/bin/sh\nprintf 'launch\\n' >> {}\nprintf 'synthetic provider ready\\n'\nwhile :; do sleep 1; done\n",
+        shell_words::quote(launches.to_str().unwrap()),
+    )).unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let pika = fake_provider_pika(&temp, &socket, &provider);
+    let receipt = pika
+        .new_session("certified_first_launch", Provider::Claude, false)
+        .unwrap();
+    let OpenTarget::Pending(pending) = receipt.target else {
+        panic!("Synthetic provider must leave the initial receipt pending");
+    };
+    let identity = pending.expected_session_id.as_deref().unwrap();
+    wait_for_provider_identity(Provider::Claude, identity);
+    let mut session = saved(
+        Provider::Claude,
+        identity,
+        "certified_first_launch",
+        temp.path(),
+    );
+    session.tmux_session = pending.tmux_session.clone();
+    session.tmux_pane = pending.tmux_pane.clone();
+    let exact = pika
+        .exact_pane_binding(&session, session.tmux_pane.as_deref())
+        .unwrap();
+    session.root_pid = Some(exact.provider_pid);
+    pika.store.upsert_session(&session, true).unwrap();
+    pika.store
+        .bind_launch(&pending.launch_token, Provider::Claude, identity)
+        .unwrap();
+    pika.store
+        .observe_launched_generation(
+            &pending.launch_token,
+            exact.provider_pid,
+            exact.provider_start_time as i64,
+        )
+        .unwrap();
+    assert!(
+        pika.store
+            .certify_launch(
+                &pending.launch_token,
+                Provider::Claude,
+                identity,
+                exact.provider_pid,
+                exact.provider_start_time as i64
+            )
+            .unwrap()
+    );
+    assert!(
+        pika.store
+            .get_pending(&pending.launch_token)
+            .unwrap()
+            .is_none()
+    );
+    pika.store
+        .set_meta("synthetic-history-sentinel", "preserved")
+        .unwrap();
+
+    for visit in 0..2 {
+        let transcript = temp.path().join(format!("certified-attach-{visit}.out"));
+        let child = recorded_terminal(
+            &transcript,
+            &[
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                "--exact",
+                "real_isolated_certified_pending_attach_helper",
+                "--ignored",
+                "--nocapture",
+            ],
+        )
+        .env("TERM", "xterm-256color")
+        .env("PIKA_CERTIFIED_TEST_ROOT", temp.path())
+        .env("PIKA_CERTIFIED_TEST_SOCKET", &socket)
+        .env("PIKA_CERTIFIED_TEST_PROVIDER", &provider)
+        .env("PIKA_CERTIFIED_TEST_TOKEN", &pending.launch_token)
+        .env("PIKA_CERTIFIED_TEST_ID", identity)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+        let mut recorder = RecordedAttach { child };
+        let _input = recorder.child.stdin.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let text = fs::read_to_string(&transcript).unwrap_or_default();
+            if text.contains("CONTINUITY PROVEN")
+                && text.contains("ATTACHED LIVE")
+                && text.contains(&identity[..8])
+            {
+                break;
+            }
+            assert!(
+                recorder.child.try_wait().unwrap().is_none(),
+                "attach exited: {text:?}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "missing certified receipt: {text:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            Command::new("tmux")
+                .args([
+                    "-L",
+                    &socket,
+                    "detach-client",
+                    "-s",
+                    exact.pane.session_name.as_str()
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        loop {
+            if let Some(status) = recorder.child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "attach did not exit after exact detach"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            pika.store
+                .get_launch_binding(&pending.launch_token)
+                .unwrap(),
+            Some((Provider::Claude, identity.to_owned()))
+        );
+        let current = pika
+            .store
+            .get_session(Provider::Claude, identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.tmux_pane, session.tmux_pane);
+        assert_eq!(
+            pika.exact_pane_binding(&current, current.tmux_pane.as_deref())
+                .unwrap()
+                .provider_pid,
+            exact.provider_pid
+        );
+        assert_eq!(
+            pika.store
+                .get_meta("synthetic-history-sentinel")
+                .unwrap()
+                .as_deref(),
+            Some("preserved")
+        );
+    }
+    assert_eq!(fs::read_to_string(launches).unwrap(), "launch\n");
+    assert_eq!(pika.store.list_sessions().unwrap().len(), 1);
+    assert!(pika.store.list_pending().unwrap().is_empty());
+    pika.store
+        .untrack_session(Provider::Claude, identity)
+        .unwrap();
+    assert!(pika.open_pending(&pending.launch_token, false).is_err());
+    assert!(pika.store.is_untracked(Provider::Claude, identity).unwrap());
+}
+
+#[test]
+#[ignore = "subprocess fixture entrypoint"]
+fn real_isolated_certified_pending_attach_helper() {
+    let Ok(root) = std::env::var("PIKA_CERTIFIED_TEST_ROOT") else {
+        return;
+    };
+    let socket = std::env::var("PIKA_CERTIFIED_TEST_SOCKET").unwrap();
+    let provider = std::env::var("PIKA_CERTIFIED_TEST_PROVIDER").unwrap();
+    let token = std::env::var("PIKA_CERTIFIED_TEST_TOKEN").unwrap();
+    let identity = std::env::var("PIKA_CERTIFIED_TEST_ID").unwrap();
+    // script's default 80-column PTY truncates the exact-ID receipt suffix.
+    let size = libc::winsize {
+        ws_row: 40,
+        ws_col: 160,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCSWINSZ, &size) },
+        0
+    );
+    let pika = fake_provider_at(
+        std::path::Path::new(&root),
+        &socket,
+        std::path::Path::new(&provider),
+    );
+    let receipt = pika.open_pending(&token, true).unwrap();
+    assert_eq!(receipt.kind, "ATTACHED LIVE");
+    assert_eq!(receipt.exit_code, 0);
+    let OpenTarget::Session(session) = receipt.target else {
+        panic!("certified launch lost its exact identity");
+    };
+    assert_eq!(session.provider, Provider::Claude);
+    assert_eq!(session.session_id, identity);
 }
 
 fn wait_for_exact_session(pika: &Pika, identity: &str) -> Session {

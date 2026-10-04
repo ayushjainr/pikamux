@@ -1728,15 +1728,20 @@ impl Pika {
     }
 
     pub fn open_pending(&self, launch_token: &str, attach: bool) -> Result<OpenReceipt> {
-        let pending = self
-            .store
-            .get_pending(launch_token)?
-            .context("That launch is no longer pending. Refresh Pika and select it again.")?;
+        let pending = self.store.get_pending(launch_token)?;
         if let Some((provider, session_id)) = self.store.get_launch_binding(launch_token)?
             && let Some(session) = self.store.get_session(provider, &session_id)?
         {
-            return self.open_session(session, attach);
+            // Certification removes the temporary pending row but retains the
+            // exact launch binding. A first-launch receipt can reach this
+            // boundary after that transition; never replace its conversation.
+            // A launch token may only recover its existing exact home, never
+            // restore tracking or resume a provider from stale metadata, even
+            // if certification/unwatch occurs after the pending snapshot.
+            return self.recover_existing_session(session, attach);
         }
+        let pending = pending
+            .context("That launch is no longer pending. Refresh Pika and select it again.")?;
         self.open_pending_terminal(pending, launch_token, attach)
     }
 
@@ -3116,6 +3121,87 @@ mod tests {
         }
         assert!(pika.store.list_sessions().unwrap().is_empty());
         assert_eq!(pika.store.list_pending().unwrap(), vec![pending]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn certified_pending_receipt_reopens_exact_binding_but_never_restores_unwatch() {
+        let (root, mut pika) = test_pika();
+        let identity = "77777777-7777-4777-8777-777777777777";
+        let pid = i64::from(std::process::id());
+        let generation = process::process_start_time(pid).unwrap();
+        let token = "certified-pending-receipt";
+        let mut pending = pending_fixture(token, Provider::Codex);
+        pending.root_pid = Some(pid);
+        pending.root_pid_start = Some(generation as i64);
+        let mut pane = tagged_pane(identity);
+        pane.pane_pid = pid;
+        pane.pika_launch_token = Some(token.into());
+        pika.tmux = fixture_tmux(root.path(), &[pane]);
+        pika.process_observer = Arc::new(move || {
+            ProcessObservation::complete(BTreeMap::from([(
+                pid,
+                record(pid, None, generation, &["codex", "resume", identity]),
+            )]))
+        });
+        let session = test_session(identity);
+        pika.store.upsert_session(&session, false).unwrap();
+        pika.store.add_pending(&pending).unwrap();
+        pika.store
+            .bind_launch(token, Provider::Codex, identity)
+            .unwrap();
+        assert!(
+            pika.store
+                .certify_launch(token, Provider::Codex, identity, pid, generation as i64)
+                .unwrap()
+        );
+        assert!(pika.store.get_pending(token).unwrap().is_none());
+        let receipt = pika.open_pending(token, false).unwrap();
+        assert_eq!(receipt.kind, "ATTACHED LIVE");
+        let OpenTarget::Session(opened) = receipt.target else {
+            panic!("lost certified identity")
+        };
+        assert_eq!(opened.session_id, identity);
+        assert_eq!(pika.store.list_sessions().unwrap().len(), 1);
+        // Freeze the selected binding, then interleave a newer explicit unwatch
+        // before the non-restoring recovery path consumes that stale selection.
+        let selected = pika
+            .store
+            .get_session(Provider::Codex, identity)
+            .unwrap()
+            .unwrap();
+        pika.store
+            .untrack_session(Provider::Codex, identity)
+            .unwrap();
+        assert!(pika.recover_existing_session(selected, false).is_err());
+        assert!(pika.open_pending(token, false).is_err());
+        assert!(pika.store.is_untracked(Provider::Codex, identity).unwrap());
+        assert!(pika.open_pending("missing-launch", false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_pending_startup_without_exact_owner_never_resumes_a_provider() {
+        let (root, mut pika) = test_pika();
+        let identity = "88888888-8888-4888-8888-888888888888";
+        let token = "bound-unproven-startup";
+        let pending = pending_fixture(token, Provider::Codex);
+        pika.tmux = fixture_tmux(root.path(), &[tagged_pane(identity)]);
+        pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
+        pika.store
+            .upsert_session(&test_session(identity), false)
+            .unwrap();
+        pika.store.add_pending(&pending).unwrap();
+        pika.store
+            .bind_launch(token, Provider::Codex, identity)
+            .unwrap();
+        assert!(pika.open_pending(token, false).is_err());
+        assert_eq!(pika.store.list_pending().unwrap(), vec![pending]);
+        assert_eq!(pika.store.list_sessions().unwrap().len(), 1);
+        assert_eq!(
+            pika.store.get_launch_binding(token).unwrap(),
+            Some((Provider::Codex, identity.into()))
+        );
     }
 
     #[test]
