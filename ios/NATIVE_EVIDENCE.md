@@ -1,5 +1,199 @@
 # Native iOS evidence ledger
 
+## Native composer controls — 2026-10-03
+
+Workspace implementation only; these controls are not deployed to existing
+0.6.40 server binaries. Older endpoints report controls unavailable; no phone
+catalog or unsupported native command is fabricated.
+
+Measured native-provider test: **1 passed in 1.59s**. Log:
+`/tmp/pika-composer-native-controls.log`. This uses the explicitly
+selected installed Codex executable, a fresh temporary provider/Pika/database
+home and a loopback fake inference endpoint. It reads no personal transcript,
+contacts no fleet machine and spends no model quota. Provider plugin downloads
+and shell snapshots are explicitly disabled in this disposable probe:
+
+```sh
+PATH=/Users/ayushjain/.rustup/toolchains/1.88.0-aarch64-apple-darwin/bin:$PATH \
+scripts/with-test-home.sh env PIKA_IOS_CODEX=/Users/ayushjain/.local/bin/codex \
+cargo test --test ios_codex_socket_spike \
+mobile_controls_change_exact_model_and_send_provider_skill_input \
+-- --ignored --test-threads=1 --nocapture
+```
+
+The actual `_mobile` → installed Codex socket path verifies unopened controls
+fail closed, current model comes from the selected provider, model selection
+updates only that exact thread and survives reopening, and selection creates
+no model turn. `thread/settings/update` can acknowledge before applying its
+queued change: the endpoint re-observes for at most three seconds without
+retrying the mutation, otherwise retaining an unknown outcome.
+
+The provider's enabled, exact-cwd skill catalog supplies structured
+`{type: "skill", name, path}` input. The fake inference request contains the
+fixture skill's unique instruction. A nonexistent explicitly selected skill
+is rejected before dispatch. Ordinary `$HOME` and `$PATH` text, without
+selected-skill metadata, is accepted literally. Removing the fixture skill
+after dispatch cannot hide the original accepted receipt on an identical
+operation replay. Metadata is separately selected by the picker; arbitrary
+dollar words do not cause skill discovery or activation.
+
+Disposable native unit checks: **14 passed, 1 pre-existing isolated-SSH test
+ignored**. `cargo fmt --all -- --check`, `git diff --check`, and disposable
+`cargo clippy --locked --all-targets -- -D warnings` passed. The native model
+picker exposes one bounded provider catalog page and labels additional pages
+explicitly.
+
+Separate native simulator result `/tmp/pika-composer-final-02.xcresult`
+(log `/tmp/pika-composer-final-02.log`): **10 passed, 0 failed, 0 skipped**;
+parsed `runtimeWarnings: []`; executable tests took **297.837s**. Six labeled
+UI-fixture composer journeys cover current checked model selection without
+a message, typed `/model` and `$` pickers, searchable skill insertion preserving
+literal `$HOME`, ordinary `/mnt/...` text sent literally, unsupported/offline
+controls, and an unknown model outcome never claiming a setting or permitting
+another immediate change. Four existing fixture regressions also passed:
+offline draft retention, machine/project paging plus creation receipt recovery,
+assistant late approval/history and exact-project return, and unknown-message
+receipt non-repetition. These are native UI fixture tests, not live provider,
+phone-device or fleet-server claims.
+Exported creation screenshot
+`/tmp/pika-composer-final-02-attachments/4CE34EF3-3911-4C4A-A825-E5076D8ACE94.png`
+was visually inspected: the required-name explanation remains readable above
+the native keyboard with the selected machine/project visible.
+
+The earlier combined `/tmp/pika-composer-final-01.xcresult` run was deliberately
+cancelled before its SSH test when listener shell-startup HOME isolation required
+hardening. It is not a completed test result. Final-02 selects only the labeled
+UI fixtures; safe SSH retention/source isolation has its own separate ledger
+entry and run. No server binary was published or deployed by these checks.
+
+## 2026-10-03 three separately saved machines over ordinary SSH
+
+`/tmp/pika-ios-transport.b4aP3S/three-machine-05.xcresult`: **1 passed,
+0 failed, 0 skipped, runtimeWarnings []**; 143.293 seconds test operations,
+not a latency benchmark. The actual Simulator app manually onboarded three
+ordinary loopback OpenSSH endpoints with three independently checked host-key
+fingerprints and different exact Pika node IDs. All expose the same provider
+`codex`, thread ID `collision-thread` and display title `Shared work` to exercise
+identity collisions. Actual scoped Keychain credentials and three saved
+connections survived process termination/relaunch. All three rows remained,
+the machine filter isolated Alpha, and Alpha/Gamma opens and sends reached their
+exact endpoints rather than the last-connected Gamma. The Alpha nickname `rs6`
+survived another process restart, and the Pika chooser selected all three named
+machines explicitly. Taking Beta offline preserved its cached row and left
+Alpha/Gamma connected; Alpha remained readable.
+
+These endpoints are explicitly labeled protocol doubles served by
+`scripts/ios-three-machine-fixture.py` through actual SSH exec. They are **not**
+Rust `_mobile`, a provider continuation, a real model, Tailscale, live fleet,
+or physical-phone proof. Independent endpoint-owned JSONL logs recorded exactly
+one Alpha send, zero Beta sends and one Gamma send, all with the receiving
+endpoint's exact node/provider/thread identity and distinct client operation IDs.
+Alpha received `Exact destination Alpha`; Gamma received
+`Exact destination Gamma`; no offline retry was sent. Evidence/config/logs:
+`/var/folders/k9/s1xh63d93rq9bd97cngqvf4c0000gn/T/pika-three-ssh-ibr3x7pc`.
+Keys are retained only in this generated fixture root; do not publish them.
+
+Isolation caveat for 05: the protocol Python processes ran with an empty
+environment and disposable HOME, and no provider or personal transcript was
+opened. The initial sshd account shell startup lacked `SetEnv HOME`, so this run
+does not establish full shell-startup isolation. The reusable harness now sets
+sshd's startup HOME and explicit XDG/provider/Pika/database/temp/tmux roots.
+The frozen-source retained-store follow-up must use corrected owned listener
+configuration; later source changes are not credited to 05 without that rerun.
+
+That separate final-source check passed:
+`/tmp/pika-ios-transport.b4aP3S/three-machine-retained-02.xcresult`, **1 passed,
+0 failed, 0 skipped, runtimeWarnings []**, 38.150 seconds test operations.
+The retained owned Alpha/Gamma listeners were reloaded with verified disposable
+HOME/ZDOTDIR and all XDG/provider/Pika/database/temp/tmux paths before this run;
+`PermitUserRC no` and `PermitUserEnvironment no` were explicit. Their existing
+host keys, node IDs, saved phone credentials and ports were unchanged.
+Beta remained offline. This was saved-store regression, not another onboarding.
+
+The 02 source retains `rs6` and restores Alpha/Gamma connections. The Dex
+capture shows neutral `Cached · Ready` badges on all three rows despite the
+connected status checks and green lens; it is not accepted as steady-state
+proof that online card badges are accurate. The test captured immediately after
+dismissing connections and checked only that a cached badge existed, not each
+row's settled badge. Scoped raw source boards contain fresh non-stale Alpha/Gamma
+observations; the rendering discrepancy was subsequently fixed and validated
+separately below.
+The fixture held the original Alpha open response,
+closed only Gamma's owned exec channel, independently observed a newly
+authenticated Gamma hello, then released the original Alpha response. Its exact
+context rendered rather than being discarded by the unrelated reconnect.
+A one-shot nil-node Gamma `connection/error` frame was independently marked
+emitted; Alpha's original composer remained send-capable and its exact reply
+was delivered. Endpoint log deltas were Alpha +1 send, Beta +0, Gamma +0;
+after 02 the retained logs contained Alpha 2, Beta 0, Gamma 1 sends, all bound to the
+receiving node's exact identity. The Gamma event is a protocol-fixture injection,
+not a naturally occurring fleet failure or provider proof.
+
+Final native images in `three-machine-retained-02-attachments`:
+`1A9FDDB5-21CC-40DA-980B-CD3035894A41.png` (Dex capture with unresolved online-badge discrepancy),
+`4EEF1075-103C-4A41-99D1-441F347525D1.png` (saved connections),
+`497CA457-7DF0-4B28-8014-D87DC4E13E1F.png` (exact Alpha reply after overlap/error).
+Owned harness session 92487 stopped cleanly, exit 0. `lsof` confirmed no
+listeners remained on 59431, 59432 or 59433; earlier harness sessions 10576 and
+69649 had also stopped cleanly. Generated keys/config/logs and result bundles
+remain in disposable evidence roots; no installed Pika, user SSH policy, fleet
+machine or phone was changed.
+
+Final visual/routing check after flattening the board's state-grouped lazy row
+identity: `three-machine-retained-03.xcresult`, **1 passed, 0 failed, 0 skipped,
+runtimeWarnings []**, 41.241 seconds test operations. The same generated
+credentials, exact node IDs and saved store were retained; only owned
+Alpha/Gamma listeners were restarted, with the corrected startup and runtime
+environment isolation preserved. The test now waits for each exact rendered
+observation Text (`boardFreshness-<exact identity>`): Alpha/rs6 and Gamma must
+say `Observed`, Beta must say `Cached`. All predicates passed, and native visual
+inspection confirms green Ready cards for rs6/Gamma, a gray Cached · Ready card
+only for Beta and the matching green lens. The nested group identity had allowed
+stale lazy-card presentation; the final board uses one attention-ordered exact
+identity list, rather than accepting a longer timing wait as its fix.
+
+The same final run repeated the held Alpha response across Gamma reconnect,
+one-shot unrelated Gamma error and exact Alpha reply with independent endpoint
+delta Alpha +1, Beta +0, Gamma +0. Retained log totals after 03 are Alpha 3,
+Beta 0 and Gamma 1 sends. Final native images in
+`three-machine-retained-03-attachments`:
+`896E8625-F3DF-4994-9DDC-A16E18D38982.png` (settled exact live/cached Dex),
+`C355A229-C290-4EB1-96B4-CF56453EA1CC.png` (connections), and
+`37CF921D-7CBD-44AD-96AA-E30E85ADF3B4.png` (exact Alpha reply).
+Resumed owned-listener session 65182 stopped cleanly, exit 0; `lsof` again
+confirmed no listeners on 59431, 59432 or 59433. No fixture listener is left live.
+
+Native screenshot directory: `three-machine-05-attachments` under the result
+root above. Dex with persisted `rs6`:
+`1783E84C-96C7-4112-B1DE-A87A6496E800.png`; actual routed Alpha reply:
+`E828AEF2-F011-422C-9BEF-0449D9882ED7.png`; saved connections showing Beta offline
+and both other nodes connected: `156DF9A6-1503-4774-A184-2443323F0B42.png`;
+explicit Pika chooser: `50644DCE-C16A-4730-BB38-97369B5F5695.png`.
+
+Earlier attempts are preserved and not counted as passes:
+
+- `three-machine-01.xcresult`: build failure because the new composer component
+  was not registered in the Xcode project; no journey ran.
+- `three-machine-02.xcresult`: build succeeded but the new test config was not
+  forwarded by the shared scheme; one test skipped, zero passed.
+- `three-machine-03.xcresult`: actual onboards/restarts/filter/exact sends and
+  Beta-offline/other-two-connected assertions were reached, then the app crashed
+  during a refused reconnect. The crash was an unfulfilled authentication
+  promise destroyed after bootstrap failure; SSHWire now completes that failure
+  path explicitly. Exported crash: `three-machine-03-attachments/`
+  `F601C49D-2D01-412C-843E-AA3165160F26.ips`. Overall result: failed.
+- `three-machine-04.xcresult`: failed locating the native nickname alert field;
+  UIKit dropped its SwiftUI accessibility identifier. The verified alert's exact
+  placeholder now supplies the test locator. No app crash was recorded, and the
+  failure is not credited as a complete journey.
+- `three-machine-retained-01.xcresult`: failed a brittle assertion that an
+  injected Gamma error's shared global notice must remain visible. It reached
+  neutral cached Beta and the held Alpha response across an actual Gamma
+  reconnect; an offline Beta retry's connection-failure notice was visible at
+  failure. The final test instead requires the independent error-emitted marker,
+  original Alpha Send capability and exact endpoint delivery; production source
+  was unchanged between these two retained runs. The failed run sent nothing.
+
 ## 2026-10-03 Start and Pika release recheck
 
 `/tmp/pika-start-assistant-01.xcresult`: four native UI journeys passed, zero

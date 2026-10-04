@@ -337,6 +337,243 @@ fn two_clients_read_same_loaded_thread_and_reject_stale_steering() {
     run_probe(false);
 }
 #[test]
+#[ignore = "Installed Codex protocol with disposable homes, loopback fake inference only"]
+fn mobile_controls_change_exact_model_and_send_provider_skill_input() {
+    let executable = std::env::var_os("PIKA_IOS_CODEX").expect("Select provider explicitly");
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let socket = home.join("app-server-control/app-server-control.sock");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let skill = home.join("skills/fixture-review/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(&skill,"---\nname: fixture-review\ndescription: Disposable review skill\n---\nUNIQUE_DISPOSABLE_SKILL_INSTRUCTION\n").unwrap();
+    let fake = TcpListener::bind("127.0.0.1:0").unwrap();
+    fake.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/v1", fake.local_addr().unwrap());
+    let mut server = Server(
+        Command::new(executable)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("CODEX_HOME", &home)
+            .env("TMPDIR", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .current_dir(root.path())
+            .args([
+                "-c",
+                "model_provider=\"isolated\"",
+                "-c",
+                "model_providers.isolated.name=\"Isolated\"",
+                "-c",
+                &format!("model_providers.isolated.base_url=\"{url}\""),
+                "-c",
+                "model_providers.isolated.wire_api=\"responses\"",
+                "-c",
+                "model_providers.isolated.requires_openai_auth=false",
+                "-c",
+                "model_providers.isolated.supports_websockets=false",
+                "-c",
+                "analytics.enabled=false",
+                "-c",
+                "features.plugins=false",
+                "-c",
+                "features.shell_snapshot=false",
+                "app-server",
+                "--listen",
+            ])
+            .arg(format!("unix://{}", socket.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline);
+        assert!(server.0.try_wait().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let mut desktop = Client::connect(&socket);
+    let catalog = desktop.rpc(2, "model/list", json!({"limit":100}));
+    let chosen = catalog["result"]["data"][0]["model"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let started = desktop.rpc(
+        3,
+        "thread/start",
+        json!({"cwd":root.path(),"model":chosen,"approvalPolicy":"never","sandbox":"read-only"}),
+    );
+    let thread = started["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let other=desktop.rpc(4,"thread/start",json!({"cwd":root.path(),"model":"isolated-other","approvalPolicy":"never","sandbox":"read-only"}));
+    let other_id = other["result"]["thread"]["id"].as_str().unwrap().to_owned();
+    // Persist empty metadata without a model turn before connect-only mobile resume.
+    for (index, id) in [&thread, &other_id].into_iter().enumerate() {
+        desktop.rpc(
+            10 + index as u64 * 3,
+            "thread/archive",
+            json!({"threadId":id}),
+        );
+        desktop.rpc(
+            11 + index as u64 * 3,
+            "thread/unarchive",
+            json!({"threadId":id}),
+        );
+        let resumed = desktop.rpc(
+            12 + index as u64 * 3,
+            "thread/resume",
+            json!({"threadId":id,"excludeTurns":true}),
+        );
+        assert!(resumed.get("error").is_none(), "{resumed}");
+    }
+    let other_before = desktop.rpc(
+        20,
+        "thread/read",
+        json!({"threadId":other_id,"includeTurns":false}),
+    )["result"]["thread"]["model"]
+        .clone();
+    let db = root.path().join("pika.db");
+    let store = pikamux::store::Store::at(&db);
+    store.initialize().unwrap();
+    let candidate = pikamux::model::Candidate {
+        provider: pikamux::model::Provider::Codex,
+        session_id: thread.clone(),
+        name: Some("Synthetic controls".into()),
+        cwd: Some(root.path().to_string_lossy().into_owned()),
+        branch: None,
+        transcript_path: None,
+        model: Some(chosen.clone()),
+        updated_at: 1.0,
+        live: true,
+        pid: Some(server.0.id() as i64),
+        source: "ios-synthetic-selected".into(),
+        parent_session_id: None,
+        created_at: 1.0,
+        lifecycle_status: Some(pikamux::model::Status::Ready),
+    };
+    store
+        .adopt_session(&pikamux::core::session_from_candidate(&candidate))
+        .unwrap();
+    let identity = json!({"nodeId":store.ensure_local_node_id().unwrap(),"provider":"codex","threadId":thread});
+    let mut phone = Endpoint::spawn(root.path(), &home, &db);
+    let unopened = phone.rpc("conversation/controls", json!({"identity":identity}));
+    assert!(unopened.get("error").is_some());
+    let opened = phone.rpc("conversation/open", json!({"identity":identity}));
+    assert!(opened.get("error").is_none(), "{opened}");
+    let controls = phone.rpc("conversation/controls", json!({"identity":identity}));
+    assert_eq!(controls["result"]["currentModel"], chosen, "{controls}");
+    assert!(
+        controls["result"]["skills"]
+            .to_string()
+            .contains("fixture-review"),
+        "{controls}"
+    );
+    let alternative = controls["result"]["models"]["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["model"] != chosen)
+        .unwrap()["model"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let changed = phone.rpc(
+        "conversation/model",
+        json!({"identity":identity,"model":alternative}),
+    );
+    assert_eq!(changed["result"]["state"], "accepted", "{changed}");
+    let reopened = phone.rpc("conversation/open", json!({"identity":identity}));
+    assert!(reopened.get("error").is_none(), "{reopened}");
+    let current = phone.rpc("conversation/controls", json!({"identity":identity}));
+    assert_eq!(
+        current["result"]["currentModel"], alternative,
+        "Reopening must preserve the selected thread setting: {current}"
+    );
+    let actual = desktop.rpc(
+        5,
+        "thread/read",
+        json!({"threadId":thread,"includeTurns":true}),
+    );
+    assert_eq!(actual["result"]["thread"]["model"], alternative, "{actual}");
+    assert!(
+        actual["result"]["thread"]["turns"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let unchanged = desktop.rpc(
+        6,
+        "thread/read",
+        json!({"threadId":other_id,"includeTurns":false}),
+    );
+    assert_eq!(unchanged["result"]["thread"]["model"], other_before);
+    let unknown=phone.rpc("conversation/send",json!({"identity":identity,"clientMessageId":uuid::Uuid::new_v4().to_string(),"text":"Use $missing-skill","skills":["missing-skill"]}));
+    assert!(unknown.get("error").is_some(), "{unknown}");
+    let skill_payload = json!({"identity":identity,"clientMessageId":uuid::Uuid::new_v4().to_string(),"text":"Use $fixture-review and keep $HOME $PATH literal","skills":["fixture-review"]});
+    let sent = phone.rpc("conversation/send", skill_payload.clone());
+    assert_eq!(sent["result"]["state"], "accepted", "{sent}");
+    let plain = phone.rpc("conversation/send",json!({"identity":identity,"clientMessageId":uuid::Uuid::new_v4().to_string(),"expectedTurnId":sent["result"]["turnId"],"text":"Keep $HOME $PATH literal without selecting any skill"}));
+    assert_eq!(
+        plain["result"]["state"], "accepted",
+        "Ordinary dollar text must not require a provider skill: {plain}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match fake.accept() {
+            Ok((s, _)) => break s,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        header.push(byte[0]);
+        assert!(header.len() < 65536);
+    }
+    let length = String::from_utf8(header)
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse::<usize>().unwrap())
+        })
+        .unwrap();
+    assert!(length < 16 * 1024 * 1024);
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body).unwrap();
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(request["model"], alternative);
+    assert!(request.to_string().contains("$HOME $PATH"));
+    assert!(
+        request
+            .to_string()
+            .contains("UNIQUE_DISPOSABLE_SKILL_INSTRUCTION"),
+        "Provider did not load selected skill"
+    );
+    std::fs::remove_file(&skill).unwrap();
+    let replay = phone.rpc("conversation/send", skill_payload);
+    assert_eq!(
+        replay["result"], sent["result"],
+        "A deleted skill cannot hide the original receipt"
+    );
+    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"fake-controls\",\"status\":\"completed\",\"output\":[]}}\n\n").unwrap();
+}
+#[test]
 #[ignore = "Actual Pika JSONL endpoint and installed Codex; isolated fake loopback model"]
 fn mobile_handler_resolves_question_and_recovers_lost_multiline_receipt() {
     run_probe(true);

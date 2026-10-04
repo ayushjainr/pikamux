@@ -107,12 +107,16 @@ jobs:
           chmod 755 "$pairing_mount"
           sudo chown nobody "$pairing_mount"
           sudo useradd --no-create-home --home-dir "$pairing_mount/accounts" --shell /bin/sh "$pairing_user"
-          trap 'sudo userdel "$pairing_user"; sudo rm -f "$pairing_mount/accounts/pika" "$pairing_mount/accounts/journey.py"; sudo rmdir "$pairing_mount/accounts" "$pairing_mount"' EXIT
+          trap 'sudo userdel "$pairing_user"; sudo rm -f "$pairing_mount/accounts/pika" "$pairing_mount/accounts/journey.py" "$pairing_mount/accounts/assistant-journey.py"; sudo rmdir "$pairing_mount/accounts/foreign/owned" "$pairing_mount/accounts/foreign" "$pairing_mount/outside" "$pairing_mount/accounts" "$pairing_mount"' EXIT
           printf '%s:%s\n' "$pairing_user" "$(openssl rand -hex 32)" | sudo chpasswd
           sudo chown "$pairing_user" "$pairing_mount/accounts"
           sudo install -o "$pairing_user" -m 700 target/debug/pika "$pairing_mount/accounts/pika"
           sudo install -o "$pairing_user" -m 600 scripts/check-pairing-account-home.py "$pairing_mount/accounts/journey.py"
           sudo -u "$pairing_user" python3 "$pairing_mount/accounts/journey.py" --binary "$pairing_mount/accounts/pika" --home-parent "$pairing_mount/accounts"
+          sudo install -o "$pairing_user" -m 600 scripts/check-assistant-account-home.py "$pairing_mount/accounts/assistant-journey.py"
+          sudo install -d -o nobody -m 755 "$pairing_mount/accounts/foreign"
+          sudo install -d -o "$pairing_user" -m 700 "$pairing_mount/accounts/foreign/owned" "$pairing_mount/outside"
+          sudo -u "$pairing_user" python3 "$pairing_mount/accounts/assistant-journey.py" --binary "$pairing_mount/accounts/pika" --home "$pairing_mount/accounts" --foreign-child "$pairing_mount/accounts/foreign/owned" --external "$pairing_mount/outside"
       - name: Test
         run: scripts/with-test-home.sh env -u PIKA_DB_PATH -u PIKA_UPDATE_CHECK cargo test --locked --all-targets --no-fail-fast -- --test-threads=1
       - name: Dependency license inventory

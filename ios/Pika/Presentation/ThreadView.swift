@@ -13,7 +13,9 @@ struct ThreadView: View {
     @State private var bottomPosition: CGFloat = 0
     @State private var readingGesture = false
     @State private var sendScrollRequest = 0
+    @State private var controlPicker: ComposerPicker?
     private var liveItem: BoardItem { model.board.first(where: { $0.identity == item.identity }) ?? item }
+    private var machineName: String { model.machineName(for: item.identity.nodeId, fallback: liveItem.machine) }
     var body: some View {
         ScrollViewReader { proxy in
         ScrollView {
@@ -21,8 +23,8 @@ struct ThreadView: View {
                 TestContextBanner()
                 if model.selected?.identity == item.identity, model.conversationCached { Text("Cached conversation · reconnect to verify current context").font(.caption).foregroundStyle(.secondary) }
                 if model.selected?.identity == item.identity, model.conversationCapabilities == .null {
-                    Button(model.connected ? "Recheck original conversation" : "Reconnect machine") {
-                        Task { if model.connected { await attachVisible(force: true) } else { model.retryConnection() } }
+                    Button(model.isConnected(node: item.identity.nodeId) ? "Recheck original conversation" : "Reconnect machine") {
+                        Task { if model.isConnected(node: item.identity.nodeId) { await attachVisible(force: true) } else { model.retryConnection() } }
                     }.buttonStyle(.bordered)
                 }
                 if model.selected?.identity == item.identity, model.historyCursor != .null {
@@ -51,7 +53,7 @@ struct ThreadView: View {
                 if model.pendingActions.values.contains(where: { $0.identity == item.identity && $0.requestId != nil && ["pending", "unknown"].contains($0.state) }) {
                     Button("Check original request status") { Task { await model.reconcileRequests(item) } }.buttonStyle(.bordered)
                 }
-                if model.messages.isEmpty { Text(model.connected ? "Reading the exact existing conversation…" : "Reconnect to read current context.").foregroundStyle(.secondary) }
+                if model.messages.isEmpty { Text(model.isConnected(node: item.identity.nodeId) ? "Reading the exact existing conversation…" : "Reconnect to read current context.").foregroundStyle(.secondary) }
                 ForEach(model.selected?.identity == item.identity ? model.messages : []) { message in
                     if message.role == "user" {
                         HStack { Spacer(minLength: 36); Text(message.text).textSelection(.enabled).lineSpacing(4)
@@ -114,6 +116,27 @@ struct ThreadView: View {
             }
             .scrollDismissesKeyboard(.interactively).background(PikaTheme.background)
             .onAppear { Task { await attachVisible() } }
+            .sheet(item: $controlPicker) { picker in
+                ComposerControls(item: item, picker: picker) { reference in
+                    let draft = model.draft(item.identity)
+                    let last = draft.split(whereSeparator: { $0.isWhitespace }).last.map(String.init) ?? ""
+                    let prefix = last == "$" ? (draft.lastIndex(where: { $0.isWhitespace }).map { String(draft[...$0]) } ?? "") : draft + (draft.isEmpty || draft.last?.isWhitespace == true ? "" : " ")
+                    model.setDraft(prefix + reference + " ", identity: item.identity)
+                    model.referenceSkill(String(reference.dropFirst()), identity: item.identity)
+                }
+            }
+            .onChange(of: model.draft(item.identity)) { _, draft in
+                guard !composing else { return }
+                let trigger = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard trigger == "/" || trigger == "/model" || draft.split(whereSeparator: { $0.isWhitespace }).last == "$" else { return }
+                Task {
+                    // Let normal paths and dollar-prefixed text continue typing
+                    // before offering a standalone control trigger.
+                    try? await Task.sleep(for: .milliseconds(350))
+                    guard !Task.isCancelled, !composing, model.draft(item.identity) == draft, controlPicker == nil else { return }
+                    controlPicker = trigger == "/model" ? .models : trigger == "/" ? .commands : .skills
+                }
+            }
             .safeAreaInset(edge: .bottom, spacing: 0) { composer }
             .safeAreaInset(edge: .top, spacing: 0) { threadHeader }
             .accessibilityAction(.escape) { dismiss() }
@@ -123,12 +146,12 @@ struct ThreadView: View {
     }
     private var threadHeader: some View {
         HStack(spacing: 10) {
-            DexSignals(states: model.connected && liveItem.stale != true && !model.conversationCached
+            DexSignals(states: model.isConnected(node: item.identity.nodeId) && liveItem.stale != true && !model.conversationCached
                 ? Set([PikaTheme.state(liveItem.state)].filter { ["Needs you", "Working", "Ready"].contains($0) }) : [])
                 .padding(.trailing, 22)
             VStack(alignment: .leading, spacing: 2) {
                 Text(liveItem.name).font(.subheadline.weight(.semibold)).lineLimit(1)
-                Text("\(liveItem.machine) · \(PikaTheme.state(liveItem.state))")
+                Text("\(machineName) · \(PikaTheme.state(liveItem.state))")
                     .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             }.frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityElement(children: .combine).accessibilityIdentifier("conversationHeader")
@@ -156,9 +179,15 @@ struct ThreadView: View {
     }
     private var composer: some View {
         VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 16) {
+                Button("/ Commands") { controlPicker = .commands }.accessibilityIdentifier("composerCommands")
+                Button("$ Skills") { controlPicker = .skills }.accessibilityIdentifier("composerSkills")
+                Spacer()
+            }.font(.caption).padding(.horizontal, 12).padding(.bottom, 6)
+                .disabled(!model.isConnected(node: item.identity.nodeId) || model.selected?.identity != item.identity || model.conversationCached)
             HStack(alignment: .bottom, spacing: 8) {
                 NativeComposer(text: Binding(get: { model.draft(item.identity) }, set: { model.setDraft($0, identity: item.identity) }),
-                    composing: $composing, label: "Reply to \(liveItem.name) on \(liveItem.machine)", send: send)
+                    composing: $composing, label: "Reply to \(liveItem.name) on \(machineName)", send: send)
                     .overlay(alignment: .topLeading) {
                         if model.draft(item.identity).isEmpty {
                             Text("Message…").foregroundStyle(.secondary).padding(.leading, 9).padding(.top, 10)
@@ -169,12 +198,17 @@ struct ThreadView: View {
                     .background(model.canSend(item, composing: composing) ? PikaTheme.shell.opacity(0.10) : Color(uiColor: .tertiarySystemFill), in: Circle())
                     .foregroundStyle(model.canSend(item, composing: composing) ? PikaTheme.buttonText : .secondary)
                     .disabled(!model.canSend(item, composing: composing))
-                    .accessibilityLabel("Send reply to \(liveItem.name) on \(liveItem.machine)").accessibilityIdentifier("sendReply")
+                    .accessibilityLabel("Send reply to \(liveItem.name) on \(machineName)").accessibilityIdentifier("sendReply")
             }.padding(8).background(PikaTheme.sheet, in: RoundedRectangle(cornerRadius: 28))
                 .overlay(RoundedRectangle(cornerRadius: 28).strokeBorder(.primary.opacity(0.10), lineWidth: 0.5))
         }.padding(.horizontal, 16).padding(.vertical, verticalSizeClass == .compact ? 4 : 10).background(PikaTheme.background)
     }
     private func send() {
+        let trigger = model.draft(item.identity).trimmingCharacters(in: .whitespacesAndNewlines)
+        if trigger == "/" || trigger == "/model" {
+            controlPicker = trigger == "/model" ? .models : .commands
+            return
+        }
         guard model.canSend(item, composing: composing) else { return }
         nearBottom = true
         readingGesture = false

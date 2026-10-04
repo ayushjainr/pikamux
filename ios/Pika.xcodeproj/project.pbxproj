@@ -25,6 +25,9 @@
 		79C9092EB9FC08DFF51EE296 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = BEC142A307A2C6237FAEC497 /* Theme.swift */; };
 		903D0FFC966C9670E998252A /* BoardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A832F9DCAFF050055ADB5D2 /* BoardView.swift */; };
 		93E177ABED1546F29A8F652B /* PikaUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 368DF1B933FFC3037E50EDF0 /* PikaUITests.swift */; };
+		A77777777777777777777777 /* PikaMultiMachineSSHTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A88888888888888888888888 /* PikaMultiMachineSSHTests.swift */; };
+		B77777777777777777777777 /* ComposerControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = B88888888888888888888888 /* ComposerControls.swift */; };
+		C77777777777777777777777 /* PikaComposerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C88888888888888888888888 /* PikaComposerTests.swift */; };
 		96DC268D60C0881944A223BE /* ApprovalCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 648AD6BECCA05D168041D027 /* ApprovalCard.swift */; };
 		9B1DC89D6AD5CDC044E382E3 /* SSHWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87A61DF228663BFC0330D79A /* SSHWire.swift */; };
 		B620972C6A8FA1EA35C74820 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 5EF537F40A459242B22BCAEF /* Assets.xcassets */; };
@@ -48,6 +51,9 @@
 		A44444444444444444444444 /* PairingScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingScanner.swift; sourceTree = "<group>"; };
 		29A1F26CAD50AE06C3DE86FD /* THIRD_PARTY.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = THIRD_PARTY.md; sourceTree = "<group>"; };
 		368DF1B933FFC3037E50EDF0 /* PikaUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PikaUITests.swift; sourceTree = "<group>"; };
+		A88888888888888888888888 /* PikaMultiMachineSSHTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PikaMultiMachineSSHTests.swift; sourceTree = "<group>"; };
+		B88888888888888888888888 /* ComposerControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerControls.swift; sourceTree = "<group>"; };
+		C88888888888888888888888 /* PikaComposerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PikaComposerTests.swift; sourceTree = "<group>"; };
 		3D22F3BD84185D2546EC7ED2 /* NativeComposer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeComposer.swift; sourceTree = "<group>"; };
 		4804ECFBFD8333DB2B1AD77A /* ConnectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionView.swift; sourceTree = "<group>"; };
 		4F340333EBF85C4097106B1C /* PikaUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = PikaUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -113,6 +119,7 @@
 				F374D05BA8B37E4FC9D07A38 /* RootView.swift */,
 				BEC142A307A2C6237FAEC497 /* Theme.swift */,
 				99BBDA01FFD2EBE5B8E77995 /* ThreadView.swift */,
+				B88888888888888888888888 /* ComposerControls.swift */,
 			);
 			path = Presentation;
 			sourceTree = "<group>";
@@ -146,6 +153,8 @@
 				E4CA0F777D3BD2938299FD84 /* PikaSSHIntegrationTests.swift */,
 				A66666666666666666666666 /* PikaQRIntegrationTests.swift */,
 				368DF1B933FFC3037E50EDF0 /* PikaUITests.swift */,
+				A88888888888888888888888 /* PikaMultiMachineSSHTests.swift */,
+				C88888888888888888888888 /* PikaComposerTests.swift */,
 			);
 			path = PikaUITests;
 			sourceTree = "<group>";
@@ -265,6 +274,8 @@
 				34CC1258C58D475A618B8C88 /* PikaSSHIntegrationTests.swift in Sources */,
 				A55555555555555555555555 /* PikaQRIntegrationTests.swift in Sources */,
 				93E177ABED1546F29A8F652B /* PikaUITests.swift in Sources */,
+				A77777777777777777777777 /* PikaMultiMachineSSHTests.swift in Sources */,
+				C77777777777777777777777 /* PikaComposerTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -288,6 +299,7 @@
 				9B1DC89D6AD5CDC044E382E3 /* SSHWire.swift in Sources */,
 				79C9092EB9FC08DFF51EE296 /* Theme.swift in Sources */,
 				5A44A7C525121B529BF7E61E /* ThreadView.swift in Sources */,
+				B77777777777777777777777 /* ComposerControls.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

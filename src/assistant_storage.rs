@@ -62,27 +62,127 @@ fn check_directory(path: &Path) -> io::Result<()> {
     check(path, true)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        // A private leaf is insufficient when another user can rename an
-        // ancestor. Canonical paths permit platform aliases such as /var while
-        // checking the actual parents; root-owned sticky /tmp is safe here.
-        for ancestor in path.canonicalize()?.ancestors().skip(1) {
-            let metadata = fs::metadata(ancestor)?;
-            let root_sticky = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
-            if !metadata.is_dir()
-                || (metadata.uid() != 0 && metadata.uid() != unsafe { libc::geteuid() })
-                || (metadata.mode() & 0o022 != 0 && !root_sticky)
-            {
-                return Err(io::Error::other(format!(
-                    "Assistant state ancestor {} is not trusted (owner UID {}, mode {:04o}); use a private profile under trusted ancestors",
-                    ancestor.display(),
-                    metadata.uid(),
-                    metadata.mode() & 0o7777
-                )));
-            }
+        check_ancestors(path, account_home()?.as_deref())?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn account_home() -> io::Result<Option<std::path::PathBuf>> {
+    use std::{ffi::CStr, os::unix::ffi::OsStrExt};
+    // Provider children replace HOME with their private provider profile. It is
+    // not an account trust boundary; use the effective account's native record.
+    let mut bytes = vec![0u8; 16_384];
+    loop {
+        let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        // SAFETY: writable native record and live buffer, pointers consumed only
+        // after a successful lookup and before that buffer is dropped.
+        let status = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                record.as_mut_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && bytes.len() < 1_048_576 {
+            bytes.resize(bytes.len() * 2, 0);
+            continue;
+        }
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+        if result.is_null() {
+            return Ok(None); // No boundary means the original strict policy.
+        }
+        let record = unsafe { record.assume_init() };
+        if record.pw_dir.is_null() {
+            return Ok(None);
+        }
+        let home = Path::new(std::ffi::OsStr::from_bytes(
+            unsafe { CStr::from_ptr(record.pw_dir) }.to_bytes(),
+        ));
+        return Ok((home.is_absolute()
+            && !home
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)))
+        .then(|| home.to_owned()));
+    }
+}
+
+#[cfg(unix)]
+fn ancestor_trusted(owner: u32, mode: u32, current: u32, above_home: bool, at_home: bool) -> bool {
+    let root_sticky = owner == 0 && mode & 0o1000 != 0;
+    (above_home || owner == 0 || owner == current)
+        && (!at_home || owner == current)
+        && (mode & 0o022 == 0 || root_sticky)
+}
+
+#[cfg(unix)]
+fn check_ancestors(path: &Path, home: Option<&Path>) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let path = absolute.as_path();
+    // A private leaf is insufficient when another user can rename an
+    // ancestor. Canonical paths permit platform aliases such as /var while
+    // checking the actual parents; root-owned sticky /tmp is safe here.
+    let canonical = path.canonicalize()?;
+    let boundary = home
+        .filter(|home| path.starts_with(home))
+        .map(Path::canonicalize)
+        .transpose()?;
+    // Preserve Darwin's system aliases, not arbitrary profile aliases.
+    // Canonicalization alone must not let a private profile escape its
+    // ownership boundary through a link, including for external profiles.
+    for ancestor in path.ancestors() {
+        if fs::symlink_metadata(ancestor)?.file_type().is_symlink() && !platform_alias(ancestor) {
+            return Err(io::Error::other(
+                "Assistant state must not use symlink ancestors",
+            ));
+        }
+    }
+    let boundary = boundary
+        .as_deref()
+        .filter(|home| canonical.starts_with(home));
+    for ancestor in canonical.ancestors().skip(1) {
+        let metadata = fs::metadata(ancestor)?;
+        let above_home =
+            boundary.is_some_and(|home| ancestor != home && home.starts_with(ancestor));
+        crate::mobile_pairing_acl::validate(ancestor).map_err(|error| {
+            io::Error::other(format!(
+                "Assistant state ancestor {} has an unsafe ACL: {error}",
+                ancestor.display()
+            ))
+        })?;
+        if !metadata.is_dir()
+            || !ancestor_trusted(
+                metadata.uid(),
+                metadata.mode(),
+                unsafe { libc::geteuid() },
+                above_home,
+                boundary == Some(ancestor),
+            )
+        {
+            return Err(io::Error::other(format!(
+                "Assistant state ancestor {} is not trusted (owner UID {}, mode {:04o}); use a private profile under trusted ancestors",
+                ancestor.display(),
+                metadata.uid(),
+                metadata.mode() & 0o7777
+            )));
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn platform_alias(path: &Path) -> bool {
+    cfg!(target_os = "macos") && matches!(path.to_str(), Some("/var" | "/tmp" | "/etc"))
 }
 
 pub(crate) fn file(path: &Path) -> io::Result<()> {
@@ -115,6 +215,12 @@ fn check(path: &Path, directory: bool) -> io::Result<()> {
     }
     #[cfg(unix)]
     {
+        crate::mobile_pairing_acl::validate(path).map_err(|error| {
+            io::Error::other(format!(
+                "Assistant state {} has an unsafe ACL: {error}",
+                path.display()
+            ))
+        })?;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if metadata.uid() != unsafe { libc::geteuid() }
             || metadata.permissions().mode() & 0o077 != 0
@@ -131,6 +237,47 @@ fn check(path: &Path, directory: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn administrator_owner_exception_is_only_above_home_and_never_writable() {
+        assert!(ancestor_trusted(1234, 0o755, 5678, true, false));
+        assert!(!ancestor_trusted(1234, 0o755, 5678, false, false));
+        assert!(!ancestor_trusted(1234, 0o755, 5678, false, true));
+        assert!(!ancestor_trusted(1234, 0o775, 5678, true, false));
+        assert!(!ancestor_trusted(5678, 0o777, 5678, false, false));
+        assert!(ancestor_trusted(0, 0o1777, 5678, true, false));
+        assert!(!ancestor_trusted(0, 0o755, 5678, false, true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_boundary_preserves_data_and_rejects_writes_and_links() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let state = home.join(".local/state/profile");
+        private_directory(&state).unwrap();
+        let db = state.join("memory.sqlite");
+        file(&db).unwrap();
+        fs::write(&db, b"existing identity and history").unwrap();
+        check_ancestors(&state, Some(&home)).unwrap();
+        fs::set_permissions(home.join(".local/state"), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(check_ancestors(&state, Some(&home)).is_err());
+        fs::set_permissions(home.join(".local/state"), fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = home.join("alias");
+        symlink(home.join(".local"), &alias).unwrap();
+        assert!(check_ancestors(&alias.join("state/profile"), Some(&home)).is_err());
+        let external = base.join("external/profile");
+        private_directory(&external).unwrap();
+        check_ancestors(&external, Some(&home)).unwrap();
+        let external_alias = base.join("external-alias");
+        symlink(base.join("external"), &external_alias).unwrap();
+        assert!(check_ancestors(&external_alias.join("profile"), Some(&home)).is_err());
+        fs::set_permissions(base.join("external"), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(check_ancestors(&external, Some(&home)).is_err());
+        assert_eq!(fs::read(&db).unwrap(), b"existing identity and history");
+    }
     #[test]
     fn existing_database_validation_never_creates_missing_state() {
         let tmp = tempfile::tempdir().unwrap();

@@ -16,6 +16,7 @@ actor FixtureWire: MobileWire {
     private var approvalAttempts = 0
     private var receiptChecks = 0
     private var creations: [String: JSONValue] = [:]
+    private var threadModels: [ThreadIdentity: String] = [:]
     init() {
         var continuation: AsyncStream<JSONValue>.Continuation!
         events = AsyncStream { continuation = $0 }; sink = continuation
@@ -23,6 +24,19 @@ actor FixtureWire: MobileWire {
     func request(_ method: String, params: JSONValue) async throws -> JSONValue {
         guard !closed else { throw ConnectionError.disconnected }
         switch method {
+        case "conversation/controls":
+            guard let selected, params["identity"] == selected.json else { throw ConnectionError.changedNode }
+            if ProcessInfo.processInfo.arguments.contains("--fixture-controls-unsupported") { throw ConnectionError.remote("Unsupported mobile method") }
+            return .object(["identity": selected.json, "currentModel": .string(threadModels[selected] ?? "fixture-current"),
+                "models": .object(["data": .array(["fixture-current", "fixture-alternative"].map { .object(["model": .string($0), "displayName": .string($0)]) })]),
+                "skills": .object(["data": .array([.object(["cwd": .string("/fixture"), "errors": .array([]), "skills": .array([
+                    .object(["name": .string("fixture-review"), "description": .string("Disposable review skill"), "path": .string("/fixture/skills/review/SKILL.md"), "enabled": .bool(true)])])])])])])
+        case "conversation/model":
+            guard let selected, params["identity"] == selected.json, let value = params["model"].string,
+                ["fixture-current", "fixture-alternative"].contains(value) else { throw ConnectionError.changedNode }
+            if ProcessInfo.processInfo.arguments.contains("--fixture-model-unknown") { return .object(["identity": selected.json, "state": .string("unknown")]) }
+            threadModels[selected] = value
+            return .object(["identity": selected.json, "state": .string("accepted"), "model": .string(value)])
         case "nodes/list":
             return .object(["items": .array([.object(["nodeId": .string("fixture-node"), "name": .string("Fixture Alpha")]),
                 .object(["nodeId": .string("fixture-node-two"), "name": .string("Fixture Beta")])])])

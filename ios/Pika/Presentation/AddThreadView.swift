@@ -32,7 +32,8 @@ struct AddThreadView: View {
                     Section { Text("This machine does not yet expose verified mobile \(flow == .start ? "creation" : "admission"). No conversation will be created or changed.").foregroundStyle(.secondary) }
                 } else if flow == .start {
                     Section("Thread") {
-                        TextField("Name this thread", text: $name).accessibilityIdentifier("newThreadName")
+                        TextField("Thread name (required)", text: $name).accessibilityIdentifier("newThreadName")
+                        Text("A name is required so you can recognize this exact thread on the board.").font(.caption).foregroundStyle(.secondary)
                         Picker("Project", selection: $projectId) {
                             Text("Choose a project").tag("")
                             ForEach(projects) { project in Text(project.name).tag(project.id) }
@@ -46,6 +47,11 @@ struct AddThreadView: View {
                             Task { if let item = await model.create(name: name, project: project, provider: provider) { opened(item) } }
                         }.disabled(model.mutationBusy || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || projectId.isEmpty || model.creations.values.contains(where: { $0.state == "unknown" || $0.state == "pending" }))
                             .accessibilityIdentifier("startThread")
+                        if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Text("Enter a thread name to enable Start thread.").font(.caption).foregroundStyle(.secondary).accessibilityIdentifier("threadNameRequired")
+                        } else if projectId.isEmpty {
+                            Text("Choose a project to enable Start thread.").font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                 } else {
                     Section("Existing named conversations") {
@@ -98,5 +104,5 @@ struct AddThreadView: View {
                 .onChange(of: projectId) { _, value in model.remember(project: value, provider: provider) }
         }
     }
-    private var supported: Bool { model.connected && model.capabilities[flow == .start ? "create" : "adopt"].bool }
+    private var supported: Bool { model.isConnected(node: nodeId) && model.capabilities(for: nodeId)[flow == .start ? "create" : "adopt"].bool }
 }

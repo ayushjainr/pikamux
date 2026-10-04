@@ -190,6 +190,124 @@ fn active_turn(turns: &Value) -> Option<&str> {
         .find(|turn| turn["status"] == "inProgress")?["id"]
         .as_str()
 }
+fn verify_model_setting(client: &mut Client, identity: &Identity, model: &str) -> Result<Value> {
+    // Settings acknowledgement can precede the provider's queued update.
+    // Re-observe briefly; never resend the mutation.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let value = client.rpc(
+            "thread/read",
+            json!({"threadId":identity.thread_id,"includeTurns":false}),
+        );
+        if value.as_ref().map_or(true, |v| {
+            v["thread"]["id"] != identity.thread_id || v["thread"]["model"] == model
+        }) || std::time::Instant::now() >= deadline
+        {
+            return value;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+fn model_change_outcome(
+    client: &mut Client,
+    identity: &Identity,
+    model: &str,
+    result: Result<Value>,
+) -> Value {
+    match result {
+        Ok(_) => match verify_model_setting(client, identity, model) {
+            Ok(value)
+                if value["thread"]["id"] == identity.thread_id
+                    && value["thread"]["model"] == model =>
+            {
+                json!({"identity":identity,"state":"accepted","model":model})
+            }
+            _ => {
+                json!({"identity":identity,"state":"unknown","message":"Model update was dispatched but its current setting could not be verified. Reopen controls before another change."})
+            }
+        },
+        Err(error) => {
+            json!({"identity":identity,"state":if error.downcast_ref::<crate::mobile_codex::Rejected>().is_some(){"rejected"}else{"unknown"},"message":error.to_string()})
+        }
+    }
+}
+fn message_outcome(identity: &Identity, id: &str, result: Result<Value>) -> Value {
+    match result {
+        Ok(result) => {
+            json!({"identity":identity,"clientMessageId":id,"state":"accepted","turnId":result.get("turnId").or_else(||result.get("turn").and_then(|t|t.get("id")))})
+        }
+        Err(error) => {
+            json!({"identity":identity,"clientMessageId":id,"state":if error.downcast_ref::<crate::mobile_codex::Rejected>().is_some(){"rejected"}else{"unknown"},"message":error.to_string()})
+        }
+    }
+}
+fn requested_model(params: &Value) -> Result<&str> {
+    params["model"]
+        .as_str()
+        .filter(|m| !m.is_empty() && m.len() <= 256)
+        .context("Model is required")
+}
+fn requested_message_text(params: &Value) -> Result<&str> {
+    params["text"]
+        .as_str()
+        .filter(|text| !text.trim().is_empty() && text.len() <= 65536)
+        .context("Message must contain text within the bound")
+}
+fn skill_references(text: &str) -> std::collections::BTreeSet<&str> {
+    text.split_whitespace()
+        .filter_map(|word| {
+            let name = word.strip_prefix('$')?;
+            let first = name.chars().next()?;
+            (first.is_ascii_alphabetic()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':')))
+            .then_some(name)
+        })
+        .collect()
+}
+fn requested_skills<'a>(
+    params: &'a Value,
+    text: &str,
+) -> Result<std::collections::BTreeSet<&'a str>> {
+    let Some(value) = params.get("skills") else {
+        return Ok(Default::default());
+    };
+    let names = value
+        .as_array()
+        .context("Skill references must be a list")?;
+    if names.len() > 32 {
+        bail!("Too many explicit skill references");
+    }
+    let visible = skill_references(text);
+    names
+        .iter()
+        .map(|value| {
+            let name = value.as_str().context("Invalid skill reference")?;
+            if !visible.contains(name) {
+                bail!("Skill reference is missing from this draft");
+            }
+            Ok(name)
+        })
+        .collect()
+}
+fn skill_input(catalog: &Value, cwd: &str, name: &str) -> Result<Value> {
+    let matches: Vec<_> = catalog["data"]
+        .as_array()
+        .context("Invalid provider skill catalog")?
+        .iter()
+        .filter(|entry| entry["cwd"] == cwd)
+        .flat_map(|entry| entry["skills"].as_array().into_iter().flatten())
+        .filter(|skill| skill["name"] == name && skill["enabled"] == true)
+        .collect();
+    if matches.len() != 1 {
+        bail!("Explicit skill ${name} is unavailable or ambiguous for this thread");
+    }
+    let path = matches[0]["path"]
+        .as_str()
+        .context("Skill path is unavailable")?;
+    Ok(json!({"type":"skill","name":name,"path":path}))
+}
 impl Handler<'_> {
     fn publish_board(&mut self, output: &mut impl Write) -> Result<()> {
         let Some(snapshot) = self
@@ -358,6 +476,8 @@ impl Handler<'_> {
                 | "conversation/candidates"
                 | "conversation/adopt"
                 | "conversation/create"
+                | "conversation/controls"
+                | "conversation/model"
                 | "projects/list"
         ) {
             let target = params["identity"]["nodeId"]
@@ -416,6 +536,8 @@ impl Handler<'_> {
             "conversation/open" => self.open_conversation(request),
             "conversation/history" => self.history(request),
             "conversation/send" => self.send_message(request),
+            "conversation/controls" => self.composer_controls(request),
+            "conversation/model" => self.select_model(request),
             "conversation/answer" | "conversation/approve" => self.answer_request(request),
             "conversation/requestStatus" => self.request_status(request),
             "conversation/receipt" => self.receipt(request),
@@ -472,17 +594,85 @@ impl Handler<'_> {
         Ok(json!({"identity":identity,"turns":page}))
     }
 
+    fn composer_controls(&mut self, request: &Request) -> Result<Value> {
+        let identity = self.identity(&request.params)?;
+        let client = self.selected(&identity)?;
+        client.require_loaded()?;
+        let thread = client.rpc(
+            "thread/read",
+            json!({"threadId":identity.thread_id,"includeTurns":false}),
+        )?["thread"]
+            .clone();
+        if thread["id"] != identity.thread_id {
+            bail!("Provider returned a different thread");
+        }
+        // Catalogs come from this exact selected provider, not phone defaults.
+        // Independent failures keep the other picker usable and are explicit.
+        let models = client.rpc("model/list", json!({"limit":100,"includeHidden":false}));
+        let skills = match thread["cwd"].as_str() {
+            Some(cwd) => client.rpc("skills/list", json!({"cwds":[cwd]})),
+            None => Err(anyhow::anyhow!(
+                "Provider did not report this thread's working directory"
+            )),
+        };
+        Ok(
+            json!({"identity":identity,"currentModel":thread["model"],"models":models.as_ref().ok(),"modelsError":models.as_ref().err().map(ToString::to_string),"skills":skills.as_ref().ok(),"skillsError":skills.as_ref().err().map(ToString::to_string)}),
+        )
+    }
+
+    fn select_model(&mut self, request: &Request) -> Result<Value> {
+        let identity = self.identity(&request.params)?;
+        self.selected(&identity)?;
+        if self.journal.lookup(&request.id)?.is_some() {
+            return self
+                .journal
+                .begin(
+                    &request.id,
+                    &json!({"method":request.method,"params":request.params}),
+                )?
+                .context("Existing model receipt disappeared");
+        }
+        let model = requested_model(&request.params)?;
+        let client = self.selected(&identity)?;
+        client.require_loaded()?;
+        let catalog = client.rpc("model/list", json!({"limit":100,"includeHidden":false}))?;
+        if !catalog["data"].as_array().is_some_and(|models| {
+            models
+                .iter()
+                .any(|m| m["model"] == model && m["hidden"] != true)
+        }) {
+            bail!("Model is not in this provider's current visible catalog");
+        }
+        if let Some(prior) = self.journal.begin(
+            &request.id,
+            &json!({"method":request.method,"params":request.params}),
+        )? {
+            return Ok(prior);
+        }
+        let client = self.selected(&identity)?;
+        let result = client.rpc(
+            "thread/settings/update",
+            json!({"threadId":identity.thread_id,"model":model}),
+        );
+        let outcome = model_change_outcome(client, &identity, model, result);
+        Ok(self.persist_outcome(&request.id, outcome))
+    }
+
     fn send_message(&mut self, request: &Request) -> Result<Value> {
         let params = &request.params;
         let identity = self.identity(params)?;
         let id = params["clientMessageId"]
             .as_str()
             .context("Message ID is required")?;
-        let text = params["text"]
-            .as_str()
-            .filter(|text| !text.trim().is_empty() && text.len() <= 65536)
-            .context("Message must contain text within the bound")?;
+        let text = requested_message_text(params)?;
         self.selected(&identity)?.require_loaded()?;
+        if let Some((payload, outcome)) = self.journal.lookup(id)? {
+            if payload != json!({"method":request.method,"params":params}) {
+                bail!("Operation identifier was reused for different work");
+            }
+            return Ok(outcome);
+        }
+        let input = self.message_input(&identity, text, params)?;
         if let Some(prior) = self
             .journal
             .begin(id, &json!({"method":request.method,"params":params}))?
@@ -491,7 +681,6 @@ impl Handler<'_> {
         }
         let client = self.selected(&identity)?;
         client.require_loaded()?;
-        let input = json!([{"type":"text","text":text}]);
         let result = if let Some(turn) = params["expectedTurnId"].as_str() {
             client.rpc("turn/steer",json!({"threadId":identity.thread_id,"expectedTurnId":turn,"clientUserMessageId":id,"input":input}))
         } else {
@@ -500,15 +689,36 @@ impl Handler<'_> {
                 json!({"threadId":identity.thread_id,"clientUserMessageId":id,"input":input}),
             )
         };
-        let outcome = match result {
-            Ok(result) => {
-                json!({"identity":identity,"clientMessageId":id,"state":"accepted","turnId":result.get("turnId").or_else(||result.get("turn").and_then(|t|t.get("id")))})
-            }
-            Err(error) => {
-                json!({"identity":identity,"clientMessageId":id,"state":if error.downcast_ref::<crate::mobile_codex::Rejected>().is_some(){"rejected"}else{"unknown"},"message":error.to_string()})
-            }
-        };
+        let outcome = message_outcome(&identity, id, result);
         Ok(self.persist_outcome(id, outcome))
+    }
+
+    fn message_input(&mut self, identity: &Identity, text: &str, params: &Value) -> Result<Value> {
+        let references = requested_skills(params, text)?;
+        let mut input = vec![json!({"type":"text","text":text})];
+        if references.is_empty() {
+            return Ok(json!(input));
+        }
+        if references.len() > 32 {
+            bail!("Too many explicit skill references");
+        }
+        let client = self.selected(identity)?;
+        let thread = client.rpc(
+            "thread/read",
+            json!({"threadId":identity.thread_id,"includeTurns":false}),
+        )?["thread"]
+            .clone();
+        if thread["id"] != identity.thread_id {
+            bail!("Provider returned a different thread");
+        }
+        let cwd = thread["cwd"]
+            .as_str()
+            .context("Skill scope is unavailable")?;
+        let catalog = client.rpc("skills/list", json!({"cwds":[cwd]}))?;
+        for name in references {
+            input.push(skill_input(&catalog, cwd, name)?);
+        }
+        Ok(json!(input))
     }
 
     fn answer_request(&mut self, request: &Request) -> Result<Value> {
@@ -1065,6 +1275,52 @@ fn start_creation_daemon(pika: &Pika) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plain_dollar_text_never_requires_provider_skills() {
+        assert!(
+            requested_skills(&json!({}), "Use $HOME $PATH $review")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            requested_skills(&json!({"skills":["review"]}), "Use $review and $HOME").unwrap(),
+            std::collections::BTreeSet::from(["review"])
+        );
+        assert!(requested_skills(&json!({"skills":["review"]}), "Use ordinary text").is_err());
+    }
+    #[test]
+    fn skill_input_uses_exact_provider_scope_and_rejects_disabled_unknown_ambiguous() {
+        let skill =
+            json!({"name":"review","path":"/project/skills/review/SKILL.md","enabled":true});
+        let catalog = json!({"data":[{"cwd":"/project","skills":[skill.clone()]},{"cwd":"/other","skills":[skill.clone()]}]});
+        assert_eq!(
+            skill_input(&catalog, "/project", "review").unwrap(),
+            json!({"type":"skill","name":"review","path":"/project/skills/review/SKILL.md"})
+        );
+        assert!(skill_input(&catalog, "/missing", "review").is_err());
+        assert!(skill_input(&catalog, "/project", "unknown").is_err());
+        assert!(
+            skill_input(
+                &json!({"data":[{"cwd":"/project","skills":[skill.clone(),skill]}]}),
+                "/project",
+                "review"
+            )
+            .is_err()
+        );
+        assert!(skill_input(&json!({"data":[{"cwd":"/project","skills":[{"name":"review","path":"/x","enabled":false}]}]}),"/project","review").is_err());
+        assert!(skill_input(&json!({}), "/project", "review").is_err());
+    }
+    #[test]
+    fn explicit_skills_are_standalone_bounded_names_not_currency_or_substrings() {
+        assert_eq!(
+            skill_references("Use $review $plugin:skill then $review"),
+            std::collections::BTreeSet::from(["plugin:skill", "review"])
+        );
+        assert!(
+            skill_references("$100 cost x$review https://example/$review $ ../../secret ${skill}")
+                .is_empty()
+        );
+    }
     #[test]
     fn fractional_fresh_observation_is_not_future_but_unknown_and_expired_are_stale() {
         assert!(!observation_stale(Some(100.75), 100.9));
