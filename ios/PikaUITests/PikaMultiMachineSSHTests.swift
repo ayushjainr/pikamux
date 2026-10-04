@@ -8,6 +8,41 @@ final class PikaMultiMachineSSHTests: XCTestCase {
     struct Configuration: Decodable {
         let root: String; let clientKeyPath: String; let username: String; let storeId: String; let machines: [Machine]
     }
+    @MainActor func testRetainedPartialCoverageOfflineAndRecovery() throws {
+        continueAfterFailure = false
+        guard let path = ProcessInfo.processInfo.environment["PIKA_MULTI_SSH_TEST_CONFIG"], !path.isEmpty, !path.contains("$(") else {
+            throw XCTSkip("Requires explicitly retained disposable machine store.")
+        }
+        let config = try JSONDecoder().decode(Configuration.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+        guard FileManager.default.fileExists(atPath: config.root + "/alpha-partial"), FileManager.default.fileExists(atPath: config.root + "/offline-beta") else {
+            throw XCTSkip("Run the partial three-machine onboarding journey first.")
+        }
+        let app = XCUIApplication()
+        app.launchArguments = ["--ssh-integration-test", "--multi-machine-integration-test"]
+        app.launchEnvironment = ["PIKA_UI_TEST_KEY_BASE64": try Data(contentsOf: URL(fileURLWithPath: config.clientKeyPath)).base64EncodedString(), "PIKA_UI_TEST_STORE_ID": config.storeId]
+        app.launch()
+        let partial = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Partial board · rs6")).firstMatch
+        XCTAssertTrue(partial.waitForExistence(timeout: 10))
+        app.buttons["Machine connections"].tap()
+        for index in [0, 2] {
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS[c] %@", "connected"), object: app.staticTexts["machineStatus-" + config.machines[index].nodeId])], timeout: 25), .completed)
+        }
+        app.buttons["Cancel"].tap()
+        let offline = URL(fileURLWithPath: config.root).appendingPathComponent("offline-alpha")
+        try Data("offline".utf8).write(to: offline, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: offline) }
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS %@", "(cached)"), object: partial)], timeout: 20), .completed)
+        app.buttons["machineFilter"].tap(); app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "rs6")).firstMatch.tap()
+        XCTAssertTrue(partial.label.contains("(cached)"), "The offline direct owner's partial cache stays authoritative")
+        app.buttons["machineFilter"].tap(); app.buttons["SSH fixture Gamma"].tap()
+        XCTAssertFalse(partial.exists)
+        app.buttons["machineFilter"].tap(); app.buttons["All machines"].tap()
+        XCTAssertTrue(partial.exists)
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Partial Alpha cache remains visible beside healthy Gamma"; shot.lifetime = .keepAlways; add(shot)
+        try FileManager.default.removeItem(atPath: config.root + "/alpha-partial")
+        try FileManager.default.removeItem(at: offline)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: partial)], timeout: 40), .completed, "Only Alpha's own complete recovery snapshot clears its warning")
+    }
     @MainActor func testRetainedDisposableStoreSettledCardFreshness() throws {
         continueAfterFailure = false
         guard let path = ProcessInfo.processInfo.environment["PIKA_MULTI_SSH_TEST_CONFIG"], !path.isEmpty, !path.contains("$(") else {
@@ -106,6 +141,7 @@ final class PikaMultiMachineSSHTests: XCTestCase {
         let config = try JSONDecoder().decode(Configuration.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
         XCTAssertEqual(config.machines.count, 3)
         XCTAssertEqual(Set(config.machines.map(\.nodeId)).count, 3)
+        try Data("partial".utf8).write(to: URL(fileURLWithPath: config.root).appendingPathComponent("alpha-partial"), options: .atomic)
         let app = XCUIApplication()
         app.launchArguments = ["--ssh-integration-test", "--multi-machine-integration-test"]
         app.launchEnvironment = ["PIKA_UI_TEST_KEY_BASE64": try Data(contentsOf: URL(fileURLWithPath: config.clientKeyPath)).base64EncodedString(), "PIKA_UI_TEST_STORE_ID": config.storeId]
@@ -137,6 +173,8 @@ final class PikaMultiMachineSSHTests: XCTestCase {
             XCTAssertTrue(row(machine).waitForExistence(timeout: 20))
         }
         for machine in config.machines { XCTAssertTrue(row(machine).exists); XCTAssertTrue(row(machine).label.contains("SSH fixture " + machine.name)) }
+        let coverage = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Partial board · SSH fixture Alpha")).firstMatch
+        XCTAssertTrue(coverage.waitForExistence(timeout: 5), "Gamma's complete snapshot must not erase Alpha's partial coverage")
         capture("Three separately pinned SSH endpoints with colliding provider UUID and name")
         app.terminate(); app.launch()
         for machine in config.machines { XCTAssertTrue(row(machine).waitForExistence(timeout: 25)) }
@@ -146,12 +184,18 @@ final class PikaMultiMachineSSHTests: XCTestCase {
         }
         app.buttons["Cancel"].tap()
         XCTAssertFalse(app.buttons["I verified this fingerprint"].exists)
+        XCTAssertTrue(coverage.exists, "Alpha's partial coverage survives saved-login reconnect and Gamma's later complete refresh")
         capture("Three saved Keychain logins restored after process death")
         let filter = app.buttons["machineFilter"]
         XCTAssertTrue(filter.waitForExistence(timeout: 5)); filter.tap()
         app.buttons["SSH fixture Alpha"].tap()
         XCTAssertTrue(row(config.machines[0]).exists); XCTAssertFalse(row(config.machines[1]).exists); XCTAssertFalse(row(config.machines[2]).exists)
+        XCTAssertTrue(coverage.exists)
+        filter.tap(); app.buttons["SSH fixture Gamma"].tap()
+        XCTAssertFalse(coverage.exists, "A healthy selected direct machine must not inherit another machine's warning")
+        XCTAssertTrue(row(config.machines[2]).exists)
         filter.tap(); app.buttons["All machines"].tap()
+        XCTAssertTrue(coverage.exists)
         // Last onboarding was Gamma. Alpha must still receive the exact open/send.
         for index in [0, 2] {
             let machine = config.machines[index]

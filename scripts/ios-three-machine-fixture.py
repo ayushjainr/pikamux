@@ -24,7 +24,7 @@ def endpoint(root, node, name):
     injected = False
     def emit(frame):
         print(json.dumps(frame), flush=True)
-    while not (root / "stop").exists() and not (name == "Beta" and (root / "offline-beta").exists()):
+    while not (root / "stop").exists() and not (root / ("offline-" + name.lower())).exists():
         if name == "Gamma" and (root / "gamma-disconnect-once").exists() and not (root / "gamma-disconnect-once-delivered").exists():
             (root / "gamma-disconnect-once-delivered").write_text("closed only the owned Gamma exec channel")
             break
@@ -47,7 +47,7 @@ def endpoint(root, node, name):
                 (root / "gamma-reconnected").write_text("new authenticated Gamma exec reached hello")
             result = {"nodeId": node, "name": "SSH fixture " + name, "capabilities": {"board": True, "codexShared": True}}
         elif method == "board/subscribe":
-            emit({"v": 1, "event": "board/snapshot", "params": {"items": [{"identity": identity, "name": "Shared work", "machine": "SSH fixture " + name, "status": "READY", "observedAt": time.time()}], "observedAt": time.time(), "health": []}})
+            emit({"v": 1, "event": "board/snapshot", "params": {"items": [{"identity": identity, "name": "Shared work", "machine": "SSH fixture " + name, "status": "READY", "observedAt": time.time()}], "observedAt": time.time(), "coverage": {"partial": name == "Alpha" and (root / "alpha-partial").exists()}, "health": []}})
         elif method == "conversation/open":
             if params.get("identity") != identity:
                 raise RuntimeError("WRONG EXACT OPEN DESTINATION: " + repr(params))
