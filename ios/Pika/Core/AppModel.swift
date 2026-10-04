@@ -81,7 +81,27 @@ final class AppModel: ObservableObject {
     @Published var fixtureSendCount = 0
     @Published var fixtureAssistantFinished = false
     @Published var fixtureAssistantOpenCount = 0
-    @Published var coverageNote: String?
+    @Published private var sourceCoverage: [String: Bool] = [:]
+    var coverageNote: String? {
+        let sources: [String]
+        if let node = machineFilter {
+            // A paired owner remains authoritative while offline. Never borrow
+            // a healthy coordinator's coverage for its cached direct board.
+            if machines.contains(where: { $0.id == node }) { sources = [node] }
+            else if let source = route(for: node) { sources = [source] }
+            else {
+                // Retain uncertainty for cached or ambiguous coordinator routes.
+                sources = sourceBoards.keys.filter { sourceBoards[$0]?.contains(where: { $0.identity.nodeId == node }) == true || sourceNodes[$0]?.contains(where: { $0.id == node }) == true }
+            }
+        } else { sources = Array(sourceCoverage.keys) }
+        let partial = sources.filter { sourceCoverage[$0] == true }.sorted()
+        guard !partial.isEmpty else { return nil }
+        let names = partial.map { source in
+            let name = machineName(for: source, fallback: sourceBoards[source]?.first(where: { $0.identity.nodeId == source })?.machine ?? "Machine")
+            return name + ((!isFixture && !onlineNodes.contains(source)) ? " (cached)" : "")
+        }.joined(separator: ", ")
+        return "Partial board · " + names + " · some work is not included in this snapshot"
+    }
     private let store = LocalStore()
     private var wire: (any MobileWire)?
     private var wires: [String: any MobileWire] = [:]
@@ -101,6 +121,7 @@ final class AppModel: ObservableObject {
     private var receivingNode: String?
     private var pendingBoardNode: String?
     private var previousPendingBoard: [BoardItem]?
+    private var previousPendingCoverage: Bool?
     private var stagingByNode: [String: [BoardItem]] = [:]
     private var revisionByNode: [String: JSONValue] = [:]
     private var pageByNode: [String: Int] = [:]
@@ -191,6 +212,7 @@ final class AppModel: ObservableObject {
         pendingPairingAvailable = (try? StagedPairing.pending()) != nil
         board = store.read("board.json", as: [BoardItem].self) ?? []
         sourceBoards = store.read("machine-boards.json", as: [String: [BoardItem]].self) ?? [:]
+        sourceCoverage = store.read("machine-coverage.json", as: [String: Bool].self) ?? [:]
         if sourceBoards.isEmpty { for row in board { sourceBoards[row.identity.nodeId, default: []].append(row) } }
         rebuildBoard()
         observedAt = store.read("observed.json", as: Date.self)
@@ -324,6 +346,7 @@ final class AppModel: ObservableObject {
                 firstBoardReceived = false
                 pendingBoardNode = node
                 previousPendingBoard = sourceBoards[node]
+                previousPendingCoverage = sourceCoverage[node]
                 listen(transport, node: node)
                 _ = try await transport.request("board/subscribe", params: .object([:]))
                 try await waitForFirstBoard(token: token)
@@ -353,7 +376,9 @@ final class AppModel: ObservableObject {
                 connectingWire = nil
                 pendingBoardNode = nil
                 previousPendingBoard = nil
+                previousPendingCoverage = nil
                 try? store.write(sourceBoards, name: "machine-boards.json")
+                try? store.write(sourceCoverage, name: "machine-coverage.json")
                 connectionAttempt = nil
                 capabilities = hello["capabilities"]
                 if let selected {
@@ -371,10 +396,11 @@ final class AppModel: ObservableObject {
                 let unfinished = connectingWire; connectingWire = nil
                 if let pending = pendingBoardNode {
                     listeners[pending]?.cancel(); listeners.removeValue(forKey: pending)
-                    sourceBoards[pending] = previousPendingBoard; rebuildBoard()
+                    sourceBoards[pending] = previousPendingBoard; sourceCoverage[pending] = previousPendingCoverage; rebuildBoard()
                 }
                 pendingBoardNode = nil
                 previousPendingBoard = nil
+                previousPendingCoverage = nil
                 if let unfinished { await unfinished.close() }
                 guard generation == token else { return }
                 if saved != nil {
@@ -424,8 +450,8 @@ final class AppModel: ObservableObject {
         if let unfinished = connectingWire { Task { await unfinished.close() }; connectingWire = nil }
         if let pending = pendingBoardNode {
             listeners[pending]?.cancel(); listeners.removeValue(forKey: pending)
-            sourceBoards[pending] = previousPendingBoard; rebuildBoard()
-        }; pendingBoardNode = nil; previousPendingBoard = nil
+            sourceBoards[pending] = previousPendingBoard; sourceCoverage[pending] = previousPendingCoverage; rebuildBoard()
+        }; pendingBoardNode = nil; previousPendingBoard = nil; previousPendingCoverage = nil
         if let attempt = connectionAttempt { Task { await attempt.cancel() }; connectionAttempt = nil }
     }
     func resume() {
@@ -580,14 +606,17 @@ final class AppModel: ObservableObject {
             } else { board = items }
             if let source = receivingNode {
                 sourceBoards[source] = board
+                sourceCoverage[source] = params["coverage"]["partial"].bool
                 rebuildBoard()
-                if !isFixture, source != pendingBoardNode { try? store.write(sourceBoards, name: "machine-boards.json") }
+                if !isFixture, source != pendingBoardNode {
+                    try? store.write(sourceBoards, name: "machine-boards.json")
+                    try? store.write(sourceCoverage, name: "machine-coverage.json")
+                }
             }
             if connectingWire != nil, receivingNode == pendingBoardNode {
                 firstBoardReceived = true; boardReady?.resume(); boardReady = nil
             } else if isFixture { firstBoardReceived = true }
             observedAt = params["observedAt"].number.map { Date(timeIntervalSince1970: $0) }
-            coverageNote = params["coverage"]["partial"].bool ? "Partial board · some work is not included in this snapshot" : nil
             if !isFixture, receivingNode != pendingBoardNode { try? store.write(board, name: "board.json"); try? store.write(observedAt, name: "observed.json") }
             if !params["health"].array.isEmpty { notice = "Some machine information is unavailable. Last-known content is preserved."; noticeDetails = params["health"].array.compactMap(\.string).joined(separator: "; ") }
         } else if frame["event"].string == "conversation/event", awaitingAssistant, assistantOpenToken == selectionGeneration {

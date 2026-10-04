@@ -734,3 +734,43 @@ under it. `/tmp/pika-flush-01.xcresult` passed the native Dex/thread/keyboard,
 draft/send and edge-return journey. Exported Dex and thread screenshots were
 visually inspected at the actual bottom edge. Signed build passed. This is
 disposable UI fixture evidence, not a new live-network claim.
+
+# Source-bound partial board coverage — 2026-10-03
+
+Dex retains partial coverage per authenticated subscription source instead of
+letting the last machine's snapshot replace a global warning. All machines
+names the partial sources; a selected directly paired owner uses only its own
+coverage, even offline. Coordinator-only selection follows the verified route,
+with conservative cached/ambiguous-source warnings. Coverage is retained with
+the disposable board cache across relaunch; failed/cancelled enrollment restores
+the previous source's coverage. Invalid or incomplete pages do not clear it.
+
+`/tmp/pika-coverage-01.xcresult`: 1 passed, 0 failed/skipped/runtime warnings,
+167.882 seconds test operations. Actual native app → ordinary loopback SSH →
+three explicitly labelled protocol doubles, no provider/model/fleet access.
+The onboarding journey verifies Alpha partial followed by Gamma complete,
+All machines/Alpha/Gamma filters, saved-login process restart and independent
+offline Beta, while preserving exact Alpha/Gamma sends and server-owned logs.
+Exported All machines screenshot was visually inspected: the Alpha warning is
+readable beside all three independently observed machine cards.
+
+`/tmp/pika-coverage-02.xcresult`: focused retained-store offline/recovery journey,
+1 passed, 0 failed/skipped/runtime warnings, 37.519 seconds test operations.
+Alpha's partial warning remains explicitly `(cached)` after its owned endpoint
+disconnects; selecting offline Alpha retains it, selecting healthy Gamma hides
+it, and All machines restores it. Only Alpha's own complete reconnect snapshot
+clears the warning. The cached-warning screenshot was visually inspected.
+
+Commands use the earlier isolated HOME/XDG invocation, simulator
+`98ECDE03-E8B5-4E7C-ABBE-DBC0C5935D27`, disposable DerivedData
+`/tmp/pika-ios-transport.b4aP3S/app-build` and sibling `xcode-packages`.
+Only `PikaMultiMachineSSHTests/testThreeSavedMachinesCollisionRoutingAndIndependentOffline`
+was selected, with `PIKA_MULTI_SSH_TEST_CONFIG` pointing to the freshly generated
+`/var/folders/k9/s1xh63d93rq9bd97cngqvf4c0000gn/T/pika-three-ssh-a6b5lskn/configuration.json`.
+No installed Pika, provider homes, real transcripts, tmux sessions or user SSH
+configuration were changed. Existing Xcode debugger-version diagnostic remains;
+this is not a zero-build-warning claim.
+Fixture stop marker was applied after both tests; its owner exited 0 and all
+three owned loopback listeners (59431–59433) were confirmed stopped. Generated
+keys/config/logs remain only in that disposable fixture root. Whitespace check
+passed. No commit, tag, publication or device/installed-command cutover here.
