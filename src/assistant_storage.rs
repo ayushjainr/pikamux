@@ -30,8 +30,12 @@ fn check_sidecars(path: &Path) -> io::Result<()> {
         let mut sibling = path.as_os_str().to_owned();
         sibling.push(suffix);
         let sibling = Path::new(&sibling);
-        if fs::symlink_metadata(sibling).is_ok() {
-            check(sibling, false)?;
+        // SQLite may unlink a journal or WAL as its last connection closes.
+        // Validate directly instead of probing existence before another stat;
+        // only an absent optional sidecar is harmless, never an unsafe one.
+        match check(sibling, false) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            result => result?,
         }
     }
     Ok(())
@@ -216,12 +220,23 @@ fn check(path: &Path, directory: bool) -> io::Result<()> {
     #[cfg(unix)]
     {
         crate::mobile_pairing_acl::validate(path).map_err(|error| {
-            io::Error::other(format!(
-                "Assistant state {} has an unsafe ACL: {error}",
-                path.display()
-            ))
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "Assistant state {} has an unsafe ACL: {error}",
+                    path.display()
+                ),
+            )
         })?;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // A concurrent unlink can leave the stat snapshot with no links.
+        // This is absence, not a hard-link bypass: mandatory files still fail.
+        if !directory && metadata.nlink() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Assistant state file was unlinked during validation",
+            ));
+        }
         if metadata.uid() != unsafe { libc::geteuid() }
             || metadata.permissions().mode() & 0o077 != 0
             || (!directory && metadata.nlink() != 1)
@@ -301,5 +316,48 @@ mod tests {
         std::os::unix::fs::symlink(&target, path.with_file_name("db-wal")).unwrap();
         assert!(database(&path).is_err());
         assert_eq!(fs::read_to_string(target).unwrap(), "untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_sidecars_may_disappear_but_unsafe_files_still_fail_closed() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state/db");
+        database(&path).unwrap();
+        let journal = path.with_file_name("db-journal");
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let churn = scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..1000 {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&journal)
+                        .unwrap();
+                    fs::remove_file(&journal).unwrap();
+                }
+            });
+            barrier.wait();
+            for _ in 0..1000 {
+                check_sidecars(&path).unwrap();
+            }
+            churn.join().unwrap();
+        });
+        assert!(!journal.exists());
+        check_sidecars(&path).unwrap();
+        file(&journal).unwrap();
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(check_sidecars(&path).is_err());
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = tmp.path().join("journal-alias");
+        fs::hard_link(&journal, &alias).unwrap();
+        assert!(check_sidecars(&path).is_err());
+        fs::remove_file(&journal).unwrap();
+        symlink(tmp.path().join("missing-target"), &journal).unwrap();
+        assert!(check_sidecars(&path).is_err());
+        assert!(existing_file(&tmp.path().join("missing-database")).is_err());
     }
 }

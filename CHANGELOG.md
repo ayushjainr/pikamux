@@ -1,11 +1,17 @@
 # Changelog
 
-## 0.6.42 — One phone board, exact machine controls
+## 0.6.43 — One phone board, exact machine controls
 
 Version 0.6.41 was not published: macOS CI exposed a terminal recorder injecting
 EOF keystrokes before the receipt was drawn. The disposable receipt fixture now
 keeps its input open; the Files fixture waits for the matching completed frame.
 Production behavior and exact-identity assertions are unchanged.
+
+Version 0.6.42 was not published: recovery instrumentation exposed a SQLite
+sidecar disappearing during assistant storage validation. Optional sidecar
+absence now tolerates concurrent SQLite cleanup; mandatory files, unsafe ACLs,
+permissions, links and ownership still fail closed. Add concurrent cleanup and
+unsafe-file regression coverage.
 
 - Keep independently paired machines together on the iPhone board, including
   cached offline rows, with optional display nicknames and explicit owner routing.
