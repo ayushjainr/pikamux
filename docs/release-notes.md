@@ -1,7 +1,12 @@
-Pika 0.6.41 keeps multiple paired machines together on the iPhone board and adds
+Pika 0.6.42 keeps multiple paired machines together on the iPhone board and adds
 exact-thread provider controls. Saved machines retain independent subscriptions,
 including cached offline rows. Optional nicknames change presentation only;
 conversation actions remain bound to the verified owning machine.
+
+Version 0.6.41 was not published after macOS CI exposed a disposable terminal
+recorder issue. This release keeps the same production changes and corrects the
+test recorder's input lifetime and Files frame-completion wait without weakening
+the receipt or file-preservation assertions.
 
 Compatible Codex threads expose live model and skill catalogs. Model changes
 require provider confirmation without sending a chat turn; skill references are
