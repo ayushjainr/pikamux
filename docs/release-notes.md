@@ -1,4 +1,16 @@
-Pika 0.6.43 keeps multiple paired machines together on the iPhone board and adds
+Pika 0.6.44 fixes the assistant's first terminal attachment after its launch
+becomes a certified exact conversation. The original launch receipt can recover
+that same proven live home without creating or resuming another provider and
+without undoing an explicit unwatch. Normal explicit thread selection is unchanged.
+
+The assistant also locates Codex's bundled runtime shell in the standard npm
+native-package layout. Existing capability checks, private credentials, state,
+account ownership and permissions remain unchanged. Running providers are not
+restarted. The iPhone app source and build identity remain unchanged.
+
+Retained features from 0.6.43:
+
+Pika keeps multiple paired machines together on the iPhone board and adds
 exact-thread provider controls. Saved machines retain independent subscriptions,
 including cached offline rows. Optional nicknames change presentation only;
 conversation actions remain bound to the verified owning machine.

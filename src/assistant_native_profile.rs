@@ -299,6 +299,121 @@ struct RuntimeReadScope<'a> {
     bundled_shell: PathBuf,
 }
 
+fn npm_platform() -> Result<(&'static str, &'static str)> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Ok(("codex-linux-x64", "x86_64-unknown-linux-musl")),
+        ("linux", "aarch64") => Ok(("codex-linux-arm64", "aarch64-unknown-linux-musl")),
+        ("macos", "x86_64") => Ok(("codex-darwin-x64", "x86_64-apple-darwin")),
+        ("macos", "aarch64") => Ok(("codex-darwin-arm64", "aarch64-apple-darwin")),
+        _ => bail!("Unsupported native Codex npm platform"),
+    }
+}
+
+fn npm_metadata(root: &Path) -> Result<serde_json::Value> {
+    let mut bytes = Vec::new();
+    fs::File::open(root.join("package.json"))?
+        .take(65537)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 65536 {
+        bail!("Native Codex package metadata exceeded its bound");
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Resolve only the selected npm package's current-platform runtime. The
+/// provider's reported capabilities never nominate a shell for this allowlist.
+fn bundled_shell(provider: &Path) -> Result<PathBuf> {
+    let package = provider
+        .parent()
+        .and_then(Path::parent)
+        .context("Native provider has no runtime parent")?;
+    if provider.file_name().is_none_or(|name| name != "codex.js")
+        || !package.ends_with("@openai/codex")
+    {
+        return Ok(package.join("codex-resources/zsh/bin/zsh"));
+    }
+    let metadata = npm_metadata(package)?;
+    let version = npm_wrapper_version(&metadata)?;
+    let (platform, target) = npm_platform()?;
+    let runtime_package = npm_runtime_package(package, &metadata, version, platform)?;
+    contained_npm_shell(&runtime_package, target)
+}
+
+fn npm_wrapper_version(metadata: &serde_json::Value) -> Result<&str> {
+    let version = metadata["version"]
+        .as_str()
+        .context("Missing Codex npm version")?;
+    if metadata["name"] != "@openai/codex" || version.is_empty() || version.len() > 100 {
+        bail!("Native Codex package identity does not match its runtime layout");
+    }
+    Ok(version)
+}
+
+fn validate_optional_npm_package(
+    candidate: &Path,
+    wrapper: &serde_json::Value,
+    version: &str,
+    platform: &str,
+) -> Result<()> {
+    let metadata = npm_metadata(candidate)?;
+    let name = format!("@openai/{platform}");
+    let alias_version = format!("{version}-{}", platform.trim_start_matches("codex-"));
+    let dependency = &wrapper["optionalDependencies"][&name];
+    let named_package =
+        metadata["name"] == name && metadata["version"] == version && dependency == version;
+    let aliased_package = metadata["name"] == "@openai/codex"
+        && metadata["version"] == alias_version
+        && dependency.as_str() == Some(format!("npm:@openai/codex@{alias_version}").as_str());
+    if !named_package && !aliased_package {
+        bail!("Native Codex optional package does not match its selected version and platform");
+    }
+    Ok(())
+}
+
+fn npm_runtime_package(
+    package: &Path,
+    metadata: &serde_json::Value,
+    version: &str,
+    platform: &str,
+) -> Result<PathBuf> {
+    let candidates = [
+        package.join("node_modules/@openai").join(platform),
+        package
+            .parent()
+            .context("Missing npm scope")?
+            .join(platform),
+    ];
+    // Match npm's nested/sibling optional-package lookup before its legacy
+    // in-package vendor fallback. A present but invalid package fails closed.
+    for candidate in candidates {
+        match fs::symlink_metadata(candidate.join("package.json")) {
+            Ok(_) => {
+                validate_optional_npm_package(&candidate, metadata, version, platform)?;
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(package.to_owned())
+}
+
+fn contained_npm_shell(runtime_package: &Path, target: &str) -> Result<PathBuf> {
+    let runtime = runtime_package.join("vendor").join(target).canonicalize()?;
+    let package_root = runtime_package.canonicalize()?;
+    let native = runtime.join("bin/codex").canonicalize()?;
+    let shell = runtime.join("codex-resources/zsh/bin/zsh").canonicalize()?;
+    if !runtime.starts_with(&package_root)
+        || !native.starts_with(&runtime)
+        || !shell.starts_with(&runtime)
+        || !native.is_file()
+        || !shell.is_file()
+    {
+        bail!("Native Codex npm runtime escapes its selected package");
+    }
+    Ok(shell)
+}
+
 impl RuntimeReadScope<'_> {
     fn allows_workspace(&self, path: &Path) -> bool {
         [self.workspace, self.canonical_workspace.as_path()].contains(&path)
@@ -336,11 +451,7 @@ fn validate_filesystem_capabilities(
             .context("Native profile has no provider home")?,
     )
     .canonicalize()?;
-    let bundled_shell = provider
-        .parent()
-        .and_then(Path::parent)
-        .context("Native provider has no runtime parent")?
-        .join("codex-resources/zsh/bin/zsh");
+    let bundled_shell = bundled_shell(provider)?;
     let scope = RuntimeReadScope {
         provider,
         workspace: &profile.cwd,
@@ -730,6 +841,104 @@ fn retain_unrelated_handlers(entries: &mut Vec<serde_json::Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn npm_runtime_shell_is_exact_platform_bound_and_rejects_unrelated_reads() {
+        let (platform, target) = npm_platform().unwrap();
+        for layout in ["nested", "sibling", "legacy"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let package = tmp.path().join("node_modules/@openai/codex");
+            let dependency = if layout == "nested" {
+                format!(
+                    "npm:@openai/codex@0.160.0-{}",
+                    platform.trim_start_matches("codex-")
+                )
+            } else {
+                "0.160.0".into()
+            };
+            install(&package.join("package.json"), &serde_json::json!({"name":"@openai/codex","version":"0.160.0","optionalDependencies":{format!("@openai/{platform}"):dependency}}).to_string()).unwrap();
+            let provider = package.join("bin/codex.js");
+            install(&provider, "synthetic npm launcher, never executed").unwrap();
+            let platform_package = match layout {
+                "nested" => package.join("node_modules/@openai").join(platform),
+                "sibling" => package.parent().unwrap().join(platform),
+                _ => package.clone(),
+            };
+            if layout != "legacy" {
+                install(
+                    &platform_package.join("package.json"),
+                    &if layout == "nested" { serde_json::json!({"name":"@openai/codex","version":format!("0.160.0-{}",platform.trim_start_matches("codex-"))}).to_string() } else { serde_json::json!({"name":format!("@openai/{platform}"),"version":"0.160.0"}).to_string() },
+                )
+                .unwrap();
+            }
+            let runtime = platform_package.join("vendor").join(target);
+            let native = runtime.join("bin/codex");
+            let shell = runtime.join("codex-resources/zsh/bin/zsh");
+            install(&native, "synthetic native payload, never executed").unwrap();
+            install(&shell, "synthetic bundled shell, never executed").unwrap();
+            let provider = provider.canonicalize().unwrap();
+            let resolved = bundled_shell(&provider).unwrap();
+            assert_eq!(resolved, shell.canonicalize().unwrap());
+            let scope = RuntimeReadScope {
+                provider: &provider,
+                workspace: &package,
+                canonical_workspace: package.canonicalize().unwrap(),
+                home: tmp.path().join("private-home"),
+                bundled_shell: resolved,
+            };
+            let mut required = FilesystemRequirements::default();
+            observe_filesystem_entry(
+                &format!(
+                    "access=\"read\"><path>{}</path></entry>",
+                    shell.canonicalize().unwrap().display()
+                ),
+                &scope,
+                &mut required,
+            )
+            .unwrap();
+            assert!(
+                observe_filesystem_entry(
+                    "access=\"read\"><path>/unrelated/private</path></entry>",
+                    &scope,
+                    &mut required,
+                )
+                .is_err()
+            );
+            fs::remove_file(&native).unwrap();
+            assert!(bundled_shell(&provider).is_err());
+            install(&native, "restored synthetic payload").unwrap();
+            if layout != "legacy" {
+                let before = fs::read_to_string(platform_package.join("package.json")).unwrap();
+                install(
+                    &platform_package.join("package.json"),
+                    r#"{"name":"@openai/codex","version":"9.9.9-wrong-platform"}"#,
+                )
+                .unwrap();
+                assert!(bundled_shell(&provider).is_err());
+                install(&platform_package.join("package.json"), &before).unwrap();
+            }
+            #[cfg(unix)]
+            {
+                fs::remove_file(&shell).unwrap();
+                let outside = tmp.path().join("unrelated/unrelated-shell");
+                install(&outside, "unrelated shell").unwrap();
+                std::os::unix::fs::symlink(&outside, &shell).unwrap();
+                assert!(bundled_shell(&provider).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn npm_runtime_rejects_wrong_package_identity_and_oversized_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package = tmp.path().join("@openai/codex");
+        let provider = package.join("bin/codex.js");
+        install(&provider, "synthetic launcher").unwrap();
+        install(&package.join("package.json"), r#"{"name":"unrelated"}"#).unwrap();
+        assert!(bundled_shell(&provider).is_err());
+        install(&package.join("package.json"), &" ".repeat(65537)).unwrap();
+        assert!(bundled_shell(&provider).is_err());
+    }
+
     fn fixture() -> (tempfile::TempDir, PathBuf, String) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("private");
