@@ -388,8 +388,7 @@ fn mouse_tree_wheel_scrolls_viewport_without_opening_file() {
     j.send(b"j\r");
     j.wait_text("ROW_00");
     j.send(b"\x1b[<65;10;8M"); // SGR wheel down over the tree.
-    j.wait_text("tree_27.txt");
-    j.wait_text("\x1b[?2026l");
+    j.wait_frame_after("tree_27.txt");
     assert!(!j.output.contains("a.rs"), "tree viewport did not move");
     assert!(
         j.output.contains("ROW_00"),

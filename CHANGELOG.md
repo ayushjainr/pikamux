@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.6.41 — One phone board, exact machine controls
+## 0.6.42 — One phone board, exact machine controls
+
+Version 0.6.41 was not published: macOS CI exposed a terminal recorder injecting
+EOF keystrokes before the receipt was drawn. The disposable receipt fixture now
+keeps its input open; the Files fixture waits for the matching completed frame.
+Production behavior and exact-identity assertions are unchanged.
 
 - Keep independently paired machines together on the iPhone board, including
   cached offline rows, with optional display nicknames and explicit owner routing.

@@ -551,7 +551,7 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
     )
     .unwrap();
     fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
-    let output = recorded_terminal(
+    let mut recorder = recorded_terminal(
         &transcript,
         &[
             std::env::current_exe().unwrap().to_str().unwrap(),
@@ -566,8 +566,15 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
     .env("PIKA_RECEIPT_TEST_PANE", &pane.pane_id)
     .env("PIKA_RECEIPT_TEST_COMMITTED", &committed)
     .env("PIKA_RECEIPT_TEST_TMUX", &adapter)
-    .output()
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
     .unwrap();
+    // Darwin script can inject EOF keystrokes when its input closes. Hold this
+    // pipe open so those keys cannot dismiss the receipt before it is drawn.
+    let _input = recorder.stdin.take().unwrap();
+    let output = recorder.wait_with_output().unwrap();
     assert!(
         output.status.success(),
         "stdout={} stderr={} transcript={} trace={}",
@@ -580,7 +587,8 @@ fn real_isolated_tmux_attach_observes_receipt_after_proven_commit() {
     let transcript = fs::read_to_string(transcript).unwrap();
     assert!(
         transcript.contains("CONTINUITY PROVEN - receipt_test - ATTACHED LIVE"),
-        "{transcript:?}"
+        "transcript={transcript:?} trace={}",
+        fs::read_to_string(&trace).unwrap_or_default()
     );
 }
 
