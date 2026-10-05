@@ -3190,6 +3190,36 @@ impl Store {
         self.reconcile_transaction(|ledger| ledger.delete_meta(key))
     }
 
+    /// One bounded, consistent read for related metadata; never opens a writer.
+    pub(crate) fn meta_snapshot(
+        &self,
+        keys: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, String>> {
+        const TOTAL: usize = 32 * 1024 * 1024;
+        anyhow::ensure!(
+            keys.len() <= 65_536 && keys.iter().all(|key| key.len() <= 512),
+            "Metadata snapshot keys exceed bounds"
+        );
+        let mut result = BTreeMap::new();
+        if keys.is_empty() || !self.exists() {
+            return Ok(result);
+        }
+        let mut db = self.open_read()?;
+        let tx = db.transaction()?;
+        let mut query = tx.prepare("SELECT CASE WHEN length(CAST(value AS BLOB)) <= ? THEN value ELSE NULL END FROM meta WHERE key=?")?;
+        let mut bytes = 0;
+        for key in keys {
+            let value: Option<String> = query
+                .query_row(params![TOTAL - bytes, key], |row| row.get(0))
+                .optional()?;
+            if let Some(value) = value {
+                bytes += value.len();
+                result.insert(key.clone(), value);
+            }
+        }
+        Ok(result)
+    }
+
     pub fn record_attach(&self, provider: Provider, session_id: &str) -> Result<()> {
         self.reconcile_transaction(|ledger| ledger.record_attach(provider, session_id))
     }

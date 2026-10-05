@@ -50,6 +50,57 @@ The iPhone remains a client of the selected machine's shared board and existing
 conversations. Its normal transport is the narrow `_mobile` command over SSH;
 the phone does not own another assistant, fleet scanner or conversation store.
 
+Approved shared-control extension (2026-10-04): future Pika-managed provider
+launches may enable a private native connection so terminal and phone operate
+the same conversation. Existing running providers are not restarted, migrated,
+or resumed into another owner. Opening on the phone never launches a substitute.
+Provider-specific adapters must prove the exact conversation and current launch
+owner before exposing send. Native permission and account gates remain intact.
+Message admission is journaled before dispatch; a lost acknowledgement stays
+unknown and never causes automatic replay. Saved history alone is not evidence
+that this shared-control journey works. This extension requires independent
+native-runtime verification per provider, not assumed protocol parity.
+
+Approved Claude experimental amendment (2026-10-05): future Pika-managed
+Claude launches may offer explicit opt-in development-channel support while
+retaining native channel warnings, account policy and tool permissions. This
+does not authorize enabling channels in existing running conversations or
+bypassing exact-conversation dispatch. Experimental consent is not evidence
+that delivery remains correctly bound across native conversation switches;
+that must be verified before exposing mobile send.
+
+Continuation-only clarification (2026-10-05): the phone continues the selected
+Claude conversation; it does not offer `/clear` or an in-place `/resume` into a
+different conversation. Normal Pika navigation attaches independently owned
+native threads. A native conversation change outside the phone invalidates its
+old mobile connection rather than redirecting it. Native CLI controls remain
+available and are not disabled to implement this phone scope.
+The experimental bridge must attest the native tool-call conversation before
+releasing message content or accepting a reply. A notification containing only
+an opaque reference and fixed routing instructions, never user message text, is
+not a delivery receipt. An external identity change may leave an already queued
+opaque notification to be refused; zero model work in that unsupported race is
+not promised. It must not disclose the message to the replacement conversation.
+
+For OpenCode, the shared launch pairs its native server with its native
+attached terminal. Phone requests name the original session explicitly; they must
+never follow whichever different session the terminal currently displays. The
+server lives only as long as its supervised terminal. Unsupported launch arguments
+or unverified native versions retain ordinary native behavior and do not advertise
+mobile control. The launch-only version probe is bounded and uses disposable
+private state. Versions 1.18.31 and 1.18.33 have native shared-session evidence;
+other versions require verification before enabling this adapter. This is not an
+automatic provider upgrade. Native switching, lifecycle, history pagination, and
+lost-acknowledgement journeys are recorded in `ios/NATIVE_EVIDENCE.md`.
+
+Claude saved-history paging follows a uniquely verified native parent chain,
+including the supported native 2.1.274 compaction preservation-list/segment
+relinking schemas. It never chooses an arbitrary latest-written branch or uses
+timestamps as a branch selector. Older pages bind the canonical projected items
+as well as the source snapshot; changing a receipt projection requires reopening
+rather than silently skipping history. Unknown schemas, missing ancestors,
+ambiguous branches and histories beyond the bounded reader remain explicit.
+
 Saved phone connections contribute independent board subscriptions to one Dex.
 Adding a connection must not replace earlier machines. Cached rows remain visible
 when their machine is offline, and the machine filter includes saved empty or

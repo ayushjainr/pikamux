@@ -37,9 +37,15 @@ mod assistant_native_turns;
 #[cfg(unix)]
 mod mobile;
 #[cfg(unix)]
+mod mobile_claude;
+#[cfg(unix)]
 mod mobile_codex;
 #[cfg(unix)]
 mod mobile_delivery;
+#[cfg(unix)]
+mod mobile_history;
+#[cfg(unix)]
+mod mobile_opencode;
 #[cfg(unix)]
 mod mobile_pairing;
 #[cfg(unix)]

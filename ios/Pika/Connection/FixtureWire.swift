@@ -4,7 +4,7 @@ import Foundation
 /// Explicitly labelled in-app endpoint double. Not a provider/network E2E proof.
 actor FixtureWire: MobileWire {
     static let items = [
-        BoardItem(identity: ThreadIdentity(nodeId: "fixture-node", provider: "codex", threadId: "fixture-one"), name: "master_quant", machine: "Fixture Alpha", state: "NEEDS YOU", detail: ""),
+        BoardItem(identity: ThreadIdentity(nodeId: "fixture-node", provider: ProcessInfo.processInfo.arguments.contains("--fixture-channel-receipt") ? "claude" : "codex", threadId: "fixture-one"), name: "master_quant", machine: "Fixture Alpha", state: "NEEDS YOU", detail: ""),
         BoardItem(identity: ThreadIdentity(nodeId: "fixture-node-two", provider: "codex", threadId: "fixture-two"), name: "master_quant", machine: "Fixture Beta", state: "WORKING", detail: "")
     ]
     nonisolated let events: AsyncStream<JSONValue>
@@ -17,6 +17,7 @@ actor FixtureWire: MobileWire {
     private var receiptChecks = 0
     private var creations: [String: JSONValue] = [:]
     private var threadModels: [ThreadIdentity: String] = [:]
+    private var replies: [ThreadIdentity: [JSONValue]] = [:]
     init() {
         var continuation: AsyncStream<JSONValue>.Continuation!
         events = AsyncStream { continuation = $0 }; sink = continuation
@@ -58,6 +59,30 @@ actor FixtureWire: MobileWire {
             else { decoded = try JSONDecoder().decode(ThreadIdentity.self, from: JSONEncoder().encode(params["identity"])) }
             guard assistant || Self.items.contains(where: { $0.identity == decoded }) else { throw ConnectionError.changedNode }
             selected = decoded
+            if ProcessInfo.processInfo.arguments.contains("--fixture-delta-before-open") || ProcessInfo.processInfo.arguments.contains("--fixture-delta-after-open") {
+                if ProcessInfo.processInfo.arguments.contains("--fixture-delta-before-open") {
+                    emit(decoded, "item/agentMessage/delta", .object(["itemId": .string("snapshot-item"), "delta": .string(" world")]))
+                    try await Task.sleep(for: .milliseconds(400))
+                }
+                Task {
+                    try? await Task.sleep(for: .milliseconds(300))
+                    emit(decoded, "item/agentMessage/delta", .object(["itemId": .string("snapshot-item"), "delta": .string(" world")]))
+                    try? await Task.sleep(for: .seconds(8))
+                    emit(decoded, "item/completed", .object(["item": .object(["id": .string("snapshot-item"), "type": .string("agentMessage"), "text": .string("Hello world · complete original reply")])]))
+                }
+                return .object(["identity": decoded.json, "activeTurnId": .string("snapshot-turn"), "capabilities": .object(["read": .bool(true), "send": .bool(true)]),
+                    "turns": .object(["order": .string("chronological"), "nextCursor": .null, "data": .array([.object(["id": .string("snapshot-turn"), "status": .string("inProgress"), "items": .array([.object(["id": .string("snapshot-item"), "type": .string("agentMessage"), "text": .string("Hello world")])])])])])])
+            }
+            if ProcessInfo.processInfo.arguments.contains("--fixture-turn-pages") {
+                let turns = (20..<30).map { fixtureTurn($0) } + (replies[decoded] ?? []).map { .object(["items": .array([$0])]) }
+                if ProcessInfo.processInfo.arguments.contains("--fixture-open-race") {
+                    emit(decoded, "item/completed", .object(["item": .object(["id": .string("open-live"), "type": .string("agentMessage"), "text": .string("Live output while original history opens")])]))
+                    try await Task.sleep(for: .milliseconds(400))
+                }
+                let legacy = ProcessInfo.processInfo.arguments.contains("--fixture-legacy-order")
+                return .object(["identity": decoded.json, "capabilities": .object(["read": .bool(true), "send": .bool(true)]),
+                    "turns": .object(["order": legacy ? .null : .string("chronological"), "data": .array(legacy ? Array(turns.reversed()) : turns), "nextCursor": .string("page-10")])])
+            }
             if assistant, ProcessInfo.processInfo.arguments.contains("--fixture-slow-assistant") {
                 try await Task.sleep(for: .seconds(4))
                 sink.yield(.object(["v": .number(1), "event": .string("fixture/assistantFinished"), "params": .object([:])]))
@@ -101,9 +126,11 @@ actor FixtureWire: MobileWire {
             let history: [JSONValue] = ProcessInfo.processInfo.arguments.contains("--fixture-long-history") ? (0..<30).map { index in
                 .object(["id": .string("long-\(index)"), "type": .string("agentMessage"), "text": .string("Original fixture context \(index)\nA sufficiently long original message to exercise native reading and history anchors.")])
             } : []
-            return .object(["identity": decoded.json, "capabilities": .object(["read": .bool(true), "send": .bool(true), "answer": .bool(true)]),
+            return .object(["identity": decoded.json, "capabilities": .object(["read": .bool(true), "send": .bool(!ProcessInfo.processInfo.arguments.contains("--fixture-read-only")), "answer": .bool(true),
+                "readOnlyReason": .string("This original provider supports verified history only; mobile replies are not available."),
+                "experimentalNotice": ProcessInfo.processInfo.arguments.contains("--fixture-experimental") ? .string("Experimental connection. Native permissions still apply; an uncertain message is never sent twice.") : .null]),
                 "assistant": assistant ? .object(["profileId": .string("fixture-profile"), "scope": .string("private"), "memoryEpoch": .string("fixture-epoch")]) : .null,
-                "turns": .object(["data": .array([.object(["items": .array([entry] + history + replayItems)])]), "nextCursor": .string("fixture-older")])])
+                "turns": .object(["order": .string("chronological"), "data": .array([.object(["items": .array([entry] + history + replayItems)])]), "nextCursor": .string("fixture-older")])])
         case "conversation/requestStatus":
             if ProcessInfo.processInfo.arguments.contains("--fixture-status-race"), let selected {
                 emit(selected, "serverRequest/resolved", .object(["requestId": params["requestId"], "turnId": params["turnId"], "itemId": params["itemId"]]))
@@ -111,6 +138,18 @@ actor FixtureWire: MobileWire {
             }
             return .object(["identity": params["identity"], "requestId": params["requestId"], "turnId": params["turnId"], "itemId": params["itemId"], "state": .string("unknown")])
         case "conversation/history":
+            if ProcessInfo.processInfo.arguments.contains("--fixture-turn-pages") {
+                if ProcessInfo.processInfo.arguments.contains("--fixture-history-live-append"), let selected {
+                    emit(selected, "item/completed", .object(["item": .object(["id": .string("history-live-append"), "type": .string("agentMessage"),
+                        "text": .string("Live output appended while older context loads.\n\nNew output below must not move the original reading anchor above.")])]))
+                    try await Task.sleep(for: .milliseconds(400))
+                }
+                let start = params["cursor"].string == "page-10" ? 10 : 0
+                let legacy = ProcessInfo.processInfo.arguments.contains("--fixture-legacy-order")
+                let turns = (start...start + 10).map { fixtureTurn($0) }
+                return .object(["identity": params["identity"], "turns": .object(["order": legacy ? .null : .string("chronological"),
+                    "data": .array(legacy ? Array(turns.reversed()) : turns), "nextCursor": start == 10 ? .string("page-0") : .null])])
+            }
             return .object(["identity": params["identity"], "turns": .object(["nextCursor": .null,
                 "data": .array([.object(["items": .array([.object(["id": .string("fixture-old"), "type": .string("agentMessage"), "text": .string("Older exact fixture history")])])])])])])
         case "conversation/approve":
@@ -123,6 +162,9 @@ actor FixtureWire: MobileWire {
             return .object(["state": .string("submitted")])
         case "conversation/receipt":
             if let id = params["clientOperationId"].string { return creations[id] ?? .object(["state": .string("unknown")]) }
+            if ProcessInfo.processInfo.arguments.contains("--fixture-channel-receipt") {
+                return .object(["identity": params["identity"], "clientMessageId": params["clientMessageId"], "state": .string("delivered")])
+            }
             receiptChecks += 1
             return .object(["identity": params["identity"], "clientMessageId": params["clientMessageId"],
                 "state": .string(receiptChecks == 1 ? "unknown" : "delivered"),
@@ -140,9 +182,24 @@ actor FixtureWire: MobileWire {
             guard let selected, params["identity"] == selected.json, let id = params["clientMessageId"].string,
                 let text = params["text"].string, !sent.contains(id) else { throw ConnectionError.malformed }
             sent.insert(id)
+            replies[selected, default: []].append(.object(["id": .string(id), "type": .string("userMessage"), "text": .string(text)]))
             sink.yield(.object(["v": .number(1), "event": .string("conversation/event"), "params": .object([
                 "identity": selected.json, "method": .string("item/completed"), "params": .object([
                     "item": .object(["id": .string(id), "type": .string("userMessage"), "content": .array([.object(["type": .string("text"), "text": .string(text)])])])])])]))
+            if ProcessInfo.processInfo.arguments.contains("--fixture-turn-pages") {
+                let reply: JSONValue = .object(["id": .string("reply-" + id), "type": .string("agentMessage"), "text": .string("Latest persisted fixture reply")])
+                replies[selected, default: []].append(reply)
+                emit(selected, "item/completed", .object(["item": reply]))
+            }
+            if ProcessInfo.processInfo.arguments.contains("--fixture-channel-receipt") {
+                Task {
+                    try? await Task.sleep(for: .seconds(2))
+                    emit(selected, "item/completed", .object(["item": .object([
+                        "id": .string("claude-channel-reply:toolu_fixture"), "type": .string("agentMessage"),
+                        "text": .string("Fixture channel reply — not a native provider proof")])]))
+                }
+                return .object(["identity": selected.json, "clientMessageId": .string(id), "state": .string("unknown")])
+            }
             if ProcessInfo.processInfo.arguments.contains("--fixture-unknown-outcome") { throw ConnectionError.timeout }
             if ProcessInfo.processInfo.arguments.contains("--fixture-long-history") {
                 emit(selected, "item/completed", .object(["item": .object(["id": .string("live-" + id), "type": .string("agentMessage"), "text": .string("Live fixture output")])]))
@@ -166,6 +223,11 @@ actor FixtureWire: MobileWire {
     private func emit(_ identity: ThreadIdentity, _ method: String, _ params: JSONValue, requestId: JSONValue = .null) {
         sink.yield(.object(["v": .number(1), "event": .string("conversation/event"),
             "params": .object(["identity": identity.json, "method": .string(method), "params": params, "requestId": requestId])]))
+    }
+    private func fixtureTurn(_ index: Int) -> JSONValue {
+        .object(["id": .string("turn-\(index)"), "items": .array([
+            .object(["id": .string("turn-user-\(index)"), "type": .string("userMessage"), "text": .string("Original user turn \(index)")]),
+            .object(["id": .string("turn-agent-\(index)"), "type": .string("agentMessage"), "text": .string("Original assistant turn \(index). Original context remains on its exact machine.\n\nThis disposable turn is long enough to require scrolling through native history.")])])])
     }
     func close() async { closed = true; sink.finish() }
 }

@@ -1,4 +1,34 @@
-Pika 0.6.44 fixes the assistant's first terminal attachment after its launch
+Pika 0.6.45 adds native mobile continuation and repairs long-thread history ordering.
+
+- Codex history pages retain chronological order across reopen and older-context
+  loading; the iPhone follows new replies after sending.
+- Compatible future Pika-managed OpenCode launches share their original native
+  server/session with the phone. Existing live terminals are not migrated.
+  After the terminal exits, saved history remains readable and send is disabled.
+  Verified native versions are 1.18.31 and 1.18.33; other versions retain ordinary
+  terminal launch without shared mobile control.
+- Future Claude launches can explicitly opt in with `pika --claude-mobile`.
+  This uses experimental native development Channels and retains Claude's account
+  policy, warnings and tool permissions. The original native conversation must
+  attest its tool calls before message text is released or a reply is accepted.
+  Uncertain delivery is not retried automatically. No mobile Clear/Resume is added.
+- Claude phone exchanges remain in their source-verified conversation history
+  after exit. An external native conversation switch revokes the old phone route.
+  Supported normal compaction records are reconstructed in native ancestry order
+  before paging, including preserved messages written earlier in the source.
+
+The separate iPhone alpha build is 42. Native release archives contain Pika host
+and client binaries, not an iPhone installation. Verification includes actual
+Simulator → SSH → native Claude send/reply/reopen and native OpenCode lifecycle
+journeys; evidence and limitations are in `ios/NATIVE_EVIDENCE.md`.
+Muse shared mobile control remains unavailable. Claude/OpenCode model and skill
+menus are not claimed equivalent to Codex's verified live controls. Large or
+ambiguous histories that cannot be verified remain explicit errors rather than
+silently guessed branches. Updating Pika never upgrades the providers themselves.
+
+Retained fixes from 0.6.44:
+
+Pika fixes the assistant's first terminal attachment after its launch
 becomes a certified exact conversation. The original launch receipt can recover
 that same proven live home without creating or resuming another provider and
 without undoing an explicit unwatch. Normal explicit thread selection is unchanged.

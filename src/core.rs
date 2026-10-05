@@ -147,6 +147,8 @@ pub struct Pika {
     local_reconcile_fence: Arc<LocalReconcileFence>,
     named_discovery: Arc<NamedDiscovery>,
     launch_context: Option<LaunchContext>,
+    #[cfg(unix)]
+    claude_mobile: bool,
 }
 
 /// Explicit launch-local provider configuration. Ordinary conversations never
@@ -206,6 +208,8 @@ impl Pika {
             local_reconcile_fence: Arc::default(),
             named_discovery: Arc::default(),
             launch_context: None,
+            #[cfg(unix)]
+            claude_mobile: false,
         })
     }
 
@@ -219,6 +223,8 @@ impl Pika {
             local_reconcile_fence: Arc::default(),
             named_discovery: Arc::default(),
             launch_context: None,
+            #[cfg(unix)]
+            claude_mobile: false,
         }
     }
 
@@ -226,6 +232,31 @@ impl Pika {
     pub(crate) fn with_launch_context(mut self, context: LaunchContext) -> Self {
         self.launch_context = Some(context);
         self
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_claude_mobile(mut self, enabled: bool) -> Self {
+        self.claude_mobile = enabled;
+        self
+    }
+
+    fn shared_launch_argv(&self, provider: Provider, token: &str, argv: &[String]) -> Vec<String> {
+        #[cfg(unix)]
+        if provider == Provider::Claude && self.claude_mobile {
+            let Ok(executable) = std::env::current_exe() else {
+                return argv.to_vec();
+            };
+            let mut wrapped = vec![
+                executable.to_string_lossy().into_owned(),
+                "_claude-shared-launch".into(),
+                "--launch-token".into(),
+                token.into(),
+                "--".into(),
+            ];
+            wrapped.extend_from_slice(argv);
+            return wrapped;
+        }
+        shared_launch_argv(provider, token, argv)
     }
 
     fn launch_argv(&self, mut argv: Vec<String>) -> Vec<String> {
@@ -670,15 +701,16 @@ impl Pika {
             .collect();
 
         let timestamp = now();
-        let owners = identity_owners(session, processes, ledger, timestamp)?;
+        let owners = identity_owners(&self.paths, session, processes, ledger, timestamp)?;
         let identities = owners.pids();
         let outside: Vec<i64> = identities.difference(&owned).copied().collect();
-        let pane_selection = process::identity_pane_candidates(
+        let pane_selection = process::identity_pane_candidates_with_advisory(
             tagged.iter().copied(),
             session.provider,
             &identities,
             processes,
             |pid, pane| owners.proves_pane(pid, pane),
+            |pid, owner| certified_pane_sibling(&self.paths, &owners, processes, pid, owner),
         );
         let candidate_panes = pane_selection.candidates;
         let ambiguous_provider = pane_selection.ambiguous_provider;
@@ -1078,9 +1110,9 @@ impl Pika {
                 session.session_id,
             );
         }
-        let owners = self
-            .store
-            .reconcile_transaction(|ledger| identity_owners(session, processes, ledger, now()))?;
+        let owners = self.store.reconcile_transaction(|ledger| {
+            identity_owners(&self.paths, session, processes, ledger, now())
+        })?;
         let identity_pids = owners.pids();
         if identity_pids.len() > 1 {
             let pids = identity_pids
@@ -1096,12 +1128,13 @@ impl Pika {
                 shell_words::quote(&format!("{}:{}", session.provider, session.session_id)),
             );
         }
-        let pane_selection = process::identity_pane_candidates(
+        let pane_selection = process::identity_pane_candidates_with_advisory(
             matches.iter().copied(),
             session.provider,
             &identity_pids,
             processes,
             |pid, pane| owners.proves_pane(pid, pane),
+            |pid, owner| certified_pane_sibling(&self.paths, &owners, processes, pid, owner),
         );
         let candidate_panes = pane_selection.candidates;
         let ambiguous_provider = pane_selection.ambiguous_provider;
@@ -1885,6 +1918,7 @@ impl Pika {
             }
             let providers = Providers::new(&self.paths, &self.config);
             let argv = self.launch_argv(providers.resume_argv(session.provider, &identity));
+            let argv = self.shared_launch_argv(session.provider, &token, &argv);
             let environment = self.register_launch_wrapper(
                 session.provider,
                 Some(&session.session_id),
@@ -2365,6 +2399,7 @@ impl Pika {
         let token = pending.launch_token.as_str();
         let name = pending.name.as_str();
         let cwd = pending.cwd.as_str();
+        let argv = self.shared_launch_argv(provider, token, argv);
         let environment = self.register_launch_wrapper(provider, reserved, token, name)?;
         let allocated = self.tmux.create_holding_session(internal, cwd)?;
         self.store.finalize_pending_pane(
@@ -2395,7 +2430,7 @@ impl Pika {
             &prepared,
             cwd,
             provider,
-            argv,
+            &argv,
             &environment,
             reserved,
             name,
@@ -2741,10 +2776,53 @@ fn wait_for_exact_binding(pika: &Pika, session: &Session, pane: &str) -> Result<
     }
 }
 
+/// Native shared infrastructure is advisory only when an exact client owns it.
+fn certified_pane_sibling(
+    paths: &Paths,
+    owners: &IdentityOwners,
+    processes: &BTreeMap<i64, ProcessRecord>,
+    pid: i64,
+    owner_pid: i64,
+) -> bool {
+    #[cfg(unix)]
+    if let (Some(owner), Some(record)) = (owners.recovery.as_ref(), processes.get(&pid)) {
+        return owner.pid == owner_pid
+            && crate::mobile_opencode::paired_server(paths, owner, record);
+    }
+    let _ = (paths, owners, processes, pid, owner_pid);
+    false
+}
+
+fn advisory_shared_owner(
+    paths: &Paths,
+    provider: Provider,
+    owners: &IdentityOwners,
+    record: Option<&ProcessRecord>,
+) -> bool {
+    let Some(record) = record else { return false };
+    if provider == Provider::Codex {
+        return (!owners.direct.is_empty() || owners.recovery.is_some())
+            && process::shared_provider_process(record, provider);
+    }
+    #[cfg(unix)]
+    if provider == Provider::Opencode {
+        // An arbitrary OpenCode server is still an independent owner. Only the
+        // private, generation-bound server paired to this certified TUI is
+        // advisory; another process or launch can never borrow this exception.
+        return owners
+            .recovery
+            .as_ref()
+            .is_some_and(|owner| crate::mobile_opencode::paired_server(paths, owner, record));
+    }
+    let _ = paths;
+    false
+}
+
 /// Shared owner evidence for reconciliation and exact actions. Recovery is a
 /// provider-confirmed immutable launch binding plus a still-current process
 /// generation, not a pane label or a transferable token by itself.
 fn identity_owners(
+    paths: &Paths,
     session: &Session,
     processes: &BTreeMap<i64, ProcessRecord>,
     ledger: &ReconcileLedger<'_>,
@@ -2787,10 +2865,12 @@ fn identity_owners(
                 owner.pid,
                 &owner.owner_token,
             )?;
-        } else if !(session.provider == Provider::Codex
-            && (!owners.direct.is_empty() || owners.recovery.is_some())
-            && shared)
-        {
+        } else if !advisory_shared_owner(
+            paths,
+            session.provider,
+            &owners,
+            processes.get(&owner.pid),
+        ) {
             owners.leases.insert(owner.pid);
         }
     }
@@ -2930,6 +3010,29 @@ fn validate_daily_name(name: &str) -> Result<()> {
         bail!("conversation names cannot start or end with whitespace");
     }
     Ok(())
+}
+
+/// Only a newly reserved provider launch crosses the shared-control boundary.
+/// Attaching to an existing owner never calls this helper. Credentials are
+/// generated inside the native launcher, not embedded in tmux's shell command.
+fn shared_launch_argv(provider: Provider, token: &str, argv: &[String]) -> Vec<String> {
+    #[cfg(unix)]
+    if provider == Provider::Opencode && crate::mobile_opencode::supports_launch(argv) {
+        let Ok(executable) = std::env::current_exe() else {
+            return argv.to_vec();
+        };
+        let mut wrapped = vec![
+            executable.to_string_lossy().into_owned(),
+            "_opencode-shared-launch".into(),
+            "--launch-token".into(),
+            token.into(),
+            "--".into(),
+        ];
+        wrapped.extend_from_slice(argv);
+        return wrapped;
+    }
+    let _ = (provider, token);
+    argv.to_vec()
 }
 
 fn launch_environment(
@@ -4644,7 +4747,9 @@ mod tests {
         ]);
         let owners = pika
             .store
-            .reconcile_transaction(|ledger| identity_owners(&session, &processes, ledger, now()))
+            .reconcile_transaction(|ledger| {
+                identity_owners(&pika.paths, &session, &processes, ledger, now())
+            })
             .unwrap();
         assert_eq!(owners.pids(), BTreeSet::from([3, 4]));
         pika.reconcile_one(&mut session, &[tagged_pane(identity)], &processes)
@@ -4657,7 +4762,9 @@ mod tests {
         assert_ne!(session.status, Status::OpenTwice);
         let owners = pika
             .store
-            .reconcile_transaction(|ledger| identity_owners(&session, &processes, ledger, now()))
+            .reconcile_transaction(|ledger| {
+                identity_owners(&pika.paths, &session, &processes, ledger, now())
+            })
             .unwrap();
         assert_eq!(owners.pids(), BTreeSet::from([3]));
         assert!(owners.proves_pane(3, &tagged_pane(identity)));
@@ -4673,7 +4780,9 @@ mod tests {
         processes.get_mut(&2).unwrap().start_time = 25;
         let owners = pika
             .store
-            .reconcile_transaction(|ledger| identity_owners(&session, &processes, ledger, now()))
+            .reconcile_transaction(|ledger| {
+                identity_owners(&pika.paths, &session, &processes, ledger, now())
+            })
             .unwrap();
         assert_eq!(owners.pids(), BTreeSet::from([3]));
         assert!(

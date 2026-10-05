@@ -1232,7 +1232,7 @@ fn order_claude_registry_paths(
         paths.retain(|path| {
             path.file_stem()
                 .and_then(OsStr::to_str)
-                .is_some_and(|identity| wanted.contains(identity))
+                .is_some_and(|identity| wanted.contains(identity) || claude_pid_registry(identity))
         });
     } else {
         paths.truncate(MAX_CLAUDE_DISCOVERY_FILES);
@@ -1557,9 +1557,6 @@ fn claude_session_paths(
             path.is_file().then_some((identity.clone(), path))
         })
         .collect::<BTreeMap<_, _>>();
-    if exact_only {
-        return selected.into_values().collect();
-    }
     for entry in fs::read_dir(&sessions)
         .into_iter()
         .flatten()
@@ -1575,9 +1572,20 @@ fn claude_session_paths(
         let Some(identity) = path.file_stem().and_then(OsStr::to_str) else {
             continue;
         };
+        // Native Claude also publishes PID-named registry files. The bounded
+        // reader below validates their sessionId; a filename is never identity.
+        if exact_only && !claude_pid_registry(identity) {
+            continue;
+        }
         selected.entry(identity.to_owned()).or_insert(path);
     }
     selected.into_values().collect()
+}
+
+fn claude_pid_registry(stem: &str) -> bool {
+    !stem.is_empty()
+        && stem.bytes().all(|byte| byte.is_ascii_digit())
+        && stem.parse::<u32>().is_ok_and(|pid| pid > 0)
 }
 
 fn transcript_title(path: &Path, explicit_only: bool, byte_budget: &mut u64) -> Option<String> {
@@ -2417,6 +2425,26 @@ mod tests {
         ));
         assert!(Providers::valid_id(Provider::Opencode, "ses_abcdef12"));
         assert!(!Providers::valid_id(Provider::Opencode, "ses_bad-name"));
+    }
+
+    #[test]
+    fn exact_claude_registry_reads_pid_filenames_by_native_session_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let identity = "11111111-1111-4111-8111-111111111111";
+        let other = "22222222-2222-4222-8222-222222222222";
+        for (pid, id) in [(1234, identity), (5678, other)] {
+            fs::write(sessions.join(format!("{pid}.json")), serde_json::json!({
+                "kind":"interactive","sessionId":id,"cwd":temp.path(),"name":"native","nameSource":"custom"
+            }).to_string()).unwrap();
+        }
+        let wanted = BTreeSet::from([identity.to_owned()]);
+        let exact = claude_records(temp.path(), None, false, Some(&wanted), None);
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].session_id, identity);
+        assert!(exact[0].transcript_path.is_none());
+        assert_eq!(exact[0].source, "claude-live-custom");
     }
 
     #[test]

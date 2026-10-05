@@ -140,6 +140,12 @@ pub fn process_kind(argv: &[String]) -> Option<Provider> {
     if muse_executable_index(argv).is_some() {
         return Some(Provider::Muse);
     }
+    if argv
+        .first()
+        .is_some_and(|value| claude_version_executable(Path::new(value)))
+    {
+        return Some(Provider::Claude);
+    }
     argv.iter().take(4).find_map(|value| {
         let name = Path::new(value)
             .file_name()
@@ -153,6 +159,26 @@ pub fn process_kind(argv: &[String]) -> Option<Provider> {
             _ => None,
         }
     })
+}
+
+/// Claude's native installer resolves its launcher to claude/versions/X.Y.Z.
+/// This is a provider-kind hint only; ownership still needs UUID and generation
+/// evidence. Never interpret a helper's argument as this executable layout.
+fn claude_version_executable(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(version) = path.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let parts: Vec<_> = version.split('.').collect();
+    path.is_absolute()
+        && parent.file_name() == Some(OsStr::new("versions"))
+        && parent.parent().and_then(Path::file_name) == Some(OsStr::new("claude"))
+        && parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn muse_executable_index(argv: &[String]) -> Option<usize> {
@@ -547,11 +573,36 @@ pub fn identity_pane_candidates<'a, I, F>(
     provider: Provider,
     identity_pids: &BTreeSet<i64>,
     processes: &BTreeMap<i64, ProcessRecord>,
-    mut proves_pane: F,
+    proves_pane: F,
 ) -> IdentityPaneSelection<'a>
 where
     I: IntoIterator<Item = &'a Pane>,
     F: FnMut(i64, &Pane) -> bool,
+{
+    identity_pane_candidates_with_advisory(
+        panes,
+        provider,
+        identity_pids,
+        processes,
+        proves_pane,
+        |_, _| false,
+    )
+}
+
+/// An external certificate may identify one exact shared sibling; the full
+/// process tree remains visible so unrelated processes still fail closed.
+pub fn identity_pane_candidates_with_advisory<'a, I, F, A>(
+    panes: I,
+    provider: Provider,
+    identity_pids: &BTreeSet<i64>,
+    processes: &BTreeMap<i64, ProcessRecord>,
+    mut proves_pane: F,
+    mut advisory: A,
+) -> IdentityPaneSelection<'a>
+where
+    I: IntoIterator<Item = &'a Pane>,
+    F: FnMut(i64, &Pane) -> bool,
+    A: FnMut(i64, i64) -> bool,
 {
     let mut candidates = Vec::new();
     let mut ambiguous_provider = false;
@@ -574,8 +625,8 @@ where
         match proven {
             Some(provider_pid) => {
                 if provider_pids.iter().copied().any(|pid| {
-                    pid != provider_pid
-                        && !is_provider_helper(pid, provider_pid, pane.pane_pid, processes)
+                    !advisory(pid, provider_pid)
+                        && unverified_provider(pid, provider_pid, pane.pane_pid, processes)
                 }) {
                     ambiguous_provider = true;
                 }
@@ -592,6 +643,15 @@ where
         ambiguous_provider,
         incomplete_root,
     }
+}
+
+fn unverified_provider(
+    pid: i64,
+    owner: i64,
+    root: i64,
+    processes: &BTreeMap<i64, ProcessRecord>,
+) -> bool {
+    pid != owner && !is_provider_helper(pid, owner, root, processes)
 }
 
 fn is_provider_helper(
@@ -1256,6 +1316,27 @@ mod platform {
 mod tests {
     use super::*;
 
+    #[test]
+    fn claude_native_version_path_is_only_an_executable_kind_hint() {
+        let native = "/fixture/home/.local/share/claude/versions/2.1.274";
+        assert_eq!(
+            process_kind(&[native.to_owned(), "--session-id".into(), "uuid".into()]),
+            Some(Provider::Claude)
+        );
+        for path in [
+            "2.1.274",
+            "claude/versions/2.1.274",
+            "/tmp/versions/2.1.274",
+            "/tmp/claude/versions/latest",
+            "/tmp/claude/versions/2..1",
+            "/tmp/claude/versions/2.1.274-helper",
+        ] {
+            assert_eq!(process_kind(&[path.to_owned()]), None, "{path}");
+        }
+        assert_eq!(process_kind(&["echo".into(), native.into()]), None);
+        assert_eq!(process_kind(&["pika".into(), native.into()]), None);
+    }
+
     #[cfg(target_os = "linux")]
     use std::{process::Command, time::Duration};
 
@@ -1475,6 +1556,47 @@ mod tests {
         );
         assert_eq!(selection.candidates.len(), 1);
         assert!(selection.ambiguous_provider);
+    }
+
+    #[test]
+    fn certified_sibling_exception_does_not_hide_other_providers() {
+        let mut processes = BTreeMap::from([
+            (1, record(1, None, &["sh"])),
+            (
+                2,
+                record(
+                    2,
+                    Some(1),
+                    &["opencode", "attach", "--session", "ses_exact"],
+                ),
+            ),
+            (3, record(3, Some(1), &["opencode", "serve"])),
+        ]);
+        let panes = [pane(1, "%1")];
+        let select = |records: &BTreeMap<i64, ProcessRecord>| {
+            identity_pane_candidates_with_advisory(
+                panes.iter(),
+                Provider::Opencode,
+                &BTreeSet::from([2]),
+                records,
+                |pid, _| pid == 2,
+                |pid, owner| pid == 3 && owner == 2,
+            )
+            .ambiguous_provider
+        };
+        assert!(!select(&processes));
+        processes.insert(4, record(4, Some(1), &["opencode", "serve"]));
+        assert!(select(&processes));
+        processes.insert(4, record(4, Some(3), &["opencode", "serve"]));
+        assert!(select(&processes));
+        let unapproved = identity_pane_candidates(
+            panes.iter(),
+            Provider::Opencode,
+            &BTreeSet::from([2]),
+            &processes,
+            |pid, _| pid == 2,
+        );
+        assert!(unapproved.ambiguous_provider);
     }
 
     #[test]

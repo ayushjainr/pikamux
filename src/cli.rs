@@ -51,6 +51,10 @@ const JSONL_OPERATIONAL_FAILURE: i32 = 1;
 #[derive(Parser, Debug)]
 #[command(name="pika", version=VERSION, about="One home for your Codex, Claude, OpenCode, and Muse conversations.", after_help="Run `pika NAME` to find, protect, attach, resume, or create the exact conversation.")]
 struct Cli {
+    /// Enable experimental phone replies for future Claude launches; native consent and permissions still apply.
+    #[cfg(unix)]
+    #[arg(long, global = true)]
+    claude_mobile: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -60,6 +64,40 @@ enum Command {
     #[cfg(unix)]
     #[command(name = "_mobile", hide = true)]
     Mobile,
+    #[cfg(unix)]
+    #[command(name = "_opencode-shared-launch", hide = true)]
+    OpencodeSharedLaunch {
+        #[arg(long)]
+        launch_token: String,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
+    #[cfg(unix)]
+    #[command(name = "_claude-shared-launch", hide = true)]
+    ClaudeSharedLaunch {
+        #[arg(long)]
+        launch_token: String,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
+    #[cfg(unix)]
+    #[command(name = "_claude-channel", hide = true)]
+    ClaudeChannel {
+        #[arg(long)]
+        launch_token: String,
+    },
+    #[cfg(unix)]
+    #[command(name = "_claude-attest", hide = true)]
+    ClaudeAttest {
+        #[arg(long)]
+        launch_token: String,
+    },
+    #[cfg(unix)]
+    #[command(name = "_claude-session", hide = true)]
+    ClaudeSession {
+        #[arg(long)]
+        launch_token: String,
+    },
     #[cfg(unix)]
     /// Connect a phone using a short-lived, private-network QR.
     Pair(crate::mobile_pairing::Args),
@@ -695,7 +733,12 @@ where
         }
         Some(Command::Hook(args)) => hook(args),
         Some(Command::ProcessExit(args)) => process_exit(args),
-        command => dispatch(&Pika::discover()?, command),
+        command => {
+            let pika = Pika::discover()?;
+            #[cfg(unix)]
+            let pika = pika.with_claude_mobile(cli.claude_mobile);
+            dispatch(&pika, command)
+        }
     }
 }
 
@@ -703,6 +746,26 @@ fn dispatch(pika: &Pika, command: Option<Command>) -> Result<i32> {
     match command {
         #[cfg(unix)]
         Some(Command::Mobile) => crate::mobile::serve(pika),
+        #[cfg(unix)]
+        Some(Command::OpencodeSharedLaunch { launch_token, argv }) => {
+            crate::mobile_opencode::launch(pika, &launch_token, &argv)
+        }
+        #[cfg(unix)]
+        Some(Command::ClaudeSharedLaunch { launch_token, argv }) => {
+            crate::mobile_claude::launcher::launch(pika, &launch_token, &argv)
+        }
+        #[cfg(unix)]
+        Some(Command::ClaudeChannel { launch_token }) => {
+            crate::mobile_claude::channel::run(pika, &launch_token)
+        }
+        #[cfg(unix)]
+        Some(Command::ClaudeAttest { launch_token }) => {
+            crate::mobile_claude::channel::attest(pika, &launch_token)
+        }
+        #[cfg(unix)]
+        Some(Command::ClaudeSession { launch_token }) => {
+            crate::mobile_claude::channel::session_event(pika, &launch_token)
+        }
         #[cfg(unix)]
         Some(Command::Pair(args)) => crate::mobile_pairing::run(pika, args),
         None => bare(pika),
