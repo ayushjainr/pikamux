@@ -3191,6 +3191,7 @@ impl Store {
     }
 
     /// One bounded, consistent read for related metadata; never opens a writer.
+    #[cfg(unix)]
     pub(crate) fn meta_snapshot(
         &self,
         keys: &BTreeSet<String>,
