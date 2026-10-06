@@ -144,6 +144,32 @@ final class PikaSSHIntegrationTests: XCTestCase {
         if !config.expectedContext.isEmpty {
             XCTAssertTrue(app.staticTexts[config.expectedContext].waitForExistence(timeout: 15))
         }
+        if config.mode == "largeHistory" {
+            let latest = app.staticTexts["Synthetic large Claude assistant 119"]
+            XCTAssertTrue(latest.waitForExistence(timeout: 20))
+            XCTAssertTrue(latest.isHittable, "Opening a large saved history must show its latest reply")
+            XCTAssertFalse(app.buttons["sendReply"].isEnabled, "Synthetic source has no native owner or send route")
+            let conversation = app.scrollViews["conversation-" + config.threadId]
+            XCTAssertTrue(conversation.waitForExistence(timeout: 10))
+            let older = app.buttons["Load older context"]
+            for _ in 0..<24 {
+                if older.isHittable { break }
+                conversation.swipeDown()
+            }
+            XCTAssertTrue(older.isHittable, "Older pages must remain available beyond the former file-size limit")
+            older.tap()
+            let previous = app.staticTexts["Synthetic large Claude assistant 079"]
+            XCTAssertTrue(previous.waitForExistence(timeout: 20), "An actual older backend page must be rendered")
+            XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == %@", "Synthetic large Claude assistant 079")).count, 1)
+            let page = XCTAttachment(screenshot: app.screenshot()); page.name = "Synthetic large Claude history older page"; page.lifetime = .keepAlways; add(page)
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.4)).press(forDuration: 0.1, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.4)))
+            XCTAssertTrue(row.waitForExistence(timeout: 10)); row.tap()
+            XCTAssertTrue(latest.waitForExistence(timeout: 20))
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: latest)], timeout: 10), .completed)
+            XCTAssertTrue(app.staticTexts[config.expectedContext].exists)
+            let reopened = XCTAttachment(screenshot: app.screenshot()); reopened.name = "Synthetic large Claude history reopened at latest reply"; reopened.lifetime = .keepAlways; add(reopened)
+            return
+        }
         if config.mode == "readOnly" {
             guard let response = config.finalResponse else { XCTFail("Read-only original response required"); return }
             XCTAssertTrue(app.staticTexts[response].waitForExistence(timeout: 20))

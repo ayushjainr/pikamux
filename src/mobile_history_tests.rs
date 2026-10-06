@@ -3,26 +3,19 @@ use std::io::Write;
 
 const CLAUDE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
-#[test]
-fn claude_logical_cursor_refuses_late_projection_change() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut file = File::create(temp.path().join("source")).unwrap();
-    let mut cursor = state(&mut file, Provider::Claude, CLAUDE);
-    let records: Vec<_> = (0..85).map(|index|json!({"sessionId":CLAUDE,"type":"user","uuid":format!("record-{index}"),"message":{"role":"user","content":format!("literal-{index}")}})).collect();
-    let projection = BTreeMap::new();
-    let (_, more) = claude_page(&records, &mut cursor, &projection, true).unwrap();
-    assert!(more);
-    let mut changed = BTreeMap::new();
-    changed.insert(
-        "record-1".into(),
-        vec![json!({"id":"native-reply","type":"agentMessage","text":"Late attested projection"})],
-    );
-    assert!(
-        claude_page(&records, &mut cursor, &changed, false)
-            .unwrap_err()
-            .to_string()
-            .contains("projection changed")
-    );
+fn reader_paths(root: &Path) -> Paths {
+    Paths {
+        config_dir: root.join("config"),
+        config: root.join("config/config.json"),
+        state_dir: root.join("state"),
+        database: root.join("state/pika.db"),
+        codex_home: root.join("codex"),
+        claude_home: root.join("claude"),
+        opencode_data_home: root.join("opencode-data"),
+        opencode_config_home: root.join("opencode-config"),
+        muse_data_home: root.join("muse-data"),
+        muse_config_home: root.join("muse-config"),
+    }
 }
 
 fn state(file: &mut File, provider: Provider, id: &str) -> Cursor {
@@ -41,6 +34,7 @@ fn state(file: &mut File, provider: Provider, id: &str) -> Cursor {
         displayed_runs: BTreeSet::new(),
         claude_before: None,
         claude_items_hash: None,
+        claude_source_hash: None,
     }
 }
 
@@ -50,21 +44,22 @@ fn claude_paging_is_chronological_literal_and_append_stable() {
     let path = temp.path().join("history.jsonl");
     let mut output = File::create(&path).unwrap();
     for index in 0..85 {
-        writeln!(output,"{}",json!({"sessionId":CLAUDE,"isSidechain":false,"uuid":format!("msg-{index}"),"type":"user","message":{"role":"user","content":[{"type":"text","text":format!("  literal {index}\nsecond line  ")},{"type":"tool_result","content":"hidden"}]}})).unwrap();
+        writeln!(output,"{}",json!({"sessionId":CLAUDE,"isSidechain":false,"uuid":format!("msg-{index}"),"parentUuid":if index==0 {None}else{Some(format!("msg-{}",index-1))},"type":"user","message":{"role":"user","content":[{"type":"text","text":format!("  literal {index}\nsecond line  ")},{"type":"tool_result","content":"hidden"}]}})).unwrap();
     }
     let mut file = File::open(&path).unwrap();
     let mut cursor = state(&mut file, Provider::Claude, CLAUDE);
-    let (latest, more) = jsonl_page(&mut file, &mut cursor).unwrap();
+    let paths = reader_paths(temp.path());
+    let (latest, more) = claude_reader::page(&paths, &mut file, &mut cursor, true).unwrap();
     assert!(more);
     assert_eq!(latest.first().unwrap()["id"], "msg-45");
     assert_eq!(latest.last().unwrap()["id"], "msg-84");
     assert_eq!(latest[0]["text"], "  literal 45\nsecond line  ");
     writeln!(output,"{}",json!({"sessionId":CLAUDE,"uuid":"new","type":"user","message":{"role":"user","content":"new"}})).unwrap();
-    let (older, more) = jsonl_page(&mut file, &mut cursor).unwrap();
+    let (older, more) = claude_reader::page(&paths, &mut file, &mut cursor, false).unwrap();
     assert!(more);
     assert_eq!(older[0]["id"], "msg-5");
     assert_eq!(older[39]["id"], "msg-44");
-    let (oldest, more) = jsonl_page(&mut file, &mut cursor).unwrap();
+    let (oldest, more) = claude_reader::page(&paths, &mut file, &mut cursor, false).unwrap();
     assert!(!more);
     assert_eq!(oldest.len(), 5);
 }
@@ -273,21 +268,23 @@ fn sqlite_readonly_wal_reader_coordination_is_not_a_database_write() {
 #[test]
 fn claude_rewind_and_compaction_never_return_append_order_as_native_history() {
     for special in [
-        json!({"uuid":"C","parentUuid":"A","sessionId":CLAUDE}),
-        json!({"uuid":"compact","parentUuid":"B","sessionId":CLAUDE,"subtype":"compact_boundary","compactMetadata":{"preservedMessages":["A"],"preservedSegment":{"headUuid":"A","tailUuid":"B"}}}),
+        json!({"type":"user","uuid":"C","parentUuid":"A","sessionId":CLAUDE}),
+        json!({"type":"system","uuid":"compact","parentUuid":"B","sessionId":CLAUDE,"subtype":"compact_boundary","compactMetadata":{"preservedMessages":["A"],"preservedSegment":{"headUuid":"A","tailUuid":"B"}}}),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("history.jsonl");
         let mut output = File::create(&path).unwrap();
         for record in [
-            json!({"uuid":"A","parentUuid":null,"sessionId":CLAUDE}),
-            json!({"uuid":"B","parentUuid":"A","sessionId":CLAUDE}),
+            json!({"type":"user","uuid":"A","parentUuid":null,"sessionId":CLAUDE}),
+            json!({"type":"user","uuid":"B","parentUuid":"A","sessionId":CLAUDE}),
             special,
         ] {
             writeln!(output, "{record}").unwrap();
         }
         let mut file = File::open(path).unwrap();
-        let cursor = state(&mut file, Provider::Claude, CLAUDE);
-        assert!(verify_claude_chain(&mut file, &cursor).is_err());
+        let mut cursor = state(&mut file, Provider::Claude, CLAUDE);
+        assert!(
+            claude_reader::page(&reader_paths(temp.path()), &mut file, &mut cursor, true).is_err()
+        );
     }
 }

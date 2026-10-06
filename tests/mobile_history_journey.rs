@@ -327,6 +327,25 @@ fn claude_channel_history_reopens_only_native_correlated_content() {
     writeln!(file,"{}",json!({"type":"user","uuid":"internal-wake","parentUuid":"item-089","sessionId":thread,"isSidechain":false,"isMeta":true,"message":{"role":"user","content":"INTERNAL_PROTOCOL_WAKE"}})).unwrap();
     let identity = json!({"nodeId":node,"provider":"claude","threadId":thread});
     // Reopening uses a fresh mobile process and the native source, not live journal overlays.
+    let key = format!("claude-channel:{token}:operation:{operation}");
+    let complete = store.get_meta(&key).unwrap().unwrap();
+    let mut unsettled: Value = serde_json::from_str(&complete).unwrap();
+    unsettled["reply"] = Value::Null;
+    unsettled["reply_tool_id"] = Value::Null;
+    store.set_meta(&key, &unsettled.to_string()).unwrap();
+    let mut before_settlement = endpoint(&root);
+    let before = before_settlement.request("conversation/open", json!({"identity":identity}));
+    assert!(before["error"].is_null(), "{before}");
+    store.set_meta(&key, &complete).unwrap();
+    let changed = before_settlement.request(
+        "conversation/history",
+        json!({"identity":identity,"cursor":before["result"]["turns"]["nextCursor"]}),
+    );
+    assert!(
+        changed["error"].to_string().contains("projection changed"),
+        "{changed}"
+    );
+    drop(before_settlement);
     for _ in 0..2 {
         let mut mobile = endpoint(&root);
         let opened = mobile.request("conversation/open", json!({"identity":identity}));
@@ -411,6 +430,7 @@ fn claude_native_compaction_pages_reconstructed_order_and_freezes_cursor() {
     let thread = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let (_store, node) = fixture(&root, Provider::Claude, thread);
     let source = root.join(format!("claude/projects/fixture/{thread}.jsonl"));
+    append_large_hidden_records(&source, thread);
     let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
     // Native 2.1.274 iOs/aOs: exact preserved UUID list is relocated AFTER its
     // summary anchor, irrespective of where those records were appended.
@@ -458,5 +478,138 @@ fn claude_native_compaction_pages_reconstructed_order_and_freezes_cursor() {
             .last()
             .unwrap()["id"],
         "append"
+    );
+}
+
+fn append_large_hidden_records(source: &Path, thread: &str) {
+    let mut file = fs::OpenOptions::new().append(true).open(source).unwrap();
+    let payload = "x".repeat(100 * 1024);
+    let mut parent = "item-084".to_owned();
+    for index in 0..200 {
+        let id = format!("hidden-{index}");
+        let record = json!({"type":"user","uuid":id,"parentUuid":parent,"sessionId":thread,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"unrelated","content":payload}]}});
+        let bytes = serde_json::to_vec(&record).unwrap();
+        assert!(bytes.len() < 256 * 1024);
+        writeln!(file, "{record}").unwrap();
+        parent = id;
+    }
+    assert!(fs::metadata(source).unwrap().len() > 16 * 1024 * 1024);
+}
+
+#[test]
+fn claude_five_thousand_small_nodes_remain_supported() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let thread = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let (_store, node) = fixture(&root, Provider::Claude, thread);
+    let source = root.join(format!("claude/projects/fixture/{thread}.jsonl"));
+    let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+    for index in 85..5000 {
+        writeln!(file,"{}",json!({"type":"user","uuid":format!("item-{index:03}"),"parentUuid":format!("item-{:03}",index-1),"sessionId":thread,"message":{"role":"user","content":format!("literal-{index}")}})).unwrap();
+    }
+    let bytes = fs::metadata(source).unwrap().len();
+    assert!(bytes < 16 * 1024 * 1024);
+    let identity = json!({"nodeId":node,"provider":"claude","threadId":thread});
+    let mut phone = endpoint(&root);
+    let opened = phone.request("conversation/open", json!({"identity":identity}));
+    assert!(opened["error"].is_null(), "{opened}");
+    assert_eq!(opened["result"]["turns"]["data"][39]["id"], "item-4999");
+    let older = phone.request(
+        "conversation/history",
+        json!({"identity":identity,"cursor":opened["result"]["turns"]["nextCursor"]}),
+    );
+    assert!(older["error"].is_null(), "{older}");
+    assert_eq!(older["result"]["turns"]["data"][39]["id"], "item-4959");
+    eprintln!(
+        "small native endpoint: {bytes} source bytes, 5000 ancestry nodes, latest and older page supported"
+    );
+}
+
+#[test]
+fn claude_oversized_individual_record_is_distinct_from_total_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let thread = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let (_, node) = fixture(&root, Provider::Claude, thread);
+    let source = root.join(format!("claude/projects/fixture/{thread}.jsonl"));
+    let mut file = fs::OpenOptions::new().append(true).open(source).unwrap();
+    writeln!(file,"{}",json!({"type":"user","uuid":"large","parentUuid":"item-084","sessionId":thread,"message":{"role":"user","content":"x".repeat(256*1024)}})).unwrap();
+    let mut phone = endpoint(&root);
+    let rejected = phone.request(
+        "conversation/open",
+        json!({"identity":{"nodeId":node,"provider":"claude","threadId":thread}}),
+    );
+    assert!(rejected["result"].is_null());
+    assert!(
+        rejected["error"]
+            .to_string()
+            .contains("individual history record exceeds 256 KiB"),
+        "{rejected}"
+    );
+}
+
+#[test]
+fn claude_large_history_opens_pages_reopens_and_refuses_nonprefix_rewrite() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let thread = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let (_store, node) = fixture(&root, Provider::Claude, thread);
+    let source = root.join(format!("claude/projects/fixture/{thread}.jsonl"));
+    append_large_hidden_records(&source, thread);
+    let identity = json!({"nodeId":node,"provider":"claude","threadId":thread});
+    for _ in 0..2 {
+        let mut phone = endpoint(&root);
+        let opened = phone.request("conversation/open", json!({"identity":identity}));
+        assert!(opened["error"].is_null(), "{opened}");
+        let mut all = opened["result"]["turns"]["data"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let mut cursor = opened["result"]["turns"]["nextCursor"].clone();
+        while cursor.is_string() {
+            let older = phone.request(
+                "conversation/history",
+                json!({"identity":identity,"cursor":cursor}),
+            );
+            assert!(older["error"].is_null(), "{older}");
+            let mut prefix = older["result"]["turns"]["data"].as_array().unwrap().clone();
+            prefix.append(&mut all);
+            all = prefix;
+            cursor = older["result"]["turns"]["nextCursor"].clone();
+        }
+        assert_eq!(all.len(), 85);
+        for (index, turn) in all.iter().enumerate() {
+            assert_eq!(turn["id"], format!("item-{index:03}"));
+        }
+    }
+    let mut phone = endpoint(&root);
+    let opened = phone.request("conversation/open", json!({"identity":identity}));
+    let cursor = opened["result"]["turns"]["nextCursor"].clone();
+    // Same inode/length and unchanged first 4096 bytes must not hide a rewrite.
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&source)
+        .unwrap();
+    file.seek(SeekFrom::Start(50_000)).unwrap();
+    let mut byte = [0];
+    file.read_exact(&mut byte).unwrap();
+    assert_eq!(byte[0], b'x');
+    file.seek(SeekFrom::Start(50_000)).unwrap();
+    file.write_all(b"y").unwrap();
+    let rejected = phone.request(
+        "conversation/history",
+        json!({"identity":identity,"cursor":cursor}),
+    );
+    assert!(
+        rejected["error"]
+            .to_string()
+            .contains("frozen history changed"),
+        "{rejected}"
+    );
+    eprintln!(
+        "large native endpoint: {} source bytes, 285 ancestry nodes, complete latest/paging/reopen and full-prefix mutation refusal",
+        fs::metadata(source).unwrap().len()
     );
 }

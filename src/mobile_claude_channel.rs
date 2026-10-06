@@ -6,7 +6,6 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, BufReader, Read, Write},
     os::{
@@ -62,6 +61,51 @@ pub(crate) struct HistoryOperation {
     pub reply_tool_id: Option<String>,
 }
 
+pub(crate) struct HistoricalSnapshot {
+    db: Option<rusqlite::Connection>,
+    thread: String,
+}
+
+impl HistoricalSnapshot {
+    pub(crate) fn open(paths: &crate::paths::Paths, thread: &str) -> Result<Self> {
+        ensure!(
+            uuid::Uuid::parse_str(thread)?.to_string() == thread,
+            "Canonical historical thread required"
+        );
+        Ok(Self {
+            db: crate::store::Store::from_paths(paths).meta_read_snapshot()?,
+            thread: thread.into(),
+        })
+    }
+
+    pub(crate) fn operation(&self, token: &str, id: &str) -> Result<Option<HistoryOperation>> {
+        let Some(db) = &self.db else {
+            return Ok(None);
+        };
+        let key = token_operation_key(token, id)?;
+        if historical_value(db, &format!("claude-channel:{token}:thread"))?.as_deref()
+            != Some(&self.thread)
+        {
+            return Ok(None);
+        }
+        historical_value(db, &key)?
+            .map(|value| historical_operation(&value))
+            .transpose()
+    }
+}
+
+fn historical_value(db: &rusqlite::Connection, key: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let value: Option<Option<String>> = db.query_row(
+        "SELECT CASE WHEN length(CAST(value AS BLOB)) <= ? THEN value ELSE NULL END FROM meta WHERE key=?",
+        rusqlite::params![FRAME, key], |row| row.get(0)).optional()?;
+    match value {
+        Some(Some(value)) => Ok(Some(value)),
+        Some(None) => anyhow::bail!("Historical channel proof exceeds its per-record bound"),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn history_operation(
     paths: &crate::paths::Paths,
@@ -69,47 +113,7 @@ pub(crate) fn history_operation(
     token: &str,
     id: &str,
 ) -> Result<Option<HistoryOperation>> {
-    let key = (token.to_owned(), uuid::Uuid::parse_str(id)?.to_string());
-    Ok(history_operations(paths, thread, std::slice::from_ref(&key))?.remove(&key))
-}
-
-pub(crate) fn history_operations(
-    paths: &crate::paths::Paths,
-    thread: &str,
-    requests: &[(String, String)],
-) -> Result<BTreeMap<(String, String), HistoryOperation>> {
-    ensure!(
-        uuid::Uuid::parse_str(thread)?.to_string() == thread,
-        "Canonical historical thread required"
-    );
-    ensure!(
-        requests.len() <= 32768,
-        "Historical operation request bound exceeded"
-    );
-    let mut keys = BTreeSet::new();
-    let mut normalized = BTreeSet::new();
-    for (token, id) in requests {
-        let id = uuid::Uuid::parse_str(id)?.to_string();
-        keys.insert(format!("claude-channel:{token}:thread"));
-        keys.insert(token_operation_key(token, &id)?);
-        normalized.insert((token.clone(), id));
-    }
-    let values = crate::store::Store::from_paths(paths).meta_snapshot(&keys)?;
-    let mut result = BTreeMap::new();
-    for (token, id) in normalized {
-        if values
-            .get(&format!("claude-channel:{token}:thread"))
-            .map(String::as_str)
-            != Some(thread)
-        {
-            continue;
-        }
-        let Some(value) = values.get(&token_operation_key(&token, &id)?) else {
-            continue;
-        };
-        result.insert((token, id), historical_operation(value)?);
-    }
-    Ok(result)
+    HistoricalSnapshot::open(paths, thread)?.operation(token, id)
 }
 
 fn historical_operation(value: &str) -> Result<HistoryOperation> {
