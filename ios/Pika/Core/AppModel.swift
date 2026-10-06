@@ -69,6 +69,7 @@ final class AppModel: ObservableObject {
     @Published var drafts: [String: String] = [:]
     private var draftSkills: [String: [String]] = [:]
     @Published var pendingActions: [String: PendingAction] = [:]
+    private var receiptChecksInFlight: Set<ThreadIdentity> = []
     @Published var machines: [SavedMachine] = []
     @Published var activeNodeId: String?
     @Published var machineFilter: String?
@@ -174,6 +175,13 @@ final class AppModel: ObservableObject {
     private var selectionGeneration = UUID()
     private var activeTurns: [ThreadIdentity: String] = [:]
     private var providerItems: [String: JSONValue] = [:]
+    private var openingConversation: UUID?
+    private var openingLiveItems = Set<String>()
+    private var openingPartialItems = Set<String>()
+    private var ambiguousLiveItems = Set<String>()
+    private var snapshotBackedItems = Set<String>()
+    @Published var conversationNeedsRefresh = false
+    private var openingLiveTurn = false
     private var lastKnownMessages: [ThreadIdentity: [ChatMessage]] = [:]
     private var observedRequests: [String: (turn: String, item: String)] = [:]
     private var boardRevision: JSONValue = .null
@@ -625,6 +633,12 @@ final class AppModel: ObservableObject {
         } else if frame["event"].string == "conversation/event", identity(params["identity"]) == selected?.identity {
             let method = params["method"].string ?? ""
             let event = params["params"]
+            if openingConversation == selectionGeneration {
+                if let id = event["item"]["id"].string ?? event["itemId"].string { openingLiveItems.insert(id) }
+                if method == "item/agentMessage/delta", let id = event["itemId"].string { openingPartialItems.insert(id) }
+                if method == "item/completed", let id = event["item"]["id"].string { openingPartialItems.remove(id) }
+                if method == "turn/started" || method == "turn/completed" { openingLiveTurn = true }
+            }
             if ["item/started", "item/completed"].contains(method), let id = event["item"]["id"].string {
                 providerItems[id] = event["item"]
                 if let current = approval, current.params["itemId"].string == id {
@@ -639,16 +653,24 @@ final class AppModel: ObservableObject {
                 activeTurns.removeValue(forKey: selected.identity)
             } else if method == "item/agentMessage/delta", let text = event["delta"].string {
                 let id = event["itemId"].string ?? "stream"
+                // No snapshot/event watermark exists on legacy endpoints. Wait
+                // for a full item rather than duplicating or dropping a prefix.
+                if snapshotBackedItems.contains(id) { ambiguousLiveItems.insert(id); conversationNeedsRefresh = true }
+                guard !ambiguousLiveItems.contains(id) else { return }
                 if let index = messages.firstIndex(where: { $0.id == id }) {
                     let old = messages[index]; messages[index] = ChatMessage(id: old.id, role: old.role, text: old.text + text)
                 } else { messages.append(ChatMessage(id: id, role: "assistant", text: text)) }
             } else if method == "item/completed", let type = event["item"]["type"].string,
                 type == "userMessage" || type == "agentMessage", let id = event["item"]["id"].string {
                 let entry = event["item"]
+                ambiguousLiveItems.remove(id); snapshotBackedItems.remove(id); conversationNeedsRefresh = !ambiguousLiveItems.isEmpty
                 let text = entry["text"].string ?? entry["content"].array.compactMap { $0["text"].string }.joined(separator: "\n")
                 let message = ChatMessage(id: id, role: type == "userMessage" ? "user" : "assistant", text: text)
                 if let index = messages.firstIndex(where: { $0.id == id }) { messages[index] = message }
                 else { messages.append(message) }
+                if id.hasPrefix("claude-channel-reply:"), let selected, selected.identity.provider == "claude" {
+                    Task { await self.reconcile(selected) }
+                }
             } else if method == "item/tool/requestUserInput", event["questions"].array.count > 0,
                 let turnId = event["turnId"].string, let itemId = event["itemId"].string,
                 params["requestId"] != .null, event["questions"].array.allSatisfy({ $0["id"].string?.isEmpty == false }) {
@@ -675,10 +697,13 @@ final class AppModel: ObservableObject {
         if !isFixture { selectMachine(node: item.identity.nodeId) }
         if selected?.identity != item.identity, noticeRequestAction != nil { notice = nil }
         if let previous = selected { lastKnownMessages[previous.identity] = Array(messages.suffix(500)) }
-        selected = item; messages = lastKnownMessages[item.identity] ?? []; question = nil; approval = nil; providerItems = [:]; conversationCapabilities = .null; historyLoading = false
+        selected = item; messages = lastKnownMessages[item.identity] ?? []; question = nil; approval = nil; providerItems = [:]; conversationCapabilities = .null; historyLoading = false; historyCursor = .null
         conversationCached = !messages.isEmpty
         if lastKnownMessages.count > 20, let eviction = lastKnownMessages.keys.first(where: { $0 != item.identity }) { lastKnownMessages.removeValue(forKey: eviction) }
         let token = UUID(); selectionGeneration = token
+        openingConversation = token; openingLiveItems = []; openingPartialItems = []; openingLiveTurn = false
+        ambiguousLiveItems = []; snapshotBackedItems = []; conversationNeedsRefresh = false
+        defer { if openingConversation == token { openingConversation = nil; openingLiveItems = []; openingPartialItems = []; openingLiveTurn = false } }
         let connectionToken = routeEpoch(for: item.identity.nodeId)
         guard let wire = transport(for: item.identity.nodeId) else { notice = "Reconnect to read this exact conversation. Your draft is saved."; return }
         do {
@@ -686,19 +711,30 @@ final class AppModel: ObservableObject {
             guard routeEpoch(for: item.identity.nodeId) == connectionToken, selectionGeneration == token, selected?.identity == item.identity else { return }
             guard identity(result["identity"]) == item.identity else { throw ConnectionError.changedNode }
             conversationCapabilities = result["capabilities"]
-            activeTurns[item.identity] = result["activeTurnId"].string
+            if !openingLiveTurn { activeTurns[item.identity] = result["activeTurnId"].string }
             historyCursor = result["turns"]["nextCursor"]
-            let turns = result["turns"]["data"].array.isEmpty ? result["thread"]["turns"].array : result["turns"]["data"].array
-            for entry in turns.flatMap({ $0["items"].array }) { if let id = entry["id"].string { providerItems[id] = entry } }
+            let turns = chronologicalTurns(result, provider: item.identity.provider)
+            snapshotBackedItems = activeSnapshotItems(turns, activeTurnId: result["activeTurnId"].string)
+            for entry in turns.flatMap({ $0["items"].array }) { if let id = entry["id"].string, !openingLiveItems.contains(id) { providerItems[id] = entry } }
             if let current = approval, let id = current.params["itemId"].string, let original = providerItems[id] {
                 approval = ProviderApproval(id: current.id, identity: current.identity, requestId: current.requestId,
                     method: current.method, params: current.params, item: original)
             }
-            messages = turns.flatMap { turn in turn["items"].array.compactMap { entry -> ChatMessage? in
+            let live = messages.filter { openingLiveItems.contains($0.id) }
+            var snapshot = turns.flatMap { turn in turn["items"].array.compactMap { entry -> ChatMessage? in
                 guard let type = entry["type"].string, type == "agentMessage" || type == "userMessage" else { return nil }
                 let text = entry["text"].string ?? entry["content"].array.compactMap { $0["text"].string }.joined(separator: "\n")
                 return ChatMessage(id: entry["id"].string ?? UUID().uuidString, role: type == "userMessage" ? "user" : "assistant", text: text)
             } }
+            for message in live {
+                if let index = snapshot.firstIndex(where: { $0.id == message.id }) {
+                    if openingPartialItems.contains(message.id) { ambiguousLiveItems.insert(message.id) }
+                    else { snapshot[index] = message }
+                }
+                else { snapshot.append(message) }
+            }
+            conversationNeedsRefresh = !ambiguousLiveItems.isEmpty
+            messages = snapshot
             lastKnownMessages[item.identity] = Array(messages.suffix(500))
             conversationCached = false
         } catch { if routeEpoch(for: item.identity.nodeId) == connectionToken, selectionGeneration == token { reportError(error, action: "Could not read this conversation. Reconnect to check its original state.") } }
@@ -713,15 +749,32 @@ final class AppModel: ObservableObject {
             let result = try await wire.request("conversation/history", params: .object(["identity": item.identity.json, "cursor": cursor]))
             guard routeEpoch(for: item.identity.nodeId) == connectionToken, selectionGeneration == token, selected?.identity == item.identity else { return }
             guard identity(result["identity"]) == item.identity else { throw ConnectionError.changedNode }
-            let previous = result["turns"]["data"].array.flatMap { $0["items"].array.compactMap { entry -> ChatMessage? in
+            let previous = chronologicalTurns(result, provider: item.identity.provider).flatMap { $0["items"].array.compactMap { entry -> ChatMessage? in
                 guard let id = entry["id"].string, let type = entry["type"].string, ["userMessage", "agentMessage"].contains(type) else { return nil }
                 return ChatMessage(id: id, role: type == "userMessage" ? "user" : "assistant",
                     text: entry["text"].string ?? entry["content"].array.compactMap { $0["text"].string }.joined(separator: "\n"))
             } }
-            let ids = Set(messages.map(\.id))
-            messages = previous.filter { !ids.contains($0.id) } + messages
+            var ids = Set(messages.map(\.id))
+            messages = previous.filter { ids.insert($0.id).inserted } + messages
             historyCursor = result["turns"]["nextCursor"]
         } catch { if routeEpoch(for: item.identity.nodeId) == connectionToken, selectionGeneration == token { reportError(error, action: "Older context is unavailable. Try again after reconnecting.") } }
+    }
+    func conversationReadToken(for identity: ThreadIdentity) -> String? {
+        guard selected?.identity == identity, let route = routeEpoch(for: identity.nodeId) else { return nil }
+        return selectionGeneration.uuidString + ":" + route.source + ":" + route.epoch.uuidString
+    }
+    private func chronologicalTurns(_ result: JSONValue, provider: String) -> [JSONValue] {
+        guard result["turns"]["data"].hasArrayShape else { return result["thread"]["turns"].array }
+        let turns = result["turns"]["data"].array
+        // Older Codex mobile endpoints expose turns/list's descending default.
+        // Items within each turn already retain their original order.
+        if result["turns"]["order"].string == "descending" ||
+            (result["turns"]["order"].string == nil && provider == "codex") { return Array(turns.reversed()) }
+        return turns
+    }
+    private func activeSnapshotItems(_ turns: [JSONValue], activeTurnId: String?) -> Set<String> {
+        Set(turns.filter { $0["status"].string == "inProgress" || (activeTurnId != nil && $0["id"].string == activeTurnId) }
+            .flatMap { $0["items"].array }.filter { $0["type"].string == "agentMessage" }.compactMap { $0["id"].string })
     }
     func canSend(_ item: BoardItem, composing: Bool) -> Bool {
         isConnected(node: item.identity.nodeId) && selected?.identity == item.identity && conversationCapabilities["send"].bool && !composing && !draft(item.identity).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
@@ -746,7 +799,7 @@ final class AppModel: ObservableObject {
             let result = try await wire.request("conversation/send", params: .object(params))
             guard identity(result["identity"]) == item.identity, result["clientMessageId"].string == id else { throw ConnectionError.malformed }
             let receipt = result["state"].string ?? "unknown"
-            let state = ["accepted", "delivered"].contains(receipt) ? "accepted" : (receipt == "rejected" ? "rejected" : "unknown")
+            let state = pendingActions[id]?.state == "accepted" || ["accepted", "delivered"].contains(receipt) ? "accepted" : (receipt == "rejected" ? "rejected" : "unknown")
             pendingActions[id]?.state = state
             if state == "accepted", draft(item.identity) == text { setDraft("", identity: item.identity) }
             if routeEpoch(for: item.identity.nodeId) == token, selected?.identity == item.identity {
@@ -767,7 +820,9 @@ final class AppModel: ObservableObject {
     }
     func reconcile(_ item: BoardItem) async {
         guard let wire = transport(for: item.identity.nodeId) else { return }
-        let unknown = pendingActions.values.filter { $0.identity == item.identity && $0.state == "unknown" && !$0.id.hasPrefix("answer:") && !$0.id.hasPrefix("approval:") }
+        guard receiptChecksInFlight.insert(item.identity).inserted else { return }
+        defer { receiptChecksInFlight.remove(item.identity) }
+        let unknown = pendingActions.values.filter { $0.identity == item.identity && ($0.state == "unknown" || (item.identity.provider == "claude" && $0.state == "pending")) && !$0.id.hasPrefix("answer:") && !$0.id.hasPrefix("approval:") }
         for action in unknown {
             do {
                 var params: [String: JSONValue] = ["identity": item.identity.json, "clientMessageId": .string(action.id)]
@@ -896,10 +951,12 @@ final class AppModel: ObservableObject {
             if selected?.identity != identity, noticeRequestAction != nil { notice = nil }
             let item = BoardItem(identity: identity, name: "Pika", machine: machines.first(where: { $0.id == identity.nodeId })?.displayName ?? "Machine", state: "ASSISTANT", detail: "")
             selected = item; question = nil; approval = nil; providerItems = [:]; conversationCapabilities = result["capabilities"]
+            ambiguousLiveItems = []; snapshotBackedItems = []; conversationNeedsRefresh = false
             conversationCached = false; historyLoading = false
             historyCursor = result["turns"]["nextCursor"]
             activeTurns[identity] = result["activeTurnId"].string
-            let turns = result["turns"]["data"].array.isEmpty ? result["thread"]["turns"].array : result["turns"]["data"].array
+            let turns = chronologicalTurns(result, provider: identity.provider)
+            snapshotBackedItems = activeSnapshotItems(turns, activeTurnId: result["activeTurnId"].string)
             for entry in turns.flatMap({ $0["items"].array }) { if let id = entry["id"].string { providerItems[id] = entry } }
             messages = turns.flatMap { $0["items"].array.compactMap { entry -> ChatMessage? in
                 guard let type = entry["type"].string, type == "agentMessage" || type == "userMessage", let id = entry["id"].string else { return nil }

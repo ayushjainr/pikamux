@@ -20,6 +20,215 @@ struct Client {
     socket: tungstenite::WebSocket<UnixStream>,
     unsolicited: Vec<Value>,
 }
+
+#[test]
+#[ignore = "Installed Codex with disposable history and loopback fake inference only"]
+fn mobile_long_history_pages_and_reopening_keep_latest_exchange() {
+    let executable = std::env::var_os("PIKA_IOS_CODEX").expect("Explicit provider binary required");
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let socket = home.join("app-server-control/app-server-control.sock");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let worker = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        for index in 0..23 {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut stream = loop {
+                if let Ok((stream, _)) = listener.accept() {
+                    break stream;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Synthetic turn {index} never arrived"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+                assert!(header.len() < 65536);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let length: usize = header
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse().unwrap())
+                })
+                .unwrap();
+            assert!(length < 4 * 1024 * 1024);
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["model"],
+                "isolated-fake"
+            );
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            let item = json!({"type":"message","id":format!("answer-{index}"),"role":"assistant","status":"completed","content":[{"type":"output_text","text":format!("History answer {index:02}"),"annotations":[]}]});
+            for event in [
+                json!({"type":"response.created","response":{"id":format!("response-{index}"),"status":"in_progress","output":[]}}),
+                json!({"type":"response.output_item.added","output_index":0,"item":item}),
+                json!({"type":"response.output_item.done","output_index":0,"item":item}),
+                json!({"type":"response.completed","response":{"id":format!("response-{index}"),"status":"completed","output":[item],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}),
+            ] {
+                writeln!(
+                    stream,
+                    "event: {}\ndata: {}\n",
+                    event["type"].as_str().unwrap(),
+                    event
+                )
+                .unwrap();
+            }
+        }
+    });
+    let mut server = Server(
+        Command::new(executable)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("CODEX_HOME", &home)
+            .env("TMPDIR", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .current_dir(root.path())
+            .args([
+                "-c",
+                "model_provider=\"isolated\"",
+                "-c",
+                "model_providers.isolated.name=\"Isolated\"",
+                "-c",
+                &format!("model_providers.isolated.base_url=\"{url}\""),
+                "-c",
+                "model_providers.isolated.wire_api=\"responses\"",
+                "-c",
+                "model_providers.isolated.requires_openai_auth=false",
+                "-c",
+                "model_providers.isolated.supports_websockets=false",
+                "-c",
+                "analytics.enabled=false",
+                "-c",
+                "features.plugins=false",
+                "-c",
+                "features.shell_snapshot=false",
+                "app-server",
+                "--listen",
+            ])
+            .arg(format!("unix://{}", socket.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline);
+        assert!(server.0.try_wait().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let mut desktop = Client::connect(&socket);
+    let created=desktop.rpc(2,"thread/start",json!({"cwd":root.path(),"model":"isolated-fake","approvalPolicy":"never","sandbox":"read-only"}));
+    let thread = created["result"]["thread"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for index in 0..22 {
+        let started=desktop.rpc(100+index,"turn/start",json!({"threadId":thread,"input":[{"type":"text","text":format!("History question {index:02}")}]}));
+        assert!(started.get("error").is_none(), "{started}");
+        loop {
+            let event = desktop.receive();
+            if event["method"] == "turn/completed" {
+                assert_eq!(event["params"]["turn"]["status"], "completed");
+                break;
+            }
+        }
+    }
+    let db = root.path().join("pika.db");
+    let store = pikamux::store::Store::at(&db);
+    store.initialize().unwrap();
+    let candidate = pikamux::model::Candidate {
+        provider: pikamux::model::Provider::Codex,
+        session_id: thread.clone(),
+        name: Some("Long history".into()),
+        cwd: Some(root.path().display().to_string()),
+        branch: None,
+        transcript_path: None,
+        model: Some("isolated-fake".into()),
+        updated_at: 1.0,
+        live: true,
+        pid: Some(server.0.id() as i64),
+        source: "isolated-history".into(),
+        parent_session_id: None,
+        created_at: 1.0,
+        lifecycle_status: Some(pikamux::model::Status::Ready),
+    };
+    store
+        .adopt_session(&pikamux::core::session_from_candidate(&candidate))
+        .unwrap();
+    let identity = json!({"nodeId":store.ensure_local_node_id().unwrap(),"provider":"codex","threadId":thread});
+    let mut phone = Endpoint::spawn(root.path(), &home, &db);
+    let initial = phone.rpc("conversation/open", json!({"identity":identity}));
+    assert_eq!(initial["result"]["identity"], identity, "{initial}");
+    let sent = phone.rpc("conversation/send", json!({"identity":identity,"clientMessageId":uuid::Uuid::new_v4().to_string(),"text":"History question 22"}));
+    assert_eq!(sent["result"]["state"], "accepted", "{sent}");
+    loop {
+        let event = desktop.receive();
+        if event["method"] == "turn/completed" {
+            assert_eq!(event["params"]["turn"]["status"], "completed");
+            break;
+        }
+    }
+    worker.join().unwrap();
+    let opened = phone.rpc("conversation/open", json!({"identity":identity}));
+    assert_eq!(opened["result"]["identity"], identity, "{opened}");
+    assert_eq!(opened["result"]["turns"]["order"], "chronological");
+    let page_text = |page: &Value| {
+        page["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().unwrap())
+            .filter(|item| item["type"] == "agentMessage")
+            .map(|item| item["text"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        page_text(&opened["result"]["turns"]),
+        (13..23)
+            .map(|i| format!("History answer {i:02}"))
+            .collect::<Vec<_>>()
+    );
+    let older = phone.rpc(
+        "conversation/history",
+        json!({"identity":identity,"cursor":opened["result"]["turns"]["nextCursor"]}),
+    );
+    assert_eq!(
+        page_text(&older["result"]["turns"]),
+        (3..13)
+            .map(|i| format!("History answer {i:02}"))
+            .collect::<Vec<_>>()
+    );
+    drop(phone);
+    let mut returned = Endpoint::spawn(root.path(), &home, &db);
+    let reopened = returned.rpc("conversation/open", json!({"identity":identity}));
+    assert_eq!(
+        page_text(&reopened["result"]["turns"]),
+        page_text(&opened["result"]["turns"])
+    );
+    eprintln!(
+        "REAL CODEX / REAL MOBILE: 23 completed synthetic exchanges, latest 10 chronological, older 10 chronological, reopened exact thread retains answer 22 last; no paid inference."
+    );
+}
 struct Endpoint {
     process: Server,
     input: std::process::ChildStdin,

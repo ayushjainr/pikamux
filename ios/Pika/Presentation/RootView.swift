@@ -61,7 +61,7 @@ struct TestContextBanner: View {
             }
             #if DEBUG
             if !model.isFixture && ProcessInfo.processInfo.arguments.contains("--ssh-integration-test") {
-                Text(ProcessInfo.processInfo.arguments.contains("--multi-machine-integration-test") ? "DISPOSABLE SSH · protocol fixtures, no provider" : "DISPOSABLE SSH INTEGRATION · synthetic model, no quota")
+                Text(ProcessInfo.processInfo.arguments.contains("--multi-machine-integration-test") ? "DISPOSABLE SSH · protocol fixtures, no provider" : "DISPOSABLE SSH INTEGRATION")
                     .font(.caption2.bold()).frame(maxWidth: .infinity).padding(8).background(Color.orange.opacity(0.15))
                     .accessibilityIdentifier("sshIntegrationBanner")
             }

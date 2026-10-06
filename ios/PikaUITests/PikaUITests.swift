@@ -278,6 +278,116 @@ final class PikaUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["This is disposable UI fixture context for Fixture Alpha. No real provider is attached."].waitForExistence(timeout: 5))
         XCTAssertFalse(app.staticTexts["/fixture/notes.txt"].exists)
     }
+    @MainActor func testPagedThreadReopenKeepsLatestAndOlderAnchor() {
+        awaitPagedThreadJourney(legacy: false)
+    }
+    @MainActor func testLegacyPagedThreadReopenKeepsLatestAndOlderAnchor() {
+        awaitPagedThreadJourney(legacy: true)
+    }
+    @MainActor private func awaitPagedThreadJourney(legacy: Bool) {
+        launchFixture(); app.terminate()
+        app.launchArguments = ["--ui-fixture", "--fixture-turn-pages", "--fixture-history-live-append"] + (legacy ? ["--fixture-legacy-order"] : [])
+        app.launch(); app.buttons["thread-fixture-one"].tap()
+        let latest = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Original assistant turn 29.")).firstMatch
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: latest)], timeout: 8), .completed)
+        let composer = app.textViews["composer"]
+        composer.tap(); composer.typeText("reply after thirty original turns"); app.buttons["sendReply"].tap()
+        let reply = app.staticTexts["Latest persisted fixture reply"]
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: reply)], timeout: 8), .completed)
+        let sentUser = app.staticTexts["reply after thirty original turns"]
+        XCTAssertTrue(sentUser.isHittable)
+        XCTAssertLessThan(sentUser.frame.minY, reply.frame.minY, "Provider streaming order must be user then assistant before reopening")
+        let sent = XCTAttachment(screenshot: app.screenshot()); sent.name = "Thirty-turn thread latest reply above keyboard"; sent.lifetime = .keepAlways; add(sent)
+        swipeBack(); app.buttons["thread-fixture-two"].tap(); swipeBack()
+        app.buttons["thread-fixture-one"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: reply)], timeout: 8), .completed, "Reopening the exact thread must keep its latest persisted reply visible")
+        XCTAssertTrue(sentUser.isHittable)
+        XCTAssertLessThan(sentUser.frame.minY, reply.frame.minY, "Persisted order must match live user then assistant order")
+        let reopened = XCTAttachment(screenshot: app.screenshot()); reopened.name = "Exact long thread reopened at latest persisted reply"; reopened.lifetime = .keepAlways; add(reopened)
+        let scroll = app.scrollViews["conversation-fixture-one"]
+        for _ in 0..<20 where !app.buttons["Load older context"].isHittable { scroll.swipeDown() }
+        let anchor = app.staticTexts["Original user turn 20"]
+        let readingY = anchor.frame.minY
+        app.buttons["Load older context"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: anchor)], timeout: 5), .completed, "Prepending older turns must retain the original first-message anchor")
+        XCTAssertEqual(anchor.frame.minY, readingY, accuracy: 5, "Prepending a page must not move the reading anchor")
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Live output appended while older context loads.")).firstMatch.exists, "Concurrent output below the history page must be retained without moving its reading anchor")
+        XCTAssertEqual(app.staticTexts.matching(NSPredicate(format: "label == %@", "Original user turn 20")).count, 1, "Overlapping pages must not duplicate messages")
+        scroll.swipeDown()
+        let previous = app.staticTexts["Original user turn 19"]
+        XCTAssertTrue(previous.isHittable, "Previous chronological turn must immediately precede the anchored page")
+        let evidence = XCTAttachment(screenshot: app.screenshot()); evidence.name = legacy ? "Legacy descending provider page normalized" : "Chronological older page preserves reading anchor"; evidence.lifetime = .keepAlways; add(evidence)
+        composer.tap(); composer.typeText("resume after older page"); app.buttons["sendReply"].tap()
+        let replies = app.staticTexts.matching(NSPredicate(format: "label == %@", "Latest persisted fixture reply"))
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in replies.allElementsBoundByIndex.last?.isHittable == true }, object: nil)], timeout: 8), .completed)
+    }
+    @MainActor func testLiveEventDuringOpenSurvivesHistorySnapshot() {
+        launchFixture(); app.terminate()
+        app.launchArguments = ["--ui-fixture", "--fixture-turn-pages", "--fixture-open-race"]; app.launch()
+        app.buttons["thread-fixture-one"].tap()
+        let live = app.staticTexts["Live output while original history opens"]
+        let composer = app.textViews["composer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        composer.tap(); composer.typeText("verify history response completed")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: app.buttons["sendReply"])], timeout: 8), .completed)
+        XCTAssertTrue(live.exists, "Live output must remain after the authoritative history response")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: live)], timeout: 8), .completed, "Latest output must remain visible after the keyboard settles")
+        XCTAssertLessThanOrEqual(live.frame.maxY, composer.frame.minY)
+        XCTAssertTrue(app.buttons["sendReply"].exists)
+        let evidence = XCTAttachment(screenshot: app.screenshot()); evidence.name = "Live output retained after original history response"; evidence.lifetime = .keepAlways; add(evidence)
+    }
+    @MainActor func testSnapshotPrefixSurvivesDeltaDuringOpen() { verifySnapshotDelta("--fixture-delta-before-open") }
+    @MainActor func testSnapshotPrefixSurvivesBufferedDeltaAfterOpen() { verifySnapshotDelta("--fixture-delta-after-open") }
+    @MainActor private func verifySnapshotDelta(_ argument: String) {
+        launchFixture(); app.terminate(); app.launchArguments = ["--ui-fixture", argument]; app.launch()
+        app.buttons["thread-fixture-one"].tap()
+        XCTAssertTrue(app.staticTexts["Hello world"].waitForExistence(timeout: 5), "A partial delta cannot replace the original snapshot prefix")
+        XCTAssertTrue(app.buttons["Refresh original conversation"].waitForExistence(timeout: 5), "Ambiguous snapshot-backed output must be explicit")
+        XCTAssertFalse(app.staticTexts["Hello world world"].exists, "A buffered delta already in the snapshot must never be appended twice")
+        XCTAssertFalse(app.staticTexts[" world"].exists)
+        XCTAssertTrue(app.staticTexts["Hello world · complete original reply"].waitForExistence(timeout: 12))
+        XCTAssertFalse(app.buttons["Refresh original conversation"].exists, "A full completion resolves the snapshot ambiguity")
+        let evidence = XCTAttachment(screenshot: app.screenshot()); evidence.name = "Authoritative full item resolves \(argument)"; evidence.lifetime = .keepAlways; add(evidence)
+    }
+    @MainActor func testReadOnlyProviderExplainsUnavailableReplies() {
+        launchFixture(); app.terminate(); app.launchArguments = ["--ui-fixture", "--fixture-read-only"]; app.launch()
+        app.buttons["thread-fixture-one"].tap()
+        XCTAssertTrue(app.staticTexts["This original provider supports verified history only; mobile replies are not available."].waitForExistence(timeout: 5))
+        app.textViews["composer"].tap(); app.textViews["composer"].typeText("not dispatched")
+        XCTAssertFalse(app.buttons["sendReply"].isEnabled)
+        XCTAssertFalse(app.buttons["composerCommands"].isEnabled)
+        XCTAssertFalse(app.buttons["composerSkills"].isEnabled)
+    }
+    @MainActor func testExperimentalConnectionNoticePreservesComposer() {
+        launchFixture(); app.terminate(); app.launchArguments = ["--ui-fixture", "--fixture-experimental"]; app.launch()
+        app.buttons["thread-fixture-one"].tap()
+        let info = app.buttons["experimentalConnectionInfo"]
+        XCTAssertTrue(info.waitForExistence(timeout: 5)); info.tap()
+        XCTAssertTrue(app.alerts["Experimental connection"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.alerts.staticTexts["Experimental connection. Native permissions still apply; an uncertain message is never sent twice."].exists)
+        app.alerts.buttons["OK"].tap()
+        let composer = app.textViews["composer"]
+        composer.tap(); composer.typeText("keep my draft")
+        XCTAssertTrue(app.buttons["sendReply"].isEnabled)
+        info.tap(); app.alerts.buttons["OK"].tap()
+        XCTAssertEqual(composer.value as? String, "keep my draft")
+        let evidence = XCTAttachment(screenshot: app.screenshot()); evidence.name = "UI fixture only — experimental notice and native composer"; evidence.lifetime = .keepAlways; add(evidence)
+    }
+    @MainActor func testChannelReplyChecksReceiptWithoutResending() {
+        launchFixture(); app.terminate(); app.launchArguments = ["--ui-fixture", "--fixture-channel-receipt"]; app.launch()
+        app.buttons["thread-fixture-one"].tap()
+        let composer = app.textViews["composer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        composer.tap(); composer.typeText("one outgoing message"); app.buttons["sendReply"].tap()
+        XCTAssertTrue(app.staticTexts["Fixture channel reply — not a native provider proof"].waitForExistence(timeout: 8))
+        XCTAssertTrue(app.staticTexts["The original machine confirmed this message was accepted. It was not sent again."].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["Check original delivery receipt"].exists)
+        composer.tap(); composer.typeText("next draft")
+        XCTAssertEqual(composer.value as? String, "next draft")
+        XCTAssertTrue(app.buttons["sendReply"].isEnabled, "A confirmed original receipt must unlock continuation")
+        XCTAssertTrue(app.staticTexts["Fixture send attempts: 1"].exists, "Receipt checks must never replay the message")
+        let evidence = XCTAttachment(screenshot: app.screenshot()); evidence.name = "UI fixture only — channel receipt permits next message without replay"; evidence.lifetime = .keepAlways; add(evidence)
+    }
     @MainActor func testNativeRecentHistoryFollowAndReadingAnchor() {
         launchFixture(); app.terminate(); app.launchArguments = ["--ui-fixture", "--fixture-long-history"]; app.launch()
         app.buttons["thread-fixture-one"].tap()

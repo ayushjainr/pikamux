@@ -15,6 +15,37 @@ use std::{
 };
 
 const MAX_REQUEST: usize = 128 * 1024;
+
+// Fetch the newest bounded page, but expose turns in reading order. The cursor
+// still belongs to the provider's descending traversal toward older history.
+fn chronological_page(client: &mut Client, thread_id: &str, cursor: Value) -> Result<Value> {
+    let mut page = client.rpc(
+        "thread/turns/list",
+        json!({"threadId":thread_id,"cursor":cursor,"limit":10,"itemsView":"full","sortDirection":"desc"}),
+    )?;
+    page["data"]
+        .as_array_mut()
+        .context("Provider returned an invalid history page")?
+        .reverse();
+    page["order"] = json!("chronological");
+    Ok(page)
+}
+
+fn require_codex_control(provider: Provider, control: &str) -> Result<()> {
+    if provider != Provider::Codex {
+        bail!("Native {control} are not supported by this connection; use the original terminal");
+    }
+    Ok(())
+}
+
+fn visible_model(catalog: &Value, model: &str) -> bool {
+    catalog["data"].as_array().is_some_and(|models| {
+        models
+            .iter()
+            .any(|entry| entry["model"] == model && entry["hidden"] != true)
+    })
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Identity {
@@ -36,12 +67,71 @@ struct Connection {
     client: Client,
     assistant: Option<(std::path::PathBuf, crate::assistant_native::SharedBinding)>,
 }
+struct NativeConnection {
+    identity: Identity,
+    client: NativeClient,
+}
+enum NativeClient {
+    Opencode(crate::mobile_opencode::Client),
+    Claude(crate::mobile_claude::Client),
+}
+impl NativeClient {
+    fn connect(pika: &Pika, provider: Provider, id: &str) -> Result<Option<Self>> {
+        match provider {
+            Provider::Opencode => {
+                Ok(crate::mobile_opencode::Client::connect(pika, id)?.map(Self::Opencode))
+            }
+            Provider::Claude => {
+                Ok(crate::mobile_claude::Client::connect(pika, id)?.map(Self::Claude))
+            }
+            _ => Ok(None),
+        }
+    }
+    fn require_loaded(&self, pika: &Pika) -> Result<()> {
+        match self {
+            Self::Opencode(c) => c.require_loaded(pika),
+            Self::Claude(c) => c.require_loaded(pika),
+        }
+    }
+    fn snapshot(&mut self, pika: &Pika) -> Result<Value> {
+        match self {
+            Self::Opencode(c) => c.snapshot(pika),
+            Self::Claude(c) => c.snapshot(pika),
+        }
+    }
+    fn history(&mut self, pika: &Pika, cursor: Option<&str>) -> Result<Value> {
+        match self {
+            Self::Opencode(c) => c.history(pika, cursor),
+            Self::Claude(c) => c.history(pika, cursor),
+        }
+    }
+    fn send(&mut self, pika: &Pika, id: &str, text: &str, expected: Option<&str>) -> Result<Value> {
+        match self {
+            Self::Opencode(c) => c.send(pika, id, text, expected),
+            Self::Claude(c) => c.send(pika, id, text, expected),
+        }
+    }
+    fn receipt(&mut self, pika: &Pika, id: &str) -> Result<Option<Value>> {
+        match self {
+            Self::Opencode(c) => c.receipt(pika, id),
+            Self::Claude(c) => c.receipt(pika, id),
+        }
+    }
+    fn poll(&mut self, pika: &Pika) -> Result<Vec<Value>> {
+        match self {
+            Self::Opencode(c) => c.poll(pika),
+            Self::Claude(c) => c.poll(pika),
+        }
+    }
+}
 struct Handler<'a> {
     pika: &'a Pika,
     node: String,
     source: Option<crate::activity_feed::Source>,
     subscription: Option<crate::activity_feed::Subscription>,
     selected: Option<Connection>,
+    native_selected: Option<NativeConnection>,
+    history_selection: Option<Identity>,
     journal: Journal,
     remote: Option<crate::mobile_remote::Remote>,
 }
@@ -56,6 +146,8 @@ pub(crate) fn serve(pika: &Pika) -> Result<i32> {
         source: None,
         subscription: None,
         selected: None,
+        native_selected: None,
+        history_selection: None,
         journal,
         remote: None,
     };
@@ -377,6 +469,38 @@ impl Handler<'_> {
     }
 
     fn pump_selected(&mut self, output: &mut impl Write) -> Result<bool> {
+        if let Some(identity) = self.native_selected.as_ref().map(|s| s.identity.clone()) {
+            let pika = self.pika;
+            let result = self.require_watched(&identity).and_then(|()| {
+                // The adapter throttles reads and validates its frozen owner
+                // around each actual read. Avoid a second HTTP request on
+                // every 50ms transport tick before that bounded poll.
+                self.native_selected
+                    .as_mut()
+                    .context("Native selection disappeared")?
+                    .client
+                    .poll(pika)
+            });
+            match result {
+                Ok(events) => {
+                    for frame in events {
+                        emit(
+                            output,
+                            json!({"v":1,"event":"conversation/event","params":{"identity":identity,"method":frame["method"],"params":frame["params"]}}),
+                        )?;
+                    }
+                }
+                Err(error) => {
+                    self.native_selected = None;
+                    emit(
+                        output,
+                        json!({"v":1,"event":"conversation/disconnected","params":{"identity":identity,"message":error.to_string()}}),
+                    )?;
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
         let Some(selected) = self.selected.as_mut() else {
             return Ok(false);
         };
@@ -462,6 +586,16 @@ impl Handler<'_> {
         selected.client.require_owner()?;
         Ok(&mut selected.client)
     }
+    fn native_selected(&mut self, identity: &Identity) -> Result<&mut NativeClient> {
+        self.require_watched(identity)?;
+        let selected = self
+            .native_selected
+            .as_mut()
+            .filter(|s| s.identity == *identity)
+            .context("This conversation has no selected certified native shared connection. Reply in its original terminal, or reopen an eligible shared conversation.")?;
+        selected.client.require_loaded(self.pika)?;
+        Ok(&mut selected.client)
+    }
     fn relay(&mut self, request: &Request) -> Result<Option<Value>> {
         let params = &request.params;
         if matches!(
@@ -507,6 +641,8 @@ impl Handler<'_> {
                     "conversation/open" | "conversation/create"
                 ) {
                     self.selected = None;
+                    self.native_selected = None;
+                    self.history_selection = None;
                 }
                 return Ok(Some(result));
             }
@@ -520,7 +656,7 @@ impl Handler<'_> {
         }
         match request.method.as_str() {
             "hello" => Ok(
-                json!({"nodeId":self.node,"version":crate::VERSION,"capabilities":{"board":true,"codexShared":true,"assistant":true,"create":true,"adopt":true},"providers":Provider::ALL.map(|provider|json!({"id":provider,"availability":if provider==Provider::Codex{"conditional"}else{"unverified"},"reason":if provider==Provider::Codex{"Requires an already-loaded shared server"}else{"Existing running conversation access is not verified"}}))}),
+                json!({"nodeId":self.node,"version":crate::VERSION,"capabilities":{"board":true,"codexShared":true,"assistant":true,"create":true,"adopt":true},"providers":Provider::ALL.map(|provider|json!({"id":provider,"availability":if matches!(provider,Provider::Codex|Provider::Opencode|Provider::Claude){"conditional"}else{"unverified"},"reason":match provider { Provider::Codex=>"Requires an already-loaded shared server", Provider::Opencode=>"Requires an already-running certified native connection from a future managed launch", Provider::Claude=>"Experimental continuation requires an explicitly opted-in future launch; native consent and permissions remain in its terminal", _=>"Existing running conversation access is not verified" }}))}),
             ),
             "board/subscribe" => {
                 if self.source.is_none() {
@@ -535,7 +671,7 @@ impl Handler<'_> {
             ),
             "conversation/open" => self.open_conversation(request),
             "conversation/history" => self.history(request),
-            "conversation/send" => self.send_message(request),
+            "conversation/send" => self.dispatch_message(request),
             "conversation/controls" => self.composer_controls(request),
             "conversation/model" => self.select_model(request),
             "conversation/answer" | "conversation/approve" => self.answer_request(request),
@@ -554,8 +690,36 @@ impl Handler<'_> {
         let params = &request.params;
         let identity = self.identity(params)?;
         self.require_watched(&identity)?;
+        if let Some(mut client) =
+            NativeClient::connect(self.pika, identity.provider, &identity.thread_id)?
+        {
+            let mut result = client.snapshot(self.pika)?;
+            result["identity"] = json!(identity);
+            if result.get("capabilities").is_none() {
+                result["capabilities"] =
+                    json!({"read":true,"send":true,"answer":false,"approvalTypes":[]});
+            }
+            self.native_selected = Some(NativeConnection { identity, client });
+            self.selected = None;
+            self.history_selection = None;
+            self.remote = None;
+            return Ok(result);
+        }
         if identity.provider != Provider::Codex {
-            bail!("This provider's existing-conversation access is not verified");
+            let mut result = crate::mobile_history::page(
+                &self.pika.paths,
+                &self.pika.config,
+                identity.provider,
+                &identity.thread_id,
+                None,
+            )?;
+            result["identity"] = json!(identity);
+            result["capabilities"] = json!({"read":true,"send":false,"answer":false,"approvalTypes":[],"readOnlyReason":"Saved history only; reopen to refresh. Reply from this provider's original terminal until its shared message connection is verified."});
+            self.selected = None;
+            self.native_selected = None;
+            self.history_selection = Some(identity);
+            self.remote = None;
+            return Ok(result);
         }
         let socket = self
             .pika
@@ -568,15 +732,14 @@ impl Handler<'_> {
             json!({"threadId":identity.thread_id,"includeTurns":false}),
         )?["thread"]
             .clone();
-        let turns = client.rpc(
-            "thread/turns/list",
-            json!({"threadId":identity.thread_id,"limit":10,"itemsView":"full"}),
-        )?;
+        let turns = chronological_page(&mut client, &identity.thread_id, Value::Null)?;
         self.selected = Some(Connection {
             identity: identity.clone(),
             client,
             assistant: None,
         });
+        self.native_selected = None;
+        self.history_selection = None;
         self.remote = None;
         Ok(
             json!({"identity":identity,"activeTurnId":active_turn(&turns),"capabilities":{"read":true,"send":true,"answer":true,"approvalTypes":["userInput","commandOnce","fileChangeOnce"]},"thread":thread,"turns":turns}),
@@ -586,16 +749,52 @@ impl Handler<'_> {
     fn history(&mut self, request: &Request) -> Result<Value> {
         let params = &request.params;
         let identity = self.identity(params)?;
+        if self
+            .native_selected
+            .as_ref()
+            .is_some_and(|s| s.identity == identity)
+        {
+            let cursor = params["cursor"]
+                .as_str()
+                .context("History cursor is required")?;
+            let pika = self.pika;
+            let mut result = self
+                .native_selected(&identity)?
+                .history(pika, Some(cursor))?;
+            result["identity"] = json!(identity);
+            return Ok(result);
+        }
+        if identity.provider != Provider::Codex {
+            self.require_watched(&identity)?;
+            if self.history_selection.as_ref() != Some(&identity) {
+                bail!("Open this exact conversation before requesting older history");
+            }
+            let cursor = params["cursor"]
+                .as_str()
+                .context("History cursor is required")?;
+            let mut result = crate::mobile_history::page(
+                &self.pika.paths,
+                &self.pika.config,
+                identity.provider,
+                &identity.thread_id,
+                Some(cursor),
+            )?;
+            result["identity"] = json!(identity);
+            return Ok(result);
+        }
         let cursor = params["cursor"].clone();
-        let page = self.selected(&identity)?.rpc(
-            "thread/turns/list",
-            json!({"threadId":identity.thread_id,"cursor":cursor,"limit":10,"itemsView":"full"}),
-        )?;
+        let page = chronological_page(self.selected(&identity)?, &identity.thread_id, cursor)?;
         Ok(json!({"identity":identity,"turns":page}))
     }
 
     fn composer_controls(&mut self, request: &Request) -> Result<Value> {
         let identity = self.identity(&request.params)?;
+        if matches!(identity.provider, Provider::Opencode | Provider::Claude) {
+            self.native_selected(&identity)?;
+            return Ok(
+                json!({"identity":identity,"modelsError":"Model changes are not supported by this native connection; use the original terminal.","skillsError":"Skill selection is not supported by this native connection; use the original terminal."}),
+            );
+        }
         let client = self.selected(&identity)?;
         client.require_loaded()?;
         let thread = client.rpc(
@@ -622,6 +821,7 @@ impl Handler<'_> {
 
     fn select_model(&mut self, request: &Request) -> Result<Value> {
         let identity = self.identity(&request.params)?;
+        require_codex_control(identity.provider, "model changes")?;
         self.selected(&identity)?;
         if self.journal.lookup(&request.id)?.is_some() {
             return self
@@ -636,11 +836,7 @@ impl Handler<'_> {
         let client = self.selected(&identity)?;
         client.require_loaded()?;
         let catalog = client.rpc("model/list", json!({"limit":100,"includeHidden":false}))?;
-        if !catalog["data"].as_array().is_some_and(|models| {
-            models
-                .iter()
-                .any(|m| m["model"] == model && m["hidden"] != true)
-        }) {
+        if !visible_model(&catalog, model) {
             bail!("Model is not in this provider's current visible catalog");
         }
         if let Some(prior) = self.journal.begin(
@@ -656,6 +852,19 @@ impl Handler<'_> {
         );
         let outcome = model_change_outcome(client, &identity, model, result);
         Ok(self.persist_outcome(&request.id, outcome))
+    }
+
+    fn dispatch_message(&mut self, request: &Request) -> Result<Value> {
+        let params = &request.params;
+        let identity = self.identity(params)?;
+        if !matches!(identity.provider, Provider::Opencode | Provider::Claude) {
+            return self.send_message(request);
+        }
+        let id = params["clientMessageId"]
+            .as_str()
+            .context("Message ID is required")?;
+        let text = requested_message_text(params)?;
+        self.send_native_message(request, &identity, id, text)
     }
 
     fn send_message(&mut self, request: &Request) -> Result<Value> {
@@ -693,6 +902,48 @@ impl Handler<'_> {
         Ok(self.persist_outcome(id, outcome))
     }
 
+    fn send_native_message(
+        &mut self,
+        request: &Request,
+        identity: &Identity,
+        id: &str,
+        text: &str,
+    ) -> Result<Value> {
+        let payload = json!({"method":request.method,"params":request.params});
+        if let Some((prior, mut outcome)) = self.journal.lookup(id)? {
+            if prior != payload {
+                bail!("Operation identifier was reused for different work");
+            }
+            // A prior admission stays authoritative after owner loss or a
+            // reconnect. Never turn an uncertain retry into a predispatch error.
+            outcome["identity"] = json!(identity);
+            outcome["clientMessageId"] = json!(id);
+            return Ok(outcome);
+        }
+        self.native_selected(identity)?;
+        if !requested_skills(&request.params, text)?.is_empty() {
+            bail!("Native skill selection is not supported; use the original terminal");
+        }
+        if let Some(mut prior) = self.journal.begin(id, &payload)? {
+            prior["identity"] = json!(identity);
+            prior["clientMessageId"] = json!(id);
+            return Ok(prior);
+        }
+        // Every failure after durable admission is uncertain: never escape as
+        // rejected_before_dispatch or replay through another provider owner.
+        let pika = self.pika;
+        let result = self.native_selected(identity).and_then(|client| {
+            client.send(pika, id, text, request.params["expectedTurnId"].as_str())
+        });
+        let mut outcome = match result {
+            Ok(result) => result,
+            Err(error) => json!({"state":"unknown","message":error.to_string()}),
+        };
+        outcome["identity"] = json!(identity);
+        outcome["clientMessageId"] = json!(id);
+        Ok(self.persist_outcome(id, outcome))
+    }
+
     fn message_input(&mut self, identity: &Identity, text: &str, params: &Value) -> Result<Value> {
         let references = requested_skills(params, text)?;
         let mut input = vec![json!({"type":"text","text":text})];
@@ -724,6 +975,7 @@ impl Handler<'_> {
     fn answer_request(&mut self, request: &Request) -> Result<Value> {
         let params = &request.params;
         let identity = self.identity(params)?;
+        require_codex_control(identity.provider, "questions and approvals")?;
         let turn = params["turnId"]
             .as_str()
             .context("Question turn ID is required")?;
@@ -766,6 +1018,7 @@ impl Handler<'_> {
     fn request_status(&mut self, request: &Request) -> Result<Value> {
         let params = &request.params;
         let identity = self.identity(params)?;
+        require_codex_control(identity.provider, "question and approval status controls")?;
         let id = &params["requestId"];
         if !(id.is_string() || id.as_i64().is_some()) {
             bail!("Invalid native request ID");
@@ -792,18 +1045,56 @@ impl Handler<'_> {
             .as_str()
             .or_else(|| params["clientOperationId"].as_str())
             .context("Stable operation ID is required")?;
-        let Some((payload, outcome)) = self.journal.lookup(id)? else {
+        let Some((payload, mut outcome)) = self.journal.lookup(id)? else {
             return Ok(json!({"identity":identity,"state":"not-found"}));
         };
         if payload["params"]["identity"] != serde_json::to_value(&identity)? {
             bail!("Receipt belongs to a different exact conversation");
         }
+        if matches!(identity.provider, Provider::Opencode | Provider::Claude) {
+            outcome["identity"] = json!(identity);
+            outcome["clientMessageId"] = json!(id);
+        }
         if payload["method"] == "conversation/send"
             && matches!(outcome["state"].as_str(), Some("accepted" | "unknown"))
         {
+            if matches!(identity.provider, Provider::Opencode | Provider::Claude) {
+                let pika = self.pika;
+                // Reconciliation is read-only. Losing the owner/connection
+                // preserves the original admitted receipt and cannot permit replay.
+                return Ok(match self.native_receipt(&identity, id, pika) {
+                    Ok(Some(mut native)) => {
+                        native["identity"] = json!(identity);
+                        native["clientMessageId"] = json!(id);
+                        self.persist_outcome(id, native)
+                    }
+                    Ok(None) => outcome,
+                    Err(error) => {
+                        let mut retained = outcome;
+                        retained["message"] = json!(format!(
+                            "Receipt remains unverified; do not replay: {error}"
+                        ));
+                        retained
+                    }
+                });
+            }
             return self.reconcile_delivery(params, &identity, id, outcome);
         }
         Ok(outcome)
+    }
+
+    fn native_receipt(
+        &mut self,
+        identity: &Identity,
+        id: &str,
+        pika: &Pika,
+    ) -> Result<Option<Value>> {
+        if identity.provider == Provider::Claude {
+            self.require_watched(identity)?;
+            return crate::mobile_claude::channel::thread_receipt(pika, &identity.thread_id, id);
+        }
+        self.native_selected(identity)
+            .and_then(|client| client.receipt(pika, id))
     }
 
     fn reconcile_delivery(
@@ -979,16 +1270,15 @@ impl Handler<'_> {
             json!({"threadId":identity.thread_id,"includeTurns":false}),
         )?["thread"]
             .clone();
-        let turns = client.rpc(
-            "thread/turns/list",
-            json!({"threadId":identity.thread_id,"limit":10,"itemsView":"full"}),
-        )?;
+        let turns = chronological_page(&mut client, &identity.thread_id, Value::Null)?;
         crate::assistant_native::require_shared_binding(&selection.profile_root, &binding)?;
         self.selected = Some(Connection {
             identity: identity.clone(),
             client,
             assistant: Some((selection.profile_root, binding.clone())),
         });
+        self.native_selected = None;
+        self.history_selection = None;
         self.remote = None;
         Ok(
             json!({"identity":identity,"activeTurnId":active_turn(&turns),"assistant":{"profileId":binding.profile_id,"scope":binding.scope,"memoryEpoch":binding.memory_epoch},"capabilities":{"read":true,"send":true,"answer":true,"approvalTypes":["userInput","commandOnce","fileChangeOnce"]},"thread":thread,"turns":turns}),
@@ -1101,6 +1391,8 @@ impl Handler<'_> {
             "thread/name/set",
             json!({"threadId":thread,"name":intent.name}),
         )?;
+        self.history_selection = None;
+        self.native_selected = None;
         self.selected = Some(Connection {
             identity: identity.clone(),
             client,

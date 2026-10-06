@@ -141,7 +141,42 @@ final class PikaSSHIntegrationTests: XCTestCase {
         XCTAssertTrue(row.waitForExistence(timeout: 20), "Saved login must reconnect without a repeated host challenge")
         XCTAssertFalse(app.buttons["I verified this fingerprint"].exists)
         row.tap()
-        XCTAssertTrue(app.staticTexts[config.expectedContext].waitForExistence(timeout: 15))
+        if !config.expectedContext.isEmpty {
+            XCTAssertTrue(app.staticTexts[config.expectedContext].waitForExistence(timeout: 15))
+        }
+        if config.mode == "readOnly" {
+            guard let response = config.finalResponse else { XCTFail("Read-only original response required"); return }
+            XCTAssertTrue(app.staticTexts[response].waitForExistence(timeout: 20))
+            XCTAssertFalse(app.buttons["sendReply"].isEnabled, "Dead native owner must not offer a send route")
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.4)).press(forDuration: 0.1, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.4)))
+            XCTAssertTrue(row.waitForExistence(timeout: 10)); row.tap()
+            XCTAssertTrue(app.staticTexts[config.expectedContext].waitForExistence(timeout: 20))
+            XCTAssertTrue(app.staticTexts[response].waitForExistence(timeout: 20))
+            let reopened = XCTAttachment(screenshot: app.screenshot()); reopened.name = "Actual SSH original Claude history after native exit"; reopened.lifetime = .keepAlways; add(reopened)
+            return
+        }
+        if config.mode == "native" {
+            guard let reply = config.reply, let response = config.finalResponse else { XCTFail("Native prompt and response required"); return }
+            let composer = app.textViews["composer"]
+            XCTAssertTrue(composer.waitForExistence(timeout: 10))
+            composer.tap(); composer.typeText(reply)
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: app.buttons["sendReply"])], timeout: 20), .completed)
+            app.buttons["sendReply"].tap()
+            let result = app.staticTexts[response]
+            XCTAssertTrue(result.waitForExistence(timeout: 30))
+            composer.tap(); composer.typeText("Unsent receipt readiness check")
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: app.buttons["sendReply"])], timeout: 20), .completed, "Verified native reply receipt must restore the composer without replay")
+            composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: "Unsent receipt readiness check".count))
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: result)], timeout: 10), .completed, "Latest native reply must be visible above the keyboard")
+            XCTAssertTrue(app.keyboards.firstMatch.exists)
+            let keyboard = XCTAttachment(screenshot: app.screenshot()); keyboard.name = "Actual OpenCode original reply with keyboard"; keyboard.lifetime = .keepAlways; add(keyboard)
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.4)).press(forDuration: 0.1, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.4)))
+            XCTAssertTrue(row.waitForExistence(timeout: 10)); row.tap()
+            XCTAssertTrue(result.waitForExistence(timeout: 20))
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: result)], timeout: 10), .completed)
+            let reopened = XCTAttachment(screenshot: app.screenshot()); reopened.name = "Actual OpenCode exact conversation reopened latest reply"; reopened.lifetime = .keepAlways; add(reopened)
+            return
+        }
         let restoredComposer = app.textViews["composer"]
         restoredComposer.tap(); restoredComposer.typeText("saved reconnect draft")
         XCUIDevice.shared.press(.home); app.activate()

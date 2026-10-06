@@ -11,17 +11,30 @@ struct ThreadView: View {
     @State private var nearBottom = true
     @State private var viewportHeight: CGFloat = 0
     @State private var bottomPosition: CGFloat = 0
+    @StateObject private var historyScroll = HistoryReadingAnchor()
     @State private var readingGesture = false
     @State private var sendScrollRequest = 0
     @State private var controlPicker: ComposerPicker?
+    @State private var showExperimentalNotice = false
     private var liveItem: BoardItem { model.board.first(where: { $0.identity == item.identity }) ?? item }
     private var machineName: String { model.machineName(for: item.identity.nodeId, fallback: liveItem.machine) }
+    private var historyOnly: Bool { !model.conversationCapabilities["send"].bool && model.conversationCapabilities["readOnlyReason"].string != nil }
+    private var experimentalNotice: String? {
+        guard model.selected?.identity == item.identity,
+            let text = model.conversationCapabilities["experimentalNotice"].string,
+            !text.isEmpty else { return nil }
+        return String(text.prefix(800))
+    }
     var body: some View {
         ScrollViewReader { proxy in
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 TestContextBanner()
                 if model.selected?.identity == item.identity, model.conversationCached { Text("Cached conversation · reconnect to verify current context").font(.caption).foregroundStyle(.secondary) }
+                if model.selected?.identity == item.identity, model.conversationNeedsRefresh {
+                    Text("Live reply updating · original snapshot preserved until the provider completes. Refresh to verify current output.").font(.caption).foregroundStyle(.secondary)
+                    Button("Refresh original conversation") { Task { await attachVisible(force: true) } }.buttonStyle(.bordered)
+                }
                 if model.selected?.identity == item.identity, model.conversationCapabilities == .null {
                     Button(model.isConnected(node: item.identity.nodeId) ? "Recheck original conversation" : "Reconnect machine") {
                         Task { if model.isConnected(node: item.identity.nodeId) { await attachVisible(force: true) } else { model.retryConnection() } }
@@ -30,8 +43,17 @@ struct ThreadView: View {
                 if model.selected?.identity == item.identity, model.historyCursor != .null {
                     Button(model.historyLoading ? "Reading older context…" : "Load older context") {
                         let anchor = model.messages.first?.id
+                        let token = model.conversationReadToken(for: item.identity)
+                        let captured = anchor.map { historyScroll.capture(messageId: $0, token: token) } ?? false
                         nearBottom = false
-                        Task { await model.loadOlder(item); await Task.yield(); if let anchor { proxy.scrollTo(anchor, anchor: .top) } }
+                        Task {
+                            await model.loadOlder(item)
+                            // Allow native content size to reflect SwiftUI's prepend.
+                            try? await Task.sleep(for: .milliseconds(50))
+                            guard let token, model.conversationReadToken(for: item.identity) == token else { historyScroll.cancel(); return }
+                            if captured { historyScroll.restore(token: token) }
+                            else if let anchor { proxy.scrollTo(anchor, anchor: .top) }
+                        }
                     }.font(.caption.weight(.medium)).buttonStyle(.bordered)
                         .buttonBorderShape(.capsule).frame(maxWidth: .infinity).disabled(model.historyLoading)
                 }
@@ -55,6 +77,7 @@ struct ThreadView: View {
                 }
                 if model.messages.isEmpty { Text(model.isConnected(node: item.identity.nodeId) ? "Reading the exact existing conversation…" : "Reconnect to read current context.").foregroundStyle(.secondary) }
                 ForEach(model.selected?.identity == item.identity ? model.messages : []) { message in
+                    Group {
                     if message.role == "user" {
                         HStack { Spacer(minLength: 36); Text(message.text).textSelection(.enabled).lineSpacing(4)
                             .padding(.horizontal, 16).padding(.vertical, 12)
@@ -69,6 +92,12 @@ struct ThreadView: View {
                             RichReply(text: message.text).equatable()
                         }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 8)
                     }
+                    }.id(message.id)
+                        .background {
+                            if message.id == model.messages.first?.id || message.id == historyScroll.anchorMessageId {
+                                HistoryScrollProbe(controller: historyScroll, messageId: message.id)
+                            }
+                        }
                 }
                 if model.selected?.identity == item.identity, let question = model.question { QuestionView(question: question, identity: item.identity).id(question.id + ":" + String(describing: question.requestId)) }
                 if model.selected?.identity == item.identity, let request = model.approval, request.identity == item.identity {
@@ -78,7 +107,7 @@ struct ThreadView: View {
                     }.id(request.id)
                 }
                 if model.conversationCapabilities != .null, !model.conversationCapabilities["send"].bool {
-                    Text("This provider does not expose verified mobile replies for this existing conversation.")
+                    Text(model.conversationCapabilities["readOnlyReason"].string ?? "This provider does not expose verified mobile replies for this existing conversation.")
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 Color.clear.frame(height: 1).id("conversation-bottom")
@@ -91,6 +120,7 @@ struct ThreadView: View {
                 if positioned, nearBottom { Task { @MainActor in await Task.yield(); if nearBottom, !readingGesture { proxy.scrollTo("conversation-bottom", anchor: .bottom) } } }
             }
             .onPreferenceChange(ConversationBottomKey.self) {
+                historyScroll.restoreIfAnchorMoved(token: model.conversationReadToken(for: item.identity))
                 bottomPosition = $0
                 if readingGesture { nearBottom = $0 <= viewportHeight + 80 }
                 else if positioned, nearBottom, $0 > viewportHeight + 1 {
@@ -114,6 +144,13 @@ struct ThreadView: View {
             .onChange(of: sendScrollRequest) { _, _ in
                 proxy.scrollTo("conversation-bottom", anchor: .bottom)
             }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidChangeFrameNotification)) { _ in
+                guard positioned, nearBottom, !readingGesture else { return }
+                Task { @MainActor in
+                    await Task.yield()
+                    if nearBottom, !readingGesture { proxy.scrollTo("conversation-bottom", anchor: .bottom) }
+                }
+            }
             .scrollDismissesKeyboard(.interactively).background(PikaTheme.background)
             .onAppear { Task { await attachVisible() } }
             .sheet(item: $controlPicker) { picker in
@@ -126,7 +163,7 @@ struct ThreadView: View {
                 }
             }
             .onChange(of: model.draft(item.identity)) { _, draft in
-                guard !composing else { return }
+                guard !composing, !historyOnly else { return }
                 let trigger = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard trigger == "/" || trigger == "/model" || draft.split(whereSeparator: { $0.isWhitespace }).last == "$" else { return }
                 Task {
@@ -183,8 +220,14 @@ struct ThreadView: View {
                 Button("/ Commands") { controlPicker = .commands }.accessibilityIdentifier("composerCommands")
                 Button("$ Skills") { controlPicker = .skills }.accessibilityIdentifier("composerSkills")
                 Spacer()
+                if experimentalNotice != nil {
+                    Button { showExperimentalNotice = true } label: {
+                        Label("Experimental", systemImage: "info.circle")
+                    }.accessibilityIdentifier("experimentalConnectionInfo")
+                }
             }.font(.caption).padding(.horizontal, 12).padding(.bottom, 6)
-                .disabled(!model.isConnected(node: item.identity.nodeId) || model.selected?.identity != item.identity || model.conversationCached)
+                .disabled(!model.isConnected(node: item.identity.nodeId) || model.selected?.identity != item.identity || model.conversationCached ||
+                    historyOnly)
             HStack(alignment: .bottom, spacing: 8) {
                 NativeComposer(text: Binding(get: { model.draft(item.identity) }, set: { model.setDraft($0, identity: item.identity) }),
                     composing: $composing, label: "Reply to \(liveItem.name) on \(machineName)", send: send)
@@ -202,8 +245,14 @@ struct ThreadView: View {
             }.padding(8).background(PikaTheme.sheet, in: RoundedRectangle(cornerRadius: 28))
                 .overlay(RoundedRectangle(cornerRadius: 28).strokeBorder(.primary.opacity(0.10), lineWidth: 0.5))
         }.padding(.horizontal, 16).padding(.vertical, verticalSizeClass == .compact ? 4 : 10).background(PikaTheme.background)
+            .alert("Experimental connection", isPresented: $showExperimentalNotice) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text(experimentalNotice ?? "This connection is no longer active. Reopen the original conversation to verify its state.")
+            }
     }
     private func send() {
+        guard !historyOnly else { return }
         let trigger = model.draft(item.identity).trimmingCharacters(in: .whitespacesAndNewlines)
         if trigger == "/" || trigger == "/model" {
             controlPicker = trigger == "/model" ? .models : .commands
@@ -318,6 +367,63 @@ private struct ConversationBottomKey: PreferenceKey {
 private struct ConversationViewportKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+/// Presentation-only native offset capture: no connection or transcript ownership.
+@MainActor private final class HistoryReadingAnchor: ObservableObject {
+    weak var scrollView: UIScrollView?
+    private weak var anchorView: UIView?
+    private var registeredId: String?
+    @Published private(set) var anchorMessageId: String?
+    private var saved: (offset: CGPoint, y: CGFloat, token: String)?
+    func register(view: UIView, messageId: String, scroll: UIScrollView) {
+        guard anchorMessageId == nil || anchorMessageId == messageId else { return }
+        anchorView = view; registeredId = messageId; scrollView = scroll
+    }
+    func capture(messageId: String, token: String?) -> Bool {
+        guard let token, let scrollView, let anchorView, registeredId == messageId else { return false }
+        saved = (scrollView.contentOffset, anchorView.convert(anchorView.bounds, to: scrollView).minY, token)
+        anchorMessageId = messageId
+        return true
+    }
+    func restoreIfAnchorMoved(token: String?) {
+        guard let saved else { return }
+        guard token == saved.token else { cancel(); return }
+        guard let scrollView, let anchorView,
+            abs(anchorView.convert(anchorView.bounds, to: scrollView).minY - saved.y) > 1 else { return }
+        restore(token: token)
+    }
+    func restore(token: String?) {
+        guard let saved else { return }
+        guard token == saved.token else { cancel(); return }
+        guard let scrollView, let anchorView else { cancel(); return }
+        scrollView.layoutIfNeeded()
+        let delta = anchorView.convert(anchorView.bounds, to: scrollView).minY - saved.y
+        cancel()
+        scrollView.setContentOffset(CGPoint(x: saved.offset.x,
+            y: saved.offset.y + delta), animated: false)
+    }
+    func cancel() { saved = nil; anchorMessageId = nil }
+}
+private struct HistoryScrollProbe: UIViewRepresentable {
+    let controller: HistoryReadingAnchor
+    let messageId: String
+    func makeUIView(context: Context) -> Probe {
+        let view = Probe(); view.controller = controller; view.messageId = messageId; view.isUserInteractionEnabled = false
+        return view
+    }
+    func updateUIView(_ uiView: Probe, context: Context) { uiView.connect() }
+    final class Probe: UIView {
+        weak var controller: HistoryReadingAnchor?
+        var messageId = ""
+        override func didMoveToWindow() { super.didMoveToWindow(); connect() }
+        func connect() {
+            var ancestor = superview
+            while let view = ancestor {
+                if let scroll = view as? UIScrollView { controller?.register(view: self, messageId: messageId, scroll: scroll); return }
+                ancestor = view.superview
+            }
+        }
+    }
 }
 
 struct QuestionView: View {

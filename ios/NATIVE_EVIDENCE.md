@@ -1,5 +1,106 @@
 # Native iOS evidence ledger
 
+Current scope amendment (2026-10-04): the user approved future shared-control
+launches. The earlier pending-decision/saved-history-only statements below record
+the prior checkpoint; see the later provider investigation and native OpenCode
+results for subsequent work. Nothing in this ledger establishes a fleet release
+or a physical-iPhone installation of these changes.
+
+## Mobile history gaps — 2026-10-03 (unreleased work)
+
+Approved outcomes: fix long-thread reopening/paging and support other providers'
+existing mobile conversations. **The second outcome is not complete:** the new
+Claude/OpenCode/Muse adapter is saved-history-only, not original-owner messaging.
+No provider is launched, resumed, or forked by history reads. Replies remain
+explicitly unavailable. Future launch changes require the pending user decision;
+no current agent, phone installation or fleet server was changed by this work.
+
+`mobile_long_history_pages_and_reopening_keep_latest_exchange` passed against
+the installed Codex using disposable homes and loopback fake inference: 22
+completed desktop exchanges, then an actual `_mobile` send and reply, latest ten
+turns in chronological order, previous ten in chronological order, and a new
+mobile process reopening the exact same thread with the last reply still last.
+Final measured run: 1 passed in 1.84 seconds (not a performance benchmark).
+This is real provider/endpoint proof, not a physical iPhone or live-model claim.
+
+`mobile_history_journey` passed 3/3 through actual `_mobile` subprocesses with
+synthetic native provider stores and denied provider executables. Each exercises
+85 literal messages, older paging, exact identities, preserved unread state,
+rejected unwatched access and rejected sends. It does **not** prove live provider
+ingress or complete compatibility with every historical provider schema.
+`ios_mobile_fleet` routing/revocation regression passed 1/1.
+
+Native pages request Codex's descending traversal explicitly, reverse only the
+turns (not their items), and mark chronological order while retaining its cursor.
+The phone also recognizes legacy unmarked Codex descending pages. Streaming
+without a snapshot watermark cannot safely concatenate an overlapping partial
+item; the implementation preserves the snapshot and waits for the full completed
+item, with a visible refresh explanation, instead of guessing text overlap.
+
+Review caught that overlap race and missing Muse user-display/steer records;
+both are being validated. Final simulator results and reviewer disposition must
+be recorded below before claiming the history fix complete. Initial simulator
+run at `/tmp/pika-history-ios.XU7zaf/history.xcresult` had 4 passes and 1 failure:
+the latest retained text was behind the keyboard. It is not passing evidence.
+The follow-up fixes keyboard-settled following without resuming intentional
+older-history reading. SQLite history access is database-read-only; SQLite may
+create/update its normal WAL shared-memory coordination sidecar.
+
+Final native regression evidence: four installed-Codex/fake-inference journeys
+passed in 3.84s, including the new long-history test, model/skills, lost-message
+receipt recovery, and shared-owner/stale-steering checks. A prior combined run
+failed its synthetic HTTP fixture because accepted sockets inherited nonblocking
+mode; explicitly making that fixture connection blocking fixed it. The passing
+repeat did not change provider production behavior to accommodate the test.
+
+`/tmp/pika-mobile-gaps-native-final.log`: library 860 passed, 6 explicitly ignored;
+fleet routing/revocation 1 passed; provider-history endpoint journeys 5 passed.
+Earlier library validation failed two new SQLite fixtures using macOS `/tmp`
+symlink paths with strict NOFOLLOW. Fixture roots were canonicalized; production
+NOFOLLOW was retained. The final endpoint suite adds refusal of Claude rewind
+and compaction: **only verified linear parent-linked Claude histories up to
+16 MiB are supported in this interim adapter**. Missing/disconnected ancestry,
+repeated IDs and native relinking cases stay unavailable. This is safe partial
+support, not fulfillment of arbitrary Claude history or mobile sending.
+
+Native UI evidence (explicit in-app endpoint doubles, not SSH/model journeys):
+`/tmp/pika-history-ios.XU7zaf/history-refined.xcresult` was an intermediate
+6/8 run: prefix/full-completion and read-only/following checks passed, strict
+pixel anchors failed. `/tmp/pika-history-ios.XU7zaf/history-final.xcresult`
+then passed five selected tests, with no skipped tests or runtime warnings.
+The final anchor implementation was strengthened again to use the original
+message's native rectangle, not total content height, and to fence restoration
+by exact selection and route generation. This prevents concurrently arriving
+output below the reader from shifting their position.
+
+`/tmp/pika-history-ios.XU7zaf/history-anchor-concurrent-fixed.xcresult`
+passed three selected journeys in 122.755s, zero failures/skips/runtime warnings:
+legacy and chronological page orders retain the original visible message within
+5pt while output arrives below during the history request; read-only explanation
+and disabled controls also pass. Its first build failed on a RouteEpoch/UUID
+type mismatch and is retained separately, not counted as passing evidence.
+
+Root visual inspection found the newly added UI fixture initially emitted an
+assistant completion before its user completion, despite correct persisted
+order. The fixture now emits user then reply and asserts visible order before
+and after reopening. The final two-test repeat is still required below.
+Independent adversarial review scored the supported history slice 95/100
+conditional on that final repeat, but the full original open-and-reply scope
+70/100 because non-Codex sends and complex Claude histories remain unavailable.
+
+Final repeat verified by root with `xcresulttool`: 2 passed, 0 failed/skipped,
+runtimeWarnings empty in
+`/tmp/pika-history-ios.XU7zaf/history-chronological-final.xcresult` (95.982s test
+operations). Both legacy/current thirty-turn journeys assert user then reply
+visible above the keyboard, correct order after reopening, and older-page anchor
+within 5pt during concurrent arriving output. Root visually inspected the final
+keyboard screenshot
+`/tmp/pika-history-ios.XU7zaf/chronological-final-attachments/AE5FAE74-5FBF-49B7-9B55-A86B1F32FA9C.png`.
+The review condition is satisfied for this history slice: self/reviewer 95/100.
+Overall remains self/reviewer 70/100 and incomplete; future provider-control
+launch changes need the outstanding authorization and original-owner protocol
+verification. None of this work is published or installed on fleet/phone.
+
 ## Native composer controls — 2026-10-03
 
 Workspace implementation only; these controls are not deployed to existing
@@ -774,3 +875,599 @@ Fixture stop marker was applied after both tests; its owner exited 0 and all
 three owned loopback listeners (59431–59433) were confirmed stopped. Generated
 keys/config/logs remain only in that disposable fixture root. Whitespace check
 passed. No commit, tag, publication or device/installed-command cutover here.
+# Future provider shared-control investigation — 2026-10-04
+
+User approved changes to future managed launches, not existing running agents.
+No provider is considered mobile-writable merely because its saved history loads.
+
+Muse native probe used installed signed `1.3.0-R3401.1`, an isolated canonical
+temporary HOME/XDG tree, native interactive TUI with `--provider echo`, disabled
+shell/write tools, and `MUSE_EXPERIMENTAL_EXTERNAL_AGENT_INGRESS=on`.
+Native discovery returned the exact fresh session; a desktop prompt and its echo
+reply appeared in that TUI without model quota. Native `session-message send`
+returned `status: unavailable`, `error_code: sender_unverified`, `receipts: []`.
+The documented display-context variant and a byte-identical signed binary named
+`muse` returned the same failure. Signature verification passed. This is a failed
+ingress probe, **not** a passing mobile journey. No production launch flag or
+permission bypass was installed. Initial `/tmp` symlink registry rejection was
+resolved in the fixture by using its canonical `/private/tmp` paths.
+
+Claude Code native `2.1.272` channel probe is **blocked, not completed**.
+Disposable proof root `/tmp/pika-claude-channel.t3WQxs/RESULT.md` records the
+sanitized command, isolation, protocol and failed result. Native interactive
+launch used explicit fresh `--session-id`, launch-local `--mcp-config`,
+`--dangerously-load-development-channels server:pika`, and isolation-only
+`--bare --strict-mcp-config`. Fake inference remained loopback with a fake key.
+MCP child PID 90227, parent native PID 90203, received `initialize` from
+`claude-code 2.1.272`, `notifications/initialized`, and `tools/list`; original
+session was `7f31bb0f-30af-48bd-84c0-6a8d686ecaa2`.
+Structured phone channel notification was written, explicitly not acknowledged.
+Native diagnostic: `Channel notifications skipped: channels feature is not
+currently available`; TUI: `Channels are not currently available`.
+No correlated reply was received, so no original-conversation mobile send/reply
+success is claimed. Owned native/MCP processes were confirmed stopped at
+2026-10-04 10:27 UTC; existing agents were untouched. No gate/cache/policy bypass,
+real credentials, quota, fleet or user transcripts were used.
+
+Official contract: <https://code.claude.com/docs/en/channels> and
+<https://code.claude.com/docs/en/channels-reference>. Development channels bypass
+the preview plugin allowlist, not provider availability or managed
+`channelsEnabled` policy; native consent must remain honored. Next supported
+step is provider preview availability for an eligible runtime/account and, where
+managed, administrator channel policy/plugin approval, then a fresh isolated
+native consent/send/correlated-reply test. No production channel enablement or
+provider source implementation was added. Production launch integration must
+preserve existing MCP configuration rather than adopting isolation-only strict
+configuration. Official Remote Control is not a documented Pika ingress API:
+<https://code.claude.com/docs/en/remote-control>.
+
+## OpenCode direct native protocol evidence — 2026-10-04
+
+Installed native OpenCode `1.18.31` passed the disposable
+`ios_opencode_shared_spike` test: 1 passed, 4.81 seconds (run 90382).
+An actual terminal-typed prompt reached synthetic loopback inference. The native
+TUI then selected a deliberately separate session; a direct second-client reply
+addressed the original session, retained its initial prompt/reply context, left
+the second session's message history unchanged, and appeared when the same TUI
+reopened the original. Original server and TUI process generations were unchanged.
+This establishes exact durable server-session authority, not a guarantee that
+the desktop currently displays the phone's selected conversation.
+
+The proven route is authenticated loopback native `serve` plus native `attach`,
+using `/session/{id}/prompt_async` and exact native message IDs. Native bounded
+older pages use the **opaque `X-Next-Cursor` header**, not a message ID: the latter
+failed with HTTP 400 in two probes. A limit-one/older-cursor journey passed;
+the greater-than-100-message Pika endpoint journey remains separate evidence.
+The newer `/api/session` engine admitted synthetic input but did not produce
+inference; default TUI `--port` accepted TCP but returned no HTTP response in
+three isolated retries. Neither unproved route is enabled. Native duplicate
+message IDs are not treated as inference-idempotent; Pika's durable operation
+journal forbids replay after an unknown result.
+
+New `mobile_opencode`, launch, transport, private-storage and Linux-proof modules
+scope future supported launches to one owned server/TUI pair. Credentials use
+private files and `Command.env`, not terminal command arguments. Both generations,
+launch identity, native session, directory and connected kernel socket owner are
+checked. Unsupported launch options retain ordinary native launch behavior.
+Terminal exit/interrupt cleans and reaps only owned children; server exit is
+peeked without reaping before owned-group cleanup. Existing running agents are
+not migrated. Reverted native history fails closed, including the connected poll.
+
+Focused tests: 5 passed, 0.61 seconds (run 38446), covering atomic session/owner
+admission, explicit-untrack refusal, actual Darwin foreign-read ACL and hardlink
+denial, and actual loopback socket ownership. An unrelated live PID received
+**no authentication bytes**. Linux proof has source/tests but no Linux native
+runtime result here. All probes used disposable HOME/XDG/Pika/database/tmux paths,
+fake credentials and loopback inference; no quota, fleet, real transcripts or
+installed configuration changes. This is not full Pika phone/UI completion.
+
+## OpenCode Pika endpoint acceptance — 2026-10-04
+
+The actual native OpenCode `1.18.31` plus compiled Pika `_mobile` journey
+`future_native_launch_mobile_reopen_and_lost_ack_never_replay` passed: 1 passed,
+15.76 seconds runtime, 0.79 seconds build; completed by 11:28:53 UTC.
+The normal public future-launch command ran in an isolated tmux terminal,
+with the real generated Pika lifecycle plugin and synthetic loopback inference.
+Phone-protocol open did not launch a provider. Two consecutive sends produced
+chronological replies in the original native TUI/session/process generations.
+The plugin and public-list reconciliation preserved its exact original TUI PID
+and pane, without classifying the certified local server as another owner.
+
+Dropping the phone transport after dispatch, reopening, querying the exact
+native message receipt, and retrying the same operation ID produced no repeated
+inference. Altering the isolated owner generation rejected a fresh operation
+before dispatch while retaining the prior delivered receipt. Unsupported native
+model/skill/approval controls stayed explicit rather than claiming parity.
+
+105 actual native `noReply` messages crossed the 100-message snapshot boundary
+using the native opaque cursor. The older page was chronological and had no
+duplicated native IDs; seeding and paging made no inference calls. A native
+revert after connection caused a disconnect and denied open/new send without
+inference. Closing only the owned terminal reaped the exact TUI, server and
+supervisor generations.
+
+After the negative revert test, the supported native `unrevert` restored the
+original history. Following complete terminal/server/supervisor exit, public
+`pika open` addressed the exact existing provider ID in the disposable terminal.
+Cold resume retained the sole watched conversation and older delivered reply,
+with new launch token, TUI and server generations. Launch made no inference
+requests. A fresh phone send produced a chronological exact delivered reply,
+visible in the resumed original native conversation's TUI. Closing that terminal
+also reaped all its owned generations. No source change was required for this
+additional acceptance proof.
+
+The unchanged final assertions first exposed two real reconciliation defects:
+pending-to-native pane tags were not handed off, then the certified sibling
+server was treated as an unverified extra provider process. Failed isolated
+fixtures remain at `/tmp/pika-opencode-mobile-Iy67XR` and
+`/tmp/pika-opencode-mobile-JXkLDs`; the fixes retained full process-tree checks
+and exempted only the exactly certified pair. The final successful fixture was
+removed. The read-only saved-history regression also passed 1/1 in 0.81 seconds.
+
+Reproduce with the repository's disposable-home wrapper, explicit installed
+OpenCode/tmux paths, and `cargo test --test ios_opencode_mobile_spike
+future_native_launch_mobile_reopen_and_lost_ack_never_replay -- --ignored
+--nocapture`. Build profiles used debug=0 and Rust 1.88.0. All native provider,
+configuration, database, tmp and tmux paths were disposable; no quota, user
+transcripts, fleet machines, installed Pika/configuration, or existing running
+agents were touched. This proves the actual provider/Pika protocol journey;
+it does not claim a new native-provider iOS simulator journey or Linux runtime
+proof.
+
+## Actual OpenCode native iOS simulator journey — 2026-10-05 UTC
+
+`/tmp/pika-opencode-simulator-9JOAgb/native-02.xcresult` passed 1/1, with
+zero failures/skips/runtime warnings and 56.502 seconds of test operations.
+This was the built native iOS app on simulator
+`98ECDE03-E8B5-4E7C-ABBE-DBC0C5935D27`, ordinary loopback OpenSSH, the compiled
+production `pika _mobile`, and actual installed OpenCode 1.18.31. It did not use
+`--ui-fixture` or a protocol/provider double. Only model inference was synthetic
+loopback; no account, quota, real transcript, fleet or phone install was used.
+
+The existing public-launch/cold-resume test held its original certified native
+TUI/server/session for a bounded opt-in window. The app manually entered its
+disposable SSH login/key, verified the disposable host fingerprint, saved login,
+restarted, opened the exact existing OpenCode thread, sent one distinct prompt,
+and showed the full latest reply above the still-visible native keyboard.
+Leaving and reopening retained that same latest reply. The held fixture then
+independently verified the exact prompt/reply in chronological native history,
+the original TUI visibly containing the reply, unchanged owner generation and
+exactly one new inference request. It passed 1/1 in 433.60 seconds including the
+deliberate simulator/build hold. Terminal exit reaped its owned TUI/server/
+supervisor; fixture cleanup removed the disposable provider root. Owned loopback
+sshd PID22534 stopped, and the test credentials remain only in the evidence root.
+
+Visually inspected attachments:
+
+- Keyboard: `/tmp/pika-opencode-simulator-9JOAgb/attachments-02/F525E9FD-F5C9-404C-B691-CBD55E40931C.png`.
+- Reopened: `/tmp/pika-opencode-simulator-9JOAgb/attachments-02/912AFCB1-EE97-44EA-B879-2F7C3A59C304.png`.
+
+Both show the unique user message before the complete OpenCode reply, with that
+latest reply visible. The first attachment includes the native keyboard.
+The first run remains `native-01.xcresult`: failure after 45.940 seconds because
+the test precreated Pika state mode0755 and real board subscription correctly
+rejected it as not owner-only. The fixture now creates its disposable directories
+mode0700; no application privacy check was weakened.
+
+Reproduction uses `PIKA_IOS_OPENCODE_READY=<evidence>/ready.json` with the existing
+ignored native OpenCode mobile test. It emits only fixture identity/environment,
+holds at most600 seconds and releases on `<evidence>/ready.stop`, with independent
+native reply and cleanup assertions. Configure a new disposable loopback sshd
+ForceCommand with exactly that environment and compiled Pika `_mobile`, then
+run the existing `PikaSSHIntegrationTests` with configuration `mode=native`,
+the emitted thread/context/reply, a fresh store UUID and new test keys. Use the
+earlier isolated Xcode invocation with `PIKA_SSH_TEST_CONFIG=<config>` and
+`-only-testing:PikaUITests/PikaSSHIntegrationTests`. No production iOS transport
+or application behavior change was required. Linux runtime remains separately
+reported; this simulator result does not imply unsupported model/skill/approval
+control parity or Claude/Muse send capability.
+
+## Concurrent native OpenCode future launches — 2026-10-05 UTC
+
+Actual installed OpenCode 1.18.31 on macOS passed
+`concurrent_managed_native_launches_keep_exact_ports_owners_and_messages`: 1/1,
+18.43 seconds runtime, 8.70 seconds build, complete by 03:40:54 UTC. Two public
+managed `pika new` commands shared one disposable Pika/provider home but retained
+distinct native conversation IDs, server ports/PIDs, native TUI generations and
+launch tokens. Public-list reconciliation before and after replies retained each
+exact TUI PID/pane without OpenTwice. Independent `_mobile` clients sent distinct
+prompts: snapshots, inference contexts and original native TUI replies did not
+cross conversations. Exact receipts were delivered; same-ID retries left exactly
+two total synthetic inference calls. Closing terminal A reaped its owned group
+while native B remained alive, then closing B reaped its group.
+
+Unchanged assertions first exposed native concurrent cold migration contention:
+40.17/40.21-second failures, with actual native panes reporting `database is
+locked` and `Native shared server exited before readiness`. Retained failure
+roots are `/tmp/pika-opencode-mobile-jW4wYW` and
+`/tmp/pika-opencode-mobile-B0HDWi`. The supported launcher now selects explicit
+ephemeral native ports and serializes only startup through native bootstrap,
+session creation and TUI certification; it releases the startup guard before
+the terminal lifetime. No inference retry was introduced. The final acceptance
+assertions were not weakened, and the successful disposable provider root was
+cleaned up. Formatting and diff checks passed. Linux concurrent evidence is
+reported separately by its runtime owner.
+
+Reproduce with the disposable-home wrapper and explicit OpenCode/tmux binaries:
+`cargo test --test ios_opencode_mobile_spike
+concurrent_managed_native_launches_keep_exact_ports_owners_and_messages --
+--ignored --nocapture`. This proves concurrent native launch/control isolation,
+not additional iOS control parity. No user transcript, fleet, configuration,
+installed Pika, real model account or quota was used.
+
+### Authorized disposable Linux bootstrap/socket diagnosis (2026-10-05 UTC)
+
+On rs8, native Bun's TCP_DEFER_ACCEPT left a connected zero-data socket in
+SYN_RECV with inode zero. A constant leading CRLF closed the connection; a fixed
+`GET ` method token caused acceptance and yielded the exact server PID's owned
+FD/inode, UID and established four-tuple. Linux transport now permits only the
+fixed method token before that unchanged proof; path, credentials and content
+remain withheld. macOS still sends no bytes before proof. An unrelated-PID
+negative test permits only that fixed token, never authentication.
+
+The subsequent generated-plugin cold-start failure was independently reproduced
+without Pika launch state: a fresh disposable native home completed its first
+session request in 12.334 seconds; a restart of the same home took 0.286 seconds.
+The native config log paused during dependency materialization, with its native
+installation lock and incomplete node_modules. Embedded native code joins
+Config.waitForDependencies on Npm.install/Arborist reify. Both probe children were
+terminated and reaped; no model requests or real transcripts were used.
+
+Startup now issues one read-only GET /session?limit=1 with a separate bounded 30-second
+bootstrap budget and cancellation/exact-process-generation checks before its
+single session-create POST. Ordinary RPCs retain their 10-second budget; there
+is no create/send retry. Full Linux integrated-journey acceptance remains a
+separate test result, not a claim from these probes.
+
+The same disposable native server returned two sessions for GET /session and
+one for GET /session?limit=1, proving that the readiness query is bounded by the
+actual provider. Local adapter tests passed 6/6, including cancellation before
+connection and the actual socket-owner negative test.
+
+Repeated Linux full-journey diagnostics then measured exact owned acceptance at
+752ms, while individual bounded /proc scans took at most 49ms. The former 500ms
+ownership observation cutoff therefore rejected the correct native server.
+Linux now observes for at most two seconds (plus a final bounded exact check);
+macOS retains 500ms. This changes only when ownership can be proven: all original
+PID-birth, UID, accepted FD/inode and four-tuple requirements still hold, and no
+path, authentication or content is sent before that proof. Temporary latency
+telemetry was removed; bounded non-secret tuple diagnostics remain on failure.
+
+With that source, the full actual Linux native/Pika journey passed 1/1 in 50.68
+seconds, including generated hooks, consecutive exact-session replies, opaque
+history pagination, lost acknowledgement/no replay, revert refusal, lifecycle
+cleanup and cold resume. The focused Linux native security/adapter tests passed
+7/7 in 2.57 seconds. Logs are in the authorized disposable validation directory
+as journey-owned-final.log and security-owned-final.log. This result predates
+the separate explicit ephemeral-port change required for concurrent launches.
+
+The explicit-port original/cold-resume Linux journey subsequently passed 1/1
+in 53.09 seconds (journey-ephemeral-final.log). Concurrent cold native launches
+then exposed native SQLite migration contention: one server failed CREATE TABLE
+workspace before readiness, matching the independently captured macOS database
+locked error. No assertion was weakened and no native session-create was retried.
+
+Managed native startup now holds an OS-owned, private pinned-file lock per Pika
+state through server initialization, read-only bootstrap, exact session creation,
+TUI generation proof and certification, releasing it before terminal lifetime.
+Acquisition is bounded to 30 seconds and cancellation-aware; closing the owner
+releases it, without unlinking/stealing an inode. Existing running agents are
+untouched. Explicit OS-reserved loopback ports are released immediately before
+native spawn and the reported port must match; a bind race fails closed.
+
+With that source, the actual two-concurrent-launch Linux test passed 1/1 in
+31.65 seconds (concurrent-locked-final.log): distinct native ports, exact owners
+and sessions, isolated phone/TUI messages and inference contexts, delivered
+receipts, same-ID no replay, public reconciliation, A shutdown preserving B,
+and cleanup of both owned groups. Local adapter/security tests passed 7/7 in
+0.64 seconds, including bounded/cancelled OS-lock acquisition and close release.
+
+Final Linux regressions with the startup lock passed: focused native
+security/adapter tests 8/8 in 2.58 seconds (security-locked-final.log), and the
+complete original-conversation/cold-resume journey 1/1 in 50.71 seconds
+(journey-locked-final.log). All validation retained isolated provider/Pika/tmux
+homes and fake inference. Successful fixture cleanup reaped owned processes;
+failed diagnostic fixture artifacts were retained, not used as acceptance.
+
+## Claude native channel eligibility correction — 2026-10-05
+
+The user completed isolated native authentication and enabled organization
+Channels. Our disposable launcher had introduced `DISABLE_TELEMETRY=1`;
+unavailable-channel results from that environment do not establish an external
+provider blocker. Removing only that test-added flag produced effective managed
+`channelsEnabled=true` in native Claude Code 2.1.274. User privacy settings,
+production configuration, policy and feature caches were not changed.
+
+After genuine development-channel consent, one benign structured notification
+received the exact correlated `CHANNEL_OK` reply in disposable native session
+`e08190ae-2d22-4c44-aad1-c7683647485d`. Original native PID 1095387 and MCP child
+1095852 remained alive and unchanged. The owning native transcript independently
+confirmed the session; terminal typing, a fork or duplicate resume did not
+substitute for incoming channel delivery. Root inspected the sanitized proof at
+`/tmp/pika-claude-normal-proof.json` and remote `RESULT.md` under the isolated
+`/tmp/pika-claude-user-auth-AzOp0t` root. One incoming model turn was used.
+
+This proves the native protocol only, not phone E2E or production readiness.
+The test preauthorized only the reply tool and used explicit development-channel
+consent. Normal permission handling and approved distribution remain unproved.
+Native tool-call metadata lacks a current conversation UUID: model-echoed chat
+metadata and unchanged PID are insufficient for safe dispatch after an in-TUI
+session switch. Current-session attestation remains a required acceptance gate.
+No Claude production adapter, installed-command change or release is claimed.
+
+After the user approved explicit experimental channel opt-in, a further native
+probe matched `PreToolUse.session_id/tool_use_id` to the MCP call's native tool
+ID before releasing content. The first `/clear` attempt queued behind the held
+tool, so it did not prove a switch boundary. A fresh uniquely named tool probe
+then interrupted the turn with Escape and cleared the conversation before
+releasing a held synthetic response. The original transcript contained the
+native cancelled-tool result; both original and new transcripts existed and
+contained zero sentinel records. Root inspected
+`/tmp/pika-claude-attested-cancel-proof.json`. This is ordinary cancellation
+evidence, not background-tool, normal-permission or phone E2E evidence. Probe
+tools were explicitly preallowed only in the disposable test environment.
+
+Independent review still found a material contract gap: a content-free channel
+wake is queued in whichever native conversation is current, without a provider
+UUID precondition. Attested fetching can refuse user content to the wrong UUID,
+but cannot prevent that wake from causing model work, quota use or native records
+in the wrong conversation. Experimental consent does not silently relax exact
+thread routing. No supported exact-target alternative was established; Claude
+mobile sending remains unimplemented pending either a native dispatch guarantee
+or explicit approval of that narrower behavior. No claim is made that the
+wrong-context wake race was reproduced by the cancellation test itself.
+## 2026-10-05 — continuation-only Claude implementation checkpoints
+
+The user clarified that the phone continues one selected conversation: mobile
+clear and in-place resume are not requested. Native terminal controls remain
+available; a native context change revokes the old connection. An opaque wake
+is not evidence of sensitive-content delivery or a reply, and zero model work
+in an external-switch race is not claimed.
+
+Local implementation now has explicit future-launch experimental opt-in,
+native permission prompts, and one-use hook/MCP tool-call correlation under
+the existing trusted-account boundary. It does not protect against arbitrary
+same-UID code that can already read/write the account's Pika data.
+
+Two native Simulator UI-double checks passed independently:
+
+- Experimental notice can open/dismiss without losing a typed draft or hiding
+  the native keyboard/composer: 1/1, 25.393 seconds. Result bundle
+  `/tmp/pika-history-ios.XU7zaf/claude-experimental-ui.xcresult`; screenshot
+  `claude-experimental-attachments/20120018-01BB-4889-B5ED-1F54B581F2A4.png`
+  inspected by the lead agent.
+- An arriving correlated Claude reply triggers a read-only original receipt
+  check, clears only the matching original draft, and permits the next draft
+  without replay: 1/1, 24.561 seconds. Result bundle
+  `/tmp/pika-history-ios.XU7zaf/claude-receipt-ui.xcresult`.
+
+These are **UI fixture evidence, not native Claude delivery evidence**.
+The disposable actual `_mobile` history journey also passed six checks,
+including fresh-process reopen of source-native fetch/reply records correlated
+with their journal tool IDs; uncorrelated lookalike tools were not shown.
+
+The first real rs8 run opened the certified fresh native Claude conversation
+`18a60a1f-7877-4245-8532-a7debc973c43` (PID 1189085), admitted one uppercase
+phone operation as unknown, and returned unknown without replay for a repeated
+operation ID. It did **not** prove delivery: native Claude canonicalized argv0
+to its `claude/versions/2.1.274` executable while keeping PID and UUID, which
+the old process-kind classifier failed to recognize. The hook then timed out.
+No fetch or reply tool record was present. Controller logs that guessed a
+permission prompt from scrollback are not permission evidence; those automatic
+inputs were stopped. The original uncertain operation is not being retried.
+The narrow argv0-only native-version classifier fix retains exact UUID,
+process-generation, launch and watched-state checks. A new owned native run
+must establish actual delivery before this feature is called verified.
+
+The next fresh owned run (`/tmp/pika-claude-mobile-krFkn5`, conversation
+`795b895f-23a7-4714-aa60-4056666a370f`, native PID 1203231) delivered an
+opaque operation notification but still did not fetch the literal request or
+reply. Native `/mcp` showed the exact generated server connected with two
+tools; an earlier startup warning was not reliable evidence of missing tools.
+The model asked what to do with the bare UUID. The wake was sent about 60
+seconds after readiness, so an immediate-startup race is not established.
+Initialize instructions alone did not produce the intended native behavior.
+The pending correction adds fixed protocol routing instructions and exact
+tool names to the opaque notification, never the user's literal text. This
+operation remains unknown and will not be re-woken. No native end-to-end
+success is claimed for this run.
+
+The third owned run (`/tmp/pika-claude-mobile-VUQqvu`) delivered an actual
+attested fetch/reply in 8.64 seconds in the original conversation
+`780ca0ba-7d1b-440b-85f8-7e3b56eac251`, native PID 1211409/birth 4148039592.
+Native permissions were preserved; no approval keys or allowed-tools injection
+were used. This first successful probe explicitly asked for a test reply via
+the reply tool, so a separate plain-language request is still required before
+generalizing the result to ordinary phone messages.
+
+Reopen initially exposed native attachment-only leaf siblings, which the
+history verifier incorrectly treated as alternate conversation branches. It now
+prunes only terminal attachment chains; message ancestors and all actual
+conversation branches retain their checks. Native `isMeta` protocol text is not
+rendered as a human message. Independent review found no material regression.
+After the owned native process was reaped at 16:03:23 UTC, a validated expired
+binding also needed to permit saved-history access without control. That narrow
+fallback leaves malformed descriptors and live identity mismatches as errors.
+
+At 16:54:41 UTC, a fresh real `_mobile` process reopened this same native
+source successfully, displayed the literal request and attested reply under
+their original native tool IDs, advertised `send:false`, and returned the
+original uppercase operation receipt as delivered. No native restart or new
+model call was used for this check. Lead inspected
+`/tmp/pika-claude-native-reopen-passed.json` independently. Latest Linux binary
+SHA256: `11bb08694879932a293ab18fc95c9d0a5298727d08079352e8cf514d8a62cb1f`.
+Simulator SSH presentation and plain-message live delivery are separate pending
+checks, not implied by this backend result.
+
+Plain-message native check passed at 16:57 UTC: the literal question
+`What is 19 plus 23? Answer with the number only.` produced an attested `42`
+in 8.633 seconds. The exact original session
+`ca814c25-6fae-435f-8b17-0691ac7cb8d4`, native PID 1244952/birth 4148448566,
+and one fetch/reply tool pair were independently checked. A fresh endpoint
+reopened the same source with `send:true`; the same operation ID was not
+re-woken. Lead inspected `/tmp/pika-claude-plain-prompt-proof.json` and
+`/tmp/pika-claude-plain-native-tools.json`. Owned native processes were reaped
+at 16:57:41 UTC.
+
+The native iOS Simulator also passed a real SSH read-only journey against the
+earlier preserved rs8 source: saved-login reconnect, exact tracked thread,
+literal request and reply, sending disabled after native exit, back/reopen.
+`/tmp/pika-claude-ios-gateway.BH8YKw/readonly-01.xcresult` reports 1 passed,
+0 failed, 0 skipped, 81.676 seconds elapsed. Lead independently read its summary
+and inspected `attachments/CEEAF2A8-BF07-4AF4-87D5-CB7BD3CE8971.png`.
+The gateway bound only localhost, imported only a disposable key into the
+simulator, and was reaped with its port closed. This read-only run caused no
+model inference. A final live simulator-send journey is pending; combining
+these separate checks is not presented as that full-path proof.
+
+The final **live simulator → SSH → native Claude** journey also passed:
+`/tmp/pika-claude-ios-send.YOJJFQ/native-01.xcresult`, 1 passed, 0 failed,
+0 skipped, 78.017 seconds elapsed. The app alone sent
+`What is 17 plus 25? Answer with the number only.` and displayed `42` above
+the keyboard. An unsent next draft verified receipt-driven composer readiness;
+it was deleted without sending. Back/reopen retained the original reply.
+Lead independently read the Xcode summary and both screenshots.
+
+Independent server evidence `/tmp/pika-claude-simulator-native-proof.json`
+contains exactly one durable phone operation and one native fetch/reply pair,
+both under original UUID `8ff3dafc-3e72-4439-ac41-007f6dbc3822`, PID
+1247435/birth 4148468328. The receipt reports delivered with matching node,
+thread, and operation. The native source hash is
+`98f5baff7e66ea1ce8bfa32c2abc53027646baa3ba2e155176b8f12e743582ea`.
+No controller sent a message on the app's behalf. The localhost gateway was
+reaped and its port checked closed; the native guard reaped its owned processes
+at 17:04:38 UTC, with separate process-health confirmation at 17:04:42 UTC.
+
+Evidence caveat: the reusable SSH test banner incorrectly said “synthetic
+model, no quota” on this real-provider run. The native records, not that stale
+label, establish actual Claude inference. The original artifact is retained
+unchanged. The test-only banner has been corrected to the neutral “DISPOSABLE
+SSH INTEGRATION”; a no-inference saved-history UI repeat verifies that correction.
+No physical-phone installation or production-server cutover occurred.
+
+The corrected-label saved-history repeat passed 1/1 with 0 failures/skips in
+62.414 seconds: `/tmp/pika-claude-ios-send.YOJJFQ/readonly-label-02.xcresult`.
+Lead independently read the summary and inspected the current screenshot
+`attachments-label-02/BABDFF87-10D3-42DC-9787-EB8A871EA8A7.png`. It shows the
+same plain request and `42` after native exit, with neutral test labeling and
+sending disabled. No new message, model call, or native launch occurred; the
+temporary gateway was again reaped and its port closed.
+
+Scoped self/adversarial scores for the experimental native Claude
+continuation/history/receipt slice are 95/100. Overall provider work remains
+incomplete (90/100): Muse's native sender-admission boundary is unresolved,
+nonlinear/compacted Claude history is explicitly refused, and unsupported native
+controls are not represented as working. These are not release approval scores.
+
+## 2026-10-05 — owner-authorized physical phone update
+
+After the user connected the phone for installation, signed Release build 42
+completed successfully from this worktree. The existing orientation warning
+remains. Code-signature verification passed. The app was installed in place on
+AJ's iPhone 15 Pro Max, bundle `dev.pika.mobile.alpha`, without uninstalling or
+resetting saved state. Device inventory independently reports version 1.0,
+build 42; normal app launch succeeded. Installation database sequence: 4692.
+Build output: `/tmp/pika-phone-update.wuZg0I/build/Build/Products/Release-iphoneos/Pika.app`.
+
+This is installation and launch evidence, not a physical-phone send/reopen
+journey. No production server binary was updated by this action; experimental
+Claude shared control still requires the matching server implementation and an
+explicitly opted-in future native launch.
+
+## 2026-10-05 — release review and deployment compatibility
+
+The owner approved publication after release checks and version-pinned updates
+to rs6, rs2a and rs8 without restarting live conversations. Read-only checks
+confirmed the invoking account is `ajain` on all three. At this checkpoint rs6
+and rs2a run Pika 0.6.44; rs8 runs 0.6.39-rc.4. No cutover has occurred yet.
+
+Independent review found that a valid OpenCode shared certificate could outlive
+its native owner and prevent saved-history fallback. After certificate validation,
+an absent exact native PID/birth now permits read-only saved history. Live-owner
+or malformed-certificate failures remain errors. An actual disposable native
+journey passed (17.46 seconds), covering terminal exit, fresh mobile endpoint,
+saved-history reopen, disabled/rejected sending, and explicit native cold resume.
+Inference was a loopback fixture; no quota was spent.
+
+rs6's installed OpenCode 1.18.33 also passed a disposable native serve/attach
+journey (1/1, 8.40 seconds): terminal-typed context, the original owner generation,
+a native view switch, phone delivery to the original session only, and visible
+reopen. Lead read `rs6:/tmp/pika-rs6-opencode-compat.u96Bl0/native.log` directly.
+The selected native executable SHA256 is
+`0abbb7c32ab0294c0a7bfa2705f9ff0df5dce5ab721d1f00cccfe393f2a11427`.
+Only disposable private state, a private tmux socket and loopback fake inference
+were used. Owned processes were reaped; installed providers were not changed.
+
+First full local release-check run failed distribution fixtures while parallel
+builds replaced their shared `target/debug/pika`, producing byte/size mismatches.
+The ordinary-launch fake OpenCode journey also failed because argv recognition
+alone selected the shared launcher. These are recorded failures, not passing
+release evidence; stable-binary reruns and runtime compatibility fallback are
+required before publication. Dependency notice regeneration and RustSec audit
+with warnings denied passed at this checkpoint.
+
+### Claude compacted history — native reconstruction subset (2026-10-05)
+
+Read-only inspection of the installed Claude 2.1.274 executable on rs8
+(`15e2d05148f801b5774032faad87e624ecd172e9903288bda448b892eb58fa07`)
+verified the provider's `iOs` / `aOs` compaction relinker. Its semantics match
+the local 2.1.272 loader: exact `preservedMessages.uuids` take precedence over
+legacy `preservedSegment` ancestry; preserved records are relinked after the
+explicit anchor, superseded pre-boundary records are removed, and continuation
+parents are redirected to the preserved tail. The native buffered reader also
+discards the prefix at a full boundary without preservation. This is native
+source evidence, not an inference from append order or a third-party schema.
+
+Pika now reconstructs that strict native chain before projecting channel
+fetch/reply records and paging. A logical cursor remains tied to the exact
+source inode, frozen byte snapshot and prefix hash, plus a hash of canonical
+display items. If later journal settlement changes that projection, an older
+page fails explicitly and requests reopening; it cannot silently shift an
+item-index boundary. Later transcript appends do not enter an older snapshot.
+
+Final isolated mobile endpoint journeys passed 7/7 in 0.94 seconds, including
+67 displayed compacted-history messages across pages, physically old preserved
+messages relocated after their summary anchor, append-during-paging, fresh
+reopen, source-backed channel projection and honest read-only sending denial.
+Focused history tests passed 14/14 in 0.06 seconds, including native list and
+segment preservation, multiple boundaries, malformed/missing/duplicate
+identities, real conversation branching refusal, native progress metadata,
+and late projection change refusal. The complexity gate reported 4,891
+functions and zero new failures at this checkpoint.
+
+The exact extracted native relinker was also executed against three disposable
+fixture graphs; all reconstructed orders matched the Rust fixtures. Artifacts:
+`/tmp/pika-claude-native-compaction-functions.json`,
+`/tmp/pika-claude-compaction-differential.js`, and
+`/tmp/pika-claude-compaction-differential-result.json`.
+These are model-free reducer comparisons, not a claim that a native CLI
+compaction turn or physical-phone compaction journey was run. No quota, real
+transcripts, provider configuration or live conversations were accessed.
+
+Unknown compaction metadata, broken preservation walks, missing ancestors,
+cycles, repeated native identities and unresolved user/assistant branches still
+fail closed. Native timestamp fallback and the broader parallel-tool sibling
+recovery reducer are deliberately not implemented. The existing 16 MiB verified
+snapshot bound remains explicit. No phone Clear or Resume control was added.
+
+### Final launch compatibility and release-source gates
+
+OpenCode shared launch now requires a successful, bounded, private-state version
+probe for the verified 1.18.31 or 1.18.33 runtime. Unknown, malformed, failed or
+stalled probes preserve the original ordinary launch arguments before any shared
+session is created. The provider is never upgraded automatically. Focused probe
+checks passed 2/2 in 0.59 seconds.
+
+The gate-enabled actual native OpenCode mobile journey passed 1/1 in 18.85 seconds:
+`/tmp/pika-opencode-gate-evidence.Tn8000/native-journey-final.log`, independently
+read by the lead. It covers consecutive replies, exact original TUI/session,
+lost acknowledgement without replay, 105-message provider pagination, native
+view changes, dead-owner saved-history reopen and send refusal, owned-process
+cleanup, and explicit cold native resume. Inference was a loopback fixture.
+An earlier compile attempt exposed a test-only dependency accidentally used in
+production; it was fixed without adding a dependency and its failed log retained.
+
+Final source formatting, all-target warnings-as-errors Clippy (30.65 seconds),
+dependency-notice regeneration, RustSec audit with warnings denied, and complexity
+(4,893 functions, 137 pre-existing hotspots, zero failures) pass. Full native
+release checks and exact-commit CI remain separately required before publication.

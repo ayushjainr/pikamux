@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.45 — Continue native conversations from your phone
+
+- Preserve chronological Codex history across long-thread reopening and paging,
+  and keep the iPhone anchored to the reply after sending.
+- Support shared control of compatible future Pika-managed OpenCode launches:
+  the native terminal and phone use the same exact session. Closing the native
+  terminal leaves saved history readable, without advertising live send.
+- Add explicitly opted-in experimental Claude mobile continuation through native
+  development Channels. Exact native tool-call attestation gates message content
+  and reply receipts; uncertain sends are never automatically replayed.
+- Preserve native Claude phone exchanges in source-verified saved history after
+  terminal exit. Existing running conversations are not restarted or migrated.
+- Reconstruct supported normal Claude compaction ancestry before paging, instead
+  of assuming transcript file order is conversation order. Unknown or ambiguous
+  reconstruction stays explicit.
+
+The iPhone alpha is build 42 and remains a separate installation, not part of
+the host binary assets. Actual Simulator-to-SSH-to-native Claude and OpenCode
+journeys are recorded in `ios/NATIVE_EVIDENCE.md`. Muse shared mobile control and
+Claude/OpenCode model/skill control parity remain unsupported; provider icons do
+not imply those capabilities. Native permissions and account policy still apply.
+
 ## 0.6.44 — Attach your assistant's certified home
 
 - Continue a first-launch receipt through its durable exact conversation binding
