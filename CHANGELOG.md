@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.47 — Read oversized Claude records without losing history
+
+- Remove the 256 KiB individual-record ceiling with validated selective streaming
+  of large tool results, thinking and image payloads.
+- Preserve exact visible text, Unicode, ancestry and immutable paging; byte-sized
+  pages do not skip messages. A single encoded visible item remains bounded at
+  eight MiB, independently of the raw source record size.
+- Add bounded native iPhone text readers with complete copy support for long
+  messages, avoiding whole-document layout freezes.
+- Verify actual Simulator-to-SSH reading, every large-text part, older pages and
+  latest-reply reopening, plus ordinary chat and supported-size paste behavior.
+
+The iPhone presentation changes require a separate app installation. Running
+threads are not restarted or migrated. Outgoing messages retain their existing
+64 KiB limit; editing an unsupported 416 KiB draft remains a known visual issue.
+
 ## 0.6.46 — Read large Claude histories on your phone
 
 - Remove the 16 MiB whole-history cutoff with a streamed, bounded-memory reader.

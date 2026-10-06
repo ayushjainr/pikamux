@@ -1525,3 +1525,119 @@ unchanged, so the same-day passing release audit and notice verification remain
 applicable. Independent adversarial review scored the scoped fix 95/100 with
 no unresolved material defect. Publication and fleet deployment are not covered
 by these local results and remain separate approval-gated actions.
+
+### Individual Claude records — repair in validation (2026-10-06)
+
+The preceding release still refused individual records above 256 KiB. That was
+a real missing user journey, not proof that the complete large-history problem
+was solved. The current repair validates and selectively streams raw records
+without that ceiling. Hidden multi-MiB tool, thinking and image payloads need
+not become visible phone messages. Visible content remains exact; a single
+encoded visible item above eight MiB is still an explicit unsupported case.
+
+Production-endpoint journeys pass 13/13 in the optimized test profile (37.89 s),
+including oversized hidden/nested payloads, escaped Unicode, byte-limited pages,
+reopen, malformed input, source mutation and explicit visible-item refusal.
+The debug journey helper now uses one absolute 20-second request deadline,
+matching the phone transport, instead of its former 10 seconds per received
+frame. This deadline change is disclosed; no content/order/hash assertion was
+removed. The complete debug history target passed 13/13 in 124.89 s.
+
+The frozen production binary SHA256
+`9295c277d4b84f0599a88f0b5a845f7703e0a6b6f96f457fb49cee896034b31c`
+was measured against a 170,939,116-byte synthetic source containing 120 visible
+messages, including a 416,000-byte code body and a reply above one MiB. Initial
+open took 4,634 ms; older pages 4,560/4,646 ms; reopen 4,598 ms. Peak native RSS
+was 24,477,696 bytes. Every returned message and its order matched the source,
+reopen matched, sending stayed disabled, process exit was clean, and source and
+binary hashes were unchanged. Source SHA256:
+`fc1f861fe227da370476961895c5ba5d89e21813d655cb6465c756ad3a71af3c`.
+These are local measurements, not fleet latency guarantees. Full-source scanning
+still repeats for every page. Measurement helper:
+`/tmp/pika-large-records-release.J3tbpR/measure.mjs`.
+
+Actual Simulator -> private SSH -> native endpoint testing exposed additional
+UI defects after the backend repair: unbounded code layout, whole-document
+composer measurement after Paste, and eager native layout of a megabyte reply.
+The intermediate 416 KiB code Copy/Paste/hash, paging and reopen journey passed
+in 162.6665 s (`pika-claude-large-ui-hnn_apx1`, UI04). A stronger fixture then
+failed on megabyte text layout. Final explicit paged-reader validation is still
+pending; the intermediate pass is not final acceptance. No physical iPhone,
+real transcript, fleet machine or native-Claude generation was tested here.
+
+Broader native checks: 903 library tests passed (six ignored). Remaining
+integration targets have passing per-test evidence, but not one clean full-suite
+run: parallel board journeys collided through same-user process observation,
+and a serial side-list test refused resume. That exact unchanged side-list test
+then passed alone in 32.36 s. The failed runs remain recorded in
+`/tmp/pika-large-records-native-tests.log` and
+`/tmp/pika-large-records-remaining-tests.log`; focused evidence is in
+`/tmp/pika-large-records-board-recheck.log`. Formatting, all-target
+warnings-as-errors Clippy and complexity checks pass (zero new complexity
+failures). No dependency/notice change invalidates the same-day audit evidence.
+Nothing in this section claims publication, fleet update or phone installation.
+
+The final reader design uses explicit <=16 KiB UTF-8 parts split at Unicode
+scalar boundaries, including giant combining-character clusters. Controls and
+indicators clamp to a valid part; source-change comparisons use exact UTF-8
+bytes, not Swift's canonical-equivalence string comparison. Full Copy remains
+separate from the displayed part. A part change resets its native scroll offset
+without resetting an unchanged page. Accessibility exposes the actual native
+page text as one element rather than synthesizing expensive paragraph children;
+paragraph-level VoiceOver navigation is therefore changed, not proven equivalent.
+Independent source review found no remaining concrete blocker in these changes.
+
+Final reading journey passed on the complete reader implementation:
+`/private/var/folders/k9/s1xh63d93rq9bd97cngqvf4c0000gn/T/pika-claude-large-ui-jjlt001l/ssh-ui-final-05.xcresult`
+reports one passed, zero failed/skipped, no runtime warnings. The actual app
+connected through SSH to frozen production binary `9295c277...034b31c` and
+traversed all 163 native parts: a 1,472,106-byte reply (90 parts), 760,060-byte
+user message including 200,000 combining marks (47 parts), and 416,000-byte
+code body (26 parts). Every actual native page was <=16 KiB; concatenated page
+hashes matched each original. Actual Copy -> Paste retained the exact code hash.
+Older 079 appeared once; reopening showed latest 118/119, with sending disabled.
+The same source was refused by public 0.6.46. Candidate endpoint traversal
+verified 120 exact messages across 40/40/40 pages and reopen in 4.528 seconds.
+
+The adjacent `normal-ui-final.xcresult` passed all four ordinary UI regressions
+(keyboard rotation, Return/draft isolation/explicit send, history reopen and
+older anchor, rich reply/code copy), with no skips or runtime warnings.
+`cleanup.json` records private listener exit zero and unchanged source SHA256
+`805a8f40f9046c73247119cf44dca6440503ed84798429714777b03a0e1a3ab3`;
+the source is 29,521,250 bytes. Independent port inspection found no listener
+on 64891; the frozen binary hash remained unchanged.
+
+Visual acceptance caveat: root inspection of the exported Copy/Paste screenshot
+showed a blank large-draft editor despite the exact native text/hash assertion.
+Thus the completed test establishes paste byte integrity,
+not usable visual editing of a 416 KiB draft. That discrepancy is under separate
+composer investigation; it must not be hidden behind the passing assertions.
+The final reading/paging/reopen evidence remains valid.
+
+A separate instrumented composer-only probe also returned passing text
+assertions but reported a roughly 2,201-second operation. It is explicitly not
+accepted as usable paste evidence. The 416 KiB draft exceeds the existing
+65,536-byte outgoing-message bound in the native endpoint. Large-draft editor
+redesign is outside this history repair; a supported-size visual check remains
+required before retaining the composer sizing change.
+
+That supported-size check subsequently passed: `supported-draft-visual.xcresult`
+in the same evidence root reports one passed, no failures/skips/runtime warnings.
+The normal fake-provider UI fixture supplied 24,042 UTF-8 bytes; actual native
+Copy -> Paste preserved the entire value, kept Send enabled, and rendered dark
+text inside the editor. A screenshot pixel check and independent visual
+inspection confirmed visible text, not only an accessibility value. The test
+operation took 34.820 seconds and its strict 120-second watchdog did not fire.
+Screenshot: `supported-draft-attachments/FD24764F-1649-4022-8C37-FC834D3FE4B8.png`.
+This is local UI evidence, not a live-provider send claim. Temporary diagnostic
+instrumentation and the composer-only SSH test mode were removed; the private
+diagnostic listener exited cleanly with the source unchanged. No production
+editor change was made after the four normal UI regression passes.
+
+Local acceptance: individual-record history reading, complete large-text
+presentation, older paging and latest-reply reopen are verified. Normal UI and
+one supported-size large paste are verified. Editing an unsupported 416 KiB
+draft remains a known visual limitation; outgoing messages still have their
+existing 64 KiB bound, distinct from the eight-MiB visible-history item bound.
+No publication, fleet cutover, physical-phone installation or actual-user
+transcript recovery is claimed by this local evidence.

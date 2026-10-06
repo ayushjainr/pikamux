@@ -13,7 +13,7 @@ use std::{
     path::Path,
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct Endpoint {
@@ -22,6 +22,12 @@ struct Endpoint {
 }
 impl Endpoint {
     fn request(&mut self, method: &str, params: Value) -> Value {
+        // Match SSHWire's real 20-second request deadline, including decoding.
+        // The old per-frame 10-second wait both rejected slower debug builds
+        // and could reset indefinitely on unrelated events. Production timing
+        // is measured separately through the optimized binary and actual app.
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(20);
         let id = uuid::Uuid::new_v4().to_string();
         writeln!(
             self.child.stdin.as_mut().unwrap(),
@@ -32,9 +38,10 @@ impl Endpoint {
         loop {
             let frame = self
                 .output
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .expect("mobile response timeout");
             if frame["id"] == id {
+                eprintln!("native journey {method}: {:?}", started.elapsed());
                 return frame;
             }
         }
@@ -483,13 +490,31 @@ fn claude_native_compaction_pages_reconstructed_order_and_freezes_cursor() {
 
 fn append_large_hidden_records(source: &Path, thread: &str) {
     let mut file = fs::OpenOptions::new().append(true).open(source).unwrap();
-    let payload = "x".repeat(100 * 1024);
+    let payload = "x".repeat(2 * 1024 * 1024);
     let mut parent = "item-084".to_owned();
-    for index in 0..200 {
+    for index in 0..12 {
         let id = format!("hidden-{index}");
-        let record = json!({"type":"user","uuid":id,"parentUuid":parent,"sessionId":thread,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"unrelated","content":payload}]}});
+        let (role, block) = match index % 4 {
+            0 => (
+                "user",
+                json!({"type":"tool_result","tool_use_id":"unrelated","content":payload}),
+            ),
+            1 => (
+                "assistant",
+                json!({"type":"thinking","thinking":payload,"signature":"synthetic"}),
+            ),
+            2 => (
+                "user",
+                json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":payload}}),
+            ),
+            _ => (
+                "user",
+                json!({"type":"tool_result","tool_use_id":"unrelated","content":[{"type":"text","text":payload}]}),
+            ),
+        };
+        let record = json!({"type":role,"uuid":id,"parentUuid":parent,"sessionId":thread,"message":{"role":role,"content":[block]}});
         let bytes = serde_json::to_vec(&record).unwrap();
-        assert!(bytes.len() < 256 * 1024);
+        assert!(bytes.len() > 2 * 1024 * 1024);
         writeln!(file, "{record}").unwrap();
         parent = id;
     }
@@ -526,26 +551,143 @@ fn claude_five_thousand_small_nodes_remain_supported() {
 }
 
 #[test]
-fn claude_oversized_individual_record_is_distinct_from_total_history() {
+fn claude_multimib_hidden_and_visible_records_page_exactly_and_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let thread = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let (_, node) = fixture(&root, Provider::Claude, thread);
+    let source = root.join(format!("claude/projects/fixture/{thread}.jsonl"));
+    append_large_hidden_records(&source, thread);
+    let mut expected: Vec<(String, String)> = (0..85)
+        .map(|i| (format!("item-{i:03}"), format!("literal {i}\nsecond line")))
+        .collect();
+    let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+    let mut parent = "hidden-11".to_owned();
+    for index in 0..12 {
+        let id = format!("visible-large-{index}");
+        let text = format!(
+            "Large {index}\n```rust\n{}\n```\n",
+            "雪🦀\\\"\t\nlet value = 42;\n".repeat(45_000)
+        );
+        assert!(serde_json::to_vec(&text).unwrap().len() > 256 * 1024);
+        writeln!(file,"{}",json!({"type":"assistant","uuid":id,"parentUuid":parent,"sessionId":thread,"message":{"role":"assistant","content":[{"type":"text","text":text}]}})).unwrap();
+        parent = id.clone();
+        expected.push((id, text));
+    }
+    let identity = json!({"nodeId":node,"provider":"claude","threadId":thread});
+    for _ in 0..2 {
+        let mut phone = endpoint(&root);
+        let mut response = phone.request("conversation/open", json!({"identity":identity}));
+        let mut pages = Vec::new();
+        loop {
+            assert!(response["error"].is_null(), "{}", response["error"]);
+            let turns = &response["result"]["turns"];
+            let page = turns["data"].as_array().unwrap().clone();
+            assert!(!page.is_empty());
+            assert!(page.len() <= 40);
+            assert!(serde_json::to_vec(&page).unwrap().len() <= 8 * 1024 * 1024);
+            pages.insert(0, page);
+            let cursor = turns["nextCursor"].clone();
+            if cursor.is_null() {
+                break;
+            }
+            assert!(pages.len() < 20);
+            response = phone.request(
+                "conversation/history",
+                json!({"identity":identity,"cursor":cursor}),
+            );
+        }
+        assert!(
+            pages.len() > 3,
+            "Byte budget must split twelve multi-MiB messages"
+        );
+        let all: Vec<_> = pages.into_iter().flatten().collect();
+        assert_eq!(all.len(), expected.len());
+        for (turn, (id, text)) in all.iter().zip(&expected) {
+            assert_eq!(turn["items"][0]["id"], *id);
+            let actual = turn["items"][0]["text"].as_str().unwrap();
+            assert_eq!(actual, text);
+            use sha2::{Digest, Sha256};
+            assert_eq!(
+                Sha256::digest(actual.as_bytes()),
+                Sha256::digest(text.as_bytes())
+            );
+        }
+    }
+}
+
+#[test]
+fn claude_source_unicode_escapes_are_bounded_by_outgoing_text_not_raw_record() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let thread = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let (_, node) = fixture(&root, Provider::Claude, thread);
     let source = root.join(format!("claude/projects/fixture/{thread}.jsonl"));
     let mut file = fs::OpenOptions::new().append(true).open(source).unwrap();
-    writeln!(file,"{}",json!({"type":"user","uuid":"large","parentUuid":"item-084","sessionId":thread,"message":{"role":"user","content":"x".repeat(256*1024)}})).unwrap();
+    let escaped = "\\u0061".repeat(2 * 1024 * 1024);
+    assert_eq!(escaped.len(), 12 * 1024 * 1024);
+    // Native-style insertion ordering puts message before the outer type, and
+    // text before its block discriminator. Classification cannot depend on order.
+    writeln!(file, "{{\"message\":{{\"role\":\"assistant\",\"content\":[{{\"text\":\"{escaped}\",\"type\":\"text\"}}]}},\"sessionId\":\"{thread}\",\"parentUuid\":\"item-084\",\"uuid\":\"escaped-large\",\"type\":\"assistant\"}}").unwrap();
+    writeln!(file, "{{\"type\":\"user\",\"uuid\":\"escaped-small\",\"parentUuid\":\"escaped-large\",\"sessionId\":\"{thread}\",\"message\":{{\"role\":\"user\",\"content\":\"\\ud83e\\udd80\\u96ea\\u0061\"}}}}").unwrap();
+    let identity = json!({"nodeId":node,"provider":"claude","threadId":thread});
+    for _ in 0..2 {
+        let mut phone = endpoint(&root);
+        let response = phone.request("conversation/open", json!({"identity":identity}));
+        assert!(response["error"].is_null(), "{}", response["error"]);
+        let page = response["result"]["turns"]["data"].as_array().unwrap();
+        let large = &page[page.len() - 2]["items"][0];
+        assert_eq!(large["id"], "escaped-large");
+        assert_eq!(large["text"].as_str().unwrap(), "a".repeat(2 * 1024 * 1024));
+        assert_eq!(page.last().unwrap()["items"][0]["text"], "🦀雪a");
+    }
+}
+
+#[test]
+fn claude_visible_record_over_encoded_page_budget_is_explicitly_unavailable() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let thread = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let (_, node) = fixture(&root, Provider::Claude, thread);
+    let source = root.join(format!("claude/projects/fixture/{thread}.jsonl"));
+    let mut file = fs::OpenOptions::new().append(true).open(source).unwrap();
+    // Decoded text is only 5 MiB, but JSON escaping exceeds the 8 MiB wire budget.
+    let text = "\n".repeat(5 * 1024 * 1024);
+    assert!(serde_json::to_vec(&text).unwrap().len() > 8 * 1024 * 1024);
+    writeln!(file,"{}",json!({"type":"user","uuid":"too-large","parentUuid":"item-084","sessionId":thread,"message":{"role":"user","content":text}})).unwrap();
     let mut phone = endpoint(&root);
-    let rejected = phone.request(
+    let response = phone.request(
         "conversation/open",
         json!({"identity":{"nodeId":node,"provider":"claude","threadId":thread}}),
     );
-    assert!(rejected["result"].is_null());
+    assert!(response["result"].is_null());
     assert!(
-        rejected["error"]
-            .to_string()
-            .contains("individual history record exceeds 256 KiB"),
-        "{rejected}"
+        response["error"].to_string().contains("8 MiB"),
+        "{response}"
     );
+}
+
+#[test]
+fn claude_malformed_multimib_hidden_record_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let thread = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let (_, node) = fixture(&root, Provider::Claude, thread);
+    let source = root.join(format!("claude/projects/fixture/{thread}.jsonl"));
+    let mut file = fs::OpenOptions::new().append(true).open(source).unwrap();
+    writeln!(
+        file,
+        "{{\"type\":\"file-history-snapshot\",\"padding\":\"{}\",\"broken\":]}}",
+        "x".repeat(3 * 1024 * 1024)
+    )
+    .unwrap();
+    let mut phone = endpoint(&root);
+    let response = phone.request(
+        "conversation/open",
+        json!({"identity":{"nodeId":node,"provider":"claude","threadId":thread}}),
+    );
+    assert!(response["result"].is_null());
+    assert!(response["error"].is_object(), "{response}");
 }
 
 #[test]
@@ -609,7 +751,7 @@ fn claude_large_history_opens_pages_reopens_and_refuses_nonprefix_rewrite() {
         "{rejected}"
     );
     eprintln!(
-        "large native endpoint: {} source bytes, 285 ancestry nodes, complete latest/paging/reopen and full-prefix mutation refusal",
+        "large native endpoint: {} source bytes, 97 ancestry nodes, complete latest/paging/reopen and full-prefix mutation refusal",
         fs::metadata(source).unwrap().len()
     );
 }

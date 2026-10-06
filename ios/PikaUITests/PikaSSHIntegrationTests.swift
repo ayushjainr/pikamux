@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import XCTest
 
 /// Installed app -> ordinary OpenSSH -> real Rust mobile endpoint -> real
@@ -26,6 +27,9 @@ final class PikaSSHIntegrationTests: XCTestCase {
         let beforeCreationProceedPath: String?
         let approvalCommand: String?
         let approvalReason: String?
+        let expectedCodeSha256: String?
+        let expectedLargeUserSha256: String?
+        let expectedLargeReplySha256: String?
     }
     @MainActor func testManualSSHOnboardingReadAndReplyToExactExistingConversation() throws {
         continueAfterFailure = false
@@ -151,7 +155,75 @@ final class PikaSSHIntegrationTests: XCTestCase {
             XCTAssertFalse(app.buttons["sendReply"].isEnabled, "Synthetic source has no native owner or send route")
             let conversation = app.scrollViews["conversation-" + config.threadId]
             XCTAssertTrue(conversation.waitForExistence(timeout: 10))
+            func revealReaderControl(_ control: XCUIElement, towardsOlder: Bool) {
+                for _ in 0..<64 {
+                    // Native accessibility can call an offscreen descendant
+                    // hittable even when the header clips its actual button.
+                    // Require the whole control inside the visible viewport.
+                    let top = max(conversation.frame.minY, app.frame.minY + app.frame.height * 0.15)
+                    let bottom = min(conversation.frame.maxY, app.frame.maxY - app.frame.height * 0.15)
+                    let frame = control.frame
+                    if control.isHittable && frame.minY >= top && frame.maxY <= bottom { return }
+                    // Drag in the transcript's outer padding, not inside the
+                    // native reader. Fixture chronology supplies direction;
+                    // offscreen accessibility frames can have stale positions.
+                    // Small drags cannot skip the whole visible control band.
+                    let start = conversation.coordinate(withNormalizedOffset: CGVector(dx: 0.99, dy: towardsOlder ? 0.3 : 0.65))
+                    let end = conversation.coordinate(withNormalizedOffset: CGVector(dx: 0.99, dy: towardsOlder ? 0.55 : 0.4))
+                    start.press(forDuration: 0.1, thenDragTo: end)
+                }
+                XCTFail("Native reader control must become fully visible within finite real gestures")
+            }
+            for (identifier, expectedHash) in [("large-reply-content", config.expectedLargeReplySha256), ("large-user-content", config.expectedLargeUserSha256), ("large-code-content", config.expectedCodeSha256)] {
+                if let expectedHash {
+                    let reader = app.textViews[identifier]
+                    XCTAssertTrue(reader.waitForExistence(timeout: 10), "The full original large message must be accessible through its native reader")
+                    var original = ""
+                    var partCount = 0
+                    while true {
+                        let visiblePart = try XCTUnwrap(reader.value as? String)
+                        XCTAssertLessThanOrEqual(visiblePart.utf8.count, 16 * 1024, "Native layout work must remain bounded even for long combining-character graphemes")
+                        original += visiblePart
+                        partCount += 1
+                        guard partCount < 512 else {
+                            XCTFail("Native parts must make finite progress without repeating a page")
+                            break
+                        }
+                        let next = app.buttons[identifier + "-next"]
+                        if !next.exists || !next.isEnabled { break }
+                        revealReaderControl(next, towardsOlder: identifier != "large-code-content")
+                        XCTAssertTrue(next.isHittable, "Every original text part must remain reachable")
+                        let indicator = app.staticTexts[identifier + "-page"]
+                        let previousIndicator = indicator.label
+                        next.tap()
+                        XCTAssertNotEqual(indicator.label, previousIndicator, "Next must advance the native part indicator")
+                    }
+                    let originalHash = SHA256.hash(data: Data(original.utf8)).map { String(format: "%02x", $0) }.joined()
+                    XCTAssertEqual(originalHash, expectedHash, "Native reader must preserve the entire original message, including Unicode, escapes and Markdown fences")
+                }
+            }
             let older = app.buttons["Load older context"]
+            if let expectedCodeSha256 = config.expectedCodeSha256 {
+                let copy = app.buttons["Copy code"]
+                revealReaderControl(copy, towardsOlder: true)
+                XCTAssertTrue(copy.isHittable, "The actual large assistant code block must render with native Copy")
+                copy.tap()
+                XCTAssertTrue(app.buttons["Code copied"].exists)
+                let composer = app.textViews["composer"]
+                composer.press(forDuration: 1.2)
+                let paste = app.menuItems["Paste"]
+                if paste.waitForExistence(timeout: 3) { paste.tap() }
+                else { app.buttons["Paste"].tap() }
+                let copied = try XCTUnwrap(composer.value as? String)
+                let copiedSha256 = SHA256.hash(data: Data(copied.utf8)).map { String(format: "%02x", $0) }.joined()
+                XCTAssertEqual(copiedSha256, expectedCodeSha256, "Native Copy must preserve every byte of the >256 KiB code body")
+                let copiedEvidence = XCTAttachment(screenshot: app.screenshot()); copiedEvidence.name = "Actual large Claude code copied exactly"; copiedEvidence.lifetime = .keepAlways; add(copiedEvidence)
+                composer.tap()
+                composer.press(forDuration: 1.2)
+                let selectAll = app.menuItems["Select All"]
+                if selectAll.waitForExistence(timeout: 3) { selectAll.tap(); composer.typeText(XCUIKeyboardKey.delete.rawValue) }
+                app.swipeDown()
+            }
             for _ in 0..<24 {
                 if older.isHittable { break }
                 conversation.swipeDown()

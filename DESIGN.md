@@ -45,6 +45,16 @@ blocks with explicit Copy. Copy contains the rendered code body without fence
 markers or the fence-separating final newline. Markdown does not execute HTML,
 fetch images automatically, or open custom URL schemes. Only a user-tapped web
 or mail link can open externally. This view owns no connection or message state.
+Large text uses explicit native reader parts bounded to sixteen KiB of UTF-8
+at Unicode scalar boundaries, rather than an unbounded glyph layout. Every part
+is reachable with Previous/Next; concatenating the parts preserves the exact
+original, even when a combining-character cluster crosses a part boundary.
+Long code retains its full Copy action, long paragraphs and user text remain
+fully readable, and replies over one MiB explicitly show their complete original
+Markdown with Copy original. This is a presentation fallback, not transcript
+truncation. Large pasted drafts retain their text and
+selection while the composer uses its existing maximum height without first
+measuring the entire document.
 
 The iPhone remains a client of the selected machine's shared board and existing
 conversations. Its normal transport is the narrow `_mobile` command over SSH;
@@ -105,9 +115,16 @@ the reader retains only the requested page of projected text, not the whole
 transcript. Native channel receipts are read from one consistent read-only
 snapshot rather than accumulated as all historical message bodies. Paging binds
 the complete frozen source digest as well as the canonical projection, allowing
-later appends but refusing changes to the original snapshot. Individual records
-and ancestry metadata retain separate explicit bounds; no content is truncated
-to make a history appear successfully loaded. This adds no persistent index,
+later appends but refusing changes to the original snapshot. Source records are
+validated and selectively read without a raw record-size ceiling: large hidden
+tool results, thinking and image payloads do not need to fit a phone message.
+Visible text retains its exact bytes, including escaped Unicode. Pages contain
+at most forty items and eight MiB of encoded items, leaving room within the
+existing sixteen MiB transport envelope. Older-page cursors use the actual item
+count, so a byte-limited page does not skip intervening messages. A single
+visible item that cannot fit, unsupported JSON depth, or exhausted ancestry
+metadata remains an explicit limitation; no content is truncated to make a
+history appear successfully loaded. This adds no persistent index,
 provider launch, transcript write, or replacement conversation.
 
 Saved phone connections contribute independent board subscriptions to one Dex.

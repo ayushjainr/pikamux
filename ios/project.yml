@@ -35,7 +35,7 @@ targets:
       path: Pika/Info.plist
       properties:
         CFBundleDisplayName: Pika
-        CFBundleVersion: '41'
+        CFBundleVersion: '43'
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         NSLocalNetworkUsageDescription: Connect to your chosen Pika machine over your private network.

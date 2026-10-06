@@ -1,3 +1,25 @@
+Pika 0.6.47 fixes oversized individual Claude history records.
+
+The native reader no longer rejects a raw record at 256 KiB. Large hidden tool,
+thinking and image payloads are validated and streamed without materializing the
+whole record. Exact visible text, native ancestry, source integrity and paging
+are preserved. Pages contain at most forty items and eight MiB of encoded items;
+a single visible item that cannot fit is explicitly refused, never truncated.
+
+The separate iPhone alpha build 43 presents very large text in bounded native reader
+parts with full-original Copy. Actual Simulator-to-SSH testing verified all
+163 parts of large reply, user and code messages, exact text, older history and
+reopening at the latest reply. Normal chat regressions and a visually verified
+24 KiB paste also pass. These synthetic journeys are not a claim of verification
+on a physical phone or recovery of a particular user's transcript.
+
+The existing outgoing-message limit remains 64 KiB. A 416 KiB draft preserves its
+bytes but is not visually usable in the editor; that unsupported editing case is
+not claimed fixed. No provider upgrade, thread restart or history migration is
+performed. Native host releases do not include an iPhone installation.
+
+Retained changes from 0.6.46 (its individual-record limitation is superseded):
+
 Pika 0.6.46 fixes opening large Claude histories on your phone.
 
 The reader no longer rejects an entire conversation because its file exceeds

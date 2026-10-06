@@ -17,6 +17,9 @@ use std::{
 const WINDOW: u64 = 4 * 1024 * 1024;
 const RECORD: usize = 256 * 1024;
 const PAGE: usize = 40;
+// Claude source records can contain arbitrarily large hidden tool payloads.
+// This is a wire budget for one visible item/page, not a source-record limit.
+const CLAUDE_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[path = "mobile_claude_ancestry.rs"]
 mod claude_ancestry;
@@ -280,6 +283,19 @@ fn item(id: &str, user: bool, text: String) -> Result<Value> {
     Ok(json!({"id":id,"type":if user {"userMessage"} else {"agentMessage"},"text":text}))
 }
 
+fn claude_item(id: &str, user: bool, text: String) -> Result<Value> {
+    ensure!(
+        !id.is_empty() && id.len() <= 512,
+        "Provider message has no bounded stable identity"
+    );
+    let value = json!({"id":id,"type":if user {"userMessage"} else {"agentMessage"},"text":text});
+    ensure!(
+        serde_json::to_vec(&value)?.len() + 3 <= CLAUDE_PAGE_BYTES,
+        "One visible Claude message exceeds the 8 MiB encoded mobile page budget; its original text has not been truncated"
+    );
+    Ok(value)
+}
+
 fn text_parts(content: &Value) -> Option<String> {
     if let Some(text) = content.as_str() {
         return Some(text.to_owned());
@@ -309,7 +325,7 @@ fn jsonl_item(value: &Value, provider: Provider, identity: &str) -> Result<Optio
         let Some(text) = text_parts(&value["message"]["content"]) else {
             return Ok(None);
         };
-        return Ok(Some(item(
+        return Ok(Some(claude_item(
             value["uuid"]
                 .as_str()
                 .context("Claude message UUID missing")?,

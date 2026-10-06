@@ -121,8 +121,11 @@ actor FixtureWire: MobileWire {
             echo 'ready'
             ```
             """
-            let entry: JSONValue = .object(["id": .string("fixture-context"), "type": .string("agentMessage"),
-                "text": .string(ProcessInfo.processInfo.arguments.contains("--fixture-markdown") ? richText : "This is disposable UI fixture context for \(Self.items.first(where: { $0.identity == decoded })?.machine ?? "Fixture Assistant"). No real provider is attached.")])
+            let supportedDraft = "BEGIN supported draft " + String(repeating: "let value = 42; 雪🦀 ", count: 1000) + " END supported draft"
+            let presentation = ProcessInfo.processInfo.arguments.contains("--fixture-supported-composer")
+                ? "```swift\n" + supportedDraft + "\n```"
+                : ProcessInfo.processInfo.arguments.contains("--fixture-markdown") ? richText : "This is disposable UI fixture context for \(Self.items.first(where: { $0.identity == decoded })?.machine ?? "Fixture Assistant"). No real provider is attached."
+            let entry: JSONValue = .object(["id": .string("fixture-context"), "type": .string("agentMessage"), "text": .string(presentation)])
             let history: [JSONValue] = ProcessInfo.processInfo.arguments.contains("--fixture-long-history") ? (0..<30).map { index in
                 .object(["id": .string("long-\(index)"), "type": .string("agentMessage"), "text": .string("Original fixture context \(index)\nA sufficiently long original message to exercise native reading and history anchors.")])
             } : []

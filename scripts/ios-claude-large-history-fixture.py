@@ -44,24 +44,50 @@ def environment(root):
     return env
 
 
+def visible_role(index):
+    return "assistant" if index == 90 or index % 2 else "user"
+
+
+def large_code_body():
+    return '雪🦀\\"\tlet value = 42; ' * 16000
+
+
+def visible_text(index):
+    text = f"Synthetic large Claude {visible_role(index)} {index:03d}"
+    if index == 88:
+        text += "\n" + 'Literal user line 雪🦀 \\"\t\n' * 12000
+        # One extended grapheme can be arbitrarily large. A character-count
+        # preview limit must not hand this entire unit to native text layout.
+        text += "\nSingle extended grapheme:\ne" + "\u0301" * 200000
+        assert len(text.encode()) > 64 * 1024
+    if index == 90:
+        text += "\n```rust\n" + large_code_body() + "\n```\n"
+    if index == 91:
+        text += "\n**Mixed long reply**\n```text\ntiny fence cannot bypass the reader\n```\n"
+        text += 'Original mixed prose 雪🦀 \\" escaped line.\n' * 32000
+        assert len(text.encode()) > 1024 * 1024
+    return text
+
+
 def source(root, thread, mib):
     folder = root / "claude/projects/synthetic-only"
     folder.mkdir(parents=True)
     path = folder / (thread + ".jsonl")
     parent = None
-    padding = "SYNTHETIC_HIDDEN_TOOL_DATA_" + "x" * (128 * 1024 - 100)
+    padding = "SYNTHETIC_HIDDEN_TOOL_DATA_" + "x" * (2 * 1024 * 1024)
     with path.open("w") as stream:
         def emit(record):
             line = json.dumps(record, separators=(",", ":")) + "\n"
-            assert len(line.encode()) < 256 * 1024
             stream.write(line)
-        for index in range(128):
+        for index in range(4):
             tool = "synthetic_tool_" + str(index)
             for role, content in [
                 ("assistant", [{"type": "tool_use", "id": tool, "name": "SyntheticNeverExecuted", "input": {}}]),
-                ("user", [{"type": "tool_result", "tool_use_id": tool, "content": padding}]),
+                ("user", [{"type": "tool_result", "tool_use_id": tool, "content": padding if index % 2 == 0 else [{"type": "text", "text": padding}]}]),
+                ("assistant", [{"type": "thinking", "thinking": padding, "signature": "synthetic"}]),
+                ("user", [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": padding}}]),
             ]:
-                identity = str(uuid.uuid5(uuid.UUID(thread), "tool:" + str(index) + ":" + role))
+                identity = str(uuid.uuid5(uuid.UUID(thread), "tool:" + str(index) + ":" + content[0]["type"]))
                 emit({"type": role, "uuid": identity, "parentUuid": parent, "sessionId": thread,
                       "isSidechain": False, "entrypoint": "cli", "cwd": str(root),
                       "message": {"role": role, "content": content}})
@@ -70,11 +96,11 @@ def source(root, thread, mib):
             emit({"type": "file-history-snapshot", "sessionId": thread,
                   "snapshot": {"trackedFileBackups": {}}, "syntheticPadding": padding})
         for index in range(120):
-            role = "user" if index % 2 == 0 else "assistant"
+            role = visible_role(index)
             identity = str(uuid.uuid5(uuid.UUID(thread), "visible:" + str(index)))
             emit({"type": role, "uuid": identity, "parentUuid": parent, "sessionId": thread,
                   "isSidechain": False, "entrypoint": "cli", "cwd": str(root),
-                  "message": {"role": role, "content": [{"type": "text", "text": f"Synthetic large Claude {role} {index:03d}"}]}})
+                  "message": {"role": role, "content": [{"type": "text", "text": visible_text(index)}]}})
             parent = identity
         emit({"type": "custom-title", "sessionId": thread, "customTitle": "Synthetic large Claude history"})
     return path
@@ -101,7 +127,7 @@ def prepare(binary, mib):
     print(json.dumps(ready), flush=True)
 
 
-def serve(root, binary=None):
+def serve(root, binary=None, configure_only=False):
     root = Path(root).resolve()
     assert root.name.startswith("pika-claude-large-ui-")
     ready = json.loads((root / "ready.json").read_text())
@@ -111,7 +137,8 @@ def serve(root, binary=None):
     transcript = Path(ready["source"])
     assert digest(transcript) == ready["sourceSha256"]
     for name in ["client-key", "host-key"]:
-        subprocess.run(["/usr/bin/ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(root / name)], check=True)
+        if not (root / name).exists():
+            subprocess.run(["/usr/bin/ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(root / name)], check=True)
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
@@ -131,8 +158,14 @@ def serve(root, binary=None):
                    "clientKeyPath": str(root / "client-key"), "fingerprint": fingerprint,
                    "threadId": ready["threadId"], "threadName": "Synthetic large Claude history",
                    "expectedContext": "Synthetic large Claude user 118", "finalResponse": "Synthetic large Claude assistant 119",
+                   "expectedCodeSha256": hashlib.sha256(large_code_body().encode()).hexdigest(),
+                   "expectedLargeUserSha256": hashlib.sha256(visible_text(88).encode()).hexdigest(),
+                   "expectedLargeReplySha256": hashlib.sha256(visible_text(91).encode()).hexdigest(),
                    "mode": "largeHistory", "storeId": str(uuid.uuid4())}
     (root / "integration.json").write_text(json.dumps(integration))
+    if configure_only:
+        print("SYNTHETIC_LARGE_HISTORY_CONFIGURED " + str(root / "integration.json"), flush=True)
+        return
     with (root / "sshd.log").open("w") as log:
         child = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", str(config)], env=ready["env"], stdout=log, stderr=log)
         try:
@@ -155,18 +188,21 @@ def serve(root, binary=None):
             assert unchanged, "Synthetic source changed during read-only journey"
 
 
-def check(root, binary):
+def check(root, binary, expect_record_limit=False):
     """Actual endpoint evidence, with no SSH/provider/model execution."""
     root = Path(root).resolve()
     ready = json.loads((root / "ready.json").read_text())
     assert root.name.startswith("pika-claude-large-ui-") and ready["root"] == str(root)
     version = subprocess.check_output([binary, "--version"], env=ready["env"], cwd=root,
                                       timeout=5, text=True).strip()
+    binary_sha256 = digest(Path(binary))
     child = subprocess.Popen([binary, "_mobile"], env=ready["env"], cwd=root,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              text=True, bufsize=1)
     started = time.monotonic()
+    latencies = []
     def request(method, params):
+        request_started = time.monotonic()
         serial = str(uuid.uuid4())
         child.stdin.write(json.dumps({"v": 1, "id": serial, "method": method, "params": params}) + "\n")
         child.stdin.flush()
@@ -177,13 +213,25 @@ def check(root, binary):
             assert line, "Endpoint exited"
             value = json.loads(line)
             if value.get("id") == serial:
+                latencies.append({"method": method, "seconds": time.monotonic()-request_started})
                 return value
         raise AssertionError("Endpoint deadline")
     try:
         hello = request("hello", {})
         identity = {"nodeId": hello["result"]["nodeId"], "provider": "claude", "threadId": ready["threadId"]}
         opened = request("conversation/open", {"identity": identity})
-        evidence = {"binary": binary, "version": version, "open": opened, "sourceSha256": ready["sourceSha256"]}
+        if expect_record_limit:
+            assert "individual history record exceeds 256 KiB" in json.dumps(opened.get("error")), opened
+            assert "result" not in opened
+            evidence = {"binary": binary, "version": version, "expectedFormerRecordLimit": opened["error"],
+                        "binarySha256": binary_sha256,
+                        "sourceSha256": ready["sourceSha256"], "elapsedSeconds": time.monotonic()-started}
+            assert digest(Path(ready["source"])) == ready["sourceSha256"]
+            (root / "endpoint-former-record-limit.json").write_text(json.dumps(evidence))
+            print(json.dumps(evidence), flush=True)
+            return
+        assert "error" not in opened, opened.get("error")
+        evidence = {"binary": binary, "binarySha256": binary_sha256, "version": version, "sourceSha256": ready["sourceSha256"]}
         if "error" not in opened:
             assert opened["result"]["capabilities"]["send"] is False
             turns = opened["result"]["turns"]
@@ -200,12 +248,19 @@ def check(root, binary):
             texts = [turn["items"][0]["text"] for page in pages for turn in page]
             identities = [turn["items"][0]["id"] for page in pages for turn in page]
             assert len(identities) == len(set(identities))
-            expected = [f"Synthetic large Claude {'user' if i % 2 == 0 else 'assistant'} {i:03d}" for i in range(120)]
+            expected = [visible_text(i) for i in range(120)]
             assert texts == expected, (len(texts), texts[:2], texts[-2:])
             evidence["pageSizes"] = [len(page) for page in pages]
             evidence["visibleMessages"] = len(texts)
+            evidence["visibleTextSha256"] = [hashlib.sha256(text.encode()).hexdigest() for text in texts]
+            reopened = request("conversation/open", {"identity": identity})
+            assert "error" not in reopened, reopened.get("error")
+            assert reopened["result"]["turns"]["data"] == pages[-1]
+            evidence["reopenedLatestExact"] = True
         evidence["elapsedSeconds"] = time.monotonic()-started
+        evidence["requestLatencies"] = latencies
         assert digest(Path(ready["source"])) == ready["sourceSha256"]
+        assert digest(Path(binary)) == binary_sha256
         (root / ("endpoint-" + str(uuid.uuid4()) + ".json")).write_text(json.dumps(evidence))
         print(json.dumps(evidence), flush=True)
     finally:
@@ -222,12 +277,14 @@ if __name__ == "__main__":
     parser.add_argument("--mib", type=int, default=20, choices=[20, 40, 160])
     parser.add_argument("--serve")
     parser.add_argument("--check")
+    parser.add_argument("--expect-record-limit", action="store_true")
+    parser.add_argument("--configure-only", action="store_true")
     args = parser.parse_args()
     if args.check:
         assert args.binary and Path(args.binary).is_file()
-        check(args.check, str(Path(args.binary).resolve()))
+        check(args.check, str(Path(args.binary).resolve()), args.expect_record_limit)
     elif args.serve:
-        serve(args.serve, args.binary)
+        serve(args.serve, args.binary, args.configure_only)
     else:
         assert args.binary and Path(args.binary).is_file(), "Explicit built native Pika required"
         prepare(str(Path(args.binary).resolve()), args.mib)

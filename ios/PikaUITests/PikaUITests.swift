@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 
 final class PikaUITests: XCTestCase {
     @MainActor private func swipeBack() {
@@ -81,6 +82,42 @@ final class PikaUITests: XCTestCase {
         app.swipeDown(); app.swipeDown()
         XCTAssertTrue(app.staticTexts["Ready for your review"].exists)
         let heading = XCTAttachment(screenshot: app.screenshot()); heading.name = "Rich reply headings and lists"; heading.lifetime = .keepAlways; add(heading)
+    }
+    @MainActor func testSupportedLargePasteHasVisibleNativeText() throws {
+        launchFixture()
+        app.terminate(); app.launchArguments = ["--ui-fixture", "--fixture-supported-composer"]; app.launch()
+        app.buttons["thread-fixture-one"].tap()
+        let copy = app.buttons["Copy code"]
+        XCTAssertTrue(copy.waitForExistence(timeout: 5)); copy.tap()
+        let composer = app.textViews["composer"]
+        composer.press(forDuration: 1.2)
+        let paste = app.menuItems["Paste"]
+        if paste.waitForExistence(timeout: 3) { paste.tap() } else { app.buttons["Paste"].tap() }
+        let expected = "BEGIN supported draft " + String(repeating: "let value = 42; 雪🦀 ", count: 1000) + " END supported draft"
+        XCTAssertGreaterThan(expected.utf8.count, 4096)
+        XCTAssertLessThanOrEqual(expected.utf8.count, 32 * 1024)
+        XCTAssertEqual(composer.value as? String, expected)
+        XCTAssertTrue(app.buttons["sendReply"].isEnabled)
+        let settled = expectation(description: "Native pasted draft viewport settles")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { settled.fulfill() }
+        wait(for: [settled], timeout: 4)
+        let screenshot = app.screenshot()
+        let evidence = XCTAttachment(screenshot: screenshot); evidence.name = "Supported large draft actual visible viewport"; evidence.lifetime = .keepAlways; add(evidence)
+        // Byte integrity alone is insufficient: actual pixels inside the
+        // native editor must contain text, not just an empty field and caret.
+        let image = try XCTUnwrap(composer.screenshot().image.cgImage)
+        let width = image.width, height = image.height
+        let context = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let pixels = try XCTUnwrap(context.data).assumingMemoryBound(to: UInt8.self)
+        var darkPixels = 0
+        for y in 12..<max(12, height - 12) {
+            for x in 12..<max(12, width - 12) {
+                let i = (y * width + x) * 4
+                if pixels[i] < 128 && pixels[i + 1] < 128 && pixels[i + 2] < 128 && pixels[i + 3] > 127 { darkPixels += 1 }
+            }
+        }
+        XCTAssertGreaterThan(darkPixels, 100, "A supported pasted draft must visibly render native text inside its editor")
     }
     @MainActor func testNormalColoredTailTabSelection() {
         let normal = XCUIApplication()

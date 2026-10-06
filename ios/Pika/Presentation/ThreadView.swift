@@ -79,7 +79,15 @@ struct ThreadView: View {
                 ForEach(model.selected?.identity == item.identity ? model.messages : []) { message in
                     Group {
                     if message.role == "user" {
-                        HStack { Spacer(minLength: 36); Text(message.text).textSelection(.enabled).lineSpacing(4)
+                        HStack { Spacer(minLength: 36); Group {
+                            if message.text.utf8.count > 64 * 1024 {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Long message · full text in parts").font(.caption).foregroundStyle(.secondary)
+                                    NativeTranscriptReader(text: message.text, monospaced: false, identifier: "large-user-content").frame(height: 320)
+                                    Button("Copy original message") { UIPasteboard.general.string = message.text }.font(.caption.weight(.medium))
+                                }
+                            } else { Text(message.text).textSelection(.enabled).lineSpacing(4) }
+                        }
                             .padding(.horizontal, 16).padding(.vertical, 12)
                             .background(PikaTheme.accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 20)) }
                             .padding(.vertical, 6)
@@ -274,7 +282,23 @@ struct ThreadView: View {
 /// Presentation only: the original provider text remains unchanged in history.
 private struct RichReply: View, Equatable {
     let text: String
+    nonisolated static func == (lhs: RichReply, rhs: RichReply) -> Bool {
+        lhs.text.utf8.elementsEqual(rhs.text.utf8)
+    }
+    @ViewBuilder
     var body: some View {
+        if text.utf8.count > 1024 * 1024 {
+            // A whole-message fallback also bounds documents with thousands
+            // of individually small blocks; fence spelling cannot bypass it.
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Long reply · original text mode · full text in parts")
+                    .font(.caption).foregroundStyle(.secondary)
+                NativeTranscriptReader(text: text, monospaced: false)
+                    .frame(height: 320)
+                Button("Copy original reply") { UIPasteboard.general.string = text }
+                    .font(.caption.weight(.medium))
+            }
+        } else {
         Markdown(text)
             .markdownTextStyle(\.text) {
                 FontSize(17)
@@ -304,6 +328,18 @@ private struct RichReply: View, Equatable {
                 ReplyCodeBlock(code: configuration.content, language: configuration.language)
                     .markdownMargin(top: 8, bottom: 16)
             }
+            .markdownBlockStyle(\.paragraph) { configuration in
+                let paragraph = configuration.content.renderPlainText()
+                if paragraph.utf8.count > 64 * 1024 {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Long paragraph · full text in parts").font(.caption).foregroundStyle(.secondary)
+                        NativeTranscriptReader(text: paragraph, monospaced: false).frame(height: 320)
+                    }.markdownMargin(top: 8, bottom: 16)
+                } else {
+                    configuration.label.fixedSize(horizontal: false, vertical: true)
+                        .relativeLineSpacing(.em(0.25)).markdownMargin(top: 0, bottom: 16)
+                }
+            }
             .markdownBlockStyle(\.table) { configuration in
                 ScrollView(.horizontal) {
                     configuration.label
@@ -319,6 +355,10 @@ private struct RichReply: View, Equatable {
                 // A displayed link is not permission to execute a custom scheme.
                 ["https", "http", "mailto"].contains(url.scheme?.lowercased() ?? "") ? .systemAction : .discarded
             })
+            if text.utf8.count > 64 * 1024 {
+                Button("Copy original reply") { UIPasteboard.general.string = text }.font(.caption.weight(.medium))
+            }
+        }
     }
 }
 
@@ -341,13 +381,128 @@ private struct ReplyCodeBlock: View {
                     .frame(minHeight: 44)
             }.padding(.horizontal, 14)
             Divider().opacity(0.5)
+            if code.utf8.count > 64 * 1024 {
+                Text("Long code · full text in parts")
+                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 14).padding(.top, 8)
+                NativeTranscriptReader(text: code, monospaced: true, identifier: "large-code-content")
+                    .frame(height: 320)
+            } else {
             ScrollView(.horizontal) {
                 Text(code).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
                     .fixedSize(horizontal: true, vertical: false).padding(14)
             }
+            }
         }.background(PikaTheme.sheet, in: RoundedRectangle(cornerRadius: 14))
             .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.primary.opacity(0.08), lineWidth: 0.5))
             .onChange(of: code) { _, _ in copied = false }
+    }
+}
+
+/// Layout itself is bounded, not merely the view's frame. Every original
+/// character is available through explicit parts; surrounding Copy controls
+/// always copy the complete original, never the currently displayed part.
+private struct NativeTranscriptReader: View {
+    let monospaced: Bool
+    let identifier: String
+    private let originalBytes: Data
+    private let parts: [String]
+    @State private var part = 0
+    init(text: String, monospaced: Bool, identifier: String = "large-reply-content") {
+        self.monospaced = monospaced
+        self.identifier = identifier
+        self.originalBytes = Data(text.utf8)
+        var parts: [String] = []
+        let scalars = text.unicodeScalars
+        var start = scalars.startIndex
+        var end = start
+        var bytes = 0
+        while end < scalars.endIndex {
+            let scalar = scalars[end].value
+            let width = scalar <= 0x7f ? 1 : scalar <= 0x7ff ? 2 : scalar <= 0xffff ? 3 : 4
+            if bytes + width > 16 * 1024 {
+                parts.append(String(text[start..<end]))
+                start = end
+                bytes = 0
+            }
+            bytes += width
+            scalars.formIndex(after: &end)
+        }
+        if start < end { parts.append(String(text[start..<end])) }
+        self.parts = parts.isEmpty ? [""] : parts
+    }
+    var body: some View {
+        let selected = min(max(part, 0), parts.count - 1)
+        VStack(spacing: 4) {
+            NativeTranscriptPage(text: parts[selected], monospaced: monospaced, identifier: identifier)
+            if parts.count > 1 {
+                HStack {
+                    Button("Previous") { part = max(0, selected - 1) }.disabled(selected == 0).accessibilityIdentifier(identifier + "-previous")
+                    Spacer()
+                    Text("Part \(selected + 1) of \(parts.count)").font(.caption).accessibilityIdentifier(identifier + "-page")
+                    Spacer()
+                    Button("Next") { part = min(parts.count - 1, selected + 1) }.disabled(selected + 1 >= parts.count).accessibilityIdentifier(identifier + "-next")
+                }.font(.caption.weight(.medium)).padding(.horizontal, 14).frame(height: 44)
+            }
+        }.onChange(of: originalBytes) { _, _ in part = 0 }
+    }
+}
+
+private struct NativeTranscriptPage: UIViewRepresentable {
+    let text: String
+    let monospaced: Bool
+    var identifier = "large-reply-content"
+    func makeUIView(context: Context) -> UITextView {
+        // A zero-width initial text container can eagerly lay out a huge
+        // single line as one glyph per line before SwiftUI supplies its frame.
+        // Noncontiguous TextKit layout keeps work scoped to the native viewport.
+        let storage = NSTextStorage()
+        let layout = NSLayoutManager()
+        layout.allowsNonContiguousLayout = true
+        let container = NSTextContainer(size: CGSize(width: 320, height: CGFloat.greatestFiniteMagnitude))
+        layout.addTextContainer(container)
+        storage.addLayoutManager(layout)
+        let view = TranscriptPageTextView(frame: CGRect(x: 0, y: 0, width: 320, height: 320), textContainer: container)
+        view.isEditable = false
+        view.isSelectable = true
+        view.isScrollEnabled = true
+        view.alwaysBounceVertical = true
+        view.backgroundColor = .clear
+        view.textColor = .label
+        view.adjustsFontForContentSizeCategory = true
+        let size = UIFont.preferredFont(forTextStyle: .callout).pointSize
+        view.font = monospaced ? .monospacedSystemFont(ofSize: size, weight: .regular) : .preferredFont(forTextStyle: .body)
+        view.textContainer.widthTracksTextView = true
+        view.textContainerInset = UIEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.accessibilityIdentifier = identifier
+        // Each explicit, bounded page is one accessible text element. UIKit's
+        // synthesized paragraph children otherwise repeatedly walk every text
+        // attribute during snapshots, including long combining sequences.
+        view.isAccessibilityElement = true
+        view.accessibilityElements = []
+        view.text = text
+        return view
+    }
+    func updateUIView(_ view: UITextView, context: Context) {
+        // Canonically equivalent Unicode strings can still have distinct
+        // original bytes; the reader must not retain a previous normalization.
+        if !view.text.utf8.elementsEqual(text.utf8) {
+            view.text = text
+            // A newly selected part starts at its beginning, while ordinary
+            // parent updates preserve the reader's current scroll position.
+            view.setContentOffset(.zero, animated: false)
+        }
+    }
+}
+
+private final class TranscriptPageTextView: UITextView {
+    // The page is literal plain text. UIKit's generic attributed-value path
+    // re-resolves thousands of font/color runs on every accessibility query.
+    // Expose exactly the displayed native text, without inventing a full-source
+    // value or hiding the explicit Previous/Next parts from accessibility.
+    override var accessibilityAttributedValue: NSAttributedString? {
+        get { NSAttributedString(string: text ?? "") }
+        set { }
     }
 }
 

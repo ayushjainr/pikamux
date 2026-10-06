@@ -34,6 +34,13 @@ struct NativeComposer: UIViewRepresentable {
     func sizeThatFits(_ proposal: ProposedViewSize, uiView: ComposerTextView, context: Context) -> CGSize? {
         let width = proposal.width ?? 300
         let limit = max(140, (uiView.font?.lineHeight ?? 20) * 5 + 20)
+        // Large pasted drafts already need the scrolling viewport. Measuring
+        // their entire document at infinite height can block the main thread
+        // before the result is clamped, particularly for long Unicode lines.
+        if uiView.text.utf8.count > 4096 {
+            uiView.isScrollEnabled = true
+            return CGSize(width: width, height: limit)
+        }
         let ideal = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
         uiView.isScrollEnabled = ideal.height > limit
         return CGSize(width: width, height: min(max(46, ideal.height), limit))
