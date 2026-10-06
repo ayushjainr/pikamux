@@ -1,4 +1,25 @@
-Pika 0.6.45 adds native mobile continuation and repairs long-thread history ordering.
+Pika 0.6.46 fixes opening large Claude histories on your phone.
+
+The reader no longer rejects an entire conversation because its file exceeds
+16 MiB. It verifies ancestry and reads pages without retaining every message body
+in memory. Chronological order, supported native compaction, exact conversation
+identity and source-backed phone exchanges are preserved. Source changes or late
+receipt settlement invalidate an older cursor rather than silently shifting it.
+
+The same 21 MiB fixture rejected by 0.6.45 now passes the actual iPhone Simulator
+to SSH journey: open, load older context, leave and reopen at the latest reply.
+Local optimized measurements opened 40 MiB in 0.7 seconds and 160 MiB in 2.2
+seconds, with about 13 MB peak process memory for both fixed-graph fixtures.
+These are local measurements, not fleet latency guarantees.
+
+Individual records retain their 256 KiB limit; ancestry metadata has a separate
+bounded budget. Unsupported or ambiguous native histories remain explicit errors.
+No transcript is truncated or modified. No new phone build, USB connection,
+provider upgrade or running-thread restart is required.
+
+Retained features from 0.6.45:
+
+Pika adds native mobile continuation and repairs long-thread history ordering.
 
 - Codex history pages retain chronological order across reopen and older-context
   loading; the iPhone follows new replies after sending.

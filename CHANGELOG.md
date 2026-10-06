@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.46 — Read large Claude histories on your phone
+
+- Remove the 16 MiB whole-history cutoff with a streamed, bounded-memory reader.
+- Preserve native ancestry, compaction, chronological paging and latest-message
+  reopening, without truncating or changing the original conversation.
+- Bind older pages to the full frozen source and source-backed receipt projection;
+  changed history requires reopening rather than silently skipping messages.
+- Verify the actual Simulator-to-SSH journey and 40/160 MiB endpoint histories.
+
+Individual records retain their explicit 256 KiB limit and ancestry metadata
+has a separate bounded budget. No phone update or provider restart is required.
+
 ## 0.6.45 — Continue native conversations from your phone
 
 - Preserve chronological Codex history across long-thread reopening and paging,

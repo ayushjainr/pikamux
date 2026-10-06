@@ -17,12 +17,13 @@ use std::{
 const WINDOW: u64 = 4 * 1024 * 1024;
 const RECORD: usize = 256 * 1024;
 const PAGE: usize = 40;
-const CLAUDE_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
 
 #[path = "mobile_claude_ancestry.rs"]
 mod claude_ancestry;
 #[path = "mobile_claude_history.rs"]
 mod claude_projection;
+#[path = "mobile_claude_reader.rs"]
+mod claude_reader;
 
 #[derive(Serialize, Deserialize)]
 struct Cursor {
@@ -41,6 +42,8 @@ struct Cursor {
     claude_before: Option<usize>,
     #[serde(default)]
     claude_items_hash: Option<String>,
+    #[serde(default)]
+    claude_source_hash: Option<String>,
 }
 
 /// Read the latest page, or an older snapshot page using its opaque cursor.
@@ -90,9 +93,7 @@ fn read_items(
     }
     verify_snapshot(file, state)?;
     if state.provider == Provider::Claude {
-        let records = verify_claude_chain(file, state)?;
-        let projection = claude_projection::project(paths, &state.id, &records)?;
-        return claude_page(&records, state, &projection, initial);
+        return claude_reader::page(paths, file, state, initial);
     }
     jsonl_page(file, state)
 }
@@ -163,70 +164,6 @@ pub(crate) fn claude_registry_without_history(
         ))
 }
 
-/// Native Claude follows ancestry, not append order, after rewind/compaction.
-/// Fail closed until provider-native relinking is verified for nonlinear histories.
-fn verify_claude_chain(file: &mut File, state: &Cursor) -> Result<Vec<Value>> {
-    ensure!(
-        state.snapshot <= CLAUDE_GRAPH_BYTES,
-        "Claude history is too large to verify its native message chain; read it in the original terminal"
-    );
-    file.seek(SeekFrom::Start(0))?;
-    let mut bytes = vec![0; state.snapshot as usize];
-    file.read_exact(&mut bytes)?;
-    let mut records = Vec::new();
-    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
-        if !line.ends_with(b"\n") {
-            break;
-        }
-        ensure!(
-            line.len() <= RECORD + 1,
-            "Claude record exceeds its verification bound"
-        );
-        if line.len() == 1 {
-            continue;
-        }
-        let value: Value = serde_json::from_slice(line)?;
-        records.push(value);
-    }
-    claude_ancestry::reconstruct(records, &state.id)
-}
-
-fn claude_page(
-    records: &[Value],
-    state: &mut Cursor,
-    projection: &BTreeMap<String, Vec<Value>>,
-    initial: bool,
-) -> Result<(Vec<Value>, bool)> {
-    let mut items = Vec::new();
-    for record in records {
-        if let Some(entries) = record["uuid"].as_str().and_then(|id| projection.get(id)) {
-            items.extend(entries.iter().cloned());
-        } else if let Some(entry) = jsonl_item(record, Provider::Claude, &state.id)? {
-            items.push(entry);
-        }
-    }
-    let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&items)?));
-    let end = if initial {
-        state.claude_items_hash = Some(hash);
-        items.len()
-    } else {
-        ensure!(
-            state.claude_items_hash.as_deref() == Some(hash.as_str()),
-            "Claude native projection changed; reopen it"
-        );
-        state
-            .claude_before
-            .context("Claude history cursor predates native reconstruction; reopen it")?
-    };
-    ensure!(
-        end <= items.len(),
-        "Claude logical history boundary changed; reopen it"
-    );
-    let start = end.saturating_sub(PAGE);
-    state.claude_before = Some(start);
-    Ok((items[start..end].to_vec(), start > 0))
-}
-
 fn prepare_cursor(
     file: &mut File,
     provider: Provider,
@@ -265,6 +202,7 @@ fn prepare_cursor(
             displayed_runs: BTreeSet::new(),
             claude_before: None,
             claude_items_hash: None,
+            claude_source_hash: None,
         })
     }
 }

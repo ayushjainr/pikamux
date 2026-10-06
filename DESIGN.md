@@ -100,6 +100,15 @@ timestamps as a branch selector. Older pages bind the canonical projected items
 as well as the source snapshot; changing a receipt projection requires reopening
 rather than silently skipping history. Unknown schemas, missing ancestors,
 ambiguous branches and histories beyond the bounded reader remain explicit.
+Large Claude files are scanned record by record into a bounded ancestry index;
+the reader retains only the requested page of projected text, not the whole
+transcript. Native channel receipts are read from one consistent read-only
+snapshot rather than accumulated as all historical message bodies. Paging binds
+the complete frozen source digest as well as the canonical projection, allowing
+later appends but refusing changes to the original snapshot. Individual records
+and ancestry metadata retain separate explicit bounds; no content is truncated
+to make a history appear successfully loaded. This adds no persistent index,
+provider launch, transcript write, or replacement conversation.
 
 Saved phone connections contribute independent board subscriptions to one Dex.
 Adding a connection must not replace earlier machines. Cached rows remain visible

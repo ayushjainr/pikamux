@@ -1471,3 +1471,57 @@ Final source formatting, all-target warnings-as-errors Clippy (30.65 seconds),
 dependency-notice regeneration, RustSec audit with warnings denied, and complexity
 (4,893 functions, 137 pre-existing hotspots, zero failures) pass. Full native
 release checks and exact-commit CI remain separately required before publication.
+
+### Large Claude history — streamed verification (2026-10-05)
+
+The released 0.6.45 endpoint refused the same 21,120,496-byte synthetic source
+that the corrected endpoint now reads as 120 exact messages across three
+chronological pages. An actual iPhone Simulator -> loopback OpenSSH -> native
+`_mobile` journey passed (1 test, 96.784 seconds): latest message 119 is visible,
+older context crosses 079 -> 080 without duplication, and leaving/reopening
+returns to 119. Sending remains disabled for this saved-history-only fixture.
+The source SHA256 stayed unchanged and the private listener was reaped with its
+port closed. No model, real transcript, fleet host, or native provider was used.
+This is not a physical-phone or native-Claude-generation claim.
+
+Evidence: `/private/var/folders/k9/s1xh63d93rq9bd97cngqvf4c0000gn/T/pika-claude-large-ui-hbyqsg1a/large-ui-01.xcresult`,
+the adjacent endpoint JSON evidence, screenshots and `cleanup.json`.
+`scripts/ios-claude-large-history-fixture.py` reproduces the isolated source and
+SSH fixture; the existing SSH integration UI test has a `largeHistory` mode.
+
+The optimized native endpoint was independently measured with the same 376-node
+graph and 120 literal messages, increasing only non-displayed source padding:
+
+| Source bytes | Initial open | Older-page requests | Reopen | Peak process RSS |
+| --- | --- | --- | --- | --- |
+| 42,103,216 | 717 ms | 709 / 712 ms | 708 ms | 13,139,968 bytes |
+| 167,868,394 | 2,222 ms | 2,210 / 2,215 ms | 2,207 ms | 13,221,888 bytes |
+
+Each run checked every returned literal, chronological order, exact reopen page,
+send capability, clean process exit and unchanged source hash. These local
+measurements are not fleet latency guarantees. Full-source scanning repeats per
+page, so CPU and I/O scale with source size even though body retention does not.
+Artifacts: `/tmp/pika-large-history-release-40.json` and
+`/tmp/pika-large-history-release-160.json`.
+
+Actual endpoint regressions passed 10/10, including >20 MiB native-compaction
+fixtures, 5,000 small nodes, append/paging/reopen, same-inode nonprefix rewrite
+refusal, and late receipt settlement invalidating an older cursor. Production
+reader checks include changed-record refusal even if original bytes are restored
+before the final digest. No obsolete test-only reader stands in for production.
+
+This removes the 16 MiB whole-transcript cutoff. Individual durable records
+retain their explicit 256 KiB bound; the separate conservative ancestry-memory
+charge is bounded at 128 MiB (not a promise about total RSS). Unsupported native
+ancestry remains a visible refusal rather than truncation or branch guessing.
+No persistent index, provider state change, dependency, or phone runtime change
+is introduced by this fix.
+
+Final local gates: 54 native test targets completed, 1,327 passed, zero failed,
+31 explicitly ignored; formatting and diff checks pass; warnings-as-errors
+all-target Clippy passes (22.58 seconds); complexity passes (4,904 functions,
+137 existing hotspots, zero failures). The dependency lockfile and notices are
+unchanged, so the same-day passing release audit and notice verification remain
+applicable. Independent adversarial review scored the scoped fix 95/100 with
+no unresolved material defect. Publication and fleet deployment are not covered
+by these local results and remain separate approval-gated actions.

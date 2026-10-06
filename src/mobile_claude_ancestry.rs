@@ -42,7 +42,7 @@ pub(super) fn reconstruct(records: Vec<Value>, identity: &str) -> Result<Vec<Val
     chain(map)
 }
 
-fn transcript(record: &Value) -> Result<bool> {
+pub(super) fn transcript(record: &Value) -> Result<bool> {
     let kind = record["type"]
         .as_str()
         .context("Claude record type missing")?;
