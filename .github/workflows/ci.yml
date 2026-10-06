@@ -67,7 +67,9 @@ jobs:
           if-no-files-found: error
 
   test:
-    timeout-minutes: 20
+    # macOS measured 16m29s for the serial suite, before the release build.
+    # Keep per-test deadlines unchanged; allow the complete job to finish.
+    timeout-minutes: ${{ matrix.os == 'macos-14' && 30 || 20 }}
     strategy:
       fail-fast: false
       matrix:

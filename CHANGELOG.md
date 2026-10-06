@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.6.47 — Read oversized Claude records without losing history
+## 0.6.48 — Read oversized Claude records without losing history
+
+Version 0.6.47 was withheld: an initial macOS assistant-contention timeout did
+not recur in the unchanged full-suite rerun, which then exhausted the overall
+20-minute job budget during release compilation. macOS now has a 30-minute job
+budget; individual test deadlines and assertions are unchanged.
 
 - Remove the 256 KiB individual-record ceiling with validated selective streaming
   of large tool results, thinking and image payloads.

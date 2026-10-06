@@ -1,4 +1,9 @@
-Pika 0.6.47 fixes oversized individual Claude history records.
+Pika 0.6.48 fixes oversized individual Claude history records.
+
+Version 0.6.47 was withheld. Its unchanged macOS suite passed on rerun after an
+initial assistant-contention timeout, but the job reached its overall deadline
+during release compilation. The macOS job now has enough budget to complete;
+individual test deadlines and assertions remain unchanged.
 
 The native reader no longer rejects a raw record at 256 KiB. Large hidden tool,
 thinking and image payloads are validated and streamed without materializing the
