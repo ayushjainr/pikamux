@@ -1,5 +1,8 @@
 //! Exercise the actual Unix executable through a disposable terminal, not just
 //! BoardAction enums. No provider, real SSH endpoint, or user tmux server is used.
+//! Fake providers wait in the shell's read builtin: forked sleep children can
+//! briefly inherit the provider UUID argv on macOS and appear as duplicate owners.
+//! EOF exits cleanly; navigation assertions and production identity checks stay intact.
 #![cfg(unix)]
 
 use pikamux::{
@@ -684,7 +687,7 @@ fn unverified_terminal_journey(boomerang: bool) {
     fs::write(
         &provider,
         format!(
-            "#!/bin/sh\n[ \"$*\" = 'app-server --stdio' ] && exit 97\nprintf '%s\\n' \"$*\" >> {}\nprintf 'EXISTING FAKE AGENT\\n'\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\n[ \"$*\" = 'app-server --stdio' ] && exit 97\nprintf '%s\\n' \"$*\" >> {}\nprintf 'EXISTING FAKE AGENT\\n'\nwhile IFS= read -r ignored; do :; done\n",
             shell_words::quote(launches.to_str().unwrap())
         ),
     )
@@ -821,7 +824,7 @@ fn remote_f12_fixture(fail: bool) -> (BoardProcess, String, String) {
     .unwrap();
     board.real_tmux = true;
     fs::write(board.root.path().join("bin/codex"),
-        "#!/bin/sh\ntest \"$1\" = resume || exit 97\nprintf 'FAKE AGENT READY\\n'\nwhile :; do sleep 1; done\n").unwrap();
+        "#!/bin/sh\ntest \"$1\" = resume || exit 97\nprintf 'FAKE AGENT READY\\n'\nwhile IFS= read -r ignored; do :; done\n").unwrap();
     board.send(b"/audit\r");
     board.await_text("FILTER audit");
     board.send(b"\r");
@@ -1079,7 +1082,7 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             ("codex", "resume")
         };
         fs::write(board.root.path().join("bin").join(executable), format!(
-        "#!/bin/sh\n{quota_probe}test \"$1\" = {resume} || exit 97\nprintf '%s\\n' \"$2\" >> {}\nprintf 'FAKE AGENT READY\\n'\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\n{quota_probe}test \"$1\" = {resume} || exit 97\nprintf '%s\\n' \"$2\" >> {}\nprintf 'FAKE AGENT READY\\n'\nwhile IFS= read -r ignored; do :; done\n",
         shell_words::quote(launches.to_str().unwrap())
     )).unwrap();
         let store = Store::at(board.root.path().join("state/pika.db"));
@@ -1554,7 +1557,7 @@ fn exact_open_detach_and_reopen_return_to_the_same_filtered_board() {
     .unwrap();
     board.real_tmux = true;
     fs::write(board.root.path().join("bin/codex"),
-        "#!/bin/sh\ntest \"$1\" = resume || exit 97\nprintf '%s\\n' 'FAKE AGENT READY' '• Queued follow-up inputs' '  ? 1 question' '' '› Ask Codex to do anything' '' 'gpt-6-astra medium · ~/fixture · weekly 58% left'\nwhile :; do sleep 1; done\n"
+        "#!/bin/sh\ntest \"$1\" = resume || exit 97\nprintf '%s\\n' 'FAKE AGENT READY' '• Queued follow-up inputs' '  ? 1 question' '' '› Ask Codex to do anything' '' 'gpt-6-astra medium · ~/fixture · weekly 58% left'\nwhile IFS= read -r ignored; do :; done\n"
     ).unwrap();
     board.send(b"/audit\r");
     board.await_text("FILTER audit");

@@ -1695,3 +1695,27 @@ Review found and repaired both premature-result ordering and compacted-away-call
 projection gaps. The reviewer authored those narrow helpers; the batch author
 and root reviewed their integration. No fleet recovery claim is made by these
 local checks alone.
+
+Prepublication live verification used a temporary, checksum-matched Linux
+release artifact on rs6, without replacing the installed command. Seven actual
+Claude histories opened, including the originally reported history. Each
+reopened with the exact same latest page; all five that offered older pages
+returned chronological, nonoverlapping pages. Evidence is
+`/tmp/pika-thread-search.tKsuvD/rs6-candidate-open.jsonl` and
+`rs6-candidate-pages.jsonl`. These responses expose saved history as read-only;
+this is not a claim that all existing Claude sessions support phone replies.
+
+Two actual entries remain blocked independently: one has multiple live owners;
+another contains a complete but malformed JSON source record. Independent JSON
+validation confirmed the latter, while the sanitized graph replay necessarily
+contained only parseable records. Neither transcript was rewritten, no record
+was silently discarded, and no agent was stopped. Seven recovered histories
+must not be reported as nine recovered live conversations.
+
+The first macOS CI attempt failed one unrelated terminal-navigation fixture
+with an OPEN TWICE observation; Linux's full suite passed. A disposable Darwin
+argument-reader reproduction observed shell children temporarily inheriting the
+fake provider's exact conversation arguments before executing sleep. Follow-up
+test-only changes replace recurring sleep forks with a blocking shell builtin
+read. Navigation assertions, timeouts and production ownership rules are
+unchanged. This establishes the mechanism, not the exact hosted claimant pair.
