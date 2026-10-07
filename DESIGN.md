@@ -105,7 +105,12 @@ lost-acknowledgement journeys are recorded in `ios/NATIVE_EVIDENCE.md`.
 
 Claude saved-history paging follows a uniquely verified native parent chain,
 including the supported native 2.1.274 compaction preservation-list/segment
-relinking schemas. It never chooses an arbitrary latest-written branch or uses
+relinking schemas. Parallel tool batches use exact native response and call
+identities; their records remain present in source-consistent parent order.
+Known native metadata is not mistaken for conversation ancestry. Ambiguity can
+be resolved only by a native `last-prompt` pointer following and exactly matching
+the final owned record, not stale metadata. It never
+chooses an arbitrary latest-written branch or uses
 timestamps as a branch selector. Older pages bind the canonical projected items
 as well as the source snapshot; changing a receipt projection requires reopening
 rather than silently skipping history. Unknown schemas, missing ancestors,
@@ -128,6 +133,11 @@ history appear successfully loaded. This adds no persistent index,
 provider launch, transcript write, or replacement conversation.
 
 Saved phone connections contribute independent board subscriptions to one Dex.
+Dex search filters that existing inventory by thread name, machine label and
+provider, with case/diacritic-insensitive terms combined across those fields.
+It intersects machine and provider filters, preserves source ordering and exact identities,
+and survives opening a thread and returning. Empty matches are distinct from an
+empty board. Search performs no transcript reads, network calls or state writes.
 Adding a connection must not replace earlier machines. Cached rows remain visible
 when their machine is offline, and the machine filter includes saved empty or
 offline machines. Optional user nicknames are presentation metadata only: SSH

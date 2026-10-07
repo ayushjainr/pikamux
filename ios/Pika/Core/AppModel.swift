@@ -211,6 +211,12 @@ final class AppModel: ObservableObject {
                 capabilities = .object(["board": .bool(true), "codexShared": .bool(true), "create": .bool(true), "adopt": .bool(true), "assistant": .bool(false)])
             }
             board = FixtureWire.items
+            if ProcessInfo.processInfo.arguments.contains("--fixture-search") {
+                machines = board.map { row in
+                    SavedMachine(id: row.identity.nodeId, address: "fixture.invalid", port: 22,
+                        username: "fixture", hostKey: "", credentialId: "", keyAuthentication: true, name: row.machine)
+                }
+            }
             observedAt = .now
             listen(fixture)
             return

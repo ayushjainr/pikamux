@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.49 — Reconstruct native Claude conversation history
+
+- Recognize native history metadata and exact parallel tool-response batches.
+- Follow an authoritative native conversation pointer when it proves the selected
+  branch; ambiguous ownership and unsupported ancestry remain explicitly blocked.
+- Preserve phone-sent input when Claude compaction keeps its result but removes
+  its fetch call, using digest-verified source records and matching receipts.
+- Add local iPhone thread search and intersecting machine/provider filters in
+  separate app build 44; native host updates do not install the phone app.
+
+No thread restart, provider upgrade or transcript migration is performed.
+
 ## 0.6.48 — Read oversized Claude records without losing history
 
 Version 0.6.47 was withheld: an initial macOS assistant-contention timeout did

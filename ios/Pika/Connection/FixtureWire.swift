@@ -5,7 +5,7 @@ import Foundation
 actor FixtureWire: MobileWire {
     static let items = [
         BoardItem(identity: ThreadIdentity(nodeId: "fixture-node", provider: ProcessInfo.processInfo.arguments.contains("--fixture-channel-receipt") ? "claude" : "codex", threadId: "fixture-one"), name: "master_quant", machine: "Fixture Alpha", state: "NEEDS YOU", detail: ""),
-        BoardItem(identity: ThreadIdentity(nodeId: "fixture-node-two", provider: "codex", threadId: "fixture-two"), name: "master_quant", machine: "Fixture Beta", state: "WORKING", detail: "")
+        BoardItem(identity: ThreadIdentity(nodeId: "fixture-node-two", provider: ProcessInfo.processInfo.arguments.contains("--fixture-search") ? "claude" : "codex", threadId: "fixture-two"), name: "master_quant", machine: "Fixture Beta", state: "WORKING", detail: "")
     ]
     nonisolated let events: AsyncStream<JSONValue>
     private let sink: AsyncStream<JSONValue>.Continuation

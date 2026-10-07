@@ -3,8 +3,11 @@
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+#[path = "mobile_claude_batches.rs"]
+mod batches;
 
 pub(super) fn reconstruct(records: Vec<Value>, identity: &str) -> Result<Vec<Value>> {
+    let selector = provider_selector(&records, identity);
     let mut order = Vec::new();
     let mut map = BTreeMap::new();
     for record in records {
@@ -36,10 +39,98 @@ pub(super) fn reconstruct(records: Vec<Value>, identity: &str) -> Result<Vec<Val
         order.push(id.clone());
         map.insert(id, record);
     }
+    let result_sources = batches::result_sources(&map);
     compact(&order, &mut map)?;
     validate_parents(&map)?;
+    validate_cycles(&map)?;
+    let selector = selector.and_then(|selector| conversational_selector(selector, &map));
     prune_attachments(&mut map);
-    chain(map)
+    batches::chain(map, &order, &result_sources, selector)
+}
+
+#[derive(Default)]
+struct ProviderSelector {
+    main: Option<(String, usize)>,
+    pointer: Option<(Value, usize, Option<usize>)>,
+    conflict: bool,
+}
+
+impl ProviderSelector {
+    fn observe(&mut self, record: &Value, index: usize) {
+        match record["type"].as_str() {
+            Some("user" | "assistant" | "system" | "attachment") => {
+                self.main = record["uuid"].as_str().map(|id| (id.into(), index));
+                self.conflict = false;
+            }
+            Some("last-prompt") => {
+                if let Some(pointer) = record.get("leafUuid") {
+                    let generation = self.main.as_ref().map(|(_, index)| *index);
+                    if let Some((previous, _, previous_generation)) = &self.pointer {
+                        self.conflict |= *previous_generation == generation && previous != pointer;
+                    }
+                    self.pointer = Some((pointer.clone(), index, generation));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(self) -> Result<Option<String>> {
+        let Some((pointer, index, _)) = self.pointer else {
+            return Ok(None);
+        };
+        let pointer = pointer
+            .as_str()
+            .context("Invalid Claude authoritative leaf selector")?;
+        ensure!(
+            !self.conflict,
+            "Conflicting Claude authoritative leaf selectors"
+        );
+        let (main, main_index) = self
+            .main
+            .context("Claude authoritative leaf has no owned transcript")?;
+        ensure!(
+            pointer == main && index > main_index,
+            "Claude authoritative leaf selector is stale or mismatched"
+        );
+        Ok(Some(pointer.into()))
+    }
+}
+
+fn provider_selector(records: &[Value], identity: &str) -> Result<Option<String>> {
+    let mut selector = ProviderSelector::default();
+    for (index, record) in records.iter().enumerate() {
+        if record["sessionId"].as_str() == Some(identity) && record["isSidechain"] != true {
+            selector.observe(record, index);
+        }
+    }
+    selector.finish()
+}
+
+fn conversational_selector(
+    selector: Option<String>,
+    map: &BTreeMap<String, Value>,
+) -> Result<Option<String>> {
+    let Some(mut id) = selector else {
+        return Ok(None);
+    };
+    let mut seen = BTreeSet::new();
+    loop {
+        ensure!(
+            seen.insert(id.clone()),
+            "Claude authoritative leaf ancestry cycles"
+        );
+        let record = map
+            .get(&id)
+            .context("Claude authoritative leaf is missing after compaction")?;
+        if record["type"] != "attachment" {
+            return Ok(Some(id));
+        }
+        id = record["parentUuid"]
+            .as_str()
+            .context("Claude authoritative leaf lacks conversational ancestry")?
+            .into();
+    }
 }
 
 pub(super) fn transcript(record: &Value) -> Result<bool> {
@@ -83,6 +174,9 @@ pub(super) fn transcript(record: &Value) -> Result<bool> {
                 | "cost-state"
                 | "queue-operation"
                 | "observer-ref"
+                | "frame-link"
+                | "artifact-comment-monitor"
+                | "artifact-autoreact-ledger"
         ),
         "Unsupported Claude history record schema"
     );
@@ -278,6 +372,26 @@ fn validate_parents(map: &BTreeMap<String, Value>) -> Result<()> {
     Ok(())
 }
 
+fn validate_cycles(map: &BTreeMap<String, Value>) -> Result<()> {
+    let mut done = BTreeSet::new();
+    for id in map.keys() {
+        let mut path = BTreeSet::new();
+        let mut current = Some(id.as_str());
+        while let Some(id) = current {
+            if done.contains(id) {
+                break;
+            }
+            ensure!(
+                path.insert(id.to_owned()),
+                "Claude native ancestry contains a cycle"
+            );
+            current = map[id]["parentUuid"].as_str();
+        }
+        done.extend(path);
+    }
+    Ok(())
+}
+
 fn prune_attachments(map: &mut BTreeMap<String, Value>) {
     let mut counts = BTreeMap::<String, usize>::new();
     for record in map.values() {
@@ -308,31 +422,6 @@ fn prune_attachments(map: &mut BTreeMap<String, Value>) {
     }
 }
 
-fn chain(mut map: BTreeMap<String, Value>) -> Result<Vec<Value>> {
-    let mut children = BTreeMap::new();
-    for (id, record) in &map {
-        let parent = record["parentUuid"].as_str().map(str::to_owned);
-        ensure!(
-            children.insert(parent, id.clone()).is_none(),
-            "Claude history contains a rewind or branching ambiguity; read it in the original terminal"
-        );
-    }
-    let mut id = children.get(&None).cloned();
-    let mut result = Vec::new();
-    while let Some(current) = id {
-        result.push(
-            map.remove(&current)
-                .context("Claude native ancestry contains a cycle")?,
-        );
-        id = children.get(&Some(current)).cloned();
-    }
-    ensure!(
-        map.is_empty(),
-        "Claude native ancestry is disconnected; read it in the original terminal"
-    );
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +438,48 @@ mod tests {
             .iter()
             .map(|record| record["uuid"].as_str().unwrap().into())
             .collect()
+    }
+    #[test]
+    fn authoritative_provider_leaf_selects_exact_branch_not_latest_fallback() {
+        let mut records = vec![
+            message("root", None),
+            message("old", Some("root")),
+            message("selected", Some("root")),
+        ];
+        assert!(reconstruct(records.clone(), "owned").is_err());
+        records.push(json!({"type":"last-prompt","sessionId":"owned","leafUuid":"selected"}));
+        assert_eq!(ids(records), ["root", "selected"]);
+    }
+    #[test]
+    fn stale_dangling_conflicting_and_missing_provider_selectors_refused() {
+        let base = vec![
+            message("root", None),
+            message("old", Some("root")),
+            message("selected", Some("root")),
+        ];
+        let pointer = |id: &str| json!({"type":"last-prompt","sessionId":"owned","leafUuid":id});
+        let mut stale = base.clone();
+        stale.insert(2, pointer("selected"));
+        let mut dangling = base.clone();
+        dangling.push(pointer("missing"));
+        let mut conflict = base.clone();
+        conflict.extend([pointer("old"), pointer("selected")]);
+        let mut missing = base.clone();
+        missing.push(json!({"type":"last-prompt","sessionId":"owned"}));
+        let mut foreign = base;
+        foreign.push(json!({"type":"last-prompt","sessionId":"other","leafUuid":"selected"}));
+        for records in [stale, dangling, conflict, missing, foreign] {
+            assert!(reconstruct(records, "owned").is_err());
+        }
+    }
+    #[test]
+    fn stale_provider_metadata_is_not_needed_to_resolve_unique_ancestry() {
+        let records = vec![
+            message("root", None),
+            json!({"type":"last-prompt","sessionId":"owned","leafUuid":"root"}),
+            message("next", Some("root")),
+        ];
+        assert_eq!(ids(records), ["root", "next"]);
     }
     #[test]
     fn native_list_rethreads_physically_old_preserved_messages_after_summary() {

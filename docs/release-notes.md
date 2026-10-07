@@ -1,3 +1,16 @@
+Pika 0.6.49 fixes native Claude history reconstruction beyond the record-size fix.
+
+Exact parallel tool-response batches and known native metadata no longer look
+like unsupported conversation branches. A fresh, matching provider conversation
+pointer can select its own branch; Pika does not guess from timestamps. Preserved
+channel results retain verified phone input even when compaction removes the
+original fetch call. Ownership conflicts still require separate recovery.
+
+The separate iPhone build 44 adds thread search and provider filtering alongside
+machine selection. Saved connections and running threads are preserved.
+
+Retained changes from 0.6.48:
+
 Pika 0.6.48 fixes oversized individual Claude history records.
 
 Version 0.6.47 was withheld. Its unchanged macOS suite passed on rerun after an

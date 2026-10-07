@@ -1641,3 +1641,57 @@ draft remains a known visual limitation; outgoing messages still have their
 existing 64 KiB bound, distinct from the eight-MiB visible-history item bound.
 No publication, fleet cutover, physical-phone installation or actual-user
 transcript recovery is claimed by this local evidence.
+
+### 2026-10-07 — Dex search and provider selection, build 44
+
+The final native simulator journeys passed (two tests, zero failures), recorded
+in `/tmp/pika-thread-search.tKsuvD/final-ui.xcresult`. They exercised searching
+same-named threads on different machines, opening the matching thread, returning
+with the query retained, clearing it, provider selection, intersecting machine
+and provider filters, the no-match state, and the normal keyboard journey.
+These are native UI tests against an explicitly labeled protocol fixture, not
+live-provider sends. Search is local to board metadata; no transcripts are read.
+
+The signed Release build 44 passed signature verification and was installed on
+the physical iPhone. Device application metadata confirmed build 44. Launch
+verification was blocked by the phone locking; installation is not a claim of
+a successful physical-device journey. Existing saved connections were retained.
+Build output: `/tmp/pika-thread-search.tKsuvD/phone44-build.log`.
+
+### 2026-10-07 — Native Claude batch/compaction reconstruction repair
+
+Read-only diagnosis of nine watched Claude entries on rs6 reproduced five
+branching failures, three unsupported-record failures, and one independent live
+ownership conflict on 0.6.48. No messages were sent or provider sessions restarted.
+Inspection retained record identity/parent/type/call/selector metadata only;
+message text, tool inputs and outputs were not copied into the replay corpus.
+
+The installed Claude 2.1.286 reconstruction distinguishes exact parallel
+response batches and native auxiliary tails. Its metadata classification includes
+frame-link, artifact-comment-monitor and artifact-autoreact-ledger. Pika retains
+all proven batch records and refuses unsupported causal order. When the graph
+requires branch selection, only a fresh, exact provider last-prompt pointer can
+authorize it; generic timestamp/latest-record selection remains forbidden.
+
+`/tmp/pika-thread-search.tKsuvD/replay-sixth.jsonl` records nine successful
+actual `_mobile` endpoint opens using sanitized source graph shapes (1,033 to
+13,483 records) and synthetic text in isolated homes with denied providers.
+All nine latest-page reopens matched exactly. Six histories exposed older pages;
+all six older-page requests succeeded. Source hashes remained unchanged.
+Debug-build initial opens measured 0.174–1.371 seconds on this Mac; these are
+synthetic local measurements, not production latency or phone-rendering claims.
+The live ownership conflict is deliberately not represented by isolated replay
+and remains separate from history reconstruction.
+
+`native-journey-6.log` in the same evidence directory reports 13 passing actual
+endpoint journeys, including large records, immutable cursors, full older-page
+ordering, reopened latest replies and compacted channel messages. The channel
+journey preserves exact phone input on two fresh opens after compaction removes
+its original fetch call, without restoring a removed assistant reply. Original
+call bytes are digest-verified; receipt evidence alone cannot create a turn.
+This regression was also rerun separately by the reviewing agent.
+
+Review found and repaired both premature-result ordering and compacted-away-call
+projection gaps. The reviewer authored those narrow helpers; the batch author
+and root reviewed their integration. No fleet recovery claim is made by these
+local checks alone.

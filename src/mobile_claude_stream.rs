@@ -22,6 +22,28 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn ancestry_retains_batch_identity_without_message_payloads() {
+        let input = serde_json::json!({"agentId":"owner","message":{"id":"response","role":"assistant","content":[
+            {"type":"text","text":"private".repeat(100000)},
+            {"type":"tool_use","id":"call","name":"never-executed","input":{"large":"x".repeat(1000000)}},
+            {"type":"tool_result","tool_use_id":"call","content":"hidden".repeat(100000)}
+        ]}}).to_string();
+        let indexed = extract(Cursor::new(input), false).unwrap();
+        assert_eq!(
+            indexed,
+            serde_json::json!({"agentId":"owner","message":{"id":"response","role":"assistant","content":[
+                {"type":"text"},{"type":"tool_use","id":"call"},{"type":"tool_result","tool_use_id":"call"}
+            ]}})
+        );
+        let prompt = extract(
+            Cursor::new(r#"{"message":{"role":"user","content":"ordinary user text"}}"#),
+            false,
+        )
+        .unwrap();
+        assert_eq!(prompt["message"]["content"], "");
+    }
+
+    #[test]
     fn escape_amplification_uses_decoded_text_budget() {
         let escaped = "\\u0061".repeat(2 * 1024 * 1024);
         let input = format!(
@@ -290,13 +312,21 @@ impl<R: BufRead> Parser<R> {
                         | "sessionId"
                         | "isSidechain"
                         | "isMeta"
+                        | "agentId"
+                        | "leafUuid"
                         | "subtype"
                         | "compactMetadata"
-                ) || self.projection && key == "message"
+                        | "message"
+                )
             }
             Some("compactMetadata") => true,
+            Some("message") if !self.projection => match path.len() {
+                1 => matches!(key, "id" | "role" | "content"),
+                2 => matches!(key, "type" | "id" | "tool_use_id"),
+                _ => false,
+            },
             Some("message") => match path.len() {
-                1 => matches!(key, "role" | "content"),
+                1 => matches!(key, "id" | "role" | "content"),
                 _ => matches!(
                     key,
                     "type"
@@ -332,6 +362,12 @@ impl<R: BufRead> Parser<R> {
     }
 
     fn string_value(&mut self, path: &[String], retain: bool) -> Result<Value> {
+        // The ancestry index needs content shape, never its text. Keep a string
+        // marker so ordinary prompts cannot be mistaken for tool-result arrays.
+        if !self.projection && retain && path == ["message", "content"] {
+            self.string(false, 0)?;
+            return Ok(Value::String(String::new()));
+        }
         let message = path.first().is_some_and(|key| key == "message");
         let limit = if message
             && (path.len() > 3

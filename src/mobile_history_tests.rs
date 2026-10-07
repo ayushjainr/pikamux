@@ -44,7 +44,8 @@ fn claude_paging_is_chronological_literal_and_append_stable() {
     let path = temp.path().join("history.jsonl");
     let mut output = File::create(&path).unwrap();
     for index in 0..85 {
-        writeln!(output,"{}",json!({"sessionId":CLAUDE,"isSidechain":false,"uuid":format!("msg-{index}"),"parentUuid":if index==0 {None}else{Some(format!("msg-{}",index-1))},"type":"user","message":{"role":"user","content":[{"type":"text","text":format!("  literal {index}\nsecond line  ")},{"type":"tool_result","content":"hidden"}]}})).unwrap();
+        writeln!(output,"{}",json!({"sessionId":CLAUDE,"isSidechain":false,"uuid":format!("call-{index}"),"parentUuid":if index==0 {None}else{Some(format!("msg-{}",index-1))},"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":format!("tool-{index}"),"name":"synthetic","input":{}}]}})).unwrap();
+        writeln!(output,"{}",json!({"sessionId":CLAUDE,"isSidechain":false,"uuid":format!("msg-{index}"),"parentUuid":format!("call-{index}"),"type":"user","message":{"role":"user","content":[{"type":"text","text":format!("  literal {index}\nsecond line  ")},{"type":"tool_result","tool_use_id":format!("tool-{index}"),"content":"hidden"}]}})).unwrap();
     }
     let mut file = File::open(&path).unwrap();
     let mut cursor = state(&mut file, Provider::Claude, CLAUDE);

@@ -379,6 +379,30 @@ fn claude_channel_history_reopens_only_native_correlated_content() {
         assert!(!opened.to_string().contains("Reply recorded"));
         assert!(!opened.to_string().contains("INTERNAL_PROTOCOL_WAKE"));
     }
+    // Native compaction preserves the real result but removes its source call.
+    // The reader must reverify that source call without reviving its old reply.
+    writeln!(file,"{}",json!({"type":"system","subtype":"compact_boundary","uuid":"compact","parentUuid":null,"sessionId":thread,"isSidechain":false,"compactMetadata":{"preservedMessages":{"anchorUuid":"summary","uuids":["item-086"]}}})).unwrap();
+    writeln!(file,"{}",json!({"type":"user","uuid":"summary","parentUuid":"compact","sessionId":thread,"isSidechain":false,"message":{"role":"user","content":"Native summary"}})).unwrap();
+    writeln!(file,"{}",json!({"type":"assistant","uuid":"latest","parentUuid":"item-086","sessionId":thread,"isSidechain":false,"message":{"role":"assistant","content":"Latest after compaction"}})).unwrap();
+    for _ in 0..2 {
+        let mut mobile = endpoint(&root);
+        let opened = mobile.request("conversation/open", json!({"identity":identity}));
+        assert!(opened["error"].is_null(), "{opened}");
+        let entries: Vec<_> = opened["result"]["turns"]["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().unwrap())
+            .collect();
+        assert_eq!(entries.len(), 3, "{opened}");
+        assert_eq!(entries[1]["id"], "claude-channel-user:toolu_fetch");
+        assert_eq!(
+            entries[1]["text"],
+            "  phone message\nwith literal whitespace  "
+        );
+        assert_eq!(entries[2]["text"], "Latest after compaction");
+        assert!(!opened.to_string().contains("Native channel reply"));
+    }
 }
 #[test]
 fn opencode_original_history_mobile_roundtrip() {
@@ -494,10 +518,15 @@ fn append_large_hidden_records(source: &Path, thread: &str) {
     let mut parent = "item-084".to_owned();
     for index in 0..12 {
         let id = format!("hidden-{index}");
+        if matches!(index % 4, 0 | 3) {
+            let call = format!("hidden-call-{index}");
+            writeln!(file,"{}",json!({"type":"assistant","uuid":call,"parentUuid":parent,"sessionId":thread,"message":{"role":"assistant","content":[{"type":"tool_use","id":format!("hidden-tool-{index}"),"name":"synthetic","input":{}}]}})).unwrap();
+            parent = call;
+        }
         let (role, block) = match index % 4 {
             0 => (
                 "user",
-                json!({"type":"tool_result","tool_use_id":"unrelated","content":payload}),
+                json!({"type":"tool_result","tool_use_id":format!("hidden-tool-{index}"),"content":payload}),
             ),
             1 => (
                 "assistant",
@@ -509,7 +538,7 @@ fn append_large_hidden_records(source: &Path, thread: &str) {
             ),
             _ => (
                 "user",
-                json!({"type":"tool_result","tool_use_id":"unrelated","content":[{"type":"text","text":payload}]}),
+                json!({"type":"tool_result","tool_use_id":format!("hidden-tool-{index}"),"content":[{"type":"text","text":payload}]}),
             ),
         };
         let record = json!({"type":role,"uuid":id,"parentUuid":parent,"sessionId":thread,"message":{"role":role,"content":[block]}});

@@ -2,6 +2,61 @@ import XCTest
 import UIKit
 
 final class PikaUITests: XCTestCase {
+    @MainActor func testThreadSearchOpenReturnAndClearJourney() {
+        launchFixture(["--fixture-search"])
+        let search = app.textFields["threadSearch"]
+        XCTAssertTrue(search.isHittable)
+        search.tap(); search.typeText("MASTER beta\n")
+        XCTAssertFalse(app.buttons["thread-fixture-one"].exists)
+        XCTAssertTrue(app.buttons["thread-fixture-two"].isHittable)
+        let filtered = XCTAttachment(screenshot: app.screenshot())
+        filtered.name = "Dex search selects exact machine"; filtered.lifetime = .keepAlways; add(filtered)
+        app.buttons["thread-fixture-two"].tap()
+        XCTAssertTrue(app.textViews["composer"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["conversationHeader"].label.contains("Fixture Beta"))
+        swipeBack()
+        XCTAssertTrue(search.waitForExistence(timeout: 3))
+        XCTAssertEqual(search.value as? String, "MASTER beta")
+        XCTAssertFalse(app.buttons["thread-fixture-one"].exists)
+        app.buttons["clearThreadSearch"].tap()
+        XCTAssertTrue(app.buttons["thread-fixture-one"].exists)
+        XCTAssertTrue(app.buttons["thread-fixture-two"].exists)
+        app.buttons["machineFilter"].tap(); app.buttons["Fixture Alpha"].tap()
+        XCTAssertTrue(app.buttons["thread-fixture-one"].exists)
+        XCTAssertFalse(app.buttons["thread-fixture-two"].exists)
+        search.tap(); search.typeText("beta\n")
+        XCTAssertTrue(app.staticTexts["No matching threads"].exists)
+        app.buttons["machineFilter"].tap(); app.buttons["All machines"].tap()
+        XCTAssertTrue(app.buttons["thread-fixture-two"].exists)
+        XCTAssertFalse(app.buttons["thread-fixture-one"].exists)
+        app.buttons["clearThreadSearch"].tap()
+        search.tap(); search.typeText("no-such-thread\n")
+        XCTAssertTrue(app.staticTexts["No matching threads"].exists)
+        XCTAssertFalse(app.buttons["thread-fixture-one"].exists)
+        XCTAssertFalse(app.buttons["Add a machine"].exists)
+        app.buttons["clearThreadSearch"].tap()
+        search.tap(); search.typeText("codex\n")
+        XCTAssertTrue(app.buttons["thread-fixture-one"].exists)
+        XCTAssertFalse(app.buttons["thread-fixture-two"].exists)
+        app.buttons["clearThreadSearch"].tap()
+        search.tap(); search.typeText("   \n")
+        XCTAssertTrue(app.buttons["thread-fixture-one"].exists)
+        XCTAssertTrue(app.buttons["thread-fixture-two"].exists)
+        app.buttons["providerFilter"].tap(); app.buttons["Claude"].tap()
+        XCTAssertFalse(app.buttons["thread-fixture-one"].exists)
+        XCTAssertTrue(app.buttons["thread-fixture-two"].exists)
+        app.buttons["machineFilter"].tap(); app.buttons["Fixture Alpha"].tap()
+        XCTAssertTrue(app.staticTexts["No matching threads"].exists)
+        app.buttons["machineFilter"].tap(); app.buttons["All machines"].tap()
+        app.buttons["thread-fixture-two"].tap()
+        XCTAssertTrue(app.textViews["composer"].waitForExistence(timeout: 5))
+        swipeBack()
+        XCTAssertFalse(app.buttons["thread-fixture-one"].exists)
+        XCTAssertTrue(app.buttons["thread-fixture-two"].exists)
+        app.buttons["providerFilter"].tap(); app.buttons["All providers"].tap()
+        XCTAssertTrue(app.buttons["thread-fixture-one"].exists)
+        XCTAssertTrue(app.buttons["thread-fixture-two"].exists)
+    }
     @MainActor private func swipeBack() {
         app.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.4))
             .press(forDuration: 0.1, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.4)))
@@ -131,10 +186,10 @@ final class PikaUITests: XCTestCase {
         XCTAssertTrue(normal.staticTexts["No saved board"].exists)
     }
     @MainActor private var app: XCUIApplication!
-    @MainActor private func launchFixture() {
+    @MainActor private func launchFixture(_ extraArguments: [String] = []) {
         continueAfterFailure = false
         app = XCUIApplication()
-        app.launchArguments = ["--ui-fixture"]
+        app.launchArguments = ["--ui-fixture"] + extraArguments
         app.launch()
         XCTAssertTrue(app.staticTexts["fixtureBanner"].waitForExistence(timeout: 5))
     }

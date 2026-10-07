@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
 };
@@ -31,8 +31,19 @@ pub(super) fn page(
         &source_hash,
         "Claude frozen history changed; reopen it",
     )?;
+    // One extra compact metadata copy (covered by the scan's fourfold charge),
+    // never original tool inputs or message bodies. Compaction may preserve a
+    // result while removing the source call that proves its channel identity.
+    let source_calls: Vec<_> = metadata
+        .iter()
+        .filter(|record| {
+            record["type"] == "assistant" && !block_ids(record, "tool_use", "id").is_empty()
+        })
+        .cloned()
+        .collect();
     let ordered = claude_ancestry::reconstruct(metadata, &state.id)?;
     let mut projector = claude_projection::Projector::new(paths, &state.id)?;
+    prepare_preserved_fetches(file, &source_calls, &ordered, &mut projector)?;
     let target = if initial {
         None
     } else {
@@ -63,6 +74,63 @@ pub(super) fn page(
     state.claude_items_hash = Some(canonical);
     state.claude_source_hash = Some(source_hash);
     Ok((page, start > 0))
+}
+
+fn block_ids<'a>(record: &'a Value, kind: &str, field: &str) -> Vec<&'a str> {
+    record["message"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|part| part["type"] == kind)
+        .filter_map(|part| part[field].as_str())
+        .collect()
+}
+
+fn prepare_preserved_fetches(
+    file: &mut File,
+    source_calls: &[Value],
+    ordered: &[Value],
+    projector: &mut claude_projection::Projector,
+) -> Result<()> {
+    let retained: BTreeSet<_> = ordered
+        .iter()
+        .flat_map(|r| block_ids(r, "tool_use", "id"))
+        .collect();
+    let needed: BTreeSet<_> = ordered
+        .iter()
+        .flat_map(|r| block_ids(r, "tool_result", "tool_use_id"))
+        .filter(|id| !retained.contains(id))
+        .collect();
+    let mut prepared = BTreeSet::new();
+    for source in source_calls {
+        if !block_ids(source, "tool_use", "id")
+            .iter()
+            .any(|id| needed.contains(id))
+        {
+            continue;
+        }
+        let original = read_record(file, source)?;
+        for part in original["message"]["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if part["type"] != "tool_use" {
+                continue;
+            }
+            let Some(id) = part["id"].as_str().filter(|id| needed.contains(id)) else {
+                continue;
+            };
+            ensure!(
+                prepared.insert(id.to_owned()),
+                "Repeated preserved Claude source call identity"
+            );
+            // This registers only a verified fetch. It cannot emit an old
+            // assistant reply, text, or a turn derived from the journal alone.
+            projector.prepare_fetch(part)?;
+        }
+    }
+    Ok(())
 }
 
 fn project_window(
@@ -145,6 +213,7 @@ fn scan(file: &mut File, snapshot: u64, identity: &str) -> Result<(Vec<Value>, S
                 .context("Malformed durable Claude history record")?;
             let record = extract_record(file, offset, read, false, &record_hash)?;
             if selected_record(&record, identity)? {
+                discard_stale_selectors(&record, &mut records, &mut used)?;
                 records.push(charged_metadata(
                     &record,
                     offset,
@@ -160,6 +229,22 @@ fn scan(file: &mut File, snapshot: u64, identity: &str) -> Result<(Vec<Value>, S
         }
     }
     Ok((records, format!("{:x}", digest.finalize())))
+}
+
+fn discard_stale_selectors(
+    record: &Value,
+    records: &mut Vec<Value>,
+    used: &mut usize,
+) -> Result<()> {
+    // Only selectors after the final owned transcript record can authorize
+    // branch selection; stale pointers must not grow a long-running index.
+    if record["type"] != "last-prompt" {
+        while records.last().is_some_and(|r| r["type"] == "last-prompt") {
+            let stale = records.pop().unwrap();
+            *used -= metadata_charge(&stale)?;
+        }
+    }
+    Ok(())
 }
 
 struct ValidatedRecord {
@@ -214,7 +299,7 @@ fn validate_streamed_record(
 fn selected_record(record: &Value, identity: &str) -> Result<bool> {
     Ok(record["sessionId"].as_str() == Some(identity)
         && record["isSidechain"] != true
-        && claude_ancestry::transcript(record)?)
+        && (claude_ancestry::transcript(record)? || record["type"] == "last-prompt"))
 }
 
 fn hash_range(file: &mut File, length: u64, digest: &mut Sha256) -> Result<()> {
@@ -239,18 +324,20 @@ fn charged_metadata(
     let mut compact = metadata(record, offset, length);
     compact["_pikaDigest"] = Value::String(hash);
     *used = used
-        .checked_add(
-            retained_charge(&compact)?
-                .checked_mul(4)
-                .context("Claude metadata allocation overflow")?
-                + NODE_OVERHEAD,
-        )
+        .checked_add(metadata_charge(&compact)?)
         .context("Claude ancestry metadata size overflow")?;
     ensure!(
         *used <= INDEX_BYTES,
         "Claude ancestry metadata exceeds its bounded memory budget; total transcript bytes are not the limit"
     );
     Ok(compact)
+}
+
+fn metadata_charge(value: &Value) -> Result<usize> {
+    retained_charge(value)?
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(NODE_OVERHEAD))
+        .context("Claude metadata allocation overflow")
 }
 
 fn retained_charge(value: &Value) -> Result<usize> {
@@ -288,6 +375,9 @@ fn metadata(record: &Value, offset: u64, length: u64) -> Value {
         "sessionId",
         "isSidechain",
         "isMeta",
+        "agentId",
+        "leafUuid",
+        "message",
         "subtype",
         "compactMetadata",
     ] {
