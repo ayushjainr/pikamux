@@ -25,8 +25,10 @@ def endpoint(root, node, name):
     def emit(frame):
         print(json.dumps(frame), flush=True)
     while not (root / "stop").exists() and not (root / ("offline-" + name.lower())).exists():
-        if name == "Gamma" and (root / "gamma-disconnect-once").exists() and not (root / "gamma-disconnect-once-delivered").exists():
-            (root / "gamma-disconnect-once-delivered").write_text("closed only the owned Gamma exec channel")
+        disconnect = root / (name.lower() + "-disconnect-once")
+        delivered = root / (name.lower() + "-disconnect-once-delivered")
+        if name in ("Alpha", "Gamma") and disconnect.exists() and not delivered.exists():
+            delivered.write_text("closed only the owned " + name + " exec channel")
             break
         if name == "Gamma" and not injected and (root / "gamma-source-error").exists():
             emit({"v": 1, "event": "connection/error", "params": {"message": "Explicit unrelated Gamma protocol-fixture error without nodeId"}})
@@ -43,6 +45,12 @@ def endpoint(root, node, name):
             log.write(json.dumps({"method": method, "params": params, "node": node}) + "\n")
         result = {}
         if method == "hello":
+            if name == "Gamma" and (root / "gamma-hello-hold").exists():
+                (root / "gamma-hello-held").write_text("Gamma's new authenticated exec is waiting before hello")
+                while not (root / "gamma-hello-release").exists() and not (root / "stop").exists():
+                    time.sleep(0.1)
+            if name == "Alpha" and (root / "alpha-disconnect-once-delivered").exists():
+                (root / "alpha-reconnected").write_text("new authenticated Alpha exec reached hello")
             if name == "Gamma" and (root / "gamma-disconnect-once-delivered").exists():
                 (root / "gamma-reconnected").write_text("new authenticated Gamma exec reached hello")
             result = {"nodeId": node, "name": "SSH fixture " + name, "capabilities": {"board": True, "codexShared": True}}

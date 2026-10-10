@@ -5,7 +5,7 @@ import NIO
 @preconcurrency import NIOSSH
 
 enum ConnectionError: Error, LocalizedError {
-    case disconnected, changedHost, changedNode, credentials, malformed, timeout, remote(String), rejected(String), secureStorage(Int32)
+    case disconnected, changedHost, changedNode, credentials, malformed, timeout, remote(String), sharedConnectionRequired(String), rejected(String), secureStorage(Int32)
     var errorDescription: String? {
         switch self {
         case .disconnected: return "Connection lost. Your drafts are saved. Pending actions may have an unknown outcome."
@@ -15,6 +15,7 @@ enum ConnectionError: Error, LocalizedError {
         case .malformed: return "The machine sent an incompatible or oversized response."
         case .timeout: return "No receipt arrived. The action's outcome may be unknown; it was not repeated."
         case .remote(let message): return message
+        case .sharedConnectionRequired(let message): return message
         case .rejected(let message): return message
         case .secureStorage(let status): return "Secure credential storage failed (\(status)). No login was saved."
         }
@@ -342,7 +343,7 @@ actor SSHWire: MobileWire {
                     let message = frame["error"]["message"].string ?? "The machine could not confirm this request."
                     let code = frame["error"]["code"].string ?? ""
                     let definitive = code == "rejected_before_dispatch"
-                    continuation.resume(throwing: definitive ? ConnectionError.rejected(message) : ConnectionError.remote(message))
+                    continuation.resume(throwing: definitive ? ConnectionError.rejected(message) : code == "shared_connection_required" ? ConnectionError.sharedConnectionRequired(message) : ConnectionError.remote(message))
                 } else { continuation.resume(returning: frame["result"]) }
             } else if frame["event"].string != nil, frame.has("params"), !frame.has("result"), !frame.has("error") {
                 if case .dropped = eventSink.yield(frame) { throw ConnectionError.malformed }

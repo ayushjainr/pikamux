@@ -4,12 +4,13 @@ import Foundation
 /// Explicitly labelled in-app endpoint double. Not a provider/network E2E proof.
 actor FixtureWire: MobileWire {
     static let items = [
-        BoardItem(identity: ThreadIdentity(nodeId: "fixture-node", provider: ProcessInfo.processInfo.arguments.contains("--fixture-channel-receipt") ? "claude" : "codex", threadId: "fixture-one"), name: "master_quant", machine: "Fixture Alpha", state: "NEEDS YOU", detail: ""),
-        BoardItem(identity: ThreadIdentity(nodeId: "fixture-node-two", provider: ProcessInfo.processInfo.arguments.contains("--fixture-search") ? "claude" : "codex", threadId: "fixture-two"), name: "master_quant", machine: "Fixture Beta", state: "WORKING", detail: "")
+        BoardItem(identity: ThreadIdentity(nodeId: "fixture-node", provider: ProcessInfo.processInfo.arguments.contains("--fixture-channel-receipt") ? "claude" : "codex", threadId: "fixture-one"), name: "master_quant", machine: "Fixture Alpha", state: ProcessInfo.processInfo.arguments.contains("--fixture-unread") ? "READY" : "NEEDS YOU", detail: "", unread: ProcessInfo.processInfo.arguments.contains("--fixture-unread")),
+        BoardItem(identity: ThreadIdentity(nodeId: "fixture-node-two", provider: ProcessInfo.processInfo.arguments.contains("--fixture-search") ? "claude" : "codex", threadId: "fixture-two"), name: "master_quant", machine: "Fixture Beta", state: "WORKING", detail: "", unread: ProcessInfo.processInfo.arguments.contains("--fixture-unread"))
     ]
     nonisolated let events: AsyncStream<JSONValue>
     private let sink: AsyncStream<JSONValue>.Continuation
     private var selected: ThreadIdentity?
+    private var acknowledgedReads: Set<ThreadIdentity> = []
     private var closed = false
     private var sent: Set<String> = []
     private var sendAttempts = 0
@@ -25,6 +26,15 @@ actor FixtureWire: MobileWire {
     func request(_ method: String, params: JSONValue) async throws -> JSONValue {
         guard !closed else { throw ConnectionError.disconnected }
         switch method {
+        case "conversation/acknowledge":
+            guard let selected, params["identity"] == selected.json,
+                params["readAcknowledgement"].string == "fixture-exact-read" else { throw ConnectionError.changedNode }
+            acknowledgedReads.insert(selected)
+            sink.yield(.object(["v": .number(1), "event": .string("board/snapshot"), "params": .object([
+                "items": .array(Self.items.map { row in .object(["identity": row.identity.json, "name": .string(row.name),
+                    "machine": .string(row.machine), "status": .string(row.state), "unread": .bool(row.unread == true && !acknowledgedReads.contains(row.identity))]) }),
+                "observedAt": .number(Date().timeIntervalSince1970), "health": .array([])])]))
+            return .object(["identity": selected.json, "acknowledged": .bool(true)])
         case "conversation/controls":
             guard let selected, params["identity"] == selected.json else { throw ConnectionError.changedNode }
             if ProcessInfo.processInfo.arguments.contains("--fixture-controls-unsupported") { throw ConnectionError.remote("Unsupported mobile method") }
@@ -54,6 +64,12 @@ actor FixtureWire: MobileWire {
             return .object(["state": .string("unknown"), "clientOperationId": .string(id)])
         case "conversation/open", "assistant/open":
             let assistant = method == "assistant/open"
+            if assistant, ProcessInfo.processInfo.arguments.contains("--fixture-assistant-shared-required") {
+                throw ConnectionError.sharedConnectionRequired("The assistant is not on its private shared connection yet. On its owning machine, exit its terminal normally, then reopen with `pika pika`. This resumes the same assistant UUID and memory; the running assistant was left untouched. Reconnecting the phone cannot enable this connection.")
+            }
+            if assistant, ProcessInfo.processInfo.arguments.contains("--fixture-assistant-legacy-shared-required") {
+                throw ConnectionError.remote("The assistant is not on its private shared connection yet. Exit its terminal normally, then reopen Pika; the running assistant was left untouched.")
+            }
             let decoded: ThreadIdentity
             if assistant { decoded = ThreadIdentity(nodeId: "fixture-node", provider: "codex", threadId: "fixture-assistant") }
             else { decoded = try JSONDecoder().decode(ThreadIdentity.self, from: JSONEncoder().encode(params["identity"])) }
@@ -129,7 +145,9 @@ actor FixtureWire: MobileWire {
             let history: [JSONValue] = ProcessInfo.processInfo.arguments.contains("--fixture-long-history") ? (0..<30).map { index in
                 .object(["id": .string("long-\(index)"), "type": .string("agentMessage"), "text": .string("Original fixture context \(index)\nA sufficiently long original message to exercise native reading and history anchors.")])
             } : []
-            return .object(["identity": decoded.json, "capabilities": .object(["read": .bool(true), "send": .bool(!ProcessInfo.processInfo.arguments.contains("--fixture-read-only")), "answer": .bool(true),
+            return .object(["identity": decoded.json,
+                "readAcknowledgement": !assistant && ProcessInfo.processInfo.arguments.contains("--fixture-unread") ? .string("fixture-exact-read") : .null,
+                "capabilities": .object(["read": .bool(true), "send": .bool(!ProcessInfo.processInfo.arguments.contains("--fixture-read-only")), "answer": .bool(true),
                 "readOnlyReason": .string("This original provider supports verified history only; mobile replies are not available."),
                 "experimentalNotice": ProcessInfo.processInfo.arguments.contains("--fixture-experimental") ? .string("Experimental connection. Native permissions still apply; an uncertain message is never sent twice.") : .null]),
                 "assistant": assistant ? .object(["profileId": .string("fixture-profile"), "scope": .string("private"), "memoryEpoch": .string("fixture-epoch")]) : .null,

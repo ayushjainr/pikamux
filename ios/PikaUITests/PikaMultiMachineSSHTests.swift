@@ -8,6 +8,52 @@ final class PikaMultiMachineSSHTests: XCTestCase {
     struct Configuration: Decodable {
         let root: String; let clientKeyPath: String; let username: String; let storeId: String; let machines: [Machine]
     }
+    /// A dropped first machine must recover while another saved machine is
+    /// independently reconnecting; neither may replace the other's board.
+    @MainActor func testRetainedTwoMachineOverlappingReconnectEventuallyRecovers() throws {
+        continueAfterFailure = false
+        guard let path = ProcessInfo.processInfo.environment["PIKA_MULTI_SSH_TEST_CONFIG"], !path.isEmpty, !path.contains("$(") else {
+            throw XCTSkip("Requires explicitly retained disposable machine store.")
+        }
+        let config = try JSONDecoder().decode(Configuration.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+        guard FileManager.default.fileExists(atPath: config.root + "/offline-beta") else {
+            throw XCTSkip("Run the three-machine disposable onboarding journey first.")
+        }
+        let root = URL(fileURLWithPath: config.root)
+        func marker(_ name: String) -> URL { root.appendingPathComponent(name) }
+        func put(_ name: String) throws { try Data(name.utf8).write(to: marker(name), options: .atomic) }
+        func wait(_ name: String, timeout: TimeInterval = 25) {
+            let predicate = NSPredicate { _, _ in FileManager.default.fileExists(atPath: marker(name).path) }
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: predicate, object: nil)], timeout: timeout), .completed, name)
+        }
+        for name in ["gamma-disconnect-once", "gamma-disconnect-once-delivered", "gamma-hello-hold", "gamma-hello-held", "gamma-hello-release", "alpha-disconnect-once", "alpha-disconnect-once-delivered", "alpha-reconnected"] {
+            try? FileManager.default.removeItem(at: marker(name))
+        }
+        defer { try? FileManager.default.removeItem(at: marker("gamma-hello-hold")); try? put("gamma-hello-release") }
+        let app = XCUIApplication()
+        app.launchArguments = ["--ssh-integration-test", "--multi-machine-integration-test"]
+        app.launchEnvironment = ["PIKA_UI_TEST_KEY_BASE64": try Data(contentsOf: URL(fileURLWithPath: config.clientKeyPath)).base64EncodedString(), "PIKA_UI_TEST_STORE_ID": config.storeId]
+        app.launch()
+        app.buttons["Machine connections"].tap()
+        for index in [0, 2] {
+            let status = app.staticTexts["machineStatus-" + config.machines[index].nodeId]
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS[c] %@", "connected"), object: status)], timeout: 30), .completed)
+        }
+        try put("gamma-hello-hold")
+        try put("gamma-disconnect-once")
+        wait("gamma-hello-held")
+        try put("alpha-disconnect-once")
+        wait("alpha-disconnect-once-delivered")
+        // Keep Gamma's independent authentication in flight while Alpha drops.
+        Thread.sleep(forTimeInterval: 8)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker("alpha-reconnected").path))
+        try put("gamma-hello-release")
+        wait("alpha-reconnected", timeout: 40)
+        if app.buttons["Machine connections"].exists { app.buttons["Machine connections"].tap() }
+        let alpha = app.staticTexts["machineStatus-" + config.machines[0].nodeId]
+        let shot = XCTAttachment(screenshot: app.screenshot()); shot.name = "Alpha automatically recovers after overlapping Gamma reconnect"; shot.lifetime = .keepAlways; add(shot)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS[c] %@", "Connected"), object: alpha)], timeout: 20), .completed, "Alpha status: \(alpha.label)")
+    }
     @MainActor func testRetainedPartialCoverageOfflineAndRecovery() throws {
         continueAfterFailure = false
         guard let path = ProcessInfo.processInfo.environment["PIKA_MULTI_SSH_TEST_CONFIG"], !path.isEmpty, !path.contains("$(") else {

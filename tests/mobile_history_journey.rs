@@ -270,6 +270,134 @@ fn history_roundtrip(provider: Provider, id: &str) {
 }
 
 #[test]
+fn successful_mobile_read_acknowledges_only_its_exact_ready_event() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let (store, node) = fixture(&root, Provider::Claude, id);
+    let mut session = store.get_session(Provider::Claude, id).unwrap().unwrap();
+    session.status = pikamux::model::Status::Ready;
+    session.unread = true;
+    session.last_event_at += 100.0;
+    store.upsert_session(&session, false).unwrap();
+    let mut endpoint = endpoint(&root);
+    let identity = json!({"nodeId":node,"provider":"claude","threadId":id});
+    let opened = endpoint.request("conversation/open", json!({"identity":identity}));
+    assert!(opened["error"].is_null(), "{opened}");
+    let token = opened["result"]["readAcknowledgement"].clone();
+    assert!(token.is_string(), "{opened}");
+    let wrong_identity = json!({"nodeId":node,"provider":"claude","threadId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"});
+    let wrong_owner = endpoint.request(
+        "conversation/acknowledge",
+        json!({"identity":wrong_identity,"readAcknowledgement":token}),
+    );
+    assert!(wrong_owner["error"].is_object());
+    // Reading/paging alone does not mutate unread; only rendering acknowledgement does.
+    assert!(
+        store
+            .get_session(Provider::Claude, id)
+            .unwrap()
+            .unwrap()
+            .unread
+    );
+    let wrong = endpoint.request(
+        "conversation/acknowledge",
+        json!({"identity":identity,"readAcknowledgement":"wrong"}),
+    );
+    assert!(wrong["error"].is_object());
+    assert!(
+        store
+            .get_session(Provider::Claude, id)
+            .unwrap()
+            .unwrap()
+            .unread
+    );
+    session.last_event_at += 1.0;
+    store.upsert_session(&session, false).unwrap();
+    let newer = endpoint.request(
+        "conversation/acknowledge",
+        json!({"identity":identity,"readAcknowledgement":token}),
+    );
+    assert_eq!(newer["result"]["acknowledged"], false, "{newer}");
+    assert!(
+        store
+            .get_session(Provider::Claude, id)
+            .unwrap()
+            .unwrap()
+            .unread
+    );
+    let reopened = endpoint.request("conversation/open", json!({"identity":identity}));
+    let fresh = reopened["result"]["readAcknowledgement"].clone();
+    let stale = endpoint.request(
+        "conversation/acknowledge",
+        json!({"identity":identity,"readAcknowledgement":token}),
+    );
+    assert!(stale["error"].is_object());
+    let ack = endpoint.request(
+        "conversation/acknowledge",
+        json!({"identity":identity,"readAcknowledgement":fresh}),
+    );
+    assert_eq!(ack["result"]["acknowledged"], true, "{ack}");
+    assert!(
+        !store
+            .get_session(Provider::Claude, id)
+            .unwrap()
+            .unwrap()
+            .unread
+    );
+    // This is persisted server state, not an app-side badge override.
+    drop(endpoint);
+    let mut endpoint = self::endpoint(&root);
+    let reopened = endpoint.request("conversation/open", json!({"identity":identity}));
+    assert!(reopened["result"]["readAcknowledgement"].is_null());
+    session.unread = true;
+    for status in [
+        pikamux::model::Status::Working,
+        pikamux::model::Status::Error,
+        pikamux::model::Status::NeedsYou,
+    ] {
+        session.last_event_at += 1.0;
+        session.status = status;
+        store.upsert_session(&session, false).unwrap();
+        let opened = endpoint.request("conversation/open", json!({"identity":identity}));
+        assert!(opened["error"].is_null(), "{status}: {opened}");
+        assert!(
+            opened["result"]["readAcknowledgement"].is_null(),
+            "{status}: {opened}"
+        );
+        assert!(
+            store
+                .get_session(Provider::Claude, id)
+                .unwrap()
+                .unwrap()
+                .unread,
+            "{status}"
+        );
+    }
+    session.status = pikamux::model::Status::Ready;
+    session.last_event_at += 1.0;
+    store.upsert_session(&session, false).unwrap();
+    let path = root
+        .join("claude/projects/fixture")
+        .join(format!("{id}.jsonl"));
+    fs::remove_file(path).unwrap();
+    let failed = endpoint.request("conversation/open", json!({"identity":identity}));
+    assert!(failed["error"].is_object(), "{failed}");
+    let denied = endpoint.request(
+        "conversation/acknowledge",
+        json!({"identity":identity,"readAcknowledgement":fresh}),
+    );
+    assert!(denied["error"].is_object());
+    assert!(
+        store
+            .get_session(Provider::Claude, id)
+            .unwrap()
+            .unwrap()
+            .unread
+    );
+}
+
+#[test]
 fn claude_original_history_mobile_roundtrip() {
     history_roundtrip(Provider::Claude, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
 }

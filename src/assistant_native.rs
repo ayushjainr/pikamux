@@ -15,6 +15,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Debug)]
+pub(crate) struct SharedConnectionRequired;
+
+impl std::fmt::Display for SharedConnectionRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The assistant is not on its private shared connection yet. On its owning machine, exit its terminal normally, then reopen with `pika pika`. This resumes the same assistant UUID and memory; the running assistant was left untouched. Reconnecting the phone cannot enable this connection.")
+    }
+}
+
+impl std::error::Error for SharedConnectionRequired {}
+
 pub(crate) fn wants_native(args: &Args) -> bool {
     !args.json
         && !args.offline
@@ -821,8 +832,9 @@ pub(crate) fn shared_binding(root: &Path, profile_id: &str, scope: &str) -> Resu
         bail!("The assistant's provider setup is unfinished; no mobile action was admitted");
     }
     let thread_id = bound_thread(root, profile_id, scope)?;
-    let socket_path = crate::assistant_native_profile::shared_socket(root).canonicalize()
-        .context("The assistant is not on its private shared connection yet. Exit its terminal normally, then reopen Pika; the running assistant was left untouched.")?;
+    let socket_path = crate::assistant_native_profile::shared_socket(root)
+        .canonicalize()
+        .context(SharedConnectionRequired)?;
     require_private_socket(&socket_path)?;
     std::os::unix::net::UnixStream::connect(&socket_path)
         .context("The private assistant provider is unavailable; no replacement was started")?;
@@ -909,6 +921,19 @@ mod mcp_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_shared_connection_has_typed_actionable_recovery() {
+        let error = Err::<(), _>(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context(SharedConnectionRequired)
+            .unwrap_err();
+        assert!(error.downcast_ref::<SharedConnectionRequired>().is_some());
+        let message = error.to_string();
+        assert!(message.contains("exit its terminal normally"));
+        assert!(message.contains("`pika pika`"));
+        assert!(message.contains("running assistant was left untouched"));
+        assert!(message.contains("Reconnecting the phone cannot"));
+    }
+
     fn registry_fixture(root: &Path) -> crate::store::Store {
         let parent = root.join("native-registry");
         crate::assistant_storage::directory(&parent).unwrap();

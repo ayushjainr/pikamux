@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.50 — Acknowledge phone reads and explain assistant recovery
+
+- Clear only the unchanged READY unread event after the phone successfully loads
+  the exact conversation and acknowledges its server-issued read grant.
+- Preserve unread state for failed or cached opens, newer output, other identities
+  and non-READY attention; board badges follow the shared owning-server feed.
+- Explain when an existing assistant lacks its private shared connection: exit
+  its terminal normally on its owning machine, then reopen with `pika pika`.
+
+The separate iPhone build 46 supports the read acknowledgement and recovery
+message. Older phone or host versions retain their existing unread behavior.
+Updating does not restart or migrate a running assistant, recover unsupported
+legacy history, or establish verified phone sending for that assistant.
+
 ## 0.6.49 — Reconstruct native Claude conversation history
 
 - Recognize native history metadata and exact parallel tool-response batches.

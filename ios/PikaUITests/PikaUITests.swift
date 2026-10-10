@@ -2,6 +2,21 @@ import XCTest
 import UIKit
 
 final class PikaUITests: XCTestCase {
+    @MainActor func testMobileSuccessfulOpenAcknowledgesServerUnread() {
+        launchFixture(["--fixture-unread"])
+        XCTAssertEqual(app.staticTexts.matching(identifier: "Unread").count, 2)
+        app.buttons["thread-fixture-one"].tap()
+        XCTAssertTrue(app.textViews["composer"].waitForExistence(timeout: 5))
+        swipeBack()
+        XCTAssertTrue(app.buttons["thread-fixture-one"].waitForExistence(timeout: 3))
+        XCTAssertEqual(app.staticTexts.matching(identifier: "Unread").count, 1)
+        app.buttons["thread-fixture-one"].tap()
+        XCTAssertTrue(app.textViews["composer"].waitForExistence(timeout: 5))
+        swipeBack()
+        XCTAssertTrue(app.buttons["thread-fixture-one"].waitForExistence(timeout: 3))
+        XCTAssertEqual(app.staticTexts.matching(identifier: "Unread").count, 1)
+    }
+
     @MainActor func testThreadSearchOpenReturnAndClearJourney() {
         launchFixture(["--fixture-search"])
         let search = app.textFields["threadSearch"]
@@ -36,8 +51,10 @@ final class PikaUITests: XCTestCase {
         XCTAssertFalse(app.buttons["Add a machine"].exists)
         app.buttons["clearThreadSearch"].tap()
         search.tap(); search.typeText("codex\n")
+        XCTAssertEqual(search.value as? String, "codex")
         XCTAssertTrue(app.buttons["thread-fixture-one"].exists)
-        XCTAssertFalse(app.buttons["thread-fixture-two"].exists)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: app.buttons["thread-fixture-two"])], timeout: 2), .completed)
         app.buttons["clearThreadSearch"].tap()
         search.tap(); search.typeText("   \n")
         XCTAssertTrue(app.buttons["thread-fixture-one"].exists)
@@ -176,6 +193,8 @@ final class PikaUITests: XCTestCase {
     }
     @MainActor func testNormalColoredTailTabSelection() {
         let normal = XCUIApplication()
+        normal.launchArguments = ["--ssh-integration-test"]
+        normal.launchEnvironment["PIKA_UI_TEST_STORE_ID"] = UUID().uuidString
         normal.launch()
         XCTAssertTrue(normal.staticTexts["No saved board"].waitForExistence(timeout: 5))
         let before = XCTAttachment(screenshot: normal.screenshot()); before.name = "Colored inactive tail"; before.lifetime = .keepAlways; add(before)
@@ -351,6 +370,36 @@ final class PikaUITests: XCTestCase {
         app.buttons["Check original creation receipts"].tap()
         XCTAssertTrue(app.staticTexts["The original creation is confirmed. No replacement was launched."].waitForExistence(timeout: 5))
         XCTAssertTrue(start.isEnabled)
+    }
+    @MainActor func testUncertainCreationDoesNotBlockAnotherMachine() {
+        launchFixture(["--fixture-mutations"])
+        app.buttons["addThread"].tap(); app.buttons["Start a thread"].tap()
+        let name = app.textFields["newThreadName"]
+        XCTAssertTrue(name.waitForExistence(timeout: 5))
+        name.tap(); name.typeText("Independent machine creation")
+        app.buttons["threadProjectPicker"].tap(); app.buttons["First page project"].tap()
+        let start = app.buttons["startThread"]
+        XCTAssertTrue(start.isEnabled); start.tap()
+        XCTAssertTrue(app.staticTexts["Creation not confirmed. It will not be repeated automatically."].waitForExistence(timeout: 5))
+        XCTAssertFalse(start.isEnabled, "The original machine must not launch a replacement while its receipt is unknown")
+        app.buttons["threadMachinePicker"].tap(); app.buttons["Fixture Beta"].tap()
+        app.buttons["threadProjectPicker"].tap(); app.buttons["Second page project"].tap()
+        XCTAssertTrue(start.isEnabled, "An unresolved operation on Alpha must not block a separate machine")
+        start.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == false"), object: start)], timeout: 5), .completed)
+        app.buttons["threadMachinePicker"].tap(); app.buttons["Fixture Alpha"].tap()
+        app.buttons["threadProjectPicker"].tap(); app.buttons["First page project"].tap()
+        XCTAssertFalse(start.isEnabled, "Changing machines must not discard the original unresolved receipt")
+        app.buttons["threadMachinePicker"].tap(); app.buttons["Fixture Beta"].tap()
+        app.buttons["threadProjectPicker"].tap(); app.buttons["Second page project"].tap()
+        XCTAssertTrue(app.staticTexts["Check this machine's earlier creation receipt before starting another thread here. Other connected machines remain available."].waitForExistence(timeout: 5),
+            "Beta must retain its own unresolved receipt, not merely a transient busy state")
+        XCTAssertFalse(start.isEnabled)
+        name.tap(); name.typeText("\n")
+        app.swipeUp()
+        let proof = XCTAttachment(screenshot: app.screenshot())
+        proof.name = "Independent creations preserve each machine's unknown receipt"
+        proof.lifetime = .keepAlways; add(proof)
     }
     @MainActor func testAssistantLateApprovalHistoryAndReturnToExactProject() {
         launchFixture()
@@ -563,6 +612,21 @@ final class PikaUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: twice, object: count)], timeout: 8), .completed)
         XCTAssertTrue(app.staticTexts["/fixture/notes.txt"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["acceptProviderRequest"].isEnabled)
+    }
+    @MainActor func testAssistantSharedConnectionRecoveryIsProminentForNewAndOldHosts() {
+        launchFixture()
+        for flag in ["--fixture-assistant-shared-required", "--fixture-assistant-legacy-shared-required"] {
+            app.terminate(); app.launchArguments = ["--ui-fixture", flag]; app.launch()
+            app.buttons["pikaTab"].tap(); app.buttons["Open Pika"].tap()
+            let recovery = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "exit its terminal normally")).firstMatch
+            XCTAssertTrue(recovery.waitForExistence(timeout: 5))
+            XCTAssertTrue(recovery.isHittable, "Recovery must be visible without opening Details")
+            XCTAssertTrue(recovery.label.contains("same assistant"))
+            XCTAssertTrue(recovery.label.contains("memory"))
+            XCTAssertTrue(recovery.label.contains("Reconnecting the phone"))
+            XCTAssertFalse(app.staticTexts["The existing Pika assistant is unavailable. Reconnect to its machine and try again."].exists)
+            XCTAssertFalse(app.textViews["replyComposer"].exists)
+        }
     }
     @MainActor func testDelayedAssistantCannotOverwriteNewerProjectSelection() {
         launchFixture()

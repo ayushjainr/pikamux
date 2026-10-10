@@ -59,6 +59,11 @@ measuring the entire document.
 The iPhone remains a client of the selected machine's shared board and existing
 conversations. Its normal transport is the narrow `_mobile` command over SSH;
 the phone does not own another assistant, fleet scanner or conversation store.
+After installing a successful exact conversation snapshot, the phone explicitly
+acknowledges its server-issued read grant. The owner freezes the unread READY
+event before reading and atomically clears only that unchanged event. Failed or
+cached opens, other identities, newer events and non-READY attention remain
+unread; board badges change only through the shared server feed.
 
 Approved shared-control extension (2026-10-04): future Pika-managed provider
 launches may enable a private native connection so terminal and phone operate
@@ -146,6 +151,18 @@ Directly paired owners take precedence over coordinator copies; an offline direc
 owner does not silently fail over through another machine. Coordinator-only
 identities require one unambiguous, verified route. Pika's assistant entry names
 the selected owning machine instead of implicitly choosing the last connection.
+
+After successfully loading an exact conversation, the phone acknowledges only
+the READY unread event frozen by its owning endpoint before the history read.
+An opaque, connection-local read grant binds the identity and event; the store
+atomically compares that event before clearing unread. Failed or cached opens,
+newer output, and other attention states remain unchanged. The board reflects
+the server's refreshed state, never a local badge override. Older endpoints
+without read grants retain their existing unread behavior until upgraded.
+An assistant still running without its private shared connection requires a
+normal terminal exit and `pika pika` reopen on its owning machine. The phone
+shows that recovery directly; reconnecting alone cannot upgrade a running owner,
+and opening from the phone never restarts or substitutes it.
 
 Mobile composer controls consume the exact selected provider's live catalogs.
 Model changes affect only that thread, require provider confirmation and do not

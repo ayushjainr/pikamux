@@ -522,7 +522,9 @@ final class AppModel: ObservableObject {
                 guard !Task.isCancelled, wireEpochs[source] == epoch else { return }
                 // A paired transport may project fleet rows, but cannot impersonate
                 // another directly paired node's conversation stream.
-                if frame["event"].string?.hasPrefix("conversation/") == true,
+                // The DEBUG-only in-memory fixture deliberately multiplexes
+                // synthetic nodes on one wire; real SSH wires must prove routing.
+                if !isFixture, frame["event"].string?.hasPrefix("conversation/") == true,
                     let owner = frame["params"]["identity"]["nodeId"].string,
                     owner != source, route(for: owner) != source { continue }
                 receivingNode = source
@@ -640,8 +642,14 @@ final class AppModel: ObservableObject {
             let method = params["method"].string ?? ""
             let event = params["params"]
             if openingConversation == selectionGeneration {
-                if let id = event["item"]["id"].string ?? event["itemId"].string { openingLiveItems.insert(id) }
-                if method == "item/agentMessage/delta", let id = event["itemId"].string { openingPartialItems.insert(id) }
+                // A request referring to an item is not a newer copy of that
+                // item. Keep its snapshot detail so approvals retain their diff.
+                if ["item/started", "item/completed"].contains(method), let id = event["item"]["id"].string {
+                    openingLiveItems.insert(id)
+                }
+                if method == "item/agentMessage/delta", let id = event["itemId"].string {
+                    openingLiveItems.insert(id); openingPartialItems.insert(id)
+                }
                 if method == "item/completed", let id = event["item"]["id"].string { openingPartialItems.remove(id) }
                 if method == "turn/started" || method == "turn/completed" { openingLiveTurn = true }
             }
@@ -743,6 +751,24 @@ final class AppModel: ObservableObject {
             messages = snapshot
             lastKnownMessages[item.identity] = Array(messages.suffix(500))
             conversationCached = false
+            // Acknowledge only the successfully installed exact server snapshot.
+            // The owning server freezes its event before reading and compares it
+            // atomically; cached/failed opens and newer output remain unread.
+            if let acknowledgement = result["readAcknowledgement"].string {
+                do {
+                    let receipt = try await wire.request("conversation/acknowledge", params: .object([
+                        "identity": item.identity.json, "readAcknowledgement": .string(acknowledgement)
+                    ]))
+                    guard identity(receipt["identity"]) == item.identity,
+                        receipt["acknowledged"] == .bool(true) || receipt["acknowledged"] == .bool(false) else {
+                        throw ConnectionError.remote("Unread acknowledgement outcome is unconfirmed; newer unread activity was not cleared locally.")
+                    }
+                } catch {
+                    if routeEpoch(for: item.identity.nodeId) == connectionToken, selectionGeneration == token {
+                        reportError(error, action: "Conversation opened, but unread acknowledgement was not confirmed.")
+                    }
+                }
+            }
         } catch { if routeEpoch(for: item.identity.nodeId) == connectionToken, selectionGeneration == token { reportError(error, action: "Could not read this conversation. Reconnect to check its original state.") } }
     }
     func loadOlder(_ item: BoardItem) async {
@@ -976,7 +1002,20 @@ final class AppModel: ObservableObject {
             if isFixture { fixtureAssistantOpenCount += 1 }
             notice = nil
             return item
-        } catch { if routeEpoch(for: requestedNode) == token, selectionGeneration == selectionToken { reportError(error, action: "The existing Pika assistant is unavailable. Reconnect to its machine and try again.") }; return nil }
+        } catch {
+            if routeEpoch(for: requestedNode) == token, selectionGeneration == selectionToken {
+                let legacySharedConnection = error.localizedDescription.contains("The assistant is not on its private shared connection yet.")
+                if case .sharedConnectionRequired = error as? ConnectionError {
+                    reportError(error, action: "")
+                } else if legacySharedConnection {
+                    notice = "On the assistant's owning machine, exit its terminal normally, then reopen with pika pika. This resumes the same assistant and memory. Reconnecting the phone will not enable its private shared connection."
+                    noticeDetails = error.localizedDescription
+                } else {
+                    reportError(error, action: "The existing Pika assistant is unavailable. Check its owning machine; no replacement was started.")
+                }
+            }
+            return nil
+        }
     }
     func controls(_ item: BoardItem) async throws -> JSONValue {
         guard selected?.identity == item.identity, let wire = transport(for: item.identity.nodeId) else { throw ConnectionError.disconnected }
@@ -1075,10 +1114,16 @@ final class AppModel: ObservableObject {
         do { if !isFixture { try store.write(updated, name: "choices.json") }; choices = updated }
         catch { notice = "The assistant machine choice could not be saved." }
     }
+    func hasUnresolvedCreation(on node: String) -> Bool {
+        creations.values.contains {
+            ($0.state == "unknown" || $0.state == "pending")
+                && (($0.params["nodeId"].string ?? "").isEmpty || $0.params["nodeId"].string == node)
+        }
+    }
     func create(name: String, project: MobileProject, provider: String) async -> BoardItem? {
         guard !mutationBusy, capabilities(for: project.nodeId)["create"].bool, let wire = transport(for: project.nodeId),
             !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-            !creations.values.contains(where: { $0.state == "unknown" || $0.state == "pending" }) else {
+            !hasUnresolvedCreation(on: project.nodeId) else {
             notice = "Creation is unavailable or an earlier creation needs its original receipt checked first."; return nil
         }
         mutationBusy = true; defer { mutationBusy = false }

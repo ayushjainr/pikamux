@@ -45,12 +45,15 @@ struct AddThreadView: View {
                         Button(model.mutationBusy ? "Starting…" : "Start thread") {
                             guard let project = projects.first(where: { $0.id == projectId }) else { return }
                             Task { if let item = await model.create(name: name, project: project, provider: provider) { opened(item) } }
-                        }.disabled(model.mutationBusy || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || projectId.isEmpty || model.creations.values.contains(where: { $0.state == "unknown" || $0.state == "pending" }))
+                        }.disabled(model.mutationBusy || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || projectId.isEmpty || model.hasUnresolvedCreation(on: nodeId))
                             .accessibilityIdentifier("startThread")
                         if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             Text("Enter a thread name to enable Start thread.").font(.caption).foregroundStyle(.secondary).accessibilityIdentifier("threadNameRequired")
                         } else if projectId.isEmpty {
                             Text("Choose a project to enable Start thread.").font(.caption).foregroundStyle(.secondary)
+                        } else if model.hasUnresolvedCreation(on: nodeId) {
+                            Text("Check this machine's earlier creation receipt before starting another thread here. Other connected machines remain available.")
+                                .font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 } else {

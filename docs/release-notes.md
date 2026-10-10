@@ -1,3 +1,21 @@
+Pika 0.6.50 clears a READY unread badge after a successful exact phone read.
+
+The owning endpoint freezes the event before reading history and issues an opaque
+read grant. The phone acknowledges only after installing that exact snapshot;
+the store atomically clears only the unchanged READY event. Failed or cached
+opens, newer output, other identities and non-READY attention remain unread.
+Board badges update through the shared server feed, not a local override.
+
+The separate iPhone build 46 also explains recovery for an assistant still
+running without its private shared connection. On its owning machine, exit its
+terminal normally, then reopen with `pika pika`. Reconnecting the phone alone
+cannot upgrade that running owner. Updating Pika does not perform this restart,
+create a replacement assistant, migrate legacy history or prove phone sending
+works for that assistant. The iPhone app remains a separate installation; older
+phone or host versions retain their existing unread behavior.
+
+Retained changes from 0.6.49:
+
 Pika 0.6.49 fixes native Claude history reconstruction beyond the record-size fix.
 
 Exact parallel tool-response batches and known native metadata no longer look

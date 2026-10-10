@@ -211,6 +211,7 @@ impl Remote {
             method,
             "hello"
                 | "conversation/open"
+                | "conversation/acknowledge"
                 | "conversation/history"
                 | "conversation/controls"
                 | "conversation/model"
@@ -255,6 +256,7 @@ impl Remote {
         self.mutation_dispatched = matches!(
             method,
             "conversation/send"
+                | "conversation/acknowledge"
                 | "conversation/model"
                 | "conversation/answer"
                 | "conversation/approve"

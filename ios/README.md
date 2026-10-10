@@ -13,8 +13,9 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodegen generate
 Open `Pika.xcodeproj`, choose an iPhone simulator, and build the Pika scheme.
 Simulator runs that exercise Keychain need ad-hoc code signing; unsigned builds
 are compilation evidence only. A physical iPhone requires the release owner's
-Apple signing team and provisioning. No physical-device installation has been
-verified.
+Apple signing team and provisioning. Development builds through 44 have been
+installed on the owner's physical iPhone; this does not establish a complete
+physical-device user journey. See the dated evidence ledger.
 Select your Apple team under the Pika target's Signing & Capabilities, leave
 automatic signing enabled, then select your paired iPhone. The generated
 project does not globally disable signing. Installing on a physical device is
@@ -40,7 +41,7 @@ private SSH key. The phone generates its own dedicated Ed25519 key and stages
 it in device-only Keychain before claiming. Success still requires the QR-pinned
 SSH host, exact Pika node and first validated board. Pairing's temporary listener
 is foreground-only on the machine's private Tailscale address, not a public service.
-Physical camera scanning and actual Tailscale routing remain unverified. A native
+Automated physical-camera and actual Tailscale journey evidence remains incomplete. A native
 Simulator journey imported a disposable compact descriptor, completed real
 pinned TLS enrollment and ordinary SSH into `_mobile`, verified the exact node
 and seeded board, then reconnected after relaunch with the saved phone key.
@@ -81,7 +82,7 @@ runs skip it. Clean actual native Start and one-time command approval journeys
 passed through ordinary live SSH, with independently matched original desktop
 identities, processes and continuation. Historical protected-SSH-child refusals
 and test-only failures remain in the ledger; the reviewed exact OS-process
-identity check preserves fail-closed handling of unknown processes. Physical-device, actual file approval, Tailscale,
+identity check preserves fail-closed handling of unknown processes. Complete physical-device journeys, actual file approval, Tailscale,
 password/encrypted-key and multi-machine/provider validation remain separate
 gates. Do not present this alpha as complete.
 
@@ -95,3 +96,17 @@ security review, physical signing evidence, and the repository's release gates.
 DEBUG-only fixture/import helpers are visually labeled and are not production
 connection success paths. Tests must not use real credentials, model quota,
 fleet machines, or the user's installed Pika/database/configuration.
+
+## Distribution readiness
+
+A paired, Developer Mode-enabled phone can receive development builds over the
+local network; USB is not required for every update. Installation and automated
+UI access still depend on the device's connection and lock state. Development
+provisioning expires; a successful installation is not indefinite distribution.
+
+TestFlight requires Apple Developer Program access and an App Store Connect app
+record, distribution signing, a validated archive, and Apple's build processing.
+The inspected Xcode account on 2026-10-09 lists only a Personal Team. Do not
+claim TestFlight availability or enroll, accept agreements, or upload on the
+owner's behalf without the required account access and publication approval.
+See Apple's [distribution guide](https://developer.apple.com/documentation/xcode/distributing-your-app-for-beta-testing-and-releases/).

@@ -132,6 +132,7 @@ struct Handler<'a> {
     selected: Option<Connection>,
     native_selected: Option<NativeConnection>,
     history_selection: Option<Identity>,
+    read_acknowledgement: Option<(Identity, String, f64, String)>,
     journal: Journal,
     remote: Option<crate::mobile_remote::Remote>,
 }
@@ -148,6 +149,7 @@ pub(crate) fn serve(pika: &Pika) -> Result<i32> {
         selected: None,
         native_selected: None,
         history_selection: None,
+        read_acknowledgement: None,
         journal,
         remote: None,
     };
@@ -224,7 +226,7 @@ fn emit_response(
         Ok(result) => emit(output, json!({"v":1,"id":id,"result":result})),
         Err(error) => emit(
             output,
-            json!({"v":1,"id":id,"error":{"code":if matches!(request.method.as_str(),"conversation/send"|"conversation/create"|"conversation/answer"|"conversation/approve"){"rejected_before_dispatch"}else{"unavailable"},"message":error.to_string(),"retryable":false}}),
+            json!({"v":1,"id":id,"error":{"code":if error.downcast_ref::<crate::assistant_native::SharedConnectionRequired>().is_some(){"shared_connection_required"}else if matches!(request.method.as_str(),"conversation/send"|"conversation/create"|"conversation/answer"|"conversation/approve"){"rejected_before_dispatch"}else{"unavailable"},"message":error.to_string(),"retryable":false}}),
         ),
     }
 }
@@ -601,6 +603,7 @@ impl Handler<'_> {
         if matches!(
             request.method.as_str(),
             "conversation/open"
+                | "conversation/acknowledge"
                 | "conversation/history"
                 | "conversation/send"
                 | "conversation/answer"
@@ -670,6 +673,7 @@ impl Handler<'_> {
                 json!({"items":std::iter::once(json!({"nodeId":self.node,"name":"This machine","local":true})).chain(self.pika.store.list_nodes()?.into_iter().map(|node|json!({"nodeId":node.node_id,"name":node.alias,"local":false,"status":node.status}))).collect::<Vec<_>>()}),
             ),
             "conversation/open" => self.open_conversation(request),
+            "conversation/acknowledge" => self.acknowledge_conversation(request),
             "conversation/history" => self.history(request),
             "conversation/send" => self.dispatch_message(request),
             "conversation/controls" => self.composer_controls(request),
@@ -687,6 +691,57 @@ impl Handler<'_> {
     }
 
     fn open_conversation(&mut self, request: &Request) -> Result<Value> {
+        self.read_acknowledgement = None;
+        let identity = self.identity(&request.params)?;
+        // Freeze the event before reading, never the newer event after a slow read.
+        let session = self
+            .pika
+            .store
+            .list_sessions()?
+            .into_iter()
+            .find(|session| {
+                session.provider == identity.provider
+                    && session.provider_thread_id() == identity.thread_id
+            });
+        let mut result = self.read_conversation(request)?;
+        if let Some(session) =
+            session.filter(|session| session.unread && session.status == Status::Ready)
+        {
+            let token = uuid::Uuid::new_v4().to_string();
+            result["readAcknowledgement"] = json!(token);
+            self.read_acknowledgement =
+                Some((identity, session.session_id, session.last_event_at, token));
+        }
+        Ok(result)
+    }
+
+    fn acknowledge_conversation(&mut self, request: &Request) -> Result<Value> {
+        let identity = self.identity(&request.params)?;
+        self.require_watched(&identity)?;
+        let (owner, session_id, event_at, token) = self
+            .read_acknowledgement
+            .as_ref()
+            .context("No successful read is awaiting acknowledgement")?;
+        if *owner != identity
+            || request.params["readAcknowledgement"].as_str() != Some(token.as_str())
+        {
+            bail!("Acknowledgement does not match this exact successful read");
+        }
+        let acknowledged = self.pika.store.acknowledge_attention(
+            identity.provider,
+            session_id,
+            *event_at,
+            false,
+        )?;
+        if acknowledged {
+            if let Some(source) = &self.source {
+                let _ = source.refresh().try_send(());
+            }
+        }
+        Ok(json!({"identity":identity,"acknowledged":acknowledged}))
+    }
+
+    fn read_conversation(&mut self, request: &Request) -> Result<Value> {
         let params = &request.params;
         let identity = self.identity(params)?;
         self.require_watched(&identity)?;

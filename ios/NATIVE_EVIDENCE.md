@@ -1719,3 +1719,282 @@ fake provider's exact conversation arguments before executing sleep. Follow-up
 test-only changes replace recurring sleep forks with a blocking shell builtin
 read. Navigation assertions, timeouts and production ownership rules are
 unchanged. This establishes the mechanism, not the exact hosted claimant pair.
+
+## 2026-10-09 — Phone reliability pass (local repairs verified; device/distribution blocked)
+
+Accepted scope: dependable Claude continuation; complete connect, multi-machine,
+search/filter, start, model/skill, assistant, reconnect, draft and ordered-history
+journeys; prepare wireless TestFlight distribution. Preserve the accepted UI,
+exact provider identity and uncertain-delivery protections. Existing production
+threads must not be restarted, rewritten or silently replaced. Publication and
+account enrollment remain distinct from local implementation and verification.
+
+Acceptance evidence must distinguish actual native UI/SSH/provider journeys from
+synthetic UI fixtures. Prior successful tests are reusable only for unchanged
+paths; saved-history success does not prove phone sending. Target self and
+independent adversarial review scores are 95/100, conditional on every accepted
+journey being satisfied rather than an averaged substitute for missing behavior.
+
+Execution ledger:
+- Driver: inspecting native Claude admission/launch and current device access.
+- Sol phone_journey_audit: read-only cross-journey audit; concrete defects and
+  executable checks pending. No fleet changes delegated.
+- Baseline: bb564c7 in the existing test-audit worktree. Primary checkout is an
+  older local main with unrelated media edits and is intentionally untouched.
+- Device tooling: isolated simulator is booted; physical iPhone is paired and
+  available, but no unlocked/interactive verification has yet been established.
+- Fleet diagnostic: all three hosts report 0.6.49. Current Claude versions differ
+  (rs8 2.1.274, rs2a 2.1.283, rs6 2.1.293). rs8 has 11 GiB available; prior disk
+  exhaustion is not currently reproduced. No provider processes were restarted.
+- Known pending boundaries: old Claude launches have no shared connection;
+  malformed source history and duplicate live owners require non-destructive
+  recovery decisions, not silent bypasses. TestFlight account readiness unverified.
+- Distribution inspection: Xcode Apple Accounts lists only a Personal Team;
+  local keychain has one Apple Development identity, no distribution identity.
+  Existing development provisioning profile expires 2026-10-10 at 12:13:41 UTC.
+  This is not TestFlight readiness. Apple Developer Program membership/account
+  access and any required agreements are owner actions, not silently enrollable.
+- Actual device transport is localNetwork, with Developer Mode enabled; USB is
+  not the blocker for another development installation. No device state reset.
+- Sol claude_continuation_journey: current 0.6.49 native endpoint journey in the
+  previously authorized isolated rs8 auth environment; at most two harmless
+  arithmetic turns, no production thread input or restart; evidence pending.
+- Reconnect hypothesis: stale global generation might leave the retry task
+  occupied after another node starts connecting. Sol owns a disposable multi-node
+  SSH/native UI reproduction; source plausibility alone is not runtime proof.
+- Active UI runs: fixture session 7748, loopback ports 59431–59433 under
+  `/var/folders/k9/s1xh63d93rq9bd97cngqvf4c0000gn/T/pika-three-ssh-qq2a8u83`;
+  Xcode session 4314 and build/results under `/tmp/pika-overlap-audit.kqfiim`.
+  First artifact is onboard.xcresult, followed by overlap before/after results.
+  Worker monitors command completion and XCTest progress; no-progress for five
+  minutes requires investigation rather than a success assumption.
+- Native Claude 0.6.49 on rs8: two harmless messages returned attested 42 and 43
+  under the same UUID/process; duplicate operation IDs did not resend. A fresh
+  endpoint reopened both in order; after owned process exit, history remained
+  readable with sending disabled. Lead inspected copied controller/lifecycle
+  evidence at `/tmp/pika-reliability-20261009.unADWj`. This is current backend
+  SSH/provider evidence, not current phone UI evidence. The first probe's source
+  path assumption failed; the corrected probe passed. No production agent changed.
+- Independent review found unresolved Start on one machine globally disabled
+  Start elsewhere. Root narrowed admission to the exact owning node (unknown
+  legacy node identity remains fail-closed), retained every original receipt,
+  added explanatory UI and a native two-machine creation journey; result pending.
+- Claude controls feasibility: current channel protocol has no documented exact
+  live model/skill control API. Existing running native processes lack launch-only
+  connection instrumentation. The no-restart contract precludes silently enabling
+  them; an explicit future same-UUID resume after exit is not seamless migration.
+- Physical phone currently requires its passcode; no locked-device UI proof is
+  claimed. Independent review correctly withholds completion/95 for these gaps.
+- Current native Codex creation regression launched as session 86216: disposable
+  HOME/XDG/provider/database/tmux, installed provider executable explicitly chosen,
+  synthetic loopback inference only. Checks new UUID, lost creation receipt,
+  exact retry identity, first reply and original desktop rendering. Build progress
+  is the first artifact; investigate after five minutes without progress.
+- Session 86216 completed successfully: 1 passed, 0 failed, 0 ignored, 2 filtered;
+  runtime 2.30 seconds after build. Output explicitly confirmed same native UUID
+  after a lost creation receipt and first reply rendered in its original TUI.
+  This is actual provider/backend evidence with synthetic inference, not iOS UI.
+- Reviewer confirmed per-node creation admission and bounded mutation serialization;
+  missing or empty persisted node identity remains fail-closed. No additional
+  high-confidence Swift defects identified beyond reconnect and creation so far.
+- Lead independently read isolated Claude delivery-journal metadata: exactly two
+  conversation/send rows, both delivered, payload and receipt both naming UUID
+  46dbbd7e-593e-4f6d-8382-1023962b854f. This corroborates the first send despite the
+  controller report being overwritten by the second probe; no further sends made.
+- Three-machine disposable SSH onboarding passed (1/1, no skips or runtime
+  warnings). First overlap reproduction timed out after authenticated hello but
+  before UI-connected state; it is not yet definitive evidence of the suspected
+  stranded timer. A longer controlled overlap and patched comparison are running.
+- Overlap after2 exposed a test-observation defect: connection completion
+  dismisses ConnectionView, so its machine-status accessibility element no longer
+  exists. Lead inspected xcresult's actual Dex hierarchy: both surviving machine
+  rows had fresh observations. Corrected test reopens the sheet before checking
+  online state; both baseline and patch must be rerun with that same observation.
+  Previous overlap failures are not credited as demonstrated production failures.
+- Independent source review found no new race in the timer identity/cancellation
+  repair or node-scoped creation guard. Provisional narrow score 87/100 pending
+  executable evidence; overall readiness about 65/100 because provider eligibility,
+  physical-phone verification and distribution account gates remain incomplete.
+- Corrected overlap journey passed on both patched (after3) and baseline (before3)
+  app builds: each 1 passed, 0 failed, 0 skipped, no runtime warnings. Therefore
+  this journey does not establish a production reconnect defect. The speculative
+  reconnect runtime change was reverted; coverage remains. The demonstrated
+  production fix in this pass is node-scoped creation admission, still validating.
+- Initial targeted creation test crashed before UI interaction because the new
+  test used its uninitialized XCUIApplication property. Root corrected it to use
+  the existing launchFixture initializer. This was a test-code defect, not evidence
+  of a simulator/runtime failure or of application correctness. Rerun pending.
+- Corrected creation UI run: session 24231/PID27356, result
+  `/tmp/pika-overlap-audit.kqfiim/creation-targeted-03.xcresult`; full follow-on
+  sweep expects 30 PikaUITests plus 6 PikaComposerTests. Worker monitors each
+  test transition and investigates five-minute no-progress intervals.
+- Root unsigned Release iOS-device build session 67302, separate disposable
+  HOME/build/packages at `/tmp/pika-ios-device-check.8IVf60`. Expected artifact
+  Release-iphoneos/Pika.app; compilation only, not installation/distribution.
+- Corrected creation-targeted-03 passed (1/1, no skips/runtime warnings). Reviewer
+  then identified that Beta's disabled button alone could be transient busy state;
+  strengthened test revisits Beta and checks its specific unresolved-receipt
+  explanation. Full sweep plus strengthened targeted rerun are still pending.
+- Unsigned Release device compilation session 67302 passed. Xcode emitted an
+  orientation/full-screen configuration warning; no claim of warning-free release.
+  No signing, installation, version bump or TestFlight upload occurred.
+- Full UI sweep `ui-full.xcresult`: 36 tests, 33 passed, 3 failed, no skips or
+  runtime warnings; 1043.967 seconds of test operations. Failures were late file
+  approval, fresh normal board, and search after typing codex. This failed run is
+  retained, not replaced by later targeted results.
+- Fresh-normal test used the ordinary cached store; changed its DEBUG launch to
+  an isolated SSH-test store UUID. Fixture Beta's approval event was rejected by
+  the new real-wire source-routing gate; added an in-memory-fixture exception
+  (isFixture can only be enabled in DEBUG), without relaxing real SSH ownership.
+  Late-file failed again individually before this correction; search passed alone.
+  Search now also checks the exact typed query and waits at most two seconds for
+  the nonmatching row to disappear rather than testing an immediate UI snapshot.
+- Targeted four rerun session 91322, `ui-four-final.xcresult`; final search source
+  may require a separate rerun because build began before its latest assertion.
+  Lead visually inspected native keyboard placement and historical reading
+  screenshots. Creation screenshot was obscured by keyboard; final test dismisses
+  it and scrolls to the receipt explanation before capturing proof.
+- Four-target rerun: 3 passed (search, isolated empty board, strengthened
+  independent creation receipts), 1 failed (late file approval). Root inspected
+  Beta receipt screenshot and confirmed caption/disabled button with no keyboard
+  obstruction. Late-file remained reproducibly broken after fixture routing repair.
+- Actual handoff defect: approval-request itemId was classified as a newer live
+  item while opening history, suppressing the snapshot's original file-change
+  detail. Fixed tracking to accept only actual started/completed item payloads or
+  message deltas; request references no longer discard snapshot detail. Exact
+  identity checks and incomplete-detail refusal remain intact. Independent source
+  review found no material safety regression; skeletal-started events remain a
+  pre-existing fail-closed edge, not silently merged with potentially stale detail.
+- Affected ten-test approval/live-history subset runs as session 95075, result
+  `open-handoff-final.xcresult`. Final Release rebuild runs as session 50281 using
+  the existing isolated device-build directory. Both results pending.
+- Final affected subset independently read by lead and adversary: 10 passed,
+  0 failed, 0 skipped, no runtime warnings, 261.131 seconds of test operations.
+  This includes late-file approval, assistant approval, live/snapshot and both
+  delta orders, approval resolution, and final search. Final Release compilation
+  session 50281 passed. Unchanged passing tests are reused; the earlier full36
+  failed run is retained and is not described as a clean full-suite run.
+- Owned disposable SSH listeners stopped cleanly; lead confirmed no listeners on
+  59431–59433. Evidence and synthetic credentials remain in the disposable root.
+  No production thread, server runtime, phone installation or publication changed.
+- Final reconciliation: node-scoped Start and late-approval snapshot preservation
+  implemented and verified; actual isolated Claude delivery/reopen verified;
+  native UI fixture journeys and multi-machine SSH coverage recorded separately.
+  Legacy Claude launches still need explicit opted-in continuation after natural
+  exit; native Claude model/skill control is not supplied by the current channel.
+  Do not silently restart user processes or substitute text commands for controls.
+- Physical device remains reachable over localNetwork but passcodeRequired=true
+  at the final check. User unlock is required before lead-owned physical QA.
+  TestFlight remains blocked on paid developer-team/account access and applicable
+  owner agreements; current Personal Team development profile expires Oct 10.
+- Final scores: lead narrow repairs 95/100, adversary 94/100 (withholds one point
+  pending a clean full-suite rerun). Overall accepted readiness: both 65/100.
+  The full contract is NOT complete and no 95-level app-readiness claim is made.
+
+### 2026-10-09 — owner unlocked phone; build 45 installed
+
+User unlocked the physical iPhone. Device lockState independently confirmed
+passcodeRequired=false. Signed Release build 45 passed, using the existing team
+and automatic provisioning; the existing orientation warning remains. Signature
+verification passed. Installed in place without uninstalling/resetting app data;
+device inventory confirms 1.0 build 45, installation database sequence 5280.
+Normal launch succeeded. No server runtime or production conversation changed.
+
+Native iPhone Mirroring now reports “iPhone in Use — Lock your iPhone to connect.”
+Requested that device-state transition for lead-controlled physical UI checks;
+installation/launch alone is not claimed as completed journey evidence.
+
+### 2026-10-09 — physical iPhone Mirroring exploration, build 45
+
+Owner locked the phone; lead operated the installed app through iPhone Mirroring
+at approximately 07:00–07:05 device time. This was the real saved-machine board,
+not the simulator or a fixture. Tool screenshots preserve the observed states.
+
+- All-machines menu retained rs2a, rs8 and rs6. Selecting rs2a displayed rs2a
+  cards; restoring all machines recovered the combined board. Claude provider
+  filtering displayed Claude cards, and the provider menu also listed Codex,
+  Muse and OpenCode. Listing an option is not proof of its continuation support.
+- Search located the existing rs8 Testing_from_mobile thread. Opening it showed
+  the latest visible messages. Commands opened a model sheet showing current
+  gpt-6.1-sol and available model choices; no model change was submitted. Skills
+  loaded server skill names/descriptions; no skill was invoked.
+- Entered only the unsent text `Draft check`, navigated back using the edge
+  gesture, then reopened. Draft and latest visible messages were preserved.
+  Removed only that test draft and verified the empty composer. No message sent.
+  Mirroring used hardware keyboard input; this does not prove physical software
+  keyboard layout. Paste did not populate the composer; typeText did.
+- Start-thread sheet displayed rs8, project and provider controls, explicit
+  required-name guidance, and a disabled Start with an explanation. Cancelled
+  without creating a server conversation; physical creation is not yet proven.
+- Unread badge remained after opening/reopening the test thread. Record as an
+  unresolved product gap, not a clean read-state pass.
+- Open Pika on rs8 failed with details explaining that the existing assistant
+  is not on its private shared connection, and requires normal terminal exit
+  then reopening. No running assistant was restarted. The general error's
+  reconnect advice does not explain this actual migration requirement.
+
+This exploration narrows physical-device uncertainty but does not complete the
+full app contract or prove live send, fresh creation, Claude continuation, or
+Pika assistant attachment on the phone. Existing readiness caveats remain.
+
+### 2026-10-09 — fixes after physical exploration; phone away
+
+Owner requested repairs without phone access. Candidate build number is 46;
+installed phone build remains 45. No fleet update, publication, phone operation
+or running-assistant restart was performed for this pass.
+
+- Unread: successful native conversation reads now issue an opaque exact-event
+  acknowledgement grant, sampled before the read. The app acknowledges after
+  installing the exact snapshot; the owning store atomically clears only that
+  READY event and refreshes the board. Newer events, other identities, failed
+  reads, cached content and non-READY states are not locally masked or cleared.
+  An unknown acknowledgement response is shown as unconfirmed, not success.
+- Assistant: typed shared-connection-required recovery and old-host compatibility
+  show normal terminal exit / `pika pika` reopen guidance without hiding it in
+  Details. Reconnect-only advice was removed. No in-place legacy-owner migration
+  defect was established; a running legacy owner remains unchanged.
+- Native disposable endpoint history suite: 14 passed, 0 failed, 167.43s.
+  Expanded acknowledgement journey passed separately (0.92s), covering wrong
+  identity/token, newer event, replaced grant, persistent acknowledgement,
+  failed read, and Working/Error/NeedsYou preservation.
+- Model-free isolated actual-provider assistant lifecycle journey passed: one
+  shared UUID and live owner reused, then same UUID reopened after owned tmux
+  teardown. This is NOT evidence for legacy embedded-mode natural-exit migration.
+  Shared-profile staging and typed error checks also passed independently.
+- Simulator native UI: `unread-assistant-final.xcresult` under
+  `/tmp/pika-overlap-audit.kqfiim`, 2 passed, 0 failed/skipped/runtime warnings.
+  Open/back/reopen changes two unread badges to one and keeps the unrelated row
+  unread. Both new-host and old-host assistant recovery are visible without
+  expanding Details. These are explicitly labelled endpoint-fixture UI checks,
+  not a real-provider/physical-device send proof.
+- First assistant UI attempt crashed because its test omitted app initialization.
+  Corrected with the existing launchFixture helper; failed evidence retained at
+  `assistant-recovery.xcresult`. No production failure was hidden.
+- Independent read-only review found acknowledgement-result validation and
+  fixture cross-thread-clearing gaps; both repaired and re-reviewed with no
+  remaining material findings. Relay lost-ack executable coverage remains a
+  limitation. `cargo fmt --check`, `cargo clippy --lib -- -D warnings` passed.
+
+Unsigned Release iphoneos build 46 passed (session 44421). The pre-existing
+full-screen/orientation warning remains; no device signing or install was attempted.
+
+Server and app changes are both required to clear unread; older endpoints do
+not supply grants and retain their previous behavior. Candidate compilation
+does not mean this repair is installed on the phone or servers.
+
+### 2026-10-09 — build 46 physical installation
+
+After the owner returned and unlocked the phone, signed Release build 46 passed
+and codesign verification succeeded. Installed in place over the paired local
+network without uninstall/reset; device inventory confirms 1.0 build 46,
+installation database sequence 5288. Normal launch succeeded. No server update
+or assistant restart was performed. The unread repair still requires the new
+server endpoint; installation alone is not an end-to-end unread success claim.
+
+Physical build 46 follow-up: after owner locked the phone, resumed iPhone
+Mirroring, opened Pika from the home screen, observed the live saved-machine
+board, selected Pika and Open Pika on rs8. The legacy host failure now displays
+normal terminal exit / pika pika reopen guidance directly in the visible card,
+including that phone reconnection will not enable the shared connection. No
+Details expansion was needed. This verifies the recovery presentation on the
+actual phone, not successful assistant attachment or deployed unread repair.
