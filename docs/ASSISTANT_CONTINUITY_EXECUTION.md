@@ -174,3 +174,36 @@ debug binary also explains the installer cancellation fixture rejection before
 its tar subprocess starts. These results are not a green full suite; a separate
 CI-profile distribution rerun is required.
 Publication remains gated on exact-commit CI and release asset verification.
+
+Candidate a2abf3f473f51177d94fe82b3eb6f00920aca92a pushed to main and tagged
+v0.6.51. CI run38051970181 and native release run38051995762 are in progress.
+Review of the final extraction found no new material blockers (96/100).
+Watch jobs at approximately one-minute cadence; investigate a failed job or
+nonadvancing job beyond its workflow timeout, never bypass the publication gate.
+
+Local serial suite ended exit101: 54 targets, 1353 passed, 9 failed, 33 ignored.
+Failures are distribution_safety_contract (3) and update_contract (6), all
+blocked by the oversized debug payload. Both full targets rerun with CI debug=0
+settings in isolated target directory `/tmp/pika-release-ci-target.t52hTN`,
+session15344; log `/tmp/pika-release-ci-rerun-20261010-continuity-gap.log`.
+
+## Release completed
+
+The CI-profile rerun passed all 10 distribution and 35 update checks (45/45);
+the binary was 47 MiB. No source workaround was needed. Reconciled local
+coverage is 1362 passed and 33 ignored; the original run itself remains failed.
+Exact-commit CI run38051970181 and native release run38051995762 both completed
+successfully. All five platform assets, checksums and provenance were verified
+by the release workflow. Public latest `pika-version` resolves to 0.6.51.
+
+Managed pinned updates completed successfully and each executable independently
+reported `pika 0.6.51`: Mac (from0.6.36), rs6, rs2a and rs8 (from0.6.50).
+Updater receipts explicitly report no agent restart. No setup, permission grant,
+profile migration, phone installation or recurring-spend enablement was run.
+Existing processes keep their version until normal reopening. Unrelated dirty
+iOS/DESIGN changes remain excluded and preserved.
+
+Release: https://github.com/ayushjainr/pikamux/releases/tag/v0.6.51
+Scoped implementation and release complete: self96/100, adversarial96/100.
+This does not close the wider real-work coordination/knowledge acceptance gap
+identified above; installation is not proof of that behavior.
