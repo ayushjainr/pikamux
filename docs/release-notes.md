@@ -1,3 +1,21 @@
+Pika 0.6.51 repairs the persistent assistant's dream maintenance and exposes
+bounded receipts for what it actually retained. Memory-only workers explicitly
+disable the interactive Pika MCP connection; consolidation receives only its
+allowed candidate types. Source validation, permission and forgetting boundaries
+remain enforced.
+
+An isolated live native journey verified learning from ordinary conversation,
+completed consolidation, recall after fresh context, lasting correction and
+forgetting followed by a fresh-context memory miss. This is not evidence of
+fleet-wide coordination or an iPhone UI test.
+
+Dream enablement still requires the existing explicit human command and budget.
+Updating does not turn on recurring spend, restart agents, merge profiles or
+install an iPhone build. Existing native conversations keep their current
+process; updated bundled guidance is available on a subsequent normal launch.
+
+Retained changes from 0.6.50:
+
 Pika 0.6.50 clears a READY unread badge after a successful exact phone read.
 
 The owning endpoint freezes the event before reading history and issues an opaque

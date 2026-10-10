@@ -349,6 +349,15 @@ logs, external copies and backups remain outside that guarantee.
 
 ## Pika's counterparts to Muse's standing Markdown files
 
+The native assistant can inspect recent dreams with the read-only `pika_dreams`
+tool: up to eight scoped consolidation/reflection jobs and bounded surviving
+output records. It reads existing receipts without starting a job or acknowledging
+work. Queued or uncertain runs are not completed dreams; creation timestamps are
+not completion timestamps. Old-generation output is withheld after forgetting,
+and omitted history is explicit. Historical learning is not proof that guidance
+is still active or that a project finished. Ask what Pika learned during its
+dreams; the assistant should consult these receipts rather than invent a diary.
+
 Pika borrows the *jobs*, not a second set of editable authorities. Its bundled
 `pika-skills/*/SKILL.md` files cover self-awareness, consolidation, Reflection,
 and user-invoked feedback. They are selected for a specific turn, typed

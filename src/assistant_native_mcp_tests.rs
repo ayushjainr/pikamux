@@ -9,6 +9,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "assistant_native_live_tests.rs"]
+mod live;
+
 struct Rpc {
     child: Child,
     input: ChildStdin,
@@ -218,6 +221,15 @@ fn native_codex_connects_pika_and_reads_only_shared_board_rows() {
         json!({"threadId":id,"detail":"toolsAndAuthOnly"}),
     );
     assert!(inventory.to_string().contains("pika_state"), "{inventory}");
+    assert!(inventory.to_string().contains("pika_dreams"), "{inventory}");
+    let dreams = rpc.request(
+        "mcpServer/tool/call",
+        json!({"threadId":id,"server":"pika","tool":"pika_dreams","arguments":{}}),
+    );
+    assert_ne!(dreams["isError"], true, "{dreams}");
+    let dream_receipt: Value =
+        serde_json::from_str(dreams["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(dream_receipt["runs"].as_array().unwrap().is_empty());
     let response = rpc.request(
         "mcpServer/tool/call",
         json!({"threadId":id,"server":"pika","tool":"pika_state","arguments":{}}),

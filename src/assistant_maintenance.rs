@@ -68,6 +68,8 @@ pub(crate) fn initialize(memory: &Store) -> Result<()> {
       CREATE TABLE IF NOT EXISTS maintenance_outbox(record_id TEXT PRIMARY KEY,job TEXT NOT NULL,delivered INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS maintenance_compaction(scope TEXT PRIMARY KEY,thread_id TEXT NOT NULL,item_id TEXT NOT NULL,observed INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS maintenance_outputs(record_id TEXT PRIMARY KEY,job TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS maintenance_jobs_recent_scope ON maintenance_jobs(scope,created DESC,id DESC);
+      CREATE INDEX IF NOT EXISTS maintenance_outputs_job ON maintenance_outputs(job,record_id);
       CREATE TABLE IF NOT EXISTS maintenance_omissions(scope TEXT NOT NULL,purpose TEXT NOT NULL,record_id TEXT NOT NULL,revision INTEGER NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(scope,purpose,record_id,revision));
       CREATE TABLE IF NOT EXISTS maintenance_revisits(record_id TEXT PRIMARY KEY,scope TEXT NOT NULL,due INTEGER NOT NULL,queued INTEGER NOT NULL DEFAULT 0);
       CREATE TRIGGER IF NOT EXISTS maintenance_forget_scrub AFTER UPDATE ON memory_meta WHEN NEW.key='forget_epoch' AND NEW.value!=OLD.value BEGIN UPDATE maintenance_jobs SET result=NULL,state=CASE WHEN state='completed' THEN state ELSE 'invalidated' END; END;")?;
@@ -480,6 +482,19 @@ fn build_assignment(
 ) -> Result<Assignment> {
     let key = scope_key(permitted_scope)?;
     let sources = context.sources.clone();
+    let candidate_schema = match purpose {
+        Purpose::Consolidation => concat!(
+            "Consolidation learning accepts ONLY these exact objects: ",
+            "{\"kind\":\"fact\",\"body\":\"text\",\"sources\":[{\"id\":\"source ID\",\"revision\":0}]}; ",
+            "{\"kind\":\"decision\",\"body\":\"text\",\"sources\":[{\"id\":\"source ID\",\"revision\":0}],\"rationale\":\"text\",\"alternatives\":[],\"revisit\":\"condition\"}; ",
+            "{\"kind\":\"commitment\",\"body\":\"text\",\"sources\":[{\"id\":\"source ID\",\"revision\":0}],\"condition\":\"condition\"}; ",
+            "{\"kind\":\"question\",\"body\":\"text\",\"sources\":[{\"id\":\"source ID\",\"revision\":0}]}. ",
+            "Retain an explicit user preference as a fact about what the user asked, not a guidance object. ",
+            "Guidance and workshop candidates are forbidden in consolidation, even when present in source evidence. ",
+            "Do not copy a prior candidate envelope from context. Use exact observed source IDs/revisions."
+        ),
+        Purpose::Reflection => assistant_continuity::OUTPUT_INSTRUCTION,
+    };
     let id = format!(
         "maintenance-{:x}",
         Sha256::digest(serde_json::to_vec(&(
@@ -494,7 +509,7 @@ fn build_assignment(
         purpose.skill(),
         purpose.key(),
         TEMPLATE_VERSION,
-        assistant_continuity::OUTPUT_INSTRUCTION,
+        candidate_schema,
         purpose.key(),
         serde_json::to_string(&selected)?,
         serde_json::to_string(&context)?
@@ -960,6 +975,90 @@ fn received_rows(memory: &Store) -> Result<Vec<ReceivedRow>> {
     .collect::<rusqlite::Result<_>>()?)
 }
 
+/// Inspect existing receipts only. Never dispatch, acknowledge, or resurrect
+/// forgotten output. This is history, not proof that guidance is still active.
+pub(crate) fn dreams(memory: &Store, scope: &Scope) -> Result<serde_json::Value> {
+    initialize(memory)?;
+    let key = scope_key(scope)?;
+    let tx = memory.connection.unchecked_transaction()?;
+    let epoch = memory.forget_epoch()?;
+    let rows = dream_rows(&tx, &key)?;
+    let more = rows.len() > 8;
+    let mut runs = Vec::new();
+    let mut remaining = 24 * 1024;
+    for (id, purpose, state, created, job_epoch) in rows.into_iter().take(8) {
+        // A forget invalidates the old context. Do not expose its old output
+        // through a history endpoint even when its job receipt survives.
+        let (memories, omitted) = if state == "completed" && job_epoch == epoch {
+            dream_outputs(memory, &tx, scope, &id, &mut remaining)?
+        } else {
+            (Vec::new(), false)
+        };
+        runs.push(json!({"id":id,"purpose":purpose,"state":state,
+            "created_at":created,"memories":memories,"outputs_omitted":omitted,
+            "prior_memory_generation":job_epoch != epoch}));
+    }
+    tx.commit()?;
+    Ok(json!({"runs":runs,"more_runs":more,
+        "notice":"Recent scoped maintenance receipts, not a complete history. Created time is not completion time. Only completed runs confirm maintenance; empty outputs do not prove nothing needed attention. Prior-generation outputs are withheld after forgetting. Memories are historical worker interpretations, not proof of active guidance, completed project work or new authority. No model call or acknowledgement was made."}))
+}
+
+type DreamReceiptRow = (String, String, String, i64, u64);
+
+fn dream_rows(tx: &rusqlite::Transaction<'_>, key: &str) -> Result<Vec<DreamReceiptRow>> {
+    let mut query = tx.prepare(
+        "SELECT id,purpose,state,created,epoch FROM maintenance_jobs WHERE scope=? ORDER BY created DESC,id DESC LIMIT 9",
+    )?;
+    Ok(query
+        .query_map([key], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn dream_outputs(
+    memory: &Store,
+    tx: &rusqlite::Transaction<'_>,
+    scope: &Scope,
+    id: &str,
+    remaining: &mut usize,
+) -> Result<(Vec<crate::assistant_memory::Record>, bool)> {
+    let ids = {
+        let mut query = tx.prepare(
+            "SELECT record_id FROM maintenance_outputs WHERE job=? ORDER BY record_id LIMIT 17",
+        )?;
+        query
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut memories = Vec::new();
+    let mut omitted = ids.len() > 16;
+    for record_id in ids.into_iter().take(16) {
+        let Some(record) = memory.get_active(&record_id)? else {
+            omitted = true;
+            continue;
+        };
+        if !record.scope.permits(scope) {
+            omitted = true;
+            continue;
+        }
+        let bytes = serde_json::to_vec(&record)?.len();
+        if bytes > *remaining {
+            omitted = true;
+            continue;
+        }
+        *remaining -= bytes;
+        memories.push(record);
+    }
+    Ok((memories, omitted))
+}
+
 pub(crate) fn status(memory: &Store, scope: &Scope) -> Result<serde_json::Value> {
     initialize(memory)?;
     let key = scope_key(scope)?;
@@ -1066,6 +1165,93 @@ mod tests {
             status(&memory, &scope()).unwrap()["next_opportunity"],
             12600
         );
+    }
+
+    #[test]
+    fn dream_receipts_survive_return_without_resurrecting_forgotten_learning() {
+        let (temp, mut memory) = database();
+        initialize(&memory).unwrap();
+        for (sql, index) in [
+            (
+                "EXPLAIN QUERY PLAN SELECT id,purpose,state,created,epoch FROM maintenance_jobs WHERE scope='fixture' ORDER BY created DESC,id DESC LIMIT 9",
+                "maintenance_jobs_recent_scope",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT record_id FROM maintenance_outputs WHERE job='fixture' ORDER BY record_id LIMIT 17",
+                "maintenance_outputs_job",
+            ),
+        ] {
+            let mut query = memory.connection.prepare(sql).unwrap();
+            let plan = query
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("\n");
+            assert!(plan.contains(index), "{plan}");
+            assert!(
+                !plan.contains("SCAN ") && !plan.contains("TEMP B-TREE"),
+                "{plan}"
+            );
+        }
+        assert!(
+            dreams(&memory, &scope()).unwrap()["runs"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let source = input(&mut memory, "Defer rollout until the audit is reviewed", 1);
+        configure(&mut memory, &scope(), 3600, true, 2).unwrap();
+        let assignment = prepare(&mut memory, &scope(), 3).unwrap().unwrap();
+        claim(&mut memory, &assignment, 3).unwrap();
+        let pending = dreams(&memory, &scope()).unwrap();
+        assert_ne!(pending["runs"][0]["state"], "completed");
+        assert!(
+            pending["runs"][0]["memories"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let output = serde_json::to_string(&Output {
+            purpose: assignment.purpose,
+            covered: assignment.selected.clone(),
+            learning: vec![LearningCandidate::Fact {
+                body: "Rollout is deliberately deferred pending audit review".into(),
+                sources: assignment.selected.clone(),
+            }],
+            workshop: vec![],
+        })
+        .unwrap();
+        checkpoint_result(&memory, &assignment.id, &output).unwrap();
+        commit(&mut memory, &assignment, &output, 4).unwrap();
+        drop(memory);
+        let mut memory = Store::open(temp.path().join("private/memory.sqlite")).unwrap();
+        let returned = dreams(&memory, &scope()).unwrap();
+        assert_eq!(returned["runs"][0]["state"], "completed");
+        assert_eq!(
+            returned["runs"][0]["memories"][0]["body"],
+            "Rollout is deliberately deferred pending audit review"
+        );
+        let other = Scope {
+            project: Some("other".into()),
+            ..Scope::default()
+        };
+        assert!(
+            dreams(&memory, &other).unwrap()["runs"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        memory.forget(&source).unwrap();
+        let forgotten = dreams(&memory, &scope()).unwrap();
+        assert_eq!(forgotten["runs"][0]["prior_memory_generation"], true);
+        assert!(
+            forgotten["runs"][0]["memories"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!forgotten.to_string().contains("Rollout is deliberately"));
     }
 
     #[test]

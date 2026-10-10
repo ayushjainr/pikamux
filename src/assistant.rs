@@ -111,6 +111,9 @@ enum Request {
     NativeReflection {
         scope: String,
     },
+    NativeDreams {
+        scope: String,
+    },
     NativeFreshContext {
         scope: String,
         request_id: String,
@@ -1141,7 +1144,7 @@ fn native_simple_control(
     action: &str,
 ) -> Result<String> {
     let notice = match action.trim() {
-        "status" => native_status_notice(root, control, name)?,
+        "status" => native_status_notice(root, memory, control, name)?,
         "pause" => {
             control.pause()?;
             "Pika paused. Project agents were not stopped.".into()
@@ -1176,7 +1179,7 @@ fn native_simple_control(
             "Pika background reasoning disabled. Project agents were not stopped.".into()
         }
         _ => bail!(
-            "Supported Pika controls: status, pause, resume, reflect, maintenance-off, background-off"
+            "Supported Pika controls: status, pause, resume, reflect, maintenance-enable CALLS [INTERVAL_HOURS], maintenance-off, background-off"
         ),
     };
     Ok(notice)
@@ -1184,13 +1187,31 @@ fn native_simple_control(
 
 fn native_status_notice(
     root: &Path,
+    memory: &Store,
     control: &crate::assistant_control::Controller,
     name: &str,
 ) -> Result<String> {
     let state = control.snapshot(name)?;
     let turns = crate::assistant_native_turns::snapshot(root, name)?;
+    let maintenance = crate::assistant_maintenance::status(memory, &scope(name)?)?;
+    let dream_status = if maintenance["enabled"] != true {
+        "off".to_owned()
+    } else {
+        let admitted = control
+            .maintenance_permission(timestamp(), false)?
+            .is_some_and(|permission| permission.scope == scope(name).unwrap_or_default());
+        format!(
+            "configured; review cadence {} hours; {}",
+            maintenance["interval_seconds"].as_u64().unwrap_or(0) / 3600,
+            if admitted {
+                "maintenance permission available; execution still depends on evidence, cadence and shared budget"
+            } else {
+                "not currently admitted (pause, foreground work, recovery or allowance may prevent it)"
+            }
+        )
+    };
     Ok(format!(
-        "Pika {}. Board sharing: {}. Latest native turn: {}. Native model-call count is unknown.",
+        "Pika {}. Board sharing: {}. Latest native turn: {}. Dreams: {}. Background allowance state: {}. Native model-call count is unknown. Dream results require completed receipts, not just enablement.",
         if state["paused"] == true {
             "paused"
         } else {
@@ -1201,7 +1222,9 @@ fn native_status_notice(
         } else {
             "disabled"
         },
-        turns["latest_turn"]["state"].as_str().unwrap_or("none")
+        turns["latest_turn"]["state"].as_str().unwrap_or("none"),
+        dream_status,
+        state["background"]["state"].as_str().unwrap_or("unknown")
     ))
 }
 
@@ -1244,6 +1267,9 @@ fn handle_native_request(
                 crate::assistant_maintenance::Purpose::Reflection,
             )?;
             json!({"signaled":true,"paid_foreground_call":false,"notice":"Reflection opportunity queued under existing maintenance permissions; no foreground model turn was started."})
+        }
+        Request::NativeDreams { scope: name } => {
+            crate::assistant_maintenance::dreams(memory, &scope(name)?)?
         }
         Request::NativeState { scope: name } => native_state(memory, control, name)?,
         Request::NativeLearning {
@@ -4520,6 +4546,30 @@ mod tests {
         let mut memory = Store::open(root.join("memory.sqlite")).unwrap();
         let mut control = crate::assistant_control::Controller::open(&root).unwrap();
         let mut session = crate::assistant_session::Session::new();
+        assert!(
+            native_status_notice(&root, &memory, &control, "personal")
+                .unwrap()
+                .contains("Dreams: off")
+        );
+        crate::assistant_maintenance::configure(
+            &mut memory,
+            &scope("personal").unwrap(),
+            7200,
+            true,
+            1,
+        )
+        .unwrap();
+        let dream_status = native_status_notice(&root, &memory, &control, "personal").unwrap();
+        assert!(dream_status.contains("review cadence 2 hours"));
+        assert!(dream_status.contains("not currently admitted"));
+        crate::assistant_maintenance::configure(
+            &mut memory,
+            &scope("personal").unwrap(),
+            7200,
+            false,
+            1,
+        )
+        .unwrap();
         let command = |body: &str| Request::NativePrompt {
             scope: "personal".into(),
             request_id: uuid::Uuid::new_v4().to_string(),

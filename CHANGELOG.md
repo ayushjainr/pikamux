@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.51 — Verify persistent learning and repair dreams
+
+- Expose bounded, source-linked dream receipts without starting maintenance or
+  resurfacing forgotten output.
+- Keep maintenance workers tool-free when sharing the private assistant login,
+  and give consolidation only the candidate types it is permitted to save.
+- Explain existing dream enablement, cadence and finite background allowance;
+  retain bounded worker failure diagnostics.
+- Verify native conversation learning, consolidation, fresh-context recall,
+  correction and forgetting with an explicitly approved isolated live trial.
+
+Updating does not enable paid maintenance, restart running conversations, install
+an iPhone app, or merge assistant profiles between machines.
+
 ## 0.6.50 — Acknowledge phone reads and explain assistant recovery
 
 - Clear only the unchanged READY unread event after the phone successfully loads

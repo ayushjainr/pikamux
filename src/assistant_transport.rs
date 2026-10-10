@@ -364,6 +364,24 @@ fn spawn_provider(config: &TransportConfig) -> Result<Child, TransportError> {
     for flag in DISABLE_FLAGS {
         command.arg(flag);
     }
+    // The native assistant and its memory-only workers share the owner's
+    // explicitly provisioned login. Disable that home's Pika MCP for workers;
+    // an empty-table override merges rather than removes native TOML entries.
+    // Other configured servers remain fail-closed at effective verification.
+    let path = config.codex_home.join("config.toml");
+    if path.exists() {
+        let content = fs::read_to_string(&path)?;
+        let document: toml_edit::DocumentMut = content.parse().map_err(|_| {
+            TransportError::Isolation("invalid private provider configuration".into())
+        })?;
+        if document
+            .get("mcp_servers")
+            .and_then(|servers| servers.get("pika"))
+            .is_some()
+        {
+            command.args(["-c", "mcp_servers.pika.enabled=false"]);
+        }
+    }
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -520,7 +538,10 @@ fn verify_effective_config(value: &Value) -> Result<(), TransportError> {
     if effective
         .get("mcp_servers")
         .and_then(Value::as_object)
-        .is_none_or(|o| !o.is_empty())
+        .is_none_or(|o| {
+            o.values()
+                .any(|server| server.get("enabled") != Some(&Value::Bool(false)))
+        })
     {
         return Err(TransportError::Isolation(
             "effective config omitted or enables MCP servers".into(),
@@ -1060,6 +1081,13 @@ mod tests {
         });
         let effective = json!({ "config": effective });
         assert!(verify_effective_config(&effective).is_ok());
+        let mut disabled = effective.clone();
+        disabled["config"]["mcp_servers"] = json!({"pika":{"enabled":false}});
+        assert!(verify_effective_config(&disabled).is_ok());
+        for entry in [json!({"enabled":true}), json!({}), Value::Null] {
+            disabled["config"]["mcp_servers"]["pika"] = entry;
+            assert!(verify_effective_config(&disabled).is_err());
+        }
 
         let mut broadened = effective.clone();
         broadened["config"]["permissions"]["pika-assistant"]["filesystem"]["/tmp"] = json!("read");

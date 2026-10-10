@@ -422,6 +422,10 @@ fn poll_active(
             // Join is off the UI thread; transport requests and owned process
             // cleanup retain their existing bounded cancellation behavior.
             job.service.join();
+            let worker_error = snapshot.error.or_else(|| match &snapshot.result {
+                Some(TurnResult::Failed { text, .. }) => Some(text.clone()),
+                _ => None,
+            });
             let result = finish(
                 memory,
                 control,
@@ -429,7 +433,11 @@ fn poll_active(
                 snapshot.result.or(native_result(root, &job.root_id)?),
                 timestamp,
             );
-            let notice = result.err().map(|e| e.to_string());
+            let notice = result
+                .err()
+                .map(|e| e.to_string())
+                .or(worker_error)
+                .map(|message| message.chars().take(4096).collect::<String>());
             let mut status = domain::status(memory, &job.assignment.scope)?;
             status["state"] = json!("idle");
             status["last_error"] = json!(notice);

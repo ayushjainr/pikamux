@@ -222,6 +222,9 @@ fn saved_id(value: &Value) -> String {
 fn maintenance_controls_default_denied_due_reconsideration_and_inspection_are_local() {
     let fixture = Fixture::new();
     let mut host = fixture.start();
+    let dreams = host.request(json!({"operation":"native_dreams","scope":"alpha"}));
+    assert!(dreams["runs"].as_array().unwrap().is_empty());
+    assert_eq!(dreams["more_runs"], false);
     host.reject(json!({"operation":"maintenance","scope":"alpha","max_calls":1,"hours":1,"interval_hours":24}));
     let help = host.request(json!({"operation":"help"}));
     assert!(
