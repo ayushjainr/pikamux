@@ -888,7 +888,7 @@ fn outside_live_recovery_journey(answer: Option<&str>, replace_generation: bool)
         assert!(
             invocations
                 .lines()
-                .any(|line| line == &format!("resume {identity}")),
+                .any(|line| line == format!("resume {identity}")),
             "{invocations}"
         );
         let panes = board.tmux(&[
