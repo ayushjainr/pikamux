@@ -12,6 +12,9 @@ Pending launch entries are live only when current runtime evidence proves it.
 Cached, paused or failed observations do not retain a false live indicator.
 Diagnostics distinguish configured-but-old hooks from missing hooks.
 
+This release also updates rustls to 0.23.46 and rustls-webpki to 0.103.16,
+addressing five dependency advisories detected by the release security gate.
+
 Updating does not restart agents, remove history, rewrite hook configuration,
 or install an iPhone build. Hook rewiring is separately previewed and approved.
 

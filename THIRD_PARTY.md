@@ -108,9 +108,9 @@ Rust's Linux targets also link its self-contained musl libc. Complete musl-relat
 | `rustc-hash` | `2.1.3` | `Apache-2.0 OR MIT` | `6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d` | The Rust Project Developers | [crate](https://crates.io/crates/rustc-hash/2.1.3) | N-62c7a1e35f56, N-23f18e03dc49 |
 | `rustc_version` | `0.4.1` | `MIT OR Apache-2.0` | `cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92` | — | [crate](https://crates.io/crates/rustc_version/0.4.1) | N-a60eea817514, N-c9a75f18b9ab |
 | `rustix` | `1.1.4` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | `b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190` | Dan Gohman &lt;dev@sunfishcode.online&gt;; Jakub Konka &lt;kubkon@jakubkonka.com&gt; | [crate](https://crates.io/crates/rustix/1.1.4) | N-377c2e7c5325, N-a60eea817514, N-a6c48161a09a, N-23f18e03dc49 |
-| `rustls` | `0.23.45` | `Apache-2.0 OR ISC OR MIT` | `0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634` | — | [crate](https://crates.io/crates/rustls/0.23.45) | N-a60eea817514, N-7cfafc877ecc, N-709e3175b421 |
+| `rustls` | `0.23.46` | `Apache-2.0 OR ISC OR MIT` | `48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf` | — | [crate](https://crates.io/crates/rustls/0.23.46) | N-a60eea817514, N-7cfafc877ecc, N-709e3175b421 |
 | `rustls-pki-types` | `1.15.1` | `MIT OR Apache-2.0` | `2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96` | — | [crate](https://crates.io/crates/rustls-pki-types/1.15.1) | N-45fd05c4865e, N-9117d922e667 |
-| `rustls-webpki` | `0.103.15` | `ISC` | `f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2` | — | [crate](https://crates.io/crates/rustls-webpki/0.103.15) | N-5b698ca13897 |
+| `rustls-webpki` | `0.103.16` | `ISC` | `4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281` | — | [crate](https://crates.io/crates/rustls-webpki/0.103.16) | N-5b698ca13897 |
 | `same-file` | `1.0.6` | `Unlicense/MIT` | `93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502` | Andrew Gallant &lt;jamslam@gmail.com&gt; | [crate](https://crates.io/crates/same-file/1.0.6) | N-01c266bced4a, N-cb3c929a05e6 |
 | `scopeguard` | `1.2.0` | `MIT OR Apache-2.0` | `94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49` | bluss | [crate](https://crates.io/crates/scopeguard/1.2.0) | N-a60eea817514, N-fb77f0a9c53e |
 | `semver` | `1.0.28` | `MIT OR Apache-2.0` | `8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd` | David Tolnay &lt;dtolnay@gmail.com&gt; | [crate](https://crates.io/crates/semver/1.0.28) | N-62c7a1e35f56, N-23f18e03dc49 |
@@ -2923,7 +2923,7 @@ limitations under the License.
 
 SHA-256: `5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a`
 
-Used by: `rustls-webpki 0.103.15` (`LICENSE`)
+Used by: `rustls-webpki 0.103.16` (`LICENSE`)
 
 ````text
 Except as otherwise noted, this project is licensed under the following
@@ -3454,7 +3454,7 @@ SOFTWARE.
 
 SHA-256: `709e3175b4212f7b13aa93971c9f62ff8c69ec45ad8c6532a7e0c41d7a7d6f8c`
 
-Used by: `rustls 0.23.45` (`LICENSE-MIT`)
+Used by: `rustls 0.23.46` (`LICENSE-MIT`)
 
 ````text
 Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
@@ -11017,7 +11017,7 @@ DEALINGS IN THE SOFTWARE.
 
 SHA-256: `7cfafc877eccc46c0e346ccbaa5c51bb6b894d2b818e617d970211e232785ad4`
 
-Used by: `rustls 0.23.45` (`LICENSE-ISC`)
+Used by: `rustls 0.23.46` (`LICENSE-ISC`)
 
 ````text
 ISC License (ISC)
@@ -12106,7 +12106,7 @@ DEALINGS IN THE SOFTWARE.
 
 SHA-256: `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`
 
-Used by: `base64 0.22.1` (`LICENSE-APACHE`); `bitflags 2.13.2` (`LICENSE-APACHE`); `cc 1.4.5` (`LICENSE-APACHE`); `cexpr 0.6.0` (`LICENSE-APACHE`); `cfg-if 1.0.4` (`LICENSE-APACHE`); `either 1.18.0` (`LICENSE-APACHE`); `equivalent 1.0.2` (`LICENSE-APACHE`); `errno 0.3.14` (`LICENSE-APACHE`); `find-msvc-tools 0.1.12` (`LICENSE-APACHE`); `fs2 0.4.3` (`LICENSE-APACHE`); `glob 0.3.4` (`LICENSE-APACHE`); `hashbrown 0.15.5` (`LICENSE-APACHE`); `hashbrown 0.17.1` (`LICENSE-APACHE`); `heck 0.5.0` (`LICENSE-APACHE`); `httparse 1.10.1` (`LICENSE-APACHE`); `indexmap 2.14.2` (`LICENSE-APACHE`); `itertools 0.13.0` (`LICENSE-APACHE`); `linux-raw-sys 0.12.1` (`LICENSE-APACHE`); `lock_api 0.4.14` (`LICENSE-APACHE`); `log 0.4.34` (`LICENSE-APACHE`); `once_cell 1.21.4` (`LICENSE-APACHE`); `parking_lot 0.12.5` (`LICENSE-APACHE`); `parking_lot_core 0.9.12` (`LICENSE-APACHE`); `pkg-config 0.3.34` (`LICENSE-APACHE`); `regex 1.13.1` (`LICENSE-APACHE`); `regex-automata 0.4.18` (`LICENSE-APACHE`); `regex-syntax 0.8.11` (`LICENSE-APACHE`); `ring 0.17.14` (`src/polyfill/once_cell/LICENSE-APACHE`); `rustc_version 0.4.1` (`LICENSE-APACHE`); `rustix 1.1.4` (`LICENSE-APACHE`); `rustls 0.23.45` (`LICENSE-APACHE`); `scopeguard 1.2.0` (`LICENSE-APACHE`); `signal-hook 0.3.18` (`LICENSE-APACHE`); `signal-hook-mio 0.2.5` (`LICENSE-APACHE`); `signal-hook-registry 1.4.8` (`LICENSE-APACHE`); `smallvec 1.16.1` (`LICENSE-APACHE`); `tungstenite 0.30.0` (`LICENSE-APACHE`); `unicode-segmentation 1.13.3` (`LICENSE-APACHE`); `unicode-width 0.2.2` (`LICENSE-APACHE`); `uuid 1.26.1` (`LICENSE-APACHE`); `vcpkg 0.2.15` (`LICENSE-APACHE`); `version_check 0.9.5` (`LICENSE-APACHE`); `yasna 0.6.0` (`LICENSE-APACHE`)
+Used by: `base64 0.22.1` (`LICENSE-APACHE`); `bitflags 2.13.2` (`LICENSE-APACHE`); `cc 1.4.5` (`LICENSE-APACHE`); `cexpr 0.6.0` (`LICENSE-APACHE`); `cfg-if 1.0.4` (`LICENSE-APACHE`); `either 1.18.0` (`LICENSE-APACHE`); `equivalent 1.0.2` (`LICENSE-APACHE`); `errno 0.3.14` (`LICENSE-APACHE`); `find-msvc-tools 0.1.12` (`LICENSE-APACHE`); `fs2 0.4.3` (`LICENSE-APACHE`); `glob 0.3.4` (`LICENSE-APACHE`); `hashbrown 0.15.5` (`LICENSE-APACHE`); `hashbrown 0.17.1` (`LICENSE-APACHE`); `heck 0.5.0` (`LICENSE-APACHE`); `httparse 1.10.1` (`LICENSE-APACHE`); `indexmap 2.14.2` (`LICENSE-APACHE`); `itertools 0.13.0` (`LICENSE-APACHE`); `linux-raw-sys 0.12.1` (`LICENSE-APACHE`); `lock_api 0.4.14` (`LICENSE-APACHE`); `log 0.4.34` (`LICENSE-APACHE`); `once_cell 1.21.4` (`LICENSE-APACHE`); `parking_lot 0.12.5` (`LICENSE-APACHE`); `parking_lot_core 0.9.12` (`LICENSE-APACHE`); `pkg-config 0.3.34` (`LICENSE-APACHE`); `regex 1.13.1` (`LICENSE-APACHE`); `regex-automata 0.4.18` (`LICENSE-APACHE`); `regex-syntax 0.8.11` (`LICENSE-APACHE`); `ring 0.17.14` (`src/polyfill/once_cell/LICENSE-APACHE`); `rustc_version 0.4.1` (`LICENSE-APACHE`); `rustix 1.1.4` (`LICENSE-APACHE`); `rustls 0.23.46` (`LICENSE-APACHE`); `scopeguard 1.2.0` (`LICENSE-APACHE`); `signal-hook 0.3.18` (`LICENSE-APACHE`); `signal-hook-mio 0.2.5` (`LICENSE-APACHE`); `signal-hook-registry 1.4.8` (`LICENSE-APACHE`); `smallvec 1.16.1` (`LICENSE-APACHE`); `tungstenite 0.30.0` (`LICENSE-APACHE`); `unicode-segmentation 1.13.3` (`LICENSE-APACHE`); `unicode-width 0.2.2` (`LICENSE-APACHE`); `uuid 1.26.1` (`LICENSE-APACHE`); `vcpkg 0.2.15` (`LICENSE-APACHE`); `version_check 0.9.5` (`LICENSE-APACHE`); `yasna 0.6.0` (`LICENSE-APACHE`)
 
 ````text
                               Apache License

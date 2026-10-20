@@ -715,16 +715,27 @@ fn install_native_reaps_archive_subprocess_groups_on_int_and_term() {
             .spawn()
             .unwrap();
         let mut process = ArchiveInstallChild { process };
-        let appeared = Instant::now() + Duration::from_secs(5);
-        let mut descendant = None;
-        while descendant.is_none() && Instant::now() < appeared {
-            descendant = fs::read_to_string(&descendant_pid)
+        // CI may be cold-starting the freshly built installer binary. Give it
+        // enough time to reach extraction, but fail early with the child's
+        // status if validation exits before the fake archive tool is invoked.
+        let appeared = Instant::now() + Duration::from_secs(30);
+        let descendant = loop {
+            let descendant = fs::read_to_string(&descendant_pid)
                 .ok()
                 .and_then(|pid| pid.trim().parse::<i32>().ok())
                 .filter(|pid| *pid > 0);
+            if let Some(descendant) = descendant {
+                break descendant;
+            }
+            if let Some(status) = process.process.try_wait().unwrap() {
+                panic!("installer exited before launching archive subprocess: {status}");
+            }
+            assert!(
+                Instant::now() < appeared,
+                "archive subprocess did not start within 30 seconds"
+            );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        let descendant = descendant.expect("archive subprocess never started");
+        };
         assert_eq!(
             unsafe { libc::kill(process.process.id() as i32, signal) },
             0

@@ -9,6 +9,8 @@
 - Require current runtime evidence before showing retained pending launches
   as live; discard that evidence when observation pauses or fails.
 - Distinguish old or incomplete hook wiring from absent configuration.
+- Update rustls and rustls-webpki to patched compatible releases required by
+  the dependency security audit.
 
 Updating preserves saved conversations and does not restart running agents.
 Hook rewiring remains a separate operation. Shared provider infrastructure is
