@@ -123,6 +123,26 @@ fn install_package(bundle: &Path, root: &Path, bin: &Path) -> pikamux::update::I
     .unwrap()
 }
 
+struct ArchiveInstallChild {
+    process: std::process::Child,
+}
+
+impl Drop for ArchiveInstallChild {
+    fn drop(&mut self) {
+        if matches!(self.process.try_wait(), Ok(None)) {
+            unsafe { libc::kill(self.process.id() as i32, libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while matches!(self.process.try_wait(), Ok(None)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if matches!(self.process.try_wait(), Ok(None)) {
+                let _ = self.process.kill();
+            }
+            let _ = self.process.wait();
+        }
+    }
+}
+
 fn replace_bundle_notices(bundle: &Path, license: &[u8], third_party: &[u8]) {
     let manifest_path = bundle.join("pika-native-release.json");
     let mut manifest = ReleaseManifest::parse(&fs::read(&manifest_path).unwrap()).unwrap();
@@ -631,7 +651,21 @@ fn install_native_reaps_archive_subprocess_groups_on_int_and_term() {
         let version = env!("CARGO_PKG_VERSION");
         let artifact_name = artifact_name(version, target).unwrap();
         let artifact = temp.path().join(&artifact_name);
-        fs::write(&artifact, b"checksum-bound archive fixture\n").unwrap();
+        let payload = temp.path().join("payload");
+        fs::create_dir(&payload).unwrap();
+        let executable = Path::new(env!("CARGO_BIN_EXE_pika"));
+        fs::copy(executable, payload.join("pika")).unwrap();
+        fs::copy("LICENSE", payload.join("LICENSE")).unwrap();
+        fs::copy("THIRD_PARTY.md", payload.join("THIRD_PARTY.md")).unwrap();
+        let archived = Command::new("python3")
+            .arg("scripts/archive-release.py")
+            .arg("tar.gz")
+            .arg(&payload)
+            .arg(payload.join("pika"))
+            .arg(&artifact)
+            .status()
+            .unwrap();
+        assert!(archived.success());
         let checksum = sha256_file(&artifact).unwrap();
         let manifest = ReleaseManifest {
             schema: 2,
@@ -661,8 +695,7 @@ fn install_native_reaps_archive_subprocess_groups_on_int_and_term() {
         .unwrap();
         fs::set_permissions(&fake_tar, fs::Permissions::from_mode(0o700)).unwrap();
         let path = format!("{}:/usr/bin:/bin", fake_bin.display());
-        let executable = Path::new(env!("CARGO_BIN_EXE_pika"));
-        let mut process = Command::new(executable)
+        let process = Command::new(executable)
             .arg("_install-native")
             .arg("--manifest")
             .arg(&manifest_path)
@@ -681,18 +714,22 @@ fn install_native_reaps_archive_subprocess_groups_on_int_and_term() {
             .env("PIKA_TEST_ARCHIVE_DESCENDANT", &descendant_pid)
             .spawn()
             .unwrap();
+        let mut process = ArchiveInstallChild { process };
         let appeared = Instant::now() + Duration::from_secs(5);
-        while !descendant_pid.exists() && Instant::now() < appeared {
+        let mut descendant = None;
+        while descendant.is_none() && Instant::now() < appeared {
+            descendant = fs::read_to_string(&descendant_pid)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+                .filter(|pid| *pid > 0);
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(descendant_pid.exists(), "archive subprocess never started");
-        let descendant: i32 = fs::read_to_string(&descendant_pid)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert_eq!(unsafe { libc::kill(process.id() as i32, signal) }, 0);
-        let status = process.wait().unwrap();
+        let descendant = descendant.expect("archive subprocess never started");
+        assert_eq!(
+            unsafe { libc::kill(process.process.id() as i32, signal) },
+            0
+        );
+        let status = process.process.wait().unwrap();
         assert_eq!(status.code(), Some(expected_code), "{status}");
 
         let reaped = Instant::now() + Duration::from_secs(3);

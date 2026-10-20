@@ -2,11 +2,11 @@
 
 use pikamux::{
     config::Config,
-    core::{OpenTarget, Pika},
+    core::{OpenError, OpenTarget, Pika},
     model::{Provider, Session, Status},
     paths::Paths,
     process,
-    store::Store,
+    store::{LiveOwner, Store},
     tmux::{ReceiptDelivery, Tmux},
 };
 use std::{
@@ -15,7 +15,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     process::{Child, Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 struct IsolatedTmux(String);
@@ -60,6 +60,15 @@ impl Drop for RecordedAttach {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+struct RunningChild(Child);
+
+impl Drop for RunningChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -166,6 +175,26 @@ fn fake_provider_at(root: &std::path::Path, socket: &str, executable: &std::path
         ..Config::default()
     };
     config.alerts = "none".into();
+    Pika::with_components(
+        paths,
+        config,
+        store,
+        Tmux::with_executable("tmux", Some(socket.to_owned())),
+    )
+}
+
+fn fake_codex_at(root: &std::path::Path, socket: &str, executable: &std::path::Path) -> Pika {
+    let paths = paths(root);
+    let store = Store::from_paths(&paths);
+    store.initialize().unwrap();
+    let config = Config {
+        provider_executables: BTreeMap::from([(
+            "codex".to_owned(),
+            executable.to_string_lossy().into_owned(),
+        )]),
+        alerts: "none".into(),
+        ..Config::default()
+    };
     Pika::with_components(
         paths,
         config,
@@ -1299,5 +1328,402 @@ fn real_isolated_tmux_resumes_all_providers_and_reuses_each_exact_home() {
     assert_eq!(
         resumed.cwd.as_deref(),
         Some(std::env::current_dir().unwrap().to_str().unwrap())
+    );
+}
+
+#[test]
+fn real_isolated_tmux_reclaims_absent_resume_generation_and_resumes_the_same_uuid_once() {
+    require_tmux();
+    let temp = tempfile::tempdir().unwrap();
+    let socket = format!("pika-stale-resume-{}", uuid::Uuid::new_v4());
+    let _guard = IsolatedTmux(socket.clone());
+    let provider = temp.path().join("codex");
+    let launches = temp.path().join("resume-identities");
+    fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = resume ]; then printf '%s\\n' \"$2\" >> {}; printf 'fake codex ready\\n'; while :; do sleep 1; done; fi\nif [ \"$1\" = app-server ]; then while :; do sleep 1; done; fi\nexit 64\n",
+            shell_words::quote(launches.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let pika = fake_codex_at(temp.path(), &socket, &provider);
+    let identity = "a3c6c6af-c814-4f65-b3d1-203a24ad35c1";
+    let session = saved(Provider::Codex, identity, "stale-resume", temp.path());
+    pika.store.upsert_session(&session, false).unwrap();
+    pika.store
+        .reserve_resume(
+            Provider::Codex,
+            identity,
+            "dead-resume-owner",
+            2_000_000_000,
+            1,
+        )
+        .unwrap();
+
+    let receipt = pika.open_session(session, false).unwrap();
+    assert_eq!(receipt.kind, "RESUMED EXACT");
+    let OpenTarget::Session(resumed) = receipt.target else {
+        panic!("exact resume did not return the selected conversation")
+    };
+    assert_eq!(resumed.provider, Provider::Codex);
+    assert_eq!(resumed.session_id, identity);
+    assert_eq!(
+        fs::read_to_string(&launches)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [identity],
+        "the exact UUID must be resumed once"
+    );
+    let pane = pika
+        .tmux
+        .get_pane(resumed.tmux_pane.as_deref().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(pane.pika_provider, Some(Provider::Codex));
+    assert_eq!(pane.pika_session_id.as_deref(), Some(identity));
+    assert!(
+        pika.store
+            .get_resume_reservation(Provider::Codex, identity)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn real_isolated_tmux_refuses_stale_lock_recovery_when_exact_shared_owner_lease_is_live() {
+    require_tmux();
+    let temp = tempfile::tempdir().unwrap();
+    let socket = format!("pika-live-resume-owner-{}", uuid::Uuid::new_v4());
+    let _guard = IsolatedTmux(socket.clone());
+    let provider = temp.path().join("codex");
+    let launches = temp.path().join("resume-identities");
+    fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = resume ]; then printf '%s\\n' \"$2\" >> {}; while :; do sleep 1; done; fi\nif [ \"$1\" = app-server ]; then while :; do sleep 1; done; fi\nexit 64\n",
+            shell_words::quote(launches.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let pika = fake_codex_at(temp.path(), &socket, &provider);
+    let identity = "b4d7d7bf-d925-40a6-ae2d-314b35be46d2";
+    let session = saved(Provider::Codex, identity, "live-shared-resume", temp.path());
+    pika.store.upsert_session(&session, false).unwrap();
+    pika.store
+        .reserve_resume(
+            Provider::Codex,
+            identity,
+            "dead-resume-owner",
+            2_000_000_001,
+            1,
+        )
+        .unwrap();
+    let owner = Command::new(&provider)
+        .arg("app-server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let owner_pid = i64::from(owner.id());
+    let owner_start = process::process_start_time(owner_pid).unwrap() as i64;
+    let mut owner = RunningChild(owner);
+    pika.store
+        .set_live_owner(&LiveOwner {
+            provider: Provider::Codex,
+            session_id: identity.into(),
+            pid: owner_pid,
+            start_time: Some(owner_start),
+            owner_token: "live-shared-codex-owner".into(),
+            last_seen: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+        })
+        .unwrap();
+
+    let error = pika.open_session(session.clone(), false).unwrap_err();
+    let recovery = match error.downcast_ref::<OpenError>() {
+        Some(OpenError::SharedOwnerConfirmation(recovery)) => recovery.clone(),
+        other => panic!("expected explicit shared-owner confirmation, got {other:?}: {error}"),
+    };
+    let before = pika.store.live_owners(Provider::Codex, identity).unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].owner_token, "live-shared-codex-owner");
+    assert_eq!(
+        pika.store
+            .get_resume_reservation(Provider::Codex, identity)
+            .unwrap()
+            .unwrap()
+            .token,
+        "dead-resume-owner",
+        "without explicit confirmation, the reservation is unchanged"
+    );
+    assert!(
+        !launches.exists(),
+        "the fake Codex resume command must not have executed"
+    );
+    assert!(owner.0.try_wait().unwrap().is_none());
+
+    // Simulate another owner refresh landing after the confirmation prompt.
+    // Its changed lease version invalidates the opaque recovery snapshot.
+    let mut changed = before[0].clone();
+    changed.last_seen = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        + 1.0;
+    pika.store.set_live_owner(&changed).unwrap();
+    let error = pika
+        .resume_after_shared_owner_confirmation(session, recovery, false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("shared-owner"), "{error}");
+    assert_eq!(
+        pika.store.live_owners(Provider::Codex, identity).unwrap()[0],
+        changed
+    );
+    assert!(!launches.exists());
+}
+
+#[test]
+fn real_isolated_tmux_confirmed_shared_lease_recovery_resumes_same_uuid_without_stopping_daemon() {
+    require_tmux();
+    let temp = tempfile::tempdir().unwrap();
+    let socket = format!("pika-confirm-shared-owner-{}", uuid::Uuid::new_v4());
+    let _guard = IsolatedTmux(socket.clone());
+    let provider = temp.path().join("codex");
+    let launches = temp.path().join("resume-identities");
+    fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = resume ]; then printf '%s\\n' \"$2\" >> {}; printf 'fake codex ready\\n'; while :; do sleep 1; done; fi\nif [ \"$1\" = app-server ]; then while :; do sleep 1; done; fi\nexit 64\n",
+            shell_words::quote(launches.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let pika = fake_codex_at(temp.path(), &socket, &provider);
+    let identity = "c5e8e8cf-e036-41b7-bc3d-425c46cf57e3";
+    let session = saved(
+        Provider::Codex,
+        identity,
+        "confirmed-shared-owner",
+        temp.path(),
+    );
+    pika.store.upsert_session(&session, false).unwrap();
+    pika.store
+        .reserve_resume(
+            Provider::Codex,
+            identity,
+            "dead-resume-owner",
+            2_000_000_002,
+            1,
+        )
+        .unwrap();
+    let child = Command::new(&provider)
+        .arg("app-server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let owner_pid = i64::from(child.id());
+    let owner_start = process::process_start_time(owner_pid).unwrap() as i64;
+    let mut owner = RunningChild(child);
+    let owner_seen = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    pika.store
+        .set_live_owner(&LiveOwner {
+            provider: Provider::Codex,
+            session_id: identity.into(),
+            pid: owner_pid,
+            start_time: Some(owner_start),
+            owner_token: "live-shared-codex-owner".into(),
+            last_seen: owner_seen,
+        })
+        .unwrap();
+
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-s",
+                "pika-c-retained-idle-shell",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let idle = pika
+        .tmux
+        .get_pane("pika-c-retained-idle-shell")
+        .unwrap()
+        .unwrap();
+    pika.tmux
+        .tag_pane_if_unchanged(
+            &idle,
+            Some(Provider::Codex),
+            Some(identity),
+            Some("confirmed-shared-owner"),
+            Some("retained-idle-pane"),
+        )
+        .unwrap();
+    let idle = pika.tmux.get_pane(&idle.pane_id).unwrap().unwrap();
+
+    let error = pika.open_session(session.clone(), false).unwrap_err();
+    let recovery = match error.downcast_ref::<OpenError>() {
+        Some(OpenError::SharedOwnerConfirmation(recovery)) => recovery.clone(),
+        other => panic!("expected explicit shared-owner confirmation, got {other:?}: {error}"),
+    };
+    assert!(!launches.exists());
+
+    let receipt = pika
+        .resume_after_shared_owner_confirmation(session, recovery, false)
+        .unwrap();
+    let OpenTarget::Session(resumed) = receipt.target else {
+        panic!("confirmation recovery lost the exact selected session")
+    };
+    assert_eq!(receipt.kind, "RESUMED EXACT");
+    assert_eq!(resumed.provider, Provider::Codex);
+    assert_eq!(resumed.session_id, identity);
+    assert_ne!(
+        resumed.tmux_pane.as_deref(),
+        Some(idle.pane_id.as_str()),
+        "resume allocates a fresh holder and does not respawn the retained idle pane"
+    );
+    let idle_after = pika.tmux.get_pane(&idle.pane_id).unwrap().unwrap();
+    assert_eq!(idle_after.pane_pid, idle.pane_pid);
+    assert_eq!(idle_after.pika_session_id.as_deref(), Some(identity));
+    assert_eq!(
+        fs::read_to_string(&launches)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [identity],
+        "confirmed recovery resumes the exact UUID once"
+    );
+    assert!(
+        owner.0.try_wait().unwrap().is_none(),
+        "shared daemon was stopped"
+    );
+    assert!(
+        pika.store
+            .live_owners(Provider::Codex, identity)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        pika.store
+            .get_resume_reservation(Provider::Codex, identity)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn real_isolated_tmux_busy_tagged_pane_blocks_shared_owner_recovery() {
+    require_tmux();
+    let temp = tempfile::tempdir().unwrap();
+    let socket = format!("pika-busy-shared-owner-{}", uuid::Uuid::new_v4());
+    let _guard = IsolatedTmux(socket.clone());
+    let provider = temp.path().join("codex");
+    let launches = temp.path().join("resume-identities");
+    fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = resume ]; then printf '%s\\n' \"$2\" >> {}; while :; do sleep 1; done; fi\nif [ \"$1\" = app-server ]; then while :; do sleep 1; done; fi\nexit 64\n",
+            shell_words::quote(launches.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let pika = fake_codex_at(temp.path(), &socket, &provider);
+    let identity = "d6f9f9df-f147-42c8-8d4e-536d57d068f4";
+    let session = saved(Provider::Codex, identity, "busy-shared-owner", temp.path());
+    pika.store.upsert_session(&session, false).unwrap();
+    pika.store
+        .reserve_resume(
+            Provider::Codex,
+            identity,
+            "dead-resume-owner",
+            2_000_000_003,
+            1,
+        )
+        .unwrap();
+    let child = Command::new(&provider)
+        .arg("app-server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let owner_pid = i64::from(child.id());
+    let owner_start = process::process_start_time(owner_pid).unwrap() as i64;
+    let _owner = RunningChild(child);
+    pika.store
+        .set_live_owner(&LiveOwner {
+            provider: Provider::Codex,
+            session_id: identity.into(),
+            pid: owner_pid,
+            start_time: Some(owner_start),
+            owner_token: "live-shared-codex-owner".into(),
+            last_seen: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+        })
+        .unwrap();
+
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-s",
+                "pika-c-busy-exact-pane",
+                "sleep 30",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let pane = pika
+        .tmux
+        .get_pane("pika-c-busy-exact-pane")
+        .unwrap()
+        .unwrap();
+    pika.tmux
+        .tag_pane_if_unchanged(
+            &pane,
+            Some(Provider::Codex),
+            Some(identity),
+            Some("busy-shared-owner"),
+            Some("busy-exact-pane"),
+        )
+        .unwrap();
+
+    let error = pika.open_session(session, false).unwrap_err();
+    assert!(
+        !matches!(
+            error.downcast_ref::<OpenError>(),
+            Some(OpenError::SharedOwnerConfirmation(_))
+        ),
+        "a live tagged exact pane must not offer shared-lease recovery: {error}"
+    );
+    assert!(
+        !launches.exists(),
+        "busy pane must not trigger a second provider"
     );
 }

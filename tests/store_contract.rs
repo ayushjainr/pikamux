@@ -648,6 +648,132 @@ fn ownership_reservations_and_bindings_preserve_pid_generations() {
 }
 
 #[test]
+fn stale_resume_reclaim_compare_and_swap_preserves_replaced_or_modified_rows() {
+    let (_temp, store) = store_fixture();
+    assert!(
+        store
+            .reserve_resume(Provider::Codex, "thread", "stale", 100, 1_000)
+            .unwrap()
+    );
+    let observed = store
+        .get_resume_reservation(Provider::Codex, "thread")
+        .unwrap()
+        .unwrap();
+
+    let mut changed_token = observed.clone();
+    changed_token.token = "replacement".into();
+    assert!(
+        !store
+            .reclaim_resume_if_generation(&changed_token, "new", 200, 2_000)
+            .unwrap()
+    );
+    let mut changed_created = observed.clone();
+    changed_created.created_at += 1.0;
+    assert!(
+        !store
+            .reclaim_resume_if_generation(&changed_created, "new", 200, 2_000)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .get_resume_reservation(Provider::Codex, "thread")
+            .unwrap()
+            .unwrap()
+            .token,
+        "stale"
+    );
+    assert!(
+        store
+            .reclaim_resume_if_generation(&observed, "reclaimed", 200, 2_000)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .get_resume_reservation(Provider::Codex, "thread")
+            .unwrap()
+            .unwrap()
+            .token,
+        "reclaimed"
+    );
+
+    assert!(
+        store
+            .release_resume(Provider::Codex, "thread", "reclaimed")
+            .unwrap()
+    );
+    assert!(
+        store
+            .reserve_resume(Provider::Codex, "thread", "concurrent", 300, 3_000)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .reclaim_resume_if_generation(&observed, "new", 200, 2_000)
+            .unwrap()
+    );
+    let reservation = store
+        .get_resume_reservation(Provider::Codex, "thread")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reservation.token, "concurrent");
+    assert_eq!(reservation.owner_pid, Some(300));
+    assert_eq!(reservation.owner_start_time, Some(3_000));
+}
+
+#[test]
+fn confirmed_shared_owner_revoke_requires_the_complete_unchanged_lease_set() {
+    let (_temp, store) = store_fixture();
+    let owner = LiveOwner {
+        provider: Provider::Codex,
+        session_id: "shared-thread".into(),
+        pid: 100,
+        start_time: Some(1_000),
+        owner_token: "owner-a".into(),
+        last_seen: 10.0,
+    };
+    store.set_live_owner(&owner).unwrap();
+    let captured = store.live_owners(Provider::Codex, "shared-thread").unwrap();
+    assert_eq!(captured, [owner.clone()]);
+
+    let mut changed = captured.clone();
+    changed[0].last_seen = 11.0;
+    assert!(
+        !store
+            .revoke_live_owners_if_exact(Provider::Codex, "shared-thread", &changed)
+            .unwrap()
+    );
+    assert_eq!(
+        store.live_owners(Provider::Codex, "shared-thread").unwrap(),
+        captured
+    );
+
+    let mut concurrent = owner.clone();
+    concurrent.pid = 101;
+    concurrent.start_time = Some(1_001);
+    concurrent.owner_token = "owner-b".into();
+    store.set_live_owner(&concurrent).unwrap();
+    assert!(
+        !store
+            .revoke_live_owners_if_exact(Provider::Codex, "shared-thread", &captured)
+            .unwrap()
+    );
+    let complete = store.live_owners(Provider::Codex, "shared-thread").unwrap();
+    assert_eq!(complete.len(), 2);
+
+    assert!(
+        store
+            .revoke_live_owners_if_exact(Provider::Codex, "shared-thread", &complete)
+            .unwrap()
+    );
+    assert!(
+        store
+            .live_owners(Provider::Codex, "shared-thread")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn fleet_cache_and_hook_records_round_trip_strictly() {
     let (_temp, store) = store_fixture();
     let local = store.ensure_local_node_id().unwrap();

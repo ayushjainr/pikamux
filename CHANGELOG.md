@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.52 — Recover stale resumes and report live state accurately
+
+- Reclaim a resume reservation only after proving its recorded process
+  generation is gone, without replacing a concurrently changed reservation.
+- Offer explicit default-No recovery choices for exact dedicated clients and
+  stale shared-client ownership, explaining interruption and continuity.
+- Require current runtime evidence before showing retained pending launches
+  as live; discard that evidence when observation pauses or fails.
+- Distinguish old or incomplete hook wiring from absent configuration.
+
+Updating preserves saved conversations and does not restart running agents.
+Hook rewiring remains a separate operation. Shared provider infrastructure is
+never stopped by a single-conversation repair.
+
 ## 0.6.51 — Verify persistent learning and repair dreams
 
 - Expose bounded, source-linked dream receipts without starting maintenance or

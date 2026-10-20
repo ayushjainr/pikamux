@@ -8,7 +8,7 @@ use crate::{
     providers::Providers,
     resolve::{EvidenceState, NameCandidate, NameResolutionError, SelectionEvidence, resolve_name},
     status::{ProjectionFallback, project_status},
-    store::{PendingLaunch, ReconcileLedger, ReconcileSession, Store},
+    store::{LiveOwner, PendingLaunch, ReconcileLedger, ReconcileSession, Store},
     tmux::{ReceiptDelivery, Tmux},
 };
 use anyhow::{Context, Result, bail};
@@ -49,6 +49,10 @@ fn fresh_observation<T>(mut observe: impl FnMut() -> Result<T>) -> Result<T> {
 pub struct Inventory {
     pub sessions: Vec<Session>,
     pub pending: Vec<PendingLaunch>,
+    /// Pending launch tokens with independently observed provider processes in
+    /// their exact token-bound startup panes. Cached inventories leave this
+    /// empty because durable launch metadata is not live-process evidence.
+    pub pending_live: BTreeSet<String>,
 }
 
 struct ReconciledInventory {
@@ -130,11 +134,25 @@ pub enum OpenError {
     #[error("{0}")]
     OutsideLive(String),
     #[error(
+        "the exact conversation has active shared-provider ownership that requires confirmation"
+    )]
+    SharedOwnerConfirmation(SharedOwnerRecovery),
+    #[error(
         "Pika could not safely identify this conversation's existing terminal. Nothing was restarted and unread state is unchanged."
     )]
     IdentityUnproven,
     #[error("{0}")]
     Identity(String),
+}
+
+/// Opaque, exact lease snapshot for the documented confirmation-only recovery
+/// of shared provider infrastructure. It intentionally exposes no process IDs
+/// or lease tokens to presentation code.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SharedOwnerRecovery {
+    provider: Provider,
+    session_id: String,
+    owners: Vec<LiveOwner>,
 }
 
 #[derive(Clone)]
@@ -277,12 +295,80 @@ impl Pika {
         (self.process_observer)()
     }
 
+    /// Reserve one exact provider UUID, reclaiming an occupied slot only when
+    /// a complete process snapshot disproves the reservation's recorded PID
+    /// generation and the exact database row still wins the CAS.
+    fn reserve_resume_after_stale_proof(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        token: &str,
+        owner_pid: i64,
+        owner_start_time: i64,
+    ) -> Result<bool> {
+        if self
+            .store
+            .reserve_resume(provider, session_id, token, owner_pid, owner_start_time)?
+        {
+            return Ok(true);
+        }
+        let Some(observed) = self.store.get_resume_reservation(provider, session_id)? else {
+            return Ok(false);
+        };
+        let (Some(stale_pid), Some(stale_start_time)) =
+            (observed.owner_pid, observed.owner_start_time)
+        else {
+            // Older or malformed rows without a full generation are not
+            // evidence that the reservation owner has exited.
+            return Ok(false);
+        };
+        let observation = self.observe_processes();
+        let processes =
+            require_complete_processes(&observation, "verify a stale resume reservation")?;
+        let stale = processes
+            .get(&stale_pid)
+            .is_none_or(|record| u64::try_from(stale_start_time).ok() != Some(record.start_time));
+        if !stale {
+            return Ok(false);
+        }
+        self.store
+            .reclaim_resume_if_generation(&observed, token, owner_pid, owner_start_time)
+    }
+
+    /// An exact per-conversation live-owner lease can be the only evidence
+    /// connecting a shared provider daemon to its UUID. Never launch a second
+    /// client while that lease's process generation remains present.
+    fn active_resume_owner_pids(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        processes: &BTreeMap<i64, ProcessRecord>,
+    ) -> Result<Vec<i64>> {
+        let mut pids = self
+            .store
+            .live_owners(provider, session_id)?
+            .into_iter()
+            .filter_map(|owner| {
+                let record = processes.get(&owner.pid)?;
+                (record.provider() == Some(provider)
+                    && owner
+                        .start_time
+                        .is_none_or(|start| u64::try_from(start).ok() == Some(record.start_time)))
+                .then_some(owner.pid)
+            })
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        pids.dedup();
+        Ok(pids)
+    }
+
     /// Return the durable cache without scanning providers, processes, tmux, or SSH.
     /// This is the first-frame path for the board.
     pub fn cached_inventory(&self) -> Result<Inventory> {
         Ok(Inventory {
             sessions: self.store.list_sessions()?,
             pending: self.store.list_visible_pending()?,
+            pending_live: BTreeSet::new(),
         })
     }
 
@@ -603,10 +689,17 @@ impl Pika {
                 session.rss_kb = runtime.rss_kb;
             }
         }
+        let pending = self.store.list_visible_pending()?;
+        let pending_live = pending
+            .iter()
+            .filter(|pending| pending_runtime_live(pending, &panes, processes))
+            .map(|pending| pending.launch_token.clone())
+            .collect();
         Ok(ReconciledInventory {
             inventory: Inventory {
                 sessions,
-                pending: self.store.list_visible_pending()?,
+                pending,
+                pending_live,
             },
             candidates: candidate_map,
         })
@@ -1383,7 +1476,18 @@ impl Pika {
 
     /// Shared pending-state projection for the board, activity feed and CLI.
     pub fn pending_session(&self, pending: &PendingLaunch) -> Result<Session> {
-        let mut session = session_from_pending(pending);
+        self.pending_session_with_runtime(pending, false)
+    }
+
+    /// Project a pending recovery handle using only separately observed runtime
+    /// evidence. Cached inventory deliberately passes false: stored pane/PID
+    /// fields alone do not prove that a terminal or provider is still alive.
+    pub(crate) fn pending_session_with_runtime(
+        &self,
+        pending: &PendingLaunch,
+        runtime_live: bool,
+    ) -> Result<Session> {
+        let mut session = session_from_pending_with_runtime(pending, runtime_live);
         if let Some(exit) = self
             .store
             .get_pending_exit(&pending.launch_token)?
@@ -1395,13 +1499,131 @@ impl Pika {
             session.home_state = "startup-exited".into();
             session.attention_reason = Some("startup exited before confirmation".into());
             session.error = Some(format!(
-                "{} exited during startup (code {}). Enter reopens the existing terminal to inspect or finish the update. No second client was started; the conversation identity is still unconfirmed.",
+                "{} exited during startup (code {}). Enter checks the retained terminal if it still exists; no replacement client is started and the conversation identity remains unconfirmed.",
                 pending.provider, exit.code
             ));
             session.last_event_at = exit.observed_at;
             session.updated_at = exit.observed_at;
         }
         Ok(session)
+    }
+
+    fn capture_shared_owner_recovery(
+        &self,
+        session: &Session,
+    ) -> Result<Option<SharedOwnerRecovery>> {
+        let observation = self.observe_processes();
+        let processes =
+            require_complete_processes(&observation, "verify shared-provider recovery ownership")?;
+        let panes = self
+            .tmux
+            .list_panes()
+            .context("Pika refused shared-provider recovery because tmux could not be observed")?;
+        let identities = identity_strings(session);
+        if identities.iter().any(|identity| {
+            !process::find_session_processes(identity, session.provider, processes).is_empty()
+        }) {
+            return Ok(None);
+        }
+        // A provably idle shell is not an active conversation client. The
+        // resume path allocates a new holder and never respawns the old pane;
+        // a busy or unobserved exact tag remains a hard blocker.
+        if panes.iter().any(|pane| {
+            !pane.dead
+                && pane.pika_provider == Some(session.provider)
+                && pane
+                    .pika_session_id
+                    .as_deref()
+                    .is_some_and(|identity| identities.contains(&identity))
+                && !processes
+                    .get(&pane.pane_pid)
+                    .is_some_and(|root| process::observed_idle_shell(root, processes))
+        }) {
+            return Ok(None);
+        }
+        let owners = self
+            .store
+            .live_owners(session.provider, &session.session_id)?;
+        if owners.is_empty() {
+            return Ok(None);
+        }
+        let at = now();
+        let all_are_current_shared_owners = owners.iter().all(|owner| {
+            processes.get(&owner.pid).is_some_and(|record| {
+                record.provider() == Some(session.provider)
+                    && owner.start_time.and_then(|start| u64::try_from(start).ok())
+                        == Some(record.start_time)
+                    && process::shared_provider_process(record, session.provider)
+                    && at - owner.last_seen <= LIVE_OWNER_LEASE_SECONDS
+            })
+        });
+        if !all_are_current_shared_owners {
+            return Ok(None);
+        }
+        Ok(Some(SharedOwnerRecovery {
+            provider: session.provider,
+            session_id: session.session_id.clone(),
+            owners,
+        }))
+    }
+
+    fn shared_owner_open_error(&self, session: &Session) -> Result<Option<OpenError>> {
+        if !(session.live && session.home_state == "outside") {
+            return Ok(None);
+        }
+        if let Some(recovery) = self.capture_shared_owner_recovery(session)? {
+            return Ok(Some(OpenError::SharedOwnerConfirmation(recovery)));
+        }
+        let owners = self
+            .store
+            .live_owners(session.provider, &session.session_id)?
+            .into_iter()
+            .map(|owner| owner.pid.to_string())
+            .collect::<Vec<_>>();
+        let pids = if owners.is_empty() {
+            "unknown".into()
+        } else {
+            owners.join(", ")
+        };
+        let display_name = session.display_name();
+        Ok(Some(OpenError::OutsideLive(format!(
+            "{display_name} has live ownership outside its Pika home (PID {pids}). Required steps: 1) return to that terminal and exit {} normally; 2) run exactly: `pika {}`. Pika will resume the exact UUID.",
+            session.provider,
+            shell_words::quote(&display_name)
+        ))))
+    }
+
+    /// Continue only after an explicit user confirmation that every client
+    /// using the captured shared provider has exited. This never signals the
+    /// shared daemon; it revalidates process/tmux/lease evidence and atomically
+    /// revokes only the exact captured lease set before reopening the UUID.
+    pub fn resume_after_shared_owner_confirmation(
+        &self,
+        session: Session,
+        recovery: SharedOwnerRecovery,
+        attach: bool,
+    ) -> Result<OpenReceipt> {
+        if recovery.provider != session.provider || recovery.session_id != session.session_id {
+            bail!("shared-owner recovery snapshot does not match the selected exact identity")
+        }
+        let current = self.capture_shared_owner_recovery(&session)?.context(
+            "shared-owner state changed; no leases were revoked and no provider was started",
+        )?;
+        if current != recovery {
+            bail!(
+                "shared-owner lease or process generations changed; no leases were revoked and no provider was started"
+            )
+        }
+        if !self.store.revoke_live_owners_if_exact(
+            session.provider,
+            &session.session_id,
+            &recovery.owners,
+        )? {
+            bail!(
+                "shared-owner lease set changed; no leases were revoked and no provider was started"
+            )
+        }
+        self.open_session(session, attach)
     }
 
     pub fn open_session(&self, mut session: Session, attach: bool) -> Result<OpenReceipt> {
@@ -1494,25 +1716,8 @@ impl Pika {
             ))
             .into());
         }
-        if session.live && session.home_state == "outside" {
-            let owners = self
-                .store
-                .live_owners(session.provider, &session.session_id)?
-                .into_iter()
-                .map(|owner| owner.pid.to_string())
-                .collect::<Vec<_>>();
-            let pids = if owners.is_empty() {
-                "unknown".into()
-            } else {
-                owners.join(", ")
-            };
-            let display_name = session.display_name();
-            return Err(OpenError::OutsideLive(format!(
-                "{display_name} has live ownership outside its Pika home (PID {pids}). Required steps: 1) return to that terminal and exit {} normally; 2) run exactly: `pika {}`. Pika will resume the exact UUID.",
-                session.provider,
-                shell_words::quote(&display_name)
-            ))
-            .into());
+        if let Some(error) = self.shared_owner_open_error(&session)? {
+            return Err(error.into());
         }
         let availability =
             crate::experts::local_source_availability(&self.paths, &self.config, &session);
@@ -1823,6 +2028,97 @@ impl Pika {
         })
     }
 
+    fn inspect_initial_resume_ownership(
+        &self,
+        session: &Session,
+        identity: &str,
+        processes: &BTreeMap<i64, ProcessRecord>,
+        selected_event: f64,
+        token: &str,
+        attach: bool,
+    ) -> Result<(Vec<Pane>, Option<OpenReceipt>)> {
+        let active_owners =
+            self.active_resume_owner_pids(session.provider, &session.session_id, processes)?;
+        if !active_owners.is_empty() {
+            bail!(
+                "{} still has active provider ownership (PID {}). No second provider was launched.",
+                session.display_name(),
+                active_owners
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        let panes = self
+            .tmux
+            .list_panes()
+            .context("Pika refused to resume because tmux could not be observed")?;
+        let all_pane_pids = panes
+            .iter()
+            .flat_map(|pane| process::process_tree(pane.pane_pid, processes))
+            .collect::<BTreeSet<_>>();
+        let exact_pids = process::find_session_processes(identity, session.provider, processes);
+        let outside = exact_pids
+            .iter()
+            .filter(|pid| !all_pane_pids.contains(pid))
+            .copied()
+            .collect::<Vec<_>>();
+        if !outside.is_empty() {
+            bail!(
+                "{} started elsewhere while Pika was reserving its exact home (PID {}). No second provider was launched.",
+                session.display_name(),
+                outside
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        let existing = if exact_pids.is_empty() {
+            None
+        } else {
+            let binding = self.exact_pane_binding(session, None)?;
+            Some(self.attach_existing_reserved(session, &binding, selected_event, token, attach)?)
+        };
+        Ok((panes, existing))
+    }
+
+    fn ensure_resume_launch_unclaimed(
+        &self,
+        session: &Session,
+        identity: &str,
+        processes: &BTreeMap<i64, ProcessRecord>,
+        prepared: &Pane,
+    ) -> Result<()> {
+        let active_owners =
+            self.active_resume_owner_pids(session.provider, &session.session_id, processes)?;
+        if !active_owners.is_empty() {
+            bail!(
+                "{} acquired active provider ownership while Pika was preparing its home (PID {}). No second provider was launched.",
+                session.display_name(),
+                active_owners
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        let appeared = process::find_session_processes(identity, session.provider, processes);
+        if !appeared.is_empty() {
+            bail!(
+                "{} acquired another exact owner while Pika was preparing its home (PID {}). No second provider was launched.",
+                session.display_name(),
+                appeared
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        require_idle_pane(prepared, processes, true)
+    }
+
     fn resume_session(&self, mut session: Session, attach: bool) -> Result<OpenReceipt> {
         // History-only Claude records can legitimately omit cwd. Match the
         // pinned provider recovery contract by using this invocation's current
@@ -1839,7 +2135,7 @@ impl Pika {
         let owner_start = process::process_start_time(owner_pid)
             .and_then(|value| i64::try_from(value).ok())
             .context("Pika cannot pin its own launch reservation process generation")?;
-        if !self.store.reserve_resume(
+        if !self.reserve_resume_after_stale_proof(
             session.provider,
             &session.session_id,
             &token,
@@ -1867,54 +2163,29 @@ impl Pika {
             candidate_observed_at: None,
             created_at: now(),
         };
-        if !self.store.add_pending(&pending)? {
-            self.store
-                .release_resume(session.provider, &session.session_id, &token)?;
-            bail!(
-                "{} is already starting. Wait a moment, then run exactly: `pika {}`.",
-                session.display_name(),
-                shell_words::quote(&session.display_name())
-            )
-        }
         let result = (|| {
             let observation = self.observe_processes();
             let processes =
                 require_complete_processes(&observation, "start the exact provider process")?;
-            let panes = self
-                .tmux
-                .list_panes()
-                .context("Pika refused to resume because tmux could not be observed")?;
-            let all_pane_pids = panes
-                .iter()
-                .flat_map(|pane| process::process_tree(pane.pane_pid, processes))
-                .collect::<BTreeSet<_>>();
-            let exact_pids =
-                process::find_session_processes(&identity, session.provider, processes);
-            let outside = exact_pids
-                .iter()
-                .filter(|pid| !all_pane_pids.contains(pid))
-                .copied()
-                .collect::<Vec<_>>();
-            if !outside.is_empty() {
-                bail!(
-                    "{} started elsewhere while Pika was reserving its exact home (PID {}). No second provider was launched.",
-                    session.display_name(),
-                    outside
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
+            let (panes, existing) = self.inspect_initial_resume_ownership(
+                &session,
+                &identity,
+                processes,
+                selected_event,
+                &token,
+                attach,
+            )?;
+            if let Some(receipt) = existing {
+                return Ok(receipt);
             }
-            if !exact_pids.is_empty() {
-                let binding = self.exact_pane_binding(&session, None)?;
-                return self.attach_existing_reserved(
-                    &session,
-                    &binding,
-                    selected_event,
-                    &token,
-                    attach,
-                );
+            // Persist the recoverable launch intent only after complete owner
+            // checks prove that no existing conversation or lease was found.
+            if !self.store.add_pending(&pending)? {
+                bail!(
+                    "{} is already starting. Wait a moment, then run exactly: `pika {}`.",
+                    session.display_name(),
+                    shell_words::quote(&session.display_name())
+                )
             }
             let providers = Providers::new(&self.paths, &self.config);
             let argv = self.launch_argv(providers.resume_argv(session.provider, &identity));
@@ -1974,20 +2245,7 @@ impl Pika {
                 &ready_observation,
                 "execute the reserved provider launch",
             )?;
-            let appeared =
-                process::find_session_processes(&identity, session.provider, ready_processes);
-            if !appeared.is_empty() {
-                bail!(
-                    "{} acquired another exact owner while Pika was preparing its home (PID {}). No second provider was launched.",
-                    session.display_name(),
-                    appeared
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
-            require_idle_pane(&prepared, ready_processes, true)?;
+            self.ensure_resume_launch_unclaimed(&session, &identity, ready_processes, &prepared)?;
             let pane = self.tmux.start_prepared_agent(
                 &prepared,
                 cwd,
@@ -2471,6 +2729,10 @@ fn recover_confirmed_pending(
 }
 
 pub fn session_from_pending(pending: &PendingLaunch) -> Session {
+    session_from_pending_with_runtime(pending, false)
+}
+
+fn session_from_pending_with_runtime(pending: &PendingLaunch, runtime_live: bool) -> Session {
     // Age can prove that startup is overdue, never that a provider has stopped
     // or that a conversation identity is known. Keep the recovery row intact.
     let overdue = now() - pending.created_at > 120.0;
@@ -2492,13 +2754,22 @@ pub fn session_from_pending(pending: &PendingLaunch) -> Session {
         model: None,
         source: "pending-launch".into(),
         managed: true,
-        error: overdue.then(|| "Pika has not confirmed this launch. Enter checks its existing terminal; X hides this launch entry without stopping the agent.".into()),
+        error: overdue.then(|| {
+            let runtime_note = if runtime_live {
+                "A provider process is present in this launch's exact terminal, but its conversation identity remains unconfirmed."
+            } else {
+                "Pika has not independently verified a live provider process in this launch's exact terminal."
+            };
+            format!(
+                "Pika has not confirmed this launch. {runtime_note} Enter checks the retained terminal if it still exists; it never starts a replacement. X hides only this entry."
+            )
+        }),
         attention_reason: Some(if overdue { "launch not confirmed" } else { "starting provider conversation" }.into()),
         created_at: pending.created_at,
         updated_at: pending.created_at,
         last_event_at: pending.created_at,
         last_activity_at: pending.created_at,
-        live: pending.tmux_pane.is_some(),
+        live: runtime_live,
         attached: false,
         home_state: "starting".into(),
         cpu_percent: None,
@@ -2511,6 +2782,26 @@ pub fn session_from_pending(pending: &PendingLaunch) -> Session {
         estimated_cost_usd: None,
         active_thread_id: None,
     }
+}
+
+fn pending_runtime_live(
+    pending: &PendingLaunch,
+    panes: &[Pane],
+    processes: &BTreeMap<i64, ProcessRecord>,
+) -> bool {
+    let (Some(session_name), Some(pane_id)) = (
+        pending.tmux_session.as_deref(),
+        pending.tmux_pane.as_deref(),
+    ) else {
+        return false;
+    };
+    panes.iter().any(|pane| {
+        pane.session_name == session_name
+            && pane.pane_id == pane_id
+            && !pane.dead
+            && pane.pika_launch_token.as_deref() == Some(pending.launch_token.as_str())
+            && process::provider_process(pane.pane_pid, Some(pending.provider), processes).is_some()
+    })
 }
 
 fn continuation_candidate<'a>(
@@ -3197,6 +3488,73 @@ mod tests {
             candidate_observed_at: None,
             created_at: now(),
         }
+    }
+
+    #[test]
+    fn pending_projection_does_not_turn_persisted_pane_metadata_into_live_evidence() {
+        let mut pending = pending_fixture("pending-projection", Provider::Codex);
+        pending.created_at = 1.0;
+        let projected = session_from_pending(&pending);
+        assert!(!projected.live);
+        assert_eq!(projected.status, Status::Error);
+        assert!(projected.error.unwrap().contains("if it still exists"));
+
+        let pid = 42;
+        let mut pane = tagged_pane("unused");
+        pane.session_name = pending.tmux_session.clone().unwrap();
+        pane.pane_id = pending.tmux_pane.clone().unwrap();
+        pane.pane_pid = pid;
+        pane.pika_launch_token = Some(pending.launch_token.clone());
+        let processes = BTreeMap::from([(pid, record(pid, None, 7, &["codex", "--version"]))]);
+        assert!(pending_runtime_live(&pending, &[pane.clone()], &processes));
+
+        pane.pika_launch_token = Some("different-launch".into());
+        assert!(!pending_runtime_live(&pending, &[pane.clone()], &processes));
+        pane.pika_launch_token = Some(pending.launch_token.clone());
+        assert!(!pending_runtime_live(&pending, &[pane], &BTreeMap::new()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_projects_pending_liveness_from_its_existing_batch_observation() {
+        let (root, mut pika) = test_pika();
+        let pending = pending_fixture("batch-observed-pending", Provider::Codex);
+        let pid = 42;
+        let mut pane = tagged_pane("unconfirmed");
+        pane.session_name = pending.tmux_session.clone().unwrap();
+        pane.pane_id = pending.tmux_pane.clone().unwrap();
+        pane.pane_pid = pid;
+        pane.pika_launch_token = Some(pending.launch_token.clone());
+        pika.tmux = fixture_tmux(root.path(), &[pane]);
+        pika.process_observer = Arc::new(move || {
+            ProcessObservation::complete(BTreeMap::from([(
+                pid,
+                record(pid, None, 7, &["codex", "--version"]),
+            )]))
+        });
+        pika.store.add_pending(&pending).unwrap();
+
+        let inventory = pika.reconcile_local().unwrap();
+        assert_eq!(inventory.pending, vec![pending.clone()]);
+        assert!(inventory.pending_live.contains(&pending.launch_token));
+    }
+
+    #[test]
+    fn partial_process_observation_keeps_pending_launch_unresolved() {
+        let (_root, mut pika) = test_pika();
+        let pending = pending_fixture("incomplete-pending-evidence", Provider::Codex);
+        pika.store.add_pending(&pending).unwrap();
+        pika.process_observer = Arc::new(|| {
+            ProcessObservation::partial(BTreeMap::new(), vec!["PID 42: permission denied".into()])
+        });
+
+        let error = pika.reconcile_local().unwrap_err().to_string();
+        assert!(error.contains("process identity observation was partial"));
+        assert_eq!(
+            pika.store.get_pending(&pending.launch_token).unwrap(),
+            Some(pending)
+        );
+        assert!(pika.store.list_sessions().unwrap().is_empty());
     }
 
     #[cfg(unix)]
@@ -5318,6 +5676,125 @@ mod tests {
                 .get_resume_reservation(session.provider, &session.session_id)
                 .unwrap()
                 .is_none()
+        );
+        assert!(pika.store.list_pending().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_resume_lock_is_reclaimed_but_active_shared_owner_never_gets_a_second_client() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, mut pika) = test_pika();
+        let identity = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut session = test_session(identity);
+        session.cwd = Some(root.path().display().to_string());
+        let marker = root.path().join("provider-called");
+        let fake_provider = root.path().join("fake-codex");
+        std::fs::write(
+            &fake_provider,
+            format!(
+                "#!/bin/sh\nprintf called > {}\n",
+                shell_words::quote(&marker.display().to_string())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        pika.config
+            .provider_executables
+            .insert("codex".into(), fake_provider.display().to_string());
+
+        pika.store
+            .reserve_resume(Provider::Codex, identity, "dead-owner", 900_001, 1)
+            .unwrap();
+        pika.store
+            .set_live_owner(&LiveOwner {
+                provider: Provider::Codex,
+                session_id: identity.into(),
+                pid: 51,
+                start_time: Some(51),
+                owner_token: "active-shared-owner".into(),
+                last_seen: now(),
+            })
+            .unwrap();
+        pika.process_observer = Arc::new(|| {
+            ProcessObservation::complete(BTreeMap::from([(
+                51,
+                record(51, None, 51, &["codex", "app-server"]),
+            )]))
+        });
+
+        let error = pika.resume_session(session, false).unwrap_err().to_string();
+        assert!(error.contains("active provider ownership"), "{error}");
+        assert!(error.contains("No second provider was launched"), "{error}");
+        assert!(!marker.exists(), "fake provider must not have executed");
+        assert!(pika.store.list_pending().unwrap().is_empty());
+        assert!(
+            pika.store
+                .get_resume_reservation(Provider::Codex, identity)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn live_or_unknown_resume_reservation_is_not_reclaimed() {
+        let (_root, mut pika) = test_pika();
+        let identity = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let session = test_session(identity);
+        let owner_pid = i64::from(std::process::id());
+        let owner_start = i64::try_from(process::process_start_time(owner_pid).unwrap()).unwrap();
+        pika.store
+            .reserve_resume(
+                Provider::Codex,
+                identity,
+                "live-owner",
+                owner_pid,
+                owner_start,
+            )
+            .unwrap();
+        pika.process_observer = Arc::new(move || {
+            ProcessObservation::complete(BTreeMap::from([(
+                owner_pid,
+                record(owner_pid, None, owner_start as u64, &["pika"]),
+            )]))
+        });
+
+        let error = pika.resume_session(session, false).unwrap_err().to_string();
+        assert!(error.contains("already being resumed"), "{error}");
+        let reservation = pika
+            .store
+            .get_resume_reservation(Provider::Codex, identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reservation.token, "live-owner");
+        assert!(pika.store.list_pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn incomplete_process_snapshot_cannot_reclaim_resume_reservation() {
+        let (_root, mut pika) = test_pika();
+        let identity = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let session = test_session(identity);
+        pika.store
+            .reserve_resume(Provider::Codex, identity, "unknown-owner", 900_002, 2)
+            .unwrap();
+        pika.process_observer = Arc::new(|| {
+            ProcessObservation::partial(BTreeMap::new(), vec!["PID 900002: denied".into()])
+        });
+
+        let error = pika.resume_session(session, false).unwrap_err().to_string();
+        assert!(
+            error.contains("process identity observation was partial"),
+            "{error}"
+        );
+        assert_eq!(
+            pika.store
+                .get_resume_reservation(Provider::Codex, identity)
+                .unwrap()
+                .unwrap()
+                .token,
+            "unknown-owner"
         );
         assert!(pika.store.list_pending().unwrap().is_empty());
     }

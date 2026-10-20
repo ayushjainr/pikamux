@@ -1,3 +1,22 @@
+Pika 0.6.52 repairs stale resume reservations and makes retained launch state
+accurate. A dead reservation owner no longer causes an endless “already being
+resumed” message. Recovery checks process generations and concurrent state
+before reclaiming a reservation.
+
+Interactive repairs require explicit confirmation and preserve the selected
+conversation identity. A dedicated-client repair warns that an active turn may
+be interrupted; shared-server ownership recovery asks whether all clients for
+that conversation have exited, and never stops the shared server.
+
+Pending launch entries are live only when current runtime evidence proves it.
+Cached, paused or failed observations do not retain a false live indicator.
+Diagnostics distinguish configured-but-old hooks from missing hooks.
+
+Updating does not restart agents, remove history, rewrite hook configuration,
+or install an iPhone build. Hook rewiring is separately previewed and approved.
+
+Retained changes from 0.6.51:
+
 Pika 0.6.51 repairs the persistent assistant's dream maintenance and exposes
 bounded receipts for what it actually retained. Memory-only workers explicitly
 disable the interactive Pika MCP connection; consolidation receives only its

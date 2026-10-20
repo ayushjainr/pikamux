@@ -345,6 +345,65 @@ fn wait_matches_only_unread_ready_and_uses_timeout_code_124() {
 
 #[cfg(unix)]
 #[test]
+fn outside_live_open_explains_recovery_but_never_approves_it_without_a_tty() {
+    let (temp, mut command) = wait_command(true);
+    let session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let pid_file = temp.path().join("fake-provider.pid");
+    write_test_executable(
+        &temp.path().join("bin/codex"),
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > {}\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",
+            shell_words::quote(pid_file.to_str().unwrap())
+        ),
+    );
+    let mut fake_provider = std::process::Command::new(temp.path().join("bin/codex"))
+        .args(["--resume", session_id])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if pid_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(pid_file.exists(), "fake provider did not start");
+
+    let mut session = wait_session(true);
+    session.live = true;
+    session.home_state = "outside".into();
+    Store::at(temp.path().join("state/pika.db"))
+        .upsert_session(&session, true)
+        .unwrap();
+
+    let output = command.args(["open", "research_thread"]).output().unwrap();
+    fake_provider.kill().unwrap();
+    fake_provider.wait().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("already running outside"), "{stderr}");
+    assert!(
+        stderr.contains("Interactive choice is required"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("no process was stopped"), "{stderr}");
+    assert!(!stderr.contains("requesting a graceful stop"), "{stderr}");
+
+    let saved = Store::at(temp.path().join("state/pika.db"))
+        .get_session(Provider::Codex, session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.session_id, session_id);
+    assert!(
+        saved.unread,
+        "a refused open must not acknowledge the event"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn ask_selects_fast_by_default_and_deep_only_when_requested() {
     for (flags, expected_model, expected_mode, jsonl, stream) in [
         (vec![], "gpt-5.6-luna", "fast", false, false),

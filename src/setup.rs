@@ -88,6 +88,14 @@ pub struct ProviderCommissioning {
     pub overdue_launches: Vec<(String, f64)>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookConfigurationState {
+    Absent,
+    PresentButNotCurrent,
+    Unverifiable,
+    Current,
+}
+
 impl ProviderCommissioning {
     pub fn observed(&self) -> bool {
         self.observation
@@ -916,6 +924,77 @@ pub fn hooks_installed(home: &Path, provider: Provider, executable: &Path) -> bo
     })
 }
 
+/// Describe whether a Pika hook definition exists and whether it matches the
+/// current provider definition. This deliberately separates absence from a
+/// configured definition that is disabled, incomplete, or targets another
+/// executable. It does not treat configuration alone as observed evidence.
+pub fn hook_configuration_state(
+    home: &Path,
+    provider: Provider,
+    executable: &Path,
+) -> HookConfigurationState {
+    if provider == Provider::Opencode {
+        let path = home.join("plugins/pika.js");
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return HookConfigurationState::Absent;
+            }
+            Err(_) => return HookConfigurationState::Unverifiable,
+        };
+        return if hooks_installed(home, provider, executable) {
+            HookConfigurationState::Current
+        } else if content.contains("pika") {
+            HookConfigurationState::PresentButNotCurrent
+        } else {
+            HookConfigurationState::Absent
+        };
+    }
+
+    let path = match provider {
+        Provider::Codex => home.join("hooks.json"),
+        Provider::Claude | Provider::Muse => home.join("settings.json"),
+        Provider::Opencode => unreachable!(),
+    };
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return HookConfigurationState::Absent;
+        }
+        Err(_) => return HookConfigurationState::Unverifiable,
+    };
+    let value = match parse_object(&path, &content) {
+        Ok(value) => value,
+        Err(_) => return HookConfigurationState::Unverifiable,
+    };
+    let Some(hooks_value) = value.get("hooks") else {
+        return HookConfigurationState::Absent;
+    };
+    let Some(hooks) = hooks_value.as_object() else {
+        return HookConfigurationState::Unverifiable;
+    };
+    let mut has_pika_hooks = false;
+    for groups in hooks.values() {
+        let Some(groups) = groups.as_array() else {
+            return HookConfigurationState::Unverifiable;
+        };
+        for group in groups {
+            if !group.is_object() {
+                return HookConfigurationState::Unverifiable;
+            }
+            has_pika_hooks |= is_pika_group(group, provider);
+        }
+    }
+    if !has_pika_hooks {
+        return HookConfigurationState::Absent;
+    }
+    if hooks_installed(home, provider, executable) {
+        HookConfigurationState::Current
+    } else {
+        HookConfigurationState::PresentButNotCurrent
+    }
+}
+
 pub fn codex_hooks_enabled(home: &Path) -> bool {
     let path = home.join("config.toml");
     let Ok(content) = fs::read_to_string(path) else {
@@ -1406,5 +1485,54 @@ mod muse_tests {
         )
         .unwrap();
         assert!(!hooks_installed(&home, Provider::Muse, &executable));
+    }
+
+    #[test]
+    fn old_codex_hook_target_is_present_but_not_current() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex");
+        fs::create_dir_all(&home).unwrap();
+        let current = root.path().join("releases/current/pika");
+        let old = root.path().join("releases/old/pika");
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&current, "current fixture").unwrap();
+        fs::write(&old, "old fixture").unwrap();
+        let changes = codex_hooks_change(&home, &old).unwrap();
+        fs::write(&changes.path, &changes.after).unwrap();
+
+        assert_eq!(
+            hook_configuration_state(&home, Provider::Codex, &current),
+            HookConfigurationState::PresentButNotCurrent
+        );
+        assert!(!hooks_installed(&home, Provider::Codex, &current));
+        assert_eq!(
+            hook_configuration_state(&home, Provider::Codex, &old),
+            HookConfigurationState::Current
+        );
+    }
+
+    #[test]
+    fn malformed_hook_configuration_is_not_reported_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex");
+        fs::create_dir_all(&home).unwrap();
+        let executable = root.path().join("pika");
+        fs::write(&executable, "fixture").unwrap();
+
+        assert_eq!(
+            hook_configuration_state(&home, Provider::Codex, &executable),
+            HookConfigurationState::Absent
+        );
+        fs::write(home.join("hooks.json"), "not json").unwrap();
+        assert_eq!(
+            hook_configuration_state(&home, Provider::Codex, &executable),
+            HookConfigurationState::Unverifiable
+        );
+        fs::write(home.join("hooks.json"), r#"{"hooks":"invalid shape"}"#).unwrap();
+        assert_eq!(
+            hook_configuration_state(&home, Provider::Codex, &executable),
+            HookConfigurationState::Unverifiable
+        );
     }
 }

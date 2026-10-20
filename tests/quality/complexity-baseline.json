@@ -95,7 +95,7 @@
       18
     ],
     "src/core.rs::open_session": [
-      26
+      24
     ],
     "src/core.rs::reconcile_local_with_candidates": [
       54
@@ -104,7 +104,7 @@
       35
     ],
     "src/core.rs::resume_session": [
-      45
+      41
     ],
     "src/doctor.rs::inspect_identity": [
       60

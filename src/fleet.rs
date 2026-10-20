@@ -4990,6 +4990,21 @@ mod receiver_clock_tests {
         let pid_path = root.path().join("escaped.pid");
         let release_path = root.path().join("release");
         let done_path = root.path().join("escaped.done");
+        struct ReleaseFixtureOnDrop(std::path::PathBuf, std::path::PathBuf);
+        impl Drop for ReleaseFixtureOnDrop {
+            fn drop(&mut self) {
+                let _ = fs::write(&self.0, b"release");
+                for _ in 0..100 {
+                    if self.1.exists() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        // Also release the owned fixture if an assertion fails, before its
+        // temporary directory disappears. Never signal an escaped numeric PID.
+        let _release_fixture = ReleaseFixtureOnDrop(release_path.clone(), done_path.clone());
         let test_binary = std::env::current_exe().unwrap();
         write_executable(
             &ssh,
@@ -5008,15 +5023,18 @@ mod receiver_clock_tests {
         let mut side = consultation_fixture(&ssh, Duration::from_secs(30));
         let holder_pid = (0..500)
             .find_map(|_| {
-                let value = fs::read_to_string(&pid_path).ok();
+                // The fixture creates the file before writing the PID. Wait
+                // for the complete value, not merely filesystem visibility.
+                let value = fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i32>().ok())
+                    .filter(|pid| *pid > 0);
                 if value.is_none() {
                     thread::sleep(Duration::from_millis(2));
                 }
                 value
             })
-            .expect("escaped pipe holder did not start")
-            .parse::<i32>()
-            .unwrap();
+            .expect("escaped pipe holder did not publish a valid PID");
 
         let started = Instant::now();
         assert_eq!(

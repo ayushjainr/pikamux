@@ -1792,6 +1792,54 @@ impl Store {
         }
     }
 
+    /// Reclaim a reservation only while every field of the observed row still
+    /// matches. The caller must independently prove that its recorded owner
+    /// PID generation is stale before invoking this compare-and-swap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reclaim_resume_if_generation(
+        &self,
+        observed: &LaunchReservation,
+        token: &str,
+        owner_pid: i64,
+        owner_start_time: i64,
+    ) -> Result<bool> {
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = tx.execute(
+            "DELETE FROM launch_reservations WHERE provider=? AND session_id=? AND token=? AND owner_pid IS ? AND owner_start_time IS ? AND created_at=?",
+            params![
+                observed.provider.as_str(),
+                observed.session_id,
+                observed.token,
+                observed.owner_pid,
+                observed.owner_start_time,
+                observed.created_at
+            ],
+        )? == 1;
+        if !removed {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO launch_reservations(provider,session_id,token,owner_pid,owner_start_time,created_at) VALUES (?,?,?,?,?,?)",
+            params![
+                observed.provider.as_str(),
+                observed.session_id,
+                token,
+                owner_pid,
+                owner_start_time,
+                now()
+            ],
+        )? == 1;
+        if inserted {
+            tx.commit()?;
+            Ok(true)
+        } else {
+            // Dropping the transaction rolls the exact compare-and-swap back.
+            Ok(false)
+        }
+    }
+
     pub fn get_resume_reservation(
         &self,
         provider: Provider,
@@ -1877,6 +1925,54 @@ impl Store {
         Ok(statement
             .query_map(params![provider.as_str(), session_id], live_owner_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Atomically revoke only the complete, unchanged set of live-owner rows
+    /// captured by an explicit recovery confirmation. An added, removed, or
+    /// refreshed row invalidates the operation without deleting anything.
+    pub fn revoke_live_owners_if_exact(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        expected: &[LiveOwner],
+    ) -> Result<bool> {
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = {
+            let mut statement = tx.prepare(
+                "SELECT provider,session_id,pid,start_time,owner_token,last_seen FROM live_owners WHERE provider=? AND session_id=? ORDER BY pid,owner_token",
+            )?;
+            statement
+                .query_map(params![provider.as_str(), session_id], live_owner_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if current != expected {
+            tx.commit()?;
+            return Ok(false);
+        }
+        if expected.is_empty() {
+            tx.commit()?;
+            return Ok(false);
+        }
+        for owner in expected {
+            let removed = tx.execute(
+                "DELETE FROM live_owners WHERE provider=? AND session_id=? AND pid=? AND start_time IS ? AND owner_token=? AND last_seen=?",
+                params![
+                    owner.provider.as_str(),
+                    owner.session_id,
+                    owner.pid,
+                    owner.start_time,
+                    owner.owner_token,
+                    owner.last_seen
+                ],
+            )?;
+            if removed != 1 {
+                // The transaction rolls back if an exact row cannot be removed.
+                return Ok(false);
+            }
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn list_live_owners(&self) -> Result<Vec<LiveOwner>> {

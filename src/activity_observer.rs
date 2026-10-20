@@ -52,12 +52,22 @@ fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activit
     let (local_done_sender, local_done_receiver) = mpsc::sync_channel(1);
     let local_refresh = thread::spawn(move || {
         let mut store_changes = worker.store.change_watcher().ok();
+        // Keep only launch records whose provider process was proven by the
+        // last successful reconciliation. Cache reloads below may reuse this
+        // evidence only while the complete PendingLaunch generation matches.
+        let mut pending_runtime_evidence = Vec::new();
         let mut next_reconcile = Instant::now();
         let mut consecutive_failures = 0;
         let mut observing = !wait_for_handoff;
         while !worker_stop.load(Ordering::Relaxed) {
             if !observation_enabled.load(Ordering::Acquire) {
                 local_lease.release();
+                invalidate_pending_evidence(
+                    &worker,
+                    &summary_worker,
+                    &mut pending_runtime_evidence,
+                );
+                next_reconcile = Instant::now();
                 if refresh_receiver.recv_timeout(Duration::from_millis(500))
                     == Err(mpsc::RecvTimeoutError::Disconnected)
                 {
@@ -72,12 +82,17 @@ fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activit
                     None
                 }
             };
+            if owner.is_none() {
+                invalidate_pending_evidence(
+                    &worker,
+                    &summary_worker,
+                    &mut pending_runtime_evidence,
+                );
+            }
             if !observing {
                 // The exact open already reconciled. Reuse its committed state
                 // instead of racing it with another provider/process sweep.
-                if let Ok((items, health)) = board_items(&worker) {
-                    summary_worker.publish(items, health);
-                }
+                publish_cached_items(&worker, &summary_worker, &mut pending_runtime_evidence);
                 next_reconcile = Instant::now() + LOCAL_RECONCILE_INTERVAL;
                 observing = true;
             }
@@ -87,7 +102,20 @@ fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activit
                     worker_inflight.store(false, Ordering::SeqCst);
                     break;
                 }
-                let refresh = worker.reconcile_local().and_then(|_| board_items(&worker));
+                let refresh = match worker.reconcile_local() {
+                    Ok(inventory) => {
+                        pending_runtime_evidence = observed_pending_evidence(&inventory);
+                        board_items(&worker, &mut pending_runtime_evidence)
+                    }
+                    Err(error) => {
+                        invalidate_pending_evidence(
+                            &worker,
+                            &summary_worker,
+                            &mut pending_runtime_evidence,
+                        );
+                        Err(error)
+                    }
+                };
                 worker_inflight.store(false, Ordering::SeqCst);
                 worker_refresh_delayed.store(
                     record_local_refresh_result(&mut consecutive_failures, refresh.is_ok()),
@@ -100,7 +128,7 @@ fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activit
                     // the read also closes the database-creation race window.
                     if let Some((items, fleet_health)) =
                         snapshot_after_store_change(&worker.store, &mut store_changes, || {
-                            board_items(&worker)
+                            board_items(&worker, &mut pending_runtime_evidence)
                         })
                     {
                         summary_worker.publish(items, fleet_health);
@@ -113,19 +141,13 @@ fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activit
             }
             // A follower may already be overdue; still wait for cache changes
             // rather than spinning or independently scanning providers/fleet.
-            let wait = if owner.is_none() {
-                Duration::from_millis(500)
-            } else {
-                next_reconcile
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(500))
-            };
+            let wait = observation_wait(owner.is_some(), next_reconcile);
             match refresh_receiver.recv_timeout(wait) {
                 Ok(()) => next_reconcile = Instant::now(),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Some((items, fleet_health)) =
                         snapshot_after_store_change(&worker.store, &mut store_changes, || {
-                            board_items(&worker)
+                            board_items(&worker, &mut pending_runtime_evidence)
                         })
                     {
                         summary_worker.publish(items, fleet_health);
@@ -169,7 +191,7 @@ fn start_with_mode(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activit
 
 fn cached_source(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activity_feed::Source> {
     // Paint bounded durable state immediately. No provider/process/SSH scan.
-    let (cached, health) = board_items(pika)?;
+    let (cached, health) = board_items(pika, &mut Vec::new())?;
     let source = crate::activity_feed::Source::default();
     if wait_for_handoff {
         source.pause_observation();
@@ -183,6 +205,49 @@ fn cached_source(pika: &Pika, wait_for_handoff: bool) -> Result<crate::activity_
         Some(pika.store.path().to_path_buf()),
     );
     Ok(source)
+}
+
+fn publish_cached_items(
+    pika: &Pika,
+    publisher: &crate::activity_feed::Publisher,
+    evidence: &mut Vec<crate::store::PendingLaunch>,
+) {
+    if let Ok((items, health)) = board_items(pika, evidence) {
+        publisher.publish(items, health);
+    }
+}
+
+fn observed_pending_evidence(
+    inventory: &crate::core::Inventory,
+) -> Vec<crate::store::PendingLaunch> {
+    inventory
+        .pending
+        .iter()
+        .filter(|pending| inventory.pending_live.contains(&pending.launch_token))
+        .cloned()
+        .collect()
+}
+
+fn observation_wait(is_owner: bool, next_reconcile: Instant) -> Duration {
+    let cache_poll = Duration::from_millis(500);
+    if is_owner {
+        next_reconcile
+            .saturating_duration_since(Instant::now())
+            .min(cache_poll)
+    } else {
+        cache_poll
+    }
+}
+
+fn invalidate_pending_evidence(
+    pika: &Pika,
+    publisher: &crate::activity_feed::Publisher,
+    evidence: &mut Vec<crate::store::PendingLaunch>,
+) {
+    if !evidence.is_empty() {
+        evidence.clear();
+        publish_cached_items(pika, publisher, evidence);
+    }
 }
 
 fn remote_observation_loop(
@@ -286,8 +351,22 @@ pub(crate) fn finish_board_observer(
     }
 }
 
-fn board_items(pika: &Pika) -> Result<(Vec<BoardItem>, Vec<String>)> {
-    board_items_from_inventory(pika, pika.cached_inventory()?)
+fn board_items(
+    pika: &Pika,
+    runtime_evidence: &mut Vec<crate::store::PendingLaunch>,
+) -> Result<(Vec<BoardItem>, Vec<String>)> {
+    let mut inventory = pika.cached_inventory()?;
+    // A process observation is transient and has no authority over store
+    // state. Reuse it only when every persisted pending field and generation
+    // is unchanged; otherwise the latest cache renders without a liveness claim.
+    runtime_evidence.retain(|evidence| inventory.pending.contains(evidence));
+    inventory.pending_live = inventory
+        .pending
+        .iter()
+        .filter(|current| runtime_evidence.contains(current))
+        .map(|pending| pending.launch_token.clone())
+        .collect();
+    board_items_from_inventory(pika, inventory)
 }
 
 fn board_items_from_inventory(
@@ -343,8 +422,9 @@ fn board_items_from_inventory(
         })
         .collect::<Vec<_>>();
     for pending in inventory.pending {
+        let runtime_live = inventory.pending_live.contains(&pending.launch_token);
         items.push(BoardItem {
-            session: pika.pending_session(&pending)?,
+            session: pika.pending_session_with_runtime(&pending, runtime_live)?,
             node_id: None,
             node_name: None,
             stale: false,
@@ -542,7 +622,7 @@ mod open_observer_tests {
         core::{Pika, session_from_candidate},
         model::{Candidate, Provider, Status},
         paths::Paths,
-        store::Store,
+        store::{PendingLaunch, Store},
         tmux::Tmux,
     };
     use std::{
@@ -690,6 +770,155 @@ mod open_observer_tests {
         wait_until(Instant::now() + Duration::from_secs(3), || {
             lease.acquire(true).unwrap().is_some()
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_pending_liveness_survives_cache_reload_but_not_a_newer_store_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let tmux_log = root.path().join("tmux.log");
+        let mut pika = test_pika(root.path(), &tmux_log);
+        let token = "observer-pending-launch";
+        let pending = PendingLaunch {
+            launch_token: token.into(),
+            provider: Provider::Codex,
+            name: "observer-pending".into(),
+            cwd: root.path().display().to_string(),
+            tmux_session: Some("pika-startup".into()),
+            tmux_pane: Some("%observer".into()),
+            expected_session_id: None,
+            root_pid: None,
+            root_pid_start: None,
+            preexisting_session_ids: Some(vec![]),
+            candidate_session_id: None,
+            candidate_observed_at: None,
+            created_at: 1.0,
+        };
+        pika.store.add_pending(&pending).unwrap();
+
+        let fifo = root.path().join("provider.fifo");
+        let marker = root.path().join("provider-starts");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let fake_provider = root.path().join("bin/codex");
+        fs::create_dir_all(fake_provider.parent().unwrap()).unwrap();
+        fs::write(
+            &fake_provider,
+            format!(
+                "#!/bin/sh\nprintf 'started\\n' >> {}\nread _ < {}\n",
+                shell_words::quote(&marker.display().to_string()),
+                shell_words::quote(&fifo.display().to_string()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_provider, PermissionsExt::from_mode(0o700)).unwrap();
+        let fake_process = ChildGuard(
+            std::process::Command::new(&fake_provider)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let marker_deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && Instant::now() < marker_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists());
+        let pid = fake_process.0.id();
+        let pid = pid.to_string();
+        let row = [
+            "pika-startup",
+            "%observer",
+            &pid,
+            "/tmp",
+            "codex",
+            "0",
+            "0",
+            "0",
+            "0",
+            "",
+            "1",
+            "1",
+            "codex",
+            "",
+            "",
+            token,
+        ]
+        .join(&char::from(31).to_string());
+        let fake_tmux = root.path().join("fake-tmux-pending");
+        fs::write(
+            &fake_tmux,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *list-panes*) printf '%s\\n' {} ;; *) exit 0 ;; esac\n",
+                shell_words::quote(&row),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_tmux, PermissionsExt::from_mode(0o700)).unwrap();
+        pika.tmux = Tmux::with_executable(fake_tmux.to_string_lossy(), None);
+
+        let source = start(&pika).unwrap();
+        wait_until(Instant::now() + Duration::from_secs(5), || {
+            source.snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .items
+                    .iter()
+                    .any(|item| item.pending_token.as_deref() == Some(token) && item.session.live)
+            })
+        });
+
+        source.pause_observation();
+        wait_until(Instant::now() + Duration::from_secs(5), || {
+            source.snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .items
+                    .iter()
+                    .any(|item| item.pending_token.as_deref() == Some(token) && !item.session.live)
+            })
+        });
+        source.activate_observation();
+        wait_until(Instant::now() + Duration::from_secs(5), || {
+            source.snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .items
+                    .iter()
+                    .any(|item| item.pending_token.as_deref() == Some(token) && item.session.live)
+            })
+        });
+
+        assert!(
+            pika.store
+                .hide_pending(token, Provider::Codex, pending.created_at)
+                .unwrap()
+        );
+        wait_until(Instant::now() + Duration::from_secs(5), || {
+            source.snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .items
+                    .iter()
+                    .all(|item| item.pending_token.as_deref() != Some(token))
+            })
+        });
+        assert_eq!(pika.store.get_pending(token).unwrap(), Some(pending));
+        assert_eq!(fs::read_to_string(marker).unwrap().lines().count(), 1);
+
+        drop(source);
     }
 
     #[test]

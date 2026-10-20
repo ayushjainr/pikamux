@@ -7,7 +7,10 @@ use pikamux::{
     model::{Pane, Provider, Session, Status},
     paths::Paths,
     process::ProcessRecord,
-    setup::{apply_changes, codex_hooks_change, hook_spec_fingerprint},
+    setup::{
+        HookConfigurationState, apply_changes, codex_hooks_change, hook_configuration_state,
+        hook_spec_fingerprint,
+    },
     store::{HookObservation, LiveOwner, PendingLaunch, Store},
 };
 use std::{collections::BTreeMap, fs, path::Path};
@@ -253,6 +256,9 @@ fn missing_hook_observation_and_unsafe_permissions_block_certificate() {
             .iter()
             .any(|check| { check.code == "hooks.codex" && check.level == CheckLevel::Warn })
     );
+    assert!(report.checks.iter().any(|check| {
+        check.code == "hooks.codex" && check.message.contains("matching observed evidence")
+    }));
     #[cfg(unix)]
     assert!(
         report
@@ -260,6 +266,63 @@ fn missing_hook_observation_and_unsafe_permissions_block_certificate() {
             .iter()
             .any(|check| { check.code == "config.permissions" && check.level == CheckLevel::Warn })
     );
+}
+
+#[test]
+fn old_binary_hook_configuration_is_present_but_not_current_or_verified() {
+    let (temp, paths, store, current_binary, runtime) = commissioned_fixture();
+    let current = inspect_with_evidence(&paths, &store, &current_binary, &runtime, 100.0);
+    assert!(current.safe_to_disconnect, "{}", current.render_human(true));
+
+    let old_binary = temp.path().join("old-release/bin/pika");
+    fs::create_dir_all(old_binary.parent().unwrap()).unwrap();
+    fs::write(&old_binary, "older Pika fixture").unwrap();
+    let old_hook_config = codex_hooks_change(&paths.codex_home, &old_binary).unwrap();
+    apply_changes(&[old_hook_config], "old-hook-target").unwrap();
+
+    assert_eq!(
+        hook_configuration_state(&paths.codex_home, Provider::Codex, &current_binary),
+        HookConfigurationState::PresentButNotCurrent
+    );
+    let report = inspect_with_evidence(&paths, &store, &current_binary, &runtime, 101.0);
+    assert!(!report.safe_to_disconnect);
+    let hook_check = report
+        .checks
+        .iter()
+        .find(|check| check.code == "hooks.codex")
+        .unwrap();
+    assert_eq!(hook_check.level, CheckLevel::Warn);
+    assert!(hook_check.message.contains("configured but"));
+    assert!(!hook_check.message.contains("not configured"));
+    assert!(!hook_check.message.contains("installed and verified"));
+}
+
+#[test]
+fn current_hook_configuration_without_matching_observation_is_not_verified() {
+    let (_temp, paths, store, binary, runtime) = commissioned_fixture();
+    store
+        .record_hook_observation(&HookObservation {
+            provider: Provider::Codex,
+            fingerprint: "different-definition".into(),
+            event_name: "Stop".into(),
+            session_id: ID.into(),
+            observed_at: 101.0,
+            source: None,
+            managed: true,
+        })
+        .unwrap();
+
+    assert_eq!(
+        hook_configuration_state(&paths.codex_home, Provider::Codex, &binary),
+        HookConfigurationState::Current
+    );
+    let report = inspect_with_evidence(&paths, &store, &binary, &runtime, 102.0);
+    assert!(!report.safe_to_disconnect);
+    assert!(report.checks.iter().any(|check| {
+        check.code == "hooks.codex"
+            && check.level == CheckLevel::Warn
+            && check.message.contains("matching observed evidence")
+    }));
 }
 
 #[test]

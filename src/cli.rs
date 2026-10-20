@@ -875,7 +875,12 @@ fn bare(pika: &Pika) -> Result<i32> {
             inventory
                 .pending
                 .iter()
-                .map(|pending| pika.pending_session(pending))
+                .map(|pending| {
+                    pika.pending_session_with_runtime(
+                        pending,
+                        inventory.pending_live.contains(&pending.launch_token),
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?,
         );
         return print_sessions(inventory.sessions, true);
@@ -1350,54 +1355,24 @@ fn open_local_session_recorded(
         Err(error)
             if matches!(
                 error.downcast_ref::<OpenError>(),
+                Some(OpenError::SharedOwnerConfirmation(_))
+            ) =>
+        {
+            let OpenError::SharedOwnerConfirmation(recovery) =
+                error.downcast_ref::<OpenError>().expect("matched above")
+            else {
+                unreachable!("shared owner recovery error changed after matching")
+            };
+            confirm_shared_owner_recovery(pika, session, recovery.clone(), &mut finish)
+        }
+        Err(error)
+            if matches!(
+                error.downcast_ref::<OpenError>(),
                 Some(OpenError::OutsideLive(_))
             ) =>
         {
             let message = error.to_string();
-            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-                bail!("{message} Interactive choice is required.")
-            }
-            let exact = pika.outside_identity_generations(&session)?;
-            if exact.len() != 1 || !process::can_terminate_generation() {
-                bail!("{message}")
-            }
-            let (pid, generation) = exact[0];
-            eprintln!(
-                "pika: exact {} conversation {:?} is live outside Pika (PID {pid}).",
-                session.provider,
-                session.display_name()
-            );
-            eprintln!("  1. Keep it there (recommended) — no process or state changes");
-            eprintln!(
-                "  2. Clean and attach here — gracefully stop that exact PID generation, then resume the same UUID"
-            );
-            eprintln!("  3. Cancel — no process or state changes");
-            print!("Choose 1-3 [1]: ");
-            io::stdout().flush()?;
-            let mut answer = String::new();
-            io::stdin().read_line(&mut answer)?;
-            match answer.trim().to_ascii_lowercase().as_str() {
-                "2" => {
-                    eprintln!(
-                        "pika: requesting a graceful stop for exact {} PID {pid}; Pika will not force-kill it.",
-                        session.provider
-                    );
-                    let receipt = pika.clean_and_attach(session, (pid, generation), true)?;
-                    finish(receipt)
-                }
-                "3" | "q" | "cancel" => {
-                    eprintln!("pika: Cancelled. No state changed.");
-                    Ok(1)
-                }
-                _ => {
-                    eprintln!(
-                        "pika: Keep using the existing {} client. To move it later, run `/exit`, wait for the shell prompt, then run exactly: `pika {}`.",
-                        session.provider,
-                        shell_words::quote(&session.display_name())
-                    );
-                    Ok(1)
-                }
-            }
+            recover_outside_live(pika, session, &message, &mut finish)
         }
         Err(error) if identity_unproven_error(&error) => {
             // One bounded fresh reconciliation absorbs a pane/process startup
@@ -1413,6 +1388,88 @@ fn open_local_session_recorded(
         }
         Err(error) => Err(error),
     }
+}
+
+fn confirm_shared_owner_recovery(
+    pika: &Pika,
+    session: Session,
+    recovery: crate::core::SharedOwnerRecovery,
+    finish: &mut impl FnMut(crate::core::OpenReceipt) -> Result<i32>,
+) -> Result<i32> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!(
+            "The shared provider server still reports this exact conversation as open. Confirm interactively whether all clients for this conversation have exited; no ownership was cleared and no provider was resumed."
+        )
+    }
+    eprintln!(
+        "pika: the shared provider server still reports {:?} open, but Pika found no matching live client or Pika home.",
+        session.display_name()
+    );
+    eprintln!(
+        "pika: have you exited all clients for this conversation? Confirming clears only its stale ownership record and resumes the same saved conversation (same UUID). Pika will not stop the shared server."
+    );
+    print!("Have you exited all clients for THIS conversation? [y/N]: ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        eprintln!(
+            "pika: No shared-owner repair requested. No ownership was cleared and no provider was resumed."
+        );
+        return Ok(1);
+    }
+    let receipt = pika.resume_after_shared_owner_confirmation(session, recovery, true)?;
+    finish(receipt)
+}
+
+fn recover_outside_live(
+    pika: &Pika,
+    session: Session,
+    message: &str,
+    finish: &mut impl FnMut(crate::core::OpenReceipt) -> Result<i32>,
+) -> Result<i32> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!(
+            "{message} Interactive choice is required; no process was stopped and no conversation was switched."
+        )
+    }
+    let exact = pika.outside_identity_generations(&session)?;
+    if exact.len() != 1 || !process::can_terminate_generation() {
+        bail!(
+            "{message} Pika could not prove one safely addressable process generation, so it did not offer a takeover."
+        )
+    }
+    let (pid, generation) = exact[0];
+    eprintln!("pika: {message}");
+    eprintln!(
+        "pika: exact {} conversation {:?} is live outside Pika (PID {pid}).",
+        session.provider,
+        session.display_name()
+    );
+    eprintln!(
+        "pika: repair here? This asks that exact process to stop gracefully and then opens the same saved conversation (same UUID)."
+    );
+    eprintln!(
+        "pika: if a turn is active, it may be interrupted; the saved conversation is preserved."
+    );
+    print!("Repair here? [y/N]: ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if answer.trim().eq_ignore_ascii_case("y") {
+        eprintln!(
+            "pika: requesting a graceful stop for exact {} PID {pid}; Pika will not force-kill it.",
+            session.provider
+        );
+        let receipt = pika.clean_and_attach(session, (pid, generation), true)?;
+        return finish(receipt);
+    }
+    eprintln!(
+        "pika: No repair requested. The existing {} client was left running; no takeover was attempted. To move it later, exit it normally, wait for the shell prompt, then run exactly: `pika {}`.",
+        session.provider,
+        shell_words::quote(&session.display_name())
+    );
+    Ok(1)
 }
 
 fn identity_unproven_error(error: &anyhow::Error) -> bool {
@@ -1708,7 +1765,12 @@ fn list(pika: &Pika, a: ListArgs) -> Result<i32> {
         inventory
             .pending
             .iter()
-            .map(|pending| pika.pending_session(pending))
+            .map(|pending| {
+                pika.pending_session_with_runtime(
+                    pending,
+                    inventory.pending_live.contains(&pending.launch_token),
+                )
+            })
             .collect::<Result<Vec<_>>>()?,
     );
     if !a.no_usage {

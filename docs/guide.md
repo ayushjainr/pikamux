@@ -440,8 +440,9 @@ protects it and opens it.
 If it is already running in an untagged tmux pane, Pika can tag that pane and
 attach. A process that started in an ordinary terminal cannot be moved safely;
 when exactly one identity-bearing provider process is proven, interactive Pika offers
-three explicit choices: keep it there, clean and attach here, or cancel. Clean and
-attach pins that exact PID generation, requests a graceful stop, waits for it to
+a default-No `Repair here? [y/N]` choice. It explains that an active turn may be
+interrupted while saved history and the conversation UUID are preserved.
+Confirming pins that exact PID generation, requests a graceful stop, waits for it to
 exit, rechecks the identity inventory, and only then resumes the same identity in Pika.
 It never escalates to a force-kill. Manual `/exit` followed by the same `pika NAME`
 command remains available. Genuine duplicate identity processes are
@@ -470,10 +471,16 @@ shared client state without guessing which client owns the lease. The same
 confirmed answer revokes only shared-infrastructure leases and resumes the exact
 identity. A running tagged pane, ambiguous dedicated owner, or multiple identity PIDs
 remains fail-closed; one exact dedicated PID can use the explicit interactive
-clean-and-attach choice. Non-interactive calls never assume confirmation. The receipt also
-gives the UTC lease deadline as a wait-only alternative. Shared app-server PIDs
-are explicitly marked as infrastructure that must not be killed. No recovery
+clean-and-attach choice. Non-interactive calls never assume confirmation.
+Shared app-server PIDs
+are infrastructure that must not be killed by this repair. No recovery
 subcommand is part of the user model.
+
+A resume reservation left by a dead process is reclaimed automatically only
+after a complete process observation proves that exact PID generation gone.
+Concurrent changes to the reservation stop reclamation. Shared-owner recovery
+also rechecks the captured leases and terminals after confirmation; a new client,
+busy terminal or changed lease stops the repair rather than risking a duplicate.
 
 `pika ask research-notes "What assumption is weakest here?"` opens a temporary
 side conversation based on that exact provider identity. Use `--jsonl` to keep

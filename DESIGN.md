@@ -380,7 +380,21 @@ a conversation, acknowledging unread work, or deleting the recovery handle.
 Exit zero does not prove an update occurred or authorize an automatic relaunch.
 `pika NAME` reopens an existing exact-name pending terminal before considering
 creation; provider/name ambiguity is never resolved by launching another client.
-Enter returns to the retained startup terminal, not a claimed live agent.
+Enter checks the retained startup terminal if it still exists, not a claimed
+live agent. Stored pane/PID metadata alone never makes a pending launch live:
+the current complete runtime observation must find a provider in its non-dead,
+exact session/pane with the matching launch token. Board cache reloads may
+reuse that transient proof only for the unchanged pending record; paused,
+lost-owner, and failed observations discard it. This proof establishes process
+liveness only, never a confirmed conversation or completed startup.
+Exact-name resume automatically reclaims a reservation only when a complete
+process observation disproves its recorded PID generation and an exact-row
+compare-and-swap still matches. Interactive dedicated-client repair defaults
+to No and explains active-turn interruption before stopping that exact process.
+Shared-only ownership instead requires the user's confirmation that all clients
+for the selected conversation have exited; it revalidates the full lease set,
+rejects busy tagged terminals and dedicated owners, and never signals the shared
+server. Neither recovery changes the selected conversation identity.
 During ordinary reconciliation, an independently proven exact home can complete
 a stranded startup record with the same expected conversation, pane, launch
 token, binding, and phase. Only its confirmed process generation replaces the

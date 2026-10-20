@@ -745,20 +745,45 @@ fn check_hook(
         Provider::Opencode => &paths.opencode_config_home,
         Provider::Muse => &paths.muse_config_home,
     };
-    let installed = setup::hooks_installed(home, provider, executable);
-    if !installed {
-        checks.push(if required {
-            warn(
-                &format!("hooks.{provider}"),
-                "lifecycle hooks are not installed; run `pika setup`",
-            )
-        } else {
-            ok(
-                &format!("hooks.{provider}"),
-                "hooks are not installed for this optional provider",
-            )
-        });
-        return;
+    let code = format!("hooks.{provider}");
+    match setup::hook_configuration_state(home, provider, executable) {
+        setup::HookConfigurationState::Absent => {
+            checks.push(if required {
+                warn(
+                    &code,
+                    "lifecycle hooks are not configured; run `pika setup`",
+                )
+            } else {
+                ok(&code, "hooks are not configured for this optional provider")
+            });
+            return;
+        }
+        setup::HookConfigurationState::PresentButNotCurrent => {
+            checks.push(if required {
+                warn(
+                    &code,
+                    "Pika lifecycle hooks are configured but disabled, incomplete, or not current; run `pika setup`",
+                )
+            } else {
+                ok(
+                    &code,
+                    "Pika lifecycle hooks are configured but not current for this optional provider",
+                )
+            });
+            return;
+        }
+        setup::HookConfigurationState::Unverifiable => {
+            checks.push(if required {
+                warn(&code, "lifecycle hook configuration could not be verified")
+            } else {
+                ok(
+                    &code,
+                    "optional provider hook configuration could not be verified",
+                )
+            });
+            return;
+        }
+        setup::HookConfigurationState::Current => {}
     }
     let expected = setup::hook_spec_fingerprint(provider, executable).ok();
     let observation = store.get_hook_observation(provider).ok().flatten();
@@ -769,7 +794,7 @@ fn check_hook(
             .is_none_or(|(observed, expected)| &observed.fingerprint != expected)
     {
         checks.push(warn(
-            &format!("hooks.{provider}"),
+            &code,
             "installed hook definition has not produced matching observed evidence",
         ));
         return;
@@ -781,7 +806,7 @@ fn check_hook(
         )
     });
     checks.push(ok(
-        &format!("hooks.{provider}"),
+        &code,
         &format!(
             "lifecycle hooks are installed{}{age}",
             if required { " and verified" } else { "" }

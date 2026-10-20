@@ -7,7 +7,7 @@
 
 use pikamux::{
     model::{ObservationKind, Status, StatusObservation},
-    store::Store,
+    store::{LiveOwner, Store},
 };
 use std::{
     fs::{self, File},
@@ -64,7 +64,63 @@ impl Recording {
 
 struct OtherTerminal {
     child: Child,
-    _terminal: File,
+    terminal: File,
+    #[cfg(unix)]
+    output: String,
+}
+
+#[cfg(unix)]
+struct FakeOutsideProvider {
+    child: Child,
+    _stdin: std::process::ChildStdin,
+}
+
+#[cfg(unix)]
+impl FakeOutsideProvider {
+    #[cfg(target_os = "linux")]
+    fn start(executable: &std::path::Path, identity: &str) -> Self {
+        let mut child = Command::new(executable)
+            .args(["--resume", identity])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        Self {
+            child,
+            _stdin: stdin,
+        }
+    }
+
+    fn stop_for_test(&mut self) {
+        if self.child.try_wait().unwrap().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn start_shared_server(executable: &std::path::Path) -> Self {
+        let mut child = Command::new(executable)
+            .args(["app-server", "--stdio"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        Self {
+            child,
+            _stdin: stdin,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FakeOutsideProvider {
+    fn drop(&mut self) {
+        self.stop_for_test();
+    }
 }
 
 #[test]
@@ -191,7 +247,9 @@ impl BoardProcess {
             .unwrap();
         OtherTerminal {
             child,
-            _terminal: terminal,
+            terminal,
+            #[cfg(unix)]
+            output: String::new(),
         }
     }
 
@@ -204,6 +262,24 @@ impl BoardProcess {
                     .map(|(_, pane)| pane.into())
             })
             .expect("the opening terminal must remain attached")
+    }
+
+    fn detach_client(&self, client_pid: u32) {
+        let listed = self.tmux(&["list-clients", "-F", "#{client_name}|#{client_pid}"]);
+        let clients = listed
+            .lines()
+            .filter_map(|line| {
+                let (name, pid) = line.split_once('|')?;
+                Some((name, pid.parse::<u32>().ok()?))
+            })
+            .collect::<Vec<_>>();
+        let client = clients
+            .iter()
+            .find(|(_, pid)| *pid == client_pid)
+            .or_else(|| (clients.len() == 1).then(|| &clients[0]))
+            .map(|(name, _)| *name)
+            .expect("the exact test-owned client must remain attached");
+        self.tmux(&["detach-client", "-t", client]);
     }
 
     fn start() -> Self {
@@ -584,6 +660,55 @@ impl BoardProcess {
     }
 }
 
+#[cfg(unix)]
+impl OtherTerminal {
+    fn send(&mut self, bytes: &[u8]) {
+        self.terminal.write_all(bytes).unwrap();
+        self.terminal.flush().unwrap();
+    }
+
+    fn await_text(&mut self, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let mut bytes = [0; 32768];
+            match self.terminal.read(&mut bytes) {
+                Ok(n) => self.output.push_str(&String::from_utf8_lossy(&bytes[..n])),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("terminal read: {error}; output: {}", self.output),
+            }
+            if self.output.contains(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing {expected:?}; output: {}",
+                self.output
+            );
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "open exited before {expected:?}: {}",
+                self.output
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait(&mut self) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "open didn't exit: {}",
+                self.output
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 #[test]
 fn remote_board_feed_verifies_node_bounds_frames_and_clears_on_disconnect() {
     let board = BoardProcess::start();
@@ -662,6 +787,312 @@ fn remote_board_feed_verifies_node_bounds_frames_and_clears_on_disconnect() {
 #[test]
 fn unverified_terminal_requires_choice_and_never_relaunches_or_acknowledges() {
     unverified_terminal_journey(false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn outside_live_recovery_requires_y_and_revalidates_the_exact_process_generation() {
+    outside_live_recovery_journey(Some("y\n"), false);
+    outside_live_recovery_journey(Some("n\n"), false);
+    outside_live_recovery_journey(Some("\n"), false);
+    outside_live_recovery_journey(Some("y\n"), true);
+}
+
+#[cfg(target_os = "linux")]
+fn outside_live_recovery_journey(answer: Option<&str>, replace_generation: bool) {
+    let identity = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let mut board = BoardProcess::start();
+    let real_tmux = real_tmux_binary();
+    fs::write(
+        board.root.path().join("bin/tmux"),
+        format!(
+            "#!/bin/sh\nexec {} -f /dev/null \"$@\"\n",
+            shell_words::quote(real_tmux.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    board.real_tmux = true;
+    board.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "recovery-placeholder",
+        "-c",
+        board.root.path().join("home").to_str().unwrap(),
+        "exec /bin/sh",
+    ]);
+    board.tmux(&["bind-key", "-T", "root", "F12", "detach-client"]);
+
+    let provider = board.root.path().join("bin/codex");
+    let invocations = board.root.path().join("provider-invocations");
+    let outside_pid = board.root.path().join("outside.pid");
+    let outside_term = board.root.path().join("outside-term");
+    fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'codex-cli 1.0.0\\n'; exit 0; fi\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = --resume ]; then printf '%s' \"$$\" > {}; trap 'printf term\\n >> {}; exit 0' TERM; printf 'OUTSIDE READY\\n'; while IFS= read -r ignored; do :; done; fi\nif [ \"$1\" = resume ]; then printf 'FAKE AGENT READY\\n'; while IFS= read -r ignored; do :; done; fi\nexit 97\n",
+            shell_words::quote(invocations.to_str().unwrap()),
+            shell_words::quote(outside_pid.to_str().unwrap()),
+            shell_words::quote(outside_term.to_str().unwrap()),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut outside = FakeOutsideProvider::start(&provider, identity);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !outside_pid.exists() {
+        assert!(Instant::now() < deadline, "outside fixture never started");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let original_pid = fs::read_to_string(&outside_pid).unwrap();
+
+    let mut open = board.other_terminal("audit_saved", true);
+    open.await_text("Repair here? [y/N]");
+    assert!(
+        open.output.contains("if a turn is active"),
+        "{}",
+        open.output
+    );
+    assert!(open.output.contains("same UUID"), "{}", open.output);
+
+    let mut replacement = None;
+    if replace_generation {
+        outside.stop_for_test();
+        let replacement_process = FakeOutsideProvider::start(&provider, identity);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(pid) = fs::read_to_string(&outside_pid)
+                && pid != original_pid
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement provider never started"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        replacement = Some(replacement_process);
+    }
+
+    if let Some(answer) = answer {
+        open.send(answer.as_bytes());
+    }
+    if answer == Some("y\n") && !replace_generation {
+        open.await_text("FAKE AGENT READY");
+        assert!(
+            outside_term.exists(),
+            "exact outside owner was not asked to stop"
+        );
+        let invocations = fs::read_to_string(&invocations).unwrap();
+        assert!(
+            invocations
+                .lines()
+                .any(|line| line == &format!("resume {identity}")),
+            "{invocations}"
+        );
+        let panes = board.tmux(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{@pika_session_id}|#{pane_current_command}",
+        ]);
+        assert!(
+            panes
+                .lines()
+                .any(|line| line.starts_with(&format!("{identity}|"))),
+            "{panes}"
+        );
+        board.detach_client(open.child.id());
+        assert!(open.wait().success(), "{}", open.output);
+    } else {
+        if replace_generation {
+            open.await_text("CLEAN AND ATTACH REFUSED: exact ownership changed");
+        } else {
+            open.await_text("No repair requested");
+        }
+        assert_eq!(open.wait().code(), Some(1));
+        assert!(
+            !outside_term.exists(),
+            "Pika signaled an outside process without a matching approved generation"
+        );
+        let invocations = fs::read_to_string(&invocations).unwrap();
+        assert!(
+            !invocations.lines().any(|line| line.starts_with("resume ")),
+            "{invocations}"
+        );
+        if replace_generation {
+            assert!(
+                replacement
+                    .as_mut()
+                    .unwrap()
+                    .child
+                    .try_wait()
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert!(outside.child.try_wait().unwrap().is_none());
+        }
+    }
+
+    let saved = Store::at(board.root.path().join("state/pika.db"))
+        .get_session(pikamux::model::Provider::Codex, identity)
+        .unwrap()
+        .unwrap();
+    if answer != Some("y\n") || replace_generation {
+        assert!(
+            saved.unread,
+            "a refused repair must not acknowledge the saved event"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn shared_owner_confirmation_requires_y_and_resumes_the_same_uuid_without_stopping_server() {
+    shared_owner_confirmation_journey(b"y\n");
+    shared_owner_confirmation_journey(b"n\n");
+    shared_owner_confirmation_journey(b"\n");
+    shared_owner_confirmation_journey(b"\x04");
+}
+
+#[cfg(unix)]
+fn shared_owner_confirmation_journey(answer: &[u8]) {
+    use pikamux::{model::Provider, process};
+
+    let identity = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let mut board = BoardProcess::start();
+    let real_tmux = real_tmux_binary();
+    fs::write(
+        board.root.path().join("bin/tmux"),
+        format!(
+            "#!/bin/sh\nexec {} -f /dev/null \"$@\"\n",
+            shell_words::quote(real_tmux.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    board.real_tmux = true;
+    board.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "recovery-placeholder",
+        "-c",
+        board.root.path().join("home").to_str().unwrap(),
+        "exec /bin/sh",
+    ]);
+    board.tmux(&["bind-key", "-T", "root", "F12", "detach-client"]);
+
+    let provider = board.root.path().join("bin/codex");
+    let resumes = board.root.path().join("resume-identities");
+    let server_term = board.root.path().join("shared-server-term");
+    fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'codex-cli 1.0.0\\n'; exit 0; fi\nif [ \"$1\" = app-server ]; then trap 'printf term\\n >> {}' TERM; printf 'SHARED SERVER READY\\n'; while IFS= read -r ignored; do :; done; fi\nif [ \"$1\" = resume ]; then printf '%s\\n' \"$2\" >> {}; printf 'FAKE AGENT READY\\n'; while IFS= read -r ignored; do :; done; fi\nexit 97\n",
+            shell_words::quote(server_term.to_str().unwrap()),
+            shell_words::quote(resumes.to_str().unwrap()),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut shared_server = FakeOutsideProvider::start_shared_server(&provider);
+    let owner_pid = i64::from(shared_server.child.id());
+    let owner_start = process::process_start_time(owner_pid).unwrap() as i64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let store = Store::at(board.root.path().join("state/pika.db"));
+    store
+        .set_live_owner(&LiveOwner {
+            provider: Provider::Codex,
+            session_id: identity.into(),
+            pid: owner_pid,
+            start_time: Some(owner_start),
+            owner_token: "fake-shared-server-owner".into(),
+            last_seen: now,
+        })
+        .unwrap();
+    store
+        .reserve_resume(
+            Provider::Codex,
+            identity,
+            "dead-resume-owner",
+            2_000_000_003,
+            1,
+        )
+        .unwrap();
+
+    let mut open = board.other_terminal("audit_saved", true);
+    open.await_text("Have you exited all clients for THIS conversation? [y/N]");
+    assert!(open.output.contains("same UUID"), "{}", open.output);
+    assert!(
+        open.output.contains("will not stop the shared server"),
+        "{}",
+        open.output
+    );
+    open.send(answer);
+
+    if answer == b"y\n" {
+        open.await_text("FAKE AGENT READY");
+        let resumes = fs::read_to_string(&resumes).unwrap();
+        assert_eq!(resumes.lines().collect::<Vec<_>>(), [identity]);
+        let panes = board.tmux(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{@pika_session_id}|#{pane_current_command}",
+        ]);
+        assert!(
+            panes
+                .lines()
+                .any(|line| line.starts_with(&format!("{identity}|"))),
+            "{panes}"
+        );
+        board.detach_client(open.child.id());
+        // This private harness can keep the launched UI process around after
+        // tmux detaches its client. Its behavior is covered above; terminate
+        // the disposable command so the journey can finish deterministically.
+        if open.child.try_wait().unwrap().is_none() {
+            open.child.kill().unwrap();
+            let _ = open.child.wait();
+        }
+        assert!(
+            store
+                .live_owners(Provider::Codex, identity)
+                .unwrap()
+                .is_empty()
+        );
+    } else {
+        open.await_text("No shared-owner repair requested");
+        assert_eq!(open.wait().code(), Some(1));
+        assert!(!resumes.exists(), "confirmation was omitted or declined");
+        let owners = store.live_owners(Provider::Codex, identity).unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].owner_token, "fake-shared-server-owner");
+        assert!(
+            store
+                .get_resume_reservation(Provider::Codex, identity)
+                .unwrap()
+                .is_some(),
+            "No must preserve the existing resume reservation"
+        );
+        assert!(shared_server.child.try_wait().unwrap().is_none());
+        assert!(
+            store
+                .get_session(Provider::Codex, identity)
+                .unwrap()
+                .unwrap()
+                .unread
+        );
+    }
+    assert!(shared_server.child.try_wait().unwrap().is_none());
+    assert!(
+        !server_term.exists(),
+        "Pika must not stop the shared server"
+    );
 }
 
 #[test]
@@ -1459,21 +1890,21 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
                 .unwrap()
                 .to_owned();
             let mut bytes = [0; 32768];
-            while let Ok(count) = other._terminal.read(&mut bytes) {
+            while let Ok(count) = other.terminal.read(&mut bytes) {
                 if count == 0 {
                     break;
                 }
             }
-            other._terminal.write_all(b"\x1b[24~").unwrap();
+            other.terminal.write_all(b"\x1b[24~").unwrap();
             let other_viewer = board.await_thread_list(&original);
-            other._terminal.write_all(b"1").unwrap();
+            other.terminal.write_all(b"1").unwrap();
             thread::sleep(Duration::from_millis(300));
             assert_eq!(board.client_pane(&other_client), other_viewer);
             board.checkpoint(
                 "Second Pika terminal · 1 cannot borrow first terminal history",
                 &store,
             );
-            other._terminal.write_all(b"\x1b").unwrap();
+            other.terminal.write_all(b"\x1b").unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             while board
                 .tmux(&["list-panes", "-t", &original, "-F", "#{pane_id}"])
@@ -1484,7 +1915,7 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
                     Instant::now() < deadline,
                     "second terminal's Esc did not reclaim its viewer"
                 );
-                while let Ok(count) = other._terminal.read(&mut bytes) {
+                while let Ok(count) = other.terminal.read(&mut bytes) {
                     if count == 0 {
                         break;
                     }
