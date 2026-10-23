@@ -91,4 +91,8 @@ build_and_run store_contract "${store_tests[@]}"
 build_and_run board_journey_contract "${board_tests[@]}"
 build_and_run real_tmux_contract "${real_tmux_tests[@]}"
 build_and_run identity_safety_contract "${identity_tests[@]}"
+build_and_run stale_pending_resume_journey \
+  stale_identityless_pending_resumes_saved_uuid_once_and_preserves_neighbors \
+  concurrent_opens_of_identityless_dead_pending_create_one_exact_home \
+  dead_root_without_authenticated_exit_remains_fail_closed
 build_and_run terminal_signal_contract real_terminal_bridge_forwards_signals_and_restores_caller_tty

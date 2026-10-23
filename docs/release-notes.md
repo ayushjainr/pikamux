@@ -1,3 +1,15 @@
+Pika 0.6.53 lets an exact saved conversation reopen after a same-name startup
+has exited. Recovery requires an authenticated exit, a dead recorded process
+generation, no surviving terminal or runtime owner, and compatible identity
+evidence. It atomically retires only the unchanged reservation and retains its
+diagnostic record. Age alone never authorizes recovery.
+
+Repeated and concurrent opens are covered by isolated native terminal journeys.
+Missing proof and conflicting identities remain explicit blocks. Updating does
+not restart agents, discard history, rewrite hooks or install an iPhone build.
+
+Retained changes from 0.6.52:
+
 Pika 0.6.52 repairs stale resume reservations and makes retained launch state
 accurate. A dead reservation owner no longer causes an endless “already being
 resumed” message. Recovery checks process generations and concurrent state

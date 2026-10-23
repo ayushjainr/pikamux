@@ -395,6 +395,13 @@ Shared-only ownership instead requires the user's confirmation that all clients
 for the selected conversation have exited; it revalidates the full lease set,
 rejects busy tagged terminals and dedicated owners, and never signals the shared
 server. Neither recovery changes the selected conversation identity.
+Explicitly reopening a saved conversation may retire a same-name failed startup
+reservation when its authenticated wrapper exit, dead recorded process generation,
+absent terminal and complete runtime observation agree. Pending identity hints
+and bindings must not name another conversation. Retirement atomically compares
+the observed row and launch metadata and retains them as diagnostic evidence;
+it does not use age as proof, discard history or launch an unnamed replacement.
+Missing exit proof, live owners and changed observations remain explicit blocks.
 During ordinary reconciliation, an independently proven exact home can complete
 a stranded startup record with the same expected conversation, pane, launch
 token, binding, and phase. Only its confirmed process generation replaces the

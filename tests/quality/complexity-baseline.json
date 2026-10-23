@@ -103,9 +103,6 @@
     "src/core.rs::reconcile_one_in": [
       35
     ],
-    "src/core.rs::resume_session": [
-      41
-    ],
     "src/doctor.rs::inspect_identity": [
       60
     ],

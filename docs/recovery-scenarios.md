@@ -58,6 +58,11 @@ the runner.
 - A nested provider helper cannot steal the conversation owner's pane.
 - Keyboard Ctrl+C and external SIGINT each reach a cancellation-capable child
   once without closing the terminal bridge; terminal modes restore after exit.
+- A failed same-name launch with an authenticated exit, missing terminal and
+  dead process generation no longer blocks reopening an existing saved UUID.
+  The isolated `stale_pending_resume_journey` checks one provider launch across
+  repeated opens and preservation of unrelated state. A missing exit receipt
+  stays an explicit uncertainty block, even when the recorded PID is dead.
 
 ### Identity-safety failure paths
 

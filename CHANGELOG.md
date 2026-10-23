@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.53 — Recover exited startup reservations on exact reopen
+
+- Reopen a saved conversation after a same-name startup exited, when its
+  authenticated exit and complete runtime evidence prove the old owner is gone.
+- Atomically retire the unchanged reservation while retaining diagnostic
+  evidence; refuse conflicting identities, live owners and incomplete proof.
+- Verify repeated and concurrent exact opens with isolated native terminal tests.
+
+Updating preserves history and does not restart running agents or rewrite hooks.
+
 ## 0.6.52 — Recover stale resumes and report live state accurately
 
 - Reclaim a resume reservation only after proving its recorded process

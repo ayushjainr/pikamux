@@ -276,6 +276,16 @@ pub struct PendingLaunchExit {
     pub observed_at: f64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PendingLaunchRetirementSnapshot {
+    pub pending: PendingLaunch,
+    pub phase: Option<String>,
+    pub exit_raw: Option<String>,
+    pub wrapper_owner: Option<String>,
+    pub binding: Option<(Provider, String)>,
+    pub authenticated_exit: Option<PendingLaunchExit>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PendingLaunchWrapperOwner {
     provider: Provider,
@@ -1470,6 +1480,55 @@ impl Store {
         Ok(deleted)
     }
 
+    /// Read all launch evidence under one SQLite snapshot, including whether
+    /// the wrapper-exit receipt authenticates against the owner token.
+    pub(crate) fn pending_retirement_snapshot(
+        &self,
+        launch_token: &str,
+    ) -> Result<Option<PendingLaunchRetirementSnapshot>> {
+        if !self.exists() {
+            return Ok(None);
+        }
+        let mut db = self.open_read()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let snapshot = pending_retirement_state(&tx, launch_token)?;
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
+    /// Retire a pending row only if every observed launch field is unchanged.
+    /// The removed reservation remains queryable as a token-scoped archive.
+    pub(crate) fn retire_pending_if_unchanged(
+        &self,
+        snapshot: &PendingLaunchRetirementSnapshot,
+        reason: &str,
+    ) -> Result<bool> {
+        let mut db = self.open_write()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = pending_retirement_state(&tx, &snapshot.pending.launch_token)?;
+        if current.as_ref() != Some(snapshot) {
+            tx.commit()?;
+            return Ok(false);
+        }
+        archive_retired_pending(&tx, snapshot, reason)?;
+        let deleted = tx.execute(
+            "DELETE FROM pending_launches WHERE launch_token=? AND created_at=?",
+            params![snapshot.pending.launch_token, snapshot.pending.created_at],
+        )? == 1;
+        if deleted {
+            tx.execute(
+                "DELETE FROM meta WHERE key IN (?,?,?)",
+                params![
+                    launch_phase_key(&snapshot.pending.launch_token),
+                    pending_launch_exit_key(&snapshot.pending.launch_token),
+                    pending_launch_wrapper_owner_key(&snapshot.pending.launch_token)
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     pub fn get_pending(&self, launch_token: &str) -> Result<Option<PendingLaunch>> {
         if !self.exists() {
             return Ok(None);
@@ -1482,6 +1541,18 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Return preserved launch diagnostics for a pending row retired only
+    /// after exact dead-owner proof. The record is intentionally not projected
+    /// as an active launch, but remains available to recovery tooling.
+    pub fn get_retired_pending_launch(&self, launch_token: &str) -> Result<Option<Value>> {
+        let Some(encoded) = self.get_meta(&retired_pending_key(launch_token))? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_str(&encoded).context(
+            "retired pending launch diagnostic archive is invalid",
+        )?))
     }
 
     /// Return an exit receipt only while it still belongs to the current exact
@@ -3444,6 +3515,10 @@ fn pending_launch_wrapper_owner_key(launch_token: &str) -> String {
     format!("pending_launch_wrapper_owner:{launch_token}")
 }
 
+fn retired_pending_key(launch_token: &str) -> String {
+    format!("retired_pending_launch:{launch_token}")
+}
+
 fn provider_hidden_key(provider: Provider, session_id: &str) -> String {
     format!("provider-hidden:{}:{session_id}", provider.as_str())
 }
@@ -4611,6 +4686,116 @@ fn pending_from_row(row: &Row<'_>) -> rusqlite::Result<PendingLaunch> {
         candidate_observed_at: row.get("candidate_observed_at")?,
         created_at: row.get("created_at")?,
     })
+}
+
+fn retirement_meta(tx: &Transaction<'_>, key: String) -> Result<Option<String>> {
+    Ok(tx
+        .query_row("SELECT value FROM meta WHERE key=?", [key], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+fn pending_retirement_state(
+    tx: &Transaction<'_>,
+    launch_token: &str,
+) -> Result<Option<PendingLaunchRetirementSnapshot>> {
+    let Some(pending) = tx
+        .query_row(
+            "SELECT * FROM pending_launches WHERE launch_token=?",
+            [launch_token],
+            pending_from_row,
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let phase = retirement_meta(tx, launch_phase_key(launch_token))?;
+    let exit_raw = retirement_meta(tx, pending_launch_exit_key(launch_token))?;
+    let wrapper_owner = retirement_meta(tx, pending_launch_wrapper_owner_key(launch_token))?;
+    let binding = tx
+        .query_row(
+            "SELECT provider,session_id FROM launch_bindings WHERE launch_token=?",
+            [launch_token],
+            |row| Ok((parse_provider(row.get_ref(0)?.as_str()?, 0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let authenticated_exit = authenticated_pending_exit(
+        &pending,
+        phase.as_deref(),
+        exit_raw.as_deref(),
+        wrapper_owner.as_deref(),
+        binding.as_ref(),
+    );
+    Ok(Some(PendingLaunchRetirementSnapshot {
+        pending,
+        phase,
+        exit_raw,
+        wrapper_owner,
+        binding,
+        authenticated_exit,
+    }))
+}
+
+fn authenticated_pending_exit(
+    pending: &PendingLaunch,
+    phase: Option<&str>,
+    exit_raw: Option<&str>,
+    owner_raw: Option<&str>,
+    binding: Option<&(Provider, String)>,
+) -> Option<PendingLaunchExit> {
+    if !matches!(phase, Some("provider_starting" | "provider_observed")) {
+        return None;
+    }
+    let exit = serde_json::from_str::<PendingLaunchExit>(exit_raw?).ok()?;
+    let owner = serde_json::from_str::<PendingLaunchWrapperOwner>(owner_raw?).ok()?;
+    if !pending_exit_owner_matches(&owner, pending, pending.provider, Some(&owner.owner_token))
+        || !pending_exit_binding_matches(pending, pending.provider, None, &binding.cloned())
+        || exit.provider != pending.provider
+        || exit.pending_created_at != pending.created_at
+        || !exit.observed_at.is_finite()
+        || exit.observed_at < pending.created_at
+    {
+        return None;
+    }
+    Some(exit)
+}
+
+fn archive_retired_pending(
+    tx: &Transaction<'_>,
+    snapshot: &PendingLaunchRetirementSnapshot,
+    reason: &str,
+) -> Result<()> {
+    let pending = &snapshot.pending;
+    let archive = serde_json::json!({
+        "pending": {
+            "launch_token": pending.launch_token,
+            "provider": pending.provider.as_str(),
+            "name": pending.name,
+            "cwd": pending.cwd,
+            "tmux_session": pending.tmux_session,
+            "tmux_pane": pending.tmux_pane,
+            "expected_session_id": pending.expected_session_id,
+            "root_pid": pending.root_pid,
+            "root_pid_start": pending.root_pid_start,
+            "preexisting_session_ids": pending.preexisting_session_ids,
+            "candidate_session_id": pending.candidate_session_id,
+            "candidate_observed_at": pending.candidate_observed_at,
+            "created_at": pending.created_at,
+        },
+        "phase": snapshot.phase,
+        "exit": snapshot.exit_raw,
+        "wrapper_owner": snapshot.wrapper_owner,
+        "binding": snapshot.binding,
+        "authenticated_exit": snapshot.authenticated_exit,
+        "retired_at": now(),
+        "reason": reason,
+    });
+    tx.execute(
+        "INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![retired_pending_key(&pending.launch_token), archive.to_string()],
+    )?;
+    Ok(())
 }
 
 fn live_owner_from_row(row: &Row<'_>) -> rusqlite::Result<LiveOwner> {
