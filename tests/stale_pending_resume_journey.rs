@@ -119,17 +119,26 @@ impl Journey {
     }
 
     fn spawn_open(&self) -> std::process::Child {
-        ProcessCommand::new(&self.script_executable)
+        let mut command = ProcessCommand::new(&self.script_executable);
+        command
             .env_clear()
             .envs(self.env.clone())
-            .current_dir(self.base())
-            .args([
-                "-q",
-                "/dev/null",
-                env!("CARGO_BIN_EXE_pika"),
-                "open",
-                "ts_monthly",
-            ])
+            .current_dir(self.base());
+        #[cfg(target_os = "linux")]
+        {
+            let pika_command =
+                shell_words::join([env!("CARGO_BIN_EXE_pika"), "open", "ts_monthly"]);
+            command.args(["-q", "-e", "-c", &pika_command, "/dev/null"]);
+        }
+        #[cfg(not(target_os = "linux"))]
+        command.args([
+            "-q",
+            "/dev/null",
+            env!("CARGO_BIN_EXE_pika"),
+            "open",
+            "ts_monthly",
+        ]);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -273,7 +282,9 @@ fn run_open(journey: &Journey) -> Output {
 
 #[test]
 fn stale_identityless_pending_resumes_saved_uuid_once_and_preserves_neighbors() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let journey = Journey::new();
     let cwd = journey.base();
     let store = Store::at(journey.base().join("state/pika.db"));
@@ -364,7 +375,9 @@ fn stale_identityless_pending_resumes_saved_uuid_once_and_preserves_neighbors() 
 
 #[test]
 fn concurrent_opens_of_identityless_dead_pending_create_one_exact_home() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let journey = Journey::new();
     let cwd = journey.base();
     let store = Store::at(journey.base().join("state/pika.db"));
@@ -468,7 +481,9 @@ fn concurrent_opens_of_identityless_dead_pending_create_one_exact_home() {
 
 #[test]
 fn dead_root_without_authenticated_exit_remains_fail_closed() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let journey = Journey::new();
     let cwd = journey.base();
     let store = Store::at(journey.base().join("state/pika.db"));

@@ -1,4 +1,4 @@
-Pika 0.6.53 lets an exact saved conversation reopen after a same-name startup
+Pika 0.6.54 lets an exact saved conversation reopen after a same-name startup
 has exited. Recovery requires an authenticated exit, a dead recorded process
 generation, no surviving terminal or runtime owner, and compatible identity
 evidence. It atomically retires only the unchanged reservation and retains its

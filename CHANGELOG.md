@@ -1,6 +1,9 @@
 # Changelog
 
-## 0.6.53 — Recover exited startup reservations on exact reopen
+## 0.6.54 — Recover exited startup reservations on exact reopen
+
+The 0.6.53 candidate was not published: Linux CI caught a test-terminal
+invocation mismatch. This candidate corrects that platform-specific fixture.
 
 - Reopen a saved conversation after a same-name startup exited, when its
   authenticated exit and complete runtime evidence prove the old owner is gone.
