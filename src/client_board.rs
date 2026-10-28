@@ -275,6 +275,8 @@ pub(crate) fn start_activity_feed(store: &Store) -> Result<crate::activity_feed:
                 }
             }
         }
+        // Completion means owned inventory connections have closed, too.
+        read_transport.clear();
         let _ = done_send.send(());
     });
     summary_source.own_observer(refresh, move || {

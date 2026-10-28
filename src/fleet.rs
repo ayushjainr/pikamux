@@ -2467,7 +2467,7 @@ fn decode_read_only_response(
     operation: &str,
     expected_node_id: &str,
 ) -> Result<(), FleetError> {
-    let object = object(&response, "Remote Pika response is not an object")?;
+    let object = object(response, "Remote Pika response is not an object")?;
     if object.get("type").and_then(Value::as_str) == Some("error") {
         return Err(FleetError::new(
             parse_error_kind(object.get("kind").and_then(Value::as_str)),
@@ -2477,7 +2477,7 @@ fn decode_read_only_response(
                 .unwrap_or("remote Pika error"),
         ));
     }
-    validate_readonly_receipt(&response, operation, expected_node_id)
+    validate_readonly_receipt(response, operation, expected_node_id)
 }
 
 fn validate_readonly_receipt(
