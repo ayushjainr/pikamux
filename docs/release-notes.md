@@ -1,4 +1,4 @@
-Pika 0.6.57 stops repeated SSH logins during board inventory refreshes and thread
+Pika 0.6.58 stops repeated SSH logins during board inventory refreshes and thread
 previews. Foreground-owned connections carry successive read-only requests over
 the existing fleet protocol. Exact machine/route checks, bounded frames and
 normal offline behavior remain intact. Failed or cancelled requests are not

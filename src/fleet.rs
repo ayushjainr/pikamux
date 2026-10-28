@@ -2301,6 +2301,7 @@ struct PersistentFleetSession {
     input: Option<AsyncChildInput>,
     events: Option<Receiver<Result<Value, FleetError>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    stderr_done: Receiver<()>,
     pipe_stop: CancellationToken,
     workers: Vec<thread::JoinHandle<()>>,
 }
@@ -2349,12 +2350,14 @@ impl PersistentFleetSession {
         let (sender, events) = mpsc::sync_channel(2);
         let output_worker = spawn_jsonl_reader(output, sender, MAX_MESSAGE_BYTES);
         let stderr = Arc::new(Mutex::new(Vec::new()));
-        let stderr_worker = spawn_bounded_stderr(errors, stderr.clone(), MAX_STDERR_BYTES);
+        let (stderr_worker, stderr_done) =
+            spawn_bounded_stderr_notifying(errors, stderr.clone(), MAX_STDERR_BYTES);
         Ok(Self {
             child,
             input: Some(input),
             events: Some(events),
             stderr,
+            stderr_done,
             pipe_stop,
             workers: vec![input_worker, output_worker, stderr_worker],
         })
@@ -2368,20 +2371,31 @@ impl PersistentFleetSession {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Value, FleetError> {
-        self.ensure_no_queued_frame()?;
         if cancellation.is_cancelled() {
             return Err(FleetError::new(
                 FleetErrorKind::Unreachable,
                 "Fleet snapshot cancelled before dispatch",
             ));
         }
-        self.input
+        self.ensure_no_queued_frame(deadline, cancellation)?;
+        let sent = self
+            .input
             .as_ref()
             .ok_or_else(|| FleetError::new(FleetErrorKind::Unreachable, "Fleet input closed"))?
-            .send(bytes.to_vec(), deadline, cancellation)?;
+            .send(bytes.to_vec(), deadline, cancellation);
+        if let Err(error) = sent {
+            let connection_error = self.closed_error(deadline, cancellation);
+            if matches!(
+                connection_error.kind,
+                FleetErrorKind::Authentication | FleetErrorKind::Missing
+            ) {
+                return Err(connection_error);
+            }
+            return Err(error);
+        }
         let response = self.receive_response(deadline, cancellation)?;
         decode_read_only_response(&response, operation, expected_node_id)?;
-        self.ensure_no_queued_frame()?;
+        self.ensure_no_queued_frame(deadline, cancellation)?;
         Ok(response)
     }
 
@@ -2413,34 +2427,54 @@ impl PersistentFleetSession {
                 Ok(Ok(response)) => return Ok(response),
                 Ok(Err(error)) => return Err(error),
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return Err(self.closed_error()),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(self.closed_error(deadline, cancellation));
+                }
             }
         }
     }
 
-    fn closed_error(&mut self) -> FleetError {
+    fn closed_error(&mut self, deadline: Instant, cancellation: &CancellationToken) -> FleetError {
         let status = poll_owned_child(&mut self.child).ok().flatten();
+        if status.is_none() {
+            let _ = terminate_child(&mut self.child);
+        }
+        // Do not cancel the stderr reader until it has drained the child pipe:
+        // SSH authentication and missing-command failures are reported there.
+        let drain_deadline = Instant::now()
+            + Duration::from_millis(250).min(deadline.saturating_duration_since(Instant::now()));
+        while !cancellation.is_cancelled() && Instant::now() < drain_deadline {
+            match self.stderr_done.recv_timeout(
+                drain_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(10)),
+            ) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+        let detail = self
+            .stderr
+            .lock()
+            .map(|value| sanitize_terminal_text(&String::from_utf8_lossy(&value)))
+            .unwrap_or_default();
         self.shutdown();
-        ssh_connection_closed_error(
-            status.as_ref().and_then(ExitStatus::code),
-            self.stderr
-                .lock()
-                .map(|value| sanitize_terminal_text(&String::from_utf8_lossy(&value)))
-                .unwrap_or_default(),
-        )
+        ssh_connection_closed_error(status.as_ref().and_then(ExitStatus::code), detail)
     }
 
-    fn ensure_no_queued_frame(&self) -> Result<(), FleetError> {
-        let events = self
+    fn ensure_no_queued_frame(
+        &mut self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), FleetError> {
+        let event = self
             .events
             .as_ref()
+            .map(Receiver::try_recv)
             .ok_or_else(|| FleetError::new(FleetErrorKind::Unreachable, "Fleet output closed"))?;
-        match events.try_recv() {
+        match event {
             Err(mpsc::TryRecvError::Empty) => Ok(()),
-            Err(mpsc::TryRecvError::Disconnected) => Err(FleetError::new(
-                FleetErrorKind::Unreachable,
-                "Persistent fleet connection closed between snapshot frames",
-            )),
+            Err(mpsc::TryRecvError::Disconnected) => Err(self.closed_error(deadline, cancellation)),
             Ok(_) => Err(FleetError::new(
                 FleetErrorKind::Incompatible,
                 "Persistent fleet connection emitted an unsolicited snapshot frame",
@@ -2963,11 +2997,8 @@ done
     fn persistent_transport_preserves_authentication_failure_classification() {
         let root = tempfile::tempdir().unwrap();
         let ssh = root.path().join("fake-ssh");
-        let script = "#!/bin/sh\nIFS= read -r request\nprintf 'Permission denied (publickey).\\n' >&2\nexit 255\n";
-        fs::write(&ssh, script).unwrap();
-        let mut permissions = fs::metadata(&ssh).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&ssh, permissions).unwrap();
+        let script = "#!/bin/sh\n(sleep 30 1>&-) &\nIFS= read -r request\nprintf 'Permission denied (publickey).\\n' >&2\nexec 1>&-\nexit 255\n";
+        install_fake_ssh(&ssh, script);
         let transport = SshReadOnlyTransport::new(SshTransport::new(
             &ssh,
             Duration::from_secs(1),
@@ -2980,6 +3011,30 @@ done
                     &request("11111111-1111-4111-8111-111111111111"),
                     false
                 )
+                .unwrap_err()
+                .kind,
+            FleetErrorKind::Authentication
+        );
+    }
+
+    #[test]
+    fn authentication_failure_is_classified_when_ssh_exits_before_reading_input() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("fake-ssh");
+        install_fake_ssh(
+            &ssh,
+            "#!/bin/sh\nprintf 'Permission denied (publickey).\\n' >&2\nexec 1>&-\nexit 255\n",
+        );
+        let transport = SshReadOnlyTransport::new(SshTransport::new(
+            &ssh,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ));
+        let mut payload = request("11111111-1111-4111-8111-111111111111");
+        payload["padding"] = Value::String("x".repeat(MAX_MESSAGE_BYTES / 4));
+        assert_eq!(
+            transport
+                .request("atlas", &payload, false)
                 .unwrap_err()
                 .kind,
             FleetErrorKind::Authentication
@@ -6839,6 +6894,29 @@ fn spawn_bounded_stderr<R: Read + Send + 'static>(
             *target = collected;
         }
     })
+}
+
+fn spawn_bounded_stderr_notifying<R: Read + Send + 'static>(
+    reader: R,
+    destination: Arc<Mutex<Vec<u8>>>,
+    max: usize,
+) -> (thread::JoinHandle<()>, Receiver<()>) {
+    let (done_sender, done_receiver) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        let mut reader = reader;
+        let mut chunk = [0_u8; 8192];
+        while let Ok(count) = reader.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            if let Ok(mut target) = destination.lock() {
+                let remaining = max.saturating_sub(target.len());
+                target.extend_from_slice(&chunk[..count.min(remaining)]);
+            }
+        }
+        let _ = done_sender.send(());
+    });
+    (worker, done_receiver)
 }
 fn wait_child(child: &mut OwnedChild, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
