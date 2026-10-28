@@ -2548,18 +2548,59 @@ mod read_only_transport_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn fake_ssh(path: &Path, launches: &Path, pid_file: &Path) {
-        let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> {}\nprintf '%s' \"$$\" > {}\nn=0\nwhile IFS= read -r request; do\n  n=$((n + 1))\n  node=$(printf '%s\\n' \"$request\" | sed -n 's/.*\\\"expected_node_id\\\":\\\"\\([^\\\"]*\\)\\\".*/\\1/p')\n  case \"$request\" in\n    *\\\"op\\\":\\\"peek\\\"*) printf '{{\\\"type\\\":\\\"peek\\\",\\\"node_id\\\":\\\"%s\\\",\\\"text\\\":\\\"frame-%s\\\"}}\\n' \"$node\" \"$n\" ;;\n    *) printf '{{\\\"type\\\":\\\"snapshot\\\",\\\"protocol\\\":\\\"%s\\\",\\\"version\\\":%s,\\\"node_id\\\":\\\"%s\\\",\\\"machine\\\":\\\"atlas\\\",\\\"captured_at\\\":%s,\\\"sessions\\\":[],\\\"profiles\\\":[],\\\"cards\\\":[]}}\\n' '{}' '{}' \"$node\" \"$n\" ;;\n  esac\ndone\n",
-            shell_quote(&launches.display().to_string()),
-            shell_quote(&pid_file.display().to_string()),
-            PROTOCOL_NAME,
-            PROTOCOL_VERSION,
-        );
-        fs::write(path, script).unwrap();
+    fn install_fake_ssh(path: &Path, body: &str) {
+        let script_path = path.with_file_name(format!(
+            "{}-body",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("ssh")
+        ));
+        fs::write(&script_path, body).unwrap();
+        let launcher = if Path::new("/bin/dash").is_file() {
+            format!(
+                "#!/bin/sh\nexec /bin/dash {} \"$@\"\n",
+                shell_quote(&script_path.display().to_string())
+            )
+        } else {
+            body.to_owned()
+        };
+        fs::write(path, launcher).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn fake_ssh(path: &Path, launches: &Path, pid_file: &Path) {
+        let snapshot = json!({
+            "type": "snapshot", "protocol": PROTOCOL_NAME, "version": PROTOCOL_VERSION,
+            "node_id": "NODE_ID", "machine": "atlas", "captured_at": 0,
+            "sessions": [], "profiles": [], "cards": []
+        })
+        .to_string();
+        let peek = json!({"type": "peek", "node_id": "NODE_ID", "text": "frame-COUNT"}).to_string();
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$$" >> {}
+printf '%s' "$$" > {}
+snapshot={}
+peek={}
+n=0
+while IFS= read -r request; do
+  n=$((n + 1))
+  node=$(printf '%s\n' "$request" | sed -n 's/.*"expected_node_id":"\([^"]*\)".*/\1/p')
+  case "$request" in
+    *'"op":"peek"'*) response=$(printf '%s' "$peek" | sed "s/NODE_ID/$node/g;s/COUNT/$n/") ;;
+    *) response=$(printf '%s' "$snapshot" | sed "s/NODE_ID/$node/g;s/\"captured_at\":0/\"captured_at\":$n/") ;;
+  esac
+  printf '%s\n' "$response"
+done
+"#,
+            shell_quote(&launches.display().to_string()),
+            shell_quote(&pid_file.display().to_string()),
+            shell_quote(&snapshot),
+            shell_quote(&peek),
+        );
+        install_fake_ssh(path, &script);
     }
 
     fn request(node_id: &str) -> Value {
@@ -2678,10 +2719,7 @@ mod read_only_transport_tests {
             shell_quote(&launches.display().to_string()),
             shell_quote(&pid_file.display().to_string()),
         );
-        fs::write(&ssh, script).unwrap();
-        let mut permissions = fs::metadata(&ssh).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&ssh, permissions).unwrap();
+        install_fake_ssh(&ssh, &script);
         let node_id = "11111111-1111-4111-8111-111111111111";
         let transport = SshReadOnlyTransport::new(SshTransport::new(
             &ssh,
@@ -2716,10 +2754,7 @@ mod read_only_transport_tests {
             "#!/bin/sh\nprintf '%s' \"$$\" > {}\nwhile IFS= read -r request; do sleep 30; done\n",
             shell_quote(&pid_file.display().to_string()),
         );
-        fs::write(&ssh, script).unwrap();
-        let mut permissions = fs::metadata(&ssh).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&ssh, permissions).unwrap();
+        install_fake_ssh(&ssh, &script);
         let node_id = "11111111-1111-4111-8111-111111111111";
         let transport = SshReadOnlyTransport::new(SshTransport::new(
             &ssh,
@@ -2788,16 +2823,18 @@ mod read_only_transport_tests {
         let root = tempfile::tempdir().unwrap();
         let ssh = root.path().join("fake-ssh");
         let launches = root.path().join("launches");
+        let wrong_node_response = json!({
+            "type": "snapshot", "protocol": PROTOCOL_NAME, "version": PROTOCOL_VERSION,
+            "node_id": "22222222-2222-4222-8222-222222222222", "machine": "atlas",
+            "captured_at": 1, "sessions": [], "profiles": [], "cards": []
+        })
+        .to_string();
         let script = format!(
-            "#!/bin/sh\nprintf 'launch\\n' >> {}\nwhile IFS= read -r request; do printf '{{\\\"type\\\":\\\"snapshot\\\",\\\"protocol\\\":\\\"{}\\\",\\\"version\\\":{},\\\"node_id\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"machine\\\":\\\"atlas\\\",\\\"captured_at\\\":1,\\\"sessions\\\":[],\\\"profiles\\\":[],\\\"cards\\\":[]}}\\n'; done\n",
+            "#!/bin/sh\nprintf 'launch\\n' >> {}\nwhile IFS= read -r request; do printf '%s\\n' {}; done\n",
             shell_quote(&launches.display().to_string()),
-            PROTOCOL_NAME,
-            PROTOCOL_VERSION,
+            shell_quote(&wrong_node_response),
         );
-        fs::write(&ssh, script).unwrap();
-        let mut permissions = fs::metadata(&ssh).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&ssh, permissions).unwrap();
+        install_fake_ssh(&ssh, &script);
         let node_id = "11111111-1111-4111-8111-111111111111";
         let transport = SshReadOnlyTransport::new(SshTransport::new(
             &ssh,

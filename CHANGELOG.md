@@ -1,10 +1,12 @@
 # Changelog
 
-## 0.6.56 — Reuse board SSH connections
+## 0.6.57 — Reuse board SSH connections
 
 The 0.6.55 candidate was not published: strict lint caught redundant borrows
 and a Windows-only unused cleanup method. This candidate corrects those findings
 and explicitly closes Windows inventory connections before reporting shutdown.
+The 0.6.56 candidate was also withheld: Linux caught a shell-specific quoting
+error in the simulated SSH fixture. The fixture now emits literal JSON portably.
 
 - Keep foreground-owned SSH connections open for repeated fleet snapshots and
   thread previews instead of opening a new login for every refresh.
