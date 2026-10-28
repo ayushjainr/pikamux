@@ -15,7 +15,7 @@ use crate::store::{MAX_REMOTE_SNAPSHOT_BYTES, Store, StoredExpertProfile};
 use crate::update::RemoteInstallBundle;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -1906,99 +1906,9 @@ impl FleetTransport for SshTransport {
         mutating: bool,
         cancellation: &CancellationToken,
     ) -> Result<Value, FleetError> {
-        let mut input = serde_json::to_vec(payload)
-            .map_err(|error| FleetError::new(FleetErrorKind::InvalidRequest, error.to_string()))?;
-        input.push(b'\n');
-        if input.len() > MAX_MESSAGE_BYTES {
-            return Err(FleetError::new(
-                FleetErrorKind::InvalidRequest,
-                "Fleet request exceeded the safety limit",
-            ));
-        }
-        let mut command =
-            self.command(target, &["_fleet".to_owned(), "--stdio".to_owned()], false)?;
-        let output = run_bounded_command_cancellable(
-            &mut command,
-            Some(&input),
-            self.overall_timeout,
-            MAX_MESSAGE_BYTES,
-            MAX_STDERR_BYTES,
-            cancellation,
-        )
-        .map_err(|error| {
-            if error.kind == FleetErrorKind::Unreachable && mutating {
-                FleetError::new(FleetErrorKind::OutcomeUnknown, error.message)
-            } else {
-                error
-            }
-        })?;
-        if !output.status.success() {
-            let bytes = if output.stderr.is_empty() {
-                &output.stdout
-            } else {
-                &output.stderr
-            };
-            let detail = sanitize_terminal_text(
-                std::str::from_utf8(bytes).unwrap_or("SSH returned invalid text"),
-            );
-            let folded = detail.to_lowercase();
-            let kind = if output.status.code() == Some(127)
-                || folded.contains("pika: not found")
-                || folded.contains("pika: command not found")
-            {
-                FleetErrorKind::Missing
-            } else if folded.contains("permission denied")
-                || folded.contains("host key verification")
-                || folded.contains("no identities")
-            {
-                FleetErrorKind::Authentication
-            } else if mutating {
-                FleetErrorKind::OutcomeUnknown
-            } else {
-                FleetErrorKind::Unreachable
-            };
-            return Err(FleetError::new(
-                kind,
-                if detail.is_empty() {
-                    format!("SSH exited {}", output.status)
-                } else {
-                    prefix_tail(&detail, 500)
-                },
-            ));
-        }
-        let stdout = std::str::from_utf8(&output.stdout).map_err(|_| {
-            FleetError::new(
-                FleetErrorKind::Incompatible,
-                "Remote Pika emitted non-UTF-8 output",
-            )
-        })?;
-        let lines: Vec<_> = stdout
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        if lines.len() != 1 {
-            return Err(FleetError::new(
-                FleetErrorKind::Incompatible,
-                "Remote Pika emitted a malformed JSONL response",
-            ));
-        }
-        let response: Value = serde_json::from_str(lines[0]).map_err(|_| {
-            FleetError::new(
-                FleetErrorKind::Incompatible,
-                "Remote Pika emitted non-JSON output",
-            )
-        })?;
-        let object = object(&response, "Remote Pika response is not an object")?;
-        if object.get("type").and_then(Value::as_str) == Some("error") {
-            return Err(FleetError::new(
-                parse_error_kind(object.get("kind").and_then(Value::as_str)),
-                object
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("remote Pika error"),
-            ));
-        }
-        Ok(response)
+        let input = encode_fleet_request(payload)?;
+        let output = self.run_fleet_request(target, &input, mutating, cancellation)?;
+        decode_fleet_output(output, mutating)
     }
 
     fn run_exact(
@@ -2020,6 +1930,1067 @@ impl FleetTransport for SshTransport {
                 )
             })?;
         Ok(status.code().unwrap_or(1))
+    }
+}
+
+impl SshTransport {
+    fn run_fleet_request(
+        &self,
+        target: &str,
+        input: &[u8],
+        mutating: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<BoundedOutput, FleetError> {
+        let mut command = self.command(target, &["_fleet".into(), "--stdio".into()], false)?;
+        run_bounded_command_cancellable(
+            &mut command,
+            Some(input),
+            self.overall_timeout,
+            MAX_MESSAGE_BYTES,
+            MAX_STDERR_BYTES,
+            cancellation,
+        )
+        .map_err(|error| classify_ssh_launch_error(error, mutating))
+    }
+}
+
+fn encode_fleet_request(payload: &Value) -> Result<Vec<u8>, FleetError> {
+    let mut input = serde_json::to_vec(payload)
+        .map_err(|error| FleetError::new(FleetErrorKind::InvalidRequest, error.to_string()))?;
+    input.push(b'\n');
+    if input.len() > MAX_MESSAGE_BYTES {
+        return Err(FleetError::new(
+            FleetErrorKind::InvalidRequest,
+            "Fleet request exceeded the safety limit",
+        ));
+    }
+    Ok(input)
+}
+
+fn classify_ssh_launch_error(error: FleetError, mutating: bool) -> FleetError {
+    if error.kind == FleetErrorKind::Unreachable && mutating {
+        FleetError::new(FleetErrorKind::OutcomeUnknown, error.message)
+    } else {
+        error
+    }
+}
+
+fn decode_fleet_output(output: BoundedOutput, mutating: bool) -> Result<Value, FleetError> {
+    if !output.status.success() {
+        return Err(ssh_exit_error(&output, mutating));
+    }
+    let response = decode_fleet_jsonl(&output.stdout)?;
+    decode_remote_fleet_error(response)
+}
+
+fn ssh_exit_error(output: &BoundedOutput, mutating: bool) -> FleetError {
+    let bytes = if output.stderr.is_empty() {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    let detail =
+        sanitize_terminal_text(std::str::from_utf8(bytes).unwrap_or("SSH returned invalid text"));
+    let folded = detail.to_lowercase();
+    let kind = if output.status.code() == Some(127)
+        || folded.contains("pika: not found")
+        || folded.contains("pika: command not found")
+    {
+        FleetErrorKind::Missing
+    } else if folded.contains("permission denied")
+        || folded.contains("host key verification")
+        || folded.contains("no identities")
+    {
+        FleetErrorKind::Authentication
+    } else if mutating {
+        FleetErrorKind::OutcomeUnknown
+    } else {
+        FleetErrorKind::Unreachable
+    };
+    FleetError::new(
+        kind,
+        if detail.is_empty() {
+            format!("SSH exited {}", output.status)
+        } else {
+            prefix_tail(&detail, 500)
+        },
+    )
+}
+
+fn decode_fleet_jsonl(bytes: &[u8]) -> Result<Value, FleetError> {
+    let stdout = std::str::from_utf8(bytes).map_err(|_| {
+        FleetError::new(
+            FleetErrorKind::Incompatible,
+            "Remote Pika emitted non-UTF-8 output",
+        )
+    })?;
+    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    let Some(line) = lines.next() else {
+        return Err(FleetError::new(
+            FleetErrorKind::Incompatible,
+            "Remote Pika emitted a malformed JSONL response",
+        ));
+    };
+    if lines.next().is_some() {
+        return Err(FleetError::new(
+            FleetErrorKind::Incompatible,
+            "Remote Pika emitted a malformed JSONL response",
+        ));
+    }
+    serde_json::from_str(line).map_err(|_| {
+        FleetError::new(
+            FleetErrorKind::Incompatible,
+            "Remote Pika emitted non-JSON output",
+        )
+    })
+}
+
+fn decode_remote_fleet_error(response: Value) -> Result<Value, FleetError> {
+    let object = object(&response, "Remote Pika response is not an object")?;
+    if object.get("type").and_then(Value::as_str) != Some("error") {
+        return Ok(response);
+    }
+    Err(FleetError::new(
+        parse_error_kind(object.get("kind").and_then(Value::as_str)),
+        object
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("remote Pika error"),
+    ))
+}
+
+/// Read-only fleet snapshots and peeks share one authenticated SSH process
+/// per exact target and immutable node identity. Mutating requests and
+/// interactive commands remain on `SshTransport`'s ordinary one-shot path.
+#[derive(Clone)]
+pub(crate) struct SshReadOnlyTransport {
+    ssh: SshTransport,
+    sessions: Arc<Mutex<HashMap<SnapshotConnection, PersistentFleetSession>>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SnapshotConnection {
+    target: String,
+    node_id: String,
+}
+
+impl Default for SshReadOnlyTransport {
+    fn default() -> Self {
+        Self::new(SshTransport::default())
+    }
+}
+
+impl SshReadOnlyTransport {
+    pub(crate) fn new(ssh: SshTransport) -> Self {
+        Self {
+            ssh,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.clear();
+        }
+    }
+
+    pub(crate) fn retain_nodes(&self, nodes: &[FleetNode]) {
+        let live: HashSet<_> = nodes
+            .iter()
+            .map(|node| SnapshotConnection {
+                target: node.ssh_target.clone(),
+                node_id: node.node_id.clone(),
+            })
+            .collect();
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.retain(|key, _| live.contains(key));
+        }
+    }
+
+    fn snapshot_request(
+        &self,
+        target: &str,
+        payload: &Value,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, FleetError> {
+        if cancellation.is_cancelled() {
+            return Err(FleetError::new(
+                FleetErrorKind::Unreachable,
+                "Fleet snapshot cancelled before dispatch",
+            ));
+        }
+        let request = prepare_read_only_request(target, payload)?;
+        let deadline = Instant::now() + self.ssh.overall_timeout;
+        let mut sessions = self.lock_sessions(deadline, cancellation)?;
+        check_read_only_dispatch(deadline, cancellation)?;
+        let session =
+            get_read_only_session(&mut sessions, &self.ssh, &request, deadline, cancellation)?;
+        let result = session.request(
+            &request.input,
+            &request.operation,
+            &request.key.node_id,
+            deadline,
+            cancellation,
+        );
+        if result.is_err() {
+            // Never let a partial or late frame enter another request.
+            sessions.remove(&request.key);
+        }
+        result.map_err(read_only_request_error)
+    }
+
+    fn lock_sessions(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        std::sync::MutexGuard<'_, HashMap<SnapshotConnection, PersistentFleetSession>>,
+        FleetError,
+    > {
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(FleetError::new(
+                    FleetErrorKind::Unreachable,
+                    "Fleet snapshot cancelled before dispatch",
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(FleetError::new(
+                    FleetErrorKind::Unreachable,
+                    "Fleet snapshot timed out waiting for its connection",
+                ));
+            }
+            match self.sessions.try_lock() {
+                Ok(sessions) => return Ok(sessions),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(FleetError::new(
+                        FleetErrorKind::Error,
+                        "Persistent fleet session pool failed",
+                    ));
+                }
+                Err(TryLockError::WouldBlock) => thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ),
+            }
+        }
+    }
+}
+
+fn check_read_only_dispatch(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), FleetError> {
+    if cancellation.is_cancelled() || Instant::now() >= deadline {
+        return Err(FleetError::new(
+            FleetErrorKind::Unreachable,
+            "Fleet snapshot cancelled or timed out before dispatch",
+        ));
+    }
+    Ok(())
+}
+
+struct PreparedReadOnlyRequest {
+    key: SnapshotConnection,
+    operation: String,
+    input: Vec<u8>,
+}
+
+fn prepare_read_only_request(
+    target: &str,
+    payload: &Value,
+) -> Result<PreparedReadOnlyRequest, FleetError> {
+    let operation = payload.get("op").and_then(Value::as_str).ok_or_else(|| {
+        FleetError::new(FleetErrorKind::InvalidRequest, "Fleet operation is missing")
+    })?;
+    if !matches!(operation, "snapshot" | "peek") {
+        return Err(FleetError::new(
+            FleetErrorKind::InvalidRequest,
+            "Persistent fleet transport accepts read-only operations only",
+        ));
+    }
+    validate_ssh_target(target)?;
+    let node_id = payload
+        .get("expected_node_id")
+        .and_then(Value::as_str)
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .ok_or_else(|| {
+            FleetError::new(
+                FleetErrorKind::InvalidRequest,
+                "Persistent fleet snapshot requires an exact node identity",
+            )
+        })?;
+    Ok(PreparedReadOnlyRequest {
+        key: SnapshotConnection {
+            target: target.to_owned(),
+            node_id: node_id.to_owned(),
+        },
+        operation: operation.to_owned(),
+        input: encode_fleet_request(payload)?,
+    })
+}
+
+fn get_read_only_session<'a>(
+    sessions: &'a mut HashMap<SnapshotConnection, PersistentFleetSession>,
+    transport: &SshTransport,
+    request: &PreparedReadOnlyRequest,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<&'a mut PersistentFleetSession, FleetError> {
+    check_read_only_dispatch(deadline, cancellation)?;
+    if !sessions.contains_key(&request.key) {
+        if sessions.len() >= MAX_CACHED_FLEET_NODES
+            && let Some(oldest) = sessions.keys().next().cloned()
+        {
+            sessions.remove(&oldest);
+        }
+        let session = PersistentFleetSession::open(transport, &request.key.target)?;
+        sessions.insert(request.key.clone(), session);
+    }
+    if let Err(error) = check_read_only_dispatch(deadline, cancellation) {
+        sessions.remove(&request.key);
+        return Err(error);
+    }
+    sessions.get_mut(&request.key).ok_or_else(|| {
+        FleetError::new(
+            FleetErrorKind::Error,
+            "Persistent fleet session was not retained",
+        )
+    })
+}
+
+fn read_only_request_error(error: FleetError) -> FleetError {
+    if error.kind == FleetErrorKind::OutcomeUnknown {
+        FleetError::new(FleetErrorKind::Unreachable, error.message)
+    } else {
+        error
+    }
+}
+
+impl FleetTransport for SshReadOnlyTransport {
+    fn request(&self, target: &str, payload: &Value, mutating: bool) -> Result<Value, FleetError> {
+        self.request_cancellable(target, payload, mutating, &CancellationToken::default())
+    }
+
+    fn request_cancellable(
+        &self,
+        target: &str,
+        payload: &Value,
+        mutating: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, FleetError> {
+        if mutating {
+            return Err(FleetError::new(
+                FleetErrorKind::InvalidRequest,
+                "Persistent fleet transport is read-only",
+            ));
+        }
+        self.snapshot_request(target, payload, cancellation)
+    }
+
+    fn run_exact(&self, _: &FleetNode, _: &[String], _: bool) -> Result<i32, FleetError> {
+        Err(FleetError::new(
+            FleetErrorKind::InvalidRequest,
+            "Persistent fleet transport cannot run commands",
+        ))
+    }
+}
+
+struct PersistentFleetSession {
+    child: OwnedChild,
+    input: Option<AsyncChildInput>,
+    events: Option<Receiver<Result<Value, FleetError>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    pipe_stop: CancellationToken,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl PersistentFleetSession {
+    fn open(transport: &SshTransport, target: &str) -> Result<Self, FleetError> {
+        let mut command = transport.command(target, &["_fleet".into(), "--stdio".into()], false)?;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = OwnedChild::spawn(&mut command).map_err(|error| {
+            FleetError::new(
+                FleetErrorKind::Unreachable,
+                format!("Could not start persistent fleet snapshot: {error}"),
+            )
+        })?;
+        let (Some(input), Some(output), Some(errors)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            kill_reap(&mut child);
+            return Err(FleetError::new(
+                FleetErrorKind::Error,
+                "Persistent fleet process has incomplete pipes",
+            ));
+        };
+        let pipe_stop = CancellationToken::default();
+        let pipes = (|| -> std::io::Result<_> {
+            Ok((
+                CancellablePipe::new(input, pipe_stop.clone())?,
+                CancellablePipe::new(output, pipe_stop.clone())?,
+                CancellablePipe::new(errors, pipe_stop.clone())?,
+            ))
+        })();
+        let (input, output, errors) = match pipes {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                kill_reap(&mut child);
+                return Err(FleetError::new(
+                    FleetErrorKind::Unreachable,
+                    format!("Could not prepare persistent fleet pipes: {error}"),
+                ));
+            }
+        };
+        let (input, input_worker) = AsyncChildInput::new(input);
+        let (sender, events) = mpsc::sync_channel(2);
+        let output_worker = spawn_jsonl_reader(output, sender, MAX_MESSAGE_BYTES);
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr_worker = spawn_bounded_stderr(errors, stderr.clone(), MAX_STDERR_BYTES);
+        Ok(Self {
+            child,
+            input: Some(input),
+            events: Some(events),
+            stderr,
+            pipe_stop,
+            workers: vec![input_worker, output_worker, stderr_worker],
+        })
+    }
+
+    fn request(
+        &mut self,
+        bytes: &[u8],
+        operation: &str,
+        expected_node_id: &str,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, FleetError> {
+        self.ensure_no_queued_frame()?;
+        if cancellation.is_cancelled() {
+            return Err(FleetError::new(
+                FleetErrorKind::Unreachable,
+                "Fleet snapshot cancelled before dispatch",
+            ));
+        }
+        self.input
+            .as_ref()
+            .ok_or_else(|| FleetError::new(FleetErrorKind::Unreachable, "Fleet input closed"))?
+            .send(bytes.to_vec(), deadline, cancellation)?;
+        let response = self.receive_response(deadline, cancellation)?;
+        decode_read_only_response(&response, operation, expected_node_id)?;
+        self.ensure_no_queued_frame()?;
+        Ok(response)
+    }
+
+    fn receive_response(
+        &mut self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, FleetError> {
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(FleetError::new(
+                    FleetErrorKind::Unreachable,
+                    "Fleet snapshot cancelled",
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(FleetError::new(
+                    FleetErrorKind::Unreachable,
+                    "Fleet snapshot timed out",
+                ));
+            }
+            match self
+                .events
+                .as_ref()
+                .ok_or_else(|| FleetError::new(FleetErrorKind::Unreachable, "Fleet output closed"))?
+                .recv_timeout(remaining.min(Duration::from_millis(25)))
+            {
+                Ok(Ok(response)) => return Ok(response),
+                Ok(Err(error)) => return Err(error),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Err(self.closed_error()),
+            }
+        }
+    }
+
+    fn closed_error(&mut self) -> FleetError {
+        let status = poll_owned_child(&mut self.child).ok().flatten();
+        self.shutdown();
+        ssh_connection_closed_error(
+            status.as_ref().and_then(ExitStatus::code),
+            self.stderr
+                .lock()
+                .map(|value| sanitize_terminal_text(&String::from_utf8_lossy(&value)))
+                .unwrap_or_default(),
+        )
+    }
+
+    fn ensure_no_queued_frame(&self) -> Result<(), FleetError> {
+        let events = self
+            .events
+            .as_ref()
+            .ok_or_else(|| FleetError::new(FleetErrorKind::Unreachable, "Fleet output closed"))?;
+        match events.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => Err(FleetError::new(
+                FleetErrorKind::Unreachable,
+                "Persistent fleet connection closed between snapshot frames",
+            )),
+            Ok(_) => Err(FleetError::new(
+                FleetErrorKind::Incompatible,
+                "Persistent fleet connection emitted an unsolicited snapshot frame",
+            )),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        let _ = terminate_child(&mut self.child);
+        self.pipe_stop.cancel();
+        if let Some(input) = self.input.as_mut() {
+            input.close();
+        }
+        self.input.take();
+        self.events.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn decode_read_only_response(
+    response: &Value,
+    operation: &str,
+    expected_node_id: &str,
+) -> Result<(), FleetError> {
+    let object = object(&response, "Remote Pika response is not an object")?;
+    if object.get("type").and_then(Value::as_str) == Some("error") {
+        return Err(FleetError::new(
+            parse_error_kind(object.get("kind").and_then(Value::as_str)),
+            object
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("remote Pika error"),
+        ));
+    }
+    validate_readonly_receipt(&response, operation, expected_node_id)
+}
+
+fn validate_readonly_receipt(
+    response: &Value,
+    operation: &str,
+    expected_node_id: &str,
+) -> Result<(), FleetError> {
+    if operation == "snapshot" {
+        return validate_snapshot(response, Some(expected_node_id)).map(|_| ());
+    }
+    validate_peek_receipt(response, expected_node_id)
+}
+
+fn validate_peek_receipt(response: &Value, expected_node_id: &str) -> Result<(), FleetError> {
+    let object = object(response, "Remote peek receipt is malformed")?;
+    exact_fields(
+        object,
+        &set(&["type", "node_id", "text"]),
+        "Remote peek receipt is malformed",
+    )?;
+    let node_id = canonical_uuid(
+        object.get("node_id"),
+        "Remote peek receipt has an invalid node identity",
+    )?;
+    let text_is_bounded =
+        matches!(object.get("text"), Some(Value::String(text)) if text.len() <= MAX_MESSAGE_BYTES);
+    if object.get("type").and_then(Value::as_str) != Some("peek")
+        || node_id != expected_node_id
+        || !text_is_bounded
+    {
+        return Err(FleetError::new(
+            FleetErrorKind::Quarantined,
+            "Remote peek receipt is malformed or belongs to a different node",
+        ));
+    }
+    Ok(())
+}
+
+fn ssh_connection_closed_error(exit_code: Option<i32>, detail: String) -> FleetError {
+    let folded = detail.to_lowercase();
+    let missing = exit_code == Some(127)
+        || folded.contains("pika: not found")
+        || folded.contains("pika: command not found");
+    let auth = folded.contains("permission denied")
+        || folded.contains("host key verification")
+        || folded.contains("no identities");
+    let kind = match (missing, auth) {
+        (true, _) => FleetErrorKind::Missing,
+        (false, true) => FleetErrorKind::Authentication,
+        _ => FleetErrorKind::Unreachable,
+    };
+    let message = if detail.is_empty() {
+        "Persistent fleet connection closed".to_owned()
+    } else {
+        prefix_tail(&detail, 500)
+    };
+    FleetError::new(kind, message)
+}
+
+impl Drop for PersistentFleetSession {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod read_only_transport_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fake_ssh(path: &Path, launches: &Path, pid_file: &Path) {
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> {}\nprintf '%s' \"$$\" > {}\nn=0\nwhile IFS= read -r request; do\n  n=$((n + 1))\n  node=$(printf '%s\\n' \"$request\" | sed -n 's/.*\\\"expected_node_id\\\":\\\"\\([^\\\"]*\\)\\\".*/\\1/p')\n  case \"$request\" in\n    *\\\"op\\\":\\\"peek\\\"*) printf '{{\\\"type\\\":\\\"peek\\\",\\\"node_id\\\":\\\"%s\\\",\\\"text\\\":\\\"frame-%s\\\"}}\\n' \"$node\" \"$n\" ;;\n    *) printf '{{\\\"type\\\":\\\"snapshot\\\",\\\"protocol\\\":\\\"%s\\\",\\\"version\\\":%s,\\\"node_id\\\":\\\"%s\\\",\\\"machine\\\":\\\"atlas\\\",\\\"captured_at\\\":%s,\\\"sessions\\\":[],\\\"profiles\\\":[],\\\"cards\\\":[]}}\\n' '{}' '{}' \"$node\" \"$n\" ;;\n  esac\ndone\n",
+            shell_quote(&launches.display().to_string()),
+            shell_quote(&pid_file.display().to_string()),
+            PROTOCOL_NAME,
+            PROTOCOL_VERSION,
+        );
+        fs::write(path, script).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn request(node_id: &str) -> Value {
+        json!({
+            "op":"snapshot", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+            "expected_node_id":node_id
+        })
+    }
+
+    #[test]
+    fn snapshots_reuse_one_process_and_receive_fresh_frames_then_drop_it() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("fake-ssh");
+        let launches = root.path().join("launches");
+        let pid_file = root.path().join("pid");
+        fake_ssh(&ssh, &launches, &pid_file);
+        let node_id = "11111111-1111-4111-8111-111111111111";
+        let transport = SshReadOnlyTransport::new(SshTransport::new(
+            &ssh,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ));
+
+        let first = transport
+            .request("atlas", &request(node_id), false)
+            .unwrap();
+        let second = transport
+            .request("atlas", &request(node_id), false)
+            .unwrap();
+        let peek = transport
+            .request(
+                "atlas",
+                &json!({
+                    "op":"peek", "protocol":PROTOCOL_NAME, "version":PROTOCOL_VERSION,
+                    "expected_node_id":node_id
+                }),
+                false,
+            )
+            .unwrap();
+        assert_eq!(first["captured_at"], 1);
+        assert_eq!(second["captured_at"], 2);
+        assert_eq!(peek["text"], "frame-3");
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 1);
+
+        let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        drop(transport);
+        // The child is an owned process group and must not survive observer
+        // shutdown as an authenticated, idle SSH connection.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    fn one_hundred_refreshes_across_three_nodes_use_three_processes() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("fake-ssh");
+        let launches = root.path().join("launches");
+        let pid_file = root.path().join("pid");
+        fake_ssh(&ssh, &launches, &pid_file);
+        let transport = SshReadOnlyTransport::new(SshTransport::new(
+            &ssh,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ));
+        let node_ids = [
+            "00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000002",
+            "00000000-0000-4000-8000-000000000003",
+        ];
+        for index in 0..100 {
+            let node_index = index % node_ids.len();
+            let response = transport
+                .request(
+                    &format!("atlas-{node_index}"),
+                    &request(node_ids[node_index]),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(response["captured_at"], index / node_ids.len() + 1);
+        }
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 3);
+        assert_eq!(transport.sessions.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn persistent_snapshot_transport_rejects_mutations_and_other_operations() {
+        let transport = SshReadOnlyTransport::default();
+        let node_id = "11111111-1111-4111-8111-111111111111";
+        assert_eq!(
+            transport
+                .request("atlas", &request(node_id), true)
+                .unwrap_err()
+                .kind,
+            FleetErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            transport
+                .request("atlas", &json!({"op":"acknowledge"}), false)
+                .unwrap_err()
+                .kind,
+            FleetErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn failed_frame_is_not_retried_and_next_call_starts_a_clean_process() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("fake-ssh");
+        let launches = root.path().join("launches");
+        let pid_file = root.path().join("pid");
+        let script = format!(
+            "#!/bin/sh\nprintf 'launch\\n' >> {}\nprintf '%s' \"$$\" > {}\nwhile IFS= read -r request; do printf 'not-json\\n'; done\n",
+            shell_quote(&launches.display().to_string()),
+            shell_quote(&pid_file.display().to_string()),
+        );
+        fs::write(&ssh, script).unwrap();
+        let mut permissions = fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&ssh, permissions).unwrap();
+        let node_id = "11111111-1111-4111-8111-111111111111";
+        let transport = SshReadOnlyTransport::new(SshTransport::new(
+            &ssh,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ));
+
+        assert_eq!(
+            transport
+                .request("atlas", &request(node_id), false)
+                .unwrap_err()
+                .kind,
+            FleetErrorKind::Incompatible
+        );
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 1);
+        assert_eq!(
+            transport
+                .request("atlas", &request(node_id), false)
+                .unwrap_err()
+                .kind,
+            FleetErrorKind::Incompatible
+        );
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn cancellation_discards_and_reaps_the_active_snapshot_process() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("fake-ssh");
+        let pid_file = root.path().join("pid");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > {}\nwhile IFS= read -r request; do sleep 30; done\n",
+            shell_quote(&pid_file.display().to_string()),
+        );
+        fs::write(&ssh, script).unwrap();
+        let mut permissions = fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&ssh, permissions).unwrap();
+        let node_id = "11111111-1111-4111-8111-111111111111";
+        let transport = SshReadOnlyTransport::new(SshTransport::new(
+            &ssh,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        ));
+        let cancellation = CancellationToken::default();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            transport.request_cancellable("atlas", &request(node_id), false, &worker_cancellation)
+        });
+        let started = Instant::now();
+        while !pid_file.exists() && started.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        cancellation.cancel();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().kind,
+            FleetErrorKind::Unreachable
+        );
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    fn pool_never_retains_more_than_the_fleet_node_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("fake-ssh");
+        let launches = root.path().join("launches");
+        let pid_file = root.path().join("pid");
+        fake_ssh(&ssh, &launches, &pid_file);
+        let transport = SshReadOnlyTransport::new(SshTransport::new(
+            &ssh,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ));
+        for index in 0..=MAX_CACHED_FLEET_NODES {
+            let node_id = format!("00000000-0000-4000-8000-{index:012x}");
+            transport
+                .request("atlas", &request(&node_id), false)
+                .unwrap();
+        }
+        assert_eq!(
+            transport.sessions.lock().unwrap().len(),
+            MAX_CACHED_FLEET_NODES
+        );
+        assert_eq!(
+            fs::read_to_string(&launches).unwrap().lines().count(),
+            MAX_CACHED_FLEET_NODES + 1
+        );
+        let live_processes = fs::read_to_string(&launches)
+            .unwrap()
+            .lines()
+            .filter_map(|value| value.parse::<i32>().ok())
+            .filter(|pid| unsafe { libc::kill(*pid, 0) } == 0)
+            .count();
+        assert_eq!(live_processes, MAX_CACHED_FLEET_NODES);
+    }
+
+    #[test]
+    fn wrong_node_receipt_evicts_the_connection() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("fake-ssh");
+        let launches = root.path().join("launches");
+        let script = format!(
+            "#!/bin/sh\nprintf 'launch\\n' >> {}\nwhile IFS= read -r request; do printf '{{\\\"type\\\":\\\"snapshot\\\",\\\"protocol\\\":\\\"{}\\\",\\\"version\\\":{},\\\"node_id\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"machine\\\":\\\"atlas\\\",\\\"captured_at\\\":1,\\\"sessions\\\":[],\\\"profiles\\\":[],\\\"cards\\\":[]}}\\n'; done\n",
+            shell_quote(&launches.display().to_string()),
+            PROTOCOL_NAME,
+            PROTOCOL_VERSION,
+        );
+        fs::write(&ssh, script).unwrap();
+        let mut permissions = fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&ssh, permissions).unwrap();
+        let node_id = "11111111-1111-4111-8111-111111111111";
+        let transport = SshReadOnlyTransport::new(SshTransport::new(
+            &ssh,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ));
+        for _ in 0..2 {
+            assert_eq!(
+                transport
+                    .request("atlas", &request(node_id), false)
+                    .unwrap_err()
+                    .kind,
+                FleetErrorKind::Quarantined
+            );
+        }
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
+        assert!(transport.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unsolicited_second_frame_is_rejected_before_the_next_request() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("fake-ssh");
+        let launches = root.path().join("launches");
+        let node_id = "11111111-1111-4111-8111-111111111111";
+        let response = json!({
+            "type": "snapshot", "protocol": PROTOCOL_NAME, "version": PROTOCOL_VERSION,
+            "node_id": node_id, "machine": "atlas", "captured_at": 1,
+            "sessions": [], "profiles": [], "cards": []
+        })
+        .to_string();
+        let script = format!(
+            "#!/bin/sh\nprintf 'launch\\n' >> {}\nwhile IFS= read -r request; do printf '%s\\n' {}; sleep 0.05; printf '%s\\n' {}; done\n",
+            shell_quote(&launches.display().to_string()),
+            shell_quote(&response),
+            shell_quote(&response),
+        );
+        fs::write(&ssh, script).unwrap();
+        let mut permissions = fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&ssh, permissions).unwrap();
+        let transport = SshReadOnlyTransport::new(SshTransport::new(
+            &ssh,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ));
+        assert!(transport.request("atlas", &request(node_id), false).is_ok());
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            transport
+                .request("atlas", &request(node_id), false)
+                .unwrap_err()
+                .kind,
+            FleetErrorKind::Incompatible
+        );
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn route_retention_and_explicit_clear_reap_idle_connections() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("fake-ssh");
+        let launches = root.path().join("launches");
+        let pid_file = root.path().join("pid");
+        fake_ssh(&ssh, &launches, &pid_file);
+        let node_id = "11111111-1111-4111-8111-111111111111";
+        let transport = SshReadOnlyTransport::new(SshTransport::new(
+            &ssh,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ));
+        transport
+            .request("atlas", &request(node_id), false)
+            .unwrap();
+        let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        transport.retain_nodes(&[]);
+        assert!(transport.sessions.lock().unwrap().is_empty());
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+
+        transport
+            .request("atlas", &request(node_id), false)
+            .unwrap();
+        transport.clear();
+        assert!(transport.sessions.lock().unwrap().is_empty());
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn timed_out_snapshot_is_not_replayed_and_next_call_reconnects() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("fake-ssh");
+        let launches = root.path().join("launches");
+        let pid_file = root.path().join("pid");
+        let script = format!(
+            "#!/bin/sh\nprintf 'launch\\n' >> {}\nprintf '%s' \"$$\" > {}\nwhile IFS= read -r request; do sleep 30; done\n",
+            shell_quote(&launches.display().to_string()),
+            shell_quote(&pid_file.display().to_string()),
+        );
+        fs::write(&ssh, script).unwrap();
+        let mut permissions = fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&ssh, permissions).unwrap();
+        let node_id = "11111111-1111-4111-8111-111111111111";
+        let transport = SshReadOnlyTransport::new(SshTransport::new(
+            &ssh,
+            Duration::from_secs(1),
+            Duration::from_millis(500),
+        ));
+        for _ in 0..2 {
+            assert_eq!(
+                transport
+                    .request("atlas", &request(node_id), false)
+                    .unwrap_err()
+                    .kind,
+                FleetErrorKind::Unreachable
+            );
+        }
+        assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn persistent_transport_preserves_authentication_failure_classification() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("fake-ssh");
+        let script = "#!/bin/sh\nIFS= read -r request\nprintf 'Permission denied (publickey).\\n' >&2\nexit 255\n";
+        fs::write(&ssh, script).unwrap();
+        let mut permissions = fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&ssh, permissions).unwrap();
+        let transport = SshReadOnlyTransport::new(SshTransport::new(
+            &ssh,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ));
+        assert_eq!(
+            transport
+                .request(
+                    "atlas",
+                    &request("11111111-1111-4111-8111-111111111111"),
+                    false
+                )
+                .unwrap_err()
+                .kind,
+            FleetErrorKind::Authentication
+        );
+    }
+
+    #[test]
+    fn blocked_input_write_is_cancelled_by_reaping_its_owned_process() {
+        let root = tempfile::tempdir().unwrap();
+        let ssh = root.path().join("fake-ssh");
+        let pid_file = root.path().join("pid");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > {}\nsleep 30\n",
+            shell_quote(&pid_file.display().to_string()),
+        );
+        fs::write(&ssh, script).unwrap();
+        let mut permissions = fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&ssh, permissions).unwrap();
+        let node_id = "11111111-1111-4111-8111-111111111111";
+        let transport = SshReadOnlyTransport::new(SshTransport::new(
+            &ssh,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        ));
+        let cancellation = CancellationToken::default();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            let mut payload = request(node_id);
+            payload["padding"] = Value::String("x".repeat(MAX_MESSAGE_BYTES / 4));
+            transport.request_cancellable("atlas", &payload, false, &worker_cancellation)
+        });
+        let started = Instant::now();
+        while !pid_file.exists() && started.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        cancellation.cancel();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().kind,
+            FleetErrorKind::Unreachable
+        );
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 }
 
@@ -3368,20 +4339,7 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
     }
 
     fn snapshot_request(&self, node: &FleetNode) -> Result<Value, FleetError> {
-        let mut request = json!({
-            "op":"snapshot", "expert_directory":true, "protocol":PROTOCOL_NAME,
-            "version":PROTOCOL_VERSION, "expected_node_id":node.node_id,
-        });
-        if node
-            .capabilities
-            .iter()
-            .any(|capability| capability == "expert-directory-notices-v1")
-        {
-            request
-                .as_object_mut()
-                .expect("snapshot request")
-                .insert("directory_notices".to_owned(), Value::Bool(true));
-        }
+        let request = snapshot_payload(node);
         self.transport.request(&node.ssh_target, &request, false)
     }
 
@@ -3390,23 +4348,28 @@ impl<'a, T: FleetTransport> FleetManager<'a, T> {
         node: &FleetNode,
         cancellation: &CancellationToken,
     ) -> Result<Value, FleetError> {
-        let mut request = json!({
-            "op":"snapshot", "expert_directory":true, "protocol":PROTOCOL_NAME,
-            "version":PROTOCOL_VERSION, "expected_node_id":node.node_id,
-        });
-        if node
-            .capabilities
-            .iter()
-            .any(|capability| capability == "expert-directory-notices-v1")
-        {
-            request
-                .as_object_mut()
-                .expect("snapshot request")
-                .insert("directory_notices".to_owned(), Value::Bool(true));
-        }
+        let request = snapshot_payload(node);
         self.transport
             .request_cancellable(&node.ssh_target, &request, false, cancellation)
     }
+}
+
+fn snapshot_payload(node: &FleetNode) -> Value {
+    let mut request = json!({
+        "op":"snapshot", "expert_directory":true, "protocol":PROTOCOL_NAME,
+        "version":PROTOCOL_VERSION, "expected_node_id":node.node_id,
+    });
+    if node
+        .capabilities
+        .iter()
+        .any(|capability| capability == "expert-directory-notices-v1")
+    {
+        request
+            .as_object_mut()
+            .expect("snapshot request")
+            .insert("directory_notices".to_owned(), Value::Bool(true));
+    }
+    request
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

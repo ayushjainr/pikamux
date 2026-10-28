@@ -2,7 +2,7 @@
 use crate::{
     consult::CancellationToken,
     core::Pika,
-    fleet::{self, FleetManager, SshTransport},
+    fleet::{self, FleetManager, SshReadOnlyTransport, SshTransport},
     monitor::{BoardItem, ExpertAnnotation},
     store::{Store, StoreChangeWatcher},
     usage,
@@ -257,25 +257,31 @@ fn remote_observation_loop(
     enabled: Arc<AtomicBool>,
     lease: Arc<crate::activity_lease::ObservationLease>,
 ) {
+    // One long-lived read-only transport owns the SSH processes used by board
+    // snapshots. Rebuilding it per poll would reopen SSH/PAM sessions each time.
+    let transport = SshReadOnlyTransport::default();
+    let manager = FleetManager::new(&worker.store, transport.clone());
     while !stop.load(Ordering::Relaxed) && !cancel.is_cancelled() {
         if !enabled.load(Ordering::Acquire) {
+            transport.clear();
             thread::park_timeout(Duration::from_secs(1));
             continue;
         }
         let Some(_lease) = lease.current() else {
+            transport.clear();
             thread::park_timeout(Duration::from_secs(1));
             continue;
         };
         if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
             break;
         }
-        let manager = FleetManager::new(&worker.store, SshTransport::default());
-        if let Ok(nodes) = manager.nodes()
-            && let Some(node) = fleet::next_remote_node(&nodes, None, now(), false)
-        {
-            // Remote work commits cache only. The sole local publisher merges
-            // it with current hook state rather than overwriting a newer board.
-            let _ = manager.refresh_node_cancellable(&node.node_id, &cancel);
+        if let Ok(nodes) = manager.nodes() {
+            transport.retain_nodes(&nodes);
+            if let Some(node) = fleet::next_remote_node(&nodes, None, now(), false) {
+                // Remote work commits cache only. The sole local publisher merges
+                // it with current hook state rather than overwriting a newer board.
+                let _ = manager.refresh_node_cancellable(&node.node_id, &cancel);
+            }
         }
         // Shutdown unparks this exact worker; no periodic cancellation poll.
         thread::park_timeout(Duration::from_secs(1));

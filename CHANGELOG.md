@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.55 — Reuse board SSH connections
+
+- Keep foreground-owned SSH connections open for repeated fleet snapshots and
+  thread previews instead of opening a new login for every refresh.
+- Bind bounded connection pools to exact machine identities and SSH routes;
+  discard failed or cancelled streams without replaying requests.
+- Release inventory connections when observation ownership ends, and release
+  board preview connections when their owning workers close.
+- Verify 100 refreshes across three simulated machines use three SSH processes.
+
+Existing native fleet endpoints support this protocol. Updating preserves
+running agents; reopen existing boards to use the new transport. The separate
+iPhone app already uses persistent SSH connections.
+
 ## 0.6.54 — Recover exited startup reservations on exact reopen
 
 The 0.6.53 candidate was not published: Linux CI caught a test-terminal

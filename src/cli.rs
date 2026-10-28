@@ -9,7 +9,7 @@ use crate::{
     doctor,
     fleet::{
         self, FleetError, FleetErrorKind, FleetInstallTransport, FleetManager, FleetService,
-        NodeCandidate, SshTransport,
+        FleetTransport, NodeCandidate, SshReadOnlyTransport, SshTransport,
     },
     hooks::{self, HookContext},
     model::{Provider, Session},
@@ -1550,9 +1550,18 @@ fn peek_board_item(pika: &Pika, item: BoardItem) -> Result<i32> {
 
 fn board_action_driver(pika: Pika) -> monitor::ActionDriver {
     let preview_pika = pika.clone();
+    let peek_transport = SshReadOnlyTransport::new(SshTransport::new(
+        "ssh",
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    ));
+    let action_peek_transport = peek_transport.clone();
+    let preview_transport = peek_transport;
     let add = crate::board_catalog::host(pika.clone());
     monitor::ActionDriver::local(move |action| match action {
-        BoardAction::Peek(item) => board_peek_report(&pika, &item),
+        BoardAction::Peek(item) => {
+            board_peek_report_with_transport(&pika, &item, action_peek_transport.clone())
+        }
         BoardAction::Untrack(item) => {
             if item.pending_token.is_some() {
                 return pending_untrack_report(&pika, &item);
@@ -1578,12 +1587,9 @@ fn board_action_driver(pika: Pika) -> monitor::ActionDriver {
         }
         if item.node_id.is_some() {
             let remote = exact_remote(&preview_pika, &item)?;
-            return FleetManager::new(
-                &preview_pika.store,
-                SshTransport::new("ssh", Duration::from_secs(5), Duration::from_secs(10)),
-            )
-            .capture_cancellable(&remote, 100, &cancellation)
-            .map_err(anyhow::Error::from);
+            return FleetManager::new(&preview_pika.store, preview_transport.clone())
+                .capture_cancellable(&remote, 100, &cancellation)
+                .map_err(anyhow::Error::from);
         }
         preview_pika.capture_exact(&item.session, 100)
     })
@@ -1609,6 +1615,14 @@ fn pending_untrack_report(pika: &Pika, item: &BoardItem) -> Result<String> {
 }
 
 fn board_peek_report(pika: &Pika, item: &BoardItem) -> Result<String> {
+    board_peek_report_with_transport(pika, item, SshTransport::default())
+}
+
+fn board_peek_report_with_transport(
+    pika: &Pika,
+    item: &BoardItem,
+    transport: impl FleetTransport,
+) -> Result<String> {
     let identity = format!(
         "{} · {} · {}",
         item.session.display_name(),
@@ -1622,7 +1636,7 @@ fn board_peek_report(pika: &Pika, item: &BoardItem) -> Result<String> {
     }
     if item.node_id.is_some() {
         let remote = exact_remote(pika, item)?;
-        let output = FleetManager::new(&pika.store, SshTransport::default())
+        let output = FleetManager::new(&pika.store, transport)
             .capture(&remote, pika.config.peek_lines)
             .map_err(anyhow::Error::from)
             .with_context(|| {

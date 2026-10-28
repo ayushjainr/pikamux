@@ -6,7 +6,8 @@ use crate::{
     },
     consult::CancellationToken,
     fleet::{
-        self, FleetError, FleetErrorKind, FleetManager, FleetSession, FleetTransport, SshTransport,
+        self, FleetError, FleetErrorKind, FleetManager, FleetSession, FleetTransport,
+        SshReadOnlyTransport, SshTransport,
     },
     model::{FleetNode, Provider},
     monitor::{
@@ -229,10 +230,12 @@ pub(crate) fn start_activity_feed(store: &Store) -> Result<crate::activity_feed:
     let (done_send, done) = mpsc::sync_channel(1);
     let worker = thread::spawn(move || {
         let store = Store::at(path);
-        let manager = FleetManager::new(
-            &store,
-            SshTransport::new("ssh.exe", Duration::from_secs(5), Duration::from_secs(12)),
-        );
+        let read_transport = SshReadOnlyTransport::new(SshTransport::new(
+            "ssh.exe",
+            Duration::from_secs(5),
+            Duration::from_secs(12),
+        ));
+        let manager = FleetManager::new(&store, read_transport.clone());
         let mut first = true;
         loop {
             if stop.is_cancelled() {
@@ -242,6 +245,7 @@ pub(crate) fn start_activity_feed(store: &Store) -> Result<crate::activity_feed:
             first = false;
             match manager.nodes() {
                 Ok(nodes) => {
+                    read_transport.retain_nodes(&nodes);
                     if let Some(node) = fleet::next_remote_node(&nodes, None, now(), manual) {
                         // Failures belong to one node; retain its last good cache
                         // and immediately admit another due node.
@@ -361,6 +365,13 @@ fn run_once(
     let action_path = cache_path.to_owned();
     let preview_path = cache_path.to_owned();
     let action_stop = cancellation.clone();
+    let read_transport = SshReadOnlyTransport::new(SshTransport::new(
+        "ssh.exe",
+        Duration::from_secs(5),
+        Duration::from_secs(12),
+    ));
+    let action_read_transport = read_transport.clone();
+    let preview_read_transport = read_transport;
     let actions = monitor::ActionDriver::new(move |action| {
         let store = Store::at(&action_path);
         let transport = WindowTransport {
@@ -385,13 +396,12 @@ fn run_once(
             }
             BoardAction::Peek(item) => {
                 let remote = exact_remote(&store, &item)?;
+                let output = FleetManager::new(&store, action_read_transport.clone())
+                    .capture(&remote, 80)?;
                 Ok(format!(
                     "{} · peek · unread preserved\n{}",
                     remote.qualified_name(),
-                    crate::preview::board_output(
-                        item.session.provider,
-                        &manager.capture(&remote, 80)?
-                    )
+                    crate::preview::board_output(item.session.provider, &output)
                 ))
             }
             BoardAction::Untrack(item) => {
@@ -409,12 +419,9 @@ fn run_once(
         .with_preview(move |item, cancellation| {
             let store = Store::at(&preview_path);
             let remote = exact_remote(&store, &item)?;
-            FleetManager::new(
-                &store,
-                SshTransport::new("ssh.exe", Duration::from_secs(5), Duration::from_secs(10)),
-            )
-            .capture_cancellable(&remote, 100, &cancellation)
-            .map_err(anyhow::Error::from)
+            FleetManager::new(&store, preview_read_transport.clone())
+                .capture_cancellable(&remote, 100, &cancellation)
+                .map_err(anyhow::Error::from)
         })
         .with_add(crate::board_catalog::client(store.clone()));
     let side_path = cache_path.to_owned();

@@ -841,6 +841,19 @@ operation outcomes; the follow-up snapshot is a separate best-effort cache
 reconciliation. A result fetched by remote peek is rendered before any separate
 acknowledgement begins, so acknowledgement uncertainty cannot hide the result.
 
+Background inventory and selected-pane preview reuse foreground-owned SSH stdio
+connections instead of logging in for every refresh. Pools are bounded and keyed
+by the exact SSH target and immutable node identity. The existing fleet endpoint
+handles successive bounded JSONL requests on each connection; snapshot and peek
+remain read-only requests, not remote subscriptions or new server daemons.
+Each reply still crosses the normal identity and schema validation boundary.
+Failed, cancelled, malformed or unsolicited frames invalidate their connection;
+the request is never automatically replayed. A later scheduled refresh may open
+a new connection under the existing failure cadence. Losing observation ownership
+or closing its source releases inventory connections; closing the board's action
+and preview workers releases their shared connections. Mutations and interactive
+attachments retain separate transports.
+
 Every fleet envelope is versioned and bounded while streaming. Sessions declare
 whether their identity is an exact provider conversation or an unbound pane
 placeholder; placeholder rows may be inventoried but remain blocked from exact

@@ -172,9 +172,6 @@
     "src/fleet.rs::remote_candidates": [
       23
     ],
-    "src/fleet.rs::request_cancellable": [
-      22
-    ],
     "src/fleet.rs::run_bounded_command_inner": [
       35
     ],

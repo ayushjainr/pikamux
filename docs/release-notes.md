@@ -1,3 +1,16 @@
+Pika 0.6.55 stops repeated SSH logins during board inventory refreshes and thread
+previews. Foreground-owned connections carry successive read-only requests over
+the existing fleet protocol. Exact machine/route checks, bounded frames and
+normal offline behavior remain intact. Failed or cancelled requests are not
+automatically replayed; later scheduled refreshes reconnect as needed.
+
+The isolated acceptance test verifies 100 refreshes across three machines use
+three SSH processes. Updating does not restart agents or change SSH settings.
+Reopen existing boards to use the new transport. The iPhone app is a separate
+installation, not part of the native updater.
+
+Retained changes from 0.6.54:
+
 Pika 0.6.54 lets an exact saved conversation reopen after a same-name startup
 has exited. Recovery requires an authenticated exit, a dead recorded process
 generation, no surviving terminal or runtime owner, and compatible identity
