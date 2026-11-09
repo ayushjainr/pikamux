@@ -710,6 +710,106 @@ impl BoardProcess {
             "click reporting left enabled"
         );
     }
+
+    #[track_caller]
+    fn await_other_thread_list(
+        &mut self,
+        other: &mut OtherTerminal,
+        client: &str,
+        origin: &str,
+    ) -> String {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            let mut bytes = [0; 32768];
+            if let Ok(count) = self.terminal.read(&mut bytes) {
+                self.receive(&bytes[..count]);
+            }
+            while let Ok(count) = other.terminal.read(&mut bytes) {
+                if count == 0 {
+                    break;
+                }
+                other
+                    .output
+                    .push_str(&String::from_utf8_lossy(&bytes[..count]));
+            }
+            let panes = self.tmux(&[
+                "list-panes",
+                "-t",
+                origin,
+                "-F",
+                "#{pane_id} #{@pika_threads_source}",
+            ]);
+            let viewer = panes.lines().find_map(|line| {
+                line.split_once(' ')
+                    .filter(|(_, source)| *source == origin)
+                    .map(|(pane, _)| pane)
+            });
+            let client_pane = self
+                .tmux(&["list-clients", "-F", "#{client_name}|#{pane_id}"])
+                .lines()
+                .find_map(|line| {
+                    line.split_once('|')
+                        .filter(|(name, _)| *name == client)
+                        .map(|(_, pane)| pane.to_owned())
+                });
+            if let Some(viewer) = viewer
+                && client_pane.as_deref() == Some(viewer)
+                && self
+                    .tmux(&["capture-pane", "-p", "-t", viewer])
+                    .contains("Threads")
+            {
+                return viewer.to_owned();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "second terminal thread list did not take focus: {panes}; client={client_pane:?}; terminal output={}",
+                other.output
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[track_caller]
+    fn await_other_client_at_pane(
+        &mut self,
+        other: &mut OtherTerminal,
+        client: &str,
+        expected_pane: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            let mut bytes = [0; 32768];
+            if let Ok(count) = self.terminal.read(&mut bytes) {
+                self.receive(&bytes[..count]);
+            }
+            while let Ok(count) = other.terminal.read(&mut bytes) {
+                if count == 0 {
+                    break;
+                }
+                other
+                    .output
+                    .push_str(&String::from_utf8_lossy(&bytes[..count]));
+            }
+            let client_pane = self
+                .tmux(&["list-clients", "-F", "#{client_name}|#{pane_id}"])
+                .lines()
+                .find_map(|line| {
+                    line.split_once('|')
+                        .filter(|(name, _)| *name == client)
+                        .map(|(_, pane)| pane.to_owned())
+                });
+            let origin_panes = self.tmux(&["list-panes", "-t", expected_pane, "-F", "#{pane_id}"]);
+            if client_pane.as_deref() == Some(expected_pane) && origin_panes.trim() == expected_pane
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "second terminal did not return to its exact origin pane: client={client_pane:?}, panes={origin_panes:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1994,39 +2094,17 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
                 .find(|client| *client != opening_client)
                 .unwrap()
                 .to_owned();
-            let mut bytes = [0; 32768];
-            while let Ok(count) = other.terminal.read(&mut bytes) {
-                if count == 0 {
-                    break;
-                }
-            }
-            other.terminal.write_all(b"\x1b[24~").unwrap();
-            let other_viewer = board.await_thread_list(&original);
-            other.terminal.write_all(b"1").unwrap();
-            thread::sleep(Duration::from_millis(300));
-            assert_eq!(board.client_pane(&other_client), other_viewer);
+            other.await_text("FAKE AGENT READY");
+            assert_eq!(board.client_pane(&other_client), original);
+            other.send(b"\x1b[24~");
+            let other_viewer = board.await_other_thread_list(other, &other_client, &original);
+            other.send(b"1\x1b");
+            board.await_other_client_at_pane(other, &other_client, &original);
+            assert_ne!(other_viewer, original);
             board.checkpoint(
                 "Second Pika terminal · 1 cannot borrow first terminal history",
                 &store,
             );
-            other.terminal.write_all(b"\x1b").unwrap();
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while board
-                .tmux(&["list-panes", "-t", &original, "-F", "#{pane_id}"])
-                .trim()
-                != original
-            {
-                assert!(
-                    Instant::now() < deadline,
-                    "second terminal's Esc did not reclaim its viewer"
-                );
-                while let Ok(count) = other.terminal.read(&mut bytes) {
-                    if count == 0 {
-                        break;
-                    }
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
             assert_eq!(board.client_pane(&other_client), original);
             board.checkpoint(
                 "Second terminal Esc · same exact A provider survives",
