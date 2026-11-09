@@ -832,9 +832,7 @@ pub(crate) fn summarize(items: &[BoardItem], filter: &str) -> Summary {
     let counts = ["NEEDS YOU", "WORKING", "READY", "PARKED"].map(|category| {
         items
             .iter()
-            .filter(|item| {
-                matches_filter(item, &needle) && group(item.session.status, item.stale) == category
-            })
+            .filter(|item| matches_filter(item, &needle) && item_group(item) == category)
             .count()
     });
     let (latest_attention, attention) = latest_attention(items, &needle)
@@ -844,6 +842,14 @@ pub(crate) fn summarize(items: &[BoardItem], filter: &str) -> Summary {
         colors: std::env::var_os("NO_COLOR").is_none(),
         latest_attention,
         attention,
+    }
+}
+
+pub(crate) fn item_group(item: &BoardItem) -> &'static str {
+    if crate::monitor::pending_terminal_only(item) {
+        "TERMINAL ONLY"
+    } else {
+        group(item.session.status, item.stale)
     }
 }
 

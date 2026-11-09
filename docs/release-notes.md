@@ -1,3 +1,16 @@
+Pika 0.6.59 separates live terminal availability from verified conversation
+identity. Pending launches with current exact-token runtime evidence appear in
+their own `terminal only` section, without false failure, activity counts or
+activity timestamps. Existing terminals remain openable; no identity is guessed.
+Missing runtime evidence and authenticated startup exits remain explicit.
+
+Explicit stale-launch cleanup now requires complete runtime evidence and an
+unchanged launch snapshot, retaining diagnostic history and protecting live or
+ambiguous owners. Updating never runs that cleanup automatically, restarts agents,
+rewrites hooks or installs an iPhone build. Reopen boards after updating.
+
+Retained changes from 0.6.58:
+
 Pika 0.6.58 stops repeated SSH logins during board inventory refreshes and thread
 previews. Foreground-owned connections carry successive read-only requests over
 the existing fleet protocol. Exact machine/route checks, bounded frames and

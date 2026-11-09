@@ -2150,7 +2150,11 @@ impl Board {
             Provider::Opencode => "O",
             Provider::Muse => "M",
         };
-        let age = human_age(session.last_event_at.max(session.last_activity_at));
+        let age = if pending_terminal_only(item) {
+            "—".into()
+        } else {
+            human_age(session.last_event_at.max(session.last_activity_at))
+        };
         let (label, missing) = self.thread_row_label(item, number);
         let usable = list_width.saturating_sub(if number.is_some() { 14 } else { 12 });
         let prefix = number.map(|value| format!("{value} ")).unwrap_or_default();
@@ -2191,6 +2195,8 @@ impl Board {
                 " startup exited"
             } else if session.status == Status::Starting {
                 " starting"
+            } else if pending_terminal_only(item) {
+                " terminal only"
             } else {
                 " unconfirmed"
             }
@@ -2706,6 +2712,8 @@ impl Board {
         styled(output, Color::Reset, true, &truncate(&title, available))?;
         let state = if item.stale {
             "CACHED"
+        } else if pending_terminal_only(item) {
+            "TERMINAL ONLY"
         } else if item.pending_token.is_some() && session.status == Status::Error {
             "LAUNCH UNCONFIRMED"
         } else {
@@ -2723,7 +2731,7 @@ impl Board {
             state,
         )?;
         let last = session.last_event_at.max(session.last_activity_at);
-        let age = if last > 0.0 {
+        let age = if !pending_terminal_only(item) && last > 0.0 {
             format!("last activity {} ago", human_age(last))
         } else {
             "activity time unknown".into()
@@ -3210,6 +3218,12 @@ fn briefing_message(item: &BoardItem) -> (&'static str, &str) {
                 .unwrap_or("Enter checks the existing terminal. X hides this launch entry."),
         );
     }
+    if pending_terminal_only(item) {
+        return (
+            "TERMINAL ONLY",
+            "The terminal is running; conversation identity and activity are unknown. Enter opens the existing terminal; no replacement is launched.",
+        );
+    }
     let reason = s.attention_reason.as_deref().filter(|text| {
         !text.trim().is_empty() && !matches!(*text, "completed" | "working" | "[object Object]")
     });
@@ -3249,6 +3263,15 @@ fn briefing_message(item: &BoardItem) -> (&'static str, &str) {
                 .unwrap_or("An error was recorded. Open for recovery steps."),
         ),
     }
+}
+
+pub(crate) fn pending_terminal_only(item: &BoardItem) -> bool {
+    !item.stale
+        && item.pending_token.is_some()
+        && item.session.status == Status::Unbound
+        && item.session.home_state == "terminal-live-unverified"
+        && item.session.live
+        && item.session.error.is_none()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3296,7 +3319,7 @@ fn thread_quota_height(width: u16, height: u16) -> u16 {
 }
 
 fn item_group(item: &BoardItem) -> &'static str {
-    crate::activity_feed::group(item.session.status, item.stale)
+    crate::activity_feed::item_group(item)
 }
 
 fn sort_items(items: &mut [BoardItem]) {
@@ -3304,7 +3327,8 @@ fn sort_items(items: &mut [BoardItem]) {
         "NEEDS YOU" => 0_u8,
         "WORKING" => 1,
         "READY" => 2,
-        _ => 3,
+        "TERMINAL ONLY" => 3,
+        _ => 4,
     };
     items.sort_by(|left, right| {
         rank(left)
@@ -5216,6 +5240,56 @@ mod tests {
         item.session.status = Status::Parked;
         assert_eq!(briefing_message(&item), ("", ""));
         assert_eq!(project_location(r"C:\Users\user\tracker\db"), "tracker/db");
+    }
+
+    #[test]
+    fn pending_verified_terminal_runtime_is_terminal_only_not_conversation_ready() {
+        let mut item = BoardItem::local(session(Status::Unbound));
+        item.pending_token = Some("pending-token".into());
+        item.session.home_state = "terminal-live-unverified".into();
+        item.session.live = true;
+        item.session.attention_reason = Some("terminal is running".into());
+
+        let board = Board::new(vec![item.clone()]);
+        assert_eq!(item_group(&item), "TERMINAL ONLY");
+        // A live terminal with unknown conversation activity is neither a
+        // request for attention nor a result, working turn or parked thread.
+        assert_eq!(
+            crate::activity_feed::summarize(&[item.clone()], "").counts,
+            [0; 4]
+        );
+        assert!(
+            board
+                .thread_row_label(&item, None)
+                .0
+                .contains(" terminal only")
+        );
+        assert_eq!(
+            briefing_message(&item),
+            (
+                "TERMINAL ONLY",
+                "The terminal is running; conversation identity and activity are unknown. Enter opens the existing terminal; no replacement is launched."
+            )
+        );
+        let mut frame = Vec::new();
+        board.draw(&mut frame, 140, 24).unwrap();
+        let rendered = String::from_utf8(frame).unwrap();
+        assert!(rendered.contains("TERMINAL ONLY"));
+        assert!(rendered.contains("activity time unknown"));
+        assert!(!rendered.contains("last activity"));
+        assert!(!rendered.contains("READY"));
+        assert!(!rendered.contains("WORKING"));
+
+        let mut stale = item;
+        stale.stale = true;
+        let stale_board = Board::new(vec![stale.clone()]);
+        assert_eq!(briefing_message(&stale).0, "Last observation");
+        assert!(
+            !stale_board
+                .thread_row_label(&stale, None)
+                .0
+                .contains("terminal only")
+        );
     }
 
     #[test]

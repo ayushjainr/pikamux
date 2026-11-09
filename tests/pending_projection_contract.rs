@@ -244,12 +244,18 @@ fn cli_lists_pending_liveness_only_from_exact_live_token_bound_runtime_and_never
         .iter()
         .find(|session| session["name"] == "live-provider")
         .unwrap();
+    assert_eq!(live_row["status"], "UNBOUND");
+    assert!(live_row["error"].is_null());
     assert!(
-        live_row["error"]
+        live_row["attention_reason"]
             .as_str()
             .unwrap()
-            .contains("provider process is present")
+            .contains("identity and activity are not verified")
     );
+    for row in rows.iter().filter(|row| row["name"] != "live-provider") {
+        assert_eq!(row["status"], "ERROR");
+        assert!(row["error"].is_string());
+    }
 
     assert!(store.list_sessions().unwrap().is_empty());
     assert_eq!(store.list_pending().unwrap(), pending);

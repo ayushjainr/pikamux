@@ -439,6 +439,15 @@ fn repair_removes_only_records_disproved_by_complete_snapshots() {
     let repairs = repair_stale(&store, &runtime, future, 300.0);
     assert_eq!(repairs.len(), 3);
     assert!(store.get_pending("stale-token").unwrap().is_none());
+    let archived = store
+        .get_retired_pending_launch("stale-token")
+        .unwrap()
+        .unwrap();
+    assert_eq!(archived["pending"]["launch_token"], "stale-token");
+    assert_eq!(
+        archived["reason"],
+        "expired launch has no matching live owner in a complete runtime snapshot"
+    );
     assert!(store.get_pending("live-token").unwrap().is_some());
     assert!(
         store
@@ -458,6 +467,263 @@ fn repair_removes_only_records_disproved_by_complete_snapshots() {
     }));
     assert_eq!(runtime.processes.len(), 2);
     assert_eq!(runtime.panes.len(), 1);
+}
+
+#[test]
+fn repair_retires_reused_pane_only_when_a_different_launch_token_is_explicit() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::from_paths(&paths(temp.path()));
+    store.initialize().unwrap();
+    let stale = PendingLaunch {
+        launch_token: "old-launch-token".into(),
+        provider: Provider::Codex,
+        name: "old-launch".into(),
+        cwd: temp.path().to_string_lossy().into_owned(),
+        tmux_session: Some("pika-c-reused".into()),
+        tmux_pane: Some("%13".into()),
+        expected_session_id: None,
+        root_pid: None,
+        root_pid_start: None,
+        preexisting_session_ids: None,
+        candidate_session_id: None,
+        candidate_observed_at: None,
+        created_at: 1.0,
+    };
+    store.add_pending(&stale).unwrap();
+    let mut runtime = evidence();
+    runtime.panes = vec![Pane {
+        session_name: "pika-c-reused".into(),
+        pane_id: "%13".into(),
+        pane_pid: 30,
+        cwd: temp.path().to_string_lossy().into_owned(),
+        current_command: "codex".into(),
+        attached: false,
+        dead: false,
+        dead_status: None,
+        activity: 0.0,
+        created: 0.0,
+        pika_provider: Some(Provider::Codex),
+        pika_session_id: Some("22222222-2222-4222-8222-222222222222".into()),
+        pika_name: Some("new-launch".into()),
+        pika_launch_token: Some("new-launch-token".into()),
+    }];
+    runtime.processes = BTreeMap::from([
+        (30, process(30, None, 30, &["zsh"])),
+        (
+            31,
+            process(
+                31,
+                Some(30),
+                31,
+                &["codex", "resume", "22222222-2222-4222-8222-222222222222"],
+            ),
+        ),
+    ]);
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        + 600.0;
+
+    let repairs = repair_stale(&store, &runtime, future, 300.0);
+
+    assert_eq!(repairs.len(), 1);
+    assert!(store.get_pending(&stale.launch_token).unwrap().is_none());
+    assert!(
+        store
+            .get_retired_pending_launch(&stale.launch_token)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn repair_keeps_pending_when_pane_token_is_missing_or_launch_owner_is_live() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::from_paths(&paths(temp.path()));
+    store.initialize().unwrap();
+    let stale = PendingLaunch {
+        launch_token: "old-launch-token".into(),
+        provider: Provider::Codex,
+        name: "old-launch".into(),
+        cwd: temp.path().to_string_lossy().into_owned(),
+        tmux_session: Some("pika-c-old".into()),
+        tmux_pane: Some("%13".into()),
+        expected_session_id: None,
+        root_pid: None,
+        root_pid_start: None,
+        preexisting_session_ids: None,
+        candidate_session_id: None,
+        candidate_observed_at: None,
+        created_at: 1.0,
+    };
+    store.add_pending(&stale).unwrap();
+    let mut ambiguous = evidence();
+    ambiguous.panes = vec![pane("%13", 30, None)];
+    ambiguous.processes = BTreeMap::from([(30, process(30, None, 30, &["codex"]))]);
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        + 600.0;
+
+    assert!(repair_stale(&store, &ambiguous, future, 300.0).is_empty());
+    assert!(store.get_pending(&stale.launch_token).unwrap().is_some());
+
+    let mut empty_token = ambiguous.clone();
+    empty_token.panes = vec![pane("%13", 30, Some(""))];
+    assert!(repair_stale(&store, &empty_token, future, 300.0).is_empty());
+    assert!(store.get_pending(&stale.launch_token).unwrap().is_some());
+
+    let retained_shell = RuntimeEvidence {
+        tmux_available: true,
+        tmux_snapshot_complete: true,
+        process_snapshot_complete: true,
+        panes: vec![pane("%13", 30, Some(&stale.launch_token))],
+        processes: BTreeMap::from([(30, process(30, None, 30, &["zsh"]))]),
+        platform: "fixture".into(),
+        ..RuntimeEvidence::default()
+    };
+    assert!(repair_stale(&store, &retained_shell, future, 300.0).is_empty());
+    assert!(store.get_pending(&stale.launch_token).unwrap().is_some());
+
+    let owner_token = "exact-wrapper-owner";
+    assert!(
+        store
+            .register_pending_wrapper_owner(&stale.launch_token, owner_token)
+            .unwrap()
+    );
+    let mut wrapper_live = RuntimeEvidence {
+        tmux_available: true,
+        tmux_snapshot_complete: true,
+        process_snapshot_complete: true,
+        platform: "fixture".into(),
+        ..RuntimeEvidence::default()
+    };
+    wrapper_live.processes = BTreeMap::from([(
+        40,
+        process(
+            40,
+            None,
+            40,
+            &[
+                "pika",
+                "_process-exit",
+                "--launch-token",
+                &stale.launch_token,
+                "--owner-token",
+                owner_token,
+            ],
+        ),
+    )]);
+
+    assert!(repair_stale(&store, &wrapper_live, future, 300.0).is_empty());
+    assert!(store.get_pending(&stale.launch_token).unwrap().is_some());
+}
+
+#[test]
+fn repair_does_not_apply_an_older_runtime_snapshot_to_a_newer_pending_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::from_paths(&paths(temp.path()));
+    store.initialize().unwrap();
+    store
+        .add_pending(&PendingLaunch {
+            launch_token: "created-after-snapshot".into(),
+            provider: Provider::Codex,
+            name: "new-launch".into(),
+            cwd: temp.path().to_string_lossy().into_owned(),
+            tmux_session: None,
+            tmux_pane: None,
+            expected_session_id: None,
+            root_pid: None,
+            root_pid_start: None,
+            preexisting_session_ids: None,
+            candidate_session_id: None,
+            candidate_observed_at: None,
+            created_at: 200.0,
+        })
+        .unwrap();
+    let runtime = RuntimeEvidence {
+        tmux_available: true,
+        tmux_snapshot_complete: true,
+        process_snapshot_complete: true,
+        platform: "fixture".into(),
+        ..RuntimeEvidence::default()
+    };
+
+    assert!(repair_stale(&store, &runtime, 100.0, 0.0).is_empty());
+    assert!(
+        store
+            .get_pending("created-after-snapshot")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn repair_keeps_pending_while_expected_candidate_or_bound_identity_is_live() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::from_paths(&paths(temp.path()));
+    store.initialize().unwrap();
+    let ids = [
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "33333333-3333-4333-8333-333333333333",
+    ];
+    let mut runtime = RuntimeEvidence {
+        tmux_available: true,
+        tmux_snapshot_complete: true,
+        process_snapshot_complete: true,
+        platform: "fixture".into(),
+        ..RuntimeEvidence::default()
+    };
+    for (index, id) in ids.iter().enumerate() {
+        let token = format!("identity-launch-{index}");
+        let mut pending = PendingLaunch {
+            launch_token: token.clone(),
+            provider: Provider::Codex,
+            name: format!("identity-{index}"),
+            cwd: temp.path().to_string_lossy().into_owned(),
+            tmux_session: None,
+            tmux_pane: None,
+            expected_session_id: None,
+            root_pid: None,
+            root_pid_start: None,
+            preexisting_session_ids: None,
+            candidate_session_id: None,
+            candidate_observed_at: None,
+            created_at: 1.0,
+        };
+        match index {
+            0 => pending.expected_session_id = Some((*id).into()),
+            1 => pending.candidate_session_id = Some((*id).into()),
+            _ => {}
+        }
+        store.add_pending(&pending).unwrap();
+        if index == 2 {
+            assert!(store.bind_launch(&token, Provider::Codex, id).unwrap());
+        }
+        let pid = 50 + index as i64;
+        runtime.processes.insert(
+            pid,
+            process(pid, None, pid as u64, &["codex", "resume", id]),
+        );
+    }
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        + 600.0;
+
+    assert!(repair_stale(&store, &runtime, future, 300.0).is_empty());
+    for index in 0..ids.len() {
+        assert!(
+            store
+                .get_pending(&format!("identity-launch-{index}"))
+                .unwrap()
+                .is_some()
+        );
+    }
 }
 
 #[test]
@@ -493,4 +759,39 @@ fn incomplete_runtime_evidence_can_never_repair_state() {
     );
     assert!(report.repairs.is_empty());
     assert!(store.get_pending("old").unwrap().is_some());
+}
+
+#[test]
+fn repair_keeps_conflicting_expected_and_candidate_identity_without_binding() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::from_paths(&paths(temp.path()));
+    store.initialize().unwrap();
+    let pending = PendingLaunch {
+        launch_token: "conflicting-identities".into(),
+        provider: Provider::Codex,
+        name: "ambiguous".into(),
+        cwd: temp.path().to_string_lossy().into_owned(),
+        tmux_session: None,
+        tmux_pane: None,
+        expected_session_id: Some("11111111-1111-4111-8111-111111111111".into()),
+        candidate_session_id: Some("22222222-2222-4222-8222-222222222222".into()),
+        candidate_observed_at: Some(2.0),
+        root_pid: None,
+        root_pid_start: None,
+        preexisting_session_ids: None,
+        created_at: 1.0,
+    };
+    store.add_pending(&pending).unwrap();
+    let runtime = RuntimeEvidence {
+        tmux_available: true,
+        tmux_snapshot_complete: true,
+        process_snapshot_complete: true,
+        platform: "fixture".into(),
+        ..RuntimeEvidence::default()
+    };
+    assert!(repair_stale(&store, &runtime, 10_000.0, 300.0).is_empty());
+    assert_eq!(
+        store.get_pending(&pending.launch_token).unwrap(),
+        Some(pending)
+    );
 }

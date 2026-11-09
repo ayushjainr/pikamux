@@ -2118,13 +2118,15 @@ impl Pika {
         let pane = self
             .tmux
             .get_pane(pane_id)?
-            .context("The pending terminal home disappeared. Run `pika doctor --repair-stale`.")?;
+            .context("This startup's terminal is gone; Pika has not verified a saved conversation for this launch. Run `pika doctor` to inspect stale launch records. No replacement conversation was started.")?;
         if pane.pika_launch_token.as_deref() != Some(launch_token)
             || pane
                 .pika_provider
                 .is_some_and(|provider| provider != pending.provider)
         {
-            bail!("Pika refused a pending home whose exact launch identity changed")
+            bail!(
+                "This startup's terminal was reused or its exact launch identity changed. Pika did not open the unrelated terminal or start a replacement. Run `pika doctor` to inspect the stale launch; a thread name alone cannot identify its saved provider conversation."
+            )
         }
         let kind = if self.store.get_pending_exit(launch_token)?.is_some() {
             "STARTUP TERMINAL"
@@ -3014,29 +3016,38 @@ fn session_from_pending_with_runtime(pending: &PendingLaunch, runtime_live: bool
         tmux_session: pending.tmux_session.clone(),
         tmux_pane: pending.tmux_pane.clone(),
         root_pid: pending.root_pid,
-        status: if overdue { Status::Error } else { Status::Starting },
+        status: if overdue && runtime_live {
+            Status::Unbound
+        } else if overdue {
+            Status::Error
+        } else {
+            Status::Starting
+        },
         unread: false,
         model: None,
         source: "pending-launch".into(),
         managed: true,
-        error: overdue.then(|| {
-            let runtime_note = if runtime_live {
-                "A provider process is present in this launch's exact terminal, but its conversation identity remains unconfirmed."
-            } else {
-                "Pika has not independently verified a live provider process in this launch's exact terminal."
-            };
-            format!(
-                "Pika has not confirmed this launch. {runtime_note} Enter checks the retained terminal if it still exists; it never starts a replacement. X hides only this entry."
-            )
+        error: (overdue && !runtime_live).then(|| {
+            "Pika has not confirmed this launch or independently verified a live provider process in its exact terminal. Enter checks the retained terminal if it still exists; it never starts a replacement. X hides only this entry.".into()
         }),
-        attention_reason: Some(if overdue { "launch not confirmed" } else { "starting provider conversation" }.into()),
+        attention_reason: Some(if overdue && runtime_live {
+            "Terminal is running; conversation identity and activity are not verified. Enter opens the existing terminal without starting a replacement."
+        } else if overdue {
+            "launch not confirmed"
+        } else {
+            "starting provider conversation"
+        }.into()),
         created_at: pending.created_at,
         updated_at: pending.created_at,
         last_event_at: pending.created_at,
         last_activity_at: pending.created_at,
         live: runtime_live,
         attached: false,
-        home_state: "starting".into(),
+        home_state: if overdue && runtime_live {
+            "terminal-live-unverified"
+        } else {
+            "starting"
+        }.into(),
         cpu_percent: None,
         rss_kb: None,
         input_tokens: None,
@@ -4146,6 +4157,52 @@ mod tests {
     }
 
     #[test]
+    fn live_pending_projection_separates_terminal_availability_from_identity() {
+        let mut pending = pending_fixture("live-no-identity", Provider::Codex);
+        pending.created_at = 1.0;
+        let projected = session_from_pending_with_runtime(&pending, true);
+        assert_eq!(projected.status, Status::Unbound);
+        assert_eq!(projected.home_state, "terminal-live-unverified");
+        assert_eq!(projected.session_id, "pending:live-no-identity");
+        assert!(projected.live);
+        assert!(projected.error.is_none());
+        assert!(!projected.has_exact_home());
+        assert!(!projected.unread);
+        assert!(!projected.needs_attention());
+        assert!(
+            projected
+                .attention_reason
+                .unwrap()
+                .contains("activity are not verified")
+        );
+
+        // Startup's grace period remains distinct, including a live process
+        // that has not yet had time to report a native identity.
+        pending.created_at = now();
+        assert_eq!(
+            session_from_pending_with_runtime(&pending, true).status,
+            Status::Starting
+        );
+    }
+
+    #[test]
+    fn authenticated_pending_exit_overrides_live_terminal_projection() {
+        let (_root, pika) = test_pika();
+        let mut pending = pending_fixture("live-but-exited", Provider::Codex);
+        pending.created_at = 1.0;
+        add_pending_with_authenticated_exit(&pika, &pending);
+        let projected = pika.pending_session_with_runtime(&pending, true).unwrap();
+        assert_eq!(projected.status, Status::Error);
+        assert_eq!(projected.home_state, "startup-exited");
+        assert!(projected.error.unwrap().contains("exited during startup"));
+        assert!(pika.store.list_sessions().unwrap().is_empty());
+        assert_eq!(
+            pika.store.get_pending(&pending.launch_token).unwrap(),
+            Some(pending)
+        );
+    }
+
+    #[test]
     fn pending_projection_does_not_turn_persisted_pane_metadata_into_live_evidence() {
         let mut pending = pending_fixture("pending-projection", Provider::Codex);
         pending.created_at = 1.0;
@@ -4162,6 +4219,21 @@ mod tests {
         pane.pika_launch_token = Some(pending.launch_token.clone());
         let processes = BTreeMap::from([(pid, record(pid, None, 7, &["codex", "--version"]))]);
         assert!(pending_runtime_live(&pending, &[pane.clone()], &processes));
+
+        // The launch holder may have exited while the terminal's current tree
+        // still hosts the client. Do not confuse that stale PID with exit.
+        pending.root_pid = Some(999_999);
+        pending.root_pid_start = Some(1);
+        let descendants = BTreeMap::from([
+            (pid, record(pid, None, 7, &["bash"])),
+            (43, record(43, Some(pid), 8, &["pika", "_terminal-bridge"])),
+            (44, record(44, Some(43), 9, &["codex"])),
+        ]);
+        assert!(pending_runtime_live(
+            &pending,
+            &[pane.clone()],
+            &descendants
+        ));
 
         pane.pika_launch_token = Some("different-launch".into());
         assert!(!pending_runtime_live(&pending, &[pane.clone()], &processes));
@@ -4357,8 +4429,43 @@ mod tests {
         pika.store.add_pending(&pending).unwrap();
         let error = pika.open_name("update_test", false, true).unwrap_err();
         assert!(error.to_string().contains("exact launch identity changed"));
+        assert!(error.to_string().contains("pika doctor"));
+        assert!(
+            error
+                .to_string()
+                .contains("did not open the unrelated terminal")
+        );
         assert_eq!(pika.store.list_pending().unwrap(), vec![pending]);
         assert!(pika.store.list_sessions().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_pending_without_terminal_never_guesses_a_saved_conversation() {
+        let (root, mut pika) = test_pika();
+        let pending = pending_fixture("legacy-launch", Provider::Codex);
+        pika.tmux = fixture_tmux(root.path(), &[]);
+        pika.process_observer = Arc::new(|| ProcessObservation::complete(BTreeMap::new()));
+        pika.store.add_pending(&pending).unwrap();
+        // A similarly named saved conversation is not a launch receipt.
+        let mut candidate = test_session("99999999-9999-4999-8999-999999999999");
+        candidate.name = Some(format!("{} candidate", pending.name));
+        candidate.cwd = Some(pending.cwd.clone());
+        pika.store.upsert_session(&candidate, false).unwrap();
+        let error = pika.open_pending(&pending.launch_token, false).unwrap_err();
+        assert!(error.to_string().contains("terminal is gone"), "{error:#}");
+        assert!(error.to_string().contains("pika doctor"));
+        assert_eq!(
+            pika.store.get_pending(&pending.launch_token).unwrap(),
+            Some(pending.clone())
+        );
+        assert!(
+            pika.store
+                .get_launch_binding(&pending.launch_token)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(pika.store.list_sessions().unwrap().len(), 1);
     }
 
     #[test]

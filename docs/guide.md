@@ -811,7 +811,13 @@ time, a successful pre-launch provider snapshot, a settling interval, one
 identity-matched provider record created in the exact directory and launch
 window, and no competing exact-identity process. A missing baseline, subordinate Codex
 thread, or ambiguous evidence remains
-`IDENTITY PENDING`; after the grace period it becomes an actionable error.
+`IDENTITY PENDING`. After the grace period, a provider observed in the exact
+launch-token-bound terminal is shown as `terminal only`, not a failed launch.
+It appears in its own section rather than contributing to conversation activity
+counts. Enter still opens that original terminal; Pika has not verified its
+conversation ID or whether it is working or ready. Without live runtime proof,
+the entry remains `unconfirmed`; an authenticated exit is `startup exited`.
+Neither a thread name nor shared-daemon activity can substitute for exact identity.
 Pika disables the tmux status bar only for sessions it creates, keeping each
 provider interface visually unchanged while leaving global tmux settings
 and explicitly adopted sessions untouched. It also launches the agent with the

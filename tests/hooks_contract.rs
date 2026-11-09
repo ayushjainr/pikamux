@@ -4,6 +4,7 @@ use pikamux::hooks::{
 };
 use pikamux::model::{ObservationKind, Provider, Session, Status, StatusObservation};
 use pikamux::store::{LiveOwner, PendingLaunch, PendingLaunchExit, Store};
+use rusqlite::Connection;
 use std::io::Cursor;
 use tempfile::TempDir;
 
@@ -117,6 +118,221 @@ fn session(provider: Provider, id: &str, status: Status) -> Session {
         estimated_cost_usd: None,
         active_thread_id: None,
     }
+}
+
+fn pending_launch(token: &str, id: &str, pid: i64, generation: i64) -> PendingLaunch {
+    PendingLaunch {
+        launch_token: token.into(),
+        provider: Provider::Codex,
+        name: "project launch".into(),
+        cwd: "/project".into(),
+        tmux_session: Some("pika-c-test".into()),
+        tmux_pane: Some("%1".into()),
+        expected_session_id: Some(id.into()),
+        root_pid: Some(pid),
+        root_pid_start: Some(generation),
+        preexisting_session_ids: Some(Vec::new()),
+        candidate_session_id: None,
+        candidate_observed_at: None,
+        created_at: 1.0,
+    }
+}
+
+fn exact_launch_context(token: &str, pid: i64, generation: i64) -> HookContext {
+    let mut context = HookContext::at(10.0);
+    context.launch_token = Some(token.into());
+    context.pane_id = Some("%1".into());
+    context.pane_session = Some("pika-c-test".into());
+    context.owner_pid = Some(pid);
+    context.owner_start_time = Some(generation);
+    context.exact_home_verified = true;
+    context
+}
+
+#[test]
+fn exact_home_launch_certificate_survives_store_reopen() {
+    let (_temp, store) = store();
+    let token = "restart-proof";
+    store
+        .add_pending(&pending_launch(token, "restart-thread", 99, 123))
+        .unwrap();
+
+    let result = handle_hook(
+        &store,
+        Provider::Codex,
+        &event(Provider::Codex, "restart-thread", "SessionStart"),
+        &exact_launch_context(token, 99, 123),
+    )
+    .unwrap();
+    assert!(result.launch_certified);
+    assert!(store.get_pending(token).unwrap().is_none());
+
+    // A new Store instance models restart/upgrade: recovery authority must be
+    // present in persisted state, not just in the hook process that observed it.
+    let reopened = Store::at(store.path());
+    let binding = reopened.get_launch_binding(token).unwrap();
+    assert_eq!(binding, Some((Provider::Codex, "restart-thread".into())));
+    assert!(reopened.get_pending(token).unwrap().is_none());
+    let owner = reopened
+        .get_recovery_owner(Provider::Codex, "restart-thread")
+        .unwrap()
+        .unwrap();
+    assert_eq!((owner.pid, owner.start_time), (99, 123));
+    assert_eq!(owner.launch_token, token);
+}
+
+#[test]
+fn mismatched_token_or_process_generation_never_certifies_pending_launch() {
+    for (hook_token, generation) in [("wrong-token", 123), ("right-token", 124)] {
+        let (_temp, store) = store();
+        store
+            .add_pending(&pending_launch("right-token", "exact-thread", 99, 123))
+            .unwrap();
+
+        let result = handle_hook(
+            &store,
+            Provider::Codex,
+            &event(Provider::Codex, "exact-thread", "SessionStart"),
+            &exact_launch_context(hook_token, 99, generation),
+        )
+        .unwrap();
+        assert!(!result.launch_certified, "{hook_token} / {generation}");
+        assert!(store.get_pending("right-token").unwrap().is_some());
+        assert!(
+            store
+                .get_recovery_owner(Provider::Codex, "exact-thread")
+                .unwrap()
+                .is_none()
+        );
+        if hook_token == "wrong-token" {
+            assert!(store.get_launch_binding("right-token").unwrap().is_none());
+        } else {
+            assert_eq!(
+                store.get_launch_binding("right-token").unwrap(),
+                Some((Provider::Codex, "exact-thread".into()))
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_hook_transaction_leaves_no_partial_launch_binding_or_session() {
+    let (_temp, store) = store();
+    let token = "rollback-proof";
+    store
+        .add_pending(&pending_launch(token, "rollback-thread", 99, 123))
+        .unwrap();
+    let db = Connection::open(store.path()).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER reject_hook_session BEFORE INSERT ON sessions
+         BEGIN SELECT RAISE(ABORT, 'injected hook session failure'); END;",
+    )
+    .unwrap();
+    drop(db);
+
+    assert!(
+        handle_hook(
+            &store,
+            Provider::Codex,
+            &event(Provider::Codex, "rollback-thread", "SessionStart"),
+            &exact_launch_context(token, 99, 123),
+        )
+        .is_err()
+    );
+
+    let reopened = Store::at(store.path());
+    assert!(
+        reopened
+            .get_session(Provider::Codex, "rollback-thread")
+            .unwrap()
+            .is_none()
+    );
+    assert!(reopened.get_launch_binding(token).unwrap().is_none());
+    assert!(
+        reopened
+            .get_recovery_owner(Provider::Codex, "rollback-thread")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        reopened.get_pending(token).unwrap(),
+        Some(pending_launch(token, "rollback-thread", 99, 123))
+    );
+}
+
+#[test]
+fn pending_title_and_cwd_without_exact_launch_token_do_not_certify_home() {
+    let (_temp, store) = store();
+    let token = "old-unbound-pending";
+    let mut pending = pending_launch(token, "actual-thread", 99, 123);
+    pending.expected_session_id = None;
+    store.add_pending(&pending).unwrap();
+    let mut payload = event(Provider::Codex, "other-thread", "SessionStart");
+    payload.session_title = Some("project launch".into());
+    assert_eq!(payload.cwd.as_deref(), Some(pending.cwd.as_str()));
+    let mut context = HookContext::at(10.0);
+    context.desired_name = Some("project launch".into());
+    context.exact_home_verified = true;
+    context.owner_pid = Some(99);
+    context.owner_start_time = Some(123);
+    context.pane_id = Some("%1".into());
+    context.pane_session = Some("pika-c-test".into());
+
+    let result = handle_hook(&store, Provider::Codex, &payload, &context).unwrap();
+    assert!(!result.launch_certified);
+    assert!(store.get_pending(token).unwrap().is_some());
+    assert!(store.get_launch_binding(token).unwrap().is_none());
+    assert!(
+        store
+            .get_recovery_owner(Provider::Codex, "other-thread")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn failed_certification_write_rolls_back_projected_session_and_binding() {
+    let (_temp, store) = store();
+    let token = "certification-rollback";
+    store
+        .add_pending(&pending_launch(token, "certification-thread", 99, 123))
+        .unwrap();
+    let db = Connection::open(store.path()).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER reject_recovery_owner BEFORE INSERT ON recovery_owners
+         BEGIN SELECT RAISE(ABORT, 'injected certification failure'); END;",
+    )
+    .unwrap();
+    drop(db);
+
+    assert!(
+        handle_hook(
+            &store,
+            Provider::Codex,
+            &event(Provider::Codex, "certification-thread", "SessionStart"),
+            &exact_launch_context(token, 99, 123),
+        )
+        .is_err()
+    );
+
+    let reopened = Store::at(store.path());
+    assert!(
+        reopened
+            .get_session(Provider::Codex, "certification-thread")
+            .unwrap()
+            .is_none()
+    );
+    assert!(reopened.get_launch_binding(token).unwrap().is_none());
+    assert!(
+        reopened
+            .get_recovery_owner(Provider::Codex, "certification-thread")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        reopened.get_pending(token).unwrap(),
+        Some(pending_launch(token, "certification-thread", 99, 123))
+    );
 }
 
 #[test]

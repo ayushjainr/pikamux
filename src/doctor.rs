@@ -10,9 +10,9 @@ use crate::{
     core::LIVE_OWNER_LEASE_SECONDS,
     model::{Pane, Provider, Session, Status},
     paths::Paths,
-    process::{self, ProcessRecord},
+    process::{self, ProcessObservation, ProcessRecord},
     setup,
-    store::{PendingLaunch, Store},
+    store::{PendingLaunchRetirementSnapshot, Store},
     tmux::Tmux,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -149,16 +149,24 @@ pub fn collect_runtime_evidence(tmux: &Tmux, config: &Config) -> RuntimeEvidence
             )
         })
         .collect();
+    let (processes, process_snapshot_complete) = process_snapshot_evidence(process::observe());
     RuntimeEvidence {
         tmux_available,
         tmux_snapshot_complete,
         tmux_error,
         panes,
-        process_snapshot_complete: cfg!(any(target_os = "linux", target_os = "macos")),
-        processes: process::snapshot(),
+        process_snapshot_complete,
+        processes,
         providers,
         platform: std::env::consts::OS.to_owned(),
     }
+}
+
+fn process_snapshot_evidence(
+    observation: ProcessObservation,
+) -> (BTreeMap<i64, ProcessRecord>, bool) {
+    let complete = matches!(observation.state, process::ObservationState::Complete);
+    (observation.processes, complete)
 }
 
 pub fn inspect_native(
@@ -257,7 +265,7 @@ pub fn inspect_with_evidence(
     if !evidence.process_snapshot_complete {
         checks.push(error_check(
             "process.snapshot",
-            "process identity snapshot is unavailable on this platform",
+            "process identity snapshot is incomplete or unavailable; stale-state repair is blocked",
         ));
     }
 
@@ -619,23 +627,39 @@ pub fn repair_stale(
     at: f64,
     older_than_seconds: f64,
 ) -> Vec<RepairReceipt> {
-    if !evidence.tmux_snapshot_complete || !evidence.process_snapshot_complete {
+    if !runtime_snapshot_can_repair(evidence, at, older_than_seconds) {
         return Vec::new();
     }
     let mut receipts = Vec::new();
     for pending in store.list_pending().unwrap_or_default() {
-        if at - pending.created_at < older_than_seconds || pending_is_live(&pending, evidence) {
+        // Do not apply a runtime snapshot to a launch created after that
+        // snapshot, even if the row was visible by the time cleanup began.
+        if !pending_old_enough(pending.created_at, at, older_than_seconds) {
+            continue;
+        }
+        let Ok(Some(snapshot)) = store.pending_retirement_snapshot(&pending.launch_token) else {
+            continue;
+        };
+        // A newer or otherwise changed row is not the record inspected above.
+        // `retire_pending_if_unchanged` repeats this complete snapshot check in
+        // its write transaction, closing the remaining observation/write race.
+        if snapshot.pending != pending || pending_is_live(&snapshot, evidence) {
             continue;
         }
         if store
-            .delete_pending_if_created(&pending.launch_token, pending.created_at)
+            .retire_pending_if_unchanged(
+                &snapshot,
+                "expired launch has no matching live owner in a complete runtime snapshot",
+            )
             .unwrap_or(false)
         {
             let _ = store.delete_meta(&format!("attached_launch:{}", pending.launch_token));
             receipts.push(RepairReceipt {
                 kind: "pending-launch".into(),
                 reference: opaque_reference(&pending.launch_token),
-                reason: "expired launch has no matching pane or provider process".into(),
+                reason:
+                    "expired launch has no matching live owner; diagnostic evidence was archived"
+                        .into(),
             });
         }
     }
@@ -699,34 +723,154 @@ pub fn repair_stale(
     receipts
 }
 
-fn pending_is_live(pending: &PendingLaunch, evidence: &RuntimeEvidence) -> bool {
-    if let Some(pid) = pending.root_pid
-        && let Some(record) = evidence.processes.get(&pid)
-    {
-        let generation_matches = pending
-            .root_pid_start
-            .is_none_or(|start| u64::try_from(start).ok() == Some(record.start_time));
-        if generation_matches && record.provider() == Some(pending.provider) {
-            return true;
-        }
-    }
+fn runtime_snapshot_can_repair(evidence: &RuntimeEvidence, at: f64, age: f64) -> bool {
+    evidence.tmux_snapshot_complete
+        && evidence.process_snapshot_complete
+        && at.is_finite()
+        && age.is_finite()
+        && age >= 0.0
+}
+
+fn pending_old_enough(created_at: f64, at: f64, age: f64) -> bool {
+    created_at.is_finite() && created_at <= at && at - created_at >= age
+}
+
+fn pending_is_live(snapshot: &PendingLaunchRetirementSnapshot, evidence: &RuntimeEvidence) -> bool {
+    pending_identity_conflicts(snapshot)
+        || pending_recorded_generation_is_live(snapshot, evidence)
+        || pending_wrapper_is_live(snapshot, evidence)
+        || pending_identity_process_is_live(snapshot, evidence)
+        || pending_pane_is_ambiguous_or_live(snapshot, evidence)
+}
+
+fn pending_identity_conflicts(snapshot: &PendingLaunchRetirementSnapshot) -> bool {
+    let pending = &snapshot.pending;
+    // Contradictory identity metadata is ambiguous, not stale. Retirement is
+    // diagnostic cleanup and must not choose between incompatible identities.
     if pending
-        .candidate_session_id
-        .as_deref()
-        .is_some_and(|identity| {
-            !process::find_session_processes(identity, pending.provider, &evidence.processes)
-                .is_empty()
-        })
+        .expected_session_id
+        .as_ref()
+        .zip(pending.candidate_session_id.as_ref())
+        .is_some_and(|(expected, candidate)| expected != candidate)
     {
         return true;
     }
+    snapshot
+        .binding
+        .as_ref()
+        .is_some_and(|(provider, identity)| {
+            *provider != pending.provider
+                || pending
+                    .expected_session_id
+                    .as_deref()
+                    .is_some_and(|expected| expected != identity)
+                || pending
+                    .candidate_session_id
+                    .as_deref()
+                    .is_some_and(|candidate| candidate != identity)
+        })
+}
+
+fn pending_recorded_generation_is_live(
+    snapshot: &PendingLaunchRetirementSnapshot,
+    evidence: &RuntimeEvidence,
+) -> bool {
+    let pending = &snapshot.pending;
+    // PID reuse cannot disprove an owner if the old record lacked a birth
+    // stamp. Conversely, any matching recorded generation remains live even
+    // if argv no longer resembles the provider command.
+    pending.root_pid.is_some_and(|pid| {
+        evidence.processes.get(&pid).is_some_and(|record| {
+            pending
+                .root_pid_start
+                .is_none_or(|start| u64::try_from(start).ok() == Some(record.start_time))
+        })
+    })
+}
+
+fn pending_wrapper_is_live(
+    snapshot: &PendingLaunchRetirementSnapshot,
+    evidence: &RuntimeEvidence,
+) -> bool {
+    let pending = &snapshot.pending;
+    // The exit wrapper carries both opaque tokens in its argv. A process that
+    // still carries this launch generation is not disproved merely because
+    // the provider root or tmux pane has disappeared.
+    let wrapper_owner = match snapshot.wrapper_owner.as_deref() {
+        Some(encoded) => serde_json::from_str::<serde_json::Value>(encoded)
+            .ok()
+            .and_then(|value| value.get("owner_token")?.as_str().map(str::to_owned)),
+        None => None,
+    };
+    if snapshot.wrapper_owner.is_some() && wrapper_owner.as_deref().is_none_or(str::is_empty) {
+        return true;
+    }
+    if evidence.processes.values().any(|record| {
+        let launch_token = process_carries_launch_token(record, &pending.launch_token);
+        let owner_token = wrapper_owner
+            .as_deref()
+            .is_some_and(|owner| record.argv.iter().any(|arg| arg.contains(owner)));
+        launch_token || owner_token
+    }) {
+        return true;
+    }
+    false
+}
+
+fn process_carries_launch_token(record: &ProcessRecord, launch_token: &str) -> bool {
+    record.argv.iter().any(|arg| {
+        arg == launch_token && record.argv.iter().any(|flag| flag == "--launch-token")
+            || arg == &format!("--launch-token={launch_token}")
+            || (arg.contains("--launch-token") && arg.contains(launch_token))
+    })
+}
+
+fn pending_identity_process_is_live(
+    snapshot: &PendingLaunchRetirementSnapshot,
+    evidence: &RuntimeEvidence,
+) -> bool {
+    let pending = &snapshot.pending;
+    // Candidate, expected, and already-bound identities are independent
+    // owner evidence. Do not clean a reservation while any exact UUID still
+    // has a provider process, even if the launch pane was replaced.
+    let bound_id = snapshot
+        .binding
+        .as_ref()
+        .filter(|(provider, _)| *provider == pending.provider)
+        .map(|(_, identity)| identity.as_str());
+    [
+        pending.candidate_session_id.as_deref(),
+        pending.expected_session_id.as_deref(),
+        bound_id,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|identity| {
+        !process::find_session_processes(identity, pending.provider, &evidence.processes).is_empty()
+    })
+}
+
+fn pending_pane_is_ambiguous_or_live(
+    snapshot: &PendingLaunchRetirementSnapshot,
+    evidence: &RuntimeEvidence,
+) -> bool {
+    let pending = &snapshot.pending;
+    // A pane/session reference with no launch token is ambiguous and remains
+    // protected. A conflicting nonempty token proves that tmux reused the
+    // referenced pane/session for another launch, so that stale reference must
+    // not keep this old reservation alive forever.
     evidence.panes.iter().any(|pane| {
-        let matches = pending.tmux_pane.as_deref() == Some(&pane.pane_id)
-            || pending.tmux_session.as_deref() == Some(&pane.session_name)
-            || pane.pika_launch_token.as_deref() == Some(&pending.launch_token);
-        matches
-            && process::provider_process(pane.pane_pid, Some(pending.provider), &evidence.processes)
-                .is_some()
+        let referenced = pending.tmux_pane.as_deref() == Some(pane.pane_id.as_str())
+            || pending.tmux_session.as_deref() == Some(pane.session_name.as_str());
+        match pane.pika_launch_token.as_deref() {
+            Some(token) if token == pending.launch_token => {
+                // A retained exact-token terminal is still the user's recovery
+                // handle even after its provider exits. Doctor must not discard it.
+                true
+            }
+            Some(token) if !token.is_empty() => false,
+            Some(_) | None => referenced,
+        }
     })
 }
 
@@ -1027,6 +1171,26 @@ mod probe_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
+
+    #[test]
+    fn process_snapshot_evidence_requires_a_complete_observation() {
+        let (complete, complete_flag) =
+            process_snapshot_evidence(ProcessObservation::complete(BTreeMap::new()));
+        assert!(complete_flag);
+        assert!(complete.is_empty());
+
+        let (partial, partial_flag) = process_snapshot_evidence(ProcessObservation::partial(
+            BTreeMap::new(),
+            vec!["one process could not be read".into()],
+        ));
+        assert!(!partial_flag);
+        assert!(partial.is_empty());
+
+        let (failed, failed_flag) =
+            process_snapshot_evidence(ProcessObservation::error("process enumeration failed"));
+        assert!(!failed_flag);
+        assert!(failed.is_empty());
+    }
 
     #[test]
     fn doctor_probe_deadline_includes_inherited_output_after_root_exit() {

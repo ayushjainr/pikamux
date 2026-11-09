@@ -369,8 +369,14 @@ and a durable tombstone prevents lifecycle hooks from silently adding the
 workstream back before then.
 
 Unconfirmed launch entries are distinct from conversations. After two minutes
-without confirmation they say `unconfirmed`, not `starting` or `working`;
-elapsed time never proves exit or identity. X explicitly hides only that launch
+without confirmation and without live runtime proof they say `unconfirmed`, not
+`starting` or `working`. An independently observed provider in the exact token-bound
+terminal instead projects `UNBOUND` / `terminal only`, outside the failure queue.
+The inspector explains that the terminal is running but its conversation identity
+and activity remain unknown. This is not Ready, Working, or a conversation binding;
+shared-daemon metadata, names and timestamps cannot establish that binding.
+Authenticated startup exits still take precedence. Cached evidence cannot create
+this live classification. Elapsed time never proves exit or identity. X explicitly hides only that launch
 entry. Its recovery record, live terminal, and any confirmed conversation stay
 intact. Hidden records remain available to launch recovery and diagnostics.
 An authenticated wrapper exit before identity confirmation is recorded against
@@ -402,6 +408,14 @@ and bindings must not name another conversation. Retirement atomically compares
 the observed row and launch metadata and retains them as diagnostic evidence;
 it does not use age as proof, discard history or launch an unnamed replacement.
 Missing exit proof, live owners and changed observations remain explicit blocks.
+Explicit `pika doctor --repair-stale` is bookkeeping cleanup, not conversation
+recovery. It archives the complete observed launch evidence and retires it only
+if that snapshot is unchanged and complete runtime observations find no matching
+owner. A reused terminal carrying another launch token does not keep the old
+reservation alive. Retained exact-token terminals, ambiguous terminal references,
+live generations, wrappers and known conversation owners remain protected.
+Cleanup never infers a conversation from its title, project or creation time,
+and never starts a replacement provider or edits native history.
 During ordinary reconciliation, an independently proven exact home can complete
 a stranded startup record with the same expected conversation, pane, launch
 token, binding, and phase. Only its confirmed process generation replaces the

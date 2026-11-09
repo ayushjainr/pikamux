@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.59 — Distinguish live terminals from unverified conversations
+
+- Show an observed live startup terminal as `terminal only`, not a failed launch,
+  without guessing its conversation identity, activity state or last activity.
+- Keep these terminals in a separate board section and out of conversation-state
+  counters; retain exact terminal opening and authenticated startup-exit precedence.
+- Harden explicit stale-launch cleanup with complete runtime observations and
+  atomic evidence checks. Preserve live owners, ambiguous terminals and history.
+- Verify hook binding rollback and persistence with isolated fixtures.
+
+Updating does not restart agents, rewrite hooks or certify an unknown conversation.
+Reopen existing boards to use the new classification. No iPhone rebuild is required
+for this native terminal-board adjustment.
+
 ## 0.6.58 — Reuse board SSH connections
 
 The 0.6.55 candidate was not published: strict lint caught redundant borrows
