@@ -941,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "pikamux"
-version = "0.6.62"
+version = "0.6.63"
 dependencies = [
  "anyhow",
  "assert_cmd",

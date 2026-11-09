@@ -13,8 +13,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
-  # Archive contracts exercise the CLI built alongside tests. Debug symbols are
-  # not shipped and must not consume its release-artifact size budget.
+  # Debug information is not shipped and must not consume the artifact budget.
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
 
@@ -67,6 +66,11 @@ jobs:
           if-no-files-found: error
 
   test:
+    # Archive contracts package the test CLI. Match shipped symbol stripping
+    # while keeping unoptimized code and debug assertions for the test suite.
+    env:
+      CARGO_PROFILE_DEV_STRIP: symbols
+      CARGO_PROFILE_TEST_STRIP: symbols
     # macOS measured 16m29s for the serial suite, before the release build.
     # Keep per-test deadlines unchanged; allow the complete job to finish.
     timeout-minutes: ${{ matrix.os == 'macos-15' && 30 || 20 }}
@@ -121,6 +125,8 @@ jobs:
           sudo -u "$pairing_user" python3 "$pairing_mount/accounts/assistant-journey.py" --binary "$pairing_mount/accounts/pika" --home "$pairing_mount/accounts" --foreign-child "$pairing_mount/accounts/foreign/owned" --external "$pairing_mount/outside"
       - name: Test
         run: scripts/with-test-home.sh env -u PIKA_DB_PATH -u PIKA_UPDATE_CHECK cargo test --locked --all-targets --no-fail-fast -- --test-threads=1
+      - name: Record archive fixture footprint
+        run: wc -c target/debug/pika
       - name: Dependency license inventory
         shell: bash
         run: |

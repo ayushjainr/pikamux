@@ -133,6 +133,8 @@ class IsolationTests(unittest.TestCase):
         return subprocess.run([str(ROOT / "scripts/with-test-home.sh"), *args],
                               env={**os.environ, "SECRET_SENTINEL": "must-not-leak",
                                    "PIKA_DB_PATH": "/not/a/test/database",
+                                   "CARGO_PROFILE_DEV_STRIP": "symbols",
+                                   "CARGO_PROFILE_TEST_STRIP": "symbols",
                                    "LLVM_PROFILE_FILE": "/tmp/quality-%p.profraw"},
                               text=True, capture_output=True)
 
@@ -144,6 +146,8 @@ class IsolationTests(unittest.TestCase):
         self.assertTrue(env["PIKA_DB_PATH"].startswith("/tmp/pq."))
         self.assertFalse(Path(env["HOME"]).exists(), "temporary HOME not cleaned")
         self.assertEqual(env["LLVM_PROFILE_FILE"], "/tmp/quality-%p.profraw")
+        self.assertEqual(env["CARGO_PROFILE_DEV_STRIP"], "symbols")
+        self.assertEqual(env["CARGO_PROFILE_TEST_STRIP"], "symbols")
         self.assertNotIn("TMUX", env)
 
     def test_failure_remains_failure(self):
