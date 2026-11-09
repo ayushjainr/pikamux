@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.64 — Distinguish live terminals from unverified conversations
+## 0.6.65 — Distinguish live terminals from unverified conversations
 
 The 0.6.59 candidate was withheld: the complexity check required extracting
 detail presentation helpers, and GitHub retired the macOS 14 runner. This
@@ -16,6 +16,9 @@ do, while retaining unoptimized code, debug assertions and the 50 MiB limit.
 The 0.6.63 candidate passed Linux validation but macOS twice missed an ephemeral
 terminal confirmation. The switching contract now waits for durable exact-target
 evidence instead of using the three-second notification as synchronization.
+The 0.6.64 candidate exposed two further fixture races on macOS. Tests now
+synchronize on the parsed SSH frame and the second terminal's readiness and
+focus, retaining the same production identity and protocol rejection checks.
 
 - Show an observed live startup terminal as `terminal only`, not a failed launch,
   without guessing its conversation identity, activity state or last activity.

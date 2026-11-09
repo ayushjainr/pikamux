@@ -2916,7 +2916,29 @@ done
             Duration::from_secs(2),
         ));
         assert!(transport.request("atlas", &request(node_id), false).is_ok());
-        thread::sleep(Duration::from_millis(100));
+        // Wait for the reader—not merely the fake process—to parse the extra
+        // frame, then put that exact queued event back so the next request
+        // observes it at the same pre-dispatch boundary as production.
+        let connection = SnapshotConnection {
+            target: "atlas".into(),
+            node_id: node_id.into(),
+        };
+        let mut sessions = transport.sessions.lock().unwrap();
+        let session = sessions.get_mut(&connection).unwrap();
+        let unsolicited = session
+            .events
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the reader must receive the unsolicited second frame");
+        assert!(
+            unsolicited.is_ok(),
+            "the unsolicited frame must be valid JSON: {unsolicited:?}"
+        );
+        let (sender, events) = mpsc::sync_channel(2);
+        sender.send(unsolicited).unwrap();
+        session.events = Some(events);
+        drop(sessions);
         assert_eq!(
             transport
                 .request("atlas", &request(node_id), false)
