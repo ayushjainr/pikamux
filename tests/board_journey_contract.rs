@@ -264,6 +264,58 @@ impl BoardProcess {
             .expect("the opening terminal must remain attached")
     }
 
+    fn await_exact_open(
+        &mut self,
+        store: &Store,
+        provider: pikamux::model::Provider,
+        session_id: &str,
+        name: &str,
+        opening_client: &str,
+    ) -> String {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut observed = String::new();
+        loop {
+            let mut bytes = [0; 32768];
+            match self.terminal.read(&mut bytes) {
+                Ok(count) => self.receive(&bytes[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("terminal read: {error}; output: {}", self.output),
+            }
+            if let Some(pane) = store
+                .get_session(provider, session_id)
+                .unwrap()
+                .and_then(|session| session.tmux_pane)
+            {
+                let identity = self.tmux(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &pane,
+                    "#{@pika_provider}|#{@pika_session_id}|#{@pika_name}|#{@pika_launch_token}",
+                ]);
+                let client_pane = self.client_pane(opening_client);
+                observed = format!(
+                    "pane={pane} identity={identity:?} client={client_pane} expected={provider}|{session_id}|{name}"
+                );
+                let mut fields = identity.trim().split('|');
+                if fields.next() == Some(provider.as_str())
+                    && fields.next() == Some(session_id)
+                    && fields.next() == Some(name)
+                    && fields.next().is_some_and(|token| !token.is_empty())
+                    && client_pane == pane
+                {
+                    return pane;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the opening client did not reach the exact provider pane: {observed}; tmux: {}",
+                fs::read_to_string(self.root.path().join("tmux-trace")).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn detach_client(&self, client_pid: u32) {
         let listed = self.tmux(&["list-clients", "-F", "#{client_name}|#{client_pid}"]);
         let clients = listed
@@ -1683,12 +1735,18 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
         board.send(b"\x1b[F"); // End then Enter: no name typing.
         board.await_text("zulu_other");
         board.send(b"\r");
-        board.await_text(&format!("exact id {}", &second.session_id[..8]));
+        let destination = board.await_exact_open(
+            &store,
+            second.provider,
+            &second.session_id,
+            second.name.as_deref().unwrap(),
+            &opening_client,
+        );
         let opened = store
             .get_session(second.provider, &second.session_id)
             .unwrap()
             .unwrap();
-        let destination = opened.tmux_pane.unwrap();
+        assert_eq!(opened.tmux_pane.as_deref(), Some(destination.as_str()));
         assert!(!opened.unread);
         assert_eq!(board.client_pane(&opening_client), destination);
         if other.is_some() {
@@ -1712,6 +1770,13 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             original_pid
         );
         assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
+        assert!(
+            fs::read_to_string(&launches)
+                .unwrap()
+                .lines()
+                .any(|launched| launched == second.session_id),
+            "the fake provider must receive the exact selected UUID"
+        );
         board.checkpoint(
             "B · unvisited thread opened through arrows and Enter",
             &store,
@@ -1721,7 +1786,13 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             board.await_thread_list(&destination);
             board.await_text("Threads");
             board.send(b"1");
-            board.await_text(&format!("exact id {}", &seed.session_id[..8]));
+            board.await_exact_open(
+                &store,
+                seed.provider,
+                &seed.session_id,
+                seed.name.as_deref().unwrap(),
+                &opening_client,
+            );
             assert_eq!(board.client_pane(&opening_client), original);
             board.checkpoint(
                 "1 · returned to A after recovering missing visit history",
@@ -1731,7 +1802,13 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             board.await_thread_list(&original);
             board.await_text("Threads");
             board.send(b"1");
-            board.await_text(&format!("exact id {}", &second.session_id[..8]));
+            board.await_exact_open(
+                &store,
+                second.provider,
+                &second.session_id,
+                second.name.as_deref().unwrap(),
+                &opening_client,
+            );
             assert_eq!(board.client_pane(&opening_client), destination);
             board.checkpoint("1 · returned to B, same live process", &store);
             assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 2);
@@ -1810,15 +1887,31 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
         board.await_text("Threads");
         board.await_text("zz_third_visit");
         board.send(b"\x1b[F\r");
-        board.await_text(&format!("exact id {}", &third.session_id[..8]));
-        let third_pane = store
-            .get_session(third.provider, &third.session_id)
-            .unwrap()
-            .unwrap()
-            .tmux_pane
-            .unwrap();
+        let third_pane = board.await_exact_open(
+            &store,
+            third.provider,
+            &third.session_id,
+            third.name.as_deref().unwrap(),
+            &opening_client,
+        );
+        assert_eq!(
+            store
+                .get_session(third.provider, &third.session_id)
+                .unwrap()
+                .unwrap()
+                .tmux_pane
+                .as_deref(),
+            Some(third_pane.as_str())
+        );
         assert_eq!(board.client_pane(&opening_client), third_pane);
         assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 3);
+        assert!(
+            fs::read_to_string(&launches)
+                .unwrap()
+                .lines()
+                .any(|launched| launched == third.session_id),
+            "the fake provider must receive the exact selected UUID"
+        );
         board.checkpoint("C · third exact visit opened", &store);
         board.send(b"\x1b[24~");
         let recent_viewer = board.await_thread_list(&third_pane);
@@ -1853,7 +1946,13 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
             &store,
         );
         board.send(b"2");
-        board.await_text(&format!("exact id {}", &seed.session_id[..8]));
+        board.await_exact_open(
+            &store,
+            seed.provider,
+            &seed.session_id,
+            seed.name.as_deref().unwrap(),
+            &opening_client,
+        );
         assert_eq!(board.client_pane(&opening_client), original);
         board.checkpoint("2 · frozen second recent opens exact A", &store);
         assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 3);
@@ -1866,7 +1965,13 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
         board.await_thread_list(&original);
         board.await_text("Threads");
         board.send(b"1");
-        board.await_text(&format!("exact id {}", &third.session_id[..8]));
+        board.await_exact_open(
+            &store,
+            third.provider,
+            &third.session_id,
+            third.name.as_deref().unwrap(),
+            &opening_client,
+        );
         assert_eq!(board.client_pane(&opening_client), third_pane);
         board.checkpoint("1 · previous thread returns to exact C", &store);
         // The second terminal opened only this exact origin through Pika;
@@ -1934,7 +2039,13 @@ fn side_list_journey(provider: pikamux::model::Provider, shared_terminal: bool) 
         // Switch back to the already-running origin. The full-board route must
         // survive more than one handoff, and this open must not launch a copy.
         board.send(b"1");
-        board.await_text(&format!("exact id {}", &seed.session_id[..8]));
+        board.await_exact_open(
+            &store,
+            seed.provider,
+            &seed.session_id,
+            seed.name.as_deref().unwrap(),
+            &opening_client,
+        );
         assert_eq!(board.client_pane(&opening_client), original);
         assert_eq!(fs::read_to_string(&launches).unwrap().lines().count(), 3);
         board.send(b"\x1b[24~");

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.63 — Distinguish live terminals from unverified conversations
+## 0.6.64 — Distinguish live terminals from unverified conversations
 
 The 0.6.59 candidate was withheld: the complexity check required extracting
 detail presentation helpers, and GitHub retired the macOS 14 runner. This
@@ -13,6 +13,9 @@ compiler. This candidate applies the same reviewed conditional simplification.
 The 0.6.62 candidate found that unstripped test executables exceed the archive
 budget on Linux. CI now strips their symbol tables, as release builds already
 do, while retaining unoptimized code, debug assertions and the 50 MiB limit.
+The 0.6.63 candidate passed Linux validation but macOS twice missed an ephemeral
+terminal confirmation. The switching contract now waits for durable exact-target
+evidence instead of using the three-second notification as synchronization.
 
 - Show an observed live startup terminal as `terminal only`, not a failed launch,
   without guessing its conversation identity, activity state or last activity.
