@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.6.59 — Distinguish live terminals from unverified conversations
+## 0.6.60 — Distinguish live terminals from unverified conversations
+
+The 0.6.59 candidate was withheld: the complexity check required extracting
+detail presentation helpers, and GitHub retired the macOS 14 runner. This
+candidate uses supported macOS 15 runners without weakening release gates.
 
 - Show an observed live startup terminal as `terminal only`, not a failed launch,
   without guessing its conversation identity, activity state or last activity.

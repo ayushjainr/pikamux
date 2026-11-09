@@ -1,4 +1,4 @@
-Pika 0.6.59 separates live terminal availability from verified conversation
+Pika 0.6.60 separates live terminal availability from verified conversation
 identity. Pending launches with current exact-token runtime evidence appear in
 their own `terminal only` section, without false failure, activity counts or
 activity timestamps. Existing terminals remain openable; no identity is guessed.

@@ -2710,15 +2710,7 @@ impl Board {
         );
         queue!(output, MoveTo(x as u16, 2))?;
         styled(output, Color::Reset, true, &truncate(&title, available))?;
-        let state = if item.stale {
-            "CACHED"
-        } else if pending_terminal_only(item) {
-            "TERMINAL ONLY"
-        } else if item.pending_token.is_some() && session.status == Status::Error {
-            "LAUNCH UNCONFIRMED"
-        } else {
-            session.status.as_str()
-        };
+        let state = detail_state(item);
         queue!(output, MoveTo(x as u16, 3))?;
         styled(
             output,
@@ -2730,12 +2722,7 @@ impl Board {
             true,
             state,
         )?;
-        let last = session.last_event_at.max(session.last_activity_at);
-        let age = if !pending_terminal_only(item) && last > 0.0 {
-            format!("last activity {} ago", human_age(last))
-        } else {
-            "activity time unknown".into()
-        };
+        let age = detail_activity_age(item);
         let context = format!(" · {} · {age}", session.provider);
         queue!(
             output,
@@ -3262,6 +3249,30 @@ fn briefing_message(item: &BoardItem) -> (&'static str, &str) {
                 .or(reason)
                 .unwrap_or("An error was recorded. Open for recovery steps."),
         ),
+    }
+}
+
+fn detail_state(item: &BoardItem) -> &'static str {
+    if item.stale {
+        "CACHED"
+    } else if pending_terminal_only(item) {
+        "TERMINAL ONLY"
+    } else if item.pending_token.is_some() && item.session.status == Status::Error {
+        "LAUNCH UNCONFIRMED"
+    } else {
+        item.session.status.as_str()
+    }
+}
+
+fn detail_activity_age(item: &BoardItem) -> String {
+    let last = item
+        .session
+        .last_event_at
+        .max(item.session.last_activity_at);
+    if !pending_terminal_only(item) && last > 0.0 {
+        format!("last activity {} ago", human_age(last))
+    } else {
+        "activity time unknown".into()
     }
 }
 
