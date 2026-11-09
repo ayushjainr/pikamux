@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.61 — Distinguish live terminals from unverified conversations
+## 0.6.62 — Distinguish live terminals from unverified conversations
 
 The 0.6.59 candidate was withheld: the complexity check required extracting
 detail presentation helpers, and GitHub retired the macOS 14 runner. This
@@ -8,6 +8,8 @@ candidate uses supported macOS 15 runners without weakening release gates.
 The 0.6.60 candidate was withheld by the security audit. This release updates
 bundled SQLite through rusqlite 0.41.1 and pins Rust 1.89 to address
 RUSTSEC-2026-0459; no database migration or automatic cleanup is added.
+The 0.6.61 candidate exposed one Windows-only style lint under the newer
+compiler. This candidate applies the same reviewed conditional simplification.
 
 - Show an observed live startup terminal as `terminal only`, not a failed launch,
   without guessing its conversation identity, activity state or last activity.

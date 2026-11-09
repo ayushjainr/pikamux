@@ -710,12 +710,13 @@ where
     let child_id = i32::try_from(child.id()).context("terminal client PID does not fit i32")?;
     let mut on_handoff = Some(on_handoff);
     loop {
-        if on_handoff.is_some() && handoff_proven(child_id) {
-            if let Err(error) = on_handoff.take().expect("handoff callback present")() {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
+        if on_handoff.is_some()
+            && handoff_proven(child_id)
+            && let Err(error) = on_handoff.take().expect("handoff callback present")()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
         }
         if let Some(status) = child.try_wait()? {
             return Ok(status.code().unwrap_or(1));
