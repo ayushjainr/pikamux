@@ -330,13 +330,13 @@ fn unblock_runtime_guards(root: &Path) -> Result<(), RecoveryError> {
         "author-runtime.sqlite",
         "maintenance-runtime.sqlite",
     ] {
-        if let Some(conn) = open_known(&root.join(name))? {
-            if table_exists(&conn, "assistant_runtime_guard")? {
-                conn.execute(
-                    "UPDATE assistant_runtime_guard SET blocked=0 WHERE id=1",
-                    [],
-                )?;
-            }
+        if let Some(conn) = open_known(&root.join(name))?
+            && table_exists(&conn, "assistant_runtime_guard")?
+        {
+            conn.execute(
+                "UPDATE assistant_runtime_guard SET blocked=0 WHERE id=1",
+                [],
+            )?;
         }
     }
     Ok(())

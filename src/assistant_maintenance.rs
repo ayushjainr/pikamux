@@ -200,13 +200,12 @@ fn due_revisits(memory: &Store, now: i64) -> Result<()> {
         let selected: Scope = serde_json::from_str(&key)?;
         if let (Some(record), Some(revision)) =
             (memory.get_active(&id)?, memory.source_version(&id)?)
+            && record.scope.permits(&selected)
         {
-            if record.scope.permits(&selected) {
-                signal(memory, &selected, Purpose::Reflection)?;
-                // Rewind the bounded scanner only after the due condition;
-                // already covered revisions remain deduplicated by claims.
-                memory.connection.execute("UPDATE maintenance_signals SET scan_cursor=MIN(scan_cursor,?) WHERE scope=? AND purpose='reflection'",params![revision.saturating_sub(1),key])?;
-            }
+            signal(memory, &selected, Purpose::Reflection)?;
+            // Rewind the bounded scanner only after the due condition;
+            // already covered revisions remain deduplicated by claims.
+            memory.connection.execute("UPDATE maintenance_signals SET scan_cursor=MIN(scan_cursor,?) WHERE scope=? AND purpose='reflection'",params![revision.saturating_sub(1),key])?;
         }
         memory.connection.execute(
             "UPDATE maintenance_revisits SET queued=1 WHERE record_id=?",

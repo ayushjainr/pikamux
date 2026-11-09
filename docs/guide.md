@@ -891,7 +891,7 @@ non-sensitive. See [security and privacy](../SECURITY.md).
 
 ## Development
 
-Build and run Pika with Rust 1.88 or newer:
+Build and run Pika with Rust 1.89 or newer:
 
 ```bash
 cargo build --locked

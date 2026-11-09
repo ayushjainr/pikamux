@@ -304,16 +304,15 @@ impl Remote {
         }) {
             bail!("Remote response belongs to another conversation");
         }
-        if method == "conversation/create" {
-            if let Some(identity) = result
+        if method == "conversation/create"
+            && let Some(identity) = result
                 .get("identity")
                 .filter(|identity| !identity.is_null())
-            {
-                if identity["nodeId"] != self.node.node_id {
-                    bail!("New conversation belongs to another machine");
-                }
-                self.selected = Some(identity.clone());
+        {
+            if identity["nodeId"] != self.node.node_id {
+                bail!("New conversation belongs to another machine");
             }
+            self.selected = Some(identity.clone());
         }
         Ok(result)
     }

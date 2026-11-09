@@ -166,10 +166,10 @@ fn candidate_record(
         record.provenance = provenance;
         return Ok(record);
     }
-    if let LearningCandidate::Decision { body, .. } = candidate {
-        if crate::assistant_decisions::commitment(body).is_some() {
-            return Err(MemoryError::Invalid("structured commitments require the commitment candidate schema; generated decisions cannot assert completion or due authority".into()));
-        }
+    if let LearningCandidate::Decision { body, .. } = candidate
+        && crate::assistant_decisions::commitment(body).is_some()
+    {
+        return Err(MemoryError::Invalid("structured commitments require the commitment candidate schema; generated decisions cannot assert completion or due authority".into()));
     }
     let (kind, body, state) = match candidate {
         LearningCandidate::Fact { body, .. } => (RecordKind::Finding, body, None),

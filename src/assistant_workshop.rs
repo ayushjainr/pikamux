@@ -29,10 +29,11 @@ impl Workshop {
         let mut catalog = self.registry.catalog(scope, hash)?;
         if let Some(tools) = catalog["tools"].as_array_mut() {
             for tool in tools {
-                if let Some(hash) = tool["hash"].as_str().map(str::to_owned) {
-                    if self.validate_candidate_sources(&hash).is_err() {
-                        *tool = serde_json::json!({"hash":hash,"active":false,"source_unavailable":true});
-                    }
+                if let Some(hash) = tool["hash"].as_str().map(str::to_owned)
+                    && self.validate_candidate_sources(&hash).is_err()
+                {
+                    *tool =
+                        serde_json::json!({"hash":hash,"active":false,"source_unavailable":true});
                 }
             }
         }

@@ -184,20 +184,18 @@ fn validate_adaptation(adaptation: &Adaptation) -> Result<(), MemoryError> {
         when,
         ..
     } = adaptation
-    {
-        if topic.trim().is_empty()
+        && (topic.trim().is_empty()
             || topic.len() > 128
             || topic.chars().any(char::is_control)
             || instruction.trim().is_empty()
             || instruction.len() > 2048
             || when
                 .as_ref()
-                .is_some_and(|v| v.trim().is_empty() || v.len() > 1024)
-        {
-            return Err(MemoryError::Invalid(
-                "guidance needs a bounded topic, instruction and optional condition".into(),
-            ));
-        }
+                .is_some_and(|v| v.trim().is_empty() || v.len() > 1024))
+    {
+        return Err(MemoryError::Invalid(
+            "guidance needs a bounded topic, instruction and optional condition".into(),
+        ));
     }
     Ok(())
 }

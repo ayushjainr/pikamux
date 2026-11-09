@@ -865,12 +865,11 @@ impl Pika {
                 let mut admitted = Vec::new();
                 for candidate in batch {
                     let session = session_from_candidate(candidate);
-                    if ledger.watch_named_session(&session)? {
-                        if let Some(existing) =
+                    if ledger.watch_named_session(&session)?
+                        && let Some(existing) =
                             ledger.get_session(candidate.provider, &candidate.session_id)?
-                        {
-                            admitted.push(existing);
-                        }
+                    {
+                        admitted.push(existing);
                     }
                 }
                 Ok(admitted)

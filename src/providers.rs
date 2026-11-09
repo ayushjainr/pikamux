@@ -2216,7 +2216,7 @@ fn opencode_source_states(
 
 fn readonly(path: &Path) -> Result<Connection> {
     let uri = format!("file:{}?mode=ro", path.to_string_lossy());
-    let db = Connection::open_with_flags(
+    let mut db = Connection::open_with_flags(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
@@ -2225,7 +2225,7 @@ fn readonly(path: &Path) -> Result<Connection> {
     .with_context(|| format!("cannot open {}", path.display()))?;
     db.busy_timeout(PROVIDER_SQLITE_BUSY_TIMEOUT)?;
     let deadline = Instant::now() + PROVIDER_SQLITE_DEADLINE;
-    db.progress_handler(1_000, Some(move || Instant::now() >= deadline));
+    db.progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
     Ok(db)
 }
 

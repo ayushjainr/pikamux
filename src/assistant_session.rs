@@ -535,17 +535,17 @@ impl Session {
             .ensure_workshop_stored()?
             .invoke(name, &inputs)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        if let Some(root) = self.workshop_root.as_ref() {
-            if let Err(error) = crate::assistant_learning::record_use(
+        if let Some(root) = self.workshop_root.as_ref()
+            && let Err(error) = crate::assistant_learning::record_use(
                 root,
                 scope,
                 &result.tool_hash,
                 &json!({"output":result.value,"fuel_used":result.fuel_used,"operations":result.operations}),
-            ) {
-                result.provenance_warning = Some(format!(
-                    "Tool completed; its learning receipt is incomplete (some memory may already be saved): {error}"
-                ));
-            }
+            )
+        {
+            result.provenance_warning = Some(format!(
+                "Tool completed; its learning receipt is incomplete (some memory may already be saved): {error}"
+            ));
         }
         Ok(result)
     }
@@ -568,18 +568,16 @@ impl Session {
         if self.workshop.is_none() {
             let workshop = WorkshopUi::open(root.join("workshop.sqlite"))
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            if let Some(pending) = self.pending_evolution.as_ref() {
-                if let Some(candidate_json) = pending.candidate_json.as_deref() {
-                    let candidate: CandidateManifest = serde_json::from_str(candidate_json)
-                        .map_err(|error| {
-                            anyhow::anyhow!("persisted candidate is invalid: {error}")
-                        })?;
-                    let hash = validate_definition(&candidate.definition)
-                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                    workshop
-                        .restore_report(&pending.experiment, &hash)
-                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                }
+            if let Some(pending) = self.pending_evolution.as_ref()
+                && let Some(candidate_json) = pending.candidate_json.as_deref()
+            {
+                let candidate: CandidateManifest = serde_json::from_str(candidate_json)
+                    .map_err(|error| anyhow::anyhow!("persisted candidate is invalid: {error}"))?;
+                let hash = validate_definition(&candidate.definition)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                workshop
+                    .restore_report(&pending.experiment, &hash)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             }
             self.workshop = Some(workshop);
         }
@@ -747,10 +745,11 @@ impl Session {
             if matches!(snapshot.state, ServiceState::Failed | ServiceState::Stopped) {
                 pending.terminal = true;
             }
-            if pending.terminal && !pending.submitted {
-                if let Some(root) = self.workshop_root.as_ref() {
-                    mark_pending_terminal(root, &pending.request_id, "authoring_failed")?;
-                }
+            if pending.terminal
+                && !pending.submitted
+                && let Some(root) = self.workshop_root.as_ref()
+            {
+                mark_pending_terminal(root, &pending.request_id, "authoring_failed")?;
             }
         }
         Ok(())
@@ -772,23 +771,22 @@ impl Session {
                             mark_pending_terminal(root, &pending.request_id, "evaluation_failed");
                     }
                 }
-            } else if workshop_snapshot.report.is_some() {
-                if let Some(pending) = self.pending_evolution.as_mut() {
-                    if pending.submitted {
-                        if let (Some(root), Some(report)) = (
-                            self.workshop_root.as_ref(),
-                            workshop_snapshot.report.as_ref(),
-                        ) {
-                            crate::assistant_learning::bind_candidate(
-                                root,
-                                &pending.request_id,
-                                &report.tool_hash,
-                            )?;
-                        }
-                        pending.terminal = true;
-                        pending.evaluation_queued = true;
-                    }
+            } else if workshop_snapshot.report.is_some()
+                && let Some(pending) = self.pending_evolution.as_mut()
+                && pending.submitted
+            {
+                if let (Some(root), Some(report)) = (
+                    self.workshop_root.as_ref(),
+                    workshop_snapshot.report.as_ref(),
+                ) {
+                    crate::assistant_learning::bind_candidate(
+                        root,
+                        &pending.request_id,
+                        &report.tool_hash,
+                    )?;
                 }
+                pending.terminal = true;
+                pending.evaluation_queued = true;
             }
         }
         Ok(())
@@ -940,17 +938,17 @@ fn persist_evolution_cases(
         let _ = mark_pending_terminal(root, request_id, "cases_failed");
         return Err(anyhow::anyhow!(error.to_string()));
     }
-    if let Some(correction_id) = spec.correction_id.as_deref() {
-        if let Err(error) = crate::assistant_learning::register_hypothesis(
+    if let Some(correction_id) = spec.correction_id.as_deref()
+        && let Err(error) = crate::assistant_learning::register_hypothesis(
             root,
             scope,
             request_id,
             correction_id,
             &spec.need,
-        ) {
-            mark_pending_terminal(root, request_id, "hypothesis_failed")?;
-            return Err(error.into());
-        }
+        )
+    {
+        mark_pending_terminal(root, request_id, "hypothesis_failed")?;
+        return Err(error.into());
     }
     Ok(())
 }

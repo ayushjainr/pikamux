@@ -384,12 +384,12 @@ impl<T: RpcTransport> MainAssistant<T> {
         };
         let response = self.transport.request(method, params)?;
         let id = verified_thread_id(&response, &self.config)?;
-        if let Some(expected) = self.profile.thread_id.as_deref() {
-            if expected != id {
-                return Err(ProviderError::Protocol(
-                    "provider returned a different thread id".into(),
-                ));
-            }
+        if let Some(expected) = self.profile.thread_id.as_deref()
+            && expected != id
+        {
+            return Err(ProviderError::Protocol(
+                "provider returned a different thread id".into(),
+            ));
         }
         self.profile.thread_id = Some(id);
         self.state = AssistantState::Ready;

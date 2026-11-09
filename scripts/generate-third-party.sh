@@ -27,8 +27,8 @@ done
 
 pika_rust_version=$(rustc --version)
 case "$pika_rust_version" in
-    'rustc 1.88.0 '*) ;;
-    *) printf 'rustc 1.88.0 is required to regenerate release notices\n' >&2; exit 2 ;;
+    'rustc 1.89.0 '*) ;;
+    *) printf 'rustc 1.89.0 is required to regenerate release notices\n' >&2; exit 2 ;;
 esac
 pika_rust_copyright="$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html"
 [ -f "$pika_rust_copyright" ] && [ ! -L "$pika_rust_copyright" ] || {

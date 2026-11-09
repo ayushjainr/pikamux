@@ -94,7 +94,7 @@ conversation history or provider credentials.
 
 ## Build from source
 
-With Rust 1.88 or newer:
+With Rust 1.89 or newer:
 
 ```bash
 cargo install --path . --locked

@@ -557,10 +557,10 @@ impl Handler<'_> {
         Ok(identity)
     }
     fn require_watched(&self, identity: &Identity) -> Result<()> {
-        if let Some(selected) = self.selected.as_ref().filter(|s| s.identity == *identity) {
-            if let Some((root, binding)) = &selected.assistant {
-                return crate::assistant_native::require_shared_binding(root, binding);
-            }
+        if let Some(selected) = self.selected.as_ref().filter(|s| s.identity == *identity)
+            && let Some((root, binding)) = &selected.assistant
+        {
+            return crate::assistant_native::require_shared_binding(root, binding);
         }
         let session = self
             .pika
@@ -733,10 +733,8 @@ impl Handler<'_> {
             *event_at,
             false,
         )?;
-        if acknowledged {
-            if let Some(source) = &self.source {
-                let _ = source.refresh().try_send(());
-            }
+        if acknowledged && let Some(source) = &self.source {
+            let _ = source.refresh().try_send(());
         }
         Ok(json!({"identity":identity,"acknowledged":acknowledged}))
     }

@@ -6,7 +6,7 @@ pull request.
 
 ## Development setup
 
-Use macOS or Linux with Rust 1.88 or newer and tmux.
+Use macOS or Linux with Rust 1.89 or newer and tmux.
 
 ```bash
 cargo build --locked

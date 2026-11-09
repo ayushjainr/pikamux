@@ -489,6 +489,20 @@ fn claude_usage(store: &Store, session: &Session) -> Result<Option<UsageMetrics>
     Ok(Some(usage))
 }
 
+fn readonly_usage_database(database: &Path) -> Result<Connection> {
+    let uri = format!("file:{}?mode=ro", database.to_string_lossy());
+    let mut db = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    db.busy_timeout(USAGE_SQLITE_BUSY_TIMEOUT)?;
+    let deadline = Instant::now() + USAGE_SQLITE_DEADLINE;
+    db.progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
+    Ok(db)
+}
+
 fn opencode_usage(home: &Path, store: &Store, session: &Session) -> Result<Option<UsageMetrics>> {
     let database = home.join("opencode.db");
     if !database.is_file() {
@@ -508,16 +522,7 @@ fn opencode_usage(home: &Path, store: &Store, session: &Session) -> Result<Optio
         }
         return Ok(Some(from_cache(cached, CostBasis::ProviderReported, false)));
     }
-    let uri = format!("file:{}?mode=ro", database.to_string_lossy());
-    let db = Connection::open_with_flags(
-        uri,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_URI
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    db.busy_timeout(USAGE_SQLITE_BUSY_TIMEOUT)?;
-    let deadline = Instant::now() + USAGE_SQLITE_DEADLINE;
-    db.progress_handler(1_000, Some(move || Instant::now() >= deadline));
+    let db = readonly_usage_database(&database)?;
     let columns = table_columns(&db, "session")?;
     if !columns.contains("id") || !columns.contains("parent_id") {
         return Ok(None);

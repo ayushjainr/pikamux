@@ -41,8 +41,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install 1.88.0 --profile minimal --target '${{ matrix.target }}'
-          rustup override set 1.88.0
+          rustup toolchain install 1.89.0 --profile minimal --target '${{ matrix.target }}'
+          rustup override set 1.89.0
       - name: Install musl compiler
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes musl-tools

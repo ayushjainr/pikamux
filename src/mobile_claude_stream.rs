@@ -604,15 +604,15 @@ impl Utf8Tail {
                 ),
             }
         }
-        if self.pending.is_empty() {
-            if let Err(error) = std::str::from_utf8(bytes) {
-                ensure!(
-                    error.error_len().is_none(),
-                    "Invalid Claude JSON UTF-8 string"
-                );
-                self.pending
-                    .extend_from_slice(&bytes[error.valid_up_to()..]);
-            }
+        if self.pending.is_empty()
+            && let Err(error) = std::str::from_utf8(bytes)
+        {
+            ensure!(
+                error.error_len().is_none(),
+                "Invalid Claude JSON UTF-8 string"
+            );
+            self.pending
+                .extend_from_slice(&bytes[error.valid_up_to()..]);
         }
         ensure!(self.pending.len() <= 3, "Invalid Claude JSON UTF-8 string");
         Ok(())

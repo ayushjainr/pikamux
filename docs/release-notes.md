@@ -1,4 +1,4 @@
-Pika 0.6.60 separates live terminal availability from verified conversation
+Pika 0.6.61 separates live terminal availability from verified conversation
 identity. Pending launches with current exact-token runtime evidence appear in
 their own `terminal only` section, without false failure, activity counts or
 activity timestamps. Existing terminals remain openable; no identity is guessed.
@@ -8,6 +8,9 @@ Explicit stale-launch cleanup now requires complete runtime evidence and an
 unchanged launch snapshot, retaining diagnostic history and protecting live or
 ambiguous owners. Updating never runs that cleanup automatically, restarts agents,
 rewrites hooks or installs an iPhone build. Reopen boards after updating.
+
+Bundled SQLite is updated to fix RUSTSEC-2026-0459. The release compiler is
+pinned to Rust 1.89 to support the patched database dependency.
 
 Retained changes from 0.6.58:
 

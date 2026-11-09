@@ -2368,25 +2368,24 @@ impl Tmux {
                         let client = receipt_client.lock().expect("tmux receipt target poisoned");
                         self.record_exact_recent_thread(client.as_deref(), pane);
                     }
-                    if let Some(receipt) = receipt {
-                        if let Some(client) = receipt_client
+                    if let Some(receipt) = receipt
+                        && let Some(client) = receipt_client
                             .lock()
                             .expect("tmux receipt target poisoned")
                             .as_deref()
-                        {
-                            let _ = self.output(
-                                [
-                                    "display-message",
-                                    "-c",
-                                    client,
-                                    "-d",
-                                    "3000",
-                                    "-l",
-                                    &receipt,
-                                ],
-                                false,
-                            );
-                        }
+                    {
+                        let _ = self.output(
+                            [
+                                "display-message",
+                                "-c",
+                                client,
+                                "-d",
+                                "3000",
+                                "-l",
+                                &receipt,
+                            ],
+                            false,
+                        );
                     }
                     Ok(())
                 },
@@ -2874,14 +2873,13 @@ fn return_command_words<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String>
         if matches!(word, "{" | "}") {
             continue;
         }
-        if word.starts_with("if-shell ")
+        if (word.starts_with("if-shell ")
             || word.starts_with("send-keys ")
-            || word.starts_with("switch-client ")
+            || word.starts_with("switch-client "))
+            && let Ok(parts) = shell_words::split(word)
         {
-            if let Ok(parts) = shell_words::split(word) {
-                result.extend(return_command_words(parts.iter().map(String::as_str)));
-                continue;
-            }
+            result.extend(return_command_words(parts.iter().map(String::as_str)));
+            continue;
         }
         result.push(word.to_owned());
     }

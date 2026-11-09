@@ -72,11 +72,11 @@ fn push_span(spans: &mut Vec<Span>, text: String, style: Style) {
     if text.is_empty() {
         return;
     }
-    if let Some(last) = spans.last_mut() {
-        if last.style == style {
-            last.text.push_str(&text);
-            return;
-        }
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        last.text.push_str(&text);
+        return;
     }
     spans.push(Span { text, style });
 }
@@ -100,15 +100,15 @@ fn inline(text: &str, base: Style) -> Vec<Span> {
             look_end -= 1;
         }
         // Code spans are intentionally displayed, never interpreted.
-        if b[i] == b'`' {
-            if let Some(end) = s[i + 1..look_end].find('`') {
-                flush(&mut out, &mut plain);
-                let mut st = base;
-                st.code = true;
-                push_span(&mut out, s[i + 1..i + 1 + end].to_owned(), st);
-                i += end + 2;
-                continue;
-            }
+        if b[i] == b'`'
+            && let Some(end) = s[i + 1..look_end].find('`')
+        {
+            flush(&mut out, &mut plain);
+            let mut st = base;
+            st.code = true;
+            push_span(&mut out, s[i + 1..i + 1 + end].to_owned(), st);
+            i += end + 2;
+            continue;
         }
         // Links and images become readable labels, with their destinations inert.
         let image = b[i] == b'!' && i + 1 < b.len() && b[i + 1] == b'[';
@@ -116,27 +116,29 @@ fn inline(text: &str, base: Style) -> Vec<Span> {
             let open = if image { i + 1 } else { i };
             if let Some(close_rel) = s[open + 1..look_end].find(']') {
                 let close = open + 1 + close_rel;
-                if close + 2 <= look_end && close + 1 < b.len() && b[close + 1] == b'(' {
-                    if let Some(paren_rel) = s[close + 2..look_end].find(')') {
-                        flush(&mut out, &mut plain);
-                        let mut st = base;
-                        st.link = true;
-                        let label = if image {
-                            format!("Image: {}", &s[open + 1..close])
-                        } else {
-                            s[open + 1..close].to_owned()
-                        };
-                        push_span(&mut out, label, st);
-                        // Keep the destination as an inert, readable path;
-                        // callers must never turn this into a terminal link.
-                        push_span(
-                            &mut out,
-                            format!(" ({})", &s[close + 2..close + 2 + paren_rel]),
-                            st,
-                        );
-                        i = close + 2 + paren_rel + 1;
-                        continue;
-                    }
+                if close + 2 <= look_end
+                    && close + 1 < b.len()
+                    && b[close + 1] == b'('
+                    && let Some(paren_rel) = s[close + 2..look_end].find(')')
+                {
+                    flush(&mut out, &mut plain);
+                    let mut st = base;
+                    st.link = true;
+                    let label = if image {
+                        format!("Image: {}", &s[open + 1..close])
+                    } else {
+                        s[open + 1..close].to_owned()
+                    };
+                    push_span(&mut out, label, st);
+                    // Keep the destination as an inert, readable path;
+                    // callers must never turn this into a terminal link.
+                    push_span(
+                        &mut out,
+                        format!(" ({})", &s[close + 2..close + 2 + paren_rel]),
+                        st,
+                    );
+                    i = close + 2 + paren_rel + 1;
+                    continue;
                 }
             }
         }

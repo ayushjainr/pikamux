@@ -282,15 +282,14 @@ fn add_links(
         .take(MAX_SOURCES)
         .collect();
     for id in links {
-        if let Some(record) = memory.get(&id)? {
-            if record.scope.permits(&package.scope)
-                && !matches!(
-                    record.kind,
-                    RecordKind::Draft | RecordKind::InferredPreference
-                )
-            {
-                include(memory, package, seen, record, limit)?;
-            }
+        if let Some(record) = memory.get(&id)?
+            && record.scope.permits(&package.scope)
+            && !matches!(
+                record.kind,
+                RecordKind::Draft | RecordKind::InferredPreference
+            )
+        {
+            include(memory, package, seen, record, limit)?;
         }
     }
     Ok(())

@@ -399,10 +399,10 @@ fn page_item(value: &Value, state: &mut Cursor) -> Result<Option<Value>> {
             }
         }
         Some("started") => {
-            if let Some(run) = value["payload"]["run_id"].as_str() {
-                if state.displayed_runs.remove(run) {
-                    return Ok(None);
-                }
+            if let Some(run) = value["payload"]["run_id"].as_str()
+                && state.displayed_runs.remove(run)
+            {
+                return Ok(None);
             }
         }
         _ => {}
@@ -491,7 +491,7 @@ fn sql_page(
 
 fn sql_connection(source: &Path, id: &str) -> Result<Connection> {
     verify_sql_sidecars(source)?;
-    let db = Connection::open_with_flags(
+    let mut db = Connection::open_with_flags(
         source,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -502,7 +502,7 @@ fn sql_connection(source: &Path, id: &str) -> Result<Connection> {
     db.progress_handler(
         10_000,
         Some(move || budget.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 100),
-    );
+    )?;
     ensure!(
         db.query_row(
             "SELECT 1 FROM session WHERE id=? AND parent_id IS NULL",
@@ -583,10 +583,10 @@ fn sql_text(db: &Connection, id: &str, message_id: &str) -> Result<String> {
         let (part, length) = piece?;
         ensure!(length <= RECORD, "OpenCode part exceeds history bounds");
         let part: Value = serde_json::from_str(&part.context("OpenCode part unavailable")?)?;
-        if part["type"] == "text" {
-            if let Some(value) = part["text"].as_str() {
-                text.push_str(value);
-            }
+        if part["type"] == "text"
+            && let Some(value) = part["text"].as_str()
+        {
+            text.push_str(value);
         }
         ensure!(text.len() <= RECORD, "OpenCode text exceeds history bounds");
     }

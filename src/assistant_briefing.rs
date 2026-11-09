@@ -650,7 +650,7 @@ mod tests {
         assert!(
             build(
                 std::slice::from_ref(&correction),
-                &[correction.scope.clone()],
+                std::slice::from_ref(&correction.scope),
                 0
             )
             .instructions

@@ -252,7 +252,13 @@ mod tests {
             Status::OpenTwice
         );
         assert_eq!(
-            project_status(&[copied.clone()], true, "open_twice", fallback.clone()).status,
+            project_status(
+                std::slice::from_ref(&copied),
+                true,
+                "open_twice",
+                fallback.clone()
+            )
+            .status,
             Status::OpenTwice
         );
         let recovered = project_status(&[copied], true, "exact", fallback);

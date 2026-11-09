@@ -162,11 +162,11 @@ fn push(out: &mut Vec<Span>, text: &str, mut style: Style, ink: SyntaxInk) {
     if text.is_empty() {
         return;
     }
-    if let Some(last) = out.last_mut() {
-        if last.style == style {
-            last.text.push_str(text);
-            return;
-        }
+    if let Some(last) = out.last_mut()
+        && last.style == style
+    {
+        last.text.push_str(text);
+        return;
     }
     out.push(Span {
         text: text.to_owned(),

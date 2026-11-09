@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# A separate pinned nightly collects actual branches; releases stay on Rust 1.88.
+# A separate pinned nightly collects actual branches; releases stay on Rust 1.89.
 set -euo pipefail
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
-toolchain=nightly-2025-06-27
+toolchain=nightly-2025-08-08
 [[ $(cargo llvm-cov --version) == 'cargo-llvm-cov 0.6.18' ]] || {
   echo 'Install cargo-llvm-cov --locked --version 0.6.18' >&2; exit 2;
 }

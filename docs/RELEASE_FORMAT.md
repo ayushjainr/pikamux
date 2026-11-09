@@ -101,7 +101,7 @@ stale generated output. The same bundle reproduces the pinned Rust toolchain's
 complete standard-library copyright report because that runtime is statically
 linked into Pika. For the self-contained musl libc linked by Linux targets, the
 generator extracts the complete musl-related notice blocks from the pinned Rust
-1.88.0 full toolchain copyright report; the text is never maintained by hand.
+1.89.0 full toolchain copyright report; the text is never maintained by hand.
 
 ## Managed installation
 

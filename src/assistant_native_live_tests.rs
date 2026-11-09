@@ -477,10 +477,10 @@ fn run_live_turn(rpc: &mut Rpc, id: &str, prompt: &str, control: bool) -> String
 }
 
 fn capture_live_item(event: &Value, reply: &mut String) {
-    if event["method"] == "item/agentMessage/delta" {
-        if let Some(delta) = event["params"]["delta"].as_str() {
-            print!("{delta}");
-        }
+    if event["method"] == "item/agentMessage/delta"
+        && let Some(delta) = event["params"]["delta"].as_str()
+    {
+        print!("{delta}");
     }
     if event["method"] == "item/completed" {
         let item = &event["params"]["item"];

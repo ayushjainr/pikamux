@@ -135,10 +135,10 @@ impl Journey {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             self.drain();
-            if let Some(start) = self.output.rfind(text) {
-                if self.output[start..].contains("\x1b[?2026l") {
-                    return;
-                }
+            if let Some(start) = self.output.rfind(text)
+                && self.output[start..].contains("\x1b[?2026l")
+            {
+                return;
             }
             assert!(
                 Instant::now() < deadline,

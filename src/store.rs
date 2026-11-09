@@ -2440,16 +2440,14 @@ impl Store {
         )?;
         let deleted = tx.execute("DELETE FROM fleet_nodes WHERE node_id=?", [node_id])? == 1;
         tx.commit()?;
-        if deleted {
-            if let Ok(cache) = self.open_fleet_cache() {
-                let _ = cache.execute("DELETE FROM projection_chunks WHERE node_id=?", [node_id]);
-                let _ = cache.execute(
-                    "DELETE FROM expert_search_fts_v2 WHERE node_id=?",
-                    [fts_identity("n", node_id)],
-                );
-                let _ = cache.execute("DELETE FROM expert_rows WHERE node_id=?", [node_id]);
-                let _ = cache.execute("DELETE FROM projections WHERE node_id=?", [node_id]);
-            }
+        if deleted && let Ok(cache) = self.open_fleet_cache() {
+            let _ = cache.execute("DELETE FROM projection_chunks WHERE node_id=?", [node_id]);
+            let _ = cache.execute(
+                "DELETE FROM expert_search_fts_v2 WHERE node_id=?",
+                [fts_identity("n", node_id)],
+            );
+            let _ = cache.execute("DELETE FROM expert_rows WHERE node_id=?", [node_id]);
+            let _ = cache.execute("DELETE FROM projections WHERE node_id=?", [node_id]);
         }
         Ok(deleted)
     }

@@ -807,24 +807,21 @@ impl<T: RpcTransport> AssistantRuntime<T> {
     }
 
     fn check_turn_deadline(&mut self, active: &ActiveTurn, now: i64) -> Result<(), RuntimeError> {
-        if let Some(reservation) = self.policy.reservation(&active.reservation_id)? {
-            if now >= reservation.deadline_at {
-                let _ = self.provider.cancel();
-                self.policy.record_outcome(
-                    &active.reservation_id,
-                    DeliveryOutcome::Unknown,
-                    now,
-                )?;
-                self.scrub_turn(&active.request_id)?;
-                self.record_turn_state(&active.request_id, "unknown", now)?;
-                self.state = RuntimeState::UnknownDelivery {
-                    reservation_id: active.reservation_id.clone(),
-                    turn_id: Some(active.turn_id.clone()),
-                };
-                return Err(RuntimeError::Denied(
-                    "turn deadline expired; delivery is unknown".into(),
-                ));
-            }
+        if let Some(reservation) = self.policy.reservation(&active.reservation_id)?
+            && now >= reservation.deadline_at
+        {
+            let _ = self.provider.cancel();
+            self.policy
+                .record_outcome(&active.reservation_id, DeliveryOutcome::Unknown, now)?;
+            self.scrub_turn(&active.request_id)?;
+            self.record_turn_state(&active.request_id, "unknown", now)?;
+            self.state = RuntimeState::UnknownDelivery {
+                reservation_id: active.reservation_id.clone(),
+                turn_id: Some(active.turn_id.clone()),
+            };
+            return Err(RuntimeError::Denied(
+                "turn deadline expired; delivery is unknown".into(),
+            ));
         }
         Ok(())
     }
@@ -955,14 +952,13 @@ impl<T: RpcTransport> AssistantRuntime<T> {
             Ok(None) => {}
             Err(_) => {
                 // Preserve a delivered answer even if learning is invalid.
-                if let Ok(value) = serde_json::from_str::<Value>(text) {
-                    if let Some(answer) = value
+                if let Ok(value) = serde_json::from_str::<Value>(text)
+                    && let Some(answer) = value
                         .get("answer")
                         .and_then(Value::as_str)
                         .filter(|s| !s.trim().is_empty() && s.len() <= 8192)
-                    {
-                        *text = answer.to_owned();
-                    }
+                {
+                    *text = answer.to_owned();
                 }
                 learning_warning = Some(
                     "The answer was delivered, but learning was not confirmed saved: the learning envelope was invalid.",

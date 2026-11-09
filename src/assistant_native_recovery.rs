@@ -64,16 +64,15 @@ fn require_saved_context(
     scope: &str,
     current: u64,
 ) -> Result<()> {
-    if let Some((actual, stored_scope, stored_epoch, state)) = row {
-        if actual != profile
+    if let Some((actual, stored_scope, stored_epoch, state)) = row
+        && (actual != profile
             || stored_scope != scope
             || stored_epoch != current
-            || state != "active"
-        {
-            bail!(
-                "Native Pika context is invalidated or retired; explicitly recover fresh context before reuse"
-            );
-        }
+            || state != "active")
+    {
+        bail!(
+            "Native Pika context is invalidated or retired; explicitly recover fresh context before reuse"
+        );
     }
     Ok(())
 }

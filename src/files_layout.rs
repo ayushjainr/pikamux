@@ -99,10 +99,10 @@ pub(crate) fn layout(lines: &[Line], width: usize, wrap: bool) -> Vec<Row> {
                         boundary = Some(end);
                     }
                 }
-                if end < units.len() {
-                    if let Some(word_end) = boundary.filter(|b| *b > start + padding) {
-                        end = word_end;
-                    }
+                if end < units.len()
+                    && let Some(word_end) = boundary.filter(|b| *b > start + padding)
+                {
+                    end = word_end;
                 }
                 let mut spans = Vec::new();
                 if padding > 0 {

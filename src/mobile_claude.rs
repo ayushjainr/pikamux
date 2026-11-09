@@ -339,10 +339,10 @@ impl Client {
         }
         self.next_poll = Instant::now() + Duration::from_secs(1);
         self.require_loaded(pika)?;
-        if let Some(source) = &self.source {
-            if self.source_stamp == Some(source_stamp(source)?) {
-                return Ok(vec![]);
-            }
+        if let Some(source) = &self.source
+            && self.source_stamp == Some(source_stamp(source)?)
+        {
+            return Ok(vec![]);
         }
         let page = self.history(pika, None)?;
         let mut events = vec![];

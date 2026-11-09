@@ -12,8 +12,8 @@ Use the repository's normal Cargo toolchain, or select one explicitly:
 
 ```sh
 scripts/check-recovery.sh
-scripts/check-recovery.sh --toolchain 1.88.0
-PIKA_CARGO_TOOLCHAIN=1.88.0 scripts/check-recovery.sh
+scripts/check-recovery.sh --toolchain 1.89.0
+PIKA_CARGO_TOOLCHAIN=1.89.0 scripts/check-recovery.sh
 ```
 
 ## Scenarios covered

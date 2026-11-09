@@ -436,11 +436,11 @@ fn select_helper<F: WorkerFactory>(
     consultation: Option<&str>,
     scope: &crate::assistant_memory::Scope,
 ) -> Result<()> {
-    if let Some(consultation) = consultation {
-        if let Err(error) = factory.select_consultation(id, consultation, id, scope, now()) {
-            policy.release_before_dispatch(id, now())?;
-            return Err(anyhow::Error::msg(error));
-        }
+    if let Some(consultation) = consultation
+        && let Err(error) = factory.select_consultation(id, consultation, id, scope, now())
+    {
+        policy.release_before_dispatch(id, now())?;
+        return Err(anyhow::Error::msg(error));
     }
     Ok(())
 }

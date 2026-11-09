@@ -100,10 +100,10 @@ def musl_notices_from_rust_copyright(path: Path) -> list[Notice]:
         text = html.unescape(encoded)
         if "musl libc" not in text or "Rich Felker" not in text:
             continue
-        notice = read_notice(text.encode("utf-8"), "Rust 1.88.0 COPYRIGHT.html musl block")
+        notice = read_notice(text.encode("utf-8"), "Rust 1.89.0 COPYRIGHT.html musl block")
         blocks[notice.digest] = notice
     if not blocks:
-        fail("Rust 1.88.0 COPYRIGHT.html contains no complete musl notice")
+        fail("Rust 1.89.0 COPYRIGHT.html contains no complete musl notice")
     return [blocks[digest] for digest in sorted(blocks)]
 
 
@@ -321,18 +321,18 @@ def main() -> None:
     if args.rust_copyright.is_symlink() or not args.rust_copyright.is_file():
         fail("Rust standard-library copyright report is not a regular file")
     rust_notice = read_notice(
-        args.rust_copyright.read_bytes(), "Rust 1.88.0 COPYRIGHT-library.html"
+        args.rust_copyright.read_bytes(), "Rust 1.89.0 COPYRIGHT-library.html"
     )
     notices[rust_notice.digest] = rust_notice
     notice_uses[rust_notice.digest].append(
-        ("Rust standard library 1.88.0", "COPYRIGHT-library.html")
+        ("Rust standard library 1.89.0", "COPYRIGHT-library.html")
     )
     rust_notice_id = rust_notice.digest
     musl_notice_ids: list[str] = []
     for musl_notice in musl_notices_from_rust_copyright(args.rust_full_copyright):
         notices[musl_notice.digest] = musl_notice
         notice_uses[musl_notice.digest].append(
-            ("Rust 1.88.0 self-contained musl libc", "COPYRIGHT.html")
+            ("Rust 1.89.0 self-contained musl libc", "COPYRIGHT.html")
         )
         musl_notice_ids.append(musl_notice.digest)
     notice_bytes = sum(len(notice.text.encode("utf-8")) for notice in notices.values())
@@ -356,11 +356,11 @@ def main() -> None:
         "Pika enables bundled SQLite. The SQLite amalgamation is included in the binary "
         "and its public-domain declaration is reproduced below with the crate notices.",
         "",
-        "The binary also statically links the Rust 1.88.0 standard library. Its complete "
+        "The binary also statically links the Rust 1.89.0 standard library. Its complete "
         f"library copyright report is included as N-{rust_notice_id[:12]}.",
         "",
         "Rust's Linux targets also link its self-contained musl libc. Complete musl-related "
-        "notice blocks are extracted from the pinned Rust 1.88.0 full toolchain copyright "
+        "notice blocks are extracted from the pinned Rust 1.89.0 full toolchain copyright "
         "report and included as "
         + ", ".join(f"N-{digest[:12]}" for digest in musl_notice_ids)
         + ".",

@@ -405,18 +405,17 @@ fn prune_attachments(map: &mut BTreeMap<String, Value>) {
         .map(|(id, _)| id.clone())
         .collect();
     while let Some(id) = leaves.pop() {
-        if let Some(record) = map.remove(&id) {
-            if let Some(parent) = record["parentUuid"].as_str() {
-                if let Some(count) = counts.get_mut(parent) {
-                    *count -= 1;
-                    if *count == 0
-                        && map
-                            .get(parent)
-                            .is_some_and(|record| record["type"] == "attachment")
-                    {
-                        leaves.push(parent.into());
-                    }
-                }
+        if let Some(record) = map.remove(&id)
+            && let Some(parent) = record["parentUuid"].as_str()
+            && let Some(count) = counts.get_mut(parent)
+        {
+            *count -= 1;
+            if *count == 0
+                && map
+                    .get(parent)
+                    .is_some_and(|record| record["type"] == "attachment")
+            {
+                leaves.push(parent.into());
             }
         }
     }

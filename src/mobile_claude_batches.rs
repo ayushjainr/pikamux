@@ -168,11 +168,11 @@ fn membership(records: &Records, sources: &ResultSources) -> Result<BTreeMap<Str
     let mut responses = BTreeMap::<&str, Vec<&str>>::new();
     for (id, record) in records {
         validate_blocks(record)?;
-        if record["type"] == "assistant" {
-            if let Some(response) = record["message"]["id"].as_str() {
-                ensure!(!response.is_empty(), "Claude response identity missing");
-                responses.entry(response).or_default().push(id);
-            }
+        if record["type"] == "assistant"
+            && let Some(response) = record["message"]["id"].as_str()
+        {
+            ensure!(!response.is_empty(), "Claude response identity missing");
+            responses.entry(response).or_default().push(id);
         }
     }
     for ids in responses.values() {
@@ -423,13 +423,11 @@ fn proven_batches(
             *assistants.entry(&members[id]).or_default() += 1;
         } else if record["type"] == "user"
             && !blocks(record, "tool_result", "tool_use_id").is_empty()
-        {
-            if let Some(parent) = record["parentUuid"]
+            && let Some(parent) = record["parentUuid"]
                 .as_str()
                 .filter(|parent| records[*parent]["type"] == "assistant")
-            {
-                *results.entry(&members[parent]).or_default() += 1;
-            }
+        {
+            *results.entry(&members[parent]).or_default() += 1;
         }
     }
     assistants

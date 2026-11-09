@@ -209,20 +209,19 @@ impl Client {
         ) {
             self.questions
                 .insert(value["id"].to_string(), value.clone());
-        } else if value["method"] == "serverRequest/resolved" {
-            if let Some(request) = self
+        } else if value["method"] == "serverRequest/resolved"
+            && let Some(request) = self
                 .questions
                 .remove(&value["params"]["requestId"].to_string())
-            {
-                // A request ID alone can be reused by a later server process.
-                // Enrich only from a request actually observed on this stream.
-                value["params"]["turnId"] = request["params"]["turnId"].clone();
-                value["params"]["itemId"] = request["params"]["itemId"].clone();
-                value["params"]["requestMethod"] = request["method"].clone();
-                self.resolved.push_back(request);
-                if self.resolved.len() > 256 {
-                    self.resolved.pop_front();
-                }
+        {
+            // A request ID alone can be reused by a later server process.
+            // Enrich only from a request actually observed on this stream.
+            value["params"]["turnId"] = request["params"]["turnId"].clone();
+            value["params"]["itemId"] = request["params"]["itemId"].clone();
+            value["params"]["requestMethod"] = request["method"].clone();
+            self.resolved.push_back(request);
+            if self.resolved.len() > 256 {
+                self.resolved.pop_front();
             }
         }
         if self.events.len() >= 256 {

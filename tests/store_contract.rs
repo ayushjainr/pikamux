@@ -733,7 +733,7 @@ fn confirmed_shared_owner_revoke_requires_the_complete_unchanged_lease_set() {
     };
     store.set_live_owner(&owner).unwrap();
     let captured = store.live_owners(Provider::Codex, "shared-thread").unwrap();
-    assert_eq!(captured, [owner.clone()]);
+    assert_eq!(captured.as_slice(), std::slice::from_ref(&owner));
 
     let mut changed = captured.clone();
     changed[0].last_seen = 11.0;

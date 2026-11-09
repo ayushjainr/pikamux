@@ -106,10 +106,9 @@ fn http(
                 line.to_ascii_lowercase()
                     .strip_prefix("content-length:")
                     .map(|s| s.trim().parse::<usize>().unwrap())
-            }) {
-                if bytes.len() >= split + 4 + length {
-                    break;
-                }
+            }) && bytes.len() >= split + 4 + length
+            {
+                break;
             }
             if head
                 .to_ascii_lowercase()

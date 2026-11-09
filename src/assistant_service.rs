@@ -584,10 +584,11 @@ fn worker<F: RuntimeFactory>(
         if active.is_none() && stop.load(Ordering::Acquire) {
             break;
         }
-        if let Ok(command) = commands.try_recv() {
-            if active.is_none() && start_command(&mut runtime, command, &mut active, &controls) {
-                continue;
-            }
+        if let Ok(command) = commands.try_recv()
+            && active.is_none()
+            && start_command(&mut runtime, command, &mut active, &controls)
+        {
+            continue;
         }
         if let Some(request_id) = active.clone() {
             if cancel.swap(false, Ordering::AcqRel) || stop.load(Ordering::Acquire) {
@@ -603,10 +604,10 @@ fn worker<F: RuntimeFactory>(
             }
         } else if stop.load(Ordering::Acquire) {
             break;
-        } else if let Ok(command) = commands.recv_timeout(Duration::from_millis(10)) {
-            if start_command(&mut runtime, command, &mut active, &controls) {
-                continue;
-            }
+        } else if let Ok(command) = commands.recv_timeout(Duration::from_millis(10))
+            && start_command(&mut runtime, command, &mut active, &controls)
+        {
+            continue;
         }
     }
     publish(

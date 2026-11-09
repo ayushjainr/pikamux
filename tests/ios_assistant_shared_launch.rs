@@ -267,10 +267,9 @@ fn fresh_assistant_reserves_one_shared_uuid_and_reopens_same_live_terminal() {
                 if let Some(session) = store
                     .get_session(pikamux::model::Provider::Codex, thread)
                     .unwrap()
+                    && session.root_pid.is_some()
                 {
-                    if session.root_pid.is_some() {
-                        break (binding, session);
-                    }
+                    break (binding, session);
                 }
             }
         }

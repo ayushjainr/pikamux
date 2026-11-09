@@ -517,11 +517,12 @@ pub(crate) fn memory_page(
 ) -> Result<MemoryPage> {
     scope_key(scope)?;
     let epoch = memory.forget_epoch()?;
-    if let Some(cursor) = cursor {
-        if cursor.profile != memory.profile_id() || cursor.scope != *scope || cursor.epoch != epoch
-        {
-            bail!("Memory cursor identity or forgetting generation changed");
-        }
+    if let Some(cursor) = cursor
+        && (cursor.profile != memory.profile_id()
+            || cursor.scope != *scope
+            || cursor.epoch != epoch)
+    {
+        bail!("Memory cursor identity or forgetting generation changed");
     }
     let page = memory.read_snapshot(|store| {
         if store.forget_epoch()? != epoch {

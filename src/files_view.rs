@@ -242,10 +242,11 @@ impl State {
                     depth,
                 });
             }
-            if entry.is_dir && self.expanded.contains(&path) {
-                if let Some(children) = self.cache.get(&path) {
-                    self.append_nodes(&path, children, depth + 1, out);
-                }
+            if entry.is_dir
+                && self.expanded.contains(&path)
+                && let Some(children) = self.cache.get(&path)
+            {
+                self.append_nodes(&path, children, depth + 1, out);
             }
         }
     }
@@ -439,10 +440,11 @@ impl State {
         } else {
             files_layout::source(&self.text)
         };
-        if self.mode == ViewMode::File && !self.rendered_markdown() {
-            if let Some(path) = &self.file_path {
-                files_syntax::highlight(&mut document, path);
-            }
+        if self.mode == ViewMode::File
+            && !self.rendered_markdown()
+            && let Some(path) = &self.file_path
+        {
+            files_syntax::highlight(&mut document, path);
         }
         self.rows = files_layout::layout(&document, width, self.wrap);
         self.scroll = self

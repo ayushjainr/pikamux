@@ -2747,10 +2747,10 @@ fn publish_staged_launcher(staged: &Path, launcher: &Path, expected: &Path) -> R
     let parent = launcher
         .parent()
         .ok_or_else(|| UpdateError::Safety("launcher has no parent directory".into()))?;
-    if let Err(error) = sync_directory(parent) {
-        if fs::read_link(launcher).ok().as_deref() != Some(expected) {
-            return Err(error);
-        }
+    if let Err(error) = sync_directory(parent)
+        && fs::read_link(launcher).ok().as_deref() != Some(expected)
+    {
+        return Err(error);
     }
     Ok(())
 }

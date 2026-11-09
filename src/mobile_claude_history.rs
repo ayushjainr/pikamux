@@ -99,14 +99,14 @@ impl Projector {
                 self.fetched.insert(id.into(), hash(&proof.text)).is_none(),
                 "Repeated native fetch identity"
             );
-        } else if tool == "reply" && proof.reply_tool_id.as_deref() == Some(id) {
-            if let Some(text) = proof
+        } else if tool == "reply"
+            && proof.reply_tool_id.as_deref() == Some(id)
+            && let Some(text) = proof
                 .reply
                 .as_ref()
                 .filter(|text| part["input"]["text"].as_str() == Some(text.as_str()))
-            {
-                return item(&format!("claude-channel-reply:{id}"), false, text.clone()).map(Some);
-            }
+        {
+            return item(&format!("claude-channel-reply:{id}"), false, text.clone()).map(Some);
         }
         Ok(None)
     }

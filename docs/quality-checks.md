@@ -5,7 +5,7 @@ or a background process to Pika.
 
 ## Recovery outcomes
 
-Run `scripts/check-recovery.sh --toolchain 1.88.0` for the focused regression
+Run `scripts/check-recovery.sh --toolchain 1.89.0` for the focused regression
 inventory in [recovery scenarios](recovery-scenarios.md). It requires tmux and
 `script`, uses fake providers, and checks that every selected test actually
 exists before running it. The ordinary native CI suite includes these tests;
@@ -66,14 +66,14 @@ or decisions—not to move complexity out of view.
 ## Recovery branch reports
 
 ```sh
-rustup toolchain install nightly-2025-06-27 --profile minimal --component llvm-tools-preview
-cargo +1.88.0 install cargo-llvm-cov --locked --version 0.6.18
+rustup toolchain install nightly-2025-08-08 --profile minimal --component llvm-tools-preview
+cargo +1.89.0 install cargo-llvm-cov --locked --version 0.6.18
 scripts/check-coverage.sh
 ```
 
 The pinned coverage-only nightly enables real branch instrumentation through
 [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov/tree/v0.6.18).
-Release builds and normal checks stay on Rust 1.88. The instrumented run covers
+Release builds and normal checks stay on Rust 1.89. The instrumented run covers
 library tests plus the recovery, startup/onboarding, CLI and terminal-color
 contract targets. One run produces JSON, an HTML report and a focused summary
 for core, store, hooks, process, tmux, CLI, terminal bridge, onboarding and monitor

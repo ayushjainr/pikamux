@@ -633,12 +633,12 @@ impl AuxiliaryWorkers {
 }
 
 fn existing_recovery_reply(root: &Path, request: &Request) -> Result<Option<Value>> {
-    if let Request::FreshContext { request_id } = request {
-        if let Some(receipt) = crate::assistant_recovery::existing_receipt(root, request_id)? {
-            return Ok(Some(
-                json!({"recovery_id":receipt.receipt_id,"notice":"This recovery was already recorded. Current work was not touched."}),
-            ));
-        }
+    if let Request::FreshContext { request_id } = request
+        && let Some(receipt) = crate::assistant_recovery::existing_receipt(root, request_id)?
+    {
+        return Ok(Some(
+            json!({"recovery_id":receipt.receipt_id,"notice":"This recovery was already recorded. Current work was not touched."}),
+        ));
     }
     Ok(None)
 }
@@ -740,25 +740,24 @@ fn native_feedback_command(root: &Path, request: &Request) -> Result<Option<Valu
     if let Request::NativePrompt {
         scope: name, body, ..
     } = &request
+        && (body == "$pika-user-feedback" || body.starts_with("$pika-user-feedback "))
     {
-        if body == "$pika-user-feedback" || body.starts_with("$pika-user-feedback ") {
-            scope(name)?;
-            let note = body.strip_prefix("$pika-user-feedback ").unwrap_or("");
-            let mut result = crate::assistant_feedback::submit(
-                root,
-                name,
-                (!note.trim().is_empty()).then_some(note),
-                timestamp(),
-            )?;
-            result["intercepted_control"] = json!(true);
-            if note.trim().is_empty() {
-                result["notice"] = json!(format!(
-                    "Feedback file: {}. Add a note with $pika-user-feedback NOTE. No model turn started.",
-                    root.join("user_feedback.md").display()
-                ));
-            }
-            return Ok(Some(result));
+        scope(name)?;
+        let note = body.strip_prefix("$pika-user-feedback ").unwrap_or("");
+        let mut result = crate::assistant_feedback::submit(
+            root,
+            name,
+            (!note.trim().is_empty()).then_some(note),
+            timestamp(),
+        )?;
+        result["intercepted_control"] = json!(true);
+        if note.trim().is_empty() {
+            result["notice"] = json!(format!(
+                "Feedback file: {}. Add a note with $pika-user-feedback NOTE. No model turn started.",
+                root.join("user_feedback.md").display()
+            ));
         }
+        return Ok(Some(result));
     }
     Ok(None)
 }
@@ -1609,10 +1608,11 @@ impl PresentationDriver {
         })
     }
     fn observe(&mut self, request: &Request) {
-        if let Request::Snapshot { scope: name } | Request::Brief { scope: name } = request {
-            if self.scopes.len() < 32 && scope(name).is_ok() {
-                self.scopes.insert(name.clone());
-            }
+        if let Request::Snapshot { scope: name } | Request::Brief { scope: name } = request
+            && self.scopes.len() < 32
+            && scope(name).is_ok()
+        {
+            self.scopes.insert(name.clone());
         }
     }
     fn tick(

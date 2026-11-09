@@ -9,11 +9,12 @@ fn shipped_third_party_notices_keep_known_required_sections() {
     assert!(notices.contains("UNICODE LICENSE V3"));
     assert!(notices.contains("The author disclaims copyright to this source code"));
     assert!(notices.contains("Copyright notices for The Rust Standard Library"));
-    assert!(notices.contains("compiler_builtins-0.1.158"));
+    assert!(notices.contains("Rust standard library 1.89.0"));
+    assert!(notices.contains("hashbrown-0.15.4"));
     assert!(notices.contains("self-contained musl libc"));
     assert!(notices.contains("musl libc"));
     assert!(notices.contains("Rich Felker"));
-    assert!(notices.contains("| `libsqlite3-sys` | `0.35.0` | `MIT` |"));
+    assert!(notices.contains("| `libsqlite3-sys` | `0.39.1` | `MIT` |"));
     assert!(notices.contains("| `windows-sys` | `0.61.2` | `MIT OR Apache-2.0` |"));
     assert!(!notices.contains(env!("CARGO_MANIFEST_DIR")));
 }
